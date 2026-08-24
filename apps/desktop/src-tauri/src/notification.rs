@@ -19,7 +19,7 @@ mod platform {
     use objc2::{
         define_class, extern_methods, rc::Retained, runtime::NSObject, runtime::ProtocolObject,
     };
-    use objc2_foundation::{NSError, NSObjectProtocol, NSString};
+    use objc2_foundation::{NSError, NSObjectProtocol};
     use objc2_user_notifications::{
         UNAuthorizationOptions, UNAuthorizationStatus, UNNotification,
         UNNotificationPresentationOptions, UNNotificationSettings, UNUserNotificationCenter,

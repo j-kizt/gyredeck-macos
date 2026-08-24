@@ -17,7 +17,7 @@ use base64::{
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    LogicalSize, Manager, Size,
+    Manager,
 };
 
 use serde::{Deserialize, Serialize};
@@ -5235,131 +5235,6 @@ fn select_display(
     display_state(window)
 }
 
-#[tauri::command]
-fn notch_metrics(window: tauri::WebviewWindow) -> (f64, f64) {
-    if let Some(metrics) = notch_metrics_for_platform(&window) {
-        return metrics;
-    }
-
-    let (sender, receiver) = mpsc::channel();
-    let scheduled_window = window.clone();
-    if window
-        .run_on_main_thread(move || {
-            let _ = sender.send(notch_metrics_for_platform(&scheduled_window));
-        })
-        .is_ok()
-    {
-        if let Ok(Some(metrics)) = receiver.recv_timeout(Duration::from_millis(250)) {
-            return metrics;
-        }
-    }
-
-    (184.0, 36.0)
-}
-
-#[cfg(target_os = "macos")]
-fn notch_metrics_for_platform(window: &tauri::WebviewWindow) -> Option<(f64, f64)> {
-    let mtm = MainThreadMarker::new()?;
-    let screens = NSScreen::screens(mtm);
-    let preference = window.app_handle().state::<DisplayPreferenceState>().get();
-    let (screen, _) = resolve_appkit_screen(&screens, preference.as_ref());
-    let screen = screen?;
-
-    let screen_frame = screen.frame();
-    let visible_frame = screen.visibleFrame();
-    let safe_insets = screen.safeAreaInsets();
-    let left_area = screen.auxiliaryTopLeftArea();
-    let right_area = screen.auxiliaryTopRightArea();
-    let derived_camera_width =
-        screen_frame.size.width - left_area.size.width - right_area.size.width + 4.0;
-    let camera_width = if safe_insets.top > 0.0 {
-        derived_camera_width.clamp(160.0, 260.0)
-    } else {
-        184.0
-    };
-    let menu_bar_height = (screen_frame.origin.y + screen_frame.size.height)
-        - (visible_frame.origin.y + visible_frame.size.height);
-    let closed_height = if safe_insets.top > 0.0 {
-        safe_insets.top.clamp(28.0, 44.0)
-    } else {
-        menu_bar_height.clamp(28.0, 40.0)
-    };
-
-    Some((camera_width, closed_height))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn notch_metrics_for_platform(_window: &tauri::WebviewWindow) -> Option<(f64, f64)> {
-    Some((184.0, 36.0))
-}
-
-#[tauri::command]
-fn set_panel_open(
-    window: tauri::WebviewWindow,
-    open: bool,
-    focus: bool,
-    width: f64,
-    height: f64,
-) -> Result<(), String> {
-    set_main_window_frame(&window, width, height)
-        .map_err(|error| format!("Failed to resize/recenter Agent Activity window: {error}"))?;
-
-    if open && focus {
-        let _ = window.set_focus();
-    }
-
-    Ok(())
-}
-
-fn set_main_window_frame(
-    window: &tauri::WebviewWindow,
-    width: f64,
-    height: f64,
-) -> tauri::Result<()> {
-    set_main_window_frame_for_platform(window, width, height)
-}
-
-#[cfg(target_os = "macos")]
-fn set_main_window_frame_for_platform(
-    window: &tauri::WebviewWindow,
-    width: f64,
-    height: f64,
-) -> tauri::Result<()> {
-    if position_main_window_with_appkit(window, Some((width, height)), false) {
-        return Ok(());
-    }
-
-    let (sender, receiver) = mpsc::channel();
-    let scheduled_window = window.clone();
-    window.run_on_main_thread(move || {
-        let _ = sender.send(position_main_window_with_appkit(
-            &scheduled_window,
-            Some((width, height)),
-            false,
-        ));
-    })?;
-
-    if receiver
-        .recv_timeout(Duration::from_millis(250))
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
-
-    window.set_size(Size::Logical(LogicalSize::new(width, height)))?;
-    position_main_window_for_logical_width(window, width)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn set_main_window_frame_for_platform(
-    window: &tauri::WebviewWindow,
-    width: f64,
-    height: f64,
-) -> tauri::Result<()> {
-    window.set_size(Size::Logical(LogicalSize::new(width, height)))?;
-    position_main_window_for_logical_width(window, width)
-}
-
 fn position_main_window(window: &tauri::WebviewWindow) -> tauri::Result<()> {
     let width = f64::from(window.outer_size()?.width);
     position_main_window_for_physical_width(window, width)
@@ -5498,14 +5373,6 @@ fn position_main_window_on_selected_display(window: &tauri::WebviewWindow) -> Re
     }
     position_main_window(window)
         .map_err(|error| format!("Could not move Agent Activity to the selected display: {error}"))
-}
-
-fn position_main_window_for_logical_width(
-    window: &tauri::WebviewWindow,
-    width: f64,
-) -> tauri::Result<()> {
-    let scale = window.scale_factor()?;
-    position_main_window_for_physical_width(window, width * scale)
 }
 
 fn position_main_window_for_physical_width(

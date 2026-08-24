@@ -156,15 +156,9 @@
 }
 
 .session-row-actions .row-focus {
-  opacity: 0;
-  transform: translateX(3px);
-  transition: opacity 0.12s ease, transform 0.12s ease;
-}
-
-.session-row:hover .session-row-actions .row-focus,
-.session-row:focus-within .session-row-actions .row-focus {
   opacity: 1;
   transform: translateX(0);
+  transition: opacity 0.12s ease, transform 0.12s ease;
 }
 
 .session-child-list {
@@ -313,6 +307,7 @@
   align-self: start;
 }
 
+.session-provider,
 .session-model,
 .session-age,
 .session-group-count {
@@ -327,10 +322,16 @@
   white-space: nowrap;
 }
 
+.session-provider,
 .session-model {
-  max-width: 72px;
+  max-width: 76px;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Provider is the primary identity; give it a touch more emphasis than the model. */
+.session-provider {
+  color: var(--text-2);
 }
 
 .session-age {

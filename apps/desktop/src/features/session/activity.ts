@@ -38,8 +38,26 @@ export const formatRelativeAge = (timestamp: string): string => {
 };
 
 export const shortModelName = (model: string): string =>
-  (model.split("/").filter(Boolean).at(-1) ?? model).replace(/^chatgpt-plus-pro\//, "") ||
-  "Claude Code";
+  (model.split("/").filter(Boolean).at(-1) ?? model)
+    .replace(/^chatgpt-plus-pro\//, "")
+    .replace(/^claude-/, "");
+
+/** Human label for the agent provider, derived from the event runtime sourceKind. */
+export const providerLabel = (sourceKind: string | null | undefined): string => {
+  switch (sourceKind) {
+    case "claudeCodeHook":
+      return "Claude Code";
+    case "codex-notify":
+    case "codex":
+      return "Codex";
+    case "agyHost":
+      return "Antigravity";
+    case "lettaHost":
+      return "Letta";
+    default:
+      return "Agent";
+  }
+};
 
 const toolKind = (name: string): ActivityKind => {
   if (name === "UpdatePlan") return "planning";

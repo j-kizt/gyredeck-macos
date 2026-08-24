@@ -3,6 +3,7 @@ import {
   getEventActivity,
   getEventSessionStatus,
   projectName,
+  providerLabel,
   shortenPath,
 } from "./activity";
 import type {
@@ -142,7 +143,11 @@ export const buildSessionSummaries = (
       workspacePath,
       detail: activity.detail,
       activityKind: activity.kind,
-      model: sessionEvents.find((event) => event.model)?.model ?? "Claude Code",
+      provider: providerLabel(
+        latest.runtime?.sourceKind ??
+          sessionEvents.find((event) => event.runtime?.sourceKind)?.runtime?.sourceKind,
+      ),
+      model: sessionEvents.find((event) => event.model)?.model ?? "",
       status: getEventSessionStatus(latest, now),
       lastActivityAt: latest.timestamp,
       herdrTarget: getSessionHerdrTarget(sessionEvents),
@@ -165,7 +170,10 @@ export const buildSessionSummaries = (
       workspacePath,
       detail: "idle",
       activityKind: "session",
-      model: presence.model ?? "Claude Code",
+      provider: providerLabel(
+        eventsForSession.find((event) => event.runtime?.sourceKind)?.runtime?.sourceKind,
+      ),
+      model: presence.model ?? "",
       status: "idle",
       lastActivityAt: presence.lastEventAt ?? new Date(0).toISOString(),
       herdrTarget: getSessionHerdrTarget(eventsForSession),
@@ -195,7 +203,7 @@ export const buildSessionDetail = (
     ...summary,
     agentName: (current ? presence.agentName : latest?.agentName) ?? "Claude Code",
     cwd: workspacePath ?? (current ? presence.cwd : latest?.cwd) ?? "No workspace",
-    model: (current ? presence.model : latest?.model) ?? "Claude Code",
+    model: (current ? presence.model : latest?.model) ?? "",
     permissionMode: (current ? presence.permissionMode : latest?.permissionMode) ?? "—",
     events: sessionEvents,
   };

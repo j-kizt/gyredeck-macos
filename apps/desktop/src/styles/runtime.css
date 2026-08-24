@@ -40,6 +40,13 @@
   gap: 6px;
 }
 
+/* Match the icon buttons on the GitHub/Usage tabs: rounded square with a hairline
+   border instead of a bare circle. */
+.runtime-toolbar .gear-btn {
+  border: 1px solid var(--hair);
+  border-radius: 7px;
+}
+
 .runtime-toolbar .gear-btn:disabled {
   color: var(--text-3);
   background: var(--fill);

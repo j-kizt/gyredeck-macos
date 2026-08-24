@@ -1,5 +1,5 @@
 import { request } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -22,6 +22,30 @@ import { randomUUID } from "node:crypto";
 const DEFAULT_ENDPOINT = { hostname: "127.0.0.1", port: 47_621 };
 const CONFIG_DIR = join(homedir(), ".config", "agent-activity");
 const HOST_STARTED_AT_MS = Math.round(Date.now() - process.uptime() * 1_000);
+
+/**
+ * Read the current model from the tail of the Claude transcript (JSONL). The last
+ * assistant entry carries `message.model`. Only the tail is read, so this stays cheap
+ * even for large transcripts. Returns null if unavailable.
+ */
+const readModelFromTranscript = async (transcriptPath) => {
+  if (typeof transcriptPath !== "string" || transcriptPath.length === 0) return null;
+  try {
+    const handle = await open(transcriptPath, "r");
+    try {
+      const { size } = await handle.stat();
+      const readLen = Math.min(size, 64 * 1024);
+      const buf = Buffer.alloc(readLen);
+      await handle.read(buf, 0, readLen, size - readLen);
+      const matches = [...buf.toString("utf8").matchAll(/"model"\s*:\s*"([^"<]+)"/g)];
+      return matches.at(-1)?.[1] ?? null;
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return null;
+  }
+};
 
 /** Read bridge endpoint from Agent Activity config. */
 const readEndpoint = async () => {
@@ -118,6 +142,7 @@ const main = async () => {
     const permissionMode = typeof input.permission_mode === "string" && input.permission_mode.length > 0
       ? input.permission_mode
       : null;
+    const model = await readModelFromTranscript(input.transcript_path);
 
     /** Build a protocol-v2 AgentActivityEvent envelope. */
     const buildEvent = (type, data = {}) => ({
@@ -129,7 +154,7 @@ const main = async () => {
       agentName: null,
       conversationId,
       cwd,
-      model: null,
+      model,
       permissionMode,
       runtime: {
         sourcePid: process.pid,

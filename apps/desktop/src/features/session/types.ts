@@ -18,6 +18,7 @@ export interface ISessionSummary {
   workspacePath: string | null;
   detail: string;
   activityKind: ActivityKind;
+  provider: string;
   model: string;
   status: "idle" | "working" | "attention" | "inactive" | "done" | "error";
   lastActivityAt: string;

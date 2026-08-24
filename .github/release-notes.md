@@ -1,6 +1,11 @@
 Agent Activity is a local macOS menu-bar companion that surfaces live Claude Code / Codex activity, provider usage, local services, and the state of the GitHub repos you track.
 
+### What's new
+- **Sessions now show the model.** Each session row shows both the provider (e.g. Claude Code) and the active model (e.g. opus-4-8), read from the Claude Code transcript.
+
 ### Fixes
-- **Consistent spacing and scrollbars across tabs.** Content is now inset equally on both sides, and the scrollbar sits at the window edge instead of crowding the content — GitHub and Usage now match Services and Sessions.
-- **Usage tab fills the full width.** Progress bars and content no longer stop short on the right.
-- **Usage toolbar buttons** (settings, refresh) are now rounded squares matching the GitHub tab's icon buttons, and a bit larger.
+- The **Focus** button on a session row is always visible now, not only on hover.
+- The **Services** refresh button is a rounded square matching the GitHub/Usage tabs.
+- The window can no longer be resized smaller than its default size.
+
+Reinstall the Claude Code hook (Settings → Plugins) so model info starts flowing.

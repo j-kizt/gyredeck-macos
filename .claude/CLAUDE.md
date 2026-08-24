@@ -2,7 +2,7 @@
 
 ## Project Reality
 
-- Agent Activity is a local-first Letta Code presence companion and Tauri desktop app. Start with `README.md` and `docs/` for product, architecture, event protocol, and presence-model context.
+- Agent Activity is a local-first, Letta-free presence companion and Tauri desktop app for AI coding agents (Claude Code / Codex / Antigravity). Start with `README.md` (product) and `.claude/context/` (architecture, event protocol, presence model, services, development, releasing) for context.
 - Use `pnpm` only (`packageManager: pnpm@10.33.0`). Do not add npm/yarn lockfiles.
 - Preserve local/generated state. `.agent-state/`, `.letta/`, `.cocoindex_code/`, `node_modules/`, build output, and test reports are ignored local state.
 - After changing `mods/agent-activity.js`, install/reload the Letta mod before judging live behavior. After native desktop changes, run an appropriate desktop check/build/install path.

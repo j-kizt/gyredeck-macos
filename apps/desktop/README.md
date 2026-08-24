@@ -1,14 +1,14 @@
 # Agent Activity Desktop
 
-The active Agent Activity desktop renderer is a Tauri v2 transparent macOS notch surface backed by the local bridge at `127.0.0.1:47621`.
+The Agent Activity desktop app is a Tauri v2 macOS menu-bar window backed by the local bridge at `127.0.0.1:47621`.
 
 Runtime flow:
 
 ```text
-http://127.0.0.1:47621/events
+bridge SSE  ─→  http://127.0.0.1:47621/events  ─→  renderer
 ```
 
-The renderer derives compact presence and persisted per-conversation Sessions from the protocol package plus bounded local event history. `src/main.tsx` owns shell/native-window orchestration; owner-local modules under `src/features/` own Sessions, presence ingestion, Setup, Usage, Pomodoro, Stopwatch, one persisted global Pet selection, the projection-only floating Completion Pet, and native display/window control. Ordered CSS ownership lives under `src/styles/`. The main renderer remains the sole Pomodoro owner; Stopwatch is a separate renderer-local state/history lane. See `../../docs/pet.md` and `../../docs/stopwatch.md`.
+The renderer derives compact presence and persisted per-conversation Sessions from the protocol package plus bounded local event history. `src/main.tsx` owns the shell and native-window orchestration; owner-local modules under `src/features/` own Sessions, presence ingestion, Setup, Usage, Services, and GitHub; `src-tauri/` (Rust) owns the tray, window, terminal focus, notifications, bridge supervision, local-services scan, and `gh`-backed GitHub data. Ordered CSS ownership lives under `src/styles/`.
 
 Do not start by scraping terminal output or transcript files. Those can be fallback diagnostics later, not the primary source.
 
@@ -21,4 +21,4 @@ pnpm test:performance
 pnpm desktop:web:build
 ```
 
-Use `pnpm desktop:install` for the native release/install gate.
+Use `pnpm desktop:install` for the native release/install gate. See [`../../.claude/context/architecture.md`](../../.claude/context/architecture.md) for the full data flow.

@@ -627,8 +627,8 @@
 
 .session-row .row-clear:hover,
 .session-row .row-clear:focus-visible {
-  color: var(--text);
-  background: rgba(255, 255, 255, 0.12);
+  color: #ff9b97;
+  background: rgba(255, 80, 80, 0.18);
 }
 
 .session-row .row-remove-group {

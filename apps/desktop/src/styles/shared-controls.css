@@ -23,12 +23,21 @@
   color: rgba(255, 255, 255, 0.54);
   background: rgba(255, 255, 255, 0.055);
   cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, transform 120ms ease;
 }
 
 .header-tab:hover,
 .header-tab[data-active="true"] {
   color: rgba(255, 255, 255, 0.9);
   background: rgba(255, 255, 255, 0.11);
+}
+
+.header-tab:hover {
+  transform: scale(1.08);
+}
+
+.header-tab:active {
+  transform: scale(0.94);
 }
 
 .gear-btn,
@@ -43,6 +52,8 @@
   color: rgba(255, 255, 255, 0.62);
   background: var(--fill);
   cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, transform 120ms ease,
+    border-color 120ms ease;
 }
 
 .gear-btn {
@@ -70,6 +81,17 @@
 .row-btn:hover {
   color: rgba(255, 255, 255, 0.86);
   background: var(--fill-2);
+  transform: scale(1.08);
+}
+
+.gear-btn:active,
+.row-btn:active {
+  transform: scale(0.92);
+}
+
+.gear-btn:disabled,
+.row-btn:disabled {
+  transform: none;
 }
 
 .row-btn.row-focus:hover {
@@ -82,6 +104,13 @@
   font-family: inherit;
   cursor: pointer;
   white-space: nowrap;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease,
+    transform 120ms ease;
+}
+
+.pill-btn:active,
+.btn:active {
+  transform: scale(0.97);
 }
 
 .pill-btn {

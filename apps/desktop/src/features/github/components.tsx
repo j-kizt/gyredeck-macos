@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { GitBranch, GitCommit, GitPullRequest, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchAvailableRepos } from "./adapter";
 import type { GithubRepoState, IGithubRun } from "./types";
 import type { IGithubMonitor } from "./useGithubMonitor";
@@ -51,7 +51,7 @@ const RepoCard = ({ repo, state, onRemove }: IRepoCardProps) => {
         <button className="gh-repo-name" type="button" onClick={() => openExternal(`https://github.com/${repo}`)} title={`Open ${repo}`}>
           {repo}
         </button>
-        <button className="gh-icon-btn" type="button" aria-label={`Stop tracking ${repo}`} onClick={() => onRemove(repo)}>
+        <button className="gh-icon-btn gh-remove" type="button" aria-label={`Stop tracking ${repo}`} onClick={() => onRemove(repo)}>
           <Trash2 size={12} strokeWidth={2.3} />
         </button>
       </div>
@@ -99,6 +99,29 @@ const AddRepo = ({ tracked, onAdd }: IAddRepoProps) => {
   const [error, setError] = useState<string | null>(null);
   const [repos, setRepos] = useState<string[]>([]);
   const [filter, setFilter] = useState("");
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const close = useCallback(() => {
+    setOpen(false);
+    setFilter("");
+  }, []);
+
+  // Dismiss the picker on Escape or a click outside it.
+  useEffect(() => {
+    if (!open) return undefined;
+    const onPointerDown = (event: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) close();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open, close]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -124,7 +147,7 @@ const AddRepo = ({ tracked, onAdd }: IAddRepoProps) => {
     .slice(0, 50);
 
   return (
-    <div className="gh-add">
+    <div className="gh-add" ref={containerRef}>
       <button className="pill-btn accent" type="button" onClick={toggle}>
         <Plus size={12} strokeWidth={2.3} /> Add repo
       </button>
@@ -151,8 +174,7 @@ const AddRepo = ({ tracked, onAdd }: IAddRepoProps) => {
                 type="button"
                 onClick={() => {
                   onAdd(repo);
-                  setOpen(false);
-                  setFilter("");
+                  close();
                 }}
               >
                 {repo}

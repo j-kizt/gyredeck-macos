@@ -122,3 +122,15 @@ button {
 .action-list::-webkit-scrollbar-corner {
   background: transparent;
 }
+
+/* Respect the OS "reduce motion" setting: drop hover/press transforms, entrance
+   animations, and looping spinners so nothing moves for users who opt out. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

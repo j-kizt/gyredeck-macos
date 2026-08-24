@@ -23,6 +23,7 @@ export interface ILocalService {
   parentProcessId: number | null;
   parentProcessName: string | null;
   executablePath: string | null;
+  commandLine: string | null;
   userId: number | null;
   physicalFootprintBytes: number | null;
   residentSizeBytes: number | null;

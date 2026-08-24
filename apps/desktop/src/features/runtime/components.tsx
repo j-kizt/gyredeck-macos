@@ -27,6 +27,48 @@ const openLocalService = async (service: ILocalService): Promise<boolean> => {
 
 type LocalServiceControlPhase = "idle" | "confirmStop" | "stopping" | "stillRunning" | "confirmForce" | "forceKilling" | "error";
 
+// A bare process name like "node" says nothing about which app it is. The process's
+// working directory is usually the project root, so fall back to its folder name
+// (e.g. "altra-rich-frontend") to identify the service. Skip uninformative roots.
+const projectFromCwd = (cwd: string | null): string | null => {
+  if (!cwd) return null;
+  const home = window.__AGENT_ACTIVITY_HOME__ ?? "";
+  if (cwd === "/" || cwd === home) return null;
+  const folder = cwd.split("/").filter(Boolean).at(-1) ?? "";
+  return folder.length > 0 ? folder : null;
+};
+
+// Bare interpreters (node, python, …) name the runtime, not the service. When the
+// process is an interpreter, the entry script (first non-flag arg) is the meaningful
+// label; otherwise the process renamed itself (e.g. "next-server (v16.2.5)") and its
+// own arg0 basename is the label.
+const SCRIPT_EXT = /\.(mjs|js|cjs|ts|py|rb)$/i;
+const basename = (value: string): string => value.split("/").filter(Boolean).at(-1) ?? value;
+
+const nameFromCommand = (commandLine: string | null): string | null => {
+  if (!commandLine) return null;
+  const tokens = commandLine.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return null;
+  const interpreters = ["node", "python3", "python", "ruby", "deno", "bun", "php", "perl"];
+  const isInterpreter = interpreters.some((name) => basename(tokens[0]).toLowerCase().startsWith(name));
+
+  let label: string | null;
+  if (isInterpreter) {
+    // Prefer the entry script (a token ending in a script extension). Matching by
+    // extension — not "first non-flag token" — survives spaces in the path, since the
+    // basename only needs the trailing path segment. Fall back to null so the caller
+    // can use the working-directory folder instead of a bare "node".
+    const rest = tokens.slice(1);
+    const script = rest.find((token) => SCRIPT_EXT.test(token)) ?? rest.find((token) => !token.startsWith("-"));
+    label = script ? basename(script).replace(SCRIPT_EXT, "") : null;
+  } else {
+    // A process that renamed itself (e.g. "next-server (v16.2.5)").
+    label = basename(tokens[0]);
+  }
+  label = label?.trim() ?? "";
+  return label.length > 0 ? label : null;
+};
+
 const LocalServiceRow = ({ expanded, onControl, onOpen, onResult, onToggle, service }: {
   expanded: boolean;
   onControl: (service: ILocalService, mode: LocalServiceControlMode) => Promise<ILocalServiceControlResult>;
@@ -36,7 +78,9 @@ const LocalServiceRow = ({ expanded, onControl, onOpen, onResult, onToggle, serv
   service: ILocalService;
 }) => {
   const genericTitle = service.httpTitle?.toLowerCase().startsWith("directory listing") || service.httpTitle?.toLowerCase().startsWith("index of ");
-  const displayTitle = service.httpTitle && !genericTitle ? service.httpTitle : service.processName;
+  const displayTitle = service.httpTitle && !genericTitle
+    ? service.httpTitle
+    : nameFromCommand(service.commandLine) ?? projectFromCwd(service.cwd) ?? service.processName;
   const ownerLabel = service.owner
     ? `Started by Letta · ${service.owner.project}${service.owner.herdrPaneId ? ` · ${service.owner.herdrPaneId}` : ""}`
     : null;
@@ -156,10 +200,11 @@ const LocalServiceRow = ({ expanded, onControl, onOpen, onResult, onToggle, serv
   );
 };
 
-const LocalServiceGroup = ({ expandedKey, id, label, onControl, onOpen, onResult, onToggle, services }: {
+const LocalServiceGroup = ({ expandedKey, id, label, showHeader = true, onControl, onOpen, onResult, onToggle, services }: {
   expandedKey: string | null;
   id: string;
   label: string;
+  showHeader?: boolean;
   onControl: (service: ILocalService, mode: LocalServiceControlMode) => Promise<ILocalServiceControlResult>;
   onOpen: (service: ILocalService) => void;
   onResult: (message: string) => void;
@@ -169,11 +214,13 @@ const LocalServiceGroup = ({ expandedKey, id, label, onControl, onOpen, onResult
   if (services.length === 0) return null;
   const headingId = `runtime-services-${id}-heading`;
   return (
-    <section data-service-group={id} aria-labelledby={headingId}>
-      <div className="session-section-head">
-        <span id={headingId}>{label}</span>
-        <span className="runtime-group-count">{services.length}</span>
-      </div>
+    <section data-service-group={id} aria-labelledby={showHeader ? headingId : undefined} aria-label={showHeader ? undefined : label}>
+      {showHeader ? (
+        <div className="session-section-head">
+          <span id={headingId}>{label}</span>
+          <span className="runtime-group-count">{services.length}</span>
+        </div>
+      ) : null}
       <ul className="runtime-list">
         {services.map((service) => {
           const key = localServiceListenerKey(service);
@@ -189,8 +236,7 @@ export const LocalServicesPanel = ({ monitor }: { monitor: IRuntimeMonitorView }
   const [expandedServiceKey, setExpandedServiceKey] = useState<string | null>(null);
   const [controlAnnouncement, setControlAnnouncement] = useState("");
   const webFrontends = useMemo(() => monitor.services.filter((service) => service.webFrontend), [monitor.services]);
-  const lettaServices = useMemo(() => monitor.services.filter((service) => !service.webFrontend && service.owner), [monitor.services]);
-  const otherServices = useMemo(() => monitor.services.filter((service) => !service.webFrontend && !service.owner), [monitor.services]);
+  const otherServices = useMemo(() => monitor.services.filter((service) => !service.webFrontend), [monitor.services]);
   useEffect(() => {
     if (expandedServiceKey && !monitor.services.some((service) => localServiceListenerKey(service) === expandedServiceKey)) setExpandedServiceKey(null);
   }, [expandedServiceKey, monitor.services]);
@@ -241,11 +287,9 @@ export const LocalServicesPanel = ({ monitor }: { monitor: IRuntimeMonitorView }
       ) : (
         <div className="runtime-service-groups">
           <LocalServiceGroup expandedKey={expandedServiceKey} id="web-frontends" label="Detected web frontends" services={webFrontends} onControl={controlService} onOpen={openService} onResult={setControlAnnouncement} onToggle={toggleService} />
-          <LocalServiceGroup expandedKey={expandedServiceKey} id="letta-services" label="Letta services" services={lettaServices} onControl={controlService} onOpen={openService} onResult={setControlAnnouncement} onToggle={toggleService} />
-          <LocalServiceGroup expandedKey={expandedServiceKey} id="other" label="Other listeners" services={otherServices} onControl={controlService} onOpen={openService} onResult={setControlAnnouncement} onToggle={toggleService} />
+          <LocalServiceGroup expandedKey={expandedServiceKey} id="other" label="Other listeners" showHeader={webFrontends.length > 0} services={otherServices} onControl={controlService} onOpen={openService} onResult={setControlAnnouncement} onToggle={toggleService} />
         </div>
       )}
-      <div className="runtime-footnote">Web evidence first · exact Letta ancestry · Stop requires confirmation</div>
     </section>
   );
 };

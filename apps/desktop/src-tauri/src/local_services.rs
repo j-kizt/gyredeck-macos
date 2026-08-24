@@ -39,6 +39,7 @@ pub struct LocalService {
     pub parent_process_id: Option<i32>,
     pub parent_process_name: Option<String>,
     pub executable_path: Option<String>,
+    pub command_line: Option<String>,
     pub user_id: Option<u32>,
     pub physical_footprint_bytes: Option<u64>,
     pub resident_size_bytes: Option<u64>,
@@ -299,6 +300,7 @@ mod macos {
     };
     use crate::standalone_bridge::BRIDGE_PORT;
     use std::{
+        collections::HashMap,
         fs::OpenOptions,
         io::{Read, Write},
         mem::{size_of, size_of_val},
@@ -681,6 +683,35 @@ mod macos {
             Err(error) if error == "lsof exited unsuccessfully (1)" => Ok(Vec::new()),
             result => result,
         }
+    }
+
+    fn run_ps_command_lines(deadline: Instant) -> HashMap<i32, String> {
+        let mut command = Command::new("/bin/ps");
+        command.args(["-Axo", "pid=,command="]);
+        let output = match run_bounded_output(command, deadline) {
+            Ok(output) => output,
+            Err(_) => return HashMap::new(),
+        };
+        let mut map = HashMap::new();
+        for line in String::from_utf8_lossy(&output).lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some(split_at) = line.find(char::is_whitespace) else {
+                continue;
+            };
+            let (pid, rest) = line.split_at(split_at);
+            let Ok(pid) = pid.parse::<i32>() else {
+                continue;
+            };
+            let command_line = rest.trim_start();
+            if command_line.is_empty() {
+                continue;
+            }
+            map.insert(pid, command_line.to_string());
+        }
+        map
     }
 
     fn request_key(request: &LocalServiceControlRequest) -> LocalServiceControlKey {
@@ -1296,6 +1327,7 @@ mod macos {
         };
 
         let listeners = parse_lsof_listeners(&String::from_utf8_lossy(&output));
+        let command_map = run_ps_command_lines(deadline);
         let services = listeners
             .iter()
             .map(|listener| {
@@ -1327,6 +1359,7 @@ mod macos {
                         .map(|identity| identity.name.clone())
                         .filter(|name| !name.is_empty()),
                     executable_path: process_executable_path(listener.process_id),
+                    command_line: command_map.get(&listener.process_id).cloned(),
                     user_id: process.as_ref().map(|identity| identity.effective_user_id),
                     physical_footprint_bytes,
                     resident_size_bytes,

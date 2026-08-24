@@ -40,11 +40,25 @@
   background: var(--fill);
   color: var(--text-2);
   cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease,
+    transform 120ms ease;
 }
 
 .gh-icon-btn:hover {
   background: var(--fill-2);
   color: var(--text);
+  transform: scale(1.08);
+}
+
+.gh-icon-btn:active {
+  transform: scale(0.92);
+}
+
+.gh-remove:hover,
+.gh-remove:focus-visible {
+  color: #ff9b97;
+  border-color: rgba(255, 107, 102, 0.4);
+  background: rgba(255, 80, 80, 0.16);
 }
 
 .gh-add {

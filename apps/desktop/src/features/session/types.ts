@@ -1,4 +1,4 @@
-import type { AgentActivityEvent } from "@agent-activity/protocol";
+import type { GyredeckEvent } from "@gyredeck/protocol";
 
 export type ActivityKind =
   | "session" | "thinking" | "planning" | "tool" | "shell" | "editing"
@@ -28,7 +28,7 @@ export interface ISessionDetail extends ISessionSummary {
   agentName: string;
   cwd: string;
   permissionMode: string;
-  events: AgentActivityEvent[];
+  events: GyredeckEvent[];
 }
 
 export interface IWorkspaceSessionGroup {
@@ -44,6 +44,6 @@ export interface IWorkspaceSessionGroup {
   sessions: ISessionSummary[];
 }
 
-export type SessionEventRegistry = Record<string, AgentActivityEvent[]>;
+export type SessionEventRegistry = Record<string, GyredeckEvent[]>;
 export type DismissedSessionRegistry = Record<string, number>;
 export type DeletedSessionRegistry = Record<string, number>;

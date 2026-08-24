@@ -66,7 +66,7 @@ jobs:
           # latest.json then serves both darwin-aarch64 and darwin-x86_64 for auto-update.
           args: --target universal-apple-darwin
           tagName: ${{ github.ref_name }}
-          releaseName: "Agent Activity __VERSION__"
+          releaseName: "Gyredeck __VERSION__"
           releaseBody: ${{ steps.changelog.outputs.notes }}
           releaseDraft: false
           prerelease: false

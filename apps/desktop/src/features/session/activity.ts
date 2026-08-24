@@ -1,4 +1,4 @@
-import type { AgentActivityEvent } from "@agent-activity/protocol";
+import type { GyredeckEvent } from "@gyredeck/protocol";
 import {
   COMPACT_STALE_AFTER_MS,
   LLM_STALE_AFTER_MS,
@@ -10,14 +10,14 @@ import type { ActivityKind, IActivityDescriptor, ISessionSummary } from "./types
 
 export const shortenPath = (path: string | null | undefined): string => {
   if (!path) return "No workspace";
-  const home = window.__AGENT_ACTIVITY_HOME__ ?? "";
+  const home = window.__GYREDECK_HOME__ ?? "";
   const normalized = home ? path.replace(home, "~") : path;
   const segments = normalized.split("/").filter(Boolean);
   return segments.length <= 3 ? normalized : `…/${segments.slice(-3).join("/")}`;
 };
 
 export const projectName = (path: string | null | undefined): string =>
-  path?.split("/").filter(Boolean).at(-1) ?? "Agent Activity";
+  path?.split("/").filter(Boolean).at(-1) ?? "Gyredeck";
 
 export const formatTime = (timestamp: string | null): string =>
   timestamp
@@ -132,7 +132,7 @@ const FALLBACK_ACTIVITY: IActivityDescriptor = { kind: "session", label: "event"
 // Events arrive from external adapters/hooks (Claude, Codex, Antigravity) and from
 // the persisted log, so their `data` shape can't be fully trusted at runtime. A thrown
 // descriptor here blanks the entire popover, so never let a malformed event escape.
-export const getEventActivity = (event: AgentActivityEvent): IActivityDescriptor => {
+export const getEventActivity = (event: GyredeckEvent): IActivityDescriptor => {
   try {
     return describeEventActivity(event) ?? FALLBACK_ACTIVITY;
   } catch {
@@ -140,7 +140,7 @@ export const getEventActivity = (event: AgentActivityEvent): IActivityDescriptor
   }
 };
 
-const describeEventActivity = (event: AgentActivityEvent): IActivityDescriptor | undefined => {
+const describeEventActivity = (event: GyredeckEvent): IActivityDescriptor | undefined => {
   switch (event.type) {
     case "bridge_ready":
       return { kind: "bridge", label: "bridge", detail: `:${event.data.port}` };
@@ -222,7 +222,7 @@ const describeEventActivity = (event: AgentActivityEvent): IActivityDescriptor |
   }
 };
 
-export const getEventDetail = (event: AgentActivityEvent) => {
+export const getEventDetail = (event: GyredeckEvent) => {
   const activity = getEventActivity(event);
   return `${activity.label} · ${activity.detail}`;
 };
@@ -237,7 +237,7 @@ const terminalStop = (value: string | null | undefined) => {
   );
 };
 
-export const staleAfterMsForEvent = (event: AgentActivityEvent): number => {
+export const staleAfterMsForEvent = (event: GyredeckEvent): number => {
   if (event.type === "llm_start") return LLM_STALE_AFTER_MS;
   if (event.type === "tool_start") return TOOL_STALE_AFTER_MS;
   if (event.type === "compact_start") return COMPACT_STALE_AFTER_MS;
@@ -249,7 +249,7 @@ export const staleAfterMsForEvent = (event: AgentActivityEvent): number => {
 };
 
 export const getEventSessionStatus = (
-  event: AgentActivityEvent,
+  event: GyredeckEvent,
   now = new Date(),
 ): ISessionSummary["status"] => {
   try {
@@ -260,7 +260,7 @@ export const getEventSessionStatus = (
 };
 
 const describeEventSessionStatus = (
-  event: AgentActivityEvent,
+  event: GyredeckEvent,
   now: Date,
 ): ISessionSummary["status"] => {
   const inactive = now.getTime() - Date.parse(event.timestamp) > staleAfterMsForEvent(event);

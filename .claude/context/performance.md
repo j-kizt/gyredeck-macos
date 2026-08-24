@@ -1,6 +1,6 @@
 # Performance budgets
 
-Agent Activity treats performance claims as local regression evidence, not universal guarantees. Measure on the same machine, with the same deterministic workloads, and compare medians/p95 rather than one run.
+Gyredeck treats performance claims as local regression evidence, not universal guarantees. Measure on the same machine, with the same deterministic workloads, and compare medians/p95 rather than one run.
 
 `pnpm test:performance` builds the desktop web bundle and then runs three evidence layers:
 
@@ -45,7 +45,7 @@ Starts the bridge under a temporary `HOME`, publishes N deterministic events (5,
 | Throughput | ≥ 20,000 events/s |
 | Persisted log | > 0 bytes |
 
-> Note: this script currently imports the bridge under the path `mods/agent-activity.js`, which does not exist in this tree — the standalone bridge lives at `adapters/bridge/agent-activity-bridge.mjs`. The `--ref`/`--mod` plumbing (comparing against a Git ref) still points at the old Letta mod path. Until the script is updated to target the standalone bridge, treat the bridge layer of `pnpm test:performance` as needing a fix rather than a working budget.
+> Note: this script currently imports the bridge under the path `mods/gyredeck.js`, which does not exist in this tree — the standalone bridge lives at `adapters/bridge/gyredeck-bridge.mjs`. The `--ref`/`--mod` plumbing (comparing against a Git ref) still points at the old Letta mod path. Until the script is updated to target the standalone bridge, treat the bridge layer of `pnpm test:performance` as needing a fix rather than a working budget.
 
 ## Commands
 

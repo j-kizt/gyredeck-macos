@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { BarChart3, Check, ChevronLeft, Focus, GitBranch, List, Server, Settings, Trash2, X } from "lucide-react";
 import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState, type ErrorInfo, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
-import type { AgentActivityPresenceStatus } from "@agent-activity/protocol";
+import type { GyredeckPresenceStatus } from "@gyredeck/protocol";
 import { SessionContextSummary, StatusGlyph, WorkspaceSessionGroupItem } from "./features/session/components";
 import {
   formatTime,
@@ -29,7 +29,7 @@ import {
   shouldKeepDisplayAwakeForActivity,
 } from "./features/session/selectors";
 import type { DeletedSessionRegistry, DismissedSessionRegistry, ISessionDetail, ISessionSummary, IWorkspaceSessionGroup } from "./features/session/types";
-import { useAgentActivityPresence } from "./features/presence/useAgentActivityPresence";
+import { useGyredeckPresence } from "./features/presence/useGyredeckPresence";
 import { SetupPanel } from "./features/setup/SetupPanel";
 import { useUpdater } from "./features/updater/useUpdater";
 import { readUsageSettings, writeUsageSettings } from "./features/usage/adapters";
@@ -41,7 +41,7 @@ import { GithubPanel } from "./features/github/components";
 import { useGithubMonitor } from "./features/github/useGithubMonitor";
 import "./styles.css";
 
-const KEEP_AWAKE_STORAGE_KEY = "agent-activity.keep-awake-while-working";
+const KEEP_AWAKE_STORAGE_KEY = "gyredeck.keep-awake-while-working";
 const SEARCH_PARAMS = new URLSearchParams(window.location.search);
 const DEMO_MODE = SEARCH_PARAMS.has("demo");
 const DEMO_SCENARIO = SEARCH_PARAMS.get("demoScenario");
@@ -68,7 +68,7 @@ interface IHookStatus {
 type MainPanelTab = "sessions" | "usage" | "services" | "github";
 
 interface IStatusView {
-  status: AgentActivityPresenceStatus | "stale";
+  status: GyredeckPresenceStatus | "stale";
   label: string;
   isStale: boolean;
   staleForMs: number;
@@ -90,7 +90,7 @@ const writeKeepAwakeEnabled = (enabled: boolean) => {
   try { window.localStorage.setItem(KEEP_AWAKE_STORAGE_KEY, `${enabled}`); } catch { /* current runtime still owns state */ }
 };
 
-const TERMINAL_STORAGE_KEY = "agent-activity.terminal";
+const TERMINAL_STORAGE_KEY = "gyredeck.terminal";
 export type TerminalChoice = "iterm" | "ghostty";
 const readTerminalChoice = (): TerminalChoice => {
   try { return window.localStorage.getItem(TERMINAL_STORAGE_KEY) === "ghostty" ? "ghostty" : "iterm"; } catch { return "iterm"; }
@@ -102,7 +102,7 @@ const writeTerminalChoice = (choice: TerminalChoice) => {
 const getGroupRemovalId = (groupKey: string, group: IWorkspaceSessionGroup) => [groupKey, ...group.sessions.map((session) => session.conversationId).sort()].join("\n");
 
 const App = () => {
-  const { capabilities, connection, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, view } = useAgentActivityPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO });
+  const { capabilities, connection, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO });
   const [usageSettings, setUsageSettings] = useState<IUsageSettings>(readUsageSettings);
   const { refresh: refreshAgentUsage, usages: agentUsages } = useAgentUsageList(usageSettings, DEMO_MODE);
   const [acknowledgedConversationId, setAcknowledgedConversationId] = useState<string | null>(null);
@@ -244,7 +244,7 @@ const App = () => {
         : activeMainTab === "github"
           ? "GitHub"
           : sessionGroups.length === 0
-          ? "Agent Activity"
+          ? "Gyredeck"
           : sessionGroups.length === 1
             ? sessionGroups[0].sessions.length === 1 ? "1 session" : `${sessionGroups[0].sessions.length} sessions`
             : `${sessionGroups.length} workspaces`;
@@ -706,7 +706,7 @@ const App = () => {
           data-state="open"
           onKeyDown={handleSurfaceKeyDown}
           role="region"
-          aria-label="Agent Activity panel"
+          aria-label="Gyredeck panel"
           data-tauri-drag-region="false"
         >
           <div className="sheet-inner" ref={sheetInnerRef}>
@@ -734,7 +734,7 @@ const App = () => {
                 <span className="spacer" />
                 <span className="bridge-dot" data-connected={isConnected} title={connectionTitle} />
                 <div className="header-tabs">
-                  <div className="header-tablist" role="tablist" aria-label="Agent Activity sections">
+                  <div className="header-tablist" role="tablist" aria-label="Gyredeck sections">
                     <button id="main-tab-sessions" className="header-tab" data-active={activeMainTab === "sessions"} data-panel-focus-target={activeMainTab === "sessions" ? "true" : undefined} type="button" role="tab" aria-label="Sessions" aria-selected={activeMainTab === "sessions"} aria-controls="main-panel-sessions" tabIndex={activeMainTab === "sessions" ? 0 : -1} onKeyDown={(event) => handleMainTabKeyDown(event, "sessions")} onClick={(event) => { event.stopPropagation(); activateMainTab("sessions"); }} data-tauri-drag-region="false" title="Sessions">
                       <List size={13} strokeWidth={2.3} />
                     </button>
@@ -907,7 +907,7 @@ const App = () => {
 
                   <div className="sheet-divider soft" />
 
-                  <div className="event-list" aria-label="Recent Agent Activity events">
+                  <div className="event-list" aria-label="Recent Gyredeck events">
                     {recentEvents.slice(0, 4).map((event) => (
                       <div className="event-row" key={event.id}>
                         <span className="event-time">{formatTime(event.timestamp)}</span>
@@ -960,7 +960,7 @@ const App = () => {
                   </>
                 ) : (
                   <>
-                    <span className="footer-copyright">© 2026 Agent Activity · J-Kitz</span>
+                    <span className="footer-copyright">© 2026 Gyredeck · J-Kitz</span>
                     {!setupOpen && activitySession?.status === "done" ? (
                       <button className="pill-btn accent footer-done-close" type="button" onClick={(event) => { event.stopPropagation(); acknowledgeDone(); }} data-tauri-drag-region="false">
                         <Check size={12} strokeWidth={2.4} />
@@ -980,7 +980,7 @@ const App = () => {
 
 declare global {
   interface Window {
-    __AGENT_ACTIVITY_HOME__?: string;
+    __GYREDECK_HOME__?: string;
     __TAURI_INTERNALS__?: unknown;
   }
 }
@@ -995,7 +995,7 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, { error: Error
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error("Agent Activity render error:", error, info.componentStack);
+    console.error("Gyredeck render error:", error, info.componentStack);
   }
 
   render() {

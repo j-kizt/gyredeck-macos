@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default Agent Activity desktop capability set","local":true,"windows":["main"],"permissions":["core:default","core:app:allow-version","updater:default","process:default","process:allow-restart"]}}
+{"default":{"identifier":"default","description":"Default Gyredeck desktop capability set","local":true,"windows":["main"],"permissions":["core:default","core:app:allow-version","updater:default","process:default","process:allow-restart"]}}

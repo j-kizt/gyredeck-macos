@@ -32,7 +32,7 @@ type LocalServiceControlPhase = "idle" | "confirmStop" | "stopping" | "stillRunn
 // (e.g. "altra-rich-frontend") to identify the service. Skip uninformative roots.
 const projectFromCwd = (cwd: string | null): string | null => {
   if (!cwd) return null;
-  const home = window.__AGENT_ACTIVITY_HOME__ ?? "";
+  const home = window.__GYREDECK_HOME__ ?? "";
   if (cwd === "/" || cwd === home) return null;
   const folder = cwd.split("/").filter(Boolean).at(-1) ?? "";
   return folder.length > 0 ? folder : null;

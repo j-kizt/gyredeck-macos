@@ -1,6 +1,6 @@
-# Agent Activity Desktop
+# Gyredeck Desktop
 
-The Agent Activity desktop app is a Tauri v2 macOS menu-bar window backed by the local bridge at `127.0.0.1:47621`.
+The Gyredeck desktop app is a Tauri v2 macOS menu-bar window backed by the local bridge at `127.0.0.1:47621`.
 
 Runtime flow:
 

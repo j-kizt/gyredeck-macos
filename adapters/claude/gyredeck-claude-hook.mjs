@@ -5,22 +5,22 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 /**
- * Agent Activity Claude Code Hook Adapter
+ * Gyredeck Claude Code Hook Adapter
  *
- * Translates Claude Code lifecycle hook events into AgentActivityEvent payloads and
- * posts them to the Agent Activity bridge. Registered in Claude Code settings.json
+ * Translates Claude Code lifecycle hook events into GyredeckEvent payloads and
+ * posts them to the Gyredeck bridge. Registered in Claude Code settings.json
  * and invoked as a command with `--event <HookEventName>`; Claude Code also
  * sends a JSON payload on stdin whose `hook_event_name` field is authoritative.
  *
  * Usage (from settings.json hooks):
- *   node agent-activity-claude-hook.mjs --event PreToolUse
+ *   node gyredeck-claude-hook.mjs --event PreToolUse
  *
  * The adapter never blocks Claude Code: it exits 0 with no stdout, so a
  * PreToolUse hook is treated as "allow" and other hooks proceed normally.
  */
 
 const DEFAULT_ENDPOINT = { hostname: "127.0.0.1", port: 47_621 };
-const CONFIG_DIR = join(homedir(), ".config", "agent-activity");
+const CONFIG_DIR = join(homedir(), ".config", "gyredeck");
 const HOST_STARTED_AT_MS = Math.round(Date.now() - process.uptime() * 1_000);
 
 /**
@@ -47,10 +47,10 @@ const readModelFromTranscript = async (transcriptPath) => {
   }
 };
 
-/** Read bridge endpoint from Agent Activity config. */
+/** Read bridge endpoint from Gyredeck config. */
 const readEndpoint = async () => {
   try {
-    const config = JSON.parse(await readFile(join(CONFIG_DIR, "agent-activity.config.json"), "utf8"));
+    const config = JSON.parse(await readFile(join(CONFIG_DIR, "gyredeck.config.json"), "utf8"));
     const hostname = config.host === DEFAULT_ENDPOINT.hostname ? config.host : DEFAULT_ENDPOINT.hostname;
     const port = Number.isInteger(config.port) ? config.port : DEFAULT_ENDPOINT.port;
     if (port < 1 || port > 65_535) return DEFAULT_ENDPOINT;
@@ -63,7 +63,7 @@ const readEndpoint = async () => {
 /** Read shared ingest token so forwarded runtime identity is trusted. */
 const readIngestToken = async () => {
   try {
-    const value = (await readFile(join(CONFIG_DIR, "agent-activity.ingest-token"), "utf8")).trim();
+    const value = (await readFile(join(CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
     return /^[a-f0-9]{64}$/i.test(value) ? value : null;
   } catch {
     return null;
@@ -81,7 +81,7 @@ const readInput = async () => {
   }
 };
 
-/** POST a JSON payload to the Agent Activity bridge. */
+/** POST a JSON payload to the Gyredeck bridge. */
 const post = (endpoint, token, path, payload) =>
   new Promise((resolve) => {
     const body = JSON.stringify(payload);
@@ -90,7 +90,7 @@ const post = (endpoint, token, path, payload) =>
       "content-length": Buffer.byteLength(body),
     };
     if (token && path === "/ingest") {
-      headers["x-agent-activity-token"] = token;
+      headers["x-gyredeck-token"] = token;
     }
 
     const req = request(
@@ -144,7 +144,7 @@ const main = async () => {
       : null;
     const model = await readModelFromTranscript(input.transcript_path);
 
-    /** Build a protocol-v2 AgentActivityEvent envelope. */
+    /** Build a protocol-v2 GyredeckEvent envelope. */
     const buildEvent = (type, data = {}) => ({
       version: 2,
       id: randomUUID(),

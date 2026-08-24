@@ -1,6 +1,6 @@
 import { useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { ArrowRight, Check, Coffee, Download, Focus, Monitor as MonitorIcon, PlugZap, Puzzle, RefreshCw } from "lucide-react";
-import type { IAgentActivityBridgeCapabilities } from "@agent-activity/protocol";
+import type { IGyredeckBridgeCapabilities } from "@gyredeck/protocol";
 import { shortenPath } from "../session/activity";
 import type { IUseUpdater } from "../updater/useUpdater";
 
@@ -8,7 +8,7 @@ type SetupCategory = "connection" | "plugins" | "display" | "update";
 const SETUP_CATEGORIES: SetupCategory[] = ["connection", "display", "plugins", "update"];
 
 export interface ISetupPanelProps {
-  capabilities: IAgentActivityBridgeCapabilities;
+  capabilities: IGyredeckBridgeCapabilities;
   canUseNativeControls: boolean;
   connectionTitle: string;
   guidance: { title: string; detail: string };

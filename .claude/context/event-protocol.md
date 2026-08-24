@@ -1,8 +1,8 @@
-# Agent Activity Event Protocol
+# Gyredeck Event Protocol
 
 Protocol version: `2` (`"protocol-v2"`)
 
-Events are newline-delimited JSON in `~/.config/agent-activity/agent-activity.events.ndjson` and Server-Sent Events from `GET /events`. Every adapter emits the same envelope regardless of which agent runtime produced the event.
+Events are newline-delimited JSON in `~/.config/gyredeck/gyredeck.events.ndjson` and Server-Sent Events from `GET /events`. Every adapter emits the same envelope regardless of which agent runtime produced the event.
 
 ## Base fields
 
@@ -36,7 +36,7 @@ Events are newline-delimited JSON in `~/.config/agent-activity/agent-activity.ev
 | Antigravity (AGY) hook | `agyHost` | hook payload `modelName` |
 | Codex notify | `codex-notify` (via the `/hook/stop` relay `source` field) | not available |
 
-Forwarded `runtime` identity is trusted only when the `POST /ingest` request carries the machine-local `x-agent-activity-token` (a `0600` file at `~/.config/agent-activity/agent-activity.ingest-token`). Untrusted or older senders stay event-compatible, but their `runtime` field is stripped before storage. Hook-derived signals (`/hook/stop`, `/hook/attention`) reuse a recently correlated scope only when it is unambiguous and inside the bounded active-scope window; an unscoped hook event leaves `runtime` null. Runtime metadata never grants process control and does not expose command arguments.
+Forwarded `runtime` identity is trusted only when the `POST /ingest` request carries the machine-local `x-gyredeck-token` (a `0600` file at `~/.config/gyredeck/gyredeck.ingest-token`). Untrusted or older senders stay event-compatible, but their `runtime` field is stripped before storage. Hook-derived signals (`/hook/stop`, `/hook/attention`) reuse a recently correlated scope only when it is unambiguous and inside the bounded active-scope window; an unscoped hook event leaves `runtime` null. Runtime metadata never grants process control and does not expose command arguments.
 
 The bridge keeps carry-forward scope **per conversation** (falling back to cwd), so scoped fields such as `model` never bleed from one agent/source into another — an Antigravity turn cannot stamp its model onto a Claude conversation.
 
@@ -47,7 +47,7 @@ Bound to `127.0.0.1:47621`.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/health` | Bridge identity + capabilities. |
-| GET | `/snapshot` | `recent: AgentActivityEvent[]` + capabilities. |
+| GET | `/snapshot` | `recent: GyredeckEvent[]` + capabilities. |
 | GET | `/events` | Live Server-Sent Events stream. |
 | POST | `/ingest` | Multi-provider event fan-in (accepts a full envelope). |
 | POST | `/hook/stop` | Turn-completion relay → `turn_complete`. |
@@ -102,7 +102,7 @@ Emitted when the bridge starts.
   "type": "bridge_ready",
   "data": {
     "port": 47621,
-    "logFile": "~/.config/agent-activity/agent-activity.events.ndjson",
+    "logFile": "~/.config/gyredeck/gyredeck.events.ndjson",
     "ssePath": "/events",
     "healthPath": "/health"
   }

@@ -30,7 +30,7 @@ Every HTTP listener exposes an inset **Open in browser** action through a safe `
 
 ### Explicit web-frontend registry
 
-A project that Agent Activity does not recognize automatically may register a current local listener through `~/.config/agent-activity/local-web-frontends.v1.json`:
+A project that Gyredeck does not recognize automatically may register a current local listener through `~/.config/gyredeck/local-web-frontends.v1.json`:
 
 ```json
 {
@@ -47,13 +47,13 @@ A project that Agent Activity does not recognize automatically may register a cu
 }
 ```
 
-The registry is positive-only and never downgrades strong automatic evidence. An entry matches only the exact live PID, process start within 2 seconds, normalized bind address, and port. Expiry must be in the future but at most 15 minutes ahead. Agent Activity never creates, rewrites, or deletes this file.
+The registry is positive-only and never downgrades strong automatic evidence. An entry matches only the exact live PID, process start within 2 seconds, normalized bind address, and port. Expiry must be in the future but at most 15 minutes ahead. Gyredeck never creates, rewrites, or deletes this file.
 
 The reader fails closed: the file must be a current-user regular file opened without following symlinks, use private permissions (`0600` recommended), stay under 32 KiB, declare schema version 1, and contain at most 32 validated non-duplicate entries. An unsafe/malformed registry is ignored as classification evidence and surfaced as a Services diagnostic while normal discovery continues. Producers must write a same-directory `0600` temporary file and atomically rename it into place.
 
 ## Stop / Force kill
 
-**Stop process** is offered only when the listener has a nonzero process-start identity, all real/effective/saved UIDs match the current non-root user, and the process is not PID 1, Agent Activity or its ancestors, or the protected Agent Activity bridge on port 47621. Confirmation states that stopping one process ends every listener it owns.
+**Stop process** is offered only when the listener has a nonzero process-start identity, all real/effective/saved UIDs match the current non-root user, and the process is not PID 1, Gyredeck or its ancestors, or the protected Gyredeck bridge on port 47621. Confirmation states that stopping one process ends every listener it owns.
 
 - Stop sends `SIGTERM` to the positive PID only after a fresh exact PID/start/address/port/UID revalidation.
 - If the process remains and the same listener is still open after a bounded grace period, native state records a short-lived one-shot Force eligibility; only then may the UI offer a confirmed **Force kill**, which repeats full revalidation before `SIGKILL`.

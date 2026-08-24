@@ -8,7 +8,7 @@ import { performance } from "node:perf_hooks";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = resolve(dirname(scriptPath), "..");
-const bridgePath = resolve(repoRoot, "adapters/bridge/agent-activity-bridge.mjs");
+const bridgePath = resolve(repoRoot, "adapters/bridge/gyredeck-bridge.mjs");
 
 const args = new Map(process.argv.slice(2).map((arg) => {
   const [key, ...value] = arg.replace(/^--/, "").split("=");
@@ -54,9 +54,9 @@ const waitFor = async (fn, attempts, delayMs, label) => {
   throw new Error(label);
 };
 
-const home = await mkdtemp(join(tmpdir(), "agent-activity-benchmark-"));
-const tokenPath = join(home, ".config", "agent-activity", "agent-activity.ingest-token");
-const logFile = join(home, ".config", "agent-activity", "agent-activity.events.ndjson");
+const home = await mkdtemp(join(tmpdir(), "gyredeck-benchmark-"));
+const tokenPath = join(home, ".config", "gyredeck", "gyredeck.ingest-token");
+const logFile = join(home, ".config", "gyredeck", "gyredeck.events.ndjson");
 const port = await reservePort();
 
 let child = null;
@@ -100,7 +100,7 @@ try {
     agentId: "benchmark-agent",
     agentName: "Benchmark",
     conversationId: "benchmark-conversation",
-    cwd: "/tmp/agent-activity-benchmark",
+    cwd: "/tmp/gyredeck-benchmark",
     model: "benchmark-model",
     permissionMode: "ask",
     runtime: {
@@ -111,7 +111,7 @@ try {
     },
     data: { toolCallId: `tool-${index}`, toolName: "Read", status: "success", outputLength: 0 },
   });
-  const headers = { "content-type": "application/json", "x-agent-activity-token": ingestToken };
+  const headers = { "content-type": "application/json", "x-gyredeck-token": ingestToken };
 
   const send = async (index) => {
     const response = await fetch(`http://${host}:${port}/ingest`, {

@@ -9,30 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "agent-activity-desktop"
-version = "0.1.6"
-dependencies = [
- "base64 0.22.1",
- "block2",
- "core-foundation",
- "libc",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "objc2-user-notifications",
- "reqwest 0.12.28",
- "security-framework",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-process",
- "tauri-plugin-updater",
- "time",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1256,6 +1232,30 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "gyredeck-desktop"
+version = "0.1.6"
+dependencies = [
+ "base64 0.22.1",
+ "block2",
+ "core-foundation",
+ "libc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "objc2-user-notifications",
+ "reqwest 0.12.28",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-process",
+ "tauri-plugin-updater",
+ "time",
 ]
 
 [[package]]

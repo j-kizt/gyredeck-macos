@@ -1,8 +1,8 @@
-# Agent Activity Architecture
+# Gyredeck Architecture
 
 ## Goal
 
-Agent Activity is a local presence layer for AI coding agents. It shows what your agents are doing — conversation lifecycle, model turns, and tool usage — without parsing terminal output as the source of truth. It surfaces this in a macOS menu-bar window alongside provider usage, locally listening services, and GitHub repo/CI/PR status.
+Gyredeck is a local presence layer for AI coding agents. It shows what your agents are doing — conversation lifecycle, model turns, and tool usage — without parsing terminal output as the source of truth. It surfaces this in a macOS menu-bar window alongside provider usage, locally listening services, and GitHub repo/CI/PR status.
 
 It is local-first: everything runs on `127.0.0.1` and nothing is uploaded.
 
@@ -22,7 +22,7 @@ adapters/claude/…    adapters/codex/…       adapters/antigravity/…
         +---- POST /ingest, /hook/stop, /hook/attention ----+
         |
         v
-Agent Activity Bridge  (adapters/bridge/agent-activity-bridge.mjs)
+Gyredeck Bridge  (adapters/bridge/gyredeck-bridge.mjs)
   127.0.0.1:47621
   - normalizes and carries scope (agent/conversation/cwd/model) per source
   - appends NDJSON audit log
@@ -38,15 +38,15 @@ Tauri menu-bar window  (apps/desktop)
 
 ### Adapters (`adapters/`)
 
-Each adapter is a small Node script (`.mjs`) invoked by an agent's hook mechanism. It translates that agent's native hook payload into a protocol-v2 `AgentActivityEvent` and POSTs it to the bridge. Adapters never block the host agent (they exit fast and, for hooks that gate execution, always return "allow").
+Each adapter is a small Node script (`.mjs`) invoked by an agent's hook mechanism. It translates that agent's native hook payload into a protocol-v2 `GyredeckEvent` and POSTs it to the bridge. Adapters never block the host agent (they exit fast and, for hooks that gate execution, always return "allow").
 
 | Adapter | File | sourceKind | Fidelity |
 | --- | --- | --- | --- |
-| Claude Code | `adapters/claude/agent-activity-claude-hook.mjs` | `claudeCodeHook` | Rich: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Notification`, `Stop`/`SubagentStop`, `SessionEnd`. Reads `model` from the tail of the transcript JSONL. |
-| Codex | `adapters/codex/agent-activity-codex-notify.mjs` | `codex-notify` | Coarse: Codex only invokes a `notify` program, so only `agent-turn-complete` is mapped, into a turn-completion signal. |
-| Antigravity (AGY) | `adapters/antigravity/agent-activity-agy-hook.mjs` | `agyHost` | `PreToolUse`, `PostToolUse`, `PreInvocation` (first invocation opens the conversation; every invocation starts a turn), `Stop`. Reads `model` from the hook payload. |
+| Claude Code | `adapters/claude/gyredeck-claude-hook.mjs` | `claudeCodeHook` | Rich: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Notification`, `Stop`/`SubagentStop`, `SessionEnd`. Reads `model` from the tail of the transcript JSONL. |
+| Codex | `adapters/codex/gyredeck-codex-notify.mjs` | `codex-notify` | Coarse: Codex only invokes a `notify` program, so only `agent-turn-complete` is mapped, into a turn-completion signal. |
+| Antigravity (AGY) | `adapters/antigravity/gyredeck-agy-hook.mjs` | `agyHost` | `PreToolUse`, `PostToolUse`, `PreInvocation` (first invocation opens the conversation; every invocation starts a turn), `Stop`. Reads `model` from the hook payload. |
 
-### Bridge (`adapters/bridge/agent-activity-bridge.mjs`)
+### Bridge (`adapters/bridge/gyredeck-bridge.mjs`)
 
 A self-contained Node HTTP server bound to `127.0.0.1:47621`. Responsibilities:
 
@@ -54,8 +54,8 @@ A self-contained Node HTTP server bound to `127.0.0.1:47621`. Responsibilities:
 - **Scope carry-forward** — remembers the last-seen scope (`agentId`, `conversationId`, `cwd`, `model`, `permissionMode`, `runtime`) per conversation (falling back to cwd) so fields like `model` never bleed between sources — an Antigravity turn cannot stamp its model onto a Claude conversation.
 - **Hook correlation** — attaches an unscoped `Stop`/attention relay to a recent scope only when exactly one recent scope matches the requested cwd/agent, within a bounded window; ambiguous matches stay unscoped.
 - **Fan-out** — `GET /events` streams Server-Sent Events; `GET /snapshot` returns recent events plus capabilities; `GET /health` returns identity and capabilities.
-- **Audit log** — appends every event as newline-delimited JSON to `~/.config/agent-activity/agent-activity.events.ndjson` (local diagnostics, not telemetry).
-- **Trust** — forwarded `runtime` identity is trusted only when the request carries the machine-local `x-agent-activity-token` (a `0600` file under `~/.config/agent-activity/`); otherwise the `runtime` field is stripped before storage.
+- **Audit log** — appends every event as newline-delimited JSON to `~/.config/gyredeck/gyredeck.events.ndjson` (local diagnostics, not telemetry).
+- **Trust** — forwarded `runtime` identity is trusted only when the request carries the machine-local `x-gyredeck-token` (a `0600` file under `~/.config/gyredeck/`); otherwise the `runtime` field is stripped before storage.
 
 The desktop app supervises a bundled standalone bridge: at startup it probes `127.0.0.1:47621/health`; a healthy existing bridge is reused, an unrelated listener fails closed, and only an explicitly refused connection starts the bundled bridge. A parent stdio lease plus native exit cleanup prevent the child from becoming a permanent daemon.
 

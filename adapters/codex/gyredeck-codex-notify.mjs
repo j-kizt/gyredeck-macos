@@ -5,26 +5,26 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 /**
- * Agent Activity Codex notify adapter
+ * Gyredeck Codex notify adapter
  *
  * Codex CLI has no tool-level hooks; it only invokes a `notify` program with a
  * single JSON argument on certain events (notably `agent-turn-complete`). This
- * adapter maps that into a coarse turn-completion signal for the Agent Activity
+ * adapter maps that into a coarse turn-completion signal for the Gyredeck
  * bridge — enough to surface "a Codex turn finished in <project>", not live
  * tool-by-tool activity.
  *
  * Wire it up in ~/.codex/config.toml:
- *   notify = ["node", "/Users/<you>/.config/agent-activity/agent-activity-codex-notify.mjs"]
+ *   notify = ["node", "/Users/<you>/.config/gyredeck/gyredeck-codex-notify.mjs"]
  *
- * Codex calls:  node agent-activity-codex-notify.mjs '<json>'
+ * Codex calls:  node gyredeck-codex-notify.mjs '<json>'
  */
 
 const DEFAULT_ENDPOINT = { hostname: "127.0.0.1", port: 47_621 };
-const CONFIG_DIR = join(homedir(), ".config", "agent-activity");
+const CONFIG_DIR = join(homedir(), ".config", "gyredeck");
 
 const readEndpoint = async () => {
   try {
-    const config = JSON.parse(await readFile(join(CONFIG_DIR, "agent-activity.config.json"), "utf8"));
+    const config = JSON.parse(await readFile(join(CONFIG_DIR, "gyredeck.config.json"), "utf8"));
     const hostname = config.host === DEFAULT_ENDPOINT.hostname ? config.host : DEFAULT_ENDPOINT.hostname;
     const port = Number.isInteger(config.port) ? config.port : DEFAULT_ENDPOINT.port;
     if (port < 1 || port > 65_535) return DEFAULT_ENDPOINT;

@@ -12,7 +12,7 @@ export default defineConfig({
     channel: "chrome",
   },
   webServer: {
-    command: "pnpm --filter @agent-activity/desktop dev",
+    command: "pnpm --filter @gyredeck/desktop dev",
     url: "http://127.0.0.1:47622/?demo=1",
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,

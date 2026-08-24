@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Install the Agent Activity Claude Code hook.
+ * Install the Gyredeck Claude Code hook.
  *
  * Copies the hook adapter to a stable local path and merges the required hook
  * entries into ~/.claude/settings.json without clobbering existing hooks. It
@@ -17,9 +17,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SOURCE_HOOK = join(HERE, "..", "adapters", "claude", "agent-activity-claude-hook.mjs");
-const CONFIG_DIR = join(homedir(), ".config", "agent-activity");
-const INSTALLED_HOOK = join(CONFIG_DIR, "agent-activity-claude-hook.mjs");
+const SOURCE_HOOK = join(HERE, "..", "adapters", "claude", "gyredeck-claude-hook.mjs");
+const CONFIG_DIR = join(homedir(), ".config", "gyredeck");
+const INSTALLED_HOOK = join(CONFIG_DIR, "gyredeck-claude-hook.mjs");
 
 // PreToolUse/PostToolUse take a tool matcher; the rest are event-only.
 const MATCHED_EVENTS = ["PreToolUse", "PostToolUse"];

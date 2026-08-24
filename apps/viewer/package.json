@@ -1,9 +1,9 @@
 {
-  "name": "@agent-activity/viewer",
+  "name": "@gyredeck/viewer",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "bin": {
-    "agent-activity-viewer": "./index.mjs"
+    "gyredeck-viewer": "./index.mjs"
   }
 }

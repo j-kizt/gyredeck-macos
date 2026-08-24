@@ -8,13 +8,13 @@ test("overview uses dense trusted metadata and contextual Focus", async ({ page 
   await page.goto("/?demo=1&demoScenario=long-llm");
 
   const row = page.locator('.session-row[data-status="working"]');
-  await expect(row.locator(".session-project")).toHaveText("agent-activity");
+  await expect(row.locator(".session-project")).toHaveText("gyredeck");
   await expect(row.locator(".session-inline-status")).toHaveText("Working");
   await expect(row.locator(".session-activity")).toHaveText("gpt-5.6-sol");
   await expect(row.locator(".session-model")).toHaveText("gpt-5.6-sol");
   await expect(page.getByText("LC", { exact: true })).toHaveCount(0);
 
-  const focus = row.getByRole("button", { name: "Focus agent-activity session in terminal" });
+  const focus = row.getByRole("button", { name: "Focus gyredeck session in terminal" });
   await row.hover();
   await expect(focus).toBeVisible();
 });

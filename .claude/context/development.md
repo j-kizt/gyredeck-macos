@@ -1,4 +1,4 @@
-# Contributing to Agent Activity
+# Contributing to Gyredeck
 
 macOS · Node 22 · pnpm 10 · Rust + the Tauri toolchain · GitHub CLI (`gh`) for the GitHub tab.
 
@@ -6,7 +6,7 @@ macOS · Node 22 · pnpm 10 · Rust + the Tauri toolchain · GitHub CLI (`gh`) f
 
 ```bash
 pnpm install
-pnpm desktop:install          # build + install /Applications/Agent Activity.app
+pnpm desktop:install          # build + install /Applications/Gyredeck.app
 ```
 
 Connect an agent (or use the in-app **Settings → Plugins → Claude Code hooks → Install**):
@@ -15,10 +15,10 @@ Connect an agent (or use the in-app **Settings → Plugins → Claude Code hooks
 pnpm hooks:install            # install the Claude Code hook into ~/.claude/settings.json
 ```
 
-Codex (optional, coarse turn-level presence): copy `adapters/codex/agent-activity-codex-notify.mjs` to `~/.config/agent-activity/` and add to `~/.codex/config.toml`:
+Codex (optional, coarse turn-level presence): copy `adapters/codex/gyredeck-codex-notify.mjs` to `~/.config/gyredeck/` and add to `~/.codex/config.toml`:
 
 ```toml
-notify = ["node", "/Users/<you>/.config/agent-activity/agent-activity-codex-notify.mjs"]
+notify = ["node", "/Users/<you>/.config/gyredeck/gyredeck-codex-notify.mjs"]
 ```
 
 ## Development
@@ -36,7 +36,7 @@ The menu-bar window, tray toggle, terminal focus, notifications, and real event 
 
 ## Architecture
 
-Data flow: agent hooks → adapter `.mjs` → `POST /ingest` → local bridge (`127.0.0.1:47621`) → SSE `/events` → Tauri menu-bar window. See [`architecture.md`](architecture.md) for the full breakdown, [`event-protocol.md`](event-protocol.md) for the wire format, and [`presence-model.md`](presence-model.md) for the state model. Local state lives under `~/.config/agent-activity/`.
+Data flow: agent hooks → adapter `.mjs` → `POST /ingest` → local bridge (`127.0.0.1:47621`) → SSE `/events` → Tauri menu-bar window. See [`architecture.md`](architecture.md) for the full breakdown, [`event-protocol.md`](event-protocol.md) for the wire format, and [`presence-model.md`](presence-model.md) for the state model. Local state lives under `~/.config/gyredeck/`.
 
 ## Project layout
 

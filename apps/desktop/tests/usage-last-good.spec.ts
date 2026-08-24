@@ -226,7 +226,7 @@ test("Usage keeps a valid empty Antigravity summary online as no quota data", as
 
 test("Usage hydrates a persisted last-good snapshot before a reload refresh completes", async ({ page }) => {
   await page.addInitScript(() => {
-    window.localStorage.setItem("agent-activity.usage-snapshots.v1", JSON.stringify({
+    window.localStorage.setItem("gyredeck.usage-snapshots.v1", JSON.stringify({
       codex: {
         providerId: "codex",
         fetchedAt: "2026-07-25T12:00:00Z",

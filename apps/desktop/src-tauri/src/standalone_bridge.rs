@@ -48,7 +48,7 @@ pub(crate) struct StandaloneBridgeState {
 impl StandaloneBridgeState {
     pub(crate) fn start(&self, bridge_script: PathBuf) -> Result<(), String> {
         let node = find_node_binary().ok_or_else(|| {
-            "Agent Activity could not find Node.js for the standalone bridge".to_string()
+            "Gyredeck could not find Node.js for the standalone bridge".to_string()
         })?;
         self.start_with(bridge_script, node, BridgeEndpoint::default())
     }
@@ -76,7 +76,7 @@ impl StandaloneBridgeState {
 
         let (stop_tx, stop_rx) = mpsc::channel();
         let join = thread::Builder::new()
-            .name("agent-activity-bridge-supervisor".to_string())
+            .name("gyredeck-bridge-supervisor".to_string())
             .spawn(move || supervise_bridge(bridge_script, node, endpoint, stop_rx))
             .map_err(|error| format!("Failed to start standalone bridge supervisor: {error}"))?;
         *supervisor = Some(BridgeSupervisorHandle { stop_tx, join });
@@ -117,12 +117,12 @@ fn supervise_bridge(
         if let Some(child) = owned_child.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    eprintln!("Agent Activity standalone bridge exited: {status}");
+                    eprintln!("Gyredeck standalone bridge exited: {status}");
                     owned_child = None;
                     consecutive_failures = 0;
                 }
                 Err(error) => {
-                    eprintln!("Agent Activity could not inspect its standalone bridge: {error}");
+                    eprintln!("Gyredeck could not inspect its standalone bridge: {error}");
                     owned_child = None;
                     consecutive_failures = 0;
                 }
@@ -145,7 +145,7 @@ fn supervise_bridge(
             owned_child = match spawn_bridge(&node, &bridge_script, endpoint) {
                 Ok(child) => Some(child),
                 Err(error) => {
-                    eprintln!("Agent Activity could not start its standalone bridge: {error}");
+                    eprintln!("Gyredeck could not start its standalone bridge: {error}");
                     None
                 }
             };
@@ -212,7 +212,7 @@ fn probe_bridge(endpoint: BridgeEndpoint) -> BridgeProbe {
 
     let mut response = String::new();
     let _ = stream.take(64 * 1024).read_to_string(&mut response);
-    if is_agent_activity_health_response(&response) {
+    if is_gyredeck_health_response(&response) {
         BridgeProbe::Healthy
     } else {
         BridgeProbe::Occupied
@@ -227,7 +227,7 @@ fn classify_connect_error(error: &std::io::Error) -> BridgeProbe {
     }
 }
 
-fn is_agent_activity_health_response(response: &str) -> bool {
+fn is_gyredeck_health_response(response: &str) -> bool {
     let mut sections = response.splitn(2, "\r\n\r\n");
     let Some(headers) = sections.next() else {
         return false;
@@ -252,13 +252,13 @@ fn is_agent_activity_health_response(response: &str) -> bool {
         .ok()
         .is_some_and(|payload| {
             payload.get("ok").and_then(|value| value.as_bool()) == Some(true)
-                && payload.get("name").and_then(|value| value.as_str()) == Some("agent-activity")
+                && payload.get("name").and_then(|value| value.as_str()) == Some("gyredeck")
                 && payload.get("version").and_then(|value| value.as_u64()) == Some(2)
         })
 }
 
 fn find_node_binary() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("AGENT_ACTIVITY_NODE_BINARY") {
+    if let Some(path) = std::env::var_os("GYREDECK_NODE_BINARY") {
         let path = PathBuf::from(path);
         if path.is_absolute() && path.is_file() {
             return Some(path);
@@ -334,10 +334,10 @@ mod tests {
     #[test]
     fn health_parser_accepts_letta_and_standalone_bridge_payloads() {
         for body in [
-            r#"{"ok":true,"name":"agent-activity","version":2,"clients":1}"#,
-            r#"{"ok":true,"name":"agent-activity","version":2,"mode":"standalone","clients":0}"#,
+            r#"{"ok":true,"name":"gyredeck","version":2,"clients":1}"#,
+            r#"{"ok":true,"name":"gyredeck","version":2,"mode":"standalone","clients":0}"#,
         ] {
-            assert!(is_agent_activity_health_response(&format!(
+            assert!(is_gyredeck_health_response(&format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{body}"
             )));
         }
@@ -345,11 +345,11 @@ mod tests {
 
     #[test]
     fn health_parser_rejects_an_unrelated_listener() {
-        assert!(!is_agent_activity_health_response(
+        assert!(!is_gyredeck_health_response(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"ok\":true,\"name\":\"other\",\"version\":2}"
         ));
-        assert!(!is_agent_activity_health_response(
-            "HTTP/1.1 503 Service Unavailable\r\n\r\n{\"ok\":true,\"name\":\"agent-activity\",\"version\":2}"
+        assert!(!is_gyredeck_health_response(
+            "HTTP/1.1 503 Service Unavailable\r\n\r\n{\"ok\":true,\"name\":\"gyredeck\",\"version\":2}"
         ));
     }
 
@@ -388,7 +388,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!("agent-activity-bridge-{unique}"));
+        let directory = std::env::temp_dir().join(format!("gyredeck-bridge-{unique}"));
         fs::create_dir_all(&directory).expect("fixture directory");
         let script = directory.join("bridge.mjs");
         fs::write(
@@ -399,7 +399,7 @@ const port = Number(args[args.indexOf('--port') + 1])
 const server = createServer((request, response) => {
   if (request.url === '/health') {
     response.writeHead(200, { 'content-type': 'application/json' })
-    response.end(JSON.stringify({ ok: true, name: 'agent-activity', version: 2, mode: 'standalone' }))
+    response.end(JSON.stringify({ ok: true, name: 'gyredeck', version: 2, mode: 'standalone' }))
     return
   }
   response.writeHead(404)
@@ -430,7 +430,7 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
         for (label, body, expected_probe) in [
             (
                 "healthy",
-                r#"{"ok":true,"name":"agent-activity","version":2}"#,
+                r#"{"ok":true,"name":"gyredeck","version":2}"#,
                 BridgeProbe::Healthy,
             ),
             (
@@ -452,7 +452,7 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
                 .expect("clock")
                 .as_nanos();
             let directory =
-                std::env::temp_dir().join(format!("agent-activity-bridge-{label}-{unique}"));
+                std::env::temp_dir().join(format!("gyredeck-bridge-{label}-{unique}"));
             fs::create_dir_all(&directory).expect("fixture directory");
             let marker = directory.join("unexpected-spawn");
             let script = directory.join("bridge.mjs");
@@ -489,14 +489,14 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
             address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
         };
         let (server_stop, server_join) =
-            serve_health_fixture(listener, r#"{"ok":true,"name":"agent-activity","version":2}"#);
+            serve_health_fixture(listener, r#"{"ok":true,"name":"gyredeck","version":2}"#);
         assert!(wait_for_probe(endpoint, BridgeProbe::Healthy));
 
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!("agent-activity-bridge-takeover-{unique}"));
+        let directory = std::env::temp_dir().join(format!("gyredeck-bridge-takeover-{unique}"));
         fs::create_dir_all(&directory).expect("fixture directory");
         let marker = directory.join("owned-started");
         let marker_json = serde_json::to_string(&marker.to_string_lossy()).expect("marker");
@@ -512,7 +512,7 @@ writeFileSync({marker_json}, 'started')
 const server = createServer((request, response) => {{
   if (request.url === '/health') {{
     response.writeHead(200, {{ 'content-type': 'application/json' }})
-    response.end(JSON.stringify({{ ok: true, name: 'agent-activity', version: 2 }}))
+    response.end(JSON.stringify({{ ok: true, name: 'gyredeck', version: 2 }}))
     return
   }}
   response.writeHead(404)

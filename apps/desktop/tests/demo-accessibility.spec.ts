@@ -7,14 +7,14 @@ test.beforeEach(async ({ page }) => {
 test("session context receives focus and Escape restores the originating row", async ({ page }) => {
   await page.goto("/?demo=1&demoScenario=multi");
 
-  const sessionRow = page.getByRole("button", { name: "Open agent-activity session details" }).first();
+  const sessionRow = page.getByRole("button", { name: "Open gyredeck session details" }).first();
   await sessionRow.focus();
   await page.keyboard.press("Enter");
 
   const context = page.locator(".session-context-summary");
   await expect(context).toBeFocused();
   await page.keyboard.press("Escape");
-  await expect(page.getByRole("button", { name: "Open agent-activity session details" }).first()).toBeFocused();
+  await expect(page.getByRole("button", { name: "Open gyredeck session details" }).first()).toBeFocused();
 });
 
 test("main section tabs provide roving keyboard navigation and panel relationships", async ({ page }) => {

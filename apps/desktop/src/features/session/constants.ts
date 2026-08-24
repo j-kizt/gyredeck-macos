@@ -8,6 +8,6 @@ export const DONE_SIGNAL_MS = 8_000;
 export const MAX_RECENT_EVENTS = 80;
 export const MAX_SESSION_EVENTS_PER_SESSION = 32;
 
-export const DISMISSED_SESSIONS_STORAGE_KEY = "agent-activity.dismissed-sessions";
-export const DELETED_SESSIONS_STORAGE_KEY = "agent-activity.deleted-sessions";
-export const SESSION_EVENTS_STORAGE_KEY = "agent-activity.session-events";
+export const DISMISSED_SESSIONS_STORAGE_KEY = "gyredeck.dismissed-sessions";
+export const DELETED_SESSIONS_STORAGE_KEY = "gyredeck.deleted-sessions";
+export const SESSION_EVENTS_STORAGE_KEY = "gyredeck.session-events";

@@ -1,14 +1,17 @@
-Agent Activity is a local macOS menu-bar companion that surfaces live Claude Code / Codex activity, provider usage, local services, and the state of the GitHub repos you track.
+Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, local services, and GitHub repo/CI/PR monitoring, in a window from the menu bar.
 
-### What's new
-- **Runs on Intel Macs too.** Releases are now a universal binary (Apple Silicon + Intel), and auto-update serves both.
-- **One-line install.** From a terminal:
+## v1.0.0 — Gyredeck
+
+First release under the new name **Gyredeck** (formerly Agent Activity), with a new app icon.
+
+- **New brand + icon.** Renamed throughout; new 5-arc icon in the Dock and menu bar.
+- **Universal build.** One download runs on both Apple Silicon and Intel Macs.
+- **One-line install:**
 
   ```sh
-  curl -fsSL https://raw.githubusercontent.com/j-kizt/agent-activity/main/scripts/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/j-kizt/gyredeck-macos/main/scripts/install.sh | bash
   ```
 
-  It downloads the latest release, installs to /Applications, clears the quarantine flag, and opens the app.
+Everything runs locally on `127.0.0.1`; nothing is uploaded. After installing, open **Settings → Plugins** to connect your Claude Code / Antigravity hooks.
 
-### Docs
-- README now has an Install section and clearer credits to upstream [agent-halo](https://github.com/mahirocoko/agent-halo).
+> Upgrading from Agent Activity: this is a rebrand with a new bundle id, so install Gyredeck fresh (the one-liner above) — it won't auto-update from the old app.

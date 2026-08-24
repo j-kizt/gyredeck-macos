@@ -20,7 +20,7 @@ importers:
 
   apps/desktop:
     dependencies:
-      '@agent-activity/protocol':
+      '@gyredeck/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
       '@tauri-apps/api':

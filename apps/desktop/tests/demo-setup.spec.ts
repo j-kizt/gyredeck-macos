@@ -25,7 +25,7 @@ test("keep awake follows any working session instead of ambient attention priori
 
 test("keep awake retries a transient native synchronization failure", async ({ page }) => {
   await page.addInitScript(() => {
-    window.localStorage.setItem("agent-activity.keep-awake-while-working", "true");
+    window.localStorage.setItem("gyredeck.keep-awake-while-working", "true");
     const calls: Array<{ active: boolean }> = [];
     let activeAttempts = 0;
     (window as typeof window & { __keepAwakeCalls: Array<{ active: boolean }> }).__keepAwakeCalls = calls;

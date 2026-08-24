@@ -1,11 +1,11 @@
-# Agent Activity Presence Model
+# Gyredeck Presence Model
 
 The bridge emits raw events. The presence model converts those events into a small UI-facing state so every viewer shares one set of rules instead of inventing its own.
 
 ## State shape
 
 ```ts
-type AgentActivityPresenceStatus =
+type GyredeckPresenceStatus =
   | "offline"
   | "idle"
   | "thinking"

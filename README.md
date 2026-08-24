@@ -1,7 +1,7 @@
-# Agent Activity
+# Gyredeck
 
 <p align="center">
-  <img src="apps/desktop/assets/agent-activity-app-icon.png" alt="Agent Activity app icon" width="128" height="128" />
+  <img src="apps/desktop/assets/gyredeck-app-icon.png" alt="Gyredeck app icon" width="128" height="128" />
 </p>
 
 <p align="center">
@@ -19,12 +19,12 @@
 macOS (Apple Silicon or Intel). Paste this into a terminal:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/j-kizt/agent-activity/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/j-kizt/gyredeck-macos/main/scripts/install.sh | bash
 ```
 
-It downloads the latest release, installs **Agent Activity.app** to `/Applications`, and opens it. The app is self-signed (not Apple-notarized), so the installer clears the quarantine flag for you; after that, updates are handled in-app via **Settings → Update**.
+It downloads the latest release, installs **Gyredeck.app** to `/Applications`, and opens it. The app is self-signed (not Apple-notarized), so the installer clears the quarantine flag for you; after that, updates are handled in-app via **Settings → Update**.
 
-Prefer to do it by hand? Download `Agent.Activity_*.app.tar.gz` from the [latest release](https://github.com/j-kizt/agent-activity/releases/latest), unpack it, and drag the app into `/Applications` (first launch: right-click → Open).
+Prefer to do it by hand? Download `Gyredeck_*.app.tar.gz` from the [latest release](https://github.com/j-kizt/gyredeck-macos/releases/latest), unpack it, and drag the app into `/Applications` (first launch: right-click → Open).
 
 ## Connect your agent
 

@@ -1,4 +1,4 @@
-# Releasing Agent Activity
+# Releasing Gyredeck
 
 ## Versioning policy (SemVer)
 
@@ -21,12 +21,12 @@ Default branch is `dev`; releases are cut from `main` by tag. Do these steps onl
 2. Rewrite `.github/release-notes.md` — CI reads it **verbatim** as the GitHub Release body. Keep the style: 1-line preamble + `### Changed` / `### Fixes` sections.
 3. Commit on `dev` (conventional-commit message, `Co-Authored-By` trailer), `git push origin dev`.
 4. `git checkout main && git merge --ff-only dev && git push origin main`.
-5. `git tag -a vX.Y.Z -m "Agent Activity vX.Y.Z" && git push origin vX.Y.Z`, then `git checkout dev`.
+5. `git tag -a vX.Y.Z -m "Gyredeck vX.Y.Z" && git push origin vX.Y.Z`, then `git checkout dev`.
 6. Tag push triggers `.github/workflows/release.yml` (build → sign → publish). Watch: `gh run watch <id> --exit-status`.
 7. Verify: `gh release view vX.Y.Z` has `.app.tar.gz` + `.sig` + `latest.json`, and `latest.json` version matches and has a signature (the auto-updater manifest).
 
 ## Notes
 
 - CI signs updater artifacts with the `TAURI_SIGNING_PRIVATE_KEY` GitHub Actions secret.
-- Local install for testing: `pnpm desktop:install` (reads the signing key from `~/.config/agent-activity/agent-activity-updater.key`).
+- Local install for testing: `pnpm desktop:install` (reads the signing key from `~/.config/gyredeck/gyredeck-updater.key`).
 - Never commit/push without explicit user approval.

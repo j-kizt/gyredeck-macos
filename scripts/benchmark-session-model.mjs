@@ -14,7 +14,7 @@ if (!address || typeof address === "string") throw new Error("failed to reserve 
 const port = address.port;
 await new Promise((resolveClose) => probe.close(resolveClose));
 
-const server = spawn("pnpm", ["--filter", "@agent-activity/desktop", "exec", "vite", "--host", "127.0.0.1", "--port", `${port}`], {
+const server = spawn("pnpm", ["--filter", "@gyredeck/desktop", "exec", "vite", "--host", "127.0.0.1", "--port", `${port}`], {
   cwd: repoRoot,
   detached: process.platform !== "win32",
   stdio: ["ignore", "pipe", "pipe"],

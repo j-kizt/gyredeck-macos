@@ -6,8 +6,8 @@ import type {
   IGithubRepoStatus,
 } from "./types";
 
-const TRACKED_REPOS_KEY = "agent-activity.github.tracked-repos";
-const STATUS_CACHE_KEY = "agent-activity.github.status-cache";
+const TRACKED_REPOS_KEY = "gyredeck.github.tracked-repos";
+const STATUS_CACHE_KEY = "gyredeck.github.status-cache";
 
 const REPO_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 

@@ -74,9 +74,9 @@ const AGY_CLOUD_CODE_BASE_URLS: [&str; 2] = [
 const AGY_CLOUD_QUOTA_SUMMARY_PATH: &str = "/v1internal:retrieveUserQuotaSummary";
 const AGY_CLOUD_LOAD_CODE_ASSIST_PATH: &str = "/v1internal:loadCodeAssist";
 const AGY_GOOGLE_OAUTH_URL: &str = "https://oauth2.googleapis.com/token";
-const AGY_GOOGLE_CLIENT_ID_ENV: &str = "AGENT_ACTIVITY_AGY_GOOGLE_CLIENT_ID";
-const AGY_GOOGLE_CLIENT_SECRET_ENV: &str = "AGENT_ACTIVITY_AGY_GOOGLE_CLIENT_SECRET";
-const AGY_GOOGLE_OAUTH_CONFIG_PATH: &str = ".config/agent-activity/agy-google-oauth.json";
+const AGY_GOOGLE_CLIENT_ID_ENV: &str = "GYREDECK_AGY_GOOGLE_CLIENT_ID";
+const AGY_GOOGLE_CLIENT_SECRET_ENV: &str = "GYREDECK_AGY_GOOGLE_CLIENT_SECRET";
+const AGY_GOOGLE_OAUTH_CONFIG_PATH: &str = ".config/gyredeck/agy-google-oauth.json";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_REFRESH_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -451,8 +451,8 @@ fn claude_hook_install_path() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     Ok(PathBuf::from(home)
         .join(".config")
-        .join("agent-activity")
-        .join("agent-activity-claude-hook.mjs"))
+        .join("gyredeck")
+        .join("gyredeck-claude-hook.mjs"))
 }
 
 fn claude_settings_path() -> Result<PathBuf, String> {
@@ -464,8 +464,8 @@ fn agy_hook_install_path() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     Ok(PathBuf::from(home)
         .join(".config")
-        .join("agent-activity")
-        .join("agent-activity-agy-hook.mjs"))
+        .join("gyredeck")
+        .join("gyredeck-agy-hook.mjs"))
 }
 
 fn agy_hooks_json_path() -> Result<PathBuf, String> {
@@ -2146,7 +2146,7 @@ fn value_to_u64(value: Option<&Value>) -> Option<u64> {
 fn usage_client(provider: &str) -> Result<reqwest::blocking::Client, String> {
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(12))
-        .user_agent("Agent Activity");
+        .user_agent("Gyredeck");
 
     if let Some(proxy_url) = openusage_proxy_url() {
         let proxy = reqwest::Proxy::all(&proxy_url)
@@ -3764,7 +3764,7 @@ fn parse_antigravity_oauth_client(value: &Value) -> Option<(String, String)> {
 fn probe_antigravity_ls_usage() -> Option<CodexUsageSnapshot> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
-        .user_agent("Agent Activity")
+        .user_agent("Gyredeck")
         .danger_accept_invalid_certs(true)
         .build()
         .ok()?;
@@ -4239,7 +4239,7 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
     let resource_path = app
         .path()
         .resolve(
-            "agent-activity-claude-hook.mjs",
+            "gyredeck-claude-hook.mjs",
             tauri::path::BaseDirectory::Resource,
         )
         .map_err(|e| format!("Failed to resolve resource: {e}"))?;
@@ -4356,7 +4356,7 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
     let resource_path = app
         .path()
         .resolve(
-            "agent-activity-agy-hook.mjs",
+            "gyredeck-agy-hook.mjs",
             tauri::path::BaseDirectory::Resource,
         )
         .map_err(|e| format!("Failed to resolve resource: {e}"))?;
@@ -4405,7 +4405,7 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
             {"type": "command", "command": agy_hook_command(&installed_path, "Stop")}
         ]
     });
-    root.insert("agent-activity".to_string(), entry);
+    root.insert("gyredeck".to_string(), entry);
 
     let Some(hooks_parent) = hooks_json_path.parent() else {
         return Err("Failed to resolve Gemini config directory".to_string());
@@ -4431,7 +4431,7 @@ fn agy_hook_status() -> Result<(String, bool), String> {
     if hooks_json_path.exists() {
         if let Ok(content) = fs::read_to_string(&hooks_json_path) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                in_hooks = json.get("agent-activity").is_some();
+                in_hooks = json.get("gyredeck").is_some();
             }
         }
     }
@@ -4695,7 +4695,7 @@ fn display_preference_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
         .map(|directory| directory.join(DISPLAY_PREFERENCE_FILE))
-        .map_err(|error| format!("Could not resolve Agent Activity config directory: {error}"))
+        .map_err(|error| format!("Could not resolve Gyredeck config directory: {error}"))
 }
 
 fn read_display_preference(app: &tauri::AppHandle) -> Option<DisplayPreference> {
@@ -4713,7 +4713,7 @@ fn write_display_preference(
         .parent()
         .ok_or_else(|| "Display preference path has no parent directory".to_string())?;
     fs::create_dir_all(parent)
-        .map_err(|error| format!("Could not create Agent Activity config directory: {error}"))?;
+        .map_err(|error| format!("Could not create Gyredeck config directory: {error}"))?;
     let temporary_path = path.with_extension("json.tmp");
     let contents = serde_json::to_vec_pretty(preference)
         .map_err(|error| format!("Could not encode display preference: {error}"))?;
@@ -5002,7 +5002,7 @@ fn reconcile_display_position(window: &tauri::WebviewWindow) -> Result<(), Strin
         if matches || position_main_window_with_appkit(window, None, false) {
             return Ok(());
         }
-        return Err("Could not reconcile Agent Activity display position".to_string());
+        return Err("Could not reconcile Gyredeck display position".to_string());
     }
 
     let (sender, receiver) = mpsc::channel();
@@ -5022,7 +5022,7 @@ fn reconcile_display_position(window: &tauri::WebviewWindow) -> Result<(), Strin
     {
         Ok(())
     } else {
-        Err("Timed out while reconciling Agent Activity display position".to_string())
+        Err("Timed out while reconciling Gyredeck display position".to_string())
     }
 }
 
@@ -5032,7 +5032,7 @@ fn reconcile_display_position(window: &tauri::WebviewWindow) -> Result<(), Strin
         return Ok(());
     }
     position_main_window(window)
-        .map_err(|error| format!("Could not reconcile Agent Activity display position: {error}"))
+        .map_err(|error| format!("Could not reconcile Gyredeck display position: {error}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -5059,7 +5059,7 @@ fn position_main_window_on_selected_display(window: &tauri::WebviewWindow) -> Re
     {
         Ok(())
     } else {
-        Err("The selected display disconnected before Agent Activity could move".to_string())
+        Err("The selected display disconnected before Gyredeck could move".to_string())
     }
 }
 
@@ -5067,10 +5067,10 @@ fn position_main_window_on_selected_display(window: &tauri::WebviewWindow) -> Re
 fn position_main_window_on_selected_display(window: &tauri::WebviewWindow) -> Result<(), String> {
     let state = display_state(window.clone())?;
     if state.selected_display_id.is_none() {
-        return Err("The selected display disconnected before Agent Activity could move".to_string());
+        return Err("The selected display disconnected before Gyredeck could move".to_string());
     }
     position_main_window(window)
-        .map_err(|error| format!("Could not move Agent Activity to the selected display: {error}"))
+        .map_err(|error| format!("Could not move Gyredeck to the selected display: {error}"))
 }
 
 fn position_main_window_for_physical_width(
@@ -5223,13 +5223,13 @@ fn configure_overlay_window(window: &tauri::WebviewWindow) {
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, TRAY_SHOW, "Show Agent Activity", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, TRAY_SHOW, "Show Gyredeck", true, None::<&str>)?;
     let hide = MenuItem::with_id(app, TRAY_HIDE, "Hide Overlay", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, TRAY_QUIT, "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &hide, &separator, &quit])?;
-    TrayIconBuilder::with_id("agent-activity")
-        .tooltip("Agent Activity")
+    TrayIconBuilder::with_id("gyredeck")
+        .tooltip("Gyredeck")
         .icon(tauri::include_image!("icons/tray-icon.png"))
         .icon_as_template(true)
         .menu(&menu)
@@ -5323,16 +5323,16 @@ pub fn run() {
             app.state::<DisplayPreferenceState>().set(preference);
 
             match app.path().resolve(
-                "agent-activity-bridge.mjs",
+                "gyredeck-bridge.mjs",
                 tauri::path::BaseDirectory::Resource,
             ) {
                 Ok(path) => {
                     if let Err(error) = app.state::<StandaloneBridgeState>().start(path) {
-                        eprintln!("Agent Activity standalone bridge is unavailable: {error}");
+                        eprintln!("Gyredeck standalone bridge is unavailable: {error}");
                     }
                 }
                 Err(error) => {
-                    eprintln!("Agent Activity standalone bridge resource is unavailable: {error}");
+                    eprintln!("Gyredeck standalone bridge resource is unavailable: {error}");
                 }
             }
 
@@ -5354,7 +5354,7 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("failed to build Agent Activity desktop");
+        .expect("failed to build Gyredeck desktop");
 
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {

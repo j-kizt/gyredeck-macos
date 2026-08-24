@@ -113,7 +113,7 @@ function render(event) {
   const eventLabel = event ? `${event.type} @ ${event.timestamp}` : "snapshot";
 
   console.clear();
-  console.log("Agent Activity Viewer");
+  console.log("Gyredeck Viewer");
   console.log("─────────────────");
   console.log(`Status:       ${view.label}`);
   console.log(`Agent:        ${agent}`);
@@ -174,7 +174,7 @@ async function connect() {
 }
 
 connect().catch((error) => {
-  console.error(`Agent Activity Viewer failed: ${error.message}`);
-  console.error("Is the Agent Activity bridge running? Check http://127.0.0.1:47621/health");
+  console.error(`Gyredeck Viewer failed: ${error.message}`);
+  console.error("Is the Gyredeck bridge running? Check http://127.0.0.1:47621/health");
   process.exitCode = 1;
 });

@@ -307,7 +307,7 @@ pub async fn github_switch_account(user: String) -> Result<String, String> {
 // ── OAuth Device Flow (add a new account) ──
 
 fn client_id() -> Result<String, String> {
-    if let Ok(value) = std::env::var("AGENT_ACTIVITY_GITHUB_CLIENT_ID") {
+    if let Ok(value) = std::env::var("GYREDECK_GITHUB_CLIENT_ID") {
         if !value.trim().is_empty() {
             return Ok(value.trim().to_string());
         }
@@ -315,10 +315,10 @@ fn client_id() -> Result<String, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     let path = std::path::PathBuf::from(home)
         .join(".config")
-        .join("agent-activity")
+        .join("gyredeck")
         .join("github-oauth.json");
     let content = std::fs::read_to_string(&path).map_err(|_| {
-        "No GitHub OAuth client id configured. Set AGENT_ACTIVITY_GITHUB_CLIENT_ID or create ~/.config/agent-activity/github-oauth.json with { \"client_id\": \"...\" }.".to_string()
+        "No GitHub OAuth client id configured. Set GYREDECK_GITHUB_CLIENT_ID or create ~/.config/gyredeck/github-oauth.json with { \"client_id\": \"...\" }.".to_string()
     })?;
     let value: Value =
         serde_json::from_str(&content).map_err(|e| format!("Invalid github-oauth.json: {e}"))?;

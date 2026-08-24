@@ -79,7 +79,7 @@ export const useAgentUsageList = (
         ...current,
         [provider.id]: createAgentUsageState(provider.id, {
           status: "offline",
-          message: "Agent Activity desktop runtime needed",
+          message: "Gyredeck desktop runtime needed",
         }),
       }));
       return;

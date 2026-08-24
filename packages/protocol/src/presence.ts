@@ -1,6 +1,6 @@
-import type { AgentActivityEvent } from "./index.js";
+import type { GyredeckEvent } from "./index.js";
 
-export type AgentActivityPresenceStatus =
+export type GyredeckPresenceStatus =
   | "offline"
   | "idle"
   | "thinking"
@@ -9,8 +9,8 @@ export type AgentActivityPresenceStatus =
   | "closed"
   | "error";
 
-export interface IAgentActivityPresence {
-  status: AgentActivityPresenceStatus;
+export interface IGyredeckPresence {
+  status: GyredeckPresenceStatus;
   agentId: string | null;
   agentName: string | null;
   conversationId: string | null;
@@ -18,20 +18,20 @@ export interface IAgentActivityPresence {
   model: string | null;
   permissionMode: string | null;
   activeToolName: string | null;
-  lastEventType: AgentActivityEvent["type"] | null;
+  lastEventType: GyredeckEvent["type"] | null;
   lastEventAt: string | null;
   messageCount: number | null;
   toolCallCount: number | null;
 }
 
-export interface IAgentActivityPresenceView {
-  status: AgentActivityPresenceStatus | "stale";
+export interface IGyredeckPresenceView {
+  status: GyredeckPresenceStatus | "stale";
   label: string;
   isStale: boolean;
   staleForMs: number;
 }
 
-export const createInitialPresence = (): IAgentActivityPresence => ({
+export const createInitialPresence = (): IGyredeckPresence => ({
   status: "offline",
   agentId: null,
   agentName: null,
@@ -47,9 +47,9 @@ export const createInitialPresence = (): IAgentActivityPresence => ({
 });
 
 export const reducePresence = (
-  current: IAgentActivityPresence,
-  event: AgentActivityEvent,
-): IAgentActivityPresence => {
+  current: IGyredeckPresence,
+  event: GyredeckEvent,
+): IGyredeckPresence => {
   const scoped = {
     agentId: event.agentId ?? current.agentId,
     agentName: event.agentName ?? current.agentName,
@@ -59,7 +59,7 @@ export const reducePresence = (
     permissionMode: event.permissionMode ?? current.permissionMode,
     lastEventType: event.type,
     lastEventAt: event.timestamp,
-  } satisfies Partial<IAgentActivityPresence>;
+  } satisfies Partial<IGyredeckPresence>;
 
   switch (event.type) {
     case "bridge_ready":
@@ -159,9 +159,9 @@ export const reducePresence = (
 };
 
 export const getPresenceView = (
-  presence: IAgentActivityPresence,
+  presence: IGyredeckPresence,
   options: { now?: Date; staleAfterMs?: number } = {},
-): IAgentActivityPresenceView => {
+): IGyredeckPresenceView => {
   const now = options.now ?? new Date();
   const staleAfterMs = options.staleAfterMs ?? 30_000;
   const lastEventMs = presence.lastEventAt ? Date.parse(presence.lastEventAt) : Number.NaN;

@@ -3,10 +3,10 @@ import {
   createInitialPresence,
   getPresenceView,
   reducePresence,
-  type AgentActivityEvent,
-  type IAgentActivityBridgeCapabilities,
-  type IAgentActivityPresence,
-} from "@agent-activity/protocol";
+  type GyredeckEvent,
+  type IGyredeckBridgeCapabilities,
+  type IGyredeckPresence,
+} from "@gyredeck/protocol";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { LLM_STALE_AFTER_MS, MAX_RECENT_EVENTS, STALE_AFTER_MS } from "../session/constants";
 import {
@@ -27,18 +27,18 @@ export interface IConnectionState {
   message: string | null;
 }
 
-export interface IAgentActivityPresenceOptions {
+export interface IGyredeckPresenceOptions {
   demoMode: boolean;
   demoScenario: string | null;
 }
 
-export interface IAgentActivityPresenceResult {
-  capabilities: IAgentActivityBridgeCapabilities;
+export interface IGyredeckPresenceResult {
+  capabilities: IGyredeckBridgeCapabilities;
   connection: IConnectionState;
-  lastLiveEvent: AgentActivityEvent | null;
+  lastLiveEvent: GyredeckEvent | null;
   now: Date;
-  presence: IAgentActivityPresence;
-  recentEvents: AgentActivityEvent[];
+  presence: IGyredeckPresence;
+  recentEvents: GyredeckEvent[];
   refreshCapabilities: () => Promise<boolean>;
   sessionEventRegistry: SessionEventRegistry;
   setSessionEventRegistry: React.Dispatch<React.SetStateAction<SessionEventRegistry>>;
@@ -52,7 +52,7 @@ const readBoolean = (value: unknown, key: string, fallback: boolean) =>
     ? (value as Record<string, boolean>)[key]
     : fallback;
 
-const normalizeCapabilities = (value: unknown): IAgentActivityBridgeCapabilities => {
+const normalizeCapabilities = (value: unknown): IGyredeckBridgeCapabilities => {
   const fallback = createDefaultBridgeCapabilities();
   if (typeof value !== "object" || value === null) return fallback;
   const record = value as Record<string, unknown>;
@@ -114,13 +114,13 @@ const base = (scenario: string, timestamp: string) => ({
   agentId: "agent-demo-mahiro-code",
   agentName: "Claude Code",
   conversationId: `local-conv-demo-${scenario}`,
-  cwd: "/Users/mahiro/ghq/github.com/j-kizt/agent-activity",
+  cwd: "/Users/mahiro/ghq/github.com/j-kizt/gyredeck-macos",
   model: "gpt-5.6-sol",
   permissionMode: "unrestricted",
   runtime: demoRuntime(scenario),
 });
 
-const createScenario = (scenario: string): AgentActivityEvent[] => {
+const createScenario = (scenario: string): GyredeckEvent[] => {
   const now = Date.now();
   const timestamp = new Date(now).toISOString();
   const at = (offset: number) => new Date(now + offset).toISOString();
@@ -391,7 +391,7 @@ const createScenario = (scenario: string): AgentActivityEvent[] => {
   ];
 };
 
-const createDemoEvent = (index: number): AgentActivityEvent => {
+const createDemoEvent = (index: number): GyredeckEvent => {
   const common = {
     version: 2 as const,
     id: `demo-${index}-${crypto.randomUUID()}`,
@@ -399,7 +399,7 @@ const createDemoEvent = (index: number): AgentActivityEvent => {
     agentId: "agent-demo-mahiro-code",
     agentName: "Claude Code",
     conversationId: `local-conv-demo-${(Math.floor(index / 10) % 3) + 1}`,
-    cwd: "/Users/mahiro/ghq/github.com/j-kizt/agent-activity",
+    cwd: "/Users/mahiro/ghq/github.com/j-kizt/gyredeck-macos",
     model: "gpt-5.5",
     permissionMode: "unrestricted",
     runtime: demoRuntime(`stream-${Math.floor(index / 10) % 3}`),
@@ -491,13 +491,13 @@ const createDemoEvent = (index: number): AgentActivityEvent => {
   }
 };
 
-export const useAgentActivityPresence = ({
+export const useGyredeckPresence = ({
   demoMode,
   demoScenario,
-}: IAgentActivityPresenceOptions): IAgentActivityPresenceResult => {
-  const [presence, setPresence] = useState<IAgentActivityPresence>(() => createInitialPresence());
-  const [recentEvents, setRecentEvents] = useState<AgentActivityEvent[]>([]);
-  const [lastLiveEvent, setLastLiveEvent] = useState<AgentActivityEvent | null>(null);
+}: IGyredeckPresenceOptions): IGyredeckPresenceResult => {
+  const [presence, setPresence] = useState<IGyredeckPresence>(() => createInitialPresence());
+  const [recentEvents, setRecentEvents] = useState<GyredeckEvent[]>([]);
+  const [lastLiveEvent, setLastLiveEvent] = useState<GyredeckEvent | null>(null);
   const [sessionEventRegistry, setSessionEventRegistry] =
     useState<SessionEventRegistry>(readSessionEventRegistry);
   const [capabilities, setCapabilities] = useState(() => createDefaultBridgeCapabilities());
@@ -543,7 +543,7 @@ export const useAgentActivityPresence = ({
   useEffect(() => {
     let disposed = false;
     let source: EventSource | null = null;
-    const store = (events: AgentActivityEvent[]) => {
+    const store = (events: GyredeckEvent[]) => {
       setSessionEventRegistry((current) => {
         const next = mergeSessionEvents(current, events);
         scheduleRegistryWrite(next);
@@ -585,7 +585,7 @@ export const useAgentActivityPresence = ({
       const response = await fetch(`${BRIDGE_URL}/${path}`);
       if (!response.ok) throw new Error(`${path} HTTP ${response.status}`);
       return response.json() as Promise<{
-        recent?: AgentActivityEvent[];
+        recent?: GyredeckEvent[];
         capabilities?: unknown;
       }>;
     };
@@ -629,13 +629,13 @@ export const useAgentActivityPresence = ({
       if (!disposed) {
         setConnection({
           status: source?.readyState === EventSource.CLOSED ? "disconnected" : "error",
-          message: "Waiting for Agent Activity bridge",
+          message: "Waiting for Gyredeck bridge",
         });
       }
     };
     const handle = (message: MessageEvent<string>) => {
       try {
-        const event = normalizeSessionEventIdentity(JSON.parse(message.data) as AgentActivityEvent);
+        const event = normalizeSessionEventIdentity(JSON.parse(message.data) as GyredeckEvent);
         liveEventVersionRef.current += 1;
         setLastLiveEvent(event);
         setPresence((current) => reducePresence(current, event));

@@ -1,12 +1,12 @@
 [package]
-name = "agent-activity-desktop"
+name = "gyredeck-desktop"
 version = "0.1.6"
-description = "Agent Activity desktop presence overlay"
+description = "Gyredeck desktop presence overlay"
 authors = ["Mahiro"]
 edition = "2021"
 
 [lib]
-name = "agent_activity_desktop_lib"
+name = "gyredeck_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

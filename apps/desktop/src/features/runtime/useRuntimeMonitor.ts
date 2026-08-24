@@ -39,7 +39,7 @@ export const useRuntimeMonitor = ({ canUseNativeControls, demoMode, registry, se
     }
     if (!canUseNativeControls) {
       setServices([]);
-      setServicesError("Local services need the native Agent Activity app");
+      setServicesError("Local services need the native Gyredeck app");
       return;
     }
     servicesLoadingRef.current = true;
@@ -87,7 +87,7 @@ export const useRuntimeMonitor = ({ canUseNativeControls, demoMode, registry, se
         status: "unsupported",
         signal: null,
         stillListening: false,
-        error: "Local service control needs the native Agent Activity app",
+        error: "Local service control needs the native Gyredeck app",
       };
     }
     if (servicesControlInFlightRef.current) {

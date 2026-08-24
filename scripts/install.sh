@@ -1,22 +1,22 @@
 #!/bin/bash
 #
-# Agent Activity installer — download the latest release and install it to
+# Gyredeck installer — download the latest release and install it to
 # /Applications. Meant to be piped straight from the repo:
 #
-#   curl -fsSL https://raw.githubusercontent.com/j-kizt/agent-activity/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/j-kizt/gyredeck-macos/main/scripts/install.sh | bash
 #
 set -euo pipefail
 
-REPO="j-kizt/agent-activity"
-APP="Agent Activity.app"
+REPO="j-kizt/gyredeck-macos"
+APP="Gyredeck.app"
 APP_DEST="/Applications/$APP"
 
 if [ "$(uname)" != "Darwin" ]; then
-  echo "Agent Activity is macOS-only." >&2
+  echo "Gyredeck is macOS-only." >&2
   exit 1
 fi
 
-echo "Finding the latest Agent Activity release…"
+echo "Finding the latest Gyredeck release…"
 asset_url="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
   | grep -oE '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+\.app\.tar\.gz"' \
   | sed -E 's/.*"(https[^"]+)"$/\1/' \
@@ -41,7 +41,7 @@ if [ -z "$src" ]; then
 fi
 
 echo "Installing to /Applications…"
-osascript -e "quit app \"Agent Activity\"" 2>/dev/null || true
+osascript -e "quit app \"Gyredeck\"" 2>/dev/null || true
 rm -rf "$APP_DEST"
 cp -R "$src" "/Applications/"
 
@@ -49,4 +49,4 @@ cp -R "$src" "/Applications/"
 xattr -dr com.apple.quarantine "$APP_DEST" 2>/dev/null || true
 
 open "$APP_DEST"
-echo "Installed Agent Activity → $APP_DEST"
+echo "Installed Gyredeck → $APP_DEST"

@@ -6,7 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
 
 const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
-const CONFIG_DIR = [".config", "agent-activity"];
+const CONFIG_DIR = [".config", "gyredeck"];
 
 /** Wait until the standalone bridge answers /health, or throw with captured stderr. */
 const waitForHealth = async (port, stderrRef) => {
@@ -47,7 +47,7 @@ const runAdapter = (adapterPath, args, home, payload) =>
   });
 
 test("install-claude-hooks copies the adapter and merges settings idempotently", async () => {
-  const home = await mkdtemp(join(tmpdir(), "agent-activity-install-"));
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-install-"));
   const settingsPath = join(home, ".claude", "settings.json");
   await mkdir(join(home, ".claude"), { recursive: true });
   // A pre-existing unrelated hook must survive the merge untouched.
@@ -78,7 +78,7 @@ test("install-claude-hooks copies the adapter and merges settings idempotently",
     assert.equal(settings.theme, "dark");
     assert.ok(settings.hooks.Stop.some((entry) => entry.hooks.some((h) => h.command === "say done")));
     // The adapter command is wired for matched and plain events exactly once.
-    const installedHook = join(home, ...CONFIG_DIR, "agent-activity-claude-hook.mjs");
+    const installedHook = join(home, ...CONFIG_DIR, "gyredeck-claude-hook.mjs");
     const command = (event) => `node ${installedHook} --event ${event}`;
     assert.ok(settings.hooks.PreToolUse.some((entry) => entry.matcher === "*" && entry.hooks.some((h) => h.command === command("PreToolUse"))));
     for (const event of ["UserPromptSubmit", "Notification", "Stop", "SessionStart", "SessionEnd", "PreCompact"]) {
@@ -86,22 +86,22 @@ test("install-claude-hooks copies the adapter and merges settings idempotently",
       assert.equal(matches.length, 1, `${event} wired exactly once`);
     }
     // The adapter was copied to the stable config path.
-    assert.match(await readFile(installedHook, "utf8"), /Agent Activity Claude Code Hook Adapter/);
+    assert.match(await readFile(installedHook, "utf8"), /Gyredeck Claude Code Hook Adapter/);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
 });
 
 test("claude adapter relays a Notification into the running bridge", async () => {
-  const home = await mkdtemp(join(tmpdir(), "agent-activity-claude-"));
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-claude-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const port = await freePort();
-  await writeFile(join(home, ...CONFIG_DIR, "agent-activity.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
 
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/agent-activity-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
@@ -109,10 +109,10 @@ test("claude adapter relays a Notification into the running bridge", async () =>
   try {
     const health = await waitForHealth(port, stderrRef);
     assert.equal(health.mode, "standalone");
-    assert.equal(health.name, "agent-activity");
+    assert.equal(health.name, "gyredeck");
 
     const result = await runAdapter(
-      "adapters/claude/agent-activity-claude-hook.mjs",
+      "adapters/claude/gyredeck-claude-hook.mjs",
       ["--event", "Notification"],
       home,
       {
@@ -139,15 +139,15 @@ test("claude adapter relays a Notification into the running bridge", async () =>
 });
 
 test("claude adapter forwards a PreToolUse ingest event with trusted runtime", async () => {
-  const home = await mkdtemp(join(tmpdir(), "agent-activity-claude-ingest-"));
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-claude-ingest-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const port = await freePort();
-  await writeFile(join(home, ...CONFIG_DIR, "agent-activity.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
 
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/agent-activity-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
@@ -155,7 +155,7 @@ test("claude adapter forwards a PreToolUse ingest event with trusted runtime", a
   try {
     await waitForHealth(port, stderrRef);
     const result = await runAdapter(
-      "adapters/claude/agent-activity-claude-hook.mjs",
+      "adapters/claude/gyredeck-claude-hook.mjs",
       ["--event", "PreToolUse"],
       home,
       {
@@ -185,15 +185,15 @@ test("claude adapter forwards a PreToolUse ingest event with trusted runtime", a
 });
 
 test("antigravity adapter allows PreToolUse and relays a tool_start", async () => {
-  const home = await mkdtemp(join(tmpdir(), "agent-activity-agy-"));
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-agy-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const port = await freePort();
-  await writeFile(join(home, ...CONFIG_DIR, "agent-activity.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
 
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/agent-activity-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
@@ -201,7 +201,7 @@ test("antigravity adapter allows PreToolUse and relays a tool_start", async () =
   try {
     await waitForHealth(port, stderrRef);
     const result = await runAdapter(
-      "adapters/antigravity/agent-activity-agy-hook.mjs",
+      "adapters/antigravity/gyredeck-agy-hook.mjs",
       ["--event", "PreToolUse"],
       home,
       {
@@ -228,15 +228,15 @@ test("antigravity adapter allows PreToolUse and relays a tool_start", async () =
 });
 
 test("standalone bridge appends relayed events to the ndjson log", async () => {
-  const home = await mkdtemp(join(tmpdir(), "agent-activity-log-"));
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-log-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const port = await freePort();
-  await writeFile(join(home, ...CONFIG_DIR, "agent-activity.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
 
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/agent-activity-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
@@ -244,14 +244,14 @@ test("standalone bridge appends relayed events to the ndjson log", async () => {
   try {
     await waitForHealth(port, stderrRef);
     const result = await runAdapter(
-      "adapters/claude/agent-activity-claude-hook.mjs",
+      "adapters/claude/gyredeck-claude-hook.mjs",
       ["--event", "Stop"],
       home,
       { hook_event_name: "Stop", cwd: "/tmp/claude-project", session_id: "claude-conv-3" },
     );
     assert.equal(result.code, 0, result.stderr);
 
-    const logPath = join(home, ...CONFIG_DIR, "agent-activity.events.ndjson");
+    const logPath = join(home, ...CONFIG_DIR, "gyredeck.events.ndjson");
     const lines = (await readFile(logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.ok(lines.some((event) => event.type === "bridge_ready"), "bridge_ready persisted");
     const complete = lines.find((event) => event.type === "turn_complete" && event.conversationId === "claude-conv-3");

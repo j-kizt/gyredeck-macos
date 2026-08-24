@@ -2,9 +2,9 @@ import { expect, test } from "@playwright/test";
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
-    if (window.sessionStorage.getItem("agent-activity-test-storage-ready")) return;
+    if (window.sessionStorage.getItem("gyredeck-test-storage-ready")) return;
     window.localStorage.clear();
-    window.sessionStorage.setItem("agent-activity-test-storage-ready", "true");
+    window.sessionStorage.setItem("gyredeck-test-storage-ready", "true");
   });
 });
 
@@ -31,7 +31,7 @@ const seedInactiveGroup = async (page: import("@playwright/test").Page, mixed = 
         },
       ]];
     }));
-    window.localStorage.setItem("agent-activity.session-events", JSON.stringify(registry));
+    window.localStorage.setItem("gyredeck.session-events", JSON.stringify(registry));
   }, { hasWorkingChild: mixed });
   await page.goto("/?demo=1");
 };
@@ -44,14 +44,14 @@ test("grouped completed workspace exposes every child session and guarded clear"
   await expect(page.locator('.session-row[data-status="done"]')).toHaveCount(2);
   await expect(page.locator('li[role="button"]')).toHaveCount(0);
 
-  const expandGroup = page.getByRole("button", { name: "Expand agent-activity, 2 sessions" });
+  const expandGroup = page.getByRole("button", { name: "Expand gyredeck, 2 sessions" });
   await expandGroup.click();
   const completedSection = page.locator(".completed-section");
   await expect(completedSection.locator(".session-child-row")).toHaveCount(2);
-  await expect(completedSection.getByRole("button", { name: "Focus agent-activity session in terminal" })).toHaveCount(2);
-  await expect(completedSection.getByRole("button", { name: "Clear completed agent-activity session" })).toHaveCount(2);
-  await completedSection.getByRole("button", { name: "Clear completed agent-activity session" }).first().click();
-  await expect(completedSection.getByRole("button", { name: "Clear completed agent-activity session" })).toHaveCount(1);
+  await expect(completedSection.getByRole("button", { name: "Focus gyredeck session in terminal" })).toHaveCount(2);
+  await expect(completedSection.getByRole("button", { name: "Clear completed gyredeck session" })).toHaveCount(2);
+  await completedSection.getByRole("button", { name: "Clear completed gyredeck session" }).first().click();
+  await expect(completedSection.getByRole("button", { name: "Clear completed gyredeck session" })).toHaveCount(1);
 
   await page.getByRole("button", { name: "Clear completed", exact: true }).click();
   await expect(page.getByRole("button", { name: "Confirm clear 2" })).toBeVisible();
@@ -62,13 +62,13 @@ test("grouped completed workspace exposes every child session and guarded clear"
 test("completed workspace group can clear all of its done children", async ({ page }) => {
   await page.goto("/?demo=1&demoScenario=multi");
 
-  await page.getByRole("button", { name: "Clear completed agent-activity group" }).click();
+  await page.getByRole("button", { name: "Clear completed gyredeck group" }).click();
 
   const completedSection = page.locator(".completed-section");
-  await expect(completedSection.getByRole("button", { name: "Clear completed agent-activity group" })).toHaveCount(0);
+  await expect(completedSection.getByRole("button", { name: "Clear completed gyredeck group" })).toHaveCount(0);
   await expect(completedSection.getByRole("button", { name: "Clear completed paoplew session" })).toBeVisible();
   await expect(page.locator('.session-section:not(.completed-section) .session-row[data-status="working"]')).toBeVisible();
-  await expect.poll(async () => page.evaluate(() => Object.keys(JSON.parse(window.localStorage.getItem("agent-activity.dismissed-sessions") ?? "{}")))).toEqual([
+  await expect.poll(async () => page.evaluate(() => Object.keys(JSON.parse(window.localStorage.getItem("gyredeck.dismissed-sessions") ?? "{}")))).toEqual([
     "local-conv-demo-done-a",
     "local-conv-demo-done-b",
   ]);
@@ -86,14 +86,14 @@ test("inactive workspace group requires confirmation before removing every child
   await expect(confirmRemove).toBeVisible();
   await expect(confirmRemove).toBeFocused();
   await expect(confirmRemove).toContainText("Remove 6");
-  await expect.poll(async () => page.evaluate(() => Object.keys(JSON.parse(window.localStorage.getItem("agent-activity.deleted-sessions") ?? "{}")))).toEqual([]);
+  await expect.poll(async () => page.evaluate(() => Object.keys(JSON.parse(window.localStorage.getItem("gyredeck.deleted-sessions") ?? "{}")))).toEqual([]);
 
   await confirmRemove.click();
 
   await expect(page.getByRole("button", { name: "Expand admin-template, 6 sessions" })).toHaveCount(0);
   await expect.poll(async () => page.evaluate(() => ({
-    deleted: Object.keys(JSON.parse(window.localStorage.getItem("agent-activity.deleted-sessions") ?? "{}")).sort(),
-    sessions: Object.keys(JSON.parse(window.localStorage.getItem("agent-activity.session-events") ?? "{}")).filter((conversationId) => conversationId.startsWith("local-conv-demo-inactive")),
+    deleted: Object.keys(JSON.parse(window.localStorage.getItem("gyredeck.deleted-sessions") ?? "{}")).sort(),
+    sessions: Object.keys(JSON.parse(window.localStorage.getItem("gyredeck.session-events") ?? "{}")).filter((conversationId) => conversationId.startsWith("local-conv-demo-inactive")),
   }))).toEqual({
     deleted: [
       "local-conv-demo-inactive-1",

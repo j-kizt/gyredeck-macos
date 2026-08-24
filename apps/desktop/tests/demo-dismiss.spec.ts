@@ -1,8 +1,8 @@
 import { expect, test } from "@playwright/test";
 
-const dismissedStorageKey = "agent-activity.dismissed-sessions";
-const deletedStorageKey = "agent-activity.deleted-sessions";
-const sessionEventsStorageKey = "agent-activity.session-events";
+const dismissedStorageKey = "gyredeck.dismissed-sessions";
+const deletedStorageKey = "gyredeck.deleted-sessions";
+const sessionEventsStorageKey = "gyredeck.session-events";
 
 test("clear hides ended sessions until fresh activity resumes", async ({ page }) => {
   await page.goto("/?demo=1");
@@ -18,7 +18,7 @@ test("clear hides ended sessions until fresh activity resumes", async ({ page })
 
   await page.reload();
   await expect.poll(async () => page.evaluate((key) => window.localStorage.getItem(key), dismissedStorageKey), { timeout: 10_000 }).not.toContain("local-conv-demo-1");
-  await expect(page.getByText("agent-activity").first()).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("gyredeck").first()).toBeVisible({ timeout: 10_000 });
 });
 
 test("delete removes a stuck session registry locally", async ({ page }) => {
@@ -68,7 +68,7 @@ test("completed session survives a quiet reload until explicitly cleared", async
             agentId: "agent-demo",
             agentName: "Mahiro Code",
             conversationId: "local-conv-quiet-done",
-            cwd: "/Users/mahiro/ghq/github.com/j-kizt/agent-activity",
+            cwd: "/Users/mahiro/ghq/github.com/j-kizt/gyredeck-macos",
             model: "gpt-5.6-sol",
             permissionMode: "unrestricted",
             type: "turn_complete",

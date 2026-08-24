@@ -1,7 +1,7 @@
-export const AGENT_ACTIVITY_PROTOCOL_VERSION = 2 as const;
+export const GYREDECK_PROTOCOL_VERSION = 2 as const;
 
 
-export interface IAgentActivityBridgeCapabilities {
+export interface IGyredeckBridgeCapabilities {
   events: {
     lifecycle: boolean;
     turns: boolean;
@@ -24,7 +24,7 @@ export interface IAgentActivityBridgeCapabilities {
   };
 }
 
-export const createDefaultBridgeCapabilities = (): IAgentActivityBridgeCapabilities => ({
+export const createDefaultBridgeCapabilities = (): IGyredeckBridgeCapabilities => ({
   events: {
     lifecycle: false,
     turns: false,
@@ -47,7 +47,7 @@ export const createDefaultBridgeCapabilities = (): IAgentActivityBridgeCapabilit
   },
 });
 
-export type AgentActivityEventType =
+export type GyredeckEventType =
   | "bridge_ready"
   | "conversation_open"
   | "conversation_close"
@@ -63,17 +63,17 @@ export type AgentActivityEventType =
   | "llm_end"
   | "bridge_error";
 
-export interface IAgentActivityEventRuntime {
+export interface IGyredeckEventRuntime {
   sourcePid: number;
   sourcePpid: number | null;
   sourceStartedAtMs: number;
   sourceKind: "agyHost" | "hookRelay" | "unknown" | string;
 }
 
-export interface IAgentActivityBaseEvent {
-  version: typeof AGENT_ACTIVITY_PROTOCOL_VERSION;
+export interface IGyredeckBaseEvent {
+  version: typeof GYREDECK_PROTOCOL_VERSION;
   id: string;
-  type: AgentActivityEventType;
+  type: GyredeckEventType;
   timestamp: string;
   agentId: string | null;
   agentName?: string | null;
@@ -81,10 +81,10 @@ export interface IAgentActivityBaseEvent {
   cwd?: string | null;
   model?: string | null;
   permissionMode?: string | null;
-  runtime?: IAgentActivityEventRuntime | null;
+  runtime?: IGyredeckEventRuntime | null;
 }
 
-export interface IAgentActivityBridgeReadyEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckBridgeReadyEvent extends IGyredeckBaseEvent {
   type: "bridge_ready";
   data: {
     port: number;
@@ -94,7 +94,7 @@ export interface IAgentActivityBridgeReadyEvent extends IAgentActivityBaseEvent 
   };
 }
 
-export interface IAgentActivityConversationOpenEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckConversationOpenEvent extends IGyredeckBaseEvent {
   type: "conversation_open";
   data: {
     reason: "startup" | "new" | "resume" | "fork" | string;
@@ -102,7 +102,7 @@ export interface IAgentActivityConversationOpenEvent extends IAgentActivityBaseE
   };
 }
 
-export interface IAgentActivityConversationCloseEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckConversationCloseEvent extends IGyredeckBaseEvent {
   type: "conversation_close";
   data: {
     durationMs: number | null;
@@ -112,7 +112,7 @@ export interface IAgentActivityConversationCloseEvent extends IAgentActivityBase
   };
 }
 
-export interface IAgentActivityTurnStartEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckTurnStartEvent extends IGyredeckBaseEvent {
   type: "turn_start";
   data: {
     inputCount: number;
@@ -120,7 +120,7 @@ export interface IAgentActivityTurnStartEvent extends IAgentActivityBaseEvent {
   };
 }
 
-export interface IAgentActivityTurnStopEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckTurnStopEvent extends IGyredeckBaseEvent {
   type: "turn_stop";
   data: {
     hookEventName: "Stop" | string;
@@ -129,7 +129,7 @@ export interface IAgentActivityTurnStopEvent extends IAgentActivityBaseEvent {
   };
 }
 
-export interface IAgentActivityTurnCompleteEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckTurnCompleteEvent extends IGyredeckBaseEvent {
   type: "turn_complete";
   data: {
     hookEventName: "Stop" | string;
@@ -138,7 +138,7 @@ export interface IAgentActivityTurnCompleteEvent extends IAgentActivityBaseEvent
   };
 }
 
-export interface IAgentActivityAttentionRequestedEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckAttentionRequestedEvent extends IGyredeckBaseEvent {
   type: "attention_requested";
   data: {
     hookEventName: "PermissionRequest" | "AskUserQuestion" | string;
@@ -149,7 +149,7 @@ export interface IAgentActivityAttentionRequestedEvent extends IAgentActivityBas
   };
 }
 
-export interface IAgentActivityToolStartEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckToolStartEvent extends IGyredeckBaseEvent {
   type: "tool_start";
   data: {
     toolCallId: string | null;
@@ -158,7 +158,7 @@ export interface IAgentActivityToolStartEvent extends IAgentActivityBaseEvent {
   };
 }
 
-export interface IAgentActivityToolEndEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckToolEndEvent extends IGyredeckBaseEvent {
   type: "tool_end";
   data: {
     toolCallId: string | null;
@@ -168,14 +168,14 @@ export interface IAgentActivityToolEndEvent extends IAgentActivityBaseEvent {
   };
 }
 
-export interface IAgentActivityCompactStartEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckCompactStartEvent extends IGyredeckBaseEvent {
   type: "compact_start";
   data: {
     trigger: "manual" | "context_window_overflow" | "context_window_limit" | string;
   };
 }
 
-export interface IAgentActivityCompactEndEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckCompactEndEvent extends IGyredeckBaseEvent {
   type: "compact_end";
   data: {
     trigger: "manual" | "context_window_overflow" | "context_window_limit" | string;
@@ -186,7 +186,7 @@ export interface IAgentActivityCompactEndEvent extends IAgentActivityBaseEvent {
   };
 }
 
-export interface IAgentActivityLlmStartEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckLlmStartEvent extends IGyredeckBaseEvent {
   type: "llm_start";
   data: {
     model: string;
@@ -195,13 +195,13 @@ export interface IAgentActivityLlmStartEvent extends IAgentActivityBaseEvent {
   };
 }
 
-export interface IAgentActivityLlmEndError {
+export interface IGyredeckLlmEndError {
   message: string;
   errorType: "llm_error" | "local_backend_error" | string;
   retryable: boolean | null;
 }
 
-export interface IAgentActivityLlmEndEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckLlmEndEvent extends IGyredeckBaseEvent {
   type: "llm_end";
   data: {
     model: string;
@@ -212,11 +212,11 @@ export interface IAgentActivityLlmEndEvent extends IAgentActivityBaseEvent {
       completionTokens: number | null;
       totalTokens: number | null;
     } | null;
-    error?: IAgentActivityLlmEndError;
+    error?: IGyredeckLlmEndError;
   };
 }
 
-export interface IAgentActivityBridgeErrorEvent extends IAgentActivityBaseEvent {
+export interface IGyredeckBridgeErrorEvent extends IGyredeckBaseEvent {
   type: "bridge_error";
   data: {
     message: string;
@@ -224,25 +224,25 @@ export interface IAgentActivityBridgeErrorEvent extends IAgentActivityBaseEvent 
   };
 }
 
-export type AgentActivityEvent =
-  | IAgentActivityBridgeReadyEvent
-  | IAgentActivityConversationOpenEvent
-  | IAgentActivityConversationCloseEvent
-  | IAgentActivityTurnStartEvent
-  | IAgentActivityTurnStopEvent
-  | IAgentActivityTurnCompleteEvent
-  | IAgentActivityAttentionRequestedEvent
-  | IAgentActivityToolStartEvent
-  | IAgentActivityToolEndEvent
-  | IAgentActivityCompactStartEvent
-  | IAgentActivityCompactEndEvent
-  | IAgentActivityLlmStartEvent
-  | IAgentActivityLlmEndEvent
-  | IAgentActivityBridgeErrorEvent;
+export type GyredeckEvent =
+  | IGyredeckBridgeReadyEvent
+  | IGyredeckConversationOpenEvent
+  | IGyredeckConversationCloseEvent
+  | IGyredeckTurnStartEvent
+  | IGyredeckTurnStopEvent
+  | IGyredeckTurnCompleteEvent
+  | IGyredeckAttentionRequestedEvent
+  | IGyredeckToolStartEvent
+  | IGyredeckToolEndEvent
+  | IGyredeckCompactStartEvent
+  | IGyredeckCompactEndEvent
+  | IGyredeckLlmStartEvent
+  | IGyredeckLlmEndEvent
+  | IGyredeckBridgeErrorEvent;
 
 export type {
-  AgentActivityPresenceStatus,
-  IAgentActivityPresence,
-  IAgentActivityPresenceView,
+  GyredeckPresenceStatus,
+  IGyredeckPresence,
+  IGyredeckPresenceView,
 } from "./presence.js";
 export { createInitialPresence, getPresenceView, reducePresence } from "./presence.js";

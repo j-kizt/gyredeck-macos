@@ -1,10 +1,10 @@
-import type { IAgentActivityEventRuntime } from "@agent-activity/protocol";
+import type { IGyredeckEventRuntime } from "@gyredeck/protocol";
 import type { ILocalService, ILocalServiceOwnerTarget, IRuntimeTargetSource } from "./types";
 
 const GIB = 1024 ** 3;
 export const LOCAL_SERVICE_OWNER_TARGET_LIMIT = 512;
 
-const isHostRuntime = (runtime: IAgentActivityEventRuntime | null | undefined): runtime is IAgentActivityEventRuntime =>
+const isHostRuntime = (runtime: IGyredeckEventRuntime | null | undefined): runtime is IGyredeckEventRuntime =>
   runtime?.sourceKind === "agyHost" && Number.isInteger(runtime.sourcePid) && runtime.sourcePid > 1 && Number.isFinite(runtime.sourceStartedAtMs);
 
 export const buildLocalServiceOwnerTargets = ({ sessions, registry }: IRuntimeTargetSource): ILocalServiceOwnerTarget[] => {
@@ -113,9 +113,9 @@ export const createDemoLocalServices = (): ILocalService[] => [
     processStartTimeMs: DEMO_SERVICES_BASE_STARTED_AT_MS - 3 * 60 * 60_000,
     processName: "bun",
     parentProcessId: 16_500,
-    parentProcessName: "Agent Activity",
+    parentProcessName: "Gyredeck",
     executablePath: "/Users/mahiro/.bun/bin/bun",
-    commandLine: "bun /Applications/Agent Activity.app/Contents/Resources/agent-activity-bridge.mjs --port 47621",
+    commandLine: "bun /Applications/Gyredeck.app/Contents/Resources/gyredeck-bridge.mjs --port 47621",
     userId: 501,
     physicalFootprintBytes: 42 * 1024 ** 2,
     residentSizeBytes: 31 * 1024 ** 2,
@@ -125,10 +125,10 @@ export const createDemoLocalServices = (): ILocalService[] => [
     webFrontend: false,
     httpTitle: null,
     url: "http://127.0.0.1:47621",
-    cwd: "/Users/mahiro/ghq/github.com/j-kizt/agent-activity",
-    owner: { conversationId: "local-conv-agent-activity", project: "agent-activity" },
+    cwd: "/Users/mahiro/ghq/github.com/j-kizt/gyredeck-macos",
+    owner: { conversationId: "local-conv-gyredeck", project: "gyredeck" },
     controlAvailable: false,
-    controlUnavailableReason: "Agent Activity bridge is protected",
+    controlUnavailableReason: "Gyredeck bridge is protected",
   },
   {
     processId: 16_590,

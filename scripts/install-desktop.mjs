@@ -5,10 +5,10 @@ import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
-const appName = "Agent Activity.app";
+const appName = "Gyredeck.app";
 const builtApp = join(root, "apps/desktop/src-tauri/target/release/bundle/macos", appName);
 const fallbackApp = join(root, "apps/desktop/src-tauri/target/release", appName);
-const installDir = process.env.AGENT_ACTIVITY_INSTALL_DIR || "/Applications";
+const installDir = process.env.GYREDECK_INSTALL_DIR || "/Applications";
 const installPath = join(installDir, appName);
 const userApplicationsPath = join(homedir(), "Applications", appName);
 
@@ -20,7 +20,7 @@ const run = (command, args) => {
 // createUpdaterArtifacts signs the bundle at build time, so a local install needs
 // the updater signing key. Load it from the local key file when present so
 // `pnpm desktop:install` works without manually exporting env vars.
-const signingKeyPath = join(homedir(), ".config", "agent-activity", "agent-activity-updater.key");
+const signingKeyPath = join(homedir(), ".config", "gyredeck", "gyredeck-updater.key");
 if (!process.env.TAURI_SIGNING_PRIVATE_KEY && existsSync(signingKeyPath)) {
   process.env.TAURI_SIGNING_PRIVATE_KEY = readFileSync(signingKeyPath, "utf8").trim();
   process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ??= "";
@@ -30,14 +30,14 @@ run("pnpm", ["desktop:build"]);
 
 const sourceApp = existsSync(builtApp) ? builtApp : fallbackApp;
 if (!existsSync(sourceApp)) {
-  console.error(`Agent Activity app bundle not found at ${builtApp}`);
+  console.error(`Gyredeck app bundle not found at ${builtApp}`);
   process.exit(1);
 }
 
 // Replacing an app bundle does not reload an already-running process. Stop the
 // current menu-bar instance before copying so the installed UI cannot remain on
 // stale in-memory code after a successful install.
-spawnSync("pkill", ["-x", "agent-activity-desktop"], { stdio: "ignore" });
+spawnSync("pkill", ["-x", "gyredeck-desktop"], { stdio: "ignore" });
 
 try {
   mkdirSync(installDir, { recursive: true });
@@ -46,9 +46,9 @@ try {
 } catch (error) {
   console.error(`Failed to install ${appName} → ${installPath}`);
   console.error(error instanceof Error ? error.message : error);
-  if (!process.env.AGENT_ACTIVITY_INSTALL_DIR && installDir === "/Applications") {
+  if (!process.env.GYREDECK_INSTALL_DIR && installDir === "/Applications") {
     console.error(
-      `If /Applications is not writable from your shell, rerun with AGENT_ACTIVITY_INSTALL_DIR=${join(
+      `If /Applications is not writable from your shell, rerun with GYREDECK_INSTALL_DIR=${join(
         homedir(),
         "Applications",
       )} pnpm desktop:install`,

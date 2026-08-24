@@ -91,7 +91,6 @@ pub struct LocalServiceOwnerTarget {
     pub process_id: i32,
     pub expected_start_time_ms: u64,
     pub project: String,
-    pub herdr_pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -99,7 +98,6 @@ pub struct LocalServiceOwnerTarget {
 pub struct LocalServiceOwner {
     pub conversation_id: String,
     pub project: String,
-    pub herdr_pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -526,21 +524,6 @@ mod macos {
         Some(value.chars().take(maximum).collect())
     }
 
-    fn safe_herdr_pane_id(value: &str) -> Option<String> {
-        let pane_id = safe_label(value, 80)?;
-        let (workspace, pane) = pane_id.split_once(":p")?;
-        (workspace.starts_with('w')
-            && workspace.len() >= 2
-            && workspace[1..]
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric())
-            && !pane.is_empty()
-            && pane
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric()))
-        .then_some(pane_id)
-    }
-
     fn match_service_owner(
         ancestry: &[ProcessIdentity],
         targets: &[LocalServiceOwnerTarget],
@@ -555,14 +538,9 @@ mod macos {
                 {
                     return None;
                 }
-                let herdr_pane_id = match target.herdr_pane_id.as_deref() {
-                    Some(pane_id) => Some(safe_herdr_pane_id(pane_id)?),
-                    None => None,
-                };
                 Some(LocalServiceOwner {
                     conversation_id: safe_label(&target.conversation_id, 160)?,
                     project: safe_label(&target.project, 120)?,
-                    herdr_pane_id,
                 })
             })
         })
@@ -783,7 +761,7 @@ mod macos {
             return Some("Agent Activity process is protected".to_string());
         }
         if process_is_exact_owner_target(process, owner_targets) {
-            return Some("Letta host is protected".to_string());
+            return Some("Agent Activity host is protected".to_string());
         }
         if !process_owned_by_current_user(process) {
             return Some("Only current-user services can be stopped".to_string());
@@ -1345,7 +1323,7 @@ mod macos {
                             process.as_ref().and_then(|identity| {
                                 protected_host_identities
                                     .contains(&(identity.pid, identity.start_time_ms))
-                                    .then(|| "Letta host is protected".to_string())
+                                    .then(|| "Agent Activity host is protected".to_string())
                             })
                         },
                     );
@@ -1787,34 +1765,16 @@ mod macos {
                 process_id: 81_354,
                 expected_start_time_ms: 1_750,
                 project: "admin-template".to_string(),
-                herdr_pane_id: Some("wH:p1".to_string()),
             }];
             let owner = match_service_owner(&ancestry, &targets).expect("exact ancestor owner");
             assert_eq!(owner.project, "admin-template");
-            assert_eq!(owner.herdr_pane_id.as_deref(), Some("wH:p1"));
+            assert_eq!(owner.conversation_id, "local-conv-haabiz");
 
             let stale_targets = vec![LocalServiceOwnerTarget {
                 expected_start_time_ms: 10_000,
                 ..targets[0].clone()
             }];
             assert!(match_service_owner(&ancestry, &stale_targets).is_none());
-
-            let malformed_pane_targets = vec![LocalServiceOwnerTarget {
-                herdr_pane_id: Some("not a pane".to_string()),
-                ..targets[0].clone()
-            }];
-            assert!(match_service_owner(&ancestry, &malformed_pane_targets).is_none());
-
-            let pane_less_targets = vec![LocalServiceOwnerTarget {
-                herdr_pane_id: None,
-                ..targets[0].clone()
-            }];
-            assert_eq!(
-                match_service_owner(&ancestry, &pane_less_targets)
-                    .expect("trusted non-Herdr owner")
-                    .herdr_pane_id,
-                None
-            );
         }
 
         #[test]
@@ -1860,11 +1820,10 @@ mod macos {
                         process_id: process.pid,
                         expected_start_time_ms: process.start_time_ms,
                         project: "agent-activity".to_string(),
-                        herdr_pane_id: None,
                     }],
                 )
                 .as_deref(),
-                Some("Letta host is protected")
+                Some("Agent Activity host is protected")
             );
             assert_eq!(
                 control_unavailable_reason(

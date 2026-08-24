@@ -5,7 +5,7 @@ const GIB = 1024 ** 3;
 export const LOCAL_SERVICE_OWNER_TARGET_LIMIT = 512;
 
 const isHostRuntime = (runtime: IAgentActivityEventRuntime | null | undefined): runtime is IAgentActivityEventRuntime =>
-  runtime?.sourceKind === "lettaHost" && Number.isInteger(runtime.sourcePid) && runtime.sourcePid > 1 && Number.isFinite(runtime.sourceStartedAtMs);
+  runtime?.sourceKind === "agyHost" && Number.isInteger(runtime.sourcePid) && runtime.sourcePid > 1 && Number.isFinite(runtime.sourceStartedAtMs);
 
 export const buildLocalServiceOwnerTargets = ({ sessions, registry }: IRuntimeTargetSource): ILocalServiceOwnerTarget[] => {
   const byProcessIdentity = new Map<string, { target: ILocalServiceOwnerTarget; lastActivityAt: string }>();
@@ -17,10 +17,6 @@ export const buildLocalServiceOwnerTargets = ({ sessions, registry }: IRuntimeTa
       processId: runtimeEvent.runtime.sourcePid,
       expectedStartTimeMs: runtimeEvent.runtime.sourceStartedAtMs,
       project: session.project,
-      herdrPaneId: session.herdrTarget?.sourcePid === runtimeEvent.runtime.sourcePid &&
-        Math.abs(session.herdrTarget.sourceStartedAtMs - runtimeEvent.runtime.sourceStartedAtMs) <= 2_000
-        ? session.herdrTarget.paneId
-        : null,
     };
     const key = `${target.processId}:${target.expectedStartTimeMs}`;
     const previous = byProcessIdentity.get(key);
@@ -73,7 +69,7 @@ export const createDemoLocalServices = (): ILocalService[] => [
     processStartTimeMs: DEMO_SERVICES_BASE_STARTED_AT_MS - 32 * 60_000,
     processName: "node",
     parentProcessId: 40_600,
-    parentProcessName: "letta",
+    parentProcessName: "Claude Code",
     executablePath: "/opt/homebrew/bin/node",
     commandLine: "node /Users/mahiro/ghq/github.com/haabiz/admin-template/apps/catalog/node_modules/.bin/vite --port 5173",
     userId: 501,
@@ -86,7 +82,7 @@ export const createDemoLocalServices = (): ILocalService[] => [
     httpTitle: "Haabiz UI",
     url: "http://127.0.0.1:5173",
     cwd: "/Users/mahiro/ghq/github.com/haabiz/admin-template/apps/catalog",
-    owner: { conversationId: "local-conv-haabiz", project: "admin-template", herdrPaneId: "wH:p1" },
+    owner: { conversationId: "local-conv-haabiz", project: "admin-template" },
     controlAvailable: true,
     controlUnavailableReason: null,
   },
@@ -95,7 +91,7 @@ export const createDemoLocalServices = (): ILocalService[] => [
     processStartTimeMs: DEMO_SERVICES_BASE_STARTED_AT_MS - 18 * 60_000,
     processName: "bun",
     parentProcessId: 40_610,
-    parentProcessName: "letta",
+    parentProcessName: "Claude Code",
     executablePath: "/Users/mahiro/.bun/bin/bun",
     commandLine: "bun run /Users/mahiro/ghq/github.com/j-kizt/building-frontends-pilot-morrow-one/server.ts",
     userId: 501,
@@ -108,7 +104,7 @@ export const createDemoLocalServices = (): ILocalService[] => [
     httpTitle: "MORROW — ONE",
     url: "http://127.0.0.1:4173",
     cwd: "/Users/mahiro/ghq/github.com/j-kizt/building-frontends-pilot-morrow-one",
-    owner: { conversationId: "local-conv-j-kizt", project: "j-kizt", herdrPaneId: "wB:pH" },
+    owner: { conversationId: "local-conv-j-kizt", project: "j-kizt" },
     controlAvailable: true,
     controlUnavailableReason: null,
   },
@@ -130,7 +126,7 @@ export const createDemoLocalServices = (): ILocalService[] => [
     httpTitle: null,
     url: "http://127.0.0.1:47621",
     cwd: "/Users/mahiro/ghq/github.com/j-kizt/agent-activity",
-    owner: { conversationId: "local-conv-agent-activity", project: "agent-activity", herdrPaneId: "wV:p1" },
+    owner: { conversationId: "local-conv-agent-activity", project: "agent-activity" },
     controlAvailable: false,
     controlUnavailableReason: "Agent Activity bridge is protected",
   },
@@ -139,7 +135,7 @@ export const createDemoLocalServices = (): ILocalService[] => [
     processStartTimeMs: DEMO_SERVICES_BASE_STARTED_AT_MS - 9 * 60_000,
     processName: "Python",
     parentProcessId: 16_500,
-    parentProcessName: "letta",
+    parentProcessName: "Claude Code",
     executablePath: "/usr/bin/python3",
     commandLine: "/usr/bin/python3 -m http.server 8000",
     userId: 501,
@@ -152,7 +148,7 @@ export const createDemoLocalServices = (): ILocalService[] => [
     httpTitle: "Directory listing for /",
     url: "http://127.0.0.1:8000",
     cwd: "/Users/mahiro/ghq/github.com/j-kizt/building-frontends-pilot-morrow-one",
-    owner: { conversationId: "local-conv-j-kizt", project: "j-kizt", herdrPaneId: "wB:pH" },
+    owner: { conversationId: "local-conv-j-kizt", project: "j-kizt" },
     controlAvailable: true,
     controlUnavailableReason: null,
   },

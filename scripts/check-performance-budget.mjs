@@ -9,10 +9,7 @@ const assetRoot = join(distRoot, "assets");
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  haloBotAssetBytes: 50_000,
-  haloformAssetBytes: 85_000,
   jsGzipBytes: 105_500,
-  movementAssetBytes: 28_250_000,
 };
 
 const walk = async (directory) => {
@@ -47,38 +44,16 @@ const js = largestAsset(".js");
 if (!css || !js) throw new Error("desktop build is missing its primary CSS or JavaScript asset");
 
 const dist = await walk(distRoot);
-const movementAssets = await walk(join(distRoot, "mediapipe"));
-const haloBotAssets = await walk(join(distRoot, "mascots", "agent-activity-roster", "body", "halo-bot"));
-const haloformAssets = await walk(join(distRoot, "mascots", "agent-activity-roster", "body", "haloform"));
-const movementRuntimeBytes = assets
-  .filter((asset) => asset.name.startsWith("vision_bundle-"))
-  .reduce((total, asset) => total + asset.bytes, 0);
-const movementAssetBytes = movementAssets.bytes + movementRuntimeBytes;
-const coreDistBytes = dist.bytes - movementAssetBytes - haloBotAssets.bytes - haloformAssets.bytes;
-const legacyEntries = [];
-const findLegacy = async (directory, relative = "") => {
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    const nextRelative = join(relative, entry.name);
-    if (nextRelative.toLowerCase().includes("session-cat")) legacyEntries.push(nextRelative);
-    if (entry.isDirectory()) await findLegacy(join(directory, entry.name), nextRelative);
-  }
-};
-await findLegacy(distRoot);
+const coreDistBytes = dist.bytes;
 
 const payload = {
-  baselineCommit: "3fc8ff8",
-  budgetRevision: "complete-pixabots-catalog",
   budgets: BUDGETS,
   current: {
     cssGzipBytes: css.gzipBytes,
     coreDistBytes,
     distFiles: dist.files,
-    haloBotAssetBytes: haloBotAssets.bytes,
-    haloformAssetBytes: haloformAssets.bytes,
     jsGzipBytes: js.gzipBytes,
-    movementAssetBytes,
   },
-  legacySessionCatEntries: legacyEntries,
 };
 
 console.log(JSON.stringify(payload, null, 2));
@@ -86,7 +61,3 @@ console.log(JSON.stringify(payload, null, 2));
 if (css.gzipBytes > BUDGETS.cssGzipBytes) throw new Error(`CSS gzip budget exceeded: ${css.gzipBytes} > ${BUDGETS.cssGzipBytes}`);
 if (js.gzipBytes > BUDGETS.jsGzipBytes) throw new Error(`JavaScript gzip budget exceeded: ${js.gzipBytes} > ${BUDGETS.jsGzipBytes}`);
 if (coreDistBytes > BUDGETS.coreDistBytes) throw new Error(`desktop core dist budget exceeded: ${coreDistBytes} > ${BUDGETS.coreDistBytes}`);
-if (haloBotAssets.bytes > BUDGETS.haloBotAssetBytes) throw new Error(`Halo Bot asset budget exceeded: ${haloBotAssets.bytes} > ${BUDGETS.haloBotAssetBytes}`);
-if (haloformAssets.bytes > BUDGETS.haloformAssetBytes) throw new Error(`Haloform asset budget exceeded: ${haloformAssets.bytes} > ${BUDGETS.haloformAssetBytes}`);
-if (movementAssetBytes > BUDGETS.movementAssetBytes) throw new Error(`movement asset budget exceeded: ${movementAssetBytes} > ${BUDGETS.movementAssetBytes}`);
-if (legacyEntries.length > 0) throw new Error(`legacy session-cat assets remain in dist: ${legacyEntries.join(", ")}`);

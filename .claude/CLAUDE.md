@@ -5,7 +5,7 @@
 - Agent Activity is a local-first, Letta-free presence companion and Tauri desktop app for AI coding agents (Claude Code / Codex / Antigravity). Start with `README.md` (product) and `.claude/context/` (architecture, event protocol, presence model, services, development, releasing) for context.
 - Use `pnpm` only (`packageManager: pnpm@10.33.0`). Do not add npm/yarn lockfiles.
 - Preserve local/generated state. `.agent-state/`, `.letta/`, `.cocoindex_code/`, `node_modules/`, build output, and test reports are ignored local state.
-- After changing `mods/agent-activity.js`, install/reload the Letta mod before judging live behavior. After native desktop changes, run an appropriate desktop check/build/install path.
+- After changing an adapter under `adapters/`, reinstall the corresponding hook (Settings → Plugins, or `pnpm hooks:install`) before judging live behavior. After native desktop changes, run an appropriate desktop check/build/install path.
 - Do not commit or push unless explicitly asked.
 
 ## Codebase Search

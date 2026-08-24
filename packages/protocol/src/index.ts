@@ -67,17 +67,7 @@ export interface IAgentActivityEventRuntime {
   sourcePid: number;
   sourcePpid: number | null;
   sourceStartedAtMs: number;
-  sourceKind: "lettaHost" | "agyHost" | "hookRelay" | "unknown" | string;
-  herdr?: IAgentActivityHerdrTarget | null;
-}
-
-export interface IAgentActivityHerdrTarget {
-  socketPath: string;
-  paneId: string;
-  sourcePid: number;
-  sourceStartedAtMs: number;
-  workspaceId?: string | null;
-  tabId?: string | null;
+  sourceKind: "agyHost" | "hookRelay" | "unknown" | string;
 }
 
 export interface IAgentActivityBaseEvent {

@@ -1,4 +1,4 @@
-import type { AgentActivityEvent, IAgentActivityHerdrTarget } from "@agent-activity/protocol";
+import type { AgentActivityEvent } from "@agent-activity/protocol";
 
 export type ActivityKind =
   | "session" | "thinking" | "planning" | "tool" | "shell" | "editing"
@@ -22,7 +22,6 @@ export interface ISessionSummary {
   model: string;
   status: "idle" | "working" | "attention" | "inactive" | "done" | "error";
   lastActivityAt: string;
-  herdrTarget: IAgentActivityHerdrTarget | null;
 }
 
 export interface ISessionDetail extends ISessionSummary {

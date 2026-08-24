@@ -82,7 +82,7 @@ const LocalServiceRow = ({ expanded, onControl, onOpen, onResult, onToggle, serv
     ? service.httpTitle
     : nameFromCommand(service.commandLine) ?? projectFromCwd(service.cwd) ?? service.processName;
   const ownerLabel = service.owner
-    ? `Started by Letta · ${service.owner.project}${service.owner.herdrPaneId ? ` · ${service.owner.herdrPaneId}` : ""}`
+    ? `Started by agent · ${service.owner.project}`
     : null;
   const detailsId = `local-service-${service.processId}-${service.port}-details`;
   const [phase, setPhase] = useState<LocalServiceControlPhase>("idle");

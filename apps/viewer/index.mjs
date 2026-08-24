@@ -175,6 +175,6 @@ async function connect() {
 
 connect().catch((error) => {
   console.error(`Agent Activity Viewer failed: ${error.message}`);
-  console.error("Is the Letta mod active? Try /reload, then check http://127.0.0.1:47621/health");
+  console.error("Is the Agent Activity bridge running? Check http://127.0.0.1:47621/health");
   process.exitCode = 1;
 });

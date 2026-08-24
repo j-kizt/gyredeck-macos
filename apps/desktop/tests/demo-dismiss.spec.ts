@@ -14,7 +14,7 @@ test("clear hides ended sessions until fresh activity resumes", async ({ page })
   await clearButton.click();
 
   await expect.poll(async () => page.evaluate((key) => window.localStorage.getItem(key), dismissedStorageKey)).toContain("local-conv-demo-1");
-  await expect(page.getByText("Waiting for Letta Code")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Waiting for Claude Code")).toBeVisible({ timeout: 10_000 });
 
   await page.reload();
   await expect.poll(async () => page.evaluate((key) => window.localStorage.getItem(key), dismissedStorageKey), { timeout: 10_000 }).not.toContain("local-conv-demo-1");

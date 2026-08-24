@@ -52,8 +52,6 @@ export const providerLabel = (sourceKind: string | null | undefined): string => 
       return "Codex";
     case "agyHost":
       return "Antigravity";
-    case "lettaHost":
-      return "Letta";
     default:
       return "Agent";
   }

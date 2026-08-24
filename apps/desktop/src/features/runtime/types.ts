@@ -5,7 +5,6 @@ export interface ILocalServiceOwnerTarget {
   processId: number;
   expectedStartTimeMs: number;
   project: string;
-  herdrPaneId: string | null;
 }
 
 export type LocalServiceKind = "http" | "tcp";
@@ -13,7 +12,6 @@ export type LocalServiceKind = "http" | "tcp";
 export interface ILocalServiceOwner {
   conversationId: string;
   project: string;
-  herdrPaneId: string | null;
 }
 
 export interface ILocalService {

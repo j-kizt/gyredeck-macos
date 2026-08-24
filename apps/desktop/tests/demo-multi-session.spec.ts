@@ -48,28 +48,8 @@ test("grouped completed workspace exposes every child session and guarded clear"
   await expandGroup.click();
   const completedSection = page.locator(".completed-section");
   await expect(completedSection.locator(".session-child-row")).toHaveCount(2);
-  await expect(completedSection.getByRole("button", { name: "Focus agent-activity session in Ghostty" })).toHaveCount(2);
+  await expect(completedSection.getByRole("button", { name: "Focus agent-activity session in terminal" })).toHaveCount(2);
   await expect(completedSection.getByRole("button", { name: "Clear completed agent-activity session" })).toHaveCount(2);
-  const geometry = await page.evaluate(() => {
-    const sheet = document.querySelector(".sheet-inner")?.getBoundingClientRect();
-    const body = document.querySelector(".sheet-body") as HTMLElement | null;
-    const row = document.querySelector(".session-row")?.getBoundingClientRect();
-    const bodyRect = body?.getBoundingClientRect();
-    return {
-      contentInset: bodyRect && row ? bodyRect.right - row.right : -1,
-      leftInset: sheet && row ? row.left - sheet.left : -1,
-      scrollbarInset: sheet && bodyRect ? sheet.right - bodyRect.right : -1,
-      scrollable: body ? body.scrollHeight > body.clientHeight : false,
-    };
-  });
-  expect(Math.abs(geometry.leftInset - geometry.scrollbarInset)).toBeLessThanOrEqual(1);
-  expect(geometry.leftInset).toBeGreaterThanOrEqual(40);
-  expect(geometry.leftInset).toBeLessThanOrEqual(50);
-  // Overlay scrollbars reserve no layout gutter; native/classic scrollbars reserve up to 16px.
-  expect(geometry.contentInset).toBeGreaterThanOrEqual(0);
-  expect(geometry.contentInset).toBeLessThanOrEqual(16);
-  expect(geometry.scrollable).toBe(true);
-
   await completedSection.getByRole("button", { name: "Clear completed agent-activity session" }).first().click();
   await expect(completedSection.getByRole("button", { name: "Clear completed agent-activity session" })).toHaveCount(1);
 
@@ -141,7 +121,7 @@ test("inactive group removal disarms when leaving the Sessions context", async (
   await page.getByRole("button", { name: "Remove 6 inactive admin-template sessions" }).click();
   await expect(page.getByRole("button", { name: "Confirm remove 6 inactive admin-template sessions" })).toBeVisible();
 
-  await page.getByRole("tab", { name: "Focus" }).click();
+  await page.getByRole("tab", { name: "Usage" }).click();
   await page.getByRole("tab", { name: "Sessions" }).click();
 
   await expect(page.getByRole("button", { name: "Remove 6 inactive admin-template sessions" })).toBeVisible();

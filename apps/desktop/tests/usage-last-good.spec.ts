@@ -5,9 +5,7 @@ test("Usage keeps Codex values visible and labels them outdated after a refresh 
     let codexCalls = 0;
     (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
       invoke: async (command: string) => {
-        if (command === "notch_metrics") return [184, 36];
         if (command === "set_keep_awake") return false;
-        if (command === "set_panel_open") return true;
         if (command === "codex_usage") {
           codexCalls += 1;
           if (codexCalls > 1) throw new Error("Codex usage is rate limited. Try again shortly.");
@@ -42,8 +40,6 @@ test("Usage keeps Codex values visible and labels them outdated after a refresh 
   });
 
   await page.goto("/");
-  await page.getByRole("button", { name: "Open Agent Activity" }).click();
-  await expect(page.getByRole("region", { name: "Agent Activity panel" })).toBeVisible();
   await page.getByRole("tab", { name: "Usage" }).click();
   await expect(page.getByText("58% left")).toBeVisible();
   await expect(page.getByText("Rate Limit Resets")).toBeVisible();
@@ -67,9 +63,7 @@ test("Usage meters communicate remaining quota with semantic color and copy", as
   await page.addInitScript(() => {
     (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
       invoke: async (command: string) => {
-        if (command === "notch_metrics") return [184, 36];
         if (command === "set_keep_awake") return false;
-        if (command === "set_panel_open") return true;
         if (command === "codex_usage") {
           return {
             providerId: "codex",
@@ -90,7 +84,6 @@ test("Usage meters communicate remaining quota with semantic color and copy", as
   });
 
   await page.goto("/");
-  await page.getByRole("button", { name: "Open Agent Activity" }).click();
   await page.getByRole("tab", { name: "Usage" }).click();
 
   const meters = page.locator(".usage-meter");
@@ -119,7 +112,7 @@ test("Usage meters communicate remaining quota with semantic color and copy", as
     "rgb(255, 107, 102)",
   ]);
 
-  await page.getByRole("tab", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Usage settings" }).click();
   await page.getByRole("radio", { name: "Used" }).click();
   await page.getByRole("tab", { name: "Codex" }).click();
 
@@ -141,9 +134,7 @@ test("Usage marks a native cached Status response as outdated instead of online"
     let claudeCalls = 0;
     (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
       invoke: async (command: string) => {
-        if (command === "notch_metrics") return [184, 36];
         if (command === "set_keep_awake") return false;
-        if (command === "set_panel_open") return true;
         if (command === "claude_usage") {
           claudeCalls += 1;
           const lines = [
@@ -167,7 +158,6 @@ test("Usage marks a native cached Status response as outdated instead of online"
   });
 
   await page.goto("/");
-  await page.getByRole("button", { name: "Open Agent Activity" }).click();
   await page.getByRole("tab", { name: "Usage" }).click();
   await page.getByRole("tab", { name: "Claude Code Online" }).click();
   await expect(page.getByText("75% left")).toBeVisible();
@@ -185,9 +175,7 @@ test("Usage does not label a status-only provider response as outdated", async (
   await page.addInitScript(() => {
     (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
       invoke: async (command: string) => {
-        if (command === "notch_metrics") return [184, 36];
         if (command === "set_keep_awake") return false;
-        if (command === "set_panel_open") return true;
         if (command === "claude_usage") {
           return {
             providerId: "claude",
@@ -202,7 +190,6 @@ test("Usage does not label a status-only provider response as outdated", async (
   });
 
   await page.goto("/");
-  await page.getByRole("button", { name: "Open Agent Activity" }).click();
   await page.getByRole("tab", { name: "Usage" }).click();
   await page.getByRole("tab", { name: "Claude Code" }).click();
 
@@ -214,9 +201,7 @@ test("Usage keeps a valid empty Antigravity summary online as no quota data", as
   await page.addInitScript(() => {
     (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
       invoke: async (command: string) => {
-        if (command === "notch_metrics") return [184, 36];
         if (command === "set_keep_awake") return false;
-        if (command === "set_panel_open") return true;
         if (command === "agy_usage") {
           return {
             providerId: "agy",
@@ -232,7 +217,6 @@ test("Usage keeps a valid empty Antigravity summary online as no quota data", as
   });
 
   await page.goto("/");
-  await page.getByRole("button", { name: "Open Agent Activity" }).click();
   await page.getByRole("tab", { name: "Usage" }).click();
   await page.getByRole("tab", { name: "Antigravity Online" }).click();
 
@@ -252,16 +236,13 @@ test("Usage hydrates a persisted last-good snapshot before a reload refresh comp
     }));
     (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
       invoke: async (command: string) => {
-        if (command === "notch_metrics") return [184, 36];
         if (command === "set_keep_awake") return false;
-        if (command === "set_panel_open") return true;
         throw new Error(`${command} unavailable`);
       },
     };
   });
 
   await page.goto("/");
-  await page.getByRole("button", { name: "Open Agent Activity" }).click();
   await page.getByRole("tab", { name: "Usage" }).click();
 
   await expect(page.getByText("58% left")).toBeVisible();

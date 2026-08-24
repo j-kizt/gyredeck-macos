@@ -682,12 +682,8 @@ const App = () => {
         conversationId: session.conversationId,
         cwd: "cwd" in session ? session.cwd : session.workspacePath,
         terminal,
-        herdrSocketPath: session.herdrTarget?.socketPath ?? null,
-        herdrPaneId: session.herdrTarget?.paneId ?? null,
-        herdrSourcePid: session.herdrTarget?.sourcePid ?? null,
-        herdrSourceStartedAtMs: session.herdrTarget?.sourceStartedAtMs ?? null,
       });
-      const exactMatch = message.startsWith("Focused Herdr ·") || message.startsWith("Focused iTerm ·") || message.startsWith("Focused Ghostty ·");
+      const exactMatch = message.startsWith("Focused iTerm ·") || message.startsWith("Focused Ghostty ·");
       setSessionAction({ ok: exactMatch, message });
     } catch (error) {
       setSessionAction({ ok: false, message: error instanceof Error ? error.message : "Terminal focus failed" });

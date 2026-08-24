@@ -924,8 +924,7 @@ const App = () => {
               )}
             </div>
 
-            {(setupOpen || selectedSession || (activeMainTab === "sessions" && activitySession?.status === "done")) ? (
-              <div className={`sheet-footer ${selectedSession ? "session-context-footer" : ""}`}>
+            <div className={`sheet-footer ${selectedSession ? "session-context-footer" : "copyright-footer"}`}>
                 {selectedSession ? (
                   <>
                     <div className="session-context-actions">
@@ -965,26 +964,18 @@ const App = () => {
                   </>
                 ) : (
                   <>
-                    <span className="footer-meta">{workspace} · {model}</span>
-                    <span className="spacer" />
-                    {setupOpen ? (
-                      <div className="footer-actions">
-                        <button className="pill-btn" type="button" onClick={backToSessions} data-tauri-drag-region="false">
-                          <List size={12} strokeWidth={2.3} />
-                          Sessions
-                        </button>
-                      </div>
-                    ) : null}
+                    <span className="footer-copyright">© 2026 Agent Activity · J-Kitz</span>
                     {!setupOpen && activitySession?.status === "done" ? (
-                      <button className="pill-btn accent" type="button" onClick={(event) => { event.stopPropagation(); acknowledgeDone(); }} data-tauri-drag-region="false">
+                      <button className="pill-btn accent footer-done-close" type="button" onClick={(event) => { event.stopPropagation(); acknowledgeDone(); }} data-tauri-drag-region="false">
                         <Check size={12} strokeWidth={2.4} />
                         Close
                       </button>
-                    ) : null}
+                    ) : (
+                      <span className="footer-version">{updater.currentVersion ? `v${updater.currentVersion}` : ""}</span>
+                    )}
                   </>
                 )}
               </div>
-            ) : null}
           </div>
         </div>
     </main>

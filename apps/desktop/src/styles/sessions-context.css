@@ -707,3 +707,23 @@
 .footer-actions .pill-btn {
   padding-inline: 9px;
 }
+
+.sheet-footer.copyright-footer {
+  justify-content: space-between;
+}
+
+.footer-copyright,
+.footer-version {
+  color: var(--text-3);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+
+.footer-version {
+  margin-left: auto;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+
+.footer-done-close {
+  margin-left: auto;
+}

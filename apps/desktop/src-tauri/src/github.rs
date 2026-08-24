@@ -266,7 +266,35 @@ fn switch_account_blocking(user: &str) -> Result<String, String> {
         return Err("Invalid account name".to_string());
     }
     run_gh(&["auth", "switch", "--hostname", "github.com", "--user", user])?;
+    // Best-effort: keep git's commit identity in step with the active account.
+    // gh auth switch only changes the token, not user.name/user.email.
+    sync_global_git_identity();
     Ok(user.to_string())
+}
+
+/// Point global git user.name/user.email at the now-active gh account so commits are
+/// authored by the right person. Uses the account's email when gh exposes it, else the
+/// GitHub noreply address. Scoped to --global because the desktop app is not tied to a
+/// repository; repos with their own local user config keep it and are unaffected.
+fn sync_global_git_identity() {
+    let Ok(bytes) = run_gh(&["api", "user", "--jq", "{login, id, email}"]) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return;
+    };
+    let Some(login) = value.get("login").and_then(Value::as_str) else {
+        return;
+    };
+    let email = match value.get("email").and_then(Value::as_str) {
+        Some(email) if !email.is_empty() => email.to_string(),
+        _ => {
+            let id = value.get("id").and_then(Value::as_u64).unwrap_or(0);
+            format!("{id}+{login}@users.noreply.github.com")
+        }
+    };
+    let _ = Command::new("git").args(["config", "--global", "user.name", login]).output();
+    let _ = Command::new("git").args(["config", "--global", "user.email", &email]).output();
 }
 
 #[tauri::command]

@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
 /**
- * Switch the active gh account AND sync this repo's local git commit identity to
- * match it. `gh auth switch` only changes which token gh uses; it does not touch
- * git's user.name/user.email, so commits would keep the old author. This wrapper
- * fixes that.
+ * Switch the active gh account AND sync the global git commit identity to match it.
+ * `gh auth switch` only changes which token gh uses; it does not touch git's
+ * user.name/user.email, so commits would keep the old author. This wrapper fixes
+ * that. Writes --global so every repo without its own local override follows the
+ * active account.
  *
  * Usage:
  *   node scripts/gh-switch.mjs <github-login>   # switch to that account, then sync
@@ -35,10 +36,10 @@ try {
       ? account.email
       : `${account.id}+${account.login}@users.noreply.github.com`;
 
-  run("git", ["config", "--local", "user.name", name]);
-  run("git", ["config", "--local", "user.email", email]);
+  run("git", ["config", "--global", "user.name", name]);
+  run("git", ["config", "--global", "user.email", email]);
 
-  console.log(`Local git identity → ${name} <${email}>`);
+  console.log(`Global git identity → ${name} <${email}>`);
 } catch (error) {
   const message = error.stderr?.toString().trim() || error.message;
   console.error(`gh-switch failed: ${message}`);

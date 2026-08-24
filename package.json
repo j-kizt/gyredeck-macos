@@ -8,6 +8,7 @@
   "scripts": {
     "check": "tsc -p tsconfig.json --noEmit && pnpm --filter @agent-activity/desktop check",
     "hooks:install": "node scripts/install-claude-hooks.mjs",
+    "gh:switch": "node scripts/gh-switch.mjs",
     "mod:tail": "tail -f ~/.config/agent-activity/agent-activity.events.ndjson",
     "viewer": "node apps/viewer/index.mjs",
     "desktop:dev": "pnpm --filter @agent-activity/desktop tauri:dev",

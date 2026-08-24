@@ -3,12 +3,16 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 0 0 18px;
-  scrollbar-gutter: stable;
+  /* Full-bleed to the window edge, then pad the content back in equally on both sides.
+     This puts the scrollbar out in the right padding zone (at the window edge) instead
+     of floating over the content, while keeping content symmetric and aligned with the
+     header in .sheet-inner. */
+  margin-inline: calc(-1 * var(--sheet-inline-padding));
+  padding: 0 var(--sheet-inline-padding) 18px;
 }
 
 .sheet-body[data-view="usage"] {
-  margin-right: 0;
+  margin-inline: 0;
   overflow: hidden;
   padding: 0;
 }

@@ -688,12 +688,25 @@
 }
 
 @media (max-width: 520px) {
+  /* Single column: the layout is the only scroller. Make it full-bleed so its
+     scrollbar rides the window edge (like Services/Sessions) instead of sitting
+     inset over the content. */
   .usage-layout {
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);
     align-content: start;
     gap: 8px;
     overflow-y: auto;
+    margin-inline: calc(-1 * var(--sheet-inline-padding));
+    padding-inline: var(--sheet-inline-padding);
+  }
+
+  /* Detail must not be its own scroller here — a nested scrollbar reserved space
+     on the right, so content stopped short of the edge. Let it fill and scroll
+     with the layout. */
+  .usage-detail-panel {
+    overflow: visible;
+    padding: 0 0 22px;
   }
 
   .usage-sidebar {
@@ -715,23 +728,25 @@
   }
 }
 
+/* Match the GitHub tab's icon buttons (.gh-icon-btn): rounded square, hairline
+   border, fill background. */
 .usage-refresh {
-  width: 20px;
-  height: 20px;
+  width: 24px;
+  height: 24px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex: none;
-  border: 0;
-  border-radius: 50%;
+  border: 1px solid var(--hair);
+  border-radius: 7px;
   color: var(--text-2);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--fill);
   cursor: pointer;
 }
 
 .usage-refresh:hover {
   color: var(--text);
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--fill-2);
 }
 
 .usage-refresh svg {
@@ -746,5 +761,5 @@
 
 .usage-refresh[data-active="true"] {
   color: var(--text);
-  background: rgba(255, 255, 255, 0.14);
+  background: var(--fill-2);
 }

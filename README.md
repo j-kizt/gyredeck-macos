@@ -14,6 +14,18 @@
 
 ---
 
+## Install
+
+macOS (Apple Silicon or Intel). Paste this into a terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/j-kizt/agent-activity/main/scripts/install.sh | bash
+```
+
+It downloads the latest release, installs **Agent Activity.app** to `/Applications`, and opens it. The app is self-signed (not Apple-notarized), so the installer clears the quarantine flag for you; after that, updates are handled in-app via **Settings → Update**.
+
+Prefer to do it by hand? Download `Agent.Activity_*.app.tar.gz` from the [latest release](https://github.com/j-kizt/agent-activity/releases/latest), unpack it, and drag the app into `/Applications` (first launch: right-click → Open).
+
 ## Overview
 
 Agent Activity is a native macOS menu-bar app that turns AI coding-agent activity into a compact live surface. Click the menu-bar icon and a popover drops down showing what your **Claude Code** (and, more coarsely, **Codex**) sessions are doing right now — plus provider usage, locally listening services, and the state of the GitHub repos you care about.
@@ -126,4 +138,6 @@ scripts/             Install/build helpers
 
 ## Credits
 
-Derived from [agent-halo](https://github.com/mahirocoko/agent-halo) by Mahiro, reworked into a Letta-free, Claude Code/Codex menu-bar popover. Local usage-provider research is informed by [OpenUsage](https://github.com/robinebers/openusage).
+- **Origin:** [agent-halo](https://github.com/mahirocoko/agent-halo) by Mahiro — the local bridge, presence protocol, and desktop shell this project is built on.
+- **This fork:** Letta-free rebuild by J-Kitz — Claude Code / Codex / Antigravity hook adapters, GitHub repo/CI/PR monitor, menu-bar window, and signed auto-update.
+- Local usage-provider research is informed by [OpenUsage](https://github.com/robinebers/openusage).

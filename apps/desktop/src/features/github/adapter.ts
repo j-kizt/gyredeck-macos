@@ -25,6 +25,12 @@ export const fetchAccounts = (): Promise<IGhAccount[]> =>
 export const switchAccount = (user: string): Promise<string> =>
   invoke<string>("github_switch_account", { user });
 
+export const importFromGh = (): Promise<IGhAccount[]> =>
+  invoke<IGhAccount[]>("github_import_from_gh");
+
+export const removeAccount = (user: string): Promise<IGhAccount[]> =>
+  invoke<IGhAccount[]>("github_remove_account", { user });
+
 export const deviceStart = (): Promise<IDeviceCodeStart> =>
   invoke<IDeviceCodeStart>("github_device_start");
 

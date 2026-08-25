@@ -8,7 +8,7 @@ Runtime flow:
 bridge SSE  ─→  http://127.0.0.1:47621/events  ─→  renderer
 ```
 
-The renderer derives compact presence and persisted per-conversation Sessions from the protocol package plus bounded local event history. `src/main.tsx` owns the shell and native-window orchestration; owner-local modules under `src/features/` own Sessions, presence ingestion, Setup, Usage, Services, and GitHub; `src-tauri/` (Rust) owns the tray, window, terminal focus, notifications, bridge supervision, local-services scan, and `gh`-backed GitHub data. Ordered CSS ownership lives under `src/styles/`.
+The renderer derives compact presence and persisted per-conversation Sessions from the protocol package plus bounded local event history. `src/main.tsx` owns the shell and native-window orchestration; owner-local modules under `src/features/` own Sessions, presence ingestion, Setup, Usage, Services, and GitHub; `src-tauri/` (Rust) owns the tray, window, terminal focus, notifications, bridge supervision, local-services scan, and GitHub REST data (own token store, `gh` optional import). Ordered CSS ownership lives under `src/styles/`.
 
 Do not start by scraping terminal output or transcript files. Those can be fallback diagnostics later, not the primary source.
 

@@ -1,11 +1,103 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
 const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const OAUTH_SCOPE: &str = "repo read:org workflow";
+
+const API_BASE: &str = "https://api.github.com";
+const API_VERSION: &str = "2022-11-28";
+const USER_AGENT: &str = "Gyredeck";
+const MAX_REPOS: usize = 300;
+
+// ── Token store (~/.config/gyredeck/github-accounts.json, mode 0600) ──
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct StoredAccount {
+    pub login: String,
+    pub id: u64,
+    pub token: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct TokenStore {
+    pub active: Option<String>,
+    pub accounts: Vec<StoredAccount>,
+}
+
+fn store_path() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("gyredeck")
+        .join("github-accounts.json"))
+}
+
+fn load_store() -> Result<TokenStore, String> {
+    let path = store_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            serde_json::from_str(&content).map_err(|e| format!("Invalid github-accounts.json: {e}"))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TokenStore::default()),
+        Err(e) => Err(format!("Failed to read github-accounts.json: {e}")),
+    }
+}
+
+fn save_store(store: &TokenStore) -> Result<(), String> {
+    let path = store_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create config dir: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(store)
+        .map_err(|e| format!("Failed to serialize accounts: {e}"))?;
+    // Atomic write: write to a temp file, chmod 0600, then rename over the target.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json.as_bytes())
+        .map_err(|e| format!("Failed to write accounts file: {e}"))?;
+    chmod_600(&tmp)?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to persist accounts file: {e}"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chmod_600(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("Failed to set permissions: {e}"))
+}
+
+#[cfg(not(unix))]
+fn chmod_600(_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn active_token() -> Result<String, String> {
+    let store = load_store()?;
+    let active = store
+        .active
+        .as_deref()
+        .ok_or_else(|| "No active GitHub account. Import an account first.".to_string())?;
+    store
+        .accounts
+        .iter()
+        .find(|a| a.login == active)
+        .map(|a| a.token.clone())
+        .ok_or_else(|| "No active GitHub account. Import an account first.".to_string())
+}
+
+fn upsert_account(store: &mut TokenStore, account: StoredAccount) {
+    if let Some(existing) = store.accounts.iter_mut().find(|a| a.login == account.login) {
+        existing.id = account.id;
+        existing.token = account.token;
+    } else {
+        store.accounts.push(account);
+    }
+}
 
 // ── Validation (repo/account strings flow into `gh` arguments) ──
 
@@ -30,20 +122,52 @@ fn is_valid_account(user: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-fn run_gh(args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = Command::new("gh")
-        .args(args)
-        .output()
-        .map_err(|e| format!("Failed to run gh (is the GitHub CLI installed?): {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            "gh command failed".to_string()
-        } else {
-            stderr
-        });
+// ── REST client ──
+
+fn http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+/// Perform an authenticated GET against the GitHub REST API. `path` is either an
+/// absolute URL (e.g. a Link-header "next" URL) or a path relative to the API base.
+fn api_get(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    path: &str,
+) -> Result<reqwest::blocking::Response, String> {
+    let url = if path.starts_with("http") {
+        path.to_string()
+    } else {
+        format!("{API_BASE}/{}", path.trim_start_matches('/'))
+    };
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", USER_AGENT)
+        .header("X-GitHub-Api-Version", API_VERSION)
+        .send()
+        .map_err(|e| format!("GitHub request failed: {e}"))?;
+    if response.status().as_u16() == 401 {
+        return Err("GitHub token expired — re-import the account".to_string());
     }
-    Ok(output.stdout)
+    if !response.status().is_success() {
+        return Err(format!("GitHub API returned {}", response.status()));
+    }
+    Ok(response)
+}
+
+fn api_get_json(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    path: &str,
+) -> Result<Value, String> {
+    api_get(client, token, path)?
+        .json()
+        .map_err(|e| format!("Invalid GitHub response: {e}"))
 }
 
 // ── Repo status ──
@@ -87,9 +211,10 @@ fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").trim().to_string()
 }
 
-fn latest_commit(repo: &str) -> Option<GithubCommit> {
-    let bytes = run_gh(&["api", &format!("repos/{repo}/commits?per_page=1")]).ok()?;
-    let value: Value = serde_json::from_slice(&bytes).ok()?;
+const MAX_PULLS: usize = 20;
+
+fn latest_commit(client: &reqwest::blocking::Client, token: &str, repo: &str) -> Option<GithubCommit> {
+    let value = api_get_json(client, token, &format!("repos/{repo}/commits?per_page=1")).ok()?;
     let entry = value.as_array()?.first()?;
     let commit = entry.get("commit")?;
     let author = commit.get("author")?;
@@ -101,87 +226,90 @@ fn latest_commit(repo: &str) -> Option<GithubCommit> {
     })
 }
 
-fn recent_runs(repo: &str) -> Vec<GithubRun> {
-    let Ok(bytes) = run_gh(&[
-        "run",
-        "list",
-        "-R",
-        repo,
-        "--limit",
-        "5",
-        "--json",
-        "status,conclusion,name,headBranch,createdAt",
-    ]) else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+fn recent_runs(client: &reqwest::blocking::Client, token: &str, repo: &str) -> Vec<GithubRun> {
+    let Ok(value) = api_get_json(client, token, &format!("repos/{repo}/actions/runs?per_page=5"))
+    else {
         return Vec::new();
     };
     value
-        .as_array()
+        .get("workflow_runs")
+        .and_then(Value::as_array)
         .map(|runs| {
             runs.iter()
                 .map(|run| GithubRun {
-                    name: run.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                    name: run
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| run.get("display_title").and_then(Value::as_str))
+                        .unwrap_or("")
+                        .to_string(),
                     status: run.get("status").and_then(Value::as_str).unwrap_or("").to_string(),
                     conclusion: run
                         .get("conclusion")
                         .and_then(Value::as_str)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string),
-                    branch: run.get("headBranch").and_then(Value::as_str).unwrap_or("").to_string(),
-                    created_at: run.get("createdAt").and_then(Value::as_str).unwrap_or("").to_string(),
+                    branch: run.get("head_branch").and_then(Value::as_str).unwrap_or("").to_string(),
+                    created_at: run.get("created_at").and_then(Value::as_str).unwrap_or("").to_string(),
                 })
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn open_pulls(repo: &str) -> Vec<GithubPull> {
-    let Ok(bytes) = run_gh(&[
-        "pr",
-        "list",
-        "-R",
-        repo,
-        "--json",
-        "number,title,author,updatedAt",
-    ]) else {
-        return Vec::new();
+fn open_pulls(client: &reqwest::blocking::Client, token: &str, repo: &str) -> (usize, Vec<GithubPull>) {
+    let Ok(value) =
+        api_get_json(client, token, &format!("repos/{repo}/pulls?state=open&per_page=100"))
+    else {
+        return (0, Vec::new());
     };
-    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-        return Vec::new();
+    let Some(array) = value.as_array() else {
+        return (0, Vec::new());
     };
-    value
-        .as_array()
-        .map(|pulls| {
-            pulls
-                .iter()
-                .map(|pr| GithubPull {
-                    number: pr.get("number").and_then(Value::as_u64).unwrap_or(0),
-                    title: pr.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
-                    author: pr
-                        .get("author")
-                        .and_then(|a| a.get("login"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    updated_at: pr.get("updatedAt").and_then(Value::as_str).unwrap_or("").to_string(),
-                })
-                .collect()
+    let count = array.len();
+    let pulls = array
+        .iter()
+        .take(MAX_PULLS)
+        .map(|pr| GithubPull {
+            number: pr.get("number").and_then(Value::as_u64).unwrap_or(0),
+            title: pr.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
+            author: pr
+                .get("user")
+                .and_then(|a| a.get("login"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            updated_at: pr.get("updated_at").and_then(Value::as_str).unwrap_or("").to_string(),
         })
-        .unwrap_or_default()
+        .collect();
+    (count, pulls)
 }
 
 fn repo_status_blocking(repo: &str) -> Result<GithubRepoStatus, String> {
     if !is_valid_repo(repo) {
         return Err("Invalid repository (expected owner/name)".to_string());
     }
-    let pulls = open_pulls(repo);
+    // Don't hard-fail the tab: surface auth/setup problems as an error field.
+    let (client, token) = match (http_client(), active_token()) {
+        (Ok(client), Ok(token)) => (client, token),
+        (Err(e), _) | (_, Err(e)) => {
+            return Ok(GithubRepoStatus {
+                repo: repo.to_string(),
+                commit: None,
+                runs: Vec::new(),
+                open_pr_count: 0,
+                pulls: Vec::new(),
+                error: Some(e),
+            });
+        }
+    };
+    let (open_pr_count, pulls) = open_pulls(&client, &token, repo);
     Ok(GithubRepoStatus {
         repo: repo.to_string(),
-        commit: latest_commit(repo),
-        runs: recent_runs(repo),
-        open_pr_count: pulls.len(),
+        commit: latest_commit(&client, &token, repo),
+        runs: recent_runs(&client, &token, repo),
+        open_pr_count,
         pulls,
         error: None,
     })
@@ -196,19 +324,46 @@ pub async fn github_repo_status(repo: String) -> Result<GithubRepoStatus, String
 
 // ── Accessible repositories (for the add-repo picker, current account only) ──
 
+/// Parse the `rel="next"` URL out of a GitHub `Link` header, if present.
+fn next_link(header: &str) -> Option<String> {
+    for part in header.split(',') {
+        let mut segments = part.split(';');
+        let url = segments.next()?.trim().trim_start_matches('<').trim_end_matches('>');
+        if segments.any(|s| s.trim() == "rel=\"next\"") {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
 fn available_repos_blocking() -> Result<Vec<String>, String> {
-    let bytes = run_gh(&[
-        "api",
-        "user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member",
-        "--jq",
-        ".[].full_name",
-    ])?;
-    Ok(String::from_utf8_lossy(&bytes)
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect())
+    let client = http_client()?;
+    let token = active_token()?;
+    let mut repos: Vec<String> = Vec::new();
+    let mut url = format!(
+        "{API_BASE}/user/repos?per_page=100&affiliation=owner,collaborator,organization_member&sort=full_name"
+    );
+    loop {
+        let response = api_get(&client, &token, &url)?;
+        let next = response
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|v| v.to_str().ok())
+            .and_then(next_link);
+        let value: Value = response.json().map_err(|e| format!("Invalid GitHub response: {e}"))?;
+        if let Some(array) = value.as_array() {
+            for repo in array {
+                if let Some(name) = repo.get("full_name").and_then(Value::as_str) {
+                    repos.push(name.to_string());
+                }
+            }
+        }
+        match next {
+            Some(next_url) if repos.len() < MAX_REPOS => url = next_url,
+            _ => break,
+        }
+    }
+    Ok(repos)
 }
 
 #[tauri::command]
@@ -227,31 +382,15 @@ pub struct GhAccount {
 }
 
 fn accounts_blocking() -> Result<Vec<GhAccount>, String> {
-    let output = Command::new("gh")
-        .args(["auth", "status"])
-        .output()
-        .map_err(|e| format!("Failed to run gh: {e}"))?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let mut accounts: Vec<GhAccount> = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.split("Logged in to github.com account ").nth(1) {
-            let login = rest.split_whitespace().next().unwrap_or("").to_string();
-            if !login.is_empty() {
-                accounts.push(GhAccount { login, active: false });
-            }
-        } else if trimmed.contains("Active account: true") {
-            if let Some(last) = accounts.last_mut() {
-                last.active = true;
-            }
-        }
-    }
-    Ok(accounts)
+    let store = load_store()?;
+    Ok(store
+        .accounts
+        .iter()
+        .map(|a| GhAccount {
+            login: a.login.clone(),
+            active: store.active.as_deref() == Some(a.login.as_str()),
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -261,45 +400,202 @@ pub async fn github_accounts() -> Result<Vec<GhAccount>, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Switch the locally-active account. Purely a Gyredeck-local preference — no `gh`
+/// invocation and no system-wide effect.
+/// Best-effort: point the global git identity at the store's active account.
+/// Resolves the email from GitHub `/user` (falling back to the noreply address),
+/// then sets `git config --global user.name/user.email`. Never fatal — a missing
+/// git binary or offline API leaves the switch itself successful.
+fn sync_git_identity(store: &TokenStore) {
+    let Some(active) = store.active.as_deref() else {
+        return;
+    };
+    let Some(account) = store.accounts.iter().find(|a| a.login == active) else {
+        return;
+    };
+    let email = http_client()
+        .ok()
+        .and_then(|client| api_get_json(&client, &account.token, "user").ok())
+        .and_then(|value| {
+            value
+                .get("email")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            format!("{}+{}@users.noreply.github.com", account.id, account.login)
+        });
+    let _ = Command::new("git")
+        .args(["config", "--global", "user.name", &account.login])
+        .status();
+    let _ = Command::new("git")
+        .args(["config", "--global", "user.email", &email])
+        .status();
+}
+
 fn switch_account_blocking(user: &str) -> Result<String, String> {
     if !is_valid_account(user) {
         return Err("Invalid account name".to_string());
     }
-    run_gh(&["auth", "switch", "--hostname", "github.com", "--user", user])?;
-    // Best-effort: keep git's commit identity in step with the active account.
-    // gh auth switch only changes the token, not user.name/user.email.
-    sync_global_git_identity();
+    let mut store = load_store()?;
+    if !store.accounts.iter().any(|a| a.login == user) {
+        return Err(format!("Account {user} is not imported"));
+    }
+    store.active = Some(user.to_string());
+    save_store(&store)?;
+    sync_git_identity(&store);
     Ok(user.to_string())
-}
-
-/// Point global git user.name/user.email at the now-active gh account so commits are
-/// authored by the right person. Uses the account's email when gh exposes it, else the
-/// GitHub noreply address. Scoped to --global because the desktop app is not tied to a
-/// repository; repos with their own local user config keep it and are unaffected.
-fn sync_global_git_identity() {
-    let Ok(bytes) = run_gh(&["api", "user", "--jq", "{login, id, email}"]) else {
-        return;
-    };
-    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-        return;
-    };
-    let Some(login) = value.get("login").and_then(Value::as_str) else {
-        return;
-    };
-    let email = match value.get("email").and_then(Value::as_str) {
-        Some(email) if !email.is_empty() => email.to_string(),
-        _ => {
-            let id = value.get("id").and_then(Value::as_u64).unwrap_or(0);
-            format!("{id}+{login}@users.noreply.github.com")
-        }
-    };
-    let _ = Command::new("git").args(["config", "--global", "user.name", login]).output();
-    let _ = Command::new("git").args(["config", "--global", "user.email", &email]).output();
 }
 
 #[tauri::command]
 pub async fn github_switch_account(user: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || switch_account_blocking(&user))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+// ── Import tokens from the gh CLI (optional token importer) ──
+
+/// Fetch a login + id from GitHub for the given token, then upsert it into the store.
+fn import_token(
+    client: &reqwest::blocking::Client,
+    store: &mut TokenStore,
+    token: &str,
+) -> Result<String, String> {
+    let value = api_get_json(client, token, "user")?;
+    let login = value
+        .get("login")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "GitHub /user response missing login".to_string())?
+        .to_string();
+    let id = value.get("id").and_then(Value::as_u64).unwrap_or(0);
+    upsert_account(
+        store,
+        StoredAccount { login: login.clone(), id, token: token.to_string() },
+    );
+    Ok(login)
+}
+
+/// Parse `gh auth status` output into (login, is_active) pairs.
+fn gh_status_accounts() -> Vec<(String, bool)> {
+    let Ok(output) = Command::new("gh").args(["auth", "status"]).output() else {
+        return Vec::new();
+    };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut accounts: Vec<(String, bool)> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.split("Logged in to github.com account ").nth(1) {
+            let login = rest.split_whitespace().next().unwrap_or("").to_string();
+            if !login.is_empty() {
+                accounts.push((login, false));
+            }
+        } else if trimmed.contains("Active account: true") {
+            if let Some(last) = accounts.last_mut() {
+                last.1 = true;
+            }
+        }
+    }
+    accounts
+}
+
+fn gh_token_for(login: Option<&str>) -> Option<String> {
+    let mut args = vec!["auth", "token"];
+    if let Some(login) = login {
+        args.push("--user");
+        args.push(login);
+    }
+    let output = Command::new("gh").args(&args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+fn import_from_gh_blocking() -> Result<Vec<GhAccount>, String> {
+    // Fail fast if gh isn't installed.
+    if Command::new("gh").arg("--version").output().is_err() {
+        return Err("GitHub CLI not found".to_string());
+    }
+    let client = http_client()?;
+    let mut store = load_store()?;
+    let gh_accounts = gh_status_accounts();
+
+    let mut imported: Vec<String> = Vec::new();
+    let mut gh_active: Option<String> = None;
+
+    if gh_accounts.is_empty() {
+        // No parsed logins — fall back to the currently-active gh token.
+        let token = gh_token_for(None).ok_or_else(|| "No gh accounts found".to_string())?;
+        let login = import_token(&client, &mut store, &token)?;
+        gh_active = Some(login.clone());
+        imported.push(login);
+    } else {
+        for (login, active) in &gh_accounts {
+            // Prefer per-login tokens; fall back to the active token when --user is
+            // unsupported and this is the active account.
+            let token = match gh_token_for(Some(login)) {
+                Some(token) => token,
+                None if *active => match gh_token_for(None) {
+                    Some(token) => token,
+                    None => continue,
+                },
+                None => continue,
+            };
+            match import_token(&client, &mut store, &token) {
+                Ok(resolved) => {
+                    if *active {
+                        gh_active = Some(resolved.clone());
+                    }
+                    imported.push(resolved);
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    if imported.is_empty() {
+        return Err("Could not import any gh accounts".to_string());
+    }
+    store.active = gh_active.or_else(|| imported.first().cloned());
+    save_store(&store)?;
+    sync_git_identity(&store);
+    accounts_blocking()
+}
+
+#[tauri::command]
+pub async fn github_import_from_gh() -> Result<Vec<GhAccount>, String> {
+    tauri::async_runtime::spawn_blocking(import_from_gh_blocking)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn remove_account_blocking(user: &str) -> Result<Vec<GhAccount>, String> {
+    if !is_valid_account(user) {
+        return Err("Invalid account name".to_string());
+    }
+    let mut store = load_store()?;
+    store.accounts.retain(|a| a.login != user);
+    if store.active.as_deref() == Some(user) {
+        store.active = store.accounts.first().map(|a| a.login.clone());
+    }
+    save_store(&store)?;
+    accounts_blocking()
+}
+
+#[tauri::command]
+pub async fn github_remove_account(user: String) -> Result<Vec<GhAccount>, String> {
+    tauri::async_runtime::spawn_blocking(move || remove_account_blocking(&user))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -328,13 +624,6 @@ fn client_id() -> Result<String, String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .ok_or_else(|| "github-oauth.json is missing a non-empty client_id".to_string())
-}
-
-fn http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {e}"))
 }
 
 #[derive(Serialize)]
@@ -388,35 +677,14 @@ pub struct DevicePollResult {
     pub login: Option<String>,
 }
 
-fn store_token_with_gh(token: &str) -> Result<Option<String>, String> {
-    use std::io::Write;
-    let mut child = Command::new("gh")
-        .args(["auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--with-token"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run gh auth login: {e}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| "Failed to open gh stdin".to_string())?
-        .write_all(format!("{token}\n").as_bytes())
-        .map_err(|e| format!("Failed to pass token to gh: {e}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("gh auth login failed: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            "gh auth login failed".to_string()
-        } else {
-            stderr
-        });
-    }
-    // Resolve the newly authenticated login.
-    let who = run_gh(&["api", "user", "--jq", ".login"]).ok();
-    Ok(who.map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string()))
+/// Persist a device-flow token into the local store and mark it active.
+fn store_device_token(token: &str) -> Result<Option<String>, String> {
+    let client = http_client()?;
+    let mut store = load_store()?;
+    let login = import_token(&client, &mut store, token)?;
+    store.active = Some(login.clone());
+    save_store(&store)?;
+    Ok(Some(login))
 }
 
 fn device_poll_blocking(device_code: &str) -> Result<DevicePollResult, String> {
@@ -437,7 +705,7 @@ fn device_poll_blocking(device_code: &str) -> Result<DevicePollResult, String> {
         .map_err(|e| format!("Invalid token response: {e}"))?;
 
     if let Some(token) = value.get("access_token").and_then(Value::as_str) {
-        let login = store_token_with_gh(token)?;
+        let login = store_device_token(token)?;
         return Ok(DevicePollResult { status: "success".to_string(), login });
     }
     match value.get("error").and_then(Value::as_str) {

@@ -32,7 +32,7 @@ mod standalone_bridge;
 
 use github::{
     github_accounts, github_available_repos, github_device_poll, github_device_start,
-    github_repo_status, github_switch_account,
+    github_import_from_gh, github_remove_account, github_repo_status, github_switch_account,
 };
 
 use keep_awake::KeepAwakeState;
@@ -5297,6 +5297,8 @@ pub fn run() {
             github_available_repos,
             github_accounts,
             github_switch_account,
+            github_import_from_gh,
+            github_remove_account,
             github_device_start,
             github_device_poll,
             control_local_service,

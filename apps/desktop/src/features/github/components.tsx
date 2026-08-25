@@ -187,40 +187,45 @@ const AddRepo = ({ tracked, onAdd }: IAddRepoProps) => {
   );
 };
 
-const ADD_ACCOUNT_COMMAND = "gh auth login";
-
-const AddAccountSteps = () => (
-  <div className="gh-add-steps">
-    <span className="muted">Add a GitHub account from the terminal:</span>
-    <ol>
-      <li>
-        Run
-        <code className="gh-inline-code">{ADD_ACCOUNT_COMMAND}</code>
-        <button
-          className="gh-copy"
-          type="button"
-          onClick={() => void navigator.clipboard?.writeText(ADD_ACCOUNT_COMMAND).catch(() => undefined)}
-          title="Copy command"
-        >
-          Copy
-        </button>
-      </li>
-      <li>Choose GitHub.com → HTTPS → Login with a web browser</li>
-      <li>Come back and press Refresh ↻ to see the new account</li>
-    </ol>
-  </div>
-);
-
 interface IGithubPanelProps {
   monitor: IGithubMonitor;
   canUseNativeControls: boolean;
 }
 
 export const GithubPanel = ({ monitor, canUseNativeControls }: IGithubPanelProps) => {
-  const [showAddSteps, setShowAddSteps] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+
+  const runImport = useCallback(async () => {
+    setImporting(true);
+    setImportError(null);
+    try {
+      await monitor.importFromGh();
+    } catch (error) {
+      setImportError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setImporting(false);
+    }
+  }, [monitor]);
 
   if (!canUseNativeControls) {
-    return <div className="gh-empty">GitHub monitoring needs the desktop runtime and the GitHub CLI (gh).</div>;
+    return <div className="gh-empty">GitHub monitoring needs the desktop runtime.</div>;
+  }
+
+  if (monitor.accounts.length === 0) {
+    return (
+      <div className="gh-panel">
+        <div className="gh-empty">
+          No GitHub accounts yet. Import a token from the GitHub CLI to get started.
+          <div className="gh-add-account">
+            <button className="pill-btn accent" type="button" onClick={() => void runImport()} disabled={importing}>
+              {importing ? <RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> : <Plus size={12} strokeWidth={2.3} />} Import from gh
+            </button>
+          </div>
+          {importError ? <div className="gh-card-line error">{importError}</div> : null}
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -234,7 +239,6 @@ export const GithubPanel = ({ monitor, canUseNativeControls }: IGithubPanelProps
           onChange={(event) => void monitor.switchTo(event.target.value)}
           aria-label="Active GitHub account"
         >
-          {monitor.accounts.length === 0 ? <option value="">No accounts</option> : null}
           {monitor.accounts.map((account) => (
             <option key={account.login} value={account.login}>
               {account.login}
@@ -245,16 +249,16 @@ export const GithubPanel = ({ monitor, canUseNativeControls }: IGithubPanelProps
         <button className="gh-icon-btn" type="button" aria-label="Refresh" onClick={() => { monitor.refresh(); void monitor.refreshAccounts(); }}>
           <RefreshCw size={12} strokeWidth={2.3} />
         </button>
-        <button className="gh-icon-btn" type="button" data-active={showAddSteps || undefined} aria-label="Add account" aria-pressed={showAddSteps} title="Add account" onClick={() => setShowAddSteps((v) => !v)}>
-          <Plus size={12} strokeWidth={2.3} />
+        <button className="gh-icon-btn" type="button" aria-label="Import from gh" title="Import from gh" disabled={importing} onClick={() => void runImport()}>
+          {importing ? <RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> : <Plus size={12} strokeWidth={2.3} />}
         </button>
       </div>
       {monitor.switching ? (
         <div className="gh-card-line muted"><RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> Switching account…</div>
       ) : null}
-      {showAddSteps ? <AddAccountSteps /> : null}
+      {importError ? <div className="gh-card-line error">{importError}</div> : null}
       {monitor.activeAccount ? (
-        <span className="gh-account-note muted">Switching affects the gh CLI system-wide.</span>
+        <span className="gh-account-note muted">Switching only affects Gyredeck.</span>
       ) : null}
 
       <AddRepo tracked={monitor.trackedRepos} onAdd={monitor.addRepo} />

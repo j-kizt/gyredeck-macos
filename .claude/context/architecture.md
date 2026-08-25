@@ -67,7 +67,7 @@ Tauri v2 shell. Native responsibilities:
 - **Terminal focus** — `focus_terminal` activates the matching iTerm2 or Ghostty window by cwd/title via AppleScript (`osascript`). This is best-effort UI focus, not process/session control.
 - **Usage providers** — `codex_usage`, `claude_usage`, `cursor_usage`, `agy_usage` run provider CLIs/HTTP off the renderer invoke path (blocking worker pool).
 - **Services scan** (`local_services.rs`) — enumerates listening TCP sockets via `lsof`, probes HTTP roots, and exposes a guarded stop/force-kill control for eligible current-user listeners. See `services.md`.
-- **GitHub** (`github.rs`) — repo latest commit, GitHub Actions status, and open PRs via the GitHub REST API, using an own token store (`~/.config/gyredeck/github-accounts.json`, `0600`); the `gh` CLI is an optional token importer. Switching the active account also best-effort syncs the global git identity (`user.name`/`user.email`).
+- **GitHub** (`github.rs`) — repo latest commit, GitHub Actions status, and open PRs via the GitHub REST API, using an own token store (`~/.config/gyredeck/github-accounts.json`, `0600`); the `gh` CLI is an optional token importer. Switching the active account also best-effort syncs the global git identity (`user.name`/`user.email`) and, when the `gh` CLI is installed, its active account too.
 - **Display / keep-awake** — persisted display selection and a keep-display-awake toggle.
 - **Hook installers** — `install_claude_hook` / `install_agy_hook` copy the adapter and register it, reporting install status back to Settings → Plugins.
 

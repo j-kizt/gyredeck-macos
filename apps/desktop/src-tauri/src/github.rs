@@ -445,7 +445,24 @@ fn switch_account_blocking(user: &str) -> Result<String, String> {
     store.active = Some(user.to_string());
     save_store(&store)?;
     sync_git_identity(&store);
+    sync_gh_active(user);
     Ok(user.to_string())
+}
+
+/// Best-effort: if the gh CLI is installed and knows this account, switch its
+/// active account too so gh stays in sync with the one picked in Gyredeck. Never
+/// fatal — a missing gh, or an account gh doesn't have, is silently ignored.
+fn sync_gh_active(login: &str) {
+    let gh_present = Command::new("gh")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if gh_present {
+        let _ = Command::new("gh")
+            .args(["auth", "switch", "--user", login])
+            .status();
+    }
 }
 
 #[tauri::command]

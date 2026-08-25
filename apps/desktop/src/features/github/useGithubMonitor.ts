@@ -1,5 +1,8 @@
+import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  deviceStart,
+  devicePoll,
   fetchAccounts,
   fetchRepoStatus,
   importFromGh as importFromGhCmd,
@@ -13,6 +16,14 @@ import {
 import type { GithubRepoState, IGhAccount } from "./types";
 
 const POLL_INTERVAL_MS = 45_000;
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+export type DeviceFlowState =
+  | { status: "idle" }
+  | { status: "starting" }
+  | { status: "awaiting"; userCode: string; verificationUri: string }
+  | { status: "error"; message: string };
 
 interface IUseGithubMonitorOptions {
   active: boolean;
@@ -31,6 +42,9 @@ export interface IGithubMonitor {
   refreshAccounts: () => Promise<void>;
   switchTo: (user: string) => Promise<void>;
   importFromGh: () => Promise<void>;
+  deviceFlow: DeviceFlowState;
+  startDeviceFlow: () => Promise<void>;
+  cancelDeviceFlow: () => void;
 }
 
 export const useGithubMonitor = ({ active, canUseNativeControls }: IUseGithubMonitorOptions): IGithubMonitor => {
@@ -45,6 +59,8 @@ export const useGithubMonitor = ({ active, canUseNativeControls }: IUseGithubMon
   });
   const [accounts, setAccounts] = useState<IGhAccount[]>([]);
   const [switching, setSwitching] = useState(false);
+  const [deviceFlow, setDeviceFlow] = useState<DeviceFlowState>({ status: "idle" });
+  const deviceSessionRef = useRef<{ cancelled: boolean }>({ cancelled: true });
 
   const activeAccount = accounts.find((account) => account.active)?.login ?? null;
   const activeAccountRef = useRef(activeAccount);
@@ -120,6 +136,51 @@ export const useGithubMonitor = ({ active, canUseNativeControls }: IUseGithubMon
     await refreshAccounts();
   }, [refreshAccounts]);
 
+  const cancelDeviceFlow = useCallback(() => {
+    deviceSessionRef.current.cancelled = true;
+    setDeviceFlow({ status: "idle" });
+  }, []);
+
+  // GitHub OAuth device flow: request a user code, open the verification page,
+  // then poll until the user authorizes (or the code expires / is cancelled).
+  const startDeviceFlow = useCallback(async () => {
+    deviceSessionRef.current.cancelled = true; // cancel any prior loop
+    const session = { cancelled: false };
+    deviceSessionRef.current = session;
+    setDeviceFlow({ status: "starting" });
+
+    let start;
+    try {
+      start = await deviceStart();
+    } catch (error) {
+      if (!session.cancelled) setDeviceFlow({ status: "error", message: error instanceof Error ? error.message : String(error) });
+      return;
+    }
+    if (session.cancelled) return;
+
+    setDeviceFlow({ status: "awaiting", userCode: start.user_code, verificationUri: start.verification_uri });
+    void invoke("open_external_url", { url: start.verification_uri }).catch(() => undefined);
+
+    const deadline = Date.now() + start.expires_in * 1000;
+    const intervalMs = Math.max(start.interval, 5) * 1000;
+    while (!session.cancelled && Date.now() < deadline) {
+      await delay(intervalMs);
+      if (session.cancelled) return;
+      try {
+        const result = await devicePoll(start.device_code);
+        if (result.status === "success") {
+          setDeviceFlow({ status: "idle" });
+          await refreshAccounts();
+          return;
+        }
+      } catch (error) {
+        if (!session.cancelled) setDeviceFlow({ status: "error", message: error instanceof Error ? error.message : String(error) });
+        return;
+      }
+    }
+    if (!session.cancelled) setDeviceFlow({ status: "error", message: "Code expired — try signing in again." });
+  }, [refreshAccounts]);
+
   const switchTo = useCallback(async (user: string) => {
     setSwitching(true);
     try {
@@ -161,5 +222,8 @@ export const useGithubMonitor = ({ active, canUseNativeControls }: IUseGithubMon
     refreshAccounts,
     switchTo,
     importFromGh,
+    deviceFlow,
+    startDeviceFlow,
+    cancelDeviceFlow,
   };
 };

@@ -170,3 +170,26 @@
 .notice-row[data-online="true"] {
   color: rgba(74, 222, 128, 0.92);
 }
+
+.app-tooltip {
+  position: fixed;
+  z-index: 9999;
+  max-width: 260px;
+  padding: 6px 9px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--hair);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(6px);
+  transform: translate(-50%, calc(-100% - 8px));
+}
+
+.app-tooltip[data-below="true"] {
+  transform: translate(-50%, 8px);
+}

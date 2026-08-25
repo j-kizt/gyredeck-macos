@@ -1,4 +1,4 @@
-import type { GyredeckEvent } from "@gyredeck/protocol";
+import type { GyredeckEvent, IGyredeckTurnUsage } from "@gyredeck/protocol";
 import {
   COMPACT_STALE_AFTER_MS,
   LLM_STALE_AFTER_MS,
@@ -127,6 +127,20 @@ const usageTokens = (
       : usage.totalTokens
     : null;
 
+// Compact per-turn token summary, e.g. "820 out · 2 in · 389K cached". Returns "" when
+// no usage is available so callers can drop the separator.
+const formatTurnUsage = (usage: IGyredeckTurnUsage | null | undefined): string => {
+  if (!usage) return "";
+  const parts: string[] = [];
+  const out = compactNumber(usage.outputTokens);
+  const input = compactNumber(usage.inputTokens);
+  const cached = compactNumber(usage.cacheReadTokens);
+  if (out) parts.push(`${out} out`);
+  if (input) parts.push(`${input} in`);
+  if (cached && (usage.cacheReadTokens ?? 0) > 0) parts.push(`${cached} cached`);
+  return parts.join(" · ");
+};
+
 const FALLBACK_ACTIVITY: IActivityDescriptor = { kind: "session", label: "event", detail: "" };
 
 // Events arrive from external adapters/hooks (Claude, Codex, Antigravity) and from
@@ -151,8 +165,15 @@ const describeEventActivity = (event: GyredeckEvent): IActivityDescriptor | unde
     case "turn_start":
       return { kind: "thinking", label: "thinking", detail: `${event.data.inputCount} input` };
     case "turn_stop":
-    case "turn_complete":
-      return { kind: "done", label: "done", detail: event.data.message ?? "turn complete" };
+    case "turn_complete": {
+      const usage = event.type === "turn_complete" ? formatTurnUsage(event.data.usage) : "";
+      // A subagent finishing is a delegation step, not the main turn ending.
+      if (event.type === "turn_complete" && event.data.hookEventName === "SubagentStop") {
+        return { kind: "delegating", label: "subagent", detail: usage ? `subagent complete · ${usage}` : "subagent complete" };
+      }
+      const base = event.data.message ?? "turn complete";
+      return { kind: "done", label: "done", detail: usage ? `${base} · ${usage}` : base };
+    }
     case "attention_requested":
       return {
         kind: "attention",
@@ -265,9 +286,12 @@ const describeEventSessionStatus = (
 ): ISessionSummary["status"] => {
   const inactive = now.getTime() - Date.parse(event.timestamp) > staleAfterMsForEvent(event);
   switch (event.type) {
+    case "turn_complete":
+      // A subagent finishing keeps the main session active, not done.
+      if (event.data.hookEventName === "SubagentStop") return inactive ? "inactive" : "working";
+      return "done";
     case "conversation_close":
     case "turn_stop":
-    case "turn_complete":
       return "done";
     case "attention_requested":
       return "attention";

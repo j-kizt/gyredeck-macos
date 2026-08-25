@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Gyredeck",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "identifier": "com.j-kizt.gyredeck",
   "build": {
     "beforeDevCommand": "pnpm dev",

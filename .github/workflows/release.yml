@@ -60,6 +60,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Baked into the binary via option_env! for the GitHub device-flow sign-in
+          # (a client id is a public identifier, kept out of source as a convenience).
+          GYREDECK_GITHUB_CLIENT_ID: ${{ secrets.GYREDECK_GITHUB_CLIENT_ID }}
         with:
           projectPath: apps/desktop
           # Universal binary so one download runs on both Apple Silicon and Intel Macs;

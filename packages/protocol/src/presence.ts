@@ -105,14 +105,18 @@ export const reducePresence = (
         activeToolName: null,
       };
     case "turn_stop":
-    case "turn_complete":
+    case "turn_complete": {
+      // A subagent finishing is not the main turn ending — keep the session active
+      // so it doesn't flicker to "done" while the main agent is still working.
+      const isSubagentStop = event.type === "turn_complete" && event.data.hookEventName === "SubagentStop";
       return {
         ...current,
         ...scoped,
         conversationId: event.conversationId,
-        status: "closed",
+        status: isSubagentStop ? "thinking" : "closed",
         activeToolName: null,
       };
+    }
     case "attention_requested":
       return {
         ...current,

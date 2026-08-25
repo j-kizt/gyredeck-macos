@@ -1,9 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import { GitBranch, GitCommit, GitPullRequest, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Download, GitBranch, GitCommit, GitPullRequest, LogIn, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchAvailableRepos } from "./adapter";
 import type { GithubRepoState, IGithubRun } from "./types";
 import type { IGithubMonitor } from "./useGithubMonitor";
+import { Tooltip } from "../../Tooltip";
 
 const relativeTime = (iso: string): string => {
   const then = Date.parse(iso);
@@ -60,24 +61,30 @@ const RepoCard = ({ repo, state, onRemove }: IRepoCardProps) => {
       ) : (
         <>
           {run ? (
-            <div className="gh-card-line">
-              <span className={`gh-dot ${run.tone}`}>{run.symbol}</span> CI {run.label}
-              {latestRun?.name ? <span className="muted"> · {latestRun.name}</span> : null}
-            </div>
+            <Tooltip label={`CI ${run.label}${latestRun?.name ? ` · ${latestRun.name}` : ""}`}>
+              <div className="gh-card-line">
+                <span className={`gh-dot ${run.tone}`}>{run.symbol}</span> CI {run.label}
+                {latestRun?.name ? <span className="muted"> · {latestRun.name}</span> : null}
+              </div>
+            </Tooltip>
           ) : data ? (
             <div className="gh-card-line muted">No workflow runs</div>
           ) : null}
           {data ? (
-            <button className="gh-card-line gh-link" type="button" onClick={() => openExternal(`https://github.com/${repo}/pulls`)}>
-              <GitPullRequest size={12} strokeWidth={2.3} /> {data.open_pr_count} open PR{data.open_pr_count === 1 ? "" : "s"}
-              {data.pulls[0] ? <span className="muted"> · {data.pulls[0].title}</span> : null}
-            </button>
+            <Tooltip label={data.pulls[0]?.title ?? `${data.open_pr_count} open PR${data.open_pr_count === 1 ? "" : "s"}`}>
+              <button className="gh-card-line gh-link" type="button" onClick={() => openExternal(`https://github.com/${repo}/pulls`)}>
+                <GitPullRequest size={12} strokeWidth={2.3} /> {data.open_pr_count} open PR{data.open_pr_count === 1 ? "" : "s"}
+                {data.pulls[0] ? <span className="muted"> · {data.pulls[0].title}</span> : null}
+              </button>
+            </Tooltip>
           ) : null}
           {data?.commit ? (
-            <button className="gh-card-line gh-link" type="button" onClick={() => openExternal(`https://github.com/${repo}/commit/${data.commit?.sha}`)}>
-              <GitCommit size={12} strokeWidth={2.3} /> {data.commit.sha} {data.commit.message}
-              <span className="muted"> · {relativeTime(data.commit.committed_at)}</span>
-            </button>
+            <Tooltip label={data.commit.message}>
+              <button className="gh-card-line gh-link" type="button" onClick={() => openExternal(`https://github.com/${repo}/commit/${data.commit?.sha}`)}>
+                <GitCommit size={12} strokeWidth={2.3} /> {data.commit.sha} {data.commit.message}
+                <span className="muted"> · {relativeTime(data.commit.committed_at)}</span>
+              </button>
+            </Tooltip>
           ) : data ? (
             <div className="gh-card-line muted">No commits yet</div>
           ) : null}
@@ -192,7 +199,34 @@ interface IGithubPanelProps {
   canUseNativeControls: boolean;
 }
 
+const DeviceFlowPrompt = ({ monitor }: { monitor: IGithubMonitor }) => {
+  const flow = monitor.deviceFlow;
+  if (flow.status === "idle") return null;
+  if (flow.status === "starting") {
+    return <div className="gh-device muted"><RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> Starting sign-in…</div>;
+  }
+  if (flow.status === "error") {
+    return <div className="gh-card-line error">{flow.message}</div>;
+  }
+  return (
+    <div className="gh-device-panel">
+      <div className="gh-device">
+        <RefreshCw className="gh-spin" size={12} strokeWidth={2.3} />
+        <span>Enter this code on GitHub:</span>
+        <button className="gh-code" type="button" title="Copy code" onClick={() => void navigator.clipboard?.writeText(flow.userCode).catch(() => undefined)}>
+          {flow.userCode}
+        </button>
+      </div>
+      <div className="gh-device-actions">
+        <button className="pill-btn" type="button" onClick={() => openExternal(flow.verificationUri)}>Open GitHub</button>
+        <button className="pill-btn" type="button" onClick={() => monitor.cancelDeviceFlow()}>Cancel</button>
+      </div>
+    </div>
+  );
+};
+
 export const GithubPanel = ({ monitor, canUseNativeControls }: IGithubPanelProps) => {
+  const signingIn = monitor.deviceFlow.status === "starting" || monitor.deviceFlow.status === "awaiting";
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
 
@@ -215,14 +249,20 @@ export const GithubPanel = ({ monitor, canUseNativeControls }: IGithubPanelProps
   if (monitor.accounts.length === 0) {
     return (
       <div className="gh-panel">
-        <div className="gh-empty">
-          No GitHub accounts yet. Import a token from the GitHub CLI to get started.
-          <div className="gh-add-account">
-            <button className="pill-btn accent" type="button" onClick={() => void runImport()} disabled={importing}>
-              {importing ? <RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> : <Plus size={12} strokeWidth={2.3} />} Import from gh
+        <div className="gh-onboard">
+          <span className="gh-onboard-badge"><GitBranch size={22} strokeWidth={2} /></span>
+          <div className="gh-onboard-title">No GitHub accounts yet</div>
+          <div className="gh-onboard-sub">Sign in to track your repos, CI, and PRs.</div>
+          <div className="gh-onboard-actions">
+            <button className="pill-btn accent" type="button" onClick={() => void monitor.startDeviceFlow()} disabled={signingIn}>
+              <LogIn size={12} strokeWidth={2.3} /> Sign in with GitHub
+            </button>
+            <button className="pill-btn" type="button" onClick={() => void runImport()} disabled={importing}>
+              {importing ? <RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> : <Download size={12} strokeWidth={2.3} />} Import from gh CLI
             </button>
           </div>
           {importError ? <div className="gh-card-line error">{importError}</div> : null}
+          <DeviceFlowPrompt monitor={monitor} />
         </div>
       </div>
     );
@@ -249,19 +289,19 @@ export const GithubPanel = ({ monitor, canUseNativeControls }: IGithubPanelProps
         <button className="gh-icon-btn" type="button" aria-label="Refresh" onClick={() => { monitor.refresh(); void monitor.refreshAccounts(); }}>
           <RefreshCw size={12} strokeWidth={2.3} />
         </button>
-        <button className="gh-icon-btn" type="button" aria-label="Import from gh" title="Import from gh" disabled={importing} onClick={() => void runImport()}>
-          {importing ? <RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> : <Plus size={12} strokeWidth={2.3} />}
+        <button className="gh-icon-btn" type="button" aria-label="Sign in with another account" title="Sign in with another account" disabled={signingIn} onClick={() => void monitor.startDeviceFlow()}>
+          <Plus size={12} strokeWidth={2.3} />
         </button>
       </div>
       {monitor.switching ? (
         <div className="gh-card-line muted"><RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> Switching account…</div>
       ) : null}
-      {importError ? <div className="gh-card-line error">{importError}</div> : null}
+      <DeviceFlowPrompt monitor={monitor} />
       {monitor.activeAccount ? (
-        <span className="gh-account-note muted">Switching only affects Gyredeck.</span>
+        <span className="gh-account-note muted">Switching updates Gyredeck and your global git identity.</span>
       ) : null}
 
-      <AddRepo tracked={monitor.trackedRepos} onAdd={monitor.addRepo} />
+      <AddRepo key={monitor.activeAccount ?? "none"} tracked={monitor.trackedRepos} onAdd={monitor.addRepo} />
 
       <div className="gh-cards">
         {monitor.trackedRepos.length === 0 ? (

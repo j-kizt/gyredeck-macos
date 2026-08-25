@@ -1,11 +1,21 @@
 import { useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowRight, Check, Coffee, Download, Focus, Monitor as MonitorIcon, PlugZap, Puzzle, RefreshCw } from "lucide-react";
+import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, Monitor as MonitorIcon, PlugZap, Puzzle, RefreshCw } from "lucide-react";
 import type { IGyredeckBridgeCapabilities } from "@gyredeck/protocol";
 import { shortenPath } from "../session/activity";
 import type { IUseUpdater } from "../updater/useUpdater";
+import { useGitCredentialHelper } from "./useGitCredentialHelper";
 
-type SetupCategory = "connection" | "plugins" | "display" | "update";
-const SETUP_CATEGORIES: SetupCategory[] = ["connection", "display", "plugins", "update"];
+type SetupCategory = "connection" | "plugins" | "display" | "git" | "update";
+const SETUP_CATEGORIES: SetupCategory[] = ["connection", "display", "git", "plugins", "update"];
+
+// Terminals Focus can jump to. Add a row here (plus its AppleScript in the native
+// focus_terminal handler) to support another terminal.
+type TerminalChoice = "iterm" | "ghostty" | "terminal";
+const TERMINAL_OPTIONS: Array<{ value: TerminalChoice; label: string }> = [
+  { value: "ghostty", label: "Ghostty" },
+  { value: "iterm", label: "iTerm2" },
+  { value: "terminal", label: "Terminal" },
+];
 
 export interface ISetupPanelProps {
   capabilities: IGyredeckBridgeCapabilities;
@@ -23,8 +33,8 @@ export interface ISetupPanelProps {
   onInstallHook: () => void;
   onInstallAgy: () => void;
   onKeepAwakeChange: (enabled: boolean) => void;
-  terminal: "iterm" | "ghostty";
-  onTerminalChange: (choice: "iterm" | "ghostty") => void;
+  terminal: TerminalChoice;
+  onTerminalChange: (choice: TerminalChoice) => void;
   updater: IUseUpdater;
 }
 
@@ -40,6 +50,7 @@ const UPDATER_DETAIL: Record<IUseUpdater["status"], string> = {
 export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, agyStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onKeepAwakeChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
   const [activeCategory, setActiveCategory] = useState<SetupCategory>("connection");
   const [compactNavigation, setCompactNavigation] = useState(() => window.matchMedia("(max-width: 380px)").matches);
+  const credentialHelper = useGitCredentialHelper(canUseNativeControls);
 
   const selectCategory = (category: SetupCategory): void => {
     setActiveCategory(category);
@@ -68,6 +79,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
         <div className="setup-sidebar" role="tablist" aria-label="Setup sections" aria-orientation={compactNavigation ? "horizontal" : "vertical"}>
           <button className="setup-side-tab" id="setup-tab-connection" type="button" role="tab" aria-selected={activeCategory === "connection"} aria-controls="setup-panel-connection" tabIndex={activeCategory === "connection" ? 0 : -1} data-active={activeCategory === "connection"} onClick={() => selectCategory("connection")} onKeyDown={(event) => handleCategoryKeyDown(event, "connection")}><PlugZap size={12} strokeWidth={2.2} /><span>Connection</span></button>
           <button className="setup-side-tab" id="setup-tab-display" type="button" role="tab" aria-selected={activeCategory === "display"} aria-controls="setup-panel-display" tabIndex={activeCategory === "display" ? 0 : -1} data-active={activeCategory === "display"} onClick={() => selectCategory("display")} onKeyDown={(event) => handleCategoryKeyDown(event, "display")}><MonitorIcon size={12} strokeWidth={2.2} /><span>Display</span></button>
+          <button className="setup-side-tab" id="setup-tab-git" type="button" role="tab" aria-selected={activeCategory === "git"} aria-controls="setup-panel-git" tabIndex={activeCategory === "git" ? 0 : -1} data-active={activeCategory === "git"} onClick={() => selectCategory("git")} onKeyDown={(event) => handleCategoryKeyDown(event, "git")}><KeyRound size={12} strokeWidth={2.2} /><span>Git</span></button>
           <button className="setup-side-tab" id="setup-tab-plugins" type="button" role="tab" aria-selected={activeCategory === "plugins"} aria-controls="setup-panel-plugins" tabIndex={activeCategory === "plugins" ? 0 : -1} data-active={activeCategory === "plugins"} onClick={() => selectCategory("plugins")} onKeyDown={(event) => handleCategoryKeyDown(event, "plugins")}><Puzzle size={12} strokeWidth={2.2} /><span>Plugins</span></button>
           <button className="setup-side-tab" id="setup-tab-update" type="button" role="tab" aria-selected={activeCategory === "update"} aria-controls="setup-panel-update" tabIndex={activeCategory === "update" ? 0 : -1} data-active={activeCategory === "update"} onClick={() => selectCategory("update")} onKeyDown={(event) => handleCategoryKeyDown(event, "update")}><Download size={12} strokeWidth={2.2} /><span>Update</span></button>
         </div>
@@ -78,7 +90,6 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
               <div className="setup-section-heading"><span>Connection</span><small>Bridge and agent integration</small></div>
               <div className="setup-row"><span className="bridge-dot" data-connected={isConnected} title={connectionTitle} /><span className="setup-copy"><span className="setup-title">Bridge</span><span className="setup-detail">{connectionTitle}</span></span>{!isConnected ? <button className="pill-btn" type="button" onClick={onCheckBridge} data-tauri-drag-region="false" aria-label="Reconnect bridge"><PlugZap size={12} strokeWidth={2.3} />Reconnect</button> : null}</div>
               <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{guidance.title}</span><span className="setup-detail">{guidance.detail}</span></span></div>
-              <div className="setup-row"><span className="status-slot"><Focus className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Terminal</span><span className="setup-detail">Focus jumps to this terminal at the session cwd</span></span><span className="setup-segment" role="group" aria-label="Focus terminal">{([["iterm", "iTerm2"], ["ghostty", "Ghostty"]] as const).map(([value, label]) => <button key={value} type="button" className="setup-segment-option" data-active={terminal === value} aria-pressed={terminal === value} onClick={() => onTerminalChange(value)} data-tauri-drag-region="false">{label}</button>)}</span></div>
               {nativeAction.message ? <div className="notice-row" data-online={nativeAction.bridgeOnline === true} role="status" aria-live="polite">{nativeAction.message}</div> : null}
             </>
           ) : null}
@@ -93,8 +104,17 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
 
           {activeCategory === "display" ? (
             <>
-              <div className="setup-section-heading"><span>Display</span><small>Screen power behavior</small></div>
-              <div className="setup-row"><span className="status-slot"><Coffee className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Keep display awake</span><span className="setup-detail">{!keepAwakeEnabled ? "Off · display follows macOS idle settings" : !canUseNativeControls ? "Desktop runtime required" : keepAwakeError ? `Unavailable · ${keepAwakeError}` : keepAwakeActive ? "Active · agent is working" : "On · waiting for active work"}</span></span><button className={`pill-btn ${keepAwakeEnabled ? "accent" : ""}`} type="button" onClick={() => onKeepAwakeChange(!keepAwakeEnabled)} data-tauri-drag-region="false" aria-label={`${keepAwakeEnabled ? "Disable" : "Enable"} keep display awake`}>{keepAwakeEnabled ? "On" : "Off"}</button></div>
+              <div className="setup-section-heading"><span>Display</span><small>Screen and focus behavior</small></div>
+              <div className="setup-row"><span className="status-slot"><Coffee className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Keep awake while working</span><span className="setup-detail">{!keepAwakeEnabled ? "Off · display follows macOS idle settings" : !canUseNativeControls ? "Desktop runtime required" : keepAwakeError ? `Unavailable · ${keepAwakeError}` : keepAwakeActive ? "Active · agent working — display won't sleep" : "On · will stay awake only while an agent is working"}</span></span><button className="switch-toggle" type="button" role="switch" aria-checked={keepAwakeEnabled} data-on={keepAwakeEnabled} disabled={!canUseNativeControls} onClick={() => onKeepAwakeChange(!keepAwakeEnabled)} data-tauri-drag-region="false" aria-label={`${keepAwakeEnabled ? "Disable" : "Enable"} keep display awake`}><span className="switch-thumb" /></button></div>
+              <div className="setup-row"><span className="status-slot"><Focus className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Terminal</span><span className="setup-detail">Focus jumps to this terminal at the session cwd</span></span><select className="setup-select" value={terminal} onChange={(event) => onTerminalChange(event.target.value as TerminalChoice)} data-tauri-drag-region="false" aria-label="Focus terminal">{TERMINAL_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></div>
+            </>
+          ) : null}
+
+          {activeCategory === "git" ? (
+            <>
+              <div className="setup-section-heading"><span>Git</span><small>Credential helper for GitHub</small></div>
+              <div className="setup-row"><span className="status-slot"><KeyRound className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Use Gyredeck for git auth</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : credentialHelper.error ? credentialHelper.error : credentialHelper.installed === null ? "Checking…" : credentialHelper.installed ? "On · git push/pull uses your active GitHub account" : "Off · git uses its default helper (e.g. osxkeychain)"}</span></span><button className="switch-toggle" type="button" role="switch" aria-checked={credentialHelper.installed === true} data-on={credentialHelper.installed === true} disabled={!canUseNativeControls || credentialHelper.busy || credentialHelper.installed === null} onClick={() => void credentialHelper.setEnabled(!credentialHelper.installed)} data-tauri-drag-region="false" aria-label={`${credentialHelper.installed ? "Disable" : "Enable"} Gyredeck git credential helper`}><span className="switch-thumb" /></button></div>
+              <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">How it works</span><span className="setup-detail">Points git at Gyredeck in your global ~/.gitconfig, so HTTPS pushes follow the account you pick on the GitHub tab — no gh CLI needed. Turn off to restore your previous helper.</span></span></div>
             </>
           ) : null}
 

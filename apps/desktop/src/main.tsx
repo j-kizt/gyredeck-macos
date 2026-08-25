@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { BarChart3, Check, ChevronLeft, Focus, GitBranch, List, Server, Settings, Trash2, X } from "lucide-react";
+import { BarChart3, ChevronLeft, Focus, GitBranch, List, Server, Settings, Trash2 } from "lucide-react";
 import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState, type ErrorInfo, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import type { GyredeckPresenceStatus } from "@gyredeck/protocol";
@@ -39,6 +39,7 @@ import { useAgentUsageList } from "./features/usage/useAgentUsageList";
 import { useRuntimeMonitor } from "./features/runtime/useRuntimeMonitor";
 import { GithubPanel } from "./features/github/components";
 import { useGithubMonitor } from "./features/github/useGithubMonitor";
+import { Tooltip } from "./Tooltip";
 import "./styles.css";
 
 const KEEP_AWAKE_STORAGE_KEY = "gyredeck.keep-awake-while-working";
@@ -91,9 +92,9 @@ const writeKeepAwakeEnabled = (enabled: boolean) => {
 };
 
 const TERMINAL_STORAGE_KEY = "gyredeck.terminal";
-export type TerminalChoice = "iterm" | "ghostty";
+export type TerminalChoice = "iterm" | "ghostty" | "terminal";
 const readTerminalChoice = (): TerminalChoice => {
-  try { return window.localStorage.getItem(TERMINAL_STORAGE_KEY) === "ghostty" ? "ghostty" : "iterm"; } catch { return "iterm"; }
+  try { const stored = window.localStorage.getItem(TERMINAL_STORAGE_KEY); return stored === "ghostty" || stored === "terminal" ? stored : "iterm"; } catch { return "iterm"; }
 };
 const writeTerminalChoice = (choice: TerminalChoice) => {
   try { window.localStorage.setItem(TERMINAL_STORAGE_KEY, choice); } catch { /* current runtime still owns state */ }
@@ -614,12 +615,6 @@ const App = () => {
     }
   };
 
-  const acknowledgeDone = () => {
-    const conversationId = activitySession?.status === "done" ? activitySession.conversationId : presence.conversationId;
-    setAcknowledgedConversationId(conversationId);
-    setSelectedSessionId(null);
-  };
-
   const checkBridge = async () => {
     if (!canUseNativeControls) {
       setNativeAction({ bridgeOnline: null, message: "Native controls need Tauri runtime" });
@@ -683,7 +678,7 @@ const App = () => {
         cwd: "cwd" in session ? session.cwd : session.workspacePath,
         terminal,
       });
-      const exactMatch = message.startsWith("Focused iTerm ·") || message.startsWith("Focused Ghostty ·");
+      const exactMatch = message.startsWith("Focused iTerm ·") || message.startsWith("Focused Ghostty ·") || message.startsWith("Focused Terminal ·");
       setSessionAction({ ok: exactMatch, message });
     } catch (error) {
       setSessionAction({ ok: false, message: error instanceof Error ? error.message : "Terminal focus failed" });
@@ -808,7 +803,7 @@ const App = () => {
                           <div className="action-row" data-kind={activity.kind} key={event.id}>
                             <span className="action-mark" aria-hidden="true" />
                             <span className="action-tool">{activity.label}</span>
-                            <span className="action-detail">{activity.detail}</span>
+                            <Tooltip label={activity.detail}><span className="action-detail">{activity.detail}</span></Tooltip>
                             <span className="session-time">{formatTime(event.timestamp)}</span>
                           </div>
                         );
@@ -912,7 +907,7 @@ const App = () => {
                       <div className="event-row" key={event.id}>
                         <span className="event-time">{formatTime(event.timestamp)}</span>
                         <span className="event-type">{event.type}</span>
-                        <span className="event-detail">{getEventDetail(event)}</span>
+                        <Tooltip label={getEventDetail(event)}><span className="event-detail">{getEventDetail(event)}</span></Tooltip>
                       </div>
                     ))}
                   </div>
@@ -923,29 +918,6 @@ const App = () => {
             <div className={`sheet-footer ${selectedSession ? "session-context-footer" : "copyright-footer"}`}>
                 {selectedSession ? (
                   <>
-                    <div className="session-context-actions">
-                    <button className="pill-btn accent" type="button" onClick={() => void focusSelectedSession(selectedSession)} data-tauri-drag-region="false">
-                      <Focus size={12} strokeWidth={2.3} />
-                      Focus
-                    </button>
-                    {selectedSession.status === "done" ? (
-                      <button className="pill-btn" type="button" onClick={() => dismissSession(selectedSession.conversationId)} data-tauri-drag-region="false" title="Hide until fresh activity arrives">
-                        <X size={12} strokeWidth={2.4} />
-                        Clear
-                      </button>
-                    ) : null}
-                    <button
-                      className={`pill-btn danger session-history-action ${pendingRemoveHistoryId === selectedSession.conversationId ? "is-armed" : ""}`}
-                      type="button"
-                      onClick={() => requestRemoveSessionHistory(selectedSession.conversationId)}
-                      data-tauri-drag-region="false"
-                      title="Remove this session's locally stored activity"
-                      aria-label={pendingRemoveHistoryId === selectedSession.conversationId ? "Confirm remove" : "Remove history"}
-                    >
-                      <Trash2 size={12} strokeWidth={2.3} />
-                      {pendingRemoveHistoryId === selectedSession.conversationId ? "Confirm remove" : null}
-                    </button>
-                    </div>
                     <button
                       className="session-context-return"
                       type="button"
@@ -955,20 +927,28 @@ const App = () => {
                     >
                       <ChevronLeft size={12} strokeWidth={2.3} />
                       <span>Back to sessions</span>
-                      <span className="session-context-return-count">{sessions.length}</span>
                     </button>
+                    <div className="session-context-actions">
+                    <button className="pill-btn accent context-icon-btn" type="button" onClick={() => void focusSelectedSession(selectedSession)} data-tauri-drag-region="false" title="Focus matching terminal" aria-label="Focus matching terminal">
+                      <Focus size={13} strokeWidth={2.3} />
+                    </button>
+                    <button
+                      className={`pill-btn danger session-history-action ${pendingRemoveHistoryId === selectedSession.conversationId ? "is-armed" : ""}`}
+                      type="button"
+                      onClick={() => requestRemoveSessionHistory(selectedSession.conversationId)}
+                      data-tauri-drag-region="false"
+                      title="Remove this session's locally stored activity"
+                      aria-label={pendingRemoveHistoryId === selectedSession.conversationId ? "Confirm remove" : "Remove history"}
+                    >
+                      <Trash2 size={13} strokeWidth={2.3} />
+                      {pendingRemoveHistoryId === selectedSession.conversationId ? "Confirm remove" : null}
+                    </button>
+                    </div>
                   </>
                 ) : (
                   <>
                     <span className="footer-copyright">© 2026 Gyredeck · J-Kitz</span>
-                    {!setupOpen && activitySession?.status === "done" ? (
-                      <button className="pill-btn accent footer-done-close" type="button" onClick={(event) => { event.stopPropagation(); acknowledgeDone(); }} data-tauri-drag-region="false">
-                        <Check size={12} strokeWidth={2.4} />
-                        Close
-                      </button>
-                    ) : (
-                      <span className="footer-version">{updater.currentVersion ? `v${updater.currentVersion}` : ""}</span>
-                    )}
+                    <span className="footer-version">{updater.currentVersion ? `v${updater.currentVersion}` : ""}</span>
                   </>
                 )}
               </div>

@@ -3,6 +3,7 @@ import { ChevronRight, ExternalLink, RefreshCw } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { formatLocalServiceEndpoint, formatLocalServiceUptime, formatRuntimeBytes, localServiceListenerKey } from "./model";
 import type { ILocalService, ILocalServiceControlResult, IRuntimeMonitorView, LocalServiceControlMode } from "./types";
+import { Tooltip } from "../../Tooltip";
 
 const openLocalServiceWindow = (url: string): boolean => {
   try {
@@ -148,7 +149,7 @@ const LocalServiceRow = ({ expanded, onControl, onOpen, onResult, onToggle, serv
         <button className="runtime-service-disclosure" type="button" aria-expanded={expanded} aria-controls={detailsId} aria-label={`${expanded ? "Collapse" : "Expand"} ${displayTitle} service details on port ${service.port}`} onClick={() => onToggle(service)}>
           <span className="runtime-identity">
             <span className="runtime-project" title={service.httpTitle ?? undefined}>{displayTitle}</span>
-            <span className="runtime-conversation">{formatLocalServiceEndpoint(service)}{displayTitle !== service.processName ? ` · ${service.processName}` : ""}</span>
+            <Tooltip label={`${formatLocalServiceEndpoint(service)}${displayTitle !== service.processName ? ` · ${service.processName}` : ""}`}><span className="runtime-conversation">{formatLocalServiceEndpoint(service)}{displayTitle !== service.processName ? ` · ${service.processName}` : ""}</span></Tooltip>
           </span>
           <ChevronRight className="runtime-service-chevron" size={12} strokeWidth={2} aria-hidden="true" />
         </button>

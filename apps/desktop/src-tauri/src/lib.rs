@@ -31,8 +31,10 @@ mod notification;
 mod standalone_bridge;
 
 use github::{
-    github_accounts, github_available_repos, github_device_poll, github_device_start,
-    github_import_from_gh, github_remove_account, github_repo_status, github_switch_account,
+    github_accounts, github_available_repos, github_credential_helper_disable,
+    github_credential_helper_enable, github_credential_helper_status, github_device_poll,
+    github_device_start, github_import_from_gh, github_remove_account, github_repo_status,
+    github_switch_account,
 };
 
 use keep_awake::KeepAwakeState;
@@ -513,6 +515,33 @@ fn claude_hook_entry_present(
             })
         })
         .unwrap_or(false)
+}
+
+/// Remove any hook entries whose command contains `needle` (e.g. an old brand's
+/// adapter path), pruning emptied matcher groups and events. Used to clean up a
+/// prior install so it can't fire alongside the current one.
+fn prune_hook_entries(hooks: &mut serde_json::Map<String, serde_json::Value>, needle: &str) {
+    let events: Vec<String> = hooks.keys().cloned().collect();
+    for event in events {
+        let Some(groups) = hooks.get_mut(&event).and_then(serde_json::Value::as_array_mut) else {
+            continue;
+        };
+        groups.retain_mut(|group| {
+            let Some(list) = group.get_mut("hooks").and_then(serde_json::Value::as_array_mut) else {
+                return true;
+            };
+            list.retain(|hook| {
+                hook.get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|command| !command.contains(needle))
+                    .unwrap_or(true)
+            });
+            !list.is_empty()
+        });
+        if groups.is_empty() {
+            hooks.remove(&event);
+        }
+    }
 }
 
 #[tauri::command]
@@ -4279,6 +4308,10 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
     }
     let hooks = hooks_value.as_object_mut().expect("hooks is object");
 
+    // Upgrading from the previous brand (agent-activity) left its hook registered;
+    // strip it so it doesn't fire alongside Gyredeck and double every event.
+    prune_hook_entries(hooks, "agent-activity");
+
     let mut register = |event: &str, entry: serde_json::Value| {
         let command = claude_hook_command(&installed_path, event);
         if claude_hook_entry_present(hooks, event, &command) {
@@ -4405,6 +4438,8 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
             {"type": "command", "command": agy_hook_command(&installed_path, "Stop")}
         ]
     });
+    // Drop the previous brand's namespace so it can't fire alongside Gyredeck.
+    root.remove("agent-activity");
     root.insert("gyredeck".to_string(), entry);
 
     let Some(hooks_parent) = hooks_json_path.parent() else {
@@ -4446,10 +4481,10 @@ fn focus_terminal(
     cwd: Option<String>,
     terminal: Option<String>,
 ) -> Result<String, String> {
-    if terminal.as_deref() == Some("ghostty") {
-        focus_ghostty_window(&conversation_id, cwd.as_deref())
-    } else {
-        focus_iterm_window(&conversation_id, cwd.as_deref())
+    match terminal.as_deref() {
+        Some("ghostty") => focus_ghostty_window(&conversation_id, cwd.as_deref()),
+        Some("terminal") => focus_appleterminal_window(&conversation_id, cwd.as_deref()),
+        _ => focus_iterm_window(&conversation_id, cwd.as_deref()),
     }
 }
 
@@ -4672,6 +4707,114 @@ tell application "Ghostty"
             end if
           end if
         end repeat
+      end repeat
+    end repeat
+  end repeat
+  activate
+end tell
+return "activated"
+"#
+    )
+}
+
+fn activate_appleterminal() -> Result<(), String> {
+    let output = Command::new("open")
+        .args(["-a", "Terminal"])
+        .output()
+        .map_err(|error| format!("Failed to launch Terminal: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        "Failed to activate Terminal".to_string()
+    } else {
+        format!("Failed to activate Terminal: {stderr}")
+    })
+}
+
+fn focus_appleterminal_window(conversation_id: &str, cwd: Option<&str>) -> Result<String, String> {
+    let hints = build_focus_hints(conversation_id, cwd);
+
+    if let Ok(message) = focus_appleterminal_with_window_hints(&hints) {
+        return Ok(message);
+    }
+
+    activate_appleterminal()?;
+    Ok("Activated Terminal · exact terminal not found".to_string())
+}
+
+fn focus_appleterminal_with_window_hints(hints: &[String]) -> Result<String, String> {
+    let script = build_focus_appleterminal_script(hints);
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|error| format!("Failed to run AppleScript: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "AppleScript focus failed".to_string()
+        } else {
+            stderr
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if let Some(rest) = stdout.strip_prefix("matched:") {
+        Ok(format!("Focused Terminal · {rest}"))
+    } else {
+        Ok("Activated Terminal · exact terminal not found".to_string())
+    }
+}
+
+fn build_focus_appleterminal_script(hints: &[String]) -> String {
+    let hints_source = hints
+        .iter()
+        .filter(|hint| !hint.trim().is_empty())
+        .map(|hint| apple_script_string(hint))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hints_source = if hints_source.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{{hints_source}}}")
+    };
+
+    // Terminal.app does not expose a session cwd, so match on window/tab title, the
+    // running process name, and tty — then select that tab and bring it to front.
+    format!(
+        r#"set matchHints to {hints_source}
+tell application "Terminal"
+  repeat with candidateWindow in windows
+    set windowTitle to ""
+    try
+      set windowTitle to (name of candidateWindow) as text
+    end try
+    repeat with candidateTab in tabs of candidateWindow
+      set tabTitle to ""
+      try
+        set tabTitle to (custom title of candidateTab) as text
+      end try
+      set tabProcess to ""
+      try
+        set tabProcess to (processes of candidateTab) as text
+      end try
+      set tabTty to ""
+      try
+        set tabTty to (tty of candidateTab) as text
+      end try
+      repeat with matchHint in matchHints
+        set hintText to matchHint as text
+        if hintText is not "" then
+          if tabTitle contains hintText or windowTitle contains hintText or tabProcess contains hintText or tabTty is hintText then
+            set frontmost of candidateWindow to true
+            set selected tab of candidateWindow to candidateTab
+            activate
+            return "matched:" & tabTitle
+          end if
+        end if
       end repeat
     end repeat
   end repeat
@@ -5277,6 +5420,15 @@ fn import_shell_path() {
 }
 
 pub fn run() {
+    // Credential-helper mode: `gyredeck-desktop git-credential <op>`. Answer git's
+    // auth request from the token store and exit before any UI initialization.
+    let mut cli = std::env::args().skip(1);
+    if cli.next().as_deref() == Some("git-credential") {
+        let op = cli.next().unwrap_or_default();
+        github::run_credential_helper(&op);
+        return;
+    }
+
     #[cfg(target_os = "macos")]
     import_shell_path();
 
@@ -5301,6 +5453,9 @@ pub fn run() {
             github_remove_account,
             github_device_start,
             github_device_poll,
+            github_credential_helper_status,
+            github_credential_helper_enable,
+            github_credential_helper_disable,
             control_local_service,
             local_services,
             notification_permission_state,

@@ -21,6 +21,7 @@ import type {
   UsageResetMode,
   UsageSidebarSelection,
 } from "./types";
+import { Tooltip } from "../../Tooltip";
 
 interface IProviderIconProps {
   provider: IUsageProviderConfig;
@@ -58,7 +59,7 @@ const Meter = ({ metric: value }: IMeterProps) => (
     data-level={value.statusLevel}
   >
     <div className="usage-meter-head">
-      <span className="usage-meter-label">{value.limitLabel ?? value.label}</span>
+      <Tooltip label={value.limitLabel ?? value.label}><span className="usage-meter-label">{value.limitLabel ?? value.label}</span></Tooltip>
       <span className="usage-meter-status">
         <span className="usage-status-dot" aria-hidden="true" />
         {value.statusLabel}
@@ -258,7 +259,7 @@ const UsageValueRows = ({ rows }: IUsageValueRowsProps) => {
       {visibleRows.map((row) => (
         <div className="usage-value-row" key={row.label}>
           <dt>{row.label}</dt>
-          <dd>{row.value}</dd>
+          <Tooltip label={row.value}><dd>{row.value}</dd></Tooltip>
         </div>
       ))}
     </dl>
@@ -296,7 +297,7 @@ const ProviderDetail = ({ provider, settings, usage }: IProviderDetailProps) => 
           <ProviderIcon provider={provider} />
           {provider.label}
         </span>
-        {usage.plan ? <span className="usage-plan">{usage.plan}</span> : null}
+        {usage.plan ? <Tooltip label={usage.plan}><span className="usage-plan">{usage.plan}</span></Tooltip> : null}
         {freshness ? (
           <span className="usage-freshness" data-stale={usage.stale}>
             {freshness}

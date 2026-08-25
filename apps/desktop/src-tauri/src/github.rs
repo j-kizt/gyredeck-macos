@@ -602,28 +602,40 @@ pub async fn github_remove_account(user: String) -> Result<Vec<GhAccount>, Strin
 
 // ── OAuth Device Flow (add a new account) ──
 
+/// Resolve the GitHub OAuth **client id** for the device flow. A client id is a
+/// public identifier (not a secret), but we keep it out of source: it is baked in
+/// at build time from the `GYREDECK_GITHUB_CLIENT_ID` CI secret via `option_env!`.
+/// A runtime env var or per-machine config file can override it for local dev.
 fn client_id() -> Result<String, String> {
+    // 1. Runtime env override (local dev).
     if let Ok(value) = std::env::var("GYREDECK_GITHUB_CLIENT_ID") {
         if !value.trim().is_empty() {
             return Ok(value.trim().to_string());
         }
     }
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
-    let path = std::path::PathBuf::from(home)
-        .join(".config")
-        .join("gyredeck")
-        .join("github-oauth.json");
-    let content = std::fs::read_to_string(&path).map_err(|_| {
-        "No GitHub OAuth client id configured. Set GYREDECK_GITHUB_CLIENT_ID or create ~/.config/gyredeck/github-oauth.json with { \"client_id\": \"...\" }.".to_string()
-    })?;
-    let value: Value =
-        serde_json::from_str(&content).map_err(|e| format!("Invalid github-oauth.json: {e}"))?;
-    value
-        .get("client_id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| "github-oauth.json is missing a non-empty client_id".to_string())
+    // 2. Per-machine config file override.
+    if let Ok(home) = std::env::var("HOME") {
+        let path = std::path::PathBuf::from(home)
+            .join(".config")
+            .join("gyredeck")
+            .join("github-oauth.json");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let value: Value = serde_json::from_str(&content)
+                .map_err(|e| format!("Invalid github-oauth.json: {e}"))?;
+            if let Some(id) = value
+                .get("client_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                return Ok(id.to_string());
+            }
+        }
+    }
+    // 3. Baked in at build time from the CI secret.
+    match option_env!("GYREDECK_GITHUB_CLIENT_ID") {
+        Some(id) if !id.is_empty() => Ok(id.to_string()),
+        _ => Err("GitHub sign-in isn't configured in this build. Set GYREDECK_GITHUB_CLIENT_ID or add ~/.config/gyredeck/github-oauth.json with { \"client_id\": \"...\" }.".to_string()),
+    }
 }
 
 #[derive(Serialize)]
@@ -684,6 +696,7 @@ fn store_device_token(token: &str) -> Result<Option<String>, String> {
     let login = import_token(&client, &mut store, token)?;
     store.active = Some(login.clone());
     save_store(&store)?;
+    sync_git_identity(&store);
     Ok(Some(login))
 }
 
@@ -720,6 +733,146 @@ fn device_poll_blocking(device_code: &str) -> Result<DevicePollResult, String> {
 #[tauri::command]
 pub async fn github_device_poll(device_code: String) -> Result<DevicePollResult, String> {
     tauri::async_runtime::spawn_blocking(move || device_poll_blocking(&device_code))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+// ── Git credential helper (Gyredeck as a gh-free credential source) ──
+//
+// When enabled, git is pointed at `gyredeck-desktop git-credential`, which answers
+// HTTPS auth for GitHub from the local token store — so `git push` follows the
+// account you pick in Gyredeck, without needing the gh CLI. Toggled from Settings.
+
+const CREDENTIAL_HOSTS: [&str; 2] = ["github.com", "gist.github.com"];
+const CREDENTIAL_CONFIG_HOSTS: [&str; 2] = ["https://github.com", "https://gist.github.com"];
+
+#[derive(Serialize)]
+pub struct CredentialHelperStatus {
+    pub installed: bool,
+    pub path: String,
+}
+
+/// Handle a `git-credential <op>` invocation. Git sends a key=value request on
+/// stdin; we answer `get` from the token store and no-op `store`/`erase`. Runs
+/// before any Tauri/UI init and must exit promptly.
+pub fn run_credential_helper(op: &str) {
+    use std::io::{Read, Write};
+    if op != "get" {
+        return;
+    }
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return;
+    }
+    let mut host = String::new();
+    let mut wanted_user = String::new();
+    for line in input.lines() {
+        if let Some(value) = line.strip_prefix("host=") {
+            host = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("username=") {
+            wanted_user = value.trim().to_string();
+        }
+    }
+    if !CREDENTIAL_HOSTS.contains(&host.as_str()) {
+        return;
+    }
+    let Ok(store) = load_store() else {
+        return;
+    };
+    // Prefer an explicit username from the remote URL; otherwise the active account.
+    let account = store
+        .accounts
+        .iter()
+        .find(|a| !wanted_user.is_empty() && a.login == wanted_user)
+        .or_else(|| {
+            let active = store.active.as_deref()?;
+            store.accounts.iter().find(|a| a.login == active)
+        });
+    let Some(account) = account else {
+        return;
+    };
+    let mut out = std::io::stdout();
+    let _ = write!(
+        out,
+        "protocol=https\nhost={host}\nusername={}\npassword={}\n",
+        account.login, account.token
+    );
+    let _ = out.flush();
+}
+
+fn helper_command_value() -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("Cannot resolve executable path: {e}"))?
+        .to_string_lossy()
+        .to_string();
+    Ok(format!("!'{exe}' git-credential"))
+}
+
+fn credential_helper_installed() -> Result<CredentialHelperStatus, String> {
+    let path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let output = Command::new("git")
+        .args(["config", "--global", "--get-all", "credential.https://github.com.helper"])
+        .output()
+        .map_err(|e| format!("git is not available: {e}"))?;
+    let installed = String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("git-credential") && lower.contains("gyredeck")
+    });
+    Ok(CredentialHelperStatus { installed, path })
+}
+
+fn credential_helper_enable_blocking() -> Result<CredentialHelperStatus, String> {
+    let helper = helper_command_value()?;
+    for host in CREDENTIAL_CONFIG_HOSTS {
+        let key = format!("credential.{host}.helper");
+        // Clear prior values, then an empty helper (drops the inherited osxkeychain)
+        // followed by ours — the same reset pattern `gh auth setup-git` uses.
+        let _ = Command::new("git").args(["config", "--global", "--unset-all", &key]).status();
+        git_config_add(&key, "")?;
+        git_config_add(&key, &helper)?;
+    }
+    credential_helper_installed()
+}
+
+fn credential_helper_disable_blocking() -> Result<CredentialHelperStatus, String> {
+    for host in CREDENTIAL_CONFIG_HOSTS {
+        let key = format!("credential.{host}.helper");
+        let _ = Command::new("git").args(["config", "--global", "--unset-all", &key]).status();
+    }
+    credential_helper_installed()
+}
+
+fn git_config_add(key: &str, value: &str) -> Result<(), String> {
+    let status = Command::new("git")
+        .args(["config", "--global", "--add", key, value])
+        .status()
+        .map_err(|e| format!("git is not available: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("git config failed for {key}"))
+    }
+}
+
+#[tauri::command]
+pub async fn github_credential_helper_status() -> Result<CredentialHelperStatus, String> {
+    tauri::async_runtime::spawn_blocking(credential_helper_installed)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn github_credential_helper_enable() -> Result<CredentialHelperStatus, String> {
+    tauri::async_runtime::spawn_blocking(credential_helper_enable_blocking)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn github_credential_helper_disable() -> Result<CredentialHelperStatus, String> {
+    tauri::async_runtime::spawn_blocking(credential_helper_disable_blocking)
         .await
         .map_err(|e| e.to_string())?
 }

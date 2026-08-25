@@ -216,8 +216,25 @@
   letter-spacing: 2px;
   color: var(--text);
   background: var(--fill-2);
+  border: 1px solid var(--hair);
   border-radius: 6px;
   padding: 3px 8px;
+  cursor: pointer;
+}
+
+.gh-device-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--hair);
+  border-radius: 10px;
+  background: var(--fill);
+}
+
+.gh-device-actions {
+  display: flex;
+  gap: 8px;
 }
 
 .gh-empty {
@@ -225,6 +242,59 @@
   font-size: 12px;
   padding: 14px 4px;
   text-align: center;
+}
+
+.gh-onboard {
+  flex: 1;
+  min-height: 300px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  text-align: center;
+  padding: 24px 16px;
+}
+
+.gh-onboard-badge {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  background: var(--fill);
+  border: 1px solid var(--hair);
+  color: var(--text-2);
+  margin-bottom: 4px;
+}
+
+.gh-onboard-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.gh-onboard-sub {
+  font-size: 12px;
+  color: var(--text-3);
+  max-width: 240px;
+  line-height: 1.45;
+}
+
+.gh-onboard-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.gh-onboard .gh-device-panel {
+  margin-top: 10px;
+  width: 100%;
+  max-width: 280px;
+  text-align: left;
 }
 
 .gh-icon-btn[data-error="true"] {

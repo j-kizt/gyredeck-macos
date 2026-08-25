@@ -315,6 +315,7 @@ function startBridge(config) {
         hookEventName: typeof data.hookEventName === "string" ? data.hookEventName : "Stop",
         source: typeof data.source === "string" ? data.source : "hook",
         message: typeof data.message === "string" ? data.message : null,
+        usage: data.usage && typeof data.usage === "object" ? data.usage : null,
       },
     });
   };

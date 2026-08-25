@@ -47,6 +47,51 @@ const readModelFromTranscript = async (transcriptPath) => {
   }
 };
 
+/**
+ * Read token usage from the last assistant entry in the transcript tail. Claude
+ * writes `message.usage` per turn; we surface it so a completed turn can report its
+ * token cost. Returns null if unavailable.
+ */
+const readUsageFromTranscript = async (transcriptPath) => {
+  if (typeof transcriptPath !== "string" || transcriptPath.length === 0) return null;
+  try {
+    const handle = await open(transcriptPath, "r");
+    try {
+      const { size } = await handle.stat();
+      const readLen = Math.min(size, 128 * 1024);
+      const buf = Buffer.alloc(readLen);
+      await handle.read(buf, 0, readLen, size - readLen);
+      const lines = buf.toString("utf8").split("\n");
+      const num = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
+      // Walk from the end; the most recent assistant entry with usage wins.
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        let entry;
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const usage = entry?.message?.usage;
+        if (usage && typeof usage === "object") {
+          return {
+            inputTokens: num(usage.input_tokens),
+            outputTokens: num(usage.output_tokens),
+            cacheReadTokens: num(usage.cache_read_input_tokens),
+            cacheCreationTokens: num(usage.cache_creation_input_tokens),
+          };
+        }
+      }
+      return null;
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return null;
+  }
+};
+
 /** Read bridge endpoint from Gyredeck config. */
 const readEndpoint = async () => {
   try {
@@ -229,6 +274,7 @@ const main = async () => {
           conversationId,
           toolName: null,
           message: null,
+          usage: await readUsageFromTranscript(input.transcript_path),
         }));
         break;
       case "SessionEnd":

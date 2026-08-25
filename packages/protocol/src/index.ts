@@ -129,12 +129,20 @@ export interface IGyredeckTurnStopEvent extends IGyredeckBaseEvent {
   };
 }
 
+export interface IGyredeckTurnUsage {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheCreationTokens: number | null;
+}
+
 export interface IGyredeckTurnCompleteEvent extends IGyredeckBaseEvent {
   type: "turn_complete";
   data: {
     hookEventName: "Stop" | string;
     source: "hook" | string;
     message?: string | null;
+    usage?: IGyredeckTurnUsage | null;
   };
 }
 

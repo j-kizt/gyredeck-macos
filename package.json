@@ -1,8 +1,8 @@
 {
   "name": "gyredeck",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
-  "description": "Native presence bridge and desktop halo for Letta Code agent activity.",
+  "description": "Local-first macOS menu-bar companion for AI coding agents — live sessions, provider usage, local services, and GitHub monitoring.",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "scripts": {

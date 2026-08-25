@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   fetchAccounts,
   fetchRepoStatus,
+  importFromGh as importFromGhCmd,
   readStatusCache,
   readTrackedRepos,
   switchAccount,
@@ -29,6 +30,7 @@ export interface IGithubMonitor {
   refresh: () => void;
   refreshAccounts: () => Promise<void>;
   switchTo: (user: string) => Promise<void>;
+  importFromGh: () => Promise<void>;
 }
 
 export const useGithubMonitor = ({ active, canUseNativeControls }: IUseGithubMonitorOptions): IGithubMonitor => {
@@ -113,6 +115,11 @@ export const useGithubMonitor = ({ active, canUseNativeControls }: IUseGithubMon
     writeStatusCache(cache);
   }, []);
 
+  const importFromGh = useCallback(async () => {
+    await importFromGhCmd();
+    await refreshAccounts();
+  }, [refreshAccounts]);
+
   const switchTo = useCallback(async (user: string) => {
     setSwitching(true);
     try {
@@ -153,5 +160,6 @@ export const useGithubMonitor = ({ active, canUseNativeControls }: IUseGithubMon
     refresh,
     refreshAccounts,
     switchTo,
+    importFromGh,
   };
 };

@@ -1,6 +1,6 @@
 {
   "name": "gyredeck",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Native presence bridge and desktop halo for Letta Code agent activity.",
   "type": "module",

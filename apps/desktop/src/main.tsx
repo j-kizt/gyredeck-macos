@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { BarChart3, ChevronLeft, Focus, GitBranch, List, Server, Settings, Trash2 } from "lucide-react";
+import { BarChart3, Check, ChevronLeft, Copy, Focus, GitBranch, List, Server, Settings, Trash2 } from "lucide-react";
 import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState, type ErrorInfo, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import type { GyredeckPresenceStatus } from "@gyredeck/protocol";
@@ -123,6 +123,7 @@ const App = () => {
   const [expandedSessionGroupKeys, setExpandedSessionGroupKeys] = useState<Set<string>>(() => new Set());
   const [clearCompletedArmed, setClearCompletedArmed] = useState(false);
   const [pendingRemoveHistoryId, setPendingRemoveHistoryId] = useState<string | null>(null);
+  const [copiedSessionId, setCopiedSessionId] = useState<string | null>(null);
   const [pendingGroupHistoryRemoval, setPendingGroupHistoryRemoval] = useState<string | null>(null);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const sheetInnerRef = useRef<HTMLDivElement | null>(null);
@@ -562,6 +563,15 @@ const App = () => {
     deleteSessions([conversationId]);
   };
 
+  const copySessionId = (conversationId: string) => {
+    void navigator.clipboard?.writeText(conversationId)
+      .then(() => {
+        setCopiedSessionId(conversationId);
+        window.setTimeout(() => setCopiedSessionId((current) => (current === conversationId ? null : current)), 1500);
+      })
+      .catch(() => undefined);
+  };
+
   const requestRemoveSessionHistory = (conversationId: string) => {
     if (pendingRemoveHistoryId !== conversationId) {
       setPendingRemoveHistoryId(conversationId);
@@ -929,6 +939,16 @@ const App = () => {
                       <span>Back to sessions</span>
                     </button>
                     <div className="session-context-actions">
+                    <button
+                      className="pill-btn context-icon-btn"
+                      type="button"
+                      onClick={() => copySessionId(selectedSession.conversationId)}
+                      data-tauri-drag-region="false"
+                      title={copiedSessionId === selectedSession.conversationId ? "Copied" : "Copy session id"}
+                      aria-label={copiedSessionId === selectedSession.conversationId ? "Session id copied" : "Copy session id"}
+                    >
+                      {copiedSessionId === selectedSession.conversationId ? <Check size={13} strokeWidth={2.3} /> : <Copy size={13} strokeWidth={2.3} />}
+                    </button>
                     <button className="pill-btn accent context-icon-btn" type="button" onClick={() => void focusSelectedSession(selectedSession)} data-tauri-drag-region="false" title="Focus matching terminal" aria-label="Focus matching terminal">
                       <Focus size={13} strokeWidth={2.3} />
                     </button>

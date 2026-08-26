@@ -1,6 +1,6 @@
 # Contributing to Gyredeck
 
-macOS · Node 22 · pnpm 10 · Rust + the Tauri toolchain · GitHub CLI (`gh`) for the GitHub tab.
+macOS · Node 22 · pnpm 10 · Rust + the Tauri toolchain. The `gh` / `glab` CLIs are optional — the Git Monitor tab signs in via OAuth device flow and can also import existing auth from them.
 
 ## Build from source
 

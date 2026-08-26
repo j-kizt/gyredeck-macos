@@ -66,7 +66,7 @@ interface IHookStatus {
   installed: boolean | null;
 }
 
-type MainPanelTab = "sessions" | "usage" | "services" | "github";
+type MainPanelTab = "sessions" | "usage" | "ports" | "git";
 
 interface IStatusView {
   status: GyredeckPresenceStatus | "stale";
@@ -182,11 +182,11 @@ const App = () => {
     canUseNativeControls,
     demoMode: DEMO_MODE,
     registry: sessionEventRegistry,
-    servicesActive: activeMainTab === "services" && !setupOpen && !selectedSessionId,
+    servicesActive: activeMainTab === "ports" && !setupOpen && !selectedSessionId,
     sessions: allSessions,
   });
   const githubMonitor = useGithubMonitor({
-    active: activeMainTab === "github" && !setupOpen && !selectedSessionId,
+    active: activeMainTab === "git" && !setupOpen && !selectedSessionId,
     canUseNativeControls,
   });
 
@@ -242,9 +242,9 @@ const App = () => {
       ? selectedSession.project
       : activeMainTab === "usage"
         ? "Usage"
-        : activeMainTab === "services"
+        : activeMainTab === "ports"
           ? "Listening Ports"
-        : activeMainTab === "github"
+        : activeMainTab === "git"
           ? "Git Monitor"
           : sessionGroups.length === 0
           ? "Gyredeck"
@@ -282,9 +282,9 @@ const App = () => {
   const headerGlyph =
     activeMainTab === "usage" ? (
       <span className="status-slot"><BarChart3 className="setup-icon" size={14} strokeWidth={2.3} /></span>
-    ) : activeMainTab === "services" ? (
+    ) : activeMainTab === "ports" ? (
       <span className="status-slot"><Server className="setup-icon" size={14} strokeWidth={2.3} /></span>
-    ) : activeMainTab === "github" ? (
+    ) : activeMainTab === "git" ? (
       <span className="status-slot"><GitBranch className="setup-icon" size={14} strokeWidth={2.3} /></span>
     ) : (
       <StatusGlyph status={glyphStatus} />
@@ -459,7 +459,7 @@ const App = () => {
   const handleMainTabKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, currentTab: MainPanelTab) => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
-    const tabs: MainPanelTab[] = ["sessions", "usage", "services", "github"];
+    const tabs: MainPanelTab[] = ["sessions", "usage", "ports", "git"];
     const currentIndex = tabs.indexOf(currentTab);
     const nextTab = event.key === "Home"
       ? tabs[0]
@@ -770,10 +770,10 @@ const App = () => {
                     <button id="main-tab-usage" className="header-tab" data-active={activeMainTab === "usage"} data-panel-focus-target={activeMainTab === "usage" ? "true" : undefined} type="button" role="tab" aria-label="Usage" aria-selected={activeMainTab === "usage"} aria-controls="main-panel-usage" tabIndex={activeMainTab === "usage" ? 0 : -1} onKeyDown={(event) => handleMainTabKeyDown(event, "usage")} onClick={(event) => { event.stopPropagation(); activateMainTab("usage"); }} data-tauri-drag-region="false" title="Usage">
                       <BarChart3 size={13} strokeWidth={2.3} />
                     </button>
-                    <button id="main-tab-services" className="header-tab" data-active={activeMainTab === "services"} data-panel-focus-target={activeMainTab === "services" ? "true" : undefined} type="button" role="tab" aria-label="Listening Ports" aria-selected={activeMainTab === "services"} aria-controls="main-panel-services" tabIndex={activeMainTab === "services" ? 0 : -1} onKeyDown={(event) => handleMainTabKeyDown(event, "services")} onClick={(event) => { event.stopPropagation(); activateMainTab("services"); }} data-tauri-drag-region="false" title="Listening Ports">
+                    <button id="main-tab-ports" className="header-tab" data-active={activeMainTab === "ports"} data-panel-focus-target={activeMainTab === "ports" ? "true" : undefined} type="button" role="tab" aria-label="Listening Ports" aria-selected={activeMainTab === "ports"} aria-controls="main-panel-ports" tabIndex={activeMainTab === "ports" ? 0 : -1} onKeyDown={(event) => handleMainTabKeyDown(event, "ports")} onClick={(event) => { event.stopPropagation(); activateMainTab("ports"); }} data-tauri-drag-region="false" title="Listening Ports">
                       <Server size={13} strokeWidth={2.3} />
                     </button>
-                    <button id="main-tab-github" className="header-tab" data-active={activeMainTab === "github"} data-panel-focus-target={activeMainTab === "github" ? "true" : undefined} type="button" role="tab" aria-label="Git Monitor" aria-selected={activeMainTab === "github"} aria-controls="main-panel-github" tabIndex={activeMainTab === "github" ? 0 : -1} onKeyDown={(event) => handleMainTabKeyDown(event, "github")} onClick={(event) => { event.stopPropagation(); activateMainTab("github"); }} data-tauri-drag-region="false" title="Git Monitor">
+                    <button id="main-tab-git" className="header-tab" data-active={activeMainTab === "git"} data-panel-focus-target={activeMainTab === "git" ? "true" : undefined} type="button" role="tab" aria-label="Git Monitor" aria-selected={activeMainTab === "git"} aria-controls="main-panel-git" tabIndex={activeMainTab === "git" ? 0 : -1} onKeyDown={(event) => handleMainTabKeyDown(event, "git")} onClick={(event) => { event.stopPropagation(); activateMainTab("git"); }} data-tauri-drag-region="false" title="Git Monitor">
                       <GitBranch size={13} strokeWidth={2.3} />
                     </button>
                   </div>
@@ -854,11 +854,11 @@ const App = () => {
                 </div>
               ) : activeMainTab === "usage" ? (
                 <AgentUsageList usages={agentUsages} onRefresh={refreshAgentUsage} settings={usageSettings} onSettingsChange={updateUsageSettings} />
-              ) : activeMainTab === "services" ? (
+              ) : activeMainTab === "ports" ? (
                 <Suspense fallback={<div className="empty-text small">Loading Services…</div>}>
                   <LocalServicesPanel monitor={runtimeMonitor} />
                 </Suspense>
-              ) : activeMainTab === "github" ? (
+              ) : activeMainTab === "git" ? (
                 <GithubPanel monitor={githubMonitor} canUseNativeControls={canUseNativeControls} />
               ) : sessions.length === 0 ? (
                 <div className="empty-state">

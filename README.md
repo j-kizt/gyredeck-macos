@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  A local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, local services, and GitHub repo/CI/PR monitoring, in a window from the menu bar.
+  A local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 </p>
 
 <p align="center">
@@ -40,16 +40,16 @@ The app needs a hook to see your sessions. After installing, click the menu-bar 
 | --- | --- |
 | **Sessions** | Workspace-grouped agent sessions with live activity (turn / tool / compaction / done / needs-input), recent-activity detail, clear/dismiss, and a Focus button that jumps to the matching terminal |
 | **Usage** | Local quota/token views for known providers (Claude Code, Codex, Cursor, Antigravity), in-use providers first; truthful unavailable/offline states |
-| **Services** | Locally listening TCP/HTTP services named from their command line, with open-in-browser and guarded stop controls |
-| **GitHub** | Per-repo latest commit, GitHub Actions status, and open PRs for repos you add from a picker of the current `gh` account; switch `gh` accounts inline |
+| **Listening Ports** | Locally listening TCP/HTTP services named from their command line, with open-in-browser and guarded stop controls |
+| **Git Monitor** | Per-repo latest commit, CI status (GitHub Actions / GitLab pipelines), and open PRs/MRs across **GitHub & GitLab**; add repos from a picker, sign in via OAuth device flow or import from `gh`/`glab`, and switch/manage accounts inline |
 
-**Settings** (gear) is grouped into **Connection**, **Display**, **Plugins** (agent hooks), and **Update** (current version + check/install updates). It also holds the **Terminal** picker (iTerm2 / Ghostty) used by session Focus, and Keep-display-awake.
+**Settings** (gear) is grouped into **Connection** (bridge status + configurable local port), **Display**, **Git** (built-in credential helper, account list, and git-identity sync), **Plugins** (agent hooks), and **Update** (current version + check/install updates). It also holds the **Terminal** picker (iTerm2 / Ghostty) used by session Focus, and Keep-display-awake.
 
 ## Privacy
 
 - Everything runs locally on `127.0.0.1`; nothing is uploaded.
 - The bridge stores tool status and output length, not raw tool output; user-text previews are off by default.
-- The GitHub tab reads the local `gh` CLI of the machine it runs on; account switching affects `gh` system-wide.
+- Git accounts are stored locally under `~/.config/gyredeck` (OAuth device-flow tokens, or imported from `gh`/`glab`); the optional built-in credential helper serves `git push`/`pull` without needing those CLIs. Switching accounts can optionally sync your global git identity (toggle in **Settings → Git**).
 
 ## Notes
 
@@ -60,7 +60,7 @@ The app needs a hook to see your sessions. After installing, click the menu-bar 
 ## Credits
 
 - **Origin:** [agent-halo](https://github.com/mahirocoko/agent-halo) by Mahiro — the local bridge, presence protocol, and desktop shell this project is built on.
-- **This fork:** Letta-free rebuild by J-Kitz — Claude Code / Codex / Antigravity hook adapters, GitHub repo/CI/PR monitor, menu-bar window, and signed auto-update.
+- **This fork:** Letta-free rebuild by J-Kitz — Claude Code / Codex / Antigravity hook adapters, GitHub/GitLab repo/CI/PR monitor, menu-bar window, and signed auto-update.
 - Local usage-provider research is informed by [OpenUsage](https://github.com/robinebers/openusage).
 
 ---

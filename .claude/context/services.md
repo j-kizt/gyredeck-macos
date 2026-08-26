@@ -1,6 +1,6 @@
-# Services
+# Listening Ports
 
-The **Services** tab is a read-only, local-only view of the TCP ports listening on this machine, with a guarded control for stopping an eligible current-user listener. It is a native desktop observation lane (`apps/desktop/src-tauri/src/local_services.rs`), not a bridge event or agent session field.
+The **Listening Ports** tab (internal tab id `ports`; the native scan module is still `local_services.rs`) is a read-only, local-only view of the TCP ports listening on this machine, with a guarded control for stopping an eligible current-user listener. It is a native desktop observation lane (`apps/desktop/src-tauri/src/local_services.rs`), not a bridge event or agent session field.
 
 ```text
 macOS TCP LISTEN sockets (lsof)
@@ -12,7 +12,7 @@ macOS TCP LISTEN sockets (lsof)
   -> optional exact-identity Stop / Force kill for eligible current-user listeners
 ```
 
-Discovery runs only while the Services tab is visible and refreshes every 5 seconds. macOS only; other platforms report an explicit unsupported state.
+Discovery runs only while the Listening Ports tab is visible and refreshes every 5 seconds. macOS only; other platforms report an explicit unsupported state.
 
 ## What it reads
 
@@ -49,7 +49,7 @@ A project that Gyredeck does not recognize automatically may register a current 
 
 The registry is positive-only and never downgrades strong automatic evidence. An entry matches only the exact live PID, process start within 2 seconds, normalized bind address, and port. Expiry must be in the future but at most 15 minutes ahead. Gyredeck never creates, rewrites, or deletes this file.
 
-The reader fails closed: the file must be a current-user regular file opened without following symlinks, use private permissions (`0600` recommended), stay under 32 KiB, declare schema version 1, and contain at most 32 validated non-duplicate entries. An unsafe/malformed registry is ignored as classification evidence and surfaced as a Services diagnostic while normal discovery continues. Producers must write a same-directory `0600` temporary file and atomically rename it into place.
+The reader fails closed: the file must be a current-user regular file opened without following symlinks, use private permissions (`0600` recommended), stay under 32 KiB, declare schema version 1, and contain at most 32 validated non-duplicate entries. An unsafe/malformed registry is ignored as classification evidence and surfaced as a Listening Ports diagnostic while normal discovery continues. Producers must write a same-directory `0600` temporary file and atomically rename it into place.
 
 ## Stop / Force kill
 

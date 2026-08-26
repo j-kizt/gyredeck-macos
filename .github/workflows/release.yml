@@ -51,6 +51,13 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
+      # Cache the cargo registry + build output so release builds don't recompile
+      # the whole dependency tree from scratch each run (the slow step).
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/desktop/src-tauri
+
       - name: Install dependencies
         run: pnpm install
 

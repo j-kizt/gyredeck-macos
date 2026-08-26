@@ -1,8 +1,10 @@
-import { useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, Monitor as MonitorIcon, PlugZap, Puzzle, RefreshCw } from "lucide-react";
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, Trash2 } from "lucide-react";
 import type { IGyredeckBridgeCapabilities } from "@gyredeck/protocol";
 import { shortenPath } from "../session/activity";
 import type { IUseUpdater } from "../updater/useUpdater";
+import { ProviderIcon } from "../github/components";
+import type { GitProvider, IGhAccount } from "../github/types";
 import { useGitCredentialHelper } from "./useGitCredentialHelper";
 
 type SetupCategory = "connection" | "plugins" | "display" | "git" | "update";
@@ -35,10 +37,108 @@ export interface ISetupPanelProps {
   onKeepAwakeChange: (enabled: boolean) => void;
   bridgePort: number;
   onApplyBridgePort: (port: number) => Promise<void> | void;
+  gitAccounts: IGhAccount[];
+  onRemoveGitAccount: (provider: GitProvider, user: string) => Promise<void> | void;
+  onSetActiveGitAccount: (provider: GitProvider, user: string) => Promise<void> | void;
+  syncGitIdentity: boolean;
+  onSyncGitIdentityChange: (enabled: boolean) => Promise<void> | void;
   terminal: TerminalChoice;
   onTerminalChange: (choice: TerminalChoice) => void;
   updater: IUseUpdater;
 }
+
+const GitAccountRow = ({ account, isHelper, onSetActive, onRemove }: {
+  account: IGhAccount;
+  isHelper: boolean;
+  onSetActive: (provider: GitProvider, user: string) => Promise<void> | void;
+  onRemove: (provider: GitProvider, user: string) => Promise<void> | void;
+}) => {
+  const [open, setOpen] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  const close = () => { setOpen(false); setConfirming(false); };
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onPointerDown = (event: MouseEvent) => {
+      if (ref.current && !ref.current.contains(event.target as Node)) close();
+    };
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  const run = async (fn: () => Promise<void> | void) => {
+    setBusy(true);
+    try { await fn(); } finally { setBusy(false); close(); }
+  };
+
+  return (
+    <div className="setup-account-row">
+      <span className="setup-account-icon"><ProviderIcon provider={account.provider} size={14} /></span>
+      <div className="setup-account-main">
+        <span className="setup-account-login">{account.login}</span>
+        {account.active || isHelper ? (
+          <div className="setup-account-tags">
+            {account.active ? <span className="setup-account-active">Active</span> : null}
+            {isHelper ? <span className="setup-account-helper" title="git push on this host uses this account">helper</span> : null}
+          </div>
+        ) : null}
+      </div>
+      <div className="setup-account-menu-wrap" ref={ref}>
+        <button className="gh-icon-btn" type="button" aria-haspopup="menu" aria-expanded={open} aria-label={`Actions for ${account.login}`} title="Account actions" data-tauri-drag-region="false" onClick={() => setOpen((o) => !o)}>
+          <MoreVertical size={12} strokeWidth={2.3} />
+        </button>
+        {open ? (
+          <div className="setup-menu" role="menu">
+            <button className="setup-menu-item" type="button" role="menuitem" disabled={account.active || busy} onClick={() => void run(() => onSetActive(account.provider, account.login))}>
+              <Check size={12} strokeWidth={2.3} /> Set active
+            </button>
+            <button className={`setup-menu-item danger${confirming ? " armed" : ""}`} type="button" role="menuitem" disabled={busy} title="Removes the account and signs out of its CLI (gh/glab)" onClick={() => { if (!confirming) { setConfirming(true); return; } void run(() => onRemove(account.provider, account.login)); }}>
+              <Trash2 size={12} strokeWidth={2.3} /> {confirming ? "Confirm delete" : "Delete"}
+            </button>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+};
+
+const GitAccountList = ({ accounts, canUseNativeControls, onSetActive, onRemove }: { accounts: IGhAccount[]; canUseNativeControls: boolean; onSetActive: (provider: GitProvider, user: string) => Promise<void> | void; onRemove: (provider: GitProvider, user: string) => Promise<void> | void }) => {
+  if (!canUseNativeControls) return null;
+  if (accounts.length === 0) {
+    return <div className="setup-row passive"><span className="status-slot"><KeyRound className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Accounts</span><span className="setup-detail">No accounts yet — add one in Git Monitor</span></span></div>;
+  }
+  // The account the credential helper resolves to per provider: the active
+  // account for the active provider, otherwise the first account of that provider.
+  const activeProvider = accounts.find((a) => a.active)?.provider ?? null;
+  const helperKeys = new Set(
+    Array.from(new Set(accounts.map((a) => a.provider)))
+      .map((provider) => {
+        const acc =
+          (provider === activeProvider ? accounts.find((a) => a.active) : undefined) ??
+          accounts.find((a) => a.provider === provider);
+        return acc ? `${acc.provider}:${acc.login}` : null;
+      })
+      .filter((k): k is string => k !== null),
+  );
+  return (
+    <div className="setup-account-list">
+      {accounts.map((account) => {
+        const key = `${account.provider}:${account.login}`;
+        return (
+          <GitAccountRow key={key} account={account} isHelper={helperKeys.has(key)} onSetActive={onSetActive} onRemove={onRemove} />
+        );
+      })}
+    </div>
+  );
+};
 
 const UPDATER_DETAIL: Record<IUseUpdater["status"], string> = {
   idle: "Check for the latest release",
@@ -52,19 +152,26 @@ const UPDATER_DETAIL: Record<IUseUpdater["status"], string> = {
 const MIN_BRIDGE_PORT = 1024;
 const MAX_BRIDGE_PORT = 65535;
 
-export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, agyStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onKeepAwakeChange, bridgePort, onApplyBridgePort, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
+export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, agyStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
   const [activeCategory, setActiveCategory] = useState<SetupCategory>("connection");
   const [compactNavigation, setCompactNavigation] = useState(() => window.matchMedia("(max-width: 380px)").matches);
   const credentialHelper = useGitCredentialHelper(canUseNativeControls);
   const [portField, setPortField] = useState(String(bridgePort));
   const [portBusy, setPortBusy] = useState(false);
   const [portStatus, setPortStatus] = useState<string | null>(null);
+  const [editingPort, setEditingPort] = useState(false);
 
   useEffect(() => { setPortField(String(bridgePort)); }, [bridgePort]);
 
   const parsedPort = Number(portField);
   const portValid = Number.isInteger(parsedPort) && parsedPort >= MIN_BRIDGE_PORT && parsedPort <= MAX_BRIDGE_PORT;
   const canApplyPort = canUseNativeControls && portValid && parsedPort !== bridgePort && !portBusy;
+
+  const toggleEditPort = (): void => {
+    setPortField(String(bridgePort));
+    setPortStatus(null);
+    setEditingPort((open) => !open);
+  };
 
   const applyPort = async (): Promise<void> => {
     if (!canApplyPort) return;
@@ -73,6 +180,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
     try {
       await onApplyBridgePort(parsedPort);
       setPortStatus(`Applied · reconnecting on ${parsedPort}`);
+      setEditingPort(false);
     } catch (error) {
       setPortStatus(typeof error === "string" ? error : error instanceof Error ? error.message : "Could not change port");
     } finally {
@@ -117,7 +225,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
             <>
               <div className="setup-section-heading"><span>Connection</span><small>Bridge and agent integration</small></div>
               <div className="setup-row"><span className="bridge-dot" data-connected={isConnected} title={connectionTitle} /><span className="setup-copy"><span className="setup-title">Bridge</span><span className="setup-detail">{connectionTitle}</span></span>{!isConnected ? <button className="pill-btn" type="button" onClick={onCheckBridge} data-tauri-drag-region="false" aria-label="Reconnect bridge"><PlugZap size={12} strokeWidth={2.3} />Reconnect</button> : null}</div>
-              <div className="setup-row"><span className="status-slot"><PlugZap className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Bridge port</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : portStatus ?? `Local port the bridge listens on · ${MIN_BRIDGE_PORT}–${MAX_BRIDGE_PORT}`}</span></span><input className="setup-input" type="number" min={MIN_BRIDGE_PORT} max={MAX_BRIDGE_PORT} value={portField} onChange={(event) => setPortField(event.target.value)} disabled={!canUseNativeControls || portBusy} data-tauri-drag-region="false" aria-label="Bridge port" /><button className="pill-btn accent" type="button" onClick={() => void applyPort()} disabled={!canApplyPort} data-tauri-drag-region="false"><Check size={12} strokeWidth={2.3} />Apply</button></div>
+              <div className="setup-row setup-row-stack"><div className="setup-row-main"><span className="status-slot"><PlugZap className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Bridge port</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : portStatus ?? `Local bridge port · ${bridgePort}`}</span></span>{canUseNativeControls ? <button className="pill-btn" type="button" onClick={toggleEditPort} data-tauri-drag-region="false" aria-expanded={editingPort} aria-label="Edit bridge port"><Pencil size={12} strokeWidth={2.3} />Edit</button> : null}</div>{editingPort ? <span className="setup-row-actions full"><input className="setup-input" type="number" min={MIN_BRIDGE_PORT} max={MAX_BRIDGE_PORT} value={portField} onChange={(event) => setPortField(event.target.value)} disabled={portBusy} data-tauri-drag-region="false" aria-label="Bridge port" autoFocus /><button className="pill-btn accent" type="button" onClick={() => void applyPort()} disabled={!canApplyPort} data-tauri-drag-region="false"><Check size={12} strokeWidth={2.3} />Apply</button></span> : null}</div>
               <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{guidance.title}</span><span className="setup-detail">{guidance.detail}</span></span></div>
               {nativeAction.message ? <div className="notice-row" data-online={nativeAction.bridgeOnline === true} role="status" aria-live="polite">{nativeAction.message}</div> : null}
             </>
@@ -141,9 +249,12 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
 
           {activeCategory === "git" ? (
             <>
-              <div className="setup-section-heading"><span>Git</span><small>Credential helper for GitHub</small></div>
-              <div className="setup-row"><span className="status-slot"><KeyRound className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Use Gyredeck for git auth</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : credentialHelper.error ? credentialHelper.error : credentialHelper.installed === null ? "Checking…" : credentialHelper.installed ? "On · git push/pull uses your active GitHub account" : "Off · git uses its default helper (e.g. osxkeychain)"}</span></span><button className="switch-toggle" type="button" role="switch" aria-checked={credentialHelper.installed === true} data-on={credentialHelper.installed === true} disabled={!canUseNativeControls || credentialHelper.busy || credentialHelper.installed === null} onClick={() => void credentialHelper.setEnabled(!credentialHelper.installed)} data-tauri-drag-region="false" aria-label={`${credentialHelper.installed ? "Disable" : "Enable"} Gyredeck git credential helper`}><span className="switch-thumb" /></button></div>
-              <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">How it works</span><span className="setup-detail">Points git at Gyredeck in your global ~/.gitconfig, so HTTPS pushes follow the account you pick on the GitHub tab — no gh CLI needed. Turn off to restore your previous helper.</span></span></div>
+              <div className="setup-section-heading"><span>Git</span><small>Credential helper · GitHub &amp; GitLab</small></div>
+              <div className="setup-row"><span className="status-slot"><KeyRound className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Use Gyredeck for git auth</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : credentialHelper.error ? credentialHelper.error : credentialHelper.installed === null ? "Checking…" : credentialHelper.installed ? "On · git push/pull uses your active account" : "Off · git uses its default helper (e.g. osxkeychain)"}</span></span><button className="switch-toggle" type="button" role="switch" aria-checked={credentialHelper.installed === true} data-on={credentialHelper.installed === true} disabled={!canUseNativeControls || credentialHelper.busy || credentialHelper.installed === null} onClick={() => void credentialHelper.setEnabled(!credentialHelper.installed)} data-tauri-drag-region="false" aria-label={`${credentialHelper.installed ? "Disable" : "Enable"} Gyredeck git credential helper`}><span className="switch-thumb" /></button></div>
+              <div className="setup-row"><span className="status-slot"><RefreshCw className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Sync git identity</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : syncGitIdentity ? "On · switching sets your global git identity & gh" : "Off · switching only changes what you view — system git untouched"}</span></span><button className="switch-toggle" type="button" role="switch" aria-checked={syncGitIdentity} data-on={syncGitIdentity} disabled={!canUseNativeControls} onClick={() => void onSyncGitIdentityChange(!syncGitIdentity)} data-tauri-drag-region="false" aria-label={`${syncGitIdentity ? "Disable" : "Enable"} git identity sync`}><span className="switch-thumb" /></button></div>
+              <div className="setup-subheading">Accounts</div>
+              <GitAccountList accounts={gitAccounts} canUseNativeControls={canUseNativeControls} onSetActive={onSetActiveGitAccount} onRemove={onRemoveGitAccount} />
+              <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">How it works</span><span className="setup-detail">Points git at Gyredeck in your global ~/.gitconfig, so HTTPS pushes follow the account you pick on the Git Monitor tab — no gh CLI needed. Turn off to restore your previous helper.</span></span></div>
             </>
           ) : null}
 

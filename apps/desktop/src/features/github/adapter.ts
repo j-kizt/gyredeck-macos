@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  GitProvider,
   IDeviceCodeStart,
   IDevicePollResult,
   IGhAccount,
@@ -9,33 +10,43 @@ import type {
 const TRACKED_REPOS_KEY = "gyredeck.github.tracked-repos";
 const STATUS_CACHE_KEY = "gyredeck.github.status-cache";
 
-const REPO_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+// owner/name (GitHub) or namespace/.../project (GitLab nested groups).
+const REPO_PATTERN = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+$/;
 
 export const isValidRepo = (repo: string): boolean => REPO_PATTERN.test(repo.trim());
 
-export const fetchRepoStatus = (repo: string): Promise<IGithubRepoStatus> =>
-  invoke<IGithubRepoStatus>("github_repo_status", { repo });
+export const fetchRepoStatus = (repo: string, provider?: GitProvider, login?: string): Promise<IGithubRepoStatus> =>
+  invoke<IGithubRepoStatus>("github_repo_status", { repo, provider, login });
 
-export const fetchAvailableRepos = (): Promise<string[]> =>
-  invoke<string[]>("github_available_repos");
+export const fetchAvailableRepos = (provider?: GitProvider, login?: string): Promise<string[]> =>
+  invoke<string[]>("github_available_repos", { provider, login });
+
+export const getSyncIdentity = (): Promise<boolean> =>
+  invoke<boolean>("get_sync_identity");
+
+export const setSyncIdentity = (enabled: boolean): Promise<void> =>
+  invoke<void>("set_sync_identity", { enabled });
 
 export const fetchAccounts = (): Promise<IGhAccount[]> =>
   invoke<IGhAccount[]>("github_accounts");
 
-export const switchAccount = (user: string): Promise<string> =>
-  invoke<string>("github_switch_account", { user });
+export const switchAccount = (provider: GitProvider, user: string): Promise<string> =>
+  invoke<string>("github_switch_account", { provider, user });
 
 export const importFromGh = (): Promise<IGhAccount[]> =>
   invoke<IGhAccount[]>("github_import_from_gh");
 
-export const removeAccount = (user: string): Promise<IGhAccount[]> =>
-  invoke<IGhAccount[]>("github_remove_account", { user });
+export const importFromGlab = (): Promise<IGhAccount[]> =>
+  invoke<IGhAccount[]>("import_from_glab");
 
-export const deviceStart = (): Promise<IDeviceCodeStart> =>
-  invoke<IDeviceCodeStart>("github_device_start");
+export const removeAccount = (provider: GitProvider, user: string): Promise<IGhAccount[]> =>
+  invoke<IGhAccount[]>("github_remove_account", { provider, user });
 
-export const devicePoll = (deviceCode: string): Promise<IDevicePollResult> =>
-  invoke<IDevicePollResult>("github_device_poll", { deviceCode });
+export const deviceStart = (provider: GitProvider): Promise<IDeviceCodeStart> =>
+  invoke<IDeviceCodeStart>("device_start", { provider });
+
+export const devicePoll = (provider: GitProvider, deviceCode: string): Promise<IDevicePollResult> =>
+  invoke<IDevicePollResult>("device_poll", { provider, deviceCode });
 
 const readJson = <T>(key: string, fallback: T): T => {
   try {
@@ -75,26 +86,37 @@ const readTrackedMap = (): TrackedMap => {
   return {};
 };
 
-export const readTrackedRepos = (account: string | null): string[] => {
-  if (!account) return [];
-  return readTrackedMap()[account] ?? [];
+// Accounts are keyed by "<provider>:<login>". GitHub repos from older builds
+// were keyed by the bare login, so fall back to that for GitHub accounts.
+const legacyBareLogin = (accountKey: string): string | null =>
+  accountKey.startsWith("github:") ? accountKey.slice("github:".length) : null;
+
+export const readTrackedRepos = (accountKey: string | null): string[] => {
+  if (!accountKey) return [];
+  const map = readTrackedMap();
+  if (map[accountKey]) return map[accountKey];
+  const bare = legacyBareLogin(accountKey);
+  if (bare && map[bare]) return map[bare];
+  return [];
 };
 
-export const writeTrackedRepos = (account: string | null, repos: string[]): void => {
-  if (!account) return;
+export const writeTrackedRepos = (accountKey: string | null, repos: string[]): void => {
+  if (!accountKey) return;
   const map = readTrackedMap();
   delete map[LEGACY_TRACKED_KEY];
-  map[account] = repos;
+  const bare = legacyBareLogin(accountKey);
+  if (bare) delete map[bare]; // fold the old bare-login entry into the new key
+  map[accountKey] = repos;
   writeJson(TRACKED_REPOS_KEY, map);
 };
 
 /** One-time adoption of a legacy flat list onto an account that has none yet. */
-export const takeLegacyTrackedRepos = (account: string | null): string[] | null => {
-  if (!account) return null;
+export const takeLegacyTrackedRepos = (accountKey: string | null): string[] | null => {
+  if (!accountKey) return null;
   const map = readTrackedMap();
   const legacy = map[LEGACY_TRACKED_KEY];
-  if (!legacy || legacy.length === 0 || (map[account]?.length ?? 0) > 0) return null;
-  writeTrackedRepos(account, legacy);
+  if (!legacy || legacy.length === 0 || readTrackedRepos(accountKey).length > 0) return null;
+  writeTrackedRepos(accountKey, legacy);
   return legacy;
 };
 

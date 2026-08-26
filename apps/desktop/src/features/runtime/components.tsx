@@ -275,7 +275,7 @@ export const LocalServicesPanel = ({ monitor }: { monitor: IRuntimeMonitorView }
         <div className="runtime-subtitle">{monitor.services.length} local listeners</div>
         <div className="runtime-toolbar-actions">
           {monitor.servicesLoading ? <span className="runtime-ended-count" role="status">Checking…</span> : null}
-          <button className="gear-btn" type="button" onClick={monitor.refreshServices} disabled={monitor.servicesLoading} aria-busy={monitor.servicesLoading} aria-label={monitor.servicesLoading ? "Refreshing Services" : "Refresh Services"} title="Refresh local services">
+          <button className="gear-btn" type="button" onClick={monitor.refreshServices} disabled={monitor.servicesLoading} aria-busy={monitor.servicesLoading} aria-label={monitor.servicesLoading ? "Refreshing listening ports" : "Refresh listening ports"} title="Refresh listening ports">
             <RefreshCw size={13} className={monitor.servicesLoading ? "is-spinning" : undefined} />
           </button>
         </div>

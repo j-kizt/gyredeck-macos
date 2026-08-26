@@ -108,9 +108,15 @@
     transform 120ms ease;
 }
 
-.pill-btn:active,
-.btn:active {
+.pill-btn:not(:disabled):active,
+.btn:not(:disabled):active {
   transform: scale(0.97);
+}
+
+.pill-btn:disabled,
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .pill-btn {
@@ -126,7 +132,7 @@
   font-weight: 500;
 }
 
-.pill-btn:hover {
+.pill-btn:not(:disabled):hover {
   background: rgba(255, 255, 255, 0.16);
 }
 

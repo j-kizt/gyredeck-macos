@@ -11,9 +11,67 @@ use std::{
 
 const BRIDGE_HOST: &str = "127.0.0.1";
 pub(crate) const BRIDGE_PORT: u16 = 47_621;
+const BRIDGE_MIN_PORT: u16 = 1024;
 const BRIDGE_PROBE_TIMEOUT: Duration = Duration::from_millis(350);
 const BRIDGE_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
 const OWNED_BRIDGE_FAILURE_LIMIT: u8 = 3;
+
+fn bridge_config_path() -> Option<PathBuf> {
+    super::home_dir().map(|home| {
+        home.join(".config")
+            .join("gyredeck")
+            .join("gyredeck.config.json")
+    })
+}
+
+/// The port the bridge should use, read from the shared
+/// `~/.config/gyredeck/gyredeck.config.json` the Node bridge already honors.
+/// Falls back to [`BRIDGE_PORT`] when unset or out of the allowed range.
+pub(crate) fn configured_bridge_port() -> u16 {
+    let Some(contents) = bridge_config_path().and_then(|path| fs::read_to_string(path).ok()) else {
+        return BRIDGE_PORT;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return BRIDGE_PORT;
+    };
+    match value.get("port").and_then(serde_json::Value::as_u64) {
+        Some(port) if port >= u64::from(BRIDGE_MIN_PORT) && port <= u64::from(u16::MAX) => {
+            port as u16
+        }
+        _ => BRIDGE_PORT,
+    }
+}
+
+/// Persist `port` into the shared bridge config, preserving any other keys.
+pub(crate) fn write_configured_port(port: u16) -> Result<(), String> {
+    if port < BRIDGE_MIN_PORT {
+        return Err(format!(
+            "Port must be between {BRIDGE_MIN_PORT} and {}",
+            u16::MAX
+        ));
+    }
+    let path =
+        bridge_config_path().ok_or_else(|| "Could not resolve Gyredeck config directory".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Gyredeck config path has no parent directory".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create Gyredeck config directory: {error}"))?;
+    let mut config = fs::read_to_string(&path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    config.insert("port".to_string(), serde_json::Value::from(port));
+    let contents = serde_json::to_vec_pretty(&serde_json::Value::Object(config))
+        .map_err(|error| format!("Could not encode Gyredeck config: {error}"))?;
+    let temporary_path = path.with_extension("json.tmp");
+    fs::write(&temporary_path, contents)
+        .map_err(|error| format!("Could not write Gyredeck config: {error}"))?;
+    fs::rename(&temporary_path, &path)
+        .map_err(|error| format!("Could not save Gyredeck config: {error}"))?;
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BridgeProbe {
@@ -30,7 +88,7 @@ struct BridgeEndpoint {
 impl Default for BridgeEndpoint {
     fn default() -> Self {
         Self {
-            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BRIDGE_PORT),
+            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), configured_bridge_port()),
         }
     }
 }
@@ -43,6 +101,7 @@ struct BridgeSupervisorHandle {
 #[derive(Default)]
 pub(crate) struct StandaloneBridgeState {
     supervisor: Mutex<Option<BridgeSupervisorHandle>>,
+    script: Mutex<Option<PathBuf>>,
 }
 
 impl StandaloneBridgeState {
@@ -50,7 +109,23 @@ impl StandaloneBridgeState {
         let node = find_node_binary().ok_or_else(|| {
             "Gyredeck could not find Node.js for the standalone bridge".to_string()
         })?;
+        if let Ok(mut script) = self.script.lock() {
+            *script = Some(bridge_script.clone());
+        }
         self.start_with(bridge_script, node, BridgeEndpoint::default())
+    }
+
+    /// Stop the current supervisor and start a fresh one, re-reading the
+    /// configured port. Used after the user changes the bridge port.
+    pub(crate) fn restart(&self) -> Result<(), String> {
+        let script = self
+            .script
+            .lock()
+            .ok()
+            .and_then(|script| script.clone())
+            .ok_or_else(|| "Standalone bridge has not been started yet".to_string())?;
+        self.stop();
+        self.start(script)
     }
 
     fn start_with(
@@ -98,6 +173,16 @@ impl StandaloneBridgeState {
 
 pub(crate) fn bridge_health() -> bool {
     probe_bridge(BridgeEndpoint::default()) == BridgeProbe::Healthy
+}
+
+/// Whether `port` is usable for the bridge: either free (nothing listening) or
+/// already answered by a Gyredeck bridge. An unrelated listener is rejected so
+/// the user gets a clear error instead of a silently failed reconnect.
+pub(crate) fn port_available_for_bridge(port: u16) -> bool {
+    let endpoint = BridgeEndpoint {
+        address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+    };
+    !matches!(probe_bridge(endpoint), BridgeProbe::Occupied)
 }
 
 fn supervise_bridge(

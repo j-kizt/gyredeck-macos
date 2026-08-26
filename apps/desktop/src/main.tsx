@@ -29,7 +29,7 @@ import {
   shouldKeepDisplayAwakeForActivity,
 } from "./features/session/selectors";
 import type { DeletedSessionRegistry, DismissedSessionRegistry, ISessionDetail, ISessionSummary, IWorkspaceSessionGroup } from "./features/session/types";
-import { useGyredeckPresence } from "./features/presence/useGyredeckPresence";
+import { DEFAULT_BRIDGE_PORT, useGyredeckPresence } from "./features/presence/useGyredeckPresence";
 import { SetupPanel } from "./features/setup/SetupPanel";
 import { useUpdater } from "./features/updater/useUpdater";
 import { readUsageSettings, writeUsageSettings } from "./features/usage/adapters";
@@ -103,7 +103,8 @@ const writeTerminalChoice = (choice: TerminalChoice) => {
 const getGroupRemovalId = (groupKey: string, group: IWorkspaceSessionGroup) => [groupKey, ...group.sessions.map((session) => session.conversationId).sort()].join("\n");
 
 const App = () => {
-  const { capabilities, connection, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO });
+  const [bridgePort, setBridgePort] = useState(DEFAULT_BRIDGE_PORT);
+  const { capabilities, connection, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO, bridgePort });
   const [usageSettings, setUsageSettings] = useState<IUsageSettings>(readUsageSettings);
   const { refresh: refreshAgentUsage, usages: agentUsages } = useAgentUsageList(usageSettings, DEMO_MODE);
   const [acknowledgedConversationId, setAcknowledgedConversationId] = useState<string | null>(null);
@@ -625,6 +626,18 @@ const App = () => {
     }
   };
 
+  useEffect(() => {
+    if (!canUseNativeControls) return;
+    void invoke<number>("get_bridge_port")
+      .then((port) => { if (Number.isInteger(port)) setBridgePort(port); })
+      .catch(() => undefined);
+  }, [canUseNativeControls]);
+
+  const applyBridgePort = async (port: number) => {
+    await invoke("set_bridge_port", { port });
+    setBridgePort(port);
+  };
+
   const checkBridge = async () => {
     if (!canUseNativeControls) {
       setNativeAction({ bridgeOnline: null, message: "Native controls need Tauri runtime" });
@@ -785,6 +798,8 @@ const App = () => {
                   onInstallHook={() => void installHook()}
                   onInstallAgy={() => void installAgy()}
                   onKeepAwakeChange={updateKeepAwakeEnabled}
+                  bridgePort={bridgePort}
+                  onApplyBridgePort={applyBridgePort}
                   terminal={terminal}
                   onTerminalChange={(choice) => { setTerminal(choice); writeTerminalChoice(choice); }}
                   updater={updater}

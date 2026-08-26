@@ -374,6 +374,22 @@
   cursor: pointer;
 }
 
+.setup-input {
+  flex: none;
+  width: 84px;
+  padding: 5px 8px;
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+  background: var(--fill);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.setup-input:disabled {
+  opacity: 0.5;
+}
+
 .setup-segment {
   display: inline-flex;
   flex: none;

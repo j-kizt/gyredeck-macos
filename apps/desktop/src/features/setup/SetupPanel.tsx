@@ -33,6 +33,8 @@ export interface ISetupPanelProps {
   onInstallHook: () => void;
   onInstallAgy: () => void;
   onKeepAwakeChange: (enabled: boolean) => void;
+  bridgePort: number;
+  onApplyBridgePort: (port: number) => Promise<void> | void;
   terminal: TerminalChoice;
   onTerminalChange: (choice: TerminalChoice) => void;
   updater: IUseUpdater;
@@ -47,10 +49,36 @@ const UPDATER_DETAIL: Record<IUseUpdater["status"], string> = {
   error: "Update check failed",
 };
 
-export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, agyStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onKeepAwakeChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
+const MIN_BRIDGE_PORT = 1024;
+const MAX_BRIDGE_PORT = 65535;
+
+export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, agyStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onKeepAwakeChange, bridgePort, onApplyBridgePort, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
   const [activeCategory, setActiveCategory] = useState<SetupCategory>("connection");
   const [compactNavigation, setCompactNavigation] = useState(() => window.matchMedia("(max-width: 380px)").matches);
   const credentialHelper = useGitCredentialHelper(canUseNativeControls);
+  const [portField, setPortField] = useState(String(bridgePort));
+  const [portBusy, setPortBusy] = useState(false);
+  const [portStatus, setPortStatus] = useState<string | null>(null);
+
+  useEffect(() => { setPortField(String(bridgePort)); }, [bridgePort]);
+
+  const parsedPort = Number(portField);
+  const portValid = Number.isInteger(parsedPort) && parsedPort >= MIN_BRIDGE_PORT && parsedPort <= MAX_BRIDGE_PORT;
+  const canApplyPort = canUseNativeControls && portValid && parsedPort !== bridgePort && !portBusy;
+
+  const applyPort = async (): Promise<void> => {
+    if (!canApplyPort) return;
+    setPortBusy(true);
+    setPortStatus(null);
+    try {
+      await onApplyBridgePort(parsedPort);
+      setPortStatus(`Applied · reconnecting on ${parsedPort}`);
+    } catch (error) {
+      setPortStatus(typeof error === "string" ? error : error instanceof Error ? error.message : "Could not change port");
+    } finally {
+      setPortBusy(false);
+    }
+  };
 
   const selectCategory = (category: SetupCategory): void => {
     setActiveCategory(category);
@@ -89,6 +117,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
             <>
               <div className="setup-section-heading"><span>Connection</span><small>Bridge and agent integration</small></div>
               <div className="setup-row"><span className="bridge-dot" data-connected={isConnected} title={connectionTitle} /><span className="setup-copy"><span className="setup-title">Bridge</span><span className="setup-detail">{connectionTitle}</span></span>{!isConnected ? <button className="pill-btn" type="button" onClick={onCheckBridge} data-tauri-drag-region="false" aria-label="Reconnect bridge"><PlugZap size={12} strokeWidth={2.3} />Reconnect</button> : null}</div>
+              <div className="setup-row"><span className="status-slot"><PlugZap className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Bridge port</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : portStatus ?? `Local port the bridge listens on · ${MIN_BRIDGE_PORT}–${MAX_BRIDGE_PORT}`}</span></span><input className="setup-input" type="number" min={MIN_BRIDGE_PORT} max={MAX_BRIDGE_PORT} value={portField} onChange={(event) => setPortField(event.target.value)} disabled={!canUseNativeControls || portBusy} data-tauri-drag-region="false" aria-label="Bridge port" /><button className="pill-btn accent" type="button" onClick={() => void applyPort()} disabled={!canApplyPort} data-tauri-drag-region="false"><Check size={12} strokeWidth={2.3} />Apply</button></div>
               <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{guidance.title}</span><span className="setup-detail">{guidance.detail}</span></span></div>
               {nativeAction.message ? <div className="notice-row" data-online={nativeAction.bridgeOnline === true} role="status" aria-live="polite">{nativeAction.message}</div> : null}
             </>

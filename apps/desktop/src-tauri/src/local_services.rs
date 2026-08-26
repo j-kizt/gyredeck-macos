@@ -296,7 +296,7 @@ mod macos {
         LocalServicesSnapshot, LOCAL_SERVICE_CONTROL_TTL_MS, LOCAL_SERVICE_FORCE_TTL_MS,
         MAX_FRONTEND_REGISTRY_BYTES, MAX_LOCAL_SERVICE_OWNER_TARGETS,
     };
-    use crate::standalone_bridge::BRIDGE_PORT;
+    use crate::standalone_bridge::configured_bridge_port;
     use std::{
         collections::HashMap,
         fs::OpenOptions,
@@ -754,7 +754,7 @@ mod macos {
         if process.pid <= 1 {
             return Some("System process is protected".to_string());
         }
-        if listener.port == BRIDGE_PORT {
+        if listener.port == configured_bridge_port() {
             return Some("Gyredeck bridge is protected".to_string());
         }
         if process_is_gyredeck_ancestor(process) {
@@ -815,7 +815,7 @@ mod macos {
             return ControlTargetState::IdentityChanged;
         }
         if before.pid <= 1
-            || request.port == BRIDGE_PORT
+            || request.port == configured_bridge_port()
             || process_is_gyredeck_ancestor(&before)
             || process_is_protected_host(&before, state)
             || !process_owned_by_current_user(&before)

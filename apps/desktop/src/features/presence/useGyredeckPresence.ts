@@ -20,7 +20,8 @@ import {
 } from "../session/persistence";
 import type { SessionEventRegistry } from "../session/types";
 
-const BRIDGE_URL = "http://127.0.0.1:47621";
+export const DEFAULT_BRIDGE_PORT = 47621;
+const bridgeUrlFor = (port: number) => `http://127.0.0.1:${port}`;
 
 export interface IConnectionState {
   status: "connecting" | "connected" | "disconnected" | "error";
@@ -30,6 +31,7 @@ export interface IConnectionState {
 export interface IGyredeckPresenceOptions {
   demoMode: boolean;
   demoScenario: string | null;
+  bridgePort?: number;
 }
 
 export interface IGyredeckPresenceResult {
@@ -494,7 +496,9 @@ const createDemoEvent = (index: number): GyredeckEvent => {
 export const useGyredeckPresence = ({
   demoMode,
   demoScenario,
+  bridgePort = DEFAULT_BRIDGE_PORT,
 }: IGyredeckPresenceOptions): IGyredeckPresenceResult => {
+  const bridgeUrl = bridgeUrlFor(bridgePort);
   const [presence, setPresence] = useState<IGyredeckPresence>(() => createInitialPresence());
   const [recentEvents, setRecentEvents] = useState<GyredeckEvent[]>([]);
   const [lastLiveEvent, setLastLiveEvent] = useState<GyredeckEvent | null>(null);
@@ -582,7 +586,7 @@ export const useGyredeckPresence = ({
     }
 
     const fetchCapabilities = async (path: "snapshot" | "health") => {
-      const response = await fetch(`${BRIDGE_URL}/${path}`);
+      const response = await fetch(`${bridgeUrl}/${path}`);
       if (!response.ok) throw new Error(`${path} HTTP ${response.status}`);
       return response.json() as Promise<{
         recent?: GyredeckEvent[];
@@ -618,7 +622,7 @@ export const useGyredeckPresence = ({
       })
       .catch(() => undefined);
 
-    source = new EventSource(`${BRIDGE_URL}/events`);
+    source = new EventSource(`${bridgeUrl}/events`);
     source.onopen = () => {
       if (!disposed) {
         setConnection({ status: "connected", message: null });
@@ -669,11 +673,12 @@ export const useGyredeckPresence = ({
       source?.close();
       flushRegistryWrite();
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [demoMode, demoScenario, bridgeUrl]);
 
   const refreshCapabilities = async () => {
     try {
-      const response = await fetch(`${BRIDGE_URL}/health`);
+      const response = await fetch(`${bridgeUrl}/health`);
       if (!response.ok) throw new Error();
       const payload = (await response.json()) as { capabilities?: unknown };
       if (payload.capabilities) setCapabilities(normalizeCapabilities(payload.capabilities));

@@ -550,6 +550,26 @@ fn bridge_health() -> bool {
 }
 
 #[tauri::command]
+fn get_bridge_port() -> u16 {
+    standalone_bridge::configured_bridge_port()
+}
+
+#[tauri::command]
+fn set_bridge_port(
+    state: tauri::State<'_, StandaloneBridgeState>,
+    port: u16,
+) -> Result<(), String> {
+    if port < 1024 {
+        return Err("Port must be between 1024 and 65535".to_string());
+    }
+    if !standalone_bridge::port_available_for_bridge(port) {
+        return Err(format!("Port {port} is already in use by another process"));
+    }
+    standalone_bridge::write_configured_port(port)?;
+    state.restart()
+}
+
+#[tauri::command]
 fn set_keep_awake(state: tauri::State<'_, KeepAwakeState>, active: bool) -> Result<bool, String> {
     state.set_active(active)
 }
@@ -5436,6 +5456,8 @@ pub fn run() {
         Box::new(tauri::generate_handler![
             agy_usage,
             bridge_health,
+            get_bridge_port,
+            set_bridge_port,
             claude_usage,
             codex_usage,
             cursor_usage,

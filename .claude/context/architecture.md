@@ -2,7 +2,7 @@
 
 ## Goal
 
-Gyredeck is a local presence layer for AI coding agents. It shows what your agents are doing — conversation lifecycle, model turns, and tool usage — without parsing terminal output as the source of truth. It surfaces this in a macOS menu-bar window alongside provider usage, locally listening services, and GitHub repo/CI/PR status.
+Gyredeck is a local presence layer for AI coding agents. It shows what your agents are doing — conversation lifecycle, model turns, and tool usage — without parsing terminal output as the source of truth. It surfaces this in a macOS menu-bar window alongside provider usage, locally listening ports, and GitHub/GitLab repo/CI/PR status.
 
 It is local-first: everything runs on `127.0.0.1` and nothing is uploaded.
 
@@ -31,7 +31,7 @@ Gyredeck Bridge  (adapters/bridge/gyredeck-bridge.mjs)
         v  GET /events (SSE) + GET /snapshot hydrate
 Tauri menu-bar window  (apps/desktop)
   - React renderer subscribes to the bridge, reduces events into presence
-  - four tabs: Sessions · Usage · Services · GitHub
+  - four tabs: Sessions · Usage · Listening Ports · Git Monitor
 ```
 
 ## Components
@@ -67,7 +67,7 @@ Tauri v2 shell. Native responsibilities:
 - **Terminal focus** — `focus_terminal` activates the matching iTerm2 or Ghostty window by cwd/title via AppleScript (`osascript`). This is best-effort UI focus, not process/session control.
 - **Usage providers** — `codex_usage`, `claude_usage`, `cursor_usage`, `agy_usage` run provider CLIs/HTTP off the renderer invoke path (blocking worker pool).
 - **Services scan** (`local_services.rs`) — enumerates listening TCP sockets via `lsof`, probes HTTP roots, and exposes a guarded stop/force-kill control for eligible current-user listeners. See `services.md`.
-- **GitHub** (`github.rs`) — repo latest commit, GitHub Actions status, and open PRs via the GitHub REST API, using an own token store (`~/.config/gyredeck/github-accounts.json`, `0600`); the `gh` CLI is an optional token importer. Switching the active account also best-effort syncs the global git identity (`user.name`/`user.email`) and, when the `gh` CLI is installed, its active account too.
+- **Git Monitor** (`github.rs`) — per-repo latest commit, CI status (GitHub Actions / GitLab pipelines), and open PRs/MRs for **GitHub and GitLab** via their REST APIs, using an own provider-tagged token store (`~/.config/gyredeck/github-accounts.json`, `0600`). Accounts are added via OAuth 2.0 device flow (GitLab tokens carry a refresh token + expiry and auto-refresh) or imported from the optional `gh`/`glab` CLIs. A built-in git credential helper (`gyredeck-desktop git-credential`) serves `git push`/`pull` without those CLIs, per-host (A1: fills only hosts with no existing gh/glab helper); GitLab uses username `oauth2`. An optional "Sync git identity" toggle writes the global `user.name`/`user.email` (+ `gh auth switch`) on account switch; with it off, switching is view-only.
 - **Display / keep-awake** — persisted display selection and a keep-display-awake toggle.
 - **Hook installers** — `install_claude_hook` / `install_agy_hook` copy the adapter and register it, reporting install status back to Settings → Plugins.
 
@@ -78,8 +78,8 @@ Protocol-driven React. `src/main.tsx` orchestrates the window and tab state; fea
 - `session` — reduces the bridge event stream into per-conversation sessions, workspace grouping, and session detail.
 - `presence` — presence ingestion from `GET /events` / `GET /snapshot`.
 - `usage` — provider usage views.
-- `runtime` — the Services panel (`LocalServicesPanel`) and its polling hook.
-- `github` — GitHub monitor.
+- `runtime` — the Listening Ports panel (`LocalServicesPanel`) and its polling hook.
+- `github` — Git Monitor (GitHub + GitLab): account/device-flow logic, repo status, and the account dropdown.
 - `setup` — Settings and hook installers.
 - `updater` — in-app update check/install.
 
@@ -91,10 +91,10 @@ Ordered files under `src/styles/` preserve CSS cascade ownership.
 | --- | --- | --- |
 | **Sessions** | bridge events → presence model | Workspace-grouped agent sessions with live activity (turn / tool / compaction / done / needs-input), recent-activity detail, clear/dismiss, and a Focus button that jumps to the matching terminal. |
 | **Usage** | native provider commands | Local quota/token views for Claude Code, Codex, Cursor, and Antigravity; truthful unavailable/offline states. |
-| **Services** | native `lsof` scan | Locally listening TCP/HTTP services named from their command line, with open-in-browser and guarded stop controls. |
-| **GitHub** | GitHub REST API (own token store; `gh` optional import) | Per-repo latest commit, GitHub Actions status, and open PRs for repos you add; inline account switching that also syncs the global git identity. |
+| **Listening Ports** | native `lsof` scan | Locally listening TCP/HTTP services named from their command line, with open-in-browser and guarded stop controls. |
+| **Git Monitor** | GitHub/GitLab REST APIs (own token store; OAuth device flow or `gh`/`glab` import) | Per-repo latest commit, CI status (Actions/pipelines), and open PRs/MRs across GitHub & GitLab; inline account management, optional git-identity sync, and a built-in credential helper for push. |
 
-**Settings** is grouped into Connection, Display, Plugins (agent hook installers), and Update, plus the Terminal picker (iTerm2 / Ghostty) used by session Focus and a keep-display-awake toggle.
+**Settings** is grouped into Connection (bridge status + configurable local port), Display, Git (credential helper, account list, git-identity sync), Plugins (agent hook installers), and Update, plus the Terminal picker (iTerm2 / Ghostty) used by session Focus and a keep-display-awake toggle.
 
 ## Presence model
 

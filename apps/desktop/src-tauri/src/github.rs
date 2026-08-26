@@ -144,6 +144,10 @@ pub struct TokenStore {
     // identity (git config / gh). Missing in legacy files => true.
     #[serde(default = "default_true")]
     pub sync_identity: bool,
+    // User preference for "Use Gyredeck for git auth" — a persisted on/off,
+    // independent of whether any helper line currently exists in gitconfig.
+    #[serde(default)]
+    pub credential_helper_enabled: bool,
 }
 
 impl Default for TokenStore {
@@ -152,6 +156,7 @@ impl Default for TokenStore {
             active: None,
             accounts: Vec::new(),
             sync_identity: true,
+            credential_helper_enabled: false,
         }
     }
 }
@@ -991,6 +996,7 @@ fn import_from_gh_blocking() -> Result<Vec<GhAccount>, String> {
     store.active = active_login.map(|login| format!("github:{login}"));
     save_store(&store)?;
     sync_git_identity(&store);
+    reapply_credential_helper();
     accounts_blocking()
 }
 
@@ -1035,6 +1041,7 @@ fn import_from_glab_blocking() -> Result<Vec<GhAccount>, String> {
     store.active = Some(format!("gitlab:{login}"));
     save_store(&store)?;
     sync_git_identity(&store);
+    reapply_credential_helper();
     accounts_blocking()
 }
 
@@ -1269,6 +1276,7 @@ fn store_oauth_token(provider: Provider, token: &OAuthToken) -> Result<Option<St
     sync_git_identity(&store);
     // Register the account with its CLI so adding mirrors removing (which logs out).
     login_cli_account(provider, &token.access_token);
+    reapply_credential_helper();
     Ok(Some(login))
 }
 
@@ -1482,38 +1490,62 @@ fn credential_helper_installed() -> Result<CredentialHelperStatus, String> {
     let path = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    // Installed if Gyredeck's helper is present on any managed host.
-    let installed = CREDENTIAL_CONFIG_HOSTS
-        .iter()
-        .any(|host| host_has_gyredeck_helper(host));
+    // The toggle reflects the persisted preference — not whether A1 currently had
+    // a host to fill — so it can be turned on/off regardless of which accounts
+    // exist. Also treat a pre-existing Gyredeck helper line as on (back-compat).
+    let installed = load_store()
+        .map(|s| s.credential_helper_enabled)
+        .unwrap_or(false)
+        || CREDENTIAL_CONFIG_HOSTS
+            .iter()
+            .any(|host| host_has_gyredeck_helper(host));
     Ok(CredentialHelperStatus { installed, path })
 }
 
-fn credential_helper_enable_blocking() -> Result<CredentialHelperStatus, String> {
+/// A1 install: put Gyredeck's helper on each host whose provider has an account
+/// and no existing gh/glab helper. Safe to call repeatedly.
+fn install_gyredeck_helper(store: &TokenStore) -> Result<(), String> {
     let helper = helper_command_value()?;
-    let store = load_store().unwrap_or_default();
     for host in CREDENTIAL_CONFIG_HOSTS {
         let Some(provider) = provider_for_host(bare_host(host)) else {
             continue;
         };
-        // Only manage hosts whose provider we actually have an account for.
         if !store.accounts.iter().any(|a| a.provider == provider) {
             continue;
         }
-        // A1: defer to an existing non-Gyredeck helper (gh/glab); fill only the gap.
-        if host_has_external_helper(host) {
+        if host_has_external_helper(host) || host_has_gyredeck_helper(host) {
             continue;
         }
         let key = format!("credential.{host}.helper");
-        // Reset then install ours (empty entry drops any inherited global helper).
         let _ = Command::new("git").args(["config", "--global", "--unset-all", &key]).status();
         git_config_add(&key, "")?;
         git_config_add(&key, &helper)?;
     }
+    Ok(())
+}
+
+/// Re-apply the helper for newly-added accounts when the preference is on.
+fn reapply_credential_helper() {
+    if let Ok(store) = load_store() {
+        if store.credential_helper_enabled {
+            let _ = install_gyredeck_helper(&store);
+        }
+    }
+}
+
+fn credential_helper_enable_blocking() -> Result<CredentialHelperStatus, String> {
+    let mut store = load_store()?;
+    store.credential_helper_enabled = true;
+    save_store(&store)?;
+    let _ = install_gyredeck_helper(&store);
     credential_helper_installed()
 }
 
 fn credential_helper_disable_blocking() -> Result<CredentialHelperStatus, String> {
+    if let Ok(mut store) = load_store() {
+        store.credential_helper_enabled = false;
+        let _ = save_store(&store);
+    }
     for host in CREDENTIAL_CONFIG_HOSTS {
         let key = format!("credential.{host}.helper");
         // Remove only Gyredeck's own entries; leave any gh/glab helper intact.

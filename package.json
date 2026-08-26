@@ -1,6 +1,6 @@
 {
   "name": "gyredeck",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "private": true,
   "description": "Local-first macOS menu-bar companion for AI coding agents — live sessions, provider usage, local services, and GitHub monitoring.",
   "type": "module",

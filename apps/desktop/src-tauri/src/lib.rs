@@ -31,10 +31,10 @@ mod notification;
 mod standalone_bridge;
 
 use github::{
-    github_accounts, github_available_repos, github_credential_helper_disable,
-    github_credential_helper_enable, github_credential_helper_status, github_device_poll,
-    github_device_start, github_import_from_gh, github_remove_account, github_repo_status,
-    github_switch_account,
+    device_poll, device_start, get_sync_identity, github_accounts, github_available_repos,
+    github_credential_helper_disable, github_credential_helper_enable,
+    github_credential_helper_status, github_import_from_gh, github_remove_account,
+    github_repo_status, github_switch_account, import_from_glab, set_sync_identity,
 };
 
 use keep_awake::KeepAwakeState;
@@ -5472,9 +5472,12 @@ pub fn run() {
             github_accounts,
             github_switch_account,
             github_import_from_gh,
+            import_from_glab,
             github_remove_account,
-            github_device_start,
-            github_device_poll,
+            get_sync_identity,
+            set_sync_identity,
+            device_start,
+            device_poll,
             github_credential_helper_status,
             github_credential_helper_enable,
             github_credential_helper_disable,

@@ -1,10 +1,42 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Download, GitBranch, GitCommit, GitPullRequest, LogIn, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Check, ChevronsUpDown, Copy, Download, GitBranch, GitCommit, GitPullRequest, LogIn, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { fetchAvailableRepos } from "./adapter";
-import type { GithubRepoState, IGithubRun } from "./types";
+import type { GitProvider, GithubRepoState, IGithubRun } from "./types";
 import type { IGithubMonitor } from "./useGithubMonitor";
 import { Tooltip } from "../../Tooltip";
+
+const PROVIDERS: { id: GitProvider; label: string }[] = [
+  { id: "github", label: "GitHub" },
+  { id: "gitlab", label: "GitLab" },
+];
+
+const webBase = (provider: GitProvider): string =>
+  provider === "gitlab" ? "https://gitlab.com" : "https://github.com";
+
+const repoUrl = (provider: GitProvider, repo: string): string => `${webBase(provider)}/${repo}`;
+
+const requestsUrl = (provider: GitProvider, repo: string): string =>
+  provider === "gitlab"
+    ? `${webBase(provider)}/${repo}/-/merge_requests`
+    : `${webBase(provider)}/${repo}/pulls`;
+
+const commitUrl = (provider: GitProvider, repo: string, sha: string): string =>
+  provider === "gitlab"
+    ? `${webBase(provider)}/${repo}/-/commit/${sha}`
+    : `${webBase(provider)}/${repo}/commit/${sha}`;
+
+const requestNoun = (provider: GitProvider): string => (provider === "gitlab" ? "MR" : "PR");
+
+// Brand marks (lucide dropped its Github/Gitlab icons), drawn with currentColor.
+export const ProviderIcon = ({ provider, size = 13 }: { provider: GitProvider; size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false">
+    {provider === "gitlab" ? (
+      <path d="m23.6 9.593-.033-.086L20.3.98a.851.851 0 0 0-.336-.405.875.875 0 0 0-1 .054.875.875 0 0 0-.29.44l-2.205 6.748H7.537L5.332 1.07a.857.857 0 0 0-.29-.442.875.875 0 0 0-1-.053.858.858 0 0 0-.336.405L.433 9.502l-.033.086a6.066 6.066 0 0 0 2.012 7.01l.011.009.03.021 4.976 3.727 2.462 1.863 1.5 1.132a1.008 1.008 0 0 0 1.22 0l1.499-1.132 2.462-1.863 5.006-3.749.012-.01a6.068 6.068 0 0 0 2.01-7.003Z" />
+    ) : (
+      <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12" />
+    )}
+  </svg>
+);
 
 const relativeTime = (iso: string): string => {
   const then = Date.parse(iso);
@@ -38,18 +70,20 @@ const openExternal = (url: string) => void invoke("open_external_url", { url }).
 
 interface IRepoCardProps {
   repo: string;
+  provider: GitProvider;
   state: GithubRepoState | undefined;
   onRemove: (repo: string) => void;
 }
 
-const RepoCard = ({ repo, state, onRemove }: IRepoCardProps) => {
+const RepoCard = ({ repo, provider, state, onRemove }: IRepoCardProps) => {
   const data = state && (state.status === "ready" || state.status === "error") ? state.data : undefined;
   const latestRun = data?.runs[0];
   const run = latestRun ? runState(latestRun) : null;
+  const noun = requestNoun(provider);
   return (
     <div className="gh-card">
       <div className="gh-card-head">
-        <button className="gh-repo-name" type="button" onClick={() => openExternal(`https://github.com/${repo}`)} title={`Open ${repo}`}>
+        <button className="gh-repo-name" type="button" onClick={() => openExternal(repoUrl(provider, repo))} title={`Open ${repo}`}>
           {repo}
         </button>
         <button className="gh-icon-btn gh-remove" type="button" aria-label={`Stop tracking ${repo}`} onClick={() => onRemove(repo)}>
@@ -71,16 +105,16 @@ const RepoCard = ({ repo, state, onRemove }: IRepoCardProps) => {
             <div className="gh-card-line muted">No workflow runs</div>
           ) : null}
           {data ? (
-            <Tooltip label={data.pulls[0]?.title ?? `${data.open_pr_count} open PR${data.open_pr_count === 1 ? "" : "s"}`}>
-              <button className="gh-card-line gh-link" type="button" onClick={() => openExternal(`https://github.com/${repo}/pulls`)}>
-                <GitPullRequest size={12} strokeWidth={2.3} /> {data.open_pr_count} open PR{data.open_pr_count === 1 ? "" : "s"}
+            <Tooltip label={data.pulls[0]?.title ?? `${data.open_pr_count} open ${noun}${data.open_pr_count === 1 ? "" : "s"}`}>
+              <button className="gh-card-line gh-link" type="button" onClick={() => openExternal(requestsUrl(provider, repo))}>
+                <GitPullRequest size={12} strokeWidth={2.3} /> {data.open_pr_count} open {noun}{data.open_pr_count === 1 ? "" : "s"}
                 {data.pulls[0] ? <span className="muted"> · {data.pulls[0].title}</span> : null}
               </button>
             </Tooltip>
           ) : null}
           {data?.commit ? (
             <Tooltip label={data.commit.message}>
-              <button className="gh-card-line gh-link" type="button" onClick={() => openExternal(`https://github.com/${repo}/commit/${data.commit?.sha}`)}>
+              <button className="gh-card-line gh-link" type="button" onClick={() => data.commit && openExternal(commitUrl(provider, repo, data.commit.sha))}>
                 <GitCommit size={12} strokeWidth={2.3} /> {data.commit.sha} {data.commit.message}
                 <span className="muted"> · {relativeTime(data.commit.committed_at)}</span>
               </button>
@@ -98,9 +132,10 @@ const RepoCard = ({ repo, state, onRemove }: IRepoCardProps) => {
 interface IAddRepoProps {
   tracked: string[];
   onAdd: (repo: string) => void;
+  loadRepos: () => Promise<string[]>;
 }
 
-const AddRepo = ({ tracked, onAdd }: IAddRepoProps) => {
+const AddRepo = ({ tracked, onAdd, loadRepos }: IAddRepoProps) => {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -134,13 +169,13 @@ const AddRepo = ({ tracked, onAdd }: IAddRepoProps) => {
     setLoading(true);
     setError(null);
     try {
-      setRepos(await fetchAvailableRepos());
+      setRepos(await loadRepos());
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [loadRepos]);
 
   const toggle = () => {
     const next = !open;
@@ -199,7 +234,10 @@ interface IGithubPanelProps {
   canUseNativeControls: boolean;
 }
 
+const providerLabel = (provider: GitProvider): string => (provider === "gitlab" ? "GitLab" : "GitHub");
+
 const DeviceFlowPrompt = ({ monitor }: { monitor: IGithubMonitor }) => {
+  const [copied, setCopied] = useState(false);
   const flow = monitor.deviceFlow;
   if (flow.status === "idle") return null;
   if (flow.status === "starting") {
@@ -208,42 +246,203 @@ const DeviceFlowPrompt = ({ monitor }: { monitor: IGithubMonitor }) => {
   if (flow.status === "error") {
     return <div className="gh-card-line error">{flow.message}</div>;
   }
+  const label = providerLabel(flow.provider);
   return (
     <div className="gh-device-panel">
       <div className="gh-device">
         <RefreshCw className="gh-spin" size={12} strokeWidth={2.3} />
-        <span>Enter this code on GitHub:</span>
+        <span>Enter this code on {label}:</span>
         <button className="gh-code" type="button" title="Copy code" onClick={() => void navigator.clipboard?.writeText(flow.userCode).catch(() => undefined)}>
           {flow.userCode}
         </button>
+        <button
+          className="gh-icon-btn gh-code-copy"
+          type="button"
+          title="Copy code"
+          aria-label="Copy code"
+          onClick={() => {
+            void navigator.clipboard?.writeText(flow.userCode).catch(() => undefined);
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1500);
+          }}
+        >
+          {copied ? <Check size={12} strokeWidth={2.6} /> : <Copy size={12} strokeWidth={2.3} />}
+        </button>
       </div>
       <div className="gh-device-actions">
-        <button className="pill-btn" type="button" onClick={() => openExternal(flow.verificationUri)}>Open GitHub</button>
+        <button className="pill-btn" type="button" onClick={() => openExternal(flow.verificationUri)}>Open {label}</button>
         <button className="pill-btn" type="button" onClick={() => monitor.cancelDeviceFlow()}>Cancel</button>
       </div>
     </div>
   );
 };
 
+const AddAccount = ({ monitor, signingIn, onDone }: { monitor: IGithubMonitor; signingIn: boolean; onDone?: () => void }) => {
+  const [provider, setProvider] = useState<GitProvider>("github");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const run = useCallback(async (fn: () => Promise<void>) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await fn();
+      onDone?.();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [onDone]);
+
+  const signIn = useCallback((p: GitProvider) => {
+    void monitor.startDeviceFlow(p).then((ok) => {
+      if (ok) onDone?.();
+    });
+  }, [monitor, onDone]);
+
+  return (
+    <div className="gh-add-account">
+      <div className="gh-provider-tabs" role="tablist" aria-label="Provider">
+        {PROVIDERS.map((p) => (
+          <button
+            key={p.id}
+            type="button"
+            role="tab"
+            aria-selected={provider === p.id}
+            className="gh-provider-tab"
+            data-active={provider === p.id}
+            onClick={() => { setProvider(p.id); setError(null); }}
+          >
+            {p.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="gh-onboard-actions">
+        {provider === "github" ? (
+          <>
+            <button className="pill-btn accent" type="button" disabled={signingIn} onClick={() => signIn("github")}>
+              <LogIn size={12} strokeWidth={2.3} /> Sign in with GitHub
+            </button>
+            <button className="pill-btn" type="button" disabled={busy} onClick={() => void run(() => monitor.importFromGh())}>
+              {busy ? <RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> : <Download size={12} strokeWidth={2.3} />} Import from gh CLI
+            </button>
+          </>
+        ) : (
+          <>
+            <button className="pill-btn accent" type="button" disabled={signingIn} onClick={() => signIn("gitlab")}>
+              <LogIn size={12} strokeWidth={2.3} /> Sign in with GitLab
+            </button>
+            <button className="pill-btn" type="button" disabled={busy} onClick={() => void run(() => monitor.importFromGlab())}>
+              {busy ? <RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> : <Download size={12} strokeWidth={2.3} />} Import from glab CLI
+            </button>
+          </>
+        )}
+      </div>
+      {error ? <div className="gh-card-line error">{error}</div> : null}
+      <DeviceFlowPrompt monitor={monitor} />
+    </div>
+  );
+};
+
+const AccountSelect = ({ monitor }: { monitor: IGithubMonitor }) => {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  // The trigger shows the account being viewed (may differ from active when
+  // sync is off); the list marks the active (pinned) account.
+  const viewing =
+    monitor.accounts.find((a) => a.provider === monitor.viewingProvider && a.login === monitor.viewingAccount) ??
+    monitor.accounts.find((a) => a.active) ??
+    monitor.accounts[0];
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onPointerDown = (event: MouseEvent) => {
+      if (ref.current && !ref.current.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div className="gh-account-select-wrap" ref={ref}>
+      <button
+        className="gh-account-trigger"
+        type="button"
+        disabled={monitor.switching}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label="Active account"
+        onClick={() => setOpen((o) => !o)}
+      >
+        {viewing ? (
+          <>
+            <ProviderIcon provider={viewing.provider} />
+            <span className="gh-account-login">{viewing.login}</span>
+          </>
+        ) : (
+          <span className="gh-account-login muted">Select account</span>
+        )}
+        <ChevronsUpDown className="gh-account-caret" size={12} strokeWidth={2.3} />
+      </button>
+      {open ? (
+        <div className="gh-picker gh-account-menu" role="listbox">
+          <div className="gh-picker-list">
+            {monitor.accounts.map((account) => {
+              const isViewing = account.provider === viewing?.provider && account.login === viewing?.login;
+              return (
+                <button
+                  key={`${account.provider}:${account.login}`}
+                  className="gh-picker-item gh-account-option"
+                  type="button"
+                  role="option"
+                  aria-selected={isViewing}
+                  onClick={() => {
+                    if (!isViewing) void monitor.switchTo(account.provider, account.login);
+                    setOpen(false);
+                  }}
+                >
+                  <ProviderIcon provider={account.provider} />
+                  <span className="gh-account-login">{account.login}</span>
+                  {account.active ? <Check className="gh-account-check" size={12} strokeWidth={2.6} /> : null}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
 export const GithubPanel = ({ monitor, canUseNativeControls }: IGithubPanelProps) => {
   const signingIn = monitor.deviceFlow.status === "starting" || monitor.deviceFlow.status === "awaiting";
-  const [importing, setImporting] = useState(false);
-  const [importError, setImportError] = useState<string | null>(null);
+  const [addingAccount, setAddingAccount] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const viewingProvider: GitProvider = monitor.viewingProvider ?? monitor.activeProvider ?? "github";
 
-  const runImport = useCallback(async () => {
-    setImporting(true);
-    setImportError(null);
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    // Guarantee the spinner is visible even when the refresh returns instantly
+    // (e.g. no tracked repos).
+    const minSpin = new Promise((resolve) => window.setTimeout(resolve, 500));
     try {
-      await monitor.importFromGh();
-    } catch (error) {
-      setImportError(error instanceof Error ? error.message : String(error));
+      await Promise.all([monitor.refresh(), monitor.refreshAccounts(), minSpin]);
     } finally {
-      setImporting(false);
+      setRefreshing(false);
     }
   }, [monitor]);
 
   if (!canUseNativeControls) {
-    return <div className="gh-empty">GitHub monitoring needs the desktop runtime.</div>;
+    return <div className="gh-empty">Git monitoring needs the desktop runtime.</div>;
   }
 
   if (monitor.accounts.length === 0) {
@@ -251,18 +450,9 @@ export const GithubPanel = ({ monitor, canUseNativeControls }: IGithubPanelProps
       <div className="gh-panel">
         <div className="gh-onboard">
           <span className="gh-onboard-badge"><GitBranch size={22} strokeWidth={2} /></span>
-          <div className="gh-onboard-title">No GitHub accounts yet</div>
-          <div className="gh-onboard-sub">Sign in to track your repos, CI, and PRs.</div>
-          <div className="gh-onboard-actions">
-            <button className="pill-btn accent" type="button" onClick={() => void monitor.startDeviceFlow()} disabled={signingIn}>
-              <LogIn size={12} strokeWidth={2.3} /> Sign in with GitHub
-            </button>
-            <button className="pill-btn" type="button" onClick={() => void runImport()} disabled={importing}>
-              {importing ? <RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> : <Download size={12} strokeWidth={2.3} />} Import from gh CLI
-            </button>
-          </div>
-          {importError ? <div className="gh-card-line error">{importError}</div> : null}
-          <DeviceFlowPrompt monitor={monitor} />
+          <div className="gh-onboard-title">No accounts yet</div>
+          <div className="gh-onboard-sub">Connect GitHub or GitLab to track repos, CI, and PRs/MRs.</div>
+          <AddAccount monitor={monitor} signingIn={signingIn} />
         </div>
       </div>
     );
@@ -272,46 +462,40 @@ export const GithubPanel = ({ monitor, canUseNativeControls }: IGithubPanelProps
     <div className="gh-panel">
       <div className="gh-account-bar">
         <GitBranch size={13} strokeWidth={2.3} />
-        <select
-          className="gh-account-select"
-          value={monitor.activeAccount ?? ""}
-          disabled={monitor.switching}
-          onChange={(event) => void monitor.switchTo(event.target.value)}
-          aria-label="Active GitHub account"
-        >
-          {monitor.accounts.map((account) => (
-            <option key={account.login} value={account.login}>
-              {account.login}
-              {account.active ? " ✓" : ""}
-            </option>
-          ))}
-        </select>
-        <button className="gh-icon-btn" type="button" aria-label="Refresh" onClick={() => { monitor.refresh(); void monitor.refreshAccounts(); }}>
-          <RefreshCw size={12} strokeWidth={2.3} />
+        <AccountSelect monitor={monitor} />
+        <button className="gh-icon-btn" type="button" aria-label="Refresh" disabled={refreshing} onClick={() => void handleRefresh()}>
+          <RefreshCw className={refreshing ? "gh-spin" : undefined} size={12} strokeWidth={2.3} />
         </button>
-        <button className="gh-icon-btn" type="button" aria-label="Sign in with another account" title="Sign in with another account" disabled={signingIn} onClick={() => void monitor.startDeviceFlow()}>
+        <button className="gh-icon-btn" type="button" data-active={addingAccount} aria-label="Add another account" aria-pressed={addingAccount} title="Add another account" onClick={() => setAddingAccount((open) => !open)}>
           <Plus size={12} strokeWidth={2.3} />
         </button>
       </div>
+      {addingAccount ? <AddAccount monitor={monitor} signingIn={signingIn} onDone={() => setAddingAccount(false)} /> : null}
       {monitor.switching ? (
         <div className="gh-card-line muted"><RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> Switching account…</div>
       ) : null}
-      <DeviceFlowPrompt monitor={monitor} />
-      {monitor.activeAccount ? (
-        <span className="gh-account-note muted">Switching updates Gyredeck and your global git identity.</span>
+      {!addingAccount ? (
+        <>
+          <DeviceFlowPrompt monitor={monitor} />
+          <span className="gh-account-note muted">
+            {monitor.syncEnabled
+              ? "Switching updates Gyredeck and your global git identity."
+              : "View-only · switching won't change your system git identity."}
+          </span>
+
+          <AddRepo key={monitor.viewingAccount ?? "none"} tracked={monitor.trackedRepos} onAdd={monitor.addRepo} loadRepos={monitor.listAvailableRepos} />
+
+          <div className="gh-cards">
+            {monitor.trackedRepos.length === 0 ? (
+              <div className="gh-empty">No repositories tracked yet. Add one accessible to the current account.</div>
+            ) : (
+              monitor.trackedRepos.map((repo) => (
+                <RepoCard key={repo} repo={repo} provider={viewingProvider} state={monitor.statuses[repo]} onRemove={monitor.removeRepo} />
+              ))
+            )}
+          </div>
+        </>
       ) : null}
-
-      <AddRepo key={monitor.activeAccount ?? "none"} tracked={monitor.trackedRepos} onAdd={monitor.addRepo} />
-
-      <div className="gh-cards">
-        {monitor.trackedRepos.length === 0 ? (
-          <div className="gh-empty">No repositories tracked yet. Add one accessible to the current account.</div>
-        ) : (
-          monitor.trackedRepos.map((repo) => (
-            <RepoCard key={repo} repo={repo} state={monitor.statuses[repo]} onRemove={monitor.removeRepo} />
-          ))
-        )}
-      </div>
     </div>
   );
 };

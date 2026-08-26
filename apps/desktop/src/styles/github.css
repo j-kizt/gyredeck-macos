@@ -14,15 +14,62 @@
   color: var(--text-2);
 }
 
-.gh-account-select {
+.gh-account-select-wrap {
+  position: relative;
   flex: 1;
   min-width: 0;
+}
+
+.gh-account-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
   background: var(--fill);
   color: var(--text);
   border: 1px solid var(--hair);
   border-radius: 8px;
   padding: 5px 8px;
   font-size: 12px;
+  cursor: pointer;
+}
+
+.gh-account-trigger:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.gh-account-login {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.gh-account-caret {
+  flex: none;
+  color: var(--text-2);
+}
+
+.gh-account-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+}
+
+.gh-account-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.gh-account-check {
+  flex: none;
+  color: rgba(255, 157, 61, 0.95);
 }
 
 .gh-account-note {
@@ -302,9 +349,52 @@
   border-color: rgba(255, 107, 102, 0.4);
 }
 
-.gh-icon-btn[data-active="true"] {
-  background: var(--fill-2);
+/* ── Add-account panel (provider picker + token) ── */
+
+.gh-add-account {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 320px;
+  margin: 8px auto 0;
+}
+
+.gh-provider-tabs {
+  display: inline-flex;
+  align-self: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.gh-provider-tab {
+  padding: 4px 12px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-2);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.gh-provider-tab[data-active="true"] {
   color: var(--text);
+  background: var(--fill);
+}
+
+.gh-icon-btn[data-active="true"] {
+  background: rgba(255, 157, 61, 0.9);
+  border-color: rgba(255, 157, 61, 0.9);
+  color: #1c1205;
+}
+
+.gh-icon-btn[data-active="true"]:hover {
+  background: rgba(255, 157, 61, 1);
+  color: #1c1205;
 }
 
 .gh-add-steps {

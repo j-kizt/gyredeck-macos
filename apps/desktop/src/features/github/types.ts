@@ -29,9 +29,12 @@ export interface IGithubRepoStatus {
   error: string | null;
 }
 
+export type GitProvider = "github" | "gitlab";
+
 export interface IGhAccount {
   login: string;
   active: boolean;
+  provider: GitProvider;
 }
 
 export interface IDeviceCodeStart {

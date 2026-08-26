@@ -814,10 +814,9 @@ fn sync_git_identity(store: &TokenStore) {
 }
 
 fn switch_account_blocking(provider: Provider, user: &str) -> Result<String, String> {
-    if !is_valid_account(user, provider) {
-        return Err("Invalid account name".to_string());
-    }
     let mut store = load_store()?;
+    // The account must exist in the store — that's the real guard. A valid name
+    // is only required for the `gh auth switch` side-effect below.
     if !store
         .accounts
         .iter()
@@ -829,7 +828,7 @@ fn switch_account_blocking(provider: Provider, user: &str) -> Result<String, Str
     let sync = store.sync_identity;
     save_store(&store)?;
     sync_git_identity(&store);
-    if sync && provider == Provider::Github {
+    if sync && provider == Provider::Github && is_valid_account(user, provider) {
         sync_gh_active(user);
     }
     Ok(user.to_string())
@@ -847,6 +846,9 @@ fn sync_gh_active(login: &str) {
     if gh_present {
         let _ = Command::new("gh")
             .args(["auth", "switch", "--user", login])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
     }
 }
@@ -1047,28 +1049,28 @@ pub async fn import_from_glab() -> Result<Vec<GhAccount>, String> {
 /// clears the system credential. GitHub supports per-user logout; glab is
 /// single-account per host so it logs out the host. Never fatal.
 fn logout_cli_account(provider: Provider, user: &str) {
-    match provider {
-        Provider::Github => {
-            if Command::new("gh").arg("--version").output().is_ok() {
-                let _ = Command::new("gh")
-                    .args(["auth", "logout", "--hostname", "github.com", "--user", user])
-                    .status();
-            }
-        }
-        Provider::Gitlab => {
-            if Command::new("glab").arg("--version").output().is_ok() {
-                let _ = Command::new("glab")
-                    .args(["auth", "logout", "--hostname", "gitlab.com"])
-                    .status();
-            }
-        }
+    // Detached stdio: never inherit stdin, so an interactive CLI prompt can't block.
+    let (bin, args): (&str, Vec<&str>) = match provider {
+        Provider::Github => (
+            "gh",
+            vec!["auth", "logout", "--hostname", "github.com", "--user", user],
+        ),
+        Provider::Gitlab => ("glab", vec!["auth", "logout", "--hostname", "gitlab.com"]),
+    };
+    if Command::new(bin).arg("--version").output().is_err() {
+        return;
     }
+    let _ = Command::new(bin)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn remove_account_blocking(provider: Provider, user: &str) -> Result<Vec<GhAccount>, String> {
-    if !is_valid_account(user, provider) {
-        return Err("Invalid account name".to_string());
-    }
+    // Removal must always work — even for a store entry with an odd/legacy name —
+    // so a corrupted account can be deleted. Name validity only gates CLI logout.
     let mut store = load_store()?;
     let removed_key = format!("{}:{}", provider.as_str(), user);
     store
@@ -1083,8 +1085,11 @@ fn remove_account_blocking(provider: Provider, user: &str) -> Result<Vec<GhAccou
         store.active = store.accounts.first().map(account_key);
     }
     save_store(&store)?;
-    // Removing an account also clears its system credential (CLI logout).
-    logout_cli_account(provider, user);
+    // Removing an account also clears its system credential (CLI logout) — only
+    // for well-formed names, since the name flows into gh/glab CLI arguments.
+    if is_valid_account(user, provider) {
+        logout_cli_account(provider, user);
+    }
     accounts_blocking()
 }
 

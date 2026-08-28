@@ -230,7 +230,7 @@
 .pill-btn:focus-visible,
 .gear-btn:focus-visible,
 .row-btn:focus-visible {
-  outline: 1px solid rgba(255, 157, 61, 0.78);
+  outline: 1px solid rgba(var(--accent-rgb), 0.78);
   outline-offset: 2px;
 }
 

@@ -56,7 +56,7 @@
 
 .setup-side-tab:focus-visible,
 .setup-size-options button:focus-visible {
-  outline: 1px solid rgba(255, 157, 61, 0.72);
+  outline: 1px solid rgba(var(--accent-rgb), 0.72);
   outline-offset: 2px;
 }
 
@@ -415,12 +415,12 @@
 
 .display-option[data-selected="true"] {
   color: var(--text);
-  border-color: rgba(255, 157, 61, 0.62);
-  background: rgba(255, 157, 61, 0.1);
+  border-color: rgba(var(--accent-rgb), 0.62);
+  background: rgba(var(--accent-rgb), 0.1);
 }
 
 .display-option:focus-visible {
-  outline: 1px solid rgba(255, 157, 61, 0.82);
+  outline: 1px solid rgba(var(--accent-rgb), 0.82);
   outline-offset: 1px;
 }
 

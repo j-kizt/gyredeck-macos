@@ -211,8 +211,9 @@ test("antigravity adapter allows PreToolUse and relays a tool_start", async () =
       },
     );
     assert.equal(result.code, 0, result.stderr);
-    // AGY treats an empty {} as deny, so PreToolUse MUST answer allow on stdout.
-    assert.deepEqual(JSON.parse(result.stdout), { decision: "allow" });
+    // AGY treats an empty {} as deny, so PreToolUse MUST answer the full documented
+    // allow shape on stdout — a partial answer risks blocking every tool call.
+    assert.deepEqual(JSON.parse(result.stdout), { decision: "allow", reason: "", permissionOverrides: [] });
 
     const snapshot = await (await fetch(`http://127.0.0.1:${port}/snapshot`)).json();
     const toolStart = snapshot.recent.find((event) => event.type === "tool_start" && event.conversationId === "agy-conv-1");
@@ -220,6 +221,63 @@ test("antigravity adapter allows PreToolUse and relays a tool_start", async () =
     assert.equal(toolStart.cwd, "/tmp/agy-project");
     assert.equal(toolStart.data.toolName, "Read");
     assert.equal(toolStart.runtime?.sourceKind, "agyHost");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("antigravity adapter answers each event with its documented response shape", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-agy-shapes-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  try {
+    await waitForHealth(port, stderrRef);
+    const expected = {
+      PreToolUse: { decision: "allow", reason: "", permissionOverrides: [] },
+      PostToolUse: {},
+      PreInvocation: { injectSteps: [] },
+      PostInvocation: { injectSteps: [], terminationBehavior: "" },
+      Stop: { decision: "continue", reason: "" },
+    };
+
+    for (const [event, shape] of Object.entries(expected)) {
+      const result = await runAdapter(
+        "adapters/antigravity/gyredeck-agy-hook.mjs",
+        ["--event", event],
+        home,
+        {
+          conversationId: "agy-shapes",
+          workspacePaths: ["/tmp/agy-project"],
+          toolCall: { name: "Read", args: {} },
+          invocationNum: 1,
+        },
+      );
+      assert.equal(result.code, 0, `${event}: ${result.stderr}`);
+      assert.deepEqual(JSON.parse(result.stdout), shape, `${event} response shape`);
+    }
+
+    // PostInvocation is registered for a valid answer only — a turn can span
+    // several invocations, so it must not report the turn as complete.
+    const snapshot = await (await fetch(`http://127.0.0.1:${port}/snapshot`)).json();
+    const forConv = snapshot.recent.filter((event) => event.conversationId === "agy-shapes");
+    assert.ok(forConv.some((event) => event.type === "tool_start"), "PreToolUse still relays");
+    assert.equal(
+      forConv.filter((event) => event.type === "turn_complete").length,
+      1,
+      "only Stop reports turn completion",
+    );
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();

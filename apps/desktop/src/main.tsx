@@ -575,8 +575,17 @@ const App = () => {
     deleteSessions([conversationId]);
   };
 
-  const copySessionId = (conversationId: string) => {
-    void navigator.clipboard?.writeText(conversationId)
+  // Claude Code's conversationId IS its resumable session id, so copy a ready
+  // `claude --resume` command. Codex (codex:<cwd>) and Antigravity ids aren't
+  // CLI-resumable, so those fall back to copying the raw id.
+  const resumeCommand = (provider: string, conversationId: string): string | null => {
+    if (provider === "Claude Code") return `claude --resume ${conversationId}`;
+    return null;
+  };
+
+  const copySessionId = (provider: string, conversationId: string) => {
+    const text = resumeCommand(provider, conversationId) ?? conversationId;
+    void navigator.clipboard?.writeText(text)
       .then(() => {
         setCopiedSessionId(conversationId);
         window.setTimeout(() => setCopiedSessionId((current) => (current === conversationId ? null : current)), 1500);
@@ -609,9 +618,16 @@ const App = () => {
     else requestRemoveInactiveSessionGroup(groupKey, group);
   };
 
+  // Opening Settings kicks off one status load per adapter. Reuse the current
+  // object when the status is already unknown so the browser demo (and any error
+  // path) doesn't re-render the panel once per adapter for no change — a stray
+  // re-render there can land between a focus() and a keypress and drop focus.
+  const clearHookStatus = (set: React.Dispatch<React.SetStateAction<IHookStatus>>) =>
+    set((current) => (current.path === null && current.installed === null ? current : { path: null, installed: null }));
+
   const loadHookStatus = async () => {
     if (!canUseNativeControls) {
-      setHookStatus({ path: null, installed: null });
+      clearHookStatus(setHookStatus);
       return;
     }
 
@@ -619,13 +635,13 @@ const App = () => {
       const [path, installed] = await invoke<[string, boolean]>("claude_hook_status");
       setHookStatus({ path, installed });
     } catch {
-      setHookStatus({ path: null, installed: null });
+      clearHookStatus(setHookStatus);
     }
   };
 
   const loadAgyStatus = async () => {
     if (!canUseNativeControls) {
-      setAgyStatus({ path: null, installed: null });
+      clearHookStatus(setAgyStatus);
       return;
     }
 
@@ -633,9 +649,10 @@ const App = () => {
       const [path, installed] = await invoke<[string, boolean]>("agy_hook_status");
       setAgyStatus({ path, installed });
     } catch {
-      setAgyStatus({ path: null, installed: null });
+      clearHookStatus(setAgyStatus);
     }
   };
+
 
   useEffect(() => {
     if (!canUseNativeControls) return;
@@ -699,6 +716,7 @@ const App = () => {
       });
     }
   };
+
 
   const focusSelectedSession = async (session: ISessionDetail | ISessionSummary) => {
     if (!canUseNativeControls) {
@@ -973,10 +991,10 @@ const App = () => {
                     <button
                       className="pill-btn context-icon-btn"
                       type="button"
-                      onClick={() => copySessionId(selectedSession.conversationId)}
+                      onClick={() => copySessionId(selectedSession.provider, selectedSession.conversationId)}
                       data-tauri-drag-region="false"
-                      title={copiedSessionId === selectedSession.conversationId ? "Copied" : "Copy session id"}
-                      aria-label={copiedSessionId === selectedSession.conversationId ? "Session id copied" : "Copy session id"}
+                      title={copiedSessionId === selectedSession.conversationId ? "Copied" : resumeCommand(selectedSession.provider, selectedSession.conversationId) ? "Copy resume command" : "Copy session id"}
+                      aria-label={copiedSessionId === selectedSession.conversationId ? "Copied" : resumeCommand(selectedSession.provider, selectedSession.conversationId) ? "Copy resume command" : "Copy session id"}
                     >
                       {copiedSessionId === selectedSession.conversationId ? <Check size={13} strokeWidth={2.3} /> : <Copy size={13} strokeWidth={2.3} />}
                     </button>

@@ -44,7 +44,7 @@ Each adapter is a small Node script (`.mjs`) invoked by an agent's hook mechanis
 | --- | --- | --- | --- |
 | Claude Code | `adapters/claude/gyredeck-claude-hook.mjs` | `claudeCodeHook` | Rich: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Notification`, `Stop`/`SubagentStop`, `SessionEnd`. Reads `model` from the tail of the transcript JSONL. |
 | Codex | `adapters/codex/gyredeck-codex-notify.mjs` | `codex-notify` | Coarse: Codex only invokes a `notify` program, so only `agent-turn-complete` is mapped, into a turn-completion signal. |
-| Antigravity (AGY) | `adapters/antigravity/gyredeck-agy-hook.mjs` | `agyHost` | `PreToolUse`, `PostToolUse`, `PreInvocation` (first invocation opens the conversation; every invocation starts a turn), `Stop`. Reads `model` from the hook payload. |
+| Antigravity (AGY) | `adapters/antigravity/gyredeck-agy-hook.mjs` | `agyHost` | Registers all five Antigravity hooks (`~/.gemini/config/hooks.json`): `PreToolUse`, `PostToolUse`, `PreInvocation` (first invocation opens the conversation; every invocation starts a turn), `PostInvocation`, `Stop`. Reads `model` from the hook payload. Each event answers its own documented response shape — `PreToolUse` must return the full `{decision:"allow", reason, permissionOverrides}` (a bare `{}` reads as *deny* and would block every tool call), `PreInvocation`/`PostInvocation` return `injectSteps`, `Stop` returns `{decision:"continue"}`. `PostInvocation` emits no Gyredeck event: a turn can span several invocations, so only `Stop` reports completion. This is also the adapter for the new Antigravity CLI, which replaced Gemini CLI in June 2026 and shares the same agent harness and hooks. |
 
 ### Bridge (`adapters/bridge/gyredeck-bridge.mjs`)
 

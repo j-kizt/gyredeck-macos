@@ -22,6 +22,7 @@ test("main section tabs provide roving keyboard navigation and panel relationshi
 
   const sessionsTab = page.getByRole("tab", { name: "Sessions" });
   await sessionsTab.focus();
+  await expect(sessionsTab).toBeFocused();
   await page.keyboard.press("ArrowRight");
 
   const usageTab = page.getByRole("tab", { name: "Usage" });
@@ -31,17 +32,17 @@ test("main section tabs provide roving keyboard navigation and panel relationshi
 
   await page.keyboard.press("ArrowRight");
 
-  const servicesTab = page.getByRole("tab", { name: "Services" });
+  const servicesTab = page.getByRole("tab", { name: "Listening Ports" });
   await expect(servicesTab).toBeFocused();
   await expect(servicesTab).toHaveAttribute("aria-selected", "true");
-  await expect(page.getByRole("tabpanel", { name: "Services" })).toBeVisible();
+  await expect(page.getByRole("tabpanel", { name: "Listening Ports" })).toBeVisible();
 
   await page.keyboard.press("ArrowRight");
 
-  const githubTab = page.getByRole("tab", { name: "GitHub" });
+  const githubTab = page.getByRole("tab", { name: "Git Monitor" });
   await expect(githubTab).toBeFocused();
   await expect(githubTab).toHaveAttribute("aria-selected", "true");
-  await expect(page.getByRole("tabpanel", { name: "GitHub" })).toBeVisible();
+  await expect(page.getByRole("tabpanel", { name: "Git Monitor" })).toBeVisible();
 
   await page.keyboard.press("Home");
   await expect(sessionsTab).toBeFocused();
@@ -63,8 +64,11 @@ test("reduced motion disables panel, status, and loading animation", async ({ pa
 test("Setup sections use vertical roving tabs and labelled panels", async ({ page }) => {
   await page.goto("/?demo=1&demoScenario=idle");
   await page.getByRole("button", { name: "Settings" }).click();
+  // Opening Settings moves focus to the panel target; wait for that before taking focus.
+  await expect(page.getByRole("button", { name: "Back to sessions" })).toBeFocused();
   const connection = page.getByRole("tab", { name: "Connection" });
   await connection.focus();
+  await expect(connection).toBeFocused();
   await page.keyboard.press("ArrowDown");
   const display = page.getByRole("tab", { name: "Display" });
   await expect(display).toBeFocused();
@@ -78,9 +82,12 @@ test("narrow Setup switches to horizontal tab semantics", async ({ page }) => {
   await page.setViewportSize({ width: 280, height: 440 });
   await page.goto("/?demo=1&demoScenario=idle");
   await page.getByRole("button", { name: "Settings" }).click();
+  // Opening Settings moves focus to the panel target; wait for that before taking focus.
+  await expect(page.getByRole("button", { name: "Back to sessions" })).toBeFocused();
   await expect(page.getByRole("tablist", { name: "Setup sections" })).toHaveAttribute("aria-orientation", "horizontal");
   const connection = page.getByRole("tab", { name: "Connection" });
   await connection.focus();
+  await expect(connection).toBeFocused();
   await page.keyboard.press("ArrowRight");
   await expect(page.getByRole("tab", { name: "Display" })).toBeFocused();
 });

@@ -102,8 +102,25 @@ const getCliArg = (flag) => {
 const main = async () => {
   const eventType = getCliArg("--event");
 
-  // PreToolUse MUST return { decision: "allow" } — empty {} is treated as deny by AGY.
-  const agyResponse = eventType === "PreToolUse" ? { decision: "allow" } : {};
+  // Each AGY event has its own documented response shape; an empty {} is not a
+  // valid answer for the gating events (PreToolUse treats it as a deny, which
+  // would block every tool call). Mirror the documented shape per event.
+  const agyResponseFor = (event) => {
+    switch (event) {
+      case "PreToolUse":
+        return { decision: "allow", reason: "", permissionOverrides: [] };
+      case "PreInvocation":
+        return { injectSteps: [] };
+      case "PostInvocation":
+        return { injectSteps: [], terminationBehavior: "" };
+      case "Stop":
+        return { decision: "continue", reason: "" };
+      default:
+        // PostToolUse (and anything unrecognized) expects a bare object.
+        return {};
+    }
+  };
+  const agyResponse = agyResponseFor(eventType);
 
   // Always output valid JSON to stdout so AGY does not block or error.
   const respond = () => {
@@ -179,6 +196,11 @@ const main = async () => {
       posts.push(post(endpoint, token, "/ingest", buildEvent("turn_start", {
         inputCount: 1,
       })));
+    } else if (eventType === "PostInvocation") {
+      // Registered so AGY gets a valid `injectSteps` answer and Gyredeck stays a
+      // well-behaved hook citizen. No Gyredeck event is emitted: a turn can span
+      // several invocations, so treating this as turn completion would end the
+      // turn early — `Stop` is the real completion signal.
     } else if (eventType === "Stop") {
       posts.push(post(endpoint, token, "/hook/stop", {
         hookId: randomUUID(),

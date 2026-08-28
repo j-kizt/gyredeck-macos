@@ -478,6 +478,7 @@ fn agy_hooks_json_path() -> Result<PathBuf, String> {
         .join("hooks.json"))
 }
 
+
 const CLAUDE_HOOK_MATCHED_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
 const CLAUDE_HOOK_PLAIN_EVENTS: [&str; 7] = [
     "UserPromptSubmit",
@@ -489,11 +490,12 @@ const CLAUDE_HOOK_PLAIN_EVENTS: [&str; 7] = [
     "PreCompact",
 ];
 
-fn claude_hook_command(installed_path: &str, event: &str) -> String {
+
+fn node_hook_command(installed_path: &str, event: &str) -> String {
     format!("node {installed_path} --event {event}")
 }
 
-fn claude_hook_entry_present(
+fn hook_entry_present(
     hooks: &serde_json::Map<String, serde_json::Value>,
     event: &str,
     command: &str,
@@ -4333,8 +4335,8 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
     prune_hook_entries(hooks, "agent-activity");
 
     let mut register = |event: &str, entry: serde_json::Value| {
-        let command = claude_hook_command(&installed_path, event);
-        if claude_hook_entry_present(hooks, event, &command) {
+        let command = node_hook_command(&installed_path, event);
+        if hook_entry_present(hooks, event, &command) {
             return;
         }
         let list = hooks
@@ -4350,13 +4352,13 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
     for event in CLAUDE_HOOK_MATCHED_EVENTS {
         let entry = serde_json::json!({
             "matcher": "*",
-            "hooks": [{"type": "command", "command": claude_hook_command(&installed_path, event)}]
+            "hooks": [{"type": "command", "command": node_hook_command(&installed_path, event)}]
         });
         register(event, entry);
     }
     for event in CLAUDE_HOOK_PLAIN_EVENTS {
         let entry = serde_json::json!({
-            "hooks": [{"type": "command", "command": claude_hook_command(&installed_path, event)}]
+            "hooks": [{"type": "command", "command": node_hook_command(&installed_path, event)}]
         });
         register(event, entry);
     }
@@ -4386,8 +4388,8 @@ fn claude_hook_status() -> Result<(String, bool), String> {
         if let Ok(content) = fs::read_to_string(&settings_path) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(hooks) = json.get("hooks").and_then(serde_json::Value::as_object) {
-                    let command = claude_hook_command(&installed_path, "Stop");
-                    in_settings = claude_hook_entry_present(hooks, "Stop", &command);
+                    let command = node_hook_command(&installed_path, "Stop");
+                    in_settings = hook_entry_present(hooks, "Stop", &command);
                 }
             }
         }
@@ -4395,10 +4397,6 @@ fn claude_hook_status() -> Result<(String, bool), String> {
 
     let installed = install_path.exists() && in_settings;
     Ok((installed_path, installed))
-}
-
-fn agy_hook_command(installed_path: &str, event: &str) -> String {
-    format!("node {installed_path} --event {event}")
 }
 
 #[tauri::command]
@@ -4445,17 +4443,20 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
     let entry = serde_json::json!({
         "PreToolUse": [{
             "matcher": ".*",
-            "hooks": [{"type": "command", "command": agy_hook_command(&installed_path, "PreToolUse")}]
+            "hooks": [{"type": "command", "command": node_hook_command(&installed_path, "PreToolUse")}]
         }],
         "PostToolUse": [{
             "matcher": ".*",
-            "hooks": [{"type": "command", "command": agy_hook_command(&installed_path, "PostToolUse")}]
+            "hooks": [{"type": "command", "command": node_hook_command(&installed_path, "PostToolUse")}]
         }],
         "PreInvocation": [
-            {"type": "command", "command": agy_hook_command(&installed_path, "PreInvocation")}
+            {"type": "command", "command": node_hook_command(&installed_path, "PreInvocation")}
+        ],
+        "PostInvocation": [
+            {"type": "command", "command": node_hook_command(&installed_path, "PostInvocation")}
         ],
         "Stop": [
-            {"type": "command", "command": agy_hook_command(&installed_path, "Stop")}
+            {"type": "command", "command": node_hook_command(&installed_path, "Stop")}
         ]
     });
     // Drop the previous brand's namespace so it can't fire alongside Gyredeck.
@@ -4494,6 +4495,7 @@ fn agy_hook_status() -> Result<(String, bool), String> {
     let installed = install_path.exists() && in_hooks;
     Ok((installed_path, installed))
 }
+
 
 #[tauri::command]
 fn focus_terminal(

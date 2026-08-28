@@ -6,7 +6,12 @@
   --hair: rgba(255, 255, 255, 0.08);
   --fill: rgba(255, 255, 255, 0.06);
   --fill-2: rgba(255, 255, 255, 0.1);
-  --accent: #ff9d3d;
+  --accent: #4ba3c7;
+  /* Channels for the alpha variants; keeps every rgba(accent, x) on one source. */
+  --accent-rgb: 75, 163, 199;
+  --accent-text: #a9d8ea;
+  /* Sits on top of an --accent fill, so it tracks the accent rather than --text. */
+  --accent-on: #05161c;
   --waiting: #ffb23d;
   --done: #4ade80;
   --danger: #ff6b66;

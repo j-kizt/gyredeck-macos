@@ -135,7 +135,7 @@
 
 .session-row-main:focus-visible {
   border-radius: 8px;
-  outline: 1px solid rgba(255, 157, 61, 0.72);
+  outline: 1px solid rgba(var(--accent-rgb), 0.72);
   outline-offset: -1px;
 }
 
@@ -249,8 +249,8 @@
 }
 
 .session-context-summary[data-status="attention"] {
-  border-color: rgba(255, 157, 61, 0.22);
-  background: rgba(255, 157, 61, 0.055);
+  border-color: rgba(var(--accent-rgb), 0.22);
+  background: rgba(var(--accent-rgb), 0.055);
 }
 
 .session-context-summary[data-status="done"] {
@@ -466,7 +466,7 @@
 .action-row[data-kind="editing"] .action-tool,
 .action-row[data-kind="shell"] .action-tool,
 .action-row[data-kind="tool"] .action-tool {
-  color: #ffcf9c;
+  color: var(--accent-text);
   background: transparent;
 }
 
@@ -535,7 +535,7 @@
   padding: 2px 5px;
   border-radius: 999px;
   color: var(--accent);
-  background: rgba(255, 157, 61, 0.16);
+  background: rgba(var(--accent-rgb), 0.16);
   font-size: 8px;
   font-weight: 700;
   letter-spacing: 0.5px;

@@ -9,6 +9,7 @@
     "check": "tsc -p tsconfig.json --noEmit && pnpm --filter @gyredeck/desktop check",
     "hooks:install": "node scripts/install-claude-hooks.mjs",
     "gh:switch": "node scripts/gh-switch.mjs",
+    "icons:render": "node scripts/render-icons.mjs",
     "mod:tail": "tail -f ~/.config/gyredeck/gyredeck.events.ndjson",
     "viewer": "node apps/viewer/index.mjs",
     "desktop:dev": "pnpm --filter @gyredeck/desktop tauri:dev",

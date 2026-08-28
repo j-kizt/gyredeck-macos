@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 1024 1024">
+  <!-- Menu-bar template icon: same mark as the app icon, no plate, single colour
+       so macOS can tint it for light/dark menu bars. Scaled to fill ~98% of the
+       frame — the app icon's margin exists for its rounded plate, and keeping it
+       here would render the icon visibly smaller than neighbouring status items. -->
+  <path d="M 907.1 406.2 A 409 409 0 1 1 617.9 116.9"
+        fill="none" stroke="#FFFFFF" stroke-width="187" stroke-linecap="round"/>
+  <circle cx="512" cy="512" r="173" fill="#FFFFFF"/>
+</svg>

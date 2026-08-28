@@ -69,7 +69,7 @@
 
 .gh-account-check {
   flex: none;
-  color: rgba(255, 157, 61, 0.95);
+  color: rgba(var(--accent-rgb), 0.95);
 }
 
 .gh-account-note {
@@ -387,14 +387,14 @@
 }
 
 .gh-icon-btn[data-active="true"] {
-  background: rgba(255, 157, 61, 0.9);
-  border-color: rgba(255, 157, 61, 0.9);
-  color: #1c1205;
+  background: rgba(var(--accent-rgb), 0.9);
+  border-color: rgba(var(--accent-rgb), 0.9);
+  color: var(--accent-on);
 }
 
 .gh-icon-btn[data-active="true"]:hover {
-  background: rgba(255, 157, 61, 1);
-  color: #1c1205;
+  background: rgba(var(--accent-rgb), 1);
+  color: var(--accent-on);
 }
 
 .gh-add-steps {

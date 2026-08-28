@@ -823,9 +823,9 @@ const App = () => {
                   hookStatus={hookStatus}
                   agyStatus={agyStatus}
                   nativeAction={nativeAction}
-                  onCheckBridge={() => void checkBridge()}
-                  onInstallHook={() => void installHook()}
-                  onInstallAgy={() => void installAgy()}
+                  onCheckBridge={checkBridge}
+                  onInstallHook={installHook}
+                  onInstallAgy={installAgy}
                   onKeepAwakeChange={updateKeepAwakeEnabled}
                   bridgePort={bridgePort}
                   onApplyBridgePort={applyBridgePort}

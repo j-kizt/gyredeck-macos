@@ -593,3 +593,14 @@
   color: #111;
   background: rgba(255, 255, 255, 0.92);
 }
+
+/* Spinner for in-flight Settings actions (update check / download). */
+.setup-spin {
+  animation: setup-spin 0.9s linear infinite;
+}
+
+@keyframes setup-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

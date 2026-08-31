@@ -5532,6 +5532,20 @@ pub fn run() {
                         let _ = hide_target.hide();
                     }
                 });
+
+                // The window is configured as visible: false so the overlay setup above
+                // lands before its first paint; show it now that the setup is done.
+                // Without this, launching the app put a tray icon on the menu bar and
+                // nothing else — there is no Dock icon to bounce, so an explicit launch
+                // looked like it had failed, and the window needed a second click on the
+                // tray. RunEvent::Reopen only covers clicking the app icon while the app
+                // is already running; macOS does not send it for a cold start.
+                //
+                // Every launch is user-initiated today. If launch-at-login is added, gate
+                // this on the launch not coming from the login item, or the window will
+                // appear on every boot.
+                let _ = window.show();
+                let _ = window.set_focus();
             }
 
             setup_tray(app)?;

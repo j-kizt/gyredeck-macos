@@ -5,13 +5,16 @@ name: Warm Rust cache
 # rebuilt the whole dependency tree every time. Only caches written on the default
 # branch are readable from every ref — including tags — so warm it here.
 #
+# This branch MUST stay the repository's default branch. Pointing it anywhere else
+# silently restores the every-release-rebuilds-everything behaviour above.
+#
 # Triggers are deliberately narrow: macOS runners are billed at a premium, and the
 # cache only goes stale when the dependency graph changes. The weekly run exists
 # because GitHub evicts caches that go unread for 7 days.
 
 on:
   push:
-    branches: [dev]
+    branches: [main]
     paths:
       - "apps/desktop/src-tauri/Cargo.lock"
       - "apps/desktop/src-tauri/Cargo.toml"

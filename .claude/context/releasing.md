@@ -15,18 +15,22 @@ When unsure whether a change is "feature" or "fix": if a user would notice the a
 
 ## Release flow
 
-Default branch is `dev`; releases are cut from `main` by tag. Do these steps only when the user asks to release.
+`main` is the only long-lived branch and the default branch; releases are cut from it
+by tag. (A `dev` branch existed until v1.6.1 but never once diverged from `main` —
+every release fast-forwarded one onto the other — so it was removed.) Land work on
+`main`, directly or via a short-lived branch and a PR. Do these steps only when the
+user asks to release.
 
-1. On `dev`, bump `"version"` in all three: `apps/desktop/src-tauri/tauri.conf.json`, `package.json`, `apps/desktop/package.json`.
+1. On `main`, bump `"version"` in all three: `apps/desktop/src-tauri/tauri.conf.json`, `package.json`, `apps/desktop/package.json`.
 2. Rewrite `.github/release-notes.md` — CI reads it **verbatim** as the GitHub Release body. Keep the style: 1-line preamble + `### Changed` / `### Fixes` sections.
-3. Commit on `dev` (conventional-commit message, `Co-Authored-By` trailer), `git push origin dev`.
-4. `git checkout main && git merge --ff-only dev && git push origin main`.
-5. `git tag -a vX.Y.Z -m "Gyredeck vX.Y.Z" && git push origin vX.Y.Z`, then `git checkout dev`.
-6. Tag push triggers `.github/workflows/release.yml` (build → sign → publish). Watch: `gh run watch <id> --exit-status`.
-7. Verify: `gh release view vX.Y.Z` has `.app.tar.gz` + `.sig` + `latest.json`, and `latest.json` version matches and has a signature (the auto-updater manifest).
+3. Commit on `main` (conventional-commit message, `Co-Authored-By` trailer), `git push origin main`.
+4. `git tag -a vX.Y.Z -m "Gyredeck vX.Y.Z" && git push origin vX.Y.Z`.
+5. Tag push triggers `.github/workflows/release.yml` (build → sign → publish). Watch: `gh run watch <id> --exit-status`.
+6. Verify: `gh release view vX.Y.Z` has `.app.tar.gz` + `.sig` + `latest.json`, and `latest.json` version matches and has a signature (the auto-updater manifest).
 
 ## Notes
 
 - CI signs updater artifacts with the `TAURI_SIGNING_PRIVATE_KEY` GitHub Actions secret.
+- Actions caches are scoped per ref and only the default branch's are readable from tags, so `.github/workflows/cache-warm.yml` must keep tracking whatever the default branch is. Repointing it turns a ~4 min release back into ~9 min.
 - Local install for testing: `pnpm desktop:install` (reads the signing key from `~/.config/gyredeck/gyredeck-updater.key`).
 - Never commit/push without explicit user approval.

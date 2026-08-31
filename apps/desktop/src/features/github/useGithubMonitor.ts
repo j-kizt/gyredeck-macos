@@ -154,7 +154,11 @@ export const useGithubMonitor = ({ active, canUseNativeControls }: IUseGithubMon
   const refreshAccounts = useCallback(async () => {
     if (!canUseNativeControls) return;
     try {
-      setAccounts(await fetchAccounts());
+      // invoke's return type is a compile-time assertion only. A command that
+      // resolves to null slips past the catch below and reaches accounts.find(),
+      // which throws during render and takes the whole panel down.
+      const next = await fetchAccounts();
+      setAccounts(Array.isArray(next) ? next : []);
     } catch {
       setAccounts([]);
     }

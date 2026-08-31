@@ -44,14 +44,14 @@ test("grouped completed workspace exposes every child session and guarded clear"
   await expect(page.locator('.session-row[data-status="done"]')).toHaveCount(2);
   await expect(page.locator('li[role="button"]')).toHaveCount(0);
 
-  const expandGroup = page.getByRole("button", { name: "Expand gyredeck, 2 sessions" });
+  const expandGroup = page.getByRole("button", { name: "Expand gyredeck-macos, 2 sessions" });
   await expandGroup.click();
   const completedSection = page.locator(".completed-section");
   await expect(completedSection.locator(".session-child-row")).toHaveCount(2);
-  await expect(completedSection.getByRole("button", { name: "Focus gyredeck session in terminal" })).toHaveCount(2);
-  await expect(completedSection.getByRole("button", { name: "Clear completed gyredeck session" })).toHaveCount(2);
-  await completedSection.getByRole("button", { name: "Clear completed gyredeck session" }).first().click();
-  await expect(completedSection.getByRole("button", { name: "Clear completed gyredeck session" })).toHaveCount(1);
+  await expect(completedSection.getByRole("button", { name: "Focus gyredeck-macos session in terminal" })).toHaveCount(2);
+  await expect(completedSection.getByRole("button", { name: "Clear completed gyredeck-macos session" })).toHaveCount(2);
+  await completedSection.getByRole("button", { name: "Clear completed gyredeck-macos session" }).first().click();
+  await expect(completedSection.getByRole("button", { name: "Clear completed gyredeck-macos session" })).toHaveCount(1);
 
   await page.getByRole("button", { name: "Clear completed", exact: true }).click();
   await expect(page.getByRole("button", { name: "Confirm clear 2" })).toBeVisible();
@@ -62,10 +62,10 @@ test("grouped completed workspace exposes every child session and guarded clear"
 test("completed workspace group can clear all of its done children", async ({ page }) => {
   await page.goto("/?demo=1&demoScenario=multi");
 
-  await page.getByRole("button", { name: "Clear completed gyredeck group" }).click();
+  await page.getByRole("button", { name: "Clear completed gyredeck-macos group" }).click();
 
   const completedSection = page.locator(".completed-section");
-  await expect(completedSection.getByRole("button", { name: "Clear completed gyredeck group" })).toHaveCount(0);
+  await expect(completedSection.getByRole("button", { name: "Clear completed gyredeck-macos group" })).toHaveCount(0);
   await expect(completedSection.getByRole("button", { name: "Clear completed paoplew session" })).toBeVisible();
   await expect(page.locator('.session-section:not(.completed-section) .session-row[data-status="working"]')).toBeVisible();
   await expect.poll(async () => page.evaluate(() => Object.keys(JSON.parse(window.localStorage.getItem("gyredeck.dismissed-sessions") ?? "{}")))).toEqual([

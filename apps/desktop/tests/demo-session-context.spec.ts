@@ -8,13 +8,13 @@ test("overview uses dense trusted metadata and contextual Focus", async ({ page 
   await page.goto("/?demo=1&demoScenario=long-llm");
 
   const row = page.locator('.session-row[data-status="working"]');
-  await expect(row.locator(".session-project")).toHaveText("gyredeck");
+  await expect(row.locator(".session-project")).toHaveText("gyredeck-macos");
   await expect(row.locator(".session-inline-status")).toHaveText("Working");
   await expect(row.locator(".session-activity")).toHaveText("gpt-5.6-sol");
   await expect(row.locator(".session-model")).toHaveText("gpt-5.6-sol");
   await expect(page.getByText("LC", { exact: true })).toHaveCount(0);
 
-  const focus = row.getByRole("button", { name: "Focus gyredeck session in terminal" });
+  const focus = row.getByRole("button", { name: "Focus gyredeck-macos session in terminal" });
   await row.hover();
   await expect(focus).toBeVisible();
 });
@@ -45,15 +45,19 @@ test("attention context reports a question without inventing answer controls", a
 });
 
 test("done and error sessions use distinct truthful context states", async ({ page }) => {
+  const clearSession = page.getByRole("button", { name: "Clear completed gyredeck-macos session" });
+
   await page.goto("/?demo=1&demoScenario=done");
+  // Clearing is offered on the list row; the context view's own actions
+  // (copy / focus / remove history) are the same whatever the status.
+  await expect(clearSession).toBeVisible();
   await page.locator(".session-row-main").click();
   await expect(page.locator('.session-context-view[data-status="done"] #session-context-title')).toHaveText("Turn completed");
-  await expect(page.getByRole("button", { name: "Clear" })).toBeVisible();
 
   await page.goto("/?demo=1&demoScenario=error");
+  await expect(clearSession).toHaveCount(0);
   await page.locator(".session-row-main").click();
   const errorContext = page.locator('.session-context-view[data-status="error"]');
   await expect(errorContext.locator("#session-context-title")).toHaveText("Activity failed");
   await expect(errorContext.locator(".session-context-detail")).toContainText("Provider request failed");
-  await expect(page.getByRole("button", { name: "Clear" })).toHaveCount(0);
 });

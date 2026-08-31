@@ -50,7 +50,9 @@ test("keep awake retries a transient native synchronization failure", async ({ p
 
   await page.getByRole("button", { name: "Settings" }).click();
   await page.getByRole("tab", { name: "Display" }).click();
-  await expect(page.getByText("Active · agent is working")).toBeVisible();
+  await expect(
+    page.locator(".setup-row").filter({ hasText: "Keep awake while working" }),
+  ).toContainText("Active · agent working");
 });
 
 test("setup view stays capability-aware in browser demo", async ({ page }) => {
@@ -81,8 +83,22 @@ test("setup view stays capability-aware in browser demo", async ({ page }) => {
 
   // Display: keep-awake needs the native runtime in the browser demo.
   await page.getByRole("tab", { name: "Display" }).click();
-  await expect(page.getByText("Keep display awake")).toBeVisible();
-  await expect(page.getByText("Off · display follows macOS idle settings")).toBeVisible();
-  await page.getByRole("button", { name: "Enable keep display awake" }).click();
-  await expect(page.locator(".setup-row").filter({ hasText: "Keep display awake" }).getByText("Desktop runtime required")).toBeVisible();
+  const keepAwakeRow = page.locator(".setup-row").filter({ hasText: "Keep awake while working" });
+  await expect(keepAwakeRow.getByText("Off · display follows macOS idle settings")).toBeVisible();
+  // The control is a switch, and with no native runtime behind it the demo
+  // disables it outright rather than letting it flip and quietly do nothing.
+  await expect(keepAwakeRow.getByRole("switch", { name: "Enable keep display awake" })).toBeDisabled();
+});
+
+test("keep awake already enabled reports the missing runtime in browser demo", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("gyredeck.keep-awake-while-working", "true");
+  });
+  await page.goto("/?demo=1");
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("tab", { name: "Display" }).click();
+
+  const keepAwakeRow = page.locator(".setup-row").filter({ hasText: "Keep awake while working" });
+  await expect(keepAwakeRow.getByText("Desktop runtime required")).toBeVisible();
+  await expect(keepAwakeRow.getByRole("switch", { name: "Disable keep display awake" })).toBeDisabled();
 });

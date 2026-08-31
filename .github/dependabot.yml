@@ -1,0 +1,34 @@
+# Dependabot was enabled from the repository UI with no config file, so security
+# updates ran against every ecosystem in the lockfiles. That surfaced a glib advisory
+# that cannot be acted on and cannot affect this app, and every scan reported it as a
+# failed run.
+#
+# open-pull-requests-limit: 0 keeps version-update PRs off — the state before this file
+# existed. Security update PRs are explicitly not affected by that limit, so genuine
+# advisories still open one; only the ignore below is silenced.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /apps/desktop/src-tauri
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 0
+    ignore:
+      # glib reaches the lockfile five levels down, through Tauri's Linux GTK stack:
+      #
+      #   glib → atk → gtk → libappindicator → tray-icon → tauri
+      #
+      # The advisory needs >= 0.20.0; this tree resolves no higher than 0.18.5, so
+      # Dependabot reports security_update_not_possible and fails the run. Nothing here
+      # can move it — Tauri has to bump tray-icon/libappindicator first.
+      #
+      # It also does not ship. `cargo tree -i glib --target aarch64-apple-darwin` prints
+      # nothing: GTK is Linux-only and this app bundles macOS alone (bundle.targets is
+      # ["app"], CI runs on macos-latest), so the vulnerable code is never compiled into
+      # the binary users install. Cargo.lock lists it because a lockfile records every
+      # platform.
+      #
+      # Drop this entry once Tauri's dependency chain allows glib 0.20 — re-check with
+      # `cargo tree -i glib --target all`.
+      - dependency-name: glib

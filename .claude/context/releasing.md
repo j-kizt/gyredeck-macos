@@ -17,16 +17,17 @@ When unsure whether a change is "feature" or "fix": if a user would notice the a
 
 `main` is the only long-lived branch and the default branch; releases are cut from it
 by tag. (A `dev` branch existed until v1.6.1 but never once diverged from `main` —
-every release fast-forwarded one onto the other — so it was removed.) Land work on
-`main`, directly or via a short-lived branch and a PR. Do these steps only when the
-user asks to release.
+every release fast-forwarded one onto the other — so it was removed.) Nothing lands on
+`main` directly, releases included: branch, PR, merge, then tag the merged commit. Do
+these steps only when the user asks to release.
 
-1. On `main`, bump `"version"` in all three: `apps/desktop/src-tauri/tauri.conf.json`, `package.json`, `apps/desktop/package.json`.
+1. Branch off `main` (e.g. `release/vX.Y.Z`) and bump `"version"` in all three: `apps/desktop/src-tauri/tauri.conf.json`, `package.json`, `apps/desktop/package.json`.
 2. Rewrite `.github/release-notes.md` — CI reads it **verbatim** as the GitHub Release body. Keep the style: 1-line preamble + `### Changed` / `### Fixes` sections.
-3. Commit on `main` (conventional-commit message, `Co-Authored-By` trailer), `git push origin main`.
-4. `git tag -a vX.Y.Z -m "Gyredeck vX.Y.Z" && git push origin vX.Y.Z`.
-5. Tag push triggers `.github/workflows/release.yml` (build → sign → publish). Watch: `gh run watch <id> --exit-status`.
-6. Verify: `gh release view vX.Y.Z` has `.app.tar.gz` + `.sig` + `latest.json`, and `latest.json` version matches and has a signature (the auto-updater manifest).
+3. Commit (conventional-commit message, `Co-Authored-By` trailer), push the branch, and open a PR into `main` with `gh pr create`.
+4. Merge the PR, then `git checkout main && git pull`.
+5. Tag the merge commit: `git tag -a vX.Y.Z -m "Gyredeck vX.Y.Z" && git push origin vX.Y.Z`. The tag must point at a commit already on `main` — tagging the branch before it merges publishes a build that `main` does not contain.
+6. Tag push triggers `.github/workflows/release.yml` (build → sign → publish). Watch: `gh run watch <id> --exit-status`.
+7. Verify: `gh release view vX.Y.Z` has `.app.tar.gz` + `.sig` + `latest.json`, and `latest.json` version matches and has a signature (the auto-updater manifest).
 
 ## Notes
 

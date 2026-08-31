@@ -7,6 +7,7 @@
 - Preserve local/generated state. `.agent-state/`, `.letta/`, `.cocoindex_code/`, `node_modules/`, build output, and test reports are ignored local state.
 - After changing an adapter under `adapters/`, reinstall the corresponding hook (Settings → Plugins, or `pnpm hooks:install`) before judging live behavior. After native desktop changes, run an appropriate desktop check/build/install path.
 - Do not commit or push unless explicitly asked.
+- `main` is the only long-lived branch. Never commit to it directly — land every change on a short-lived branch and open a PR into `main` (`gh pr create`). This applies to releases too; see `.claude/context/releasing.md`.
 
 ## Codebase Search
 

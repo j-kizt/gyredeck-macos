@@ -31,3 +31,5 @@
 - Desktop web build: `pnpm desktop:web:build`
 - Native desktop build/install: `pnpm desktop:build` or `pnpm desktop:install`
 - Rust-only native check: run `cargo check` from `apps/desktop/src-tauri/`
+- `.github/workflows/ci.yml` runs `pnpm check`, `cargo check`, `pnpm test:hooks` (job `check`) and `pnpm test:demo` (job `test`) on every PR. Both are required checks on `main`, so a red PR cannot merge.
+- Do not leave `pnpm desktop:dev` running while `pnpm test:demo` runs locally: Playwright reuses that vite server and its workers then hang at teardown, exiting non-zero even when every test passed.

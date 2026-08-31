@@ -1,5 +1,6 @@
 import { ChevronDown, ChevronRight, Focus, Trash2, X } from "lucide-react";
-import { formatRelativeAge, formatTime, shortModelName } from "./activity";
+import { compactNumber, formatRelativeAge, formatTime, shortModelName } from "./activity";
+import { buildContextMeter, type IContextUsageSnapshot } from "./contextWindow";
 import type { ISessionDetail, ISessionSummary, IWorkspaceSessionGroup } from "./types";
 import { Tooltip } from "../../Tooltip";
 
@@ -29,6 +30,55 @@ export const SessionContextSummary = ({ session }: { session: ISessionDetail }) 
       <StatusGlyph status={session.status} />
       <span className="session-context-copy"><span className="session-context-eyebrow">{copy.eyebrow}</span><span className="session-context-title" id="session-context-title">{copy.title}</span><span className="session-context-detail">{copy.detail}</span></span>
       <span className="session-context-meta"><span className="session-provider">{session.provider}</span>{session.model ? <Tooltip label={session.model}><span className="session-model">{shortModelName(session.model)}</span></Tooltip> : null}<span className="session-age" title={formatTime(session.lastActivityAt)}>{formatRelativeAge(session.lastActivityAt)}</span></span>
+    </section>
+  );
+};
+
+/**
+ * Context size as of the last completed turn. Labelled "last turn" because that is
+ * literally when the number is measured — usage only reaches Gyredeck when Claude
+ * Code's Stop hook fires, so this holds steady mid-turn rather than tracking live.
+ * Renders nothing at all unless a turn reported usage; drops the bar (keeping the
+ * count) when the model's context window is unknown.
+ */
+export const SessionContextMeter = ({
+  session,
+  usage,
+}: { session: ISessionDetail; usage: IContextUsageSnapshot | null | undefined }) => {
+  const meter = buildContextMeter(usage, session.model);
+  if (!meter) return null;
+  const percent = meter.ratio === null ? null : Math.round(meter.ratio * 100);
+  const breakdown = [
+    meter.cacheReadTokens > 0 ? `${compactNumber(meter.cacheReadTokens)} cached` : null,
+    meter.cacheCreationTokens > 0 ? `${compactNumber(meter.cacheCreationTokens)} new` : null,
+    meter.inputTokens > 0 ? `${compactNumber(meter.inputTokens)} fresh` : null,
+  ].filter(Boolean).join(" · ");
+  return (
+    <section className="session-context-meter" aria-label="Context usage">
+      <div className="context-meter-head">
+        <span className="context-meter-label">Context</span>
+        <span className="context-meter-value">
+          {compactNumber(meter.used)}
+          {meter.window ? <span className="context-meter-window"> / {compactNumber(meter.window)}</span> : null}
+          {percent === null ? null : <span className="context-meter-percent" data-high={percent >= 80}>{percent}%</span>}
+        </span>
+      </div>
+      {meter.ratio === null ? null : (
+        <div
+          className="context-meter-track"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={percent ?? 0}
+          aria-valuetext={`${percent}% of context used`}
+        >
+          <span className="context-meter-fill" data-high={(percent ?? 0) >= 80} style={{ width: `${meter.ratio * 100}%` }} />
+        </div>
+      )}
+      <div className="context-meter-foot">
+        {breakdown ? <span>{breakdown}</span> : null}
+        <span className="context-meter-note">last turn</span>
+      </div>
     </section>
   );
 };

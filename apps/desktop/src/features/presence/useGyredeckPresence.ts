@@ -18,6 +18,7 @@ import {
   readSessionEventRegistry,
   writeSessionEventRegistry,
 } from "../session/persistence";
+import { collectContextUsage, type ContextUsageRegistry } from "../session/contextWindow";
 import type { SessionEventRegistry } from "../session/types";
 
 export const DEFAULT_BRIDGE_PORT = 47621;
@@ -44,6 +45,7 @@ export interface IGyredeckPresenceResult {
   refreshCapabilities: () => Promise<boolean>;
   sessionEventRegistry: SessionEventRegistry;
   setSessionEventRegistry: React.Dispatch<React.SetStateAction<SessionEventRegistry>>;
+  contextUsage: ContextUsageRegistry;
   view: ReturnType<typeof getPresenceView>;
 }
 
@@ -195,6 +197,49 @@ const createScenario = (scenario: string): GyredeckEvent[] => {
         timestamp: at(1),
         type: "turn_complete",
         data: { hookEventName: "Stop", source: "hook", message: null },
+      },
+    ];
+  }
+
+  // Only Claude Code reports token usage, and the context window is resolved from the
+  // model name, so this scenario overrides the shared envelope's gpt-5.6-sol/agyHost —
+  // every other scenario runs Antigravity and correctly shows no meter.
+  if (scenario === "context") {
+    const claudeCommon = {
+      ...common,
+      model: "claude-opus-5",
+      runtime: { ...common.runtime, sourceKind: "claudeCodeHook" as const },
+    };
+    return [
+      {
+        ...claudeCommon,
+        id: `${claudeCommon.id}-open`,
+        type: "conversation_open",
+        data: { reason: "startup", previousConversationId: null },
+      },
+      {
+        ...claudeCommon,
+        id: `${claudeCommon.id}-llm`,
+        timestamp: at(1),
+        type: "llm_start",
+        data: { model: "claude-opus-5", messageCount: 42, contextWindow: null },
+      },
+      {
+        ...claudeCommon,
+        id: `${claudeCommon.id}-done`,
+        timestamp: at(2),
+        type: "turn_complete",
+        data: {
+          hookEventName: "Stop",
+          source: "hook",
+          message: null,
+          usage: {
+            inputTokens: 2,
+            outputTokens: 341,
+            cacheReadTokens: 301_854,
+            cacheCreationTokens: 763,
+          },
+        },
       },
     ];
   }
@@ -504,6 +549,11 @@ export const useGyredeckPresence = ({
   const [lastLiveEvent, setLastLiveEvent] = useState<GyredeckEvent | null>(null);
   const [sessionEventRegistry, setSessionEventRegistry] =
     useState<SessionEventRegistry>(readSessionEventRegistry);
+  // Sticky per-conversation context usage. Derived from events but never evicted with
+  // them: the event registry caps each session, which used to drop the turn_complete
+  // holding the usage mid-turn and made the meter blink out.
+  const [contextUsage, setContextUsage] = useState<ContextUsageRegistry>(() =>
+    collectContextUsage({}, Object.values(readSessionEventRegistry()).flat()));
   const [capabilities, setCapabilities] = useState(() => createDefaultBridgeCapabilities());
   const [connection, setConnection] = useState<IConnectionState>({
     status: "connecting",
@@ -553,6 +603,7 @@ export const useGyredeckPresence = ({
         scheduleRegistryWrite(next);
         return next;
       });
+      setContextUsage((current) => collectContextUsage(current, events));
     };
 
     if (demoMode) {
@@ -569,6 +620,7 @@ export const useGyredeckPresence = ({
         const next = mergeSessionEvents({}, events);
         writeSessionEventRegistry(next);
         setSessionEventRegistry(next);
+        setContextUsage(collectContextUsage({}, events));
         return;
       }
 
@@ -702,6 +754,7 @@ export const useGyredeckPresence = ({
     refreshCapabilities,
     sessionEventRegistry,
     setSessionEventRegistry,
+    contextUsage,
     view,
   };
 };

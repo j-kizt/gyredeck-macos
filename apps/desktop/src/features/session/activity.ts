@@ -107,7 +107,7 @@ const TOOL_DETAILS: Record<string, string> = {
 const toolLabel = (kind: ActivityKind) => TOOL_LABELS[kind] ?? "tool";
 const toolDetail = (name: string) => TOOL_DETAILS[name] ?? name;
 
-const compactNumber = (value: number | null | undefined) =>
+export const compactNumber = (value: number | null | undefined) =>
   typeof value === "number" && Number.isFinite(value)
     ? new Intl.NumberFormat(undefined, {
         notation: "compact",

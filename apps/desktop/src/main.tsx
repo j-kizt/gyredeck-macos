@@ -3,7 +3,7 @@ import { BarChart3, Check, ChevronLeft, Copy, Focus, GitBranch, List, Server, Se
 import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState, type ErrorInfo, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import type { GyredeckPresenceStatus } from "@gyredeck/protocol";
-import { SessionContextSummary, StatusGlyph, WorkspaceSessionGroupItem } from "./features/session/components";
+import { SessionContextMeter, SessionContextSummary, StatusGlyph, WorkspaceSessionGroupItem } from "./features/session/components";
 import {
   formatTime,
   getEventActivity,
@@ -104,7 +104,7 @@ const getGroupRemovalId = (groupKey: string, group: IWorkspaceSessionGroup) => [
 
 const App = () => {
   const [bridgePort, setBridgePort] = useState(DEFAULT_BRIDGE_PORT);
-  const { capabilities, connection, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO, bridgePort });
+  const { capabilities, connection, contextUsage, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO, bridgePort });
   const [usageSettings, setUsageSettings] = useState<IUsageSettings>(readUsageSettings);
   const { refresh: refreshAgentUsage, usages: agentUsages } = useAgentUsageList(usageSettings, DEMO_MODE);
   const [acknowledgedConversationId, setAcknowledgedConversationId] = useState<string | null>(null);
@@ -841,6 +841,7 @@ const App = () => {
               ) : selectedSession ? (
                 <div className="detail-body session-context-view" data-status={selectedSession.status}>
                   <SessionContextSummary session={selectedSession} />
+                  <SessionContextMeter session={selectedSession} usage={contextUsage[selectedSession.conversationId]} />
                   <div className="detail-path" title={selectedSession.cwd}>{shortenPath(selectedSession.cwd)}</div>
                   {canUseNativeControls ? (
                     <div className="capability-note">Focus matches iTerm terminal cwd/title and selects its session</div>

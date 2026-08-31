@@ -389,6 +389,87 @@
   color: var(--danger);
 }
 
+.session-context-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 11px;
+  border: 1px solid var(--hair);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.context-meter-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.context-meter-label {
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.context-meter-value {
+  color: var(--text);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.context-meter-window {
+  color: var(--text-3);
+}
+
+.context-meter-percent {
+  margin-left: 7px;
+  color: var(--accent-text);
+  font-weight: 700;
+}
+
+.context-meter-percent[data-high="true"] {
+  color: var(--waiting);
+}
+
+.context-meter-track {
+  overflow: hidden;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--fill-2);
+}
+
+.context-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 240ms ease;
+}
+
+.context-meter-fill[data-high="true"] {
+  background: var(--waiting);
+}
+
+.context-meter-foot {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-3);
+  font-size: 10px;
+}
+
+.context-meter-note {
+  flex: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .context-meter-fill {
+    transition: none;
+  }
+}
+
 .detail-path {
   overflow: hidden;
   color: var(--text-3);

@@ -760,6 +760,12 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     assert.match(appHeader.ephemeralMessage, /from the user, via Gyredeck/);
     assert.doesNotMatch(appHeader.ephemeralMessage, /carries no authority/);
 
+    // A session is never handed its own reply back: replies land in the room they
+    // answer, so without this it would read its last answer as fresh mail and reply to
+    // itself forever.
+    await send(conversationId, "my own earlier reply");
+    assert.deepEqual(await preInvocation(10), []);
+
     // A message with no reply address gets no command to run.
     await send("codex", "no reply address");
     const withoutReply = await preInvocation(8);
@@ -981,6 +987,17 @@ test("claude UserPromptSubmit delivers mail as additional context exactly once",
     const fromUser = JSON.parse(await prompt()).hookSpecificOutput.additionalContext;
     assert.match(fromUser, /from the user, via Gyredeck/);
     assert.doesNotMatch(fromUser, /carries no authority/);
+
+    // A reply is attributed to the session that wrote it, so the room stays readable
+    // as one thread and a reply can be told apart from a message to the session.
+    assert.match(context, new RegExp(`"from":"${conversationId}"`));
+
+    // And a session is never handed its own reply back. Replies land in the room they
+    // answer, so without this it would read its last answer as fresh mail and reply to
+    // itself on every prompt. Reported by a Claude Code session that noticed its own
+    // echo arriving.
+    await send(conversationId, "my own earlier reply");
+    assert.equal(await prompt(), "");
 
     // With the bridge gone the hook must still answer, and answer quickly: this runs
     // before the prompt does, so a stalled hook is a stalled session.

@@ -603,12 +603,18 @@ const App = () => {
     deleteSessions([conversationId]);
   };
 
-  // Claude Code and Antigravity both report a conversationId that IS their resumable
-  // session id, so copy a ready-to-run command. Codex cannot: its id is synthesised by
-  // the adapter as `codex:<cwd>`, which no CLI accepts, so it falls back to the raw id.
+  // Each agent reports a conversationId that is its own resumable session id, so the
+  // copy button hands over a ready-to-run command.
+  //
+  // Codex is conditional. Its hook adapter reports the real session_id, but the older
+  // notify integration synthesised `codex:<cwd>` — not a session id at all — and both
+  // surface under the same provider label. The id itself is what distinguishes them.
   const resumeCommand = (provider: string, conversationId: string): string | null => {
     if (provider === "Claude Code") return `claude --resume ${conversationId}`;
     if (provider === "Antigravity") return `agy --conversation=${conversationId}`;
+    if (provider === "Codex") {
+      return conversationId.startsWith("codex:") ? null : `codex resume ${conversationId}`;
+    }
     return null;
   };
 

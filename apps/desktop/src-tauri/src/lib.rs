@@ -454,11 +454,14 @@ fn codex_hooks_json_path() -> Result<PathBuf, String> {
 
 /// Codex's matcher is a regex over the tool name.
 const CODEX_HOOK_MATCHED_EVENTS: [&str; 3] = ["PreToolUse", "PostToolUse", "PermissionRequest"];
-const CODEX_HOOK_PLAIN_EVENTS: [&str; 6] = [
+const CODEX_HOOK_PLAIN_EVENTS: [&str; 7] = [
     "SessionStart",
     "SessionEnd",
     "UserPromptSubmit",
     "Stop",
+    // Not in the published hook list; found on Codex's own /hooks screen. Without it a
+    // turn the user aborts leaves the session showing as working until it goes stale.
+    "Interrupt",
     "PreCompact",
     "PostCompact",
 ];
@@ -475,8 +478,22 @@ const CLAUDE_HOOK_PLAIN_EVENTS: [&str; 7] = [
 ];
 
 
+/// The command an agent runs for a hook.
+///
+/// Node is resolved to an absolute path at install time rather than left as bare
+/// `node`. Agents are not always launched from a shell: from the Dock or Spotlight the
+/// process inherits launchd's PATH, which is /usr/bin:/bin:/usr/sbin:/sbin and holds no
+/// node on a machine that installed it through nvm or Homebrew. The hook would then
+/// fail to spawn, and because hooks report failures nowhere visible, presence would
+/// simply stop with no error anywhere.
+///
+/// Falls back to bare `node` only when the binary cannot be found at all, which at
+/// least works for agents started from a shell that has it.
 fn node_hook_command(installed_path: &str, event: &str) -> String {
-    format!("node {installed_path} --event {event}")
+    let node = standalone_bridge::find_node_binary()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "node".to_string());
+    format!("{node} {installed_path} --event {event}")
 }
 
 fn hook_entry_present(
@@ -3924,22 +3941,31 @@ fn install_codex_hook(app: tauri::AppHandle) -> Result<String, String> {
         }
     };
 
+    // async so Codex never waits on this. It only reports — it returns no decision on
+    // PreToolUse or PermissionRequest — so blocking the agent on a localhost POST would
+    // buy nothing and cost latency on every event.
+    //
+    // SessionEnd is the exception: Codex runs it synchronously whatever the config says,
+    // and clamps its timeout to 3s. Declaring async there only earns two warnings on the
+    // /hooks screen, so it is declared the way Codex will actually run it.
+    let handler = |event: &str| {
+        let ends_session = event == "SessionEnd";
+        serde_json::json!({
+            "type": "command",
+            "command": node_hook_command(&installed_path, event),
+            "async": !ends_session,
+            "timeout": if ends_session { 3 } else { 5 }
+        })
+    };
+
     for event in CODEX_HOOK_MATCHED_EVENTS {
         register(
             event,
-            serde_json::json!({
-                "matcher": ".*",
-                "hooks": [{"type": "command", "command": node_hook_command(&installed_path, event)}]
-            }),
+            serde_json::json!({ "matcher": ".*", "hooks": [handler(event)] }),
         );
     }
     for event in CODEX_HOOK_PLAIN_EVENTS {
-        register(
-            event,
-            serde_json::json!({
-                "hooks": [{"type": "command", "command": node_hook_command(&installed_path, event)}]
-            }),
-        );
+        register(event, serde_json::json!({ "hooks": [handler(event)] }));
     }
 
     let Some(hooks_parent) = hooks_json_path.parent() else {

@@ -225,6 +225,9 @@ const main = async () => {
         break;
       case "Stop":
       case "SubagentStop":
+      // An interrupted turn is still a turn that ended: without this the session sits
+      // on "working" until it goes stale, which reads as an agent still thinking.
+      case "Interrupt":
         posts.push(post(endpoint, token, "/hook/stop", {
           hookId: randomUUID(),
           hookEventName: eventType,
@@ -232,7 +235,7 @@ const main = async () => {
           workingDirectory: cwd,
           conversationId,
           toolName: null,
-          message: null,
+          message: eventType === "Interrupt" ? "turn interrupted" : null,
           usage: null,
         }));
         break;

@@ -731,17 +731,24 @@ function startBridge(config) {
       // GET /mail/<room>?since=<seq> — read what was missed. `since` is the highest
       // seq the caller has already handled, so a hook that runs once per turn can
       // pick up everything sent while its agent was idle.
+      //
+      // `collect=1` says the caller is the session's actual reader and is taking
+      // delivery. Everything else is a look: the desktop panel polls this to draw the
+      // thread, and if looking counted as collecting then opening a session would mark
+      // its mail delivered while the agent had never seen it.
       if (req.method === "GET" && tail === undefined) {
         const room = mailRoomFor(name, false);
         const parsed = Number.parseInt(url.searchParams.get("since") ?? "", 10);
         const since = Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
         const messages = room ? room.messages.filter((message) => message.seq > since) : [];
         if (room) {
-          // Advance on what was actually handed over, and never backwards: a caller
-          // re-reading from an old `since` is inspecting the room, not un-reading it.
-          room.readSeq = Math.max(room.readSeq, messages.at(-1)?.seq ?? since);
-          room.lastReadAt = new Date().toISOString();
           room.touchedAt = Date.now();
+          if (url.searchParams.get("collect") === "1") {
+            // Never backwards: a collector re-reading from an old `since` has not
+            // un-taken what it already had.
+            room.readSeq = Math.max(room.readSeq, messages.at(-1)?.seq ?? since);
+            room.lastReadAt = new Date().toISOString();
+          }
         }
         sendJson(200, { ok: true, room: name, seq: room?.seq ?? 0, messages });
         return;

@@ -249,7 +249,9 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
   if (!token || !MAIL_ROOM_NAME.test(room)) return [];
 
   const since = await readMailCursor(room);
-  let result = await getJson(endpoint, token, `/mail/${room}?since=${since}`);
+  // collect=1: this is the session's own reader taking delivery, not something
+  // looking at the room. Without it the room could not tell the two apart.
+  let result = await getJson(endpoint, token, `/mail/${room}?since=${since}&collect=1`);
 
   // Rooms live in the bridge's memory and this cursor lives on disk, so a bridge
   // restart takes a room's seq back to zero while the cursor keeps counting. Asking
@@ -257,7 +259,7 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
   // one of them, silently, with the hook reporting success. A room behind the cursor
   // can only be a new room, so read it from the start.
   if (since > 0 && Number.isInteger(result?.seq) && result.seq < since) {
-    result = await getJson(endpoint, token, `/mail/${room}?since=0`);
+    result = await getJson(endpoint, token, `/mail/${room}?since=0&collect=1`);
   }
 
   const messages = Array.isArray(result?.messages) ? result.messages : [];

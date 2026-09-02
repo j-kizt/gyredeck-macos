@@ -228,6 +228,78 @@ test("antigravity adapter allows PreToolUse and relays a tool_start", async () =
   }
 });
 
+test("antigravity adapter raises attention when the model asks the user a question", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-agy-ask-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  try {
+    await waitForHealth(port, stderrRef);
+    // Shape taken from a real ask_question call captured off the Antigravity hook.
+    const asked = await runAdapter(
+      "adapters/antigravity/gyredeck-agy-hook.mjs",
+      ["--event", "PreToolUse"],
+      home,
+      {
+        conversationId: "agy-ask-1",
+        workspacePaths: ["/tmp/agy-project"],
+        toolCall: {
+          name: "ask_question",
+          args: {
+            questions: [{ question: "Which layout do you want?", options: ["A", "B"], is_multi_select: false }],
+            toolAction: "Asking user for next steps",
+            toolSummary: "Ask layout preference",
+          },
+        },
+      },
+    );
+    assert.equal(asked.code, 0, asked.stderr);
+    // Still has to answer the gating shape, or Antigravity reads it as a deny.
+    assert.deepEqual(JSON.parse(asked.stdout), { decision: "allow", reason: "", permissionOverrides: [] });
+
+    // A tool that does not involve the user must not raise attention.
+    const quiet = await runAdapter(
+      "adapters/antigravity/gyredeck-agy-hook.mjs",
+      ["--event", "PreToolUse"],
+      home,
+      {
+        conversationId: "agy-quiet-1",
+        workspacePaths: ["/tmp/agy-project"],
+        toolCall: { name: "view_file", args: { path: "README.md" } },
+      },
+    );
+    assert.equal(quiet.code, 0, quiet.stderr);
+
+    const snapshot = await (await fetch(`http://127.0.0.1:${port}/snapshot`)).json();
+    const attention = snapshot.recent.filter((event) => event.type === "attention_requested");
+    assert.equal(attention.length, 1, "only the ask_question call raises attention");
+    assert.equal(attention[0].conversationId, "agy-ask-1");
+    // Notification is what makes the bridge file this as a question rather than a
+    // permission prompt, and the question text is what the panel shows.
+    assert.equal(attention[0].data.kind, "question");
+    assert.equal(attention[0].data.toolName, "ask_question");
+    assert.equal(attention[0].data.message, "Which layout do you want?");
+    assert.equal(attention[0].runtime?.sourceKind, "agyHost");
+
+    // The tool_start still goes out for both, attention is additional.
+    const starts = snapshot.recent.filter((event) => event.type === "tool_start");
+    assert.deepEqual(starts.map((event) => event.data.toolName).sort(), ["ask_question", "view_file"]);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("antigravity adapter answers each event with its documented response shape", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-agy-shapes-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });

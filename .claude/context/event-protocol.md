@@ -117,7 +117,7 @@ A room reports `seq` (newest message), `readSeq` (how far it has handed out), an
 
 It only ever moves forward: re-reading from an older `since` is an inspection, not an un-read, and a resuming subscriber's replay does not rewind it. It is a hint for the UI, not a delivery guarantee: with more than one reader on a room they share the number, and a manual read from a shell counts as a delivery.
 
-The desktop app reads this through the native `mail_rooms` command rather than fetching it in the webview, so the ingest token stays on the native side. Polled every few seconds while the session list is on screen — mail is not part of the event protocol, and letting a message decide a session's presence status would be worse than a few seconds of lag.
+The desktop app reads this through native commands — `mail_rooms` for the chip, `mail_thread` for one session's messages, `mail_send` to add to them — rather than fetching in the webview, so the ingest token stays on the native side. A message the person sends is recorded as `from: "gyredeck"` rather than as a session, because a reader deciding how much weight to give a message should be able to tell the user from a peer. Polled every few seconds while the session list is on screen — mail is not part of the event protocol, and letting a message decide a session's presence status would be worse than a few seconds of lag.
 
 ### Delivery, per agent
 

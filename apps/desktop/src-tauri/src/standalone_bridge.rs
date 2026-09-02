@@ -13,6 +13,8 @@ const BRIDGE_HOST: &str = "127.0.0.1";
 pub(crate) const BRIDGE_PORT: u16 = 47_621;
 const BRIDGE_MIN_PORT: u16 = 1024;
 const BRIDGE_PROBE_TIMEOUT: Duration = Duration::from_millis(350);
+// Mail calls carry a body and a reply, so they get more room than a health probe.
+const MAIL_REQUEST_TIMEOUT: Duration = Duration::from_millis(1500);
 const BRIDGE_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
 const OWNED_BRIDGE_FAILURE_LIMIT: u8 = 3;
 
@@ -333,43 +335,83 @@ fn read_ingest_token() -> Option<String> {
     (token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit())).then_some(token)
 }
 
-/// Ask the bridge which mail rooms exist and how much is waiting in each.
+/// One message in a mail room.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct MailMessage {
+    pub seq: u32,
+    pub from: String,
+    pub text: String,
+    #[serde(rename = "replyTo")]
+    pub reply_to: Option<String>,
+    pub ts: Option<String>,
+}
+
+/// Outcome of handing a message to the session a room belongs to.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct MailSendResult {
+    pub seq: u32,
+    /// "queued", "on_next_turn", "unknown_recipient" or "unavailable" — what the
+    /// bridge managed to do, so the UI can say that rather than imply "sent".
+    pub delivery: String,
+}
+
+/// One request to the bridge's mail endpoints.
 ///
-/// Uses the same raw request as the health probe rather than an HTTP client: this is
-/// one loopback GET, and the bridge answers with Content-Length rather than chunked.
-pub(crate) fn mail_rooms() -> Result<Vec<MailRoom>, String> {
+/// Raw HTTP rather than a client crate: this is a single loopback call and the bridge
+/// answers with Content-Length rather than chunked. The token is attached here and
+/// never handed to the webview, which has no other use for it.
+fn mail_request(method: &str, path: &str, body: Option<String>) -> Result<serde_json::Value, String> {
     let Some(token) = read_ingest_token() else {
         return Err("Ingest token is not available yet".to_string());
     };
     let port = configured_bridge_port();
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
-    let mut stream = TcpStream::connect_timeout(&address, BRIDGE_PROBE_TIMEOUT)
+    let mut stream = TcpStream::connect_timeout(&address, MAIL_REQUEST_TIMEOUT)
         .map_err(|error| format!("Bridge is not reachable: {error}"))?;
-    let _ = stream.set_read_timeout(Some(BRIDGE_PROBE_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(BRIDGE_PROBE_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(MAIL_REQUEST_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(MAIL_REQUEST_TIMEOUT));
 
-    let request = format!(
-        "GET /mail HTTP/1.1\r\nHost: {BRIDGE_HOST}:{port}\r\nAccept: application/json\r\nX-Gyredeck-Token: {token}\r\nConnection: close\r\n\r\n"
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {BRIDGE_HOST}:{port}\r\nAccept: application/json\r\nX-Gyredeck-Token: {token}\r\nConnection: close\r\n"
     );
+    match &body {
+        Some(payload) => request.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        )),
+        None => request.push_str("\r\n"),
+    }
     stream
         .write_all(request.as_bytes())
-        .map_err(|error| format!("Failed to ask the bridge for mail rooms: {error}"))?;
+        .map_err(|error| format!("Failed to reach the bridge: {error}"))?;
 
     let mut response = String::new();
-    let _ = stream.take(256 * 1024).read_to_string(&mut response);
+    let _ = stream.take(512 * 1024).read_to_string(&mut response);
 
-    let Some((head, body)) = response.split_once("\r\n\r\n") else {
+    let Some((head, payload)) = response.split_once("\r\n\r\n") else {
         return Err("Bridge returned no response body".to_string());
     };
-    if !head.starts_with("HTTP/1.1 200") {
+    if !(head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.1 202")) {
         // A bridge predating mail rooms answers 404 here; an unauthorized read is 401.
         let status = head.lines().next().unwrap_or("unknown status");
-        return Err(format!("Bridge declined the mail room read: {status}"));
+        return Err(format!("Bridge declined the mail request: {status}"));
     }
+    serde_json::from_str(payload).map_err(|error| format!("Bridge sent malformed JSON: {error}"))
+}
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(body).map_err(|error| format!("Bridge sent malformed JSON: {error}"))?;
+/// Room names must survive being put in a URL, and they come from session ids.
+fn valid_room(room: &str) -> bool {
+    !room.is_empty()
+        && room.len() <= 64
+        && room
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Ask the bridge which mail rooms exist and how much is waiting in each.
+pub(crate) fn mail_rooms() -> Result<Vec<MailRoom>, String> {
+    let parsed = mail_request("GET", "/mail", None)?;
     let Some(rooms) = parsed.get("rooms").and_then(|value| value.as_array()) else {
         return Ok(Vec::new());
     };
@@ -394,6 +436,53 @@ pub(crate) fn mail_rooms() -> Result<Vec<MailRoom>, String> {
             })
         })
         .collect())
+}
+
+/// Every message in one room, oldest first.
+pub(crate) fn mail_thread(room: &str) -> Result<Vec<MailMessage>, String> {
+    if !valid_room(room) {
+        return Err("Not a valid room name".to_string());
+    }
+    let parsed = mail_request("GET", &format!("/mail/{room}"), None)?;
+    let Some(messages) = parsed.get("messages").and_then(|value| value.as_array()) else {
+        return Ok(Vec::new());
+    };
+
+    Ok(messages
+        .iter()
+        .filter_map(|message| {
+            Some(MailMessage {
+                seq: message.get("seq")?.as_u64()? as u32,
+                from: message.get("from")?.as_str()?.to_string(),
+                text: message.get("text")?.as_str()?.to_string(),
+                reply_to: message
+                    .get("replyTo")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
+                ts: message.get("ts").and_then(|v| v.as_str()).map(|v| v.to_string()),
+            })
+        })
+        .collect())
+}
+
+/// Send a message to the session a room belongs to.
+pub(crate) fn mail_send(room: &str, from: &str, text: &str) -> Result<MailSendResult, String> {
+    if !valid_room(room) {
+        return Err("Not a valid room name".to_string());
+    }
+    if text.trim().is_empty() {
+        return Err("Message is empty".to_string());
+    }
+    let body = serde_json::json!({ "from": from, "text": text, "replyTo": room }).to_string();
+    let parsed = mail_request("POST", &format!("/mail/{room}"), Some(body))?;
+    Ok(MailSendResult {
+        seq: parsed.get("seq").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        delivery: parsed
+            .get("delivery")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown_recipient")
+            .to_string(),
+    })
 }
 
 fn classify_connect_error(error: &std::io::Error) -> BridgeProbe {

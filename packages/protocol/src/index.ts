@@ -69,7 +69,7 @@ export interface IGyredeckEventRuntime {
   sourcePid: number;
   sourcePpid: number | null;
   sourceStartedAtMs: number;
-  sourceKind: "agyHost" | "claudeCodeHook" | "hookRelay" | "unknown" | string;
+  sourceKind: "agyHost" | "claudeCodeHook" | "codexCliHook" | "hookRelay" | "unknown" | string;
 }
 
 export interface IGyredeckBaseEvent {

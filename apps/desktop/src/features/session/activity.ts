@@ -47,6 +47,7 @@ export const providerLabel = (sourceKind: string | null | undefined): string => 
   switch (sourceKind) {
     case "claudeCodeHook":
       return "Claude Code";
+    case "codexCliHook":
     case "codex-notify":
     case "codex":
       return "Codex";

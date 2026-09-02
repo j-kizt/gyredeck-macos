@@ -296,6 +296,25 @@ const App = () => {
   );
   const hasAgentLiveActivity = isWorkingActivity || activityStatus === "attention" || activityStatus === "done" || activityStatus === "error";
 
+  // Any session waiting on the user raises a badge on the tray icon, so a menu bar with
+  // the window closed still shows there is something to answer.
+  //
+  // Derived to a single boolean before the effect runs: tool events fire many times a
+  // second during a turn and every one of them produces a new sessions array, but the
+  // answer only changes when a session enters or leaves attention. Depending on the
+  // boolean rather than the array keeps this to one IPC call per real transition.
+  const hasAttention = useMemo(
+    () => sessions.some((session) => session.status === "attention"),
+    [sessions],
+  );
+
+  useEffect(() => {
+    if (!canUseNativeControls) return;
+    void invoke("set_tray_attention", { active: hasAttention }).catch(() => {
+      // The tray is decoration; a failed update must not disturb the session view.
+    });
+  }, [canUseNativeControls, hasAttention]);
+
   useEffect(() => {
     if (!canUseNativeControls) {
       setKeepAwakeActive(false);

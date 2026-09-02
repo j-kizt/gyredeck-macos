@@ -45,12 +45,38 @@ const hasCommand = (entries, cmd) =>
   Array.isArray(entries) &&
   entries.some((entry) => Array.isArray(entry.hooks) && entry.hooks.some((h) => h.command === cmd));
 
+/**
+ * Drop every entry that runs our adapter, whatever shape its command has.
+ *
+ * Presence was decided by comparing the whole command string, so the day the command
+ * changed — `node` becoming an absolute path so a GUI-launched agent could find it —
+ * installing again added a second entry beside the first, and every event was relayed
+ * twice from then on. Matching on the script path instead means the command can change
+ * shape again without leaving a duplicate behind. A user's own hooks are untouched:
+ * they do not run this file.
+ */
+const pruneOurs = (settings) => {
+  for (const event of Object.keys(settings.hooks)) {
+    const groups = settings.hooks[event];
+    if (!Array.isArray(groups)) continue;
+    const kept = groups
+      .map((group) => {
+        if (!Array.isArray(group.hooks)) return group;
+        return { ...group, hooks: group.hooks.filter((hook) => !String(hook.command ?? "").includes(INSTALLED_HOOK)) };
+      })
+      .filter((group) => !Array.isArray(group.hooks) || group.hooks.length > 0);
+    if (kept.length > 0) settings.hooks[event] = kept;
+    else delete settings.hooks[event];
+  }
+};
+
 const install = () => {
   mkdirSync(CONFIG_DIR, { recursive: true });
   copyFileSync(SOURCE_HOOK, INSTALLED_HOOK);
 
   const settings = readSettings();
   settings.hooks ??= {};
+  pruneOurs(settings);
   let added = 0;
 
   const addEntry = (event, entry) => {

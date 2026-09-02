@@ -3742,6 +3742,14 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
     // strip it so it doesn't fire alongside Gyredeck and double every event.
     prune_hook_entries(hooks, "agent-activity");
 
+    // Strip our own entries before registering. "Already registered" was decided by
+    // comparing the whole command string, so the day the command changed — switching
+    // from `node` to an absolute path so a GUI-launched agent could find it —
+    // installing again added a second entry beside the first, and every event was
+    // relayed twice from then on. Pruning by script path means the command can change
+    // shape again without leaving a duplicate behind.
+    prune_hook_entries(hooks, &installed_path);
+
     let mut register = |event: &str, entry: serde_json::Value| {
         let command = node_hook_command(&installed_path, event);
         if hook_entry_present(hooks, event, &command) {
@@ -3941,6 +3949,14 @@ fn install_codex_hook(app: tauri::AppHandle) -> Result<String, String> {
         *hooks_value = serde_json::json!({});
     }
     let hooks = hooks_value.as_object_mut().expect("hooks is object");
+
+    // Strip our own entries before registering. "Already registered" was decided by
+    // comparing the whole command string, so the day the command changed — switching
+    // from `node` to an absolute path so a GUI-launched agent could find it —
+    // installing again added a second entry beside the first, and every event was
+    // relayed twice from then on. Pruning by script path means the command can change
+    // shape again without leaving a duplicate behind.
+    prune_hook_entries(hooks, &installed_path);
 
     let mut register = |event: &str, entry: serde_json::Value| {
         let command = node_hook_command(&installed_path, event);

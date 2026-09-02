@@ -74,6 +74,29 @@ test("install-claude-hooks copies the adapter and merges settings idempotently",
       else assert.deepEqual(settings, first, "second install must be a no-op");
     }
 
+    // An entry of ours left by an older command shape must be replaced, not joined.
+    // "Already registered" used to be decided by comparing the whole command string,
+    // so when the command changed — `node` becoming an absolute path so a
+    // GUI-launched agent could find it — a second entry appeared beside the first and
+    // every event was relayed twice.
+    const stale = JSON.parse(await readFile(settingsPath, "utf8"));
+    stale.hooks.UserPromptSubmit = [
+      ...(stale.hooks.UserPromptSubmit ?? []),
+      { hooks: [{ type: "command", command: `node ${join(home, ".config", "gyredeck", "gyredeck-claude-hook.mjs")} --event UserPromptSubmit` }] },
+    ];
+    await writeFile(settingsPath, `${JSON.stringify(stale, null, 2)}\n`);
+    const reinstall = spawnSync(process.execPath, ["scripts/install-claude-hooks.mjs"], {
+      cwd: repoRoot, env: { ...process.env, HOME: home }, encoding: "utf8",
+    });
+    assert.equal(reinstall.status, 0, reinstall.stderr);
+    const deduped = JSON.parse(await readFile(settingsPath, "utf8"));
+    const ourCommands = (deduped.hooks.UserPromptSubmit ?? [])
+      .flatMap((group) => group.hooks ?? [])
+      .filter((hook) => hook.command.includes("gyredeck-claude-hook.mjs"));
+    assert.equal(ourCommands.length, 1, "one of ours per event, whatever shape the old one had");
+    assert.ok(deduped.hooks.Stop.some((entry) => entry.hooks.some((h) => h.command === "say done")),
+      "and the user's own hook is still untouched");
+
     const settings = JSON.parse(await readFile(settingsPath, "utf8"));
     // Existing unrelated preferences and hooks are preserved.
     assert.equal(settings.theme, "dark");

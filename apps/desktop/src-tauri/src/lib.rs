@@ -2414,10 +2414,20 @@ fn claude_oauth_config() -> ClaudeOauthConfig {
         oauth_file_suffix = "-staging-oauth".to_string();
     }
 
+    // A refresh token and a bearer token go over this URL, so a plaintext override is
+    // refused outright rather than honoured. Loopback is allowed: it never leaves the
+    // machine, and the local OAuth path above already relies on it.
     if let Some(custom) = env_text("CLAUDE_CODE_CUSTOM_OAUTH_URL") {
-        base_api = custom.trim_end_matches('/').to_string();
-        refresh_url = format!("{base_api}/v1/oauth/token");
-        oauth_file_suffix = "-custom-oauth".to_string();
+        let custom = custom.trim_end_matches('/').to_string();
+        if is_confidential_oauth_url(&custom) {
+            base_api = custom;
+            refresh_url = format!("{base_api}/v1/oauth/token");
+            oauth_file_suffix = "-custom-oauth".to_string();
+        } else {
+            eprintln!(
+                "Ignoring CLAUDE_CODE_CUSTOM_OAUTH_URL: {custom} is not https and is not loopback"
+            );
+        }
     }
     if let Some(override_client_id) = env_text("CLAUDE_CODE_OAUTH_CLIENT_ID") {
         client_id = override_client_id;
@@ -3109,7 +3119,12 @@ fn parse_antigravity_oauth_client(value: &Value) -> Option<(String, String)> {
 }
 
 fn probe_antigravity_ls_usage() -> Option<CodexUsageSnapshot> {
-    let client = reqwest::blocking::Client::builder()
+    // Antigravity's language server listens on loopback with a self-signed
+    // certificate, so the check has to come off to reach it at all. That makes this
+    // client unsafe for anything else: it is named for its only legal destination,
+    // every URL it is given comes from antigravity_ls_url (hardcoded to
+    // LOOPBACK_HOST), and the two functions below assert that before sending.
+    let loopback_client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .user_agent("Gyredeck")
         .danger_accept_invalid_certs(true)
@@ -3120,11 +3135,11 @@ fn probe_antigravity_ls_usage() -> Option<CodexUsageSnapshot> {
         let ports = discover_listening_ports(&discovery);
         for port in ports {
             for scheme in ["https", "http"] {
-                if probe_antigravity_ls_port(&client, scheme, port, &discovery.csrf).is_none() {
+                if probe_antigravity_ls_port(&loopback_client, scheme, port, &discovery.csrf).is_none() {
                     continue;
                 }
                 if let Some(snapshot) =
-                    fetch_antigravity_ls_snapshot(&client, scheme, port, &discovery.csrf)
+                    fetch_antigravity_ls_snapshot(&loopback_client, scheme, port, &discovery.csrf)
                 {
                     return Some(snapshot);
                 }
@@ -3216,8 +3231,37 @@ fn discover_listening_ports(discovery: &AntigravityLsDiscovery) -> Vec<u16> {
     ports
 }
 
+/// True when an OAuth base URL is safe to send credentials to: TLS, or loopback where
+/// the request never reaches a network.
+fn is_confidential_oauth_url(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    // IPv6 authorities bracket the host, so the port cannot simply be split on ':'.
+    let host = match authority.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// The only host the certificate-skipping client above may ever be pointed at.
+const LOOPBACK_HOST: &str = "127.0.0.1";
+
 fn antigravity_ls_url(scheme: &str, port: u16, method: &str) -> String {
-    format!("{scheme}://127.0.0.1:{port}/{AGY_LS_SERVICE}/{method}")
+    format!("{scheme}://{LOOPBACK_HOST}:{port}/{AGY_LS_SERVICE}/{method}")
+}
+
+/// Guard for requests made with the certificate-skipping client. Skipping validation
+/// is only defensible because the traffic never leaves the machine; this is what stops
+/// a later caller from quietly widening that.
+fn is_loopback_ls_url(url: &str) -> bool {
+    url.starts_with(&format!("http://{LOOPBACK_HOST}:"))
+        || url.starts_with(&format!("https://{LOOPBACK_HOST}:"))
 }
 
 fn antigravity_ls_headers(
@@ -3236,10 +3280,12 @@ fn probe_antigravity_ls_port(
     port: u16,
     csrf: &str,
 ) -> Option<()> {
-    let response = antigravity_ls_headers(
-        client.post(antigravity_ls_url(scheme, port, "GetUnleashData")),
-        csrf,
-    )
+    let url = antigravity_ls_url(scheme, port, "GetUnleashData");
+    // This client skips certificate validation; refuse to send anywhere but loopback.
+    if !is_loopback_ls_url(&url) {
+        return None;
+    }
+    let response = antigravity_ls_headers(client.post(url), csrf)
     .json(&serde_json::json!({
         "context": { "properties": { "devMode": "false", "extensionVersion": "unknown", "ide": "antigravity", "ideVersion": "unknown", "os": "macos" } }
     }))
@@ -3259,10 +3305,12 @@ fn call_antigravity_ls(
     csrf: &str,
     method: &str,
 ) -> Option<Value> {
-    let response = antigravity_ls_headers(
-        client.post(antigravity_ls_url(scheme, port, method)),
-        csrf,
-    )
+    let url = antigravity_ls_url(scheme, port, method);
+    // Same client, same rule: certificate validation is off, so loopback only.
+    if !is_loopback_ls_url(&url) {
+        return None;
+    }
+    let response = antigravity_ls_headers(client.post(url), csrf)
     .json(&serde_json::json!({
         "metadata": { "ideName": "antigravity", "extensionName": "antigravity", "ideVersion": "unknown", "locale": "en" }
     }))
@@ -4930,6 +4978,37 @@ pub fn run() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod transport_safety_tests {
+    use super::*;
+
+    #[test]
+    fn loopback_guard_accepts_only_the_local_language_server() {
+        assert!(is_loopback_ls_url(&antigravity_ls_url("https", 42100, "GetUserStatus")));
+        assert!(is_loopback_ls_url(&antigravity_ls_url("http", 42100, "GetUserStatus")));
+        // The client behind this guard skips certificate validation, so anything that
+        // could leave the machine has to be refused — including hosts that merely look
+        // local, and the loopback name appearing anywhere but the host.
+        assert!(!is_loopback_ls_url("https://127.0.0.1.evil.test:443/x"));
+        assert!(!is_loopback_ls_url("https://example.test/127.0.0.1:1/x"));
+        assert!(!is_loopback_ls_url("https://localhost:42100/x"));
+        assert!(!is_loopback_ls_url("https://10.0.0.5:42100/x"));
+    }
+
+    #[test]
+    fn custom_oauth_url_must_be_tls_or_loopback() {
+        assert!(is_confidential_oauth_url("https://api.anthropic.com"));
+        assert!(is_confidential_oauth_url("http://localhost:8000"));
+        assert!(is_confidential_oauth_url("http://127.0.0.1:8000"));
+        assert!(is_confidential_oauth_url("http://[::1]:8000"));
+        // A refresh token would cross the network in the clear.
+        assert!(!is_confidential_oauth_url("http://api.anthropic.com"));
+        assert!(!is_confidential_oauth_url("http://localhost.evil.test:8000"));
+        assert!(!is_confidential_oauth_url("ftp://api.anthropic.com"));
+        assert!(!is_confidential_oauth_url("api.anthropic.com"));
+    }
 }
 
 #[cfg(test)]

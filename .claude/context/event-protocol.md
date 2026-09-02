@@ -53,7 +53,7 @@ Bound to `127.0.0.1:47621`.
 | POST | `/hook/stop` | Turn-completion relay → `turn_complete`. |
 | POST | `/hook/attention` | Attention/permission relay → `attention_requested`. |
 | GET | `/mail` | Mail rooms that currently exist, with how much is waiting in each. |
-| POST | `/mail/<room>` | Send a message into a room. |
+| POST | `/mail/<room>` | Send a message into a room, and deliver it to the session that room belongs to. |
 | GET | `/mail/<room>?since=<seq>` | Read messages after `seq`. |
 | GET | `/mail/<room>/events` | Subscribe to a room (SSE). |
 
@@ -118,6 +118,27 @@ A room reports `seq` (newest message), `readSeq` (how far it has handed out), an
 It only ever moves forward: re-reading from an older `since` is an inspection, not an un-read, and a resuming subscriber's replay does not rewind it. It is a hint for the UI, not a delivery guarantee: with more than one reader on a room they share the number, and a manual read from a shell counts as a delivery.
 
 The desktop app reads this through the native `mail_rooms` command rather than fetching it in the webview, so the ingest token stays on the native side. Polled every few seconds while the session list is on screen — mail is not part of the event protocol, and letting a message decide a session's presence status would be worse than a few seconds of lag.
+
+### Delivery, per agent
+
+A room is named after a conversation, and reaching that conversation is not the same job for every agent. `POST /mail/<room>` reports which one applied:
+
+| `delivery` | Meaning |
+| --- | --- |
+| `queued` | Handed to a running session, which will pick it up on its own |
+| `on_next_turn` | Waiting in the room until the session's hook next runs |
+| `unknown_recipient` | No agent has been seen on that conversation, so there is nobody to deliver to |
+| `unavailable` | The agent's CLI could not be located |
+
+The bridge learns who owns a conversation from the `runtime.sourceKind` on the events it receives, seeded from the event log at startup so a restart does not lose the routing.
+
+**Codex** is delivered to with `codex queue --thread <room> --message`, which reaches a session that is sitting idle — it starts a turn within a couple of seconds with nobody at the keyboard. No other agent here can be reached that way.
+
+Its answer is then read from its own rollout log rather than asked of it. `task_complete` carries the whole reply in `last_agent_message`, bounded to one turn, so there is no walking of content arrays and no guessing which message was final. Reads are filtered to turns that began after the message was queued, so nothing the session said beforehand is ever looked at.
+
+That indirection is not a convenience. Replying through the bridge would mean running a shell command, and Codex asks the user to approve each one — the message text is part of the command, so an approval is never reused and every single reply would need a keypress. Answering in plain text needs no approval at all.
+
+A queued message counts as delivered whether or not the session answers, and a harvested reply counts as already collected — neither should leave the chip lit on a session that has the message in hand.
 
 ### Delivery into Antigravity
 

@@ -22,7 +22,8 @@
  *   POST /ingest    - Multi-provider event fan-in
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -292,6 +293,7 @@ function startBridge(config) {
 
   const emitLocal = (payload) => {
     tracker.rememberScope(payload);
+    rememberProvider(payload);
     recent.push(payload);
     if (recent.length > maxRecent) recent.shift();
 
@@ -360,6 +362,94 @@ function startBridge(config) {
       req.on("error", () => resolve({}));
     });
 
+  // Which agent runtime owns a conversation, learned from the events it sends.
+  // A mail room is named after a conversation, and delivery is not the same for every
+  // agent: Codex takes a queued message and wakes to read it, while the others are
+  // handed theirs by their own hook on their next turn.
+  const providerByConversation = new Map();
+  const rememberProvider = (payload) => {
+    const conversationId = payload?.conversationId;
+    const sourceKind = payload?.runtime?.sourceKind;
+    if (typeof conversationId === "string" && typeof sourceKind === "string") {
+      providerByConversation.set(conversationId, sourceKind);
+    }
+  };
+
+  // Locate an agent CLI the way the desktop app locates node: a process launched from
+  // Finder or Spotlight does not inherit the shell's PATH, so the usual install
+  // directories have to be searched explicitly.
+  const agentBinaryCache = new Map();
+  const findAgentBinary = (name) => {
+    if (agentBinaryCache.has(name)) return agentBinaryCache.get(name);
+    const directories = [
+      join(homedir(), ".bun", "bin"),
+      join(homedir(), ".nvm", "current", "bin"),
+      join(homedir(), ".local", "bin"),
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      ...(process.env.PATH ?? "").split(":"),
+    ];
+    let found = null;
+    for (const directory of directories) {
+      if (!directory) continue;
+      const candidate = join(directory, name);
+      try {
+        if (statSync(candidate).isFile()) { found = candidate; break; }
+      } catch {}
+    }
+    agentBinaryCache.set(name, found);
+    return found;
+  };
+
+  // Events already on disk tell us who owns which conversation, so a bridge that has
+  // just restarted can still route a message without waiting for fresh activity.
+  for (const payload of recent) rememberProvider(payload);
+
+  const CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");
+  const CODEX_REPLY_TIMEOUT_MS = 120_000;
+  const CODEX_REPLY_POLL_MS = 1_000;
+
+  /** Newest rollout log for a Codex thread, or null when the session is unknown. */
+  const codexRolloutFor = (threadId) => {
+    let newest = null;
+    try {
+      for (const entry of readdirSync(CODEX_SESSIONS_DIR, { recursive: true })) {
+        const name = String(entry);
+        if (!name.endsWith(".jsonl") || !name.includes(threadId)) continue;
+        const path = join(CODEX_SESSIONS_DIR, name);
+        const at = statSync(path).mtimeMs;
+        if (!newest || at > newest.at) newest = { path, at };
+      }
+    } catch {}
+    return newest?.path ?? null;
+  };
+
+  /**
+   * What Codex said after `sinceMs`, read from its own log rather than asked of it.
+   *
+   * Replying through the bridge would mean running a shell command, and Codex asks the
+   * user to approve each one — the message text is part of the command, so no approval
+   * is ever reused. Reading `task_complete` costs nothing and needs no permission: the
+   * whole answer is one field, already bounded to a turn.
+   */
+  const readCodexReplies = (rolloutPath, sinceMs) => {
+    const replies = [];
+    let content = "";
+    try { content = readFileSync(rolloutPath, "utf8"); } catch { return replies; }
+    for (const line of content.split("\n")) {
+      if (!line.trim()) continue;
+      let entry;
+      try { entry = JSON.parse(line); } catch { continue; }
+      if (entry.type !== "event_msg" || entry.payload?.type !== "task_complete") continue;
+      const text = entry.payload.last_agent_message;
+      if (typeof text !== "string" || !text.trim()) continue;
+      const at = Date.parse(entry.timestamp ?? "");
+      if (Number.isFinite(at) && at < sinceMs) continue;
+      replies.push({ turnId: entry.payload.turn_id ?? null, text: text.trim() });
+    }
+    return replies;
+  };
+
   // Mail rooms: a named channel for agents on this machine to talk to each other,
   // multiplexed onto the bridge port so no second listener has to be opened. A room
   // is just a key. Subscribers holding an SSE connection are pushed to immediately;
@@ -400,7 +490,7 @@ function startBridge(config) {
   const mailFrame = (message) =>
     `id: ${message.seq}\nevent: mail\ndata: ${JSON.stringify(message)}\n\n`;
 
-  const publishMail = (room, from, text, replyTo) => {
+  const publishMail = (room, from, text, replyTo, fromSession = false) => {
     room.seq += 1;
     room.touchedAt = Date.now();
     // replyTo is the sender naming where it is listening. Without it a recipient can
@@ -423,11 +513,64 @@ function startBridge(config) {
     // A push is a delivery. Without this a room whose only reader holds a stream
     // would report every message as still waiting to be picked up forever, because
     // nothing ever calls the read endpoint on it.
-    if (pushed) {
+    // A push is a delivery, and so is a message the session itself produced — neither
+    // is waiting for anyone to collect it.
+    if (pushed || fromSession) {
       room.readSeq = Math.max(room.readSeq, message.seq);
       room.lastReadAt = message.ts;
     }
     return message;
+  };
+
+  /**
+   * Hand a message to a Codex session and put its answer back in the room.
+   *
+   * `codex queue` reaches a session that is sitting idle — it starts a turn within a
+   * couple of seconds with nobody at the keyboard, which no other agent here can do.
+   * The answer is then read from the session's own log, so Codex never has to run a
+   * command to reply and the user is never asked to approve one.
+   *
+   * Fire-and-forget on purpose: the POST that triggered this has already been answered,
+   * and a session that never replies must not leave a request hanging.
+   */
+  const deliverToCodex = (roomName, room, text) => {
+    const binary = findAgentBinary("codex");
+    if (!binary) return "unavailable";
+
+    const rolloutPath = codexRolloutFor(roomName);
+    const since = Date.now();
+    const child = spawn(binary, ["queue", "--thread", roomName, "--message", text], {
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    child.on("error", () => {});
+
+    // Without a log to read there is nothing to harvest, but the message was still
+    // delivered — the session will show it even if we cannot see the answer.
+    if (!rolloutPath) return "queued";
+
+    const deadline = since + CODEX_REPLY_TIMEOUT_MS;
+    const seen = new Set();
+    const poll = () => {
+      for (const reply of readCodexReplies(rolloutPath, since)) {
+        const key = reply.turnId ?? reply.text;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        publishMail(room, roomName, reply.text, null, true);
+      }
+      if (seen.size === 0 && Date.now() < deadline) setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
+    };
+    setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
+    return "queued";
+  };
+
+  /** How a message reaches the session a room belongs to, if it can at all. */
+  const deliverMail = (roomName, room, text) => {
+    const provider = providerByConversation.get(roomName);
+    if (provider === "codexCliHook") return deliverToCodex(roomName, room, text);
+    // The others are handed their mail by their own hook, which only runs when the
+    // session next does — nothing to push, and nothing to wait for.
+    if (provider === "agyHost" || provider === "claudeCodeHook") return "on_next_turn";
+    return "unknown_recipient";
   };
 
   const server = createServer(async (req, res) => {
@@ -565,7 +708,23 @@ function startBridge(config) {
           return;
         }
         const message = publishMail(room, from, text, replyTo);
-        sendJson(202, { ok: true, room: name, seq: message.seq, subscribers: room.clients.size });
+        // Delivery is per-agent and reported back so a caller can say what will happen
+        // rather than guess: "queued" reaches an idle session, "on_next_turn" waits.
+        const delivery = deliverMail(name, room, text);
+        // A queued message is in the session's hands whether or not it answers, so it
+        // is not still waiting to be collected. Leaving it pending would light the
+        // chip on a session that had already been handed the message.
+        if (delivery === "queued") {
+          room.readSeq = Math.max(room.readSeq, message.seq);
+          room.lastReadAt = message.ts;
+        }
+        sendJson(202, {
+          ok: true,
+          room: name,
+          seq: message.seq,
+          subscribers: room.clients.size,
+          delivery,
+        });
         return;
       }
 

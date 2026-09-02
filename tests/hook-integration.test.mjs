@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import test from "node:test";
 
 const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
@@ -820,6 +821,57 @@ test("antigravity recovers when its mail cursor outlives the room", async () => 
     assert.deepEqual(await deliveredTexts(2), ["after restart"]);
   } finally {
     await stopBridge(bridge);
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("mail delivery reports how a message will reach the session it is addressed to", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-deliver-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+
+    // A room nobody has been seen on cannot be routed: mail is addressed to a
+    // conversation, and the bridge only knows who owns one from the events it sends.
+    const unknown = await (await fetch(`${base}/mail/nobody-here`, {
+      method: "POST", headers, body: JSON.stringify({ from: "claude-code", text: "hello" }),
+    })).json();
+    assert.equal(unknown.delivery, "unknown_recipient");
+
+    // An agent that collects its own mail through a hook cannot be pushed to — it
+    // reads when it next runs, and saying so is the whole point of the field.
+    const conversationId = "agy-conversation-1";
+    await fetch(`${base}/ingest`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        version: 2, id: randomUUID(), type: "turn_start",
+        timestamp: new Date().toISOString(), conversationId, cwd: "/tmp/agy",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "agyHost" },
+        data: { inputCount: 1 },
+      }),
+    });
+    const hookDelivered = await (await fetch(`${base}/mail/${conversationId}`, {
+      method: "POST", headers, body: JSON.stringify({ from: "claude-code", text: "hello" }),
+    })).json();
+    assert.equal(hookDelivered.delivery, "on_next_turn");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true });
   }
 });

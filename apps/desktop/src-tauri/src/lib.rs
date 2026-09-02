@@ -3799,9 +3799,13 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
         "PostInvocation": [
             {"type": "command", "command": node_hook_command(&installed_path, "PostInvocation")}
         ],
+        // Antigravity reads the Stop hook's response as a decision about whether the
+        // turn may end, so the adapter must answer "allow" here. It once answered
+        // "continue" — meaning "keep going" — and the agent replied to every finished
+        // turn with "Stop hook blocked termination", looping forever.
         "Stop": [
             {"type": "command", "command": node_hook_command(&installed_path, "Stop")}
-        ]
+        ],
     });
     // Drop the previous brand's namespace so it can't fire alongside Gyredeck.
     root.remove("agent-activity");

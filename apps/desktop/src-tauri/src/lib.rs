@@ -559,6 +559,22 @@ fn mail_rooms() -> Result<Vec<standalone_bridge::MailRoom>, String> {
     standalone_bridge::mail_rooms()
 }
 
+/// Every message exchanged with one session, so its detail view can show the thread.
+#[tauri::command]
+fn mail_thread(room: String) -> Result<Vec<standalone_bridge::MailMessage>, String> {
+    standalone_bridge::mail_thread(&room)
+}
+
+/// Send a message to a session on the user's behalf.
+///
+/// The sender is recorded as "gyredeck" rather than as another session: this came from
+/// the person at the keyboard through the app, and a reader deciding how much weight to
+/// give a message should be able to tell those apart.
+#[tauri::command]
+fn mail_send(room: String, text: String) -> Result<standalone_bridge::MailSendResult, String> {
+    standalone_bridge::mail_send(&room, "gyredeck", &text)
+}
+
 #[tauri::command]
 fn get_bridge_port() -> u16 {
     standalone_bridge::configured_bridge_port()
@@ -5039,6 +5055,8 @@ pub fn run() {
             bridge_health,
             get_bridge_port,
             mail_rooms,
+            mail_thread,
+            mail_send,
             set_bridge_port,
             claude_usage,
             codex_usage,

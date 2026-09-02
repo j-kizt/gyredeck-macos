@@ -3,6 +3,7 @@ import { BarChart3, Check, ChevronLeft, Copy, Focus, GitBranch, List, Server, Se
 import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState, type ErrorInfo, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import type { GyredeckPresenceStatus } from "@gyredeck/protocol";
+import { SessionMessages } from "./features/mail/SessionMessages";
 import { useMailRooms } from "./features/mail/useMailRooms";
 import { SessionContextMeter, SessionContextSummary, StatusGlyph, WorkspaceSessionGroupItem } from "./features/session/components";
 import {
@@ -921,6 +922,7 @@ const App = () => {
                   {sessionAction.message ? (
                     <div className="notice-row compact" data-online={sessionAction.ok === true} role="status" aria-live="polite">{sessionAction.message}</div>
                   ) : null}
+                  <SessionMessages session={selectedSession} canUseNativeControls={canUseNativeControls} />
                   <div className="detail-section-label">Recent activity</div>
                   {selectedSessionActivityEvents.length === 0 ? (
                     <div className="empty-text small">No events captured yet</div>

@@ -547,9 +547,9 @@ test("bridge mail rooms push to subscribers and buffer for periodic readers", as
     // milliseconds — reads what it missed instead, and `since` makes that repeatable.
     await publish("beta", { from: "claude-code", text: "while you were away" });
     await publish("beta", { from: "claude-code", text: "and again" });
-    const drained = await (await fetch(`${base}/mail/beta`, { headers })).json();
+    const drained = await (await fetch(`${base}/mail/beta?collect=1`, { headers })).json();
     assert.deepEqual(drained.messages.map((message) => message.text), ["while you were away", "and again"]);
-    const empty = await (await fetch(`${base}/mail/beta?since=${drained.seq}`, { headers })).json();
+    const empty = await (await fetch(`${base}/mail/beta?since=${drained.seq}&collect=1`, { headers })).json();
     assert.deepEqual(empty.messages, []);
 
     // Rooms do not leak into each other.
@@ -580,10 +580,19 @@ test("bridge mail rooms push to subscribers and buffer for periodic readers", as
     assert.equal(gammaRoom.readSeq, 0);
     assert.equal(gammaRoom.lastReadAt, null);
 
-    // Re-reading from an older `since` is an inspection, not an un-read.
-    await fetch(`${base}/mail/beta?since=0`, { headers });
+    // A collector re-reading from an older `since` has not un-taken what it had.
+    await fetch(`${base}/mail/beta?since=0&collect=1`, { headers });
     const reread = await (await fetch(`${base}/mail`, { headers })).json();
     assert.equal(reread.rooms.find((room) => room.room === "beta").readSeq, 2);
+
+    // And a look leaves the numbers alone entirely.
+    await publish("delta", { from: "claude-code", text: "nobody has taken this" });
+    await fetch(`${base}/mail/delta`, { headers });
+    const looked = await (await fetch(`${base}/mail`, { headers })).json();
+    const deltaRoom = looked.rooms.find((room) => room.room === "delta");
+    assert.equal(deltaRoom.readSeq, 0, "looking is not collecting");
+    assert.equal(deltaRoom.pending, 1);
+    assert.equal(deltaRoom.lastReadAt, null);
 
     // A subscriber that dropped resumes from the last id it saw, so reconnecting
     // closes the gap instead of silently skipping it. EventSource sends this header

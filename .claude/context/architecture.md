@@ -9,14 +9,14 @@ It is local-first: everything runs on `127.0.0.1` and nothing is uploaded.
 ## Data flow
 
 ```text
-Claude Code hooks     Codex notify        Antigravity (AGY) hooks
+Claude Code hooks     Codex hooks         Antigravity (AGY) hooks
   Pre/PostToolUse       agent-turn-          PreToolUse / PostToolUse
   UserPromptSubmit      complete             PreInvocation / Stop
   Stop / Notification        |                       |
         |                    |                       |
         v                    v                       v
 adapters/claude/…    adapters/codex/…       adapters/antigravity/…
-  claude-hook.mjs      codex-notify.mjs       agy-hook.mjs
+  claude-hook.mjs      codex-hook.mjs         agy-hook.mjs
   (rich per-tool)      (coarse turn-level)    (per-tool + turn)
         |                    |                       |
         +---- POST /ingest, /hook/stop, /hook/attention ----+

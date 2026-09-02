@@ -358,6 +358,81 @@ test("antigravity adapter answers each event with its documented response shape"
   }
 });
 
+test("codex adapter reports a session id, a paired tool call, and approval attention", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-codex-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  // Field names and shapes below are taken from payloads captured off a live Codex run.
+  const base = {
+    session_id: "01a06082-8ef6-7900-ae39-44fe2e460079",
+    cwd: "/tmp/codex-project",
+    model: "gpt-5.6-luna",
+    permission_mode: "default",
+    transcript_path: "/tmp/rollout.jsonl",
+  };
+  const run = (event, extra) =>
+    runAdapter("adapters/codex/gyredeck-codex-hook.mjs", ["--event", event], home, {
+      ...base, hook_event_name: event, ...extra,
+    });
+
+  try {
+    await waitForHealth(port, stderrRef);
+
+    const pre = await run("PreToolUse", {
+      tool_name: "Bash", tool_use_id: "exec-06b89e1c", tool_input: { command: "ls", timeout: 5 },
+    });
+    // Codex reads stdout as a decision. `{}` states no opinion; an allow here would
+    // override the user's own approval settings.
+    assert.deepEqual(JSON.parse(pre.stdout), {});
+
+    await run("PostToolUse", {
+      tool_name: "Bash", tool_use_id: "exec-06b89e1c", tool_response: { output: "a\nb" },
+    });
+    await run("PermissionRequest", {
+      tool_name: "Bash", tool_input: { command: "rm -rf build", description: "Delete build output" },
+    });
+
+    const snapshot = await (await fetch(`http://127.0.0.1:${port}/snapshot`)).json();
+    const of = (type) => snapshot.recent.find((event) => event.type === type);
+
+    const start = of("tool_start");
+    assert.ok(start, "tool_start reached the bridge");
+    // The real session id is the point of moving off notify: it makes sessions
+    // resumable and stops two Codex runs in one directory collapsing together.
+    assert.equal(start.conversationId, base.session_id);
+    assert.equal(start.model, "gpt-5.6-luna");
+    assert.equal(start.runtime?.sourceKind, "codexCliHook");
+    // Codex supplies a call id, so start and end pair up — Claude's adapter sends null.
+    assert.equal(start.data.toolCallId, "exec-06b89e1c");
+    assert.deepEqual(start.data.argKeys, ["command", "timeout"]);
+
+    const end = of("tool_end");
+    assert.equal(end.data.toolCallId, "exec-06b89e1c");
+    assert.equal(end.data.status, "success");
+    assert.equal(end.data.outputLength, 3);
+
+    const attention = of("attention_requested");
+    assert.ok(attention, "PermissionRequest raised attention");
+    // No Notification event name, so the bridge files it as an approval.
+    assert.equal(attention.data.kind, "approval");
+    assert.equal(attention.data.message, "Delete build output");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("standalone bridge appends relayed events to the ndjson log", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-log-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });

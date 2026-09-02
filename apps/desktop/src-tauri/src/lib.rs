@@ -439,6 +439,30 @@ fn agy_hooks_json_path() -> Result<PathBuf, String> {
 }
 
 
+fn codex_hook_install_path() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("gyredeck")
+        .join("gyredeck-codex-hook.mjs"))
+}
+
+fn codex_hooks_json_path() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    Ok(PathBuf::from(home).join(".codex").join("hooks.json"))
+}
+
+/// Codex's matcher is a regex over the tool name.
+const CODEX_HOOK_MATCHED_EVENTS: [&str; 3] = ["PreToolUse", "PostToolUse", "PermissionRequest"];
+const CODEX_HOOK_PLAIN_EVENTS: [&str; 6] = [
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "Stop",
+    "PreCompact",
+    "PostCompact",
+];
+
 const CLAUDE_HOOK_MATCHED_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
 const CLAUDE_HOOK_PLAIN_EVENTS: [&str; 7] = [
     "UserPromptSubmit",
@@ -3833,6 +3857,132 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn install_codex_hook(app: tauri::AppHandle) -> Result<String, String> {
+    let install_path = codex_hook_install_path()?;
+    let hooks_json_path = codex_hooks_json_path()?;
+
+    let resource_path = app
+        .path()
+        .resolve(
+            "gyredeck-codex-hook.mjs",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|e| format!("Failed to resolve resource: {e}"))?;
+
+    let Some(parent) = install_path.parent() else {
+        return Err("Failed to resolve config directory".to_string());
+    };
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Failed to create config directory: {error}"))?;
+    fs::copy(&resource_path, &install_path)
+        .map_err(|error| format!("Failed to copy hook script: {error}"))?;
+
+    let installed_path = install_path.to_string_lossy().to_string();
+
+    // Unlike Antigravity's file, ~/.codex/hooks.json has no per-tool namespace — the
+    // user's own hooks sit in the same event arrays. Entries are appended, never
+    // replaced, and a refusal to overwrite unparsable JSON keeps a hand-written file
+    // from being destroyed by a mis-click.
+    let mut hooks_root: serde_json::Value = if hooks_json_path.exists() {
+        let content = fs::read_to_string(&hooks_json_path)
+            .map_err(|e| format!("Failed to read hooks.json: {e}"))?;
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&content).map_err(|e| {
+                format!("Refusing to overwrite unparsable ~/.codex/hooks.json: {e}")
+            })?
+        }
+    } else {
+        serde_json::json!({})
+    };
+    if !hooks_root.is_object() {
+        return Err("Refusing to overwrite ~/.codex/hooks.json: root is not an object".to_string());
+    }
+
+    let root = hooks_root.as_object_mut().expect("hooks root is object");
+    let hooks_value = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !hooks_value.is_object() {
+        *hooks_value = serde_json::json!({});
+    }
+    let hooks = hooks_value.as_object_mut().expect("hooks is object");
+
+    let mut register = |event: &str, entry: serde_json::Value| {
+        let command = node_hook_command(&installed_path, event);
+        if hook_entry_present(hooks, event, &command) {
+            return;
+        }
+        let list = hooks
+            .entry(event.to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(arr) = list.as_array_mut() {
+            arr.push(entry);
+        } else {
+            *list = serde_json::json!([entry]);
+        }
+    };
+
+    for event in CODEX_HOOK_MATCHED_EVENTS {
+        register(
+            event,
+            serde_json::json!({
+                "matcher": ".*",
+                "hooks": [{"type": "command", "command": node_hook_command(&installed_path, event)}]
+            }),
+        );
+    }
+    for event in CODEX_HOOK_PLAIN_EVENTS {
+        register(
+            event,
+            serde_json::json!({
+                "hooks": [{"type": "command", "command": node_hook_command(&installed_path, event)}]
+            }),
+        );
+    }
+
+    let Some(hooks_parent) = hooks_json_path.parent() else {
+        return Err("Failed to resolve Codex config directory".to_string());
+    };
+    fs::create_dir_all(hooks_parent)
+        .map_err(|error| format!("Failed to create Codex config directory: {error}"))?;
+
+    let json_string = serde_json::to_string_pretty(&hooks_root)
+        .map_err(|e| format!("Failed to stringify hooks.json: {e}"))?;
+    fs::write(&hooks_json_path, format!("{json_string}\n"))
+        .map_err(|error| format!("Failed to write hooks.json: {error}"))?;
+
+    Ok(installed_path)
+}
+
+#[tauri::command]
+fn codex_hook_status() -> Result<(String, bool), String> {
+    let install_path = codex_hook_install_path()?;
+    let hooks_json_path = codex_hooks_json_path()?;
+    let installed_path = install_path.to_string_lossy().to_string();
+
+    // Probe the exact command string for one event, the way the Claude status does:
+    // the file existing says nothing about whether Codex will actually call it.
+    let mut in_hooks = false;
+    if hooks_json_path.exists() {
+        if let Ok(content) = fs::read_to_string(&hooks_json_path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(hooks) = json.get("hooks").and_then(|v| v.as_object()) {
+                    in_hooks = hook_entry_present(
+                        hooks,
+                        "Stop",
+                        &node_hook_command(&installed_path, "Stop"),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok((installed_path, install_path.exists() && in_hooks))
+}
+
+#[tauri::command]
 fn agy_hook_status() -> Result<(String, bool), String> {
     let install_path = agy_hook_install_path()?;
     let hooks_json_path = agy_hooks_json_path()?;
@@ -4872,6 +5022,8 @@ pub fn run() {
             claude_hook_status,
             install_agy_hook,
             agy_hook_status,
+            install_codex_hook,
+            codex_hook_status,
             github_repo_status,
             github_available_repos,
             github_accounts,

@@ -32,7 +32,7 @@ The app needs a hook to see your sessions. After installing, click the menu-bar 
 
 - **Claude Code** — install the Claude Code hook, then start a new Claude Code session. Rich per-tool activity.
 - **Antigravity** — install the Antigravity hook the same way.
-- **Codex** (optional) — coarse turn-level presence; see [`.claude/context/development.md`](.claude/context/development.md) for the one-time `notify` setup.
+- **Codex** (optional) — full hook presence: sessions, turns, tool calls, approvals and compaction. Install from Settings → Plugins.
 
 ## What it shows
 
@@ -54,7 +54,6 @@ The app needs a hook to see your sessions. After installing, click the menu-bar 
 ## Notes
 
 - No real "end session" control (Claude Code exposes no stable scoped API for it).
-- Codex presence is turn-level only.
 - Terminal Focus matches iTerm2 or Ghostty by cwd/title — it is not a process/session-control API.
 
 ## Credits

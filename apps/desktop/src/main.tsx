@@ -116,6 +116,7 @@ const App = () => {
   const [setupOpen, setSetupOpen] = useState(false);
   const [hookStatus, setHookStatus] = useState<IHookStatus>({ path: null, installed: null });
   const [agyStatus, setAgyStatus] = useState<IHookStatus>({ path: null, installed: null });
+  const [codexStatus, setCodexStatus] = useState<IHookStatus>({ path: null, installed: null });
   const [dismissedSessionIds, setDismissedSessionIds] = useState<DismissedSessionRegistry>(readDismissedSessionIds);
   const [deletedSessionIds, setDeletedSessionIds] = useState<DeletedSessionRegistry>(readDeletedSessionIds);
   const [keepAwakeEnabled, setKeepAwakeEnabled] = useState(readKeepAwakeEnabled);
@@ -727,6 +728,20 @@ const App = () => {
     }
   };
 
+  const loadCodexStatus = async () => {
+    if (!canUseNativeControls) {
+      clearHookStatus(setCodexStatus);
+      return;
+    }
+
+    try {
+      const [path, installed] = await invoke<[string, boolean]>("codex_hook_status");
+      setCodexStatus({ path, installed });
+    } catch {
+      clearHookStatus(setCodexStatus);
+    }
+  };
+
   const installAgy = async () => {
     if (!canUseNativeControls) {
       setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: "Open with pnpm desktop:dev" });
@@ -741,6 +756,24 @@ const App = () => {
       setNativeAction({
         bridgeOnline: nativeAction.bridgeOnline,
         message: error instanceof Error ? error.message : "Antigravity hook install failed",
+      });
+    }
+  };
+
+  const installCodex = async () => {
+    if (!canUseNativeControls) {
+      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: "Open with pnpm desktop:dev" });
+      return;
+    }
+
+    try {
+      const path = await invoke<string>("install_codex_hook");
+      setCodexStatus({ path, installed: true });
+      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: `Installed → ${shortenPath(path)} · restart Codex` });
+    } catch (error) {
+      setNativeAction({
+        bridgeOnline: nativeAction.bridgeOnline,
+        message: error instanceof Error ? error.message : "Codex hook install failed",
       });
     }
   };
@@ -769,6 +802,7 @@ const App = () => {
     if (setupOpen) {
       void loadHookStatus();
       void loadAgyStatus();
+      void loadCodexStatus();
       void checkBridge();
     }
   }, [setupOpen]);
@@ -850,10 +884,12 @@ const App = () => {
                   keepAwakeError={keepAwakeError}
                   hookStatus={hookStatus}
                   agyStatus={agyStatus}
+                  codexStatus={codexStatus}
                   nativeAction={nativeAction}
                   onCheckBridge={checkBridge}
                   onInstallHook={installHook}
                   onInstallAgy={installAgy}
+                  onInstallCodex={installCodex}
                   onKeepAwakeChange={updateKeepAwakeEnabled}
                   bridgePort={bridgePort}
                   onApplyBridgePort={applyBridgePort}

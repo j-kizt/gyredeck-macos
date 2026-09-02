@@ -47,6 +47,7 @@
     "resources": {
       "../../../adapters/claude/gyredeck-claude-hook.mjs": "gyredeck-claude-hook.mjs",
       "../../../adapters/antigravity/gyredeck-agy-hook.mjs": "gyredeck-agy-hook.mjs",
+      "../../../adapters/codex/gyredeck-codex-hook.mjs": "gyredeck-codex-hook.mjs",
       "../../../adapters/bridge/gyredeck-bridge.mjs": "gyredeck-bridge.mjs"
     }
   },

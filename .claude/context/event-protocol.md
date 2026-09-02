@@ -142,12 +142,21 @@ That indirection is not a convenience. Replying through the bridge would mean ru
 
 A queued message counts as delivered whether or not the session answers, and a harvested reply counts as already collected — neither should leave the chip lit on a session that has the message in hand.
 
+### Delivery into Claude Code
+
+`UserPromptSubmit` can add to the model's context, and it is the only inbound path: nothing reaches a Claude Code session from outside, so mail waits in its room until the person types again. The drain lives on that event rather than `SessionStart` — mail arriving mid-session would otherwise wait for a restart.
+
+The shape is `{"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "…"}}`, one string rather than a list of steps, so senders are labelled inline. Anything else on stdout is read as a hook result, so an empty room produces no output at all.
+
+The cursor, caps, reset recovery and failure behaviour match the Antigravity drain below, and the two share the same `mail-cursors.json`.
+
 ### Delivery into Antigravity
 
 Antigravity is the reason the buffered read path exists. It offers no way to push a message into a live session — no queue command, no socket — but its `PreInvocation` hook response accepts `injectSteps`, steps handed to the agent before it runs. So the adapter drains the room on every invocation:
 
 - The room is named after the **conversation id**, because a message is addressed to a session rather than to Antigravity in general.
-- Messages arrive as `ephemeralMessage` steps labelled `[gyredeck mail · from <sender>]`. Never `userMessage`: the text did not come from the person at the keyboard, and attributing it to them would both mislead the agent and lend an outside message the authority of a user instruction.
+- Messages arrive as `ephemeralMessage` steps labelled `[gyredeck mail · from <sender>]`. Never `userMessage`: that would attribute another process's text to the person at the keyboard, and any local caller holding the token could then issue instructions carrying the user's authority.
+- A message sent from the desktop app *is* the user speaking, and is labelled "the user, via Gyredeck". The caution about peers is left out for those, since describing the user's own message as untrusted is both wrong and an invitation to discount it.
 - `PreInvocation` fires per invocation, not per user message, so a message landing mid-turn is delivered at the next one.
 - The cursor lives in `~/.config/gyredeck/mail-cursors.json` (`{room: seq}`, 64 rooms, `0600`). A hook process keeps no memory between runs, so without it every invocation would re-inject the whole room.
 - At most 10 steps per invocation and 2 KB per message; the remainder keeps its place in the room and arrives next time.

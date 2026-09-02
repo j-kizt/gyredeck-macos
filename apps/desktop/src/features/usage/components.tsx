@@ -366,7 +366,7 @@ const ProviderDetail = ({ provider, settings, usage }: IProviderDetailProps) => 
           ]}
         />
       ) : null}
-      {["codex", "cursor"].includes(provider.id) && hasMetrics ? (
+      {provider.id === "codex" && hasMetrics ? (
         <ProviderInsights provider={provider} usage={usage} />
       ) : null}
       {provider.id !== "codex" && (usage.credits || usage.rateLimitResets) ? (

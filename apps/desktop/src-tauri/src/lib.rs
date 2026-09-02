@@ -51,6 +51,7 @@ use objc2_foundation::{NSArray, NSPoint, NSRect, NSSize, NSString};
 #[cfg(target_os = "macos")]
 use security_framework::passwords::set_generic_password;
 
+const TRAY_ID: &str = "gyredeck";
 const TRAY_SHOW: &str = "show";
 const TRAY_HIDE: &str = "hide";
 const TRAY_QUIT: &str = "quit";
@@ -5387,13 +5388,61 @@ fn configure_overlay_window(window: &tauri::WebviewWindow) {
     }
 }
 
+/// Whether the tray is currently showing the attention badge. Kept so a system
+/// appearance change can re-pick the matching icon without the frontend re-sending.
+#[derive(Default)]
+struct TrayAttentionState(std::sync::atomic::AtomicBool);
+
+/// Point the tray at the icon for `attention`, and set template mode to match.
+///
+/// The idle mark is a macOS template image, so the system tints it for the current menu
+/// bar. The attention mark cannot be: its badge is red and template mode keeps only the
+/// alpha channel. That also means it does not follow the appearance on its own, so one
+/// file is rendered per theme and the matching one is chosen here — and re-chosen from
+/// the ThemeChanged handler while the badge is up.
+///
+/// Both properties must be set on every transition. Leaving is_template false while
+/// showing the white idle mark would make it invisible on a light menu bar.
+fn apply_tray_icon(app: &tauri::AppHandle, attention: bool) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    if !attention {
+        let _ = tray.set_icon(Some(tauri::include_image!("icons/tray-icon.png")));
+        let _ = tray.set_icon_as_template(true);
+        return;
+    }
+    let dark = app
+        .get_webview_window("main")
+        .and_then(|window| window.theme().ok())
+        .map(|theme| theme == tauri::Theme::Dark)
+        .unwrap_or(true);
+    let icon = if dark {
+        tauri::include_image!("icons/tray-icon-attention-dark.png")
+    } else {
+        tauri::include_image!("icons/tray-icon-attention-light.png")
+    };
+    let _ = tray.set_icon(Some(icon));
+    let _ = tray.set_icon_as_template(false);
+}
+
+/// Raise or clear the tray's attention badge. The frontend owns session state, so it
+/// decides when any session is waiting on the user; this only renders that.
+#[tauri::command]
+fn set_tray_attention(app: tauri::AppHandle, active: bool) {
+    app.state::<TrayAttentionState>()
+        .0
+        .store(active, std::sync::atomic::Ordering::Relaxed);
+    apply_tray_icon(&app, active);
+}
+
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, TRAY_SHOW, "Show Gyredeck", true, None::<&str>)?;
     let hide = MenuItem::with_id(app, TRAY_HIDE, "Hide Overlay", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, TRAY_QUIT, "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &hide, &separator, &quit])?;
-    TrayIconBuilder::with_id("gyredeck")
+    TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("Gyredeck")
         .icon(tauri::include_image!("icons/tray-icon.png"))
         .icon_as_template(true)
@@ -5490,12 +5539,14 @@ pub fn run() {
             reconcile_display,
             request_notification_permission,
             set_keep_awake,
+            set_tray_attention,
             select_display
         ]);
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(KeepAwakeState::default())
+        .manage(TrayAttentionState::default())
         .manage(DisplayPreferenceState::default())
         .manage(LocalServicesControlState::default())
         .manage(StandaloneBridgeState::default())
@@ -5530,6 +5581,18 @@ pub fn run() {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
                         let _ = hide_target.hide();
+                    }
+                    // The attention icon is not a template image, so it does not follow
+                    // the menu bar on its own — re-pick it when the appearance flips.
+                    if let tauri::WindowEvent::ThemeChanged(_) = event {
+                        let app = hide_target.app_handle();
+                        if app
+                            .state::<TrayAttentionState>()
+                            .0
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            apply_tray_icon(app, true);
+                        }
                     }
                 });
 

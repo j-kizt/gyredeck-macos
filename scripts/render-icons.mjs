@@ -35,6 +35,14 @@ const GRAD_FROM = [0x2b, 0x5f, 0xa8];
 const GRAD_TO = [0x4b, 0xa3, 0xc7];
 const CORE = [0x7e, 0xc8, 0xe3];
 const WHITE = [0xff, 0xff, 0xff];
+const BLACK = [0x00, 0x00, 0x00];
+const BADGE = [0xff, 0x45, 0x3a];
+
+// Attention badge. It lands inside the arc's own 60 degree gap, but the round cap on
+// the gap's lower edge still reaches it, so BADGE_PAD is punched out of the mark to
+// keep a visible channel between the two.
+const BADGE_AT = { x: 838, y: 186, r: 180 };
+const BADGE_PAD = 75;
 const GRAD_P0 = [221, 221], GRAD_P1 = [803, 803];
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
@@ -78,7 +86,7 @@ function over(px, o, rgb, a) {
   px[o + 3] = Math.round(out * 255);
 }
 
-function render(size, { plate, geom, mono }) {
+function render(size, { plate, geom, mono, badge }) {
   const px = new Uint8Array(size * size * 4);
   const scale = size / 1024;              // design units -> device pixels
   const inv = 1 / scale;
@@ -87,10 +95,17 @@ function render(size, { plate, geom, mono }) {
       const o = (y * size + x) * 4;
       const dx = (x + 0.5) * inv, dy = (y + 0.5) * inv;   // pixel centre
       if (plate) over(px, o, PLATE, cover(roundedRectDistance(dx, dy, 1024, PLATE_RADIUS), scale));
-      const ring = cover(arcDistance(dx, dy, geom.radius) - geom.stroke / 2, scale);
+      // Clearance around the badge, as a coverage multiplier on the mark below it.
+      const clear = badge
+        ? 1 - cover(Math.hypot(dx - BADGE_AT.x, dy - BADGE_AT.y) - (BADGE_AT.r + BADGE_PAD), scale)
+        : 1;
+      const ring = cover(arcDistance(dx, dy, geom.radius) - geom.stroke / 2, scale) * clear;
       over(px, o, mono ?? gradientAt(dx, dy), ring);
-      const core = cover(Math.hypot(dx - CX, dy - CY) - geom.core, scale);
+      const core = cover(Math.hypot(dx - CX, dy - CY) - geom.core, scale) * clear;
       over(px, o, mono ?? CORE, core);
+      if (badge) {
+        over(px, o, BADGE, cover(Math.hypot(dx - BADGE_AT.x, dy - BADGE_AT.y) - BADGE_AT.r, scale));
+      }
     }
   }
   return px;
@@ -151,6 +166,13 @@ const assets = join(root, "apps/desktop/assets");
 const appIcon = (size) => encodePng(render(size, { plate: true, geom: APP }), size);
 const trayIcon = (size) => encodePng(render(size, { plate: false, geom: TRAY, mono: WHITE }), size);
 
+// The attention icon carries a red badge, so it cannot be a macOS template image —
+// template mode discards colour and keeps only alpha. That means it does not follow
+// the menu bar's appearance either, so one is rendered per theme and lib.rs picks the
+// matching file. Named for the theme they are used in: Theme::Dark wants a light mark.
+const attentionIcon = (size, mark) =>
+  encodePng(render(size, { plate: false, geom: TRAY, mono: mark, badge: true }), size);
+
 const work = mkdtempSync(join(tmpdir(), "gyredeck-icons-"));
 try {
   const iconset = join(work, "icon.iconset");
@@ -167,6 +189,8 @@ try {
   writeFileSync(join(icons, "128x128@2x.png"), appIcon(256));
   writeFileSync(join(icons, "icon.png"), appIcon(1024));
   writeFileSync(join(icons, "tray-icon.png"), trayIcon(128));
+  writeFileSync(join(icons, "tray-icon-attention-dark.png"), attentionIcon(128, WHITE));
+  writeFileSync(join(icons, "tray-icon-attention-light.png"), attentionIcon(128, BLACK));
   copyFileSync(join(icons, "icon.png"), join(assets, "gyredeck-app-icon.png"));
 
   console.log("icons regenerated — tray-icon.png is compiled in, so rebuild the desktop app to see it");

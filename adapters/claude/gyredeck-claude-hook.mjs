@@ -265,6 +265,10 @@ const drainMailIntoContext = async (endpoint, token, room) => {
   const messages = Array.isArray(result?.messages) ? result.messages : [];
   const delivered = messages
     .filter((message) => Number.isInteger(message?.seq) && typeof message?.text === "string")
+    // Replies land in the same room they answer, which is what makes the desktop panel
+    // read as one thread. The cost is that a session would otherwise be handed its own
+    // last reply back as fresh mail on its next turn, and answer itself forever.
+    .filter((message) => message.from !== room)
     .slice(0, MAIL_MAX_MESSAGES);
   if (delivered.length === 0) return null;
 
@@ -305,7 +309,7 @@ const drainMailIntoContext = async (endpoint, token, room) => {
         "  TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); " +
         `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${replyRooms[0]} ` +
         "-H 'content-type: application/json' -H \"x-gyredeck-token: $TOKEN\" " +
-        `-d '{"from":"claude-code","text":"YOUR REPLY HERE","replyTo":"${room}"}'`,
+        `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}"}'`,
     );
   }
 

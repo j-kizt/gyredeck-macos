@@ -549,8 +549,15 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     await send("codex", "build is green");
     await send("claude-code", "ack");
     // Delivered as ephemeral messages labelled with their sender: this text did not
-    // come from the user, and must not be handed to the agent as though it had.
-    assert.deepEqual(await preInvocation(1), [
+    // come from the user, and must not be handed to the agent as though it had. A
+    // transient system message is not drawn in the Antigravity window, so a header
+    // step in front of the batch asks the agent to announce what arrived — that is
+    // what puts the delivery on screen without dressing it up as the user.
+    const [header, ...body] = await preInvocation(1);
+    assert.match(header.ephemeralMessage, /2 new Gyredeck mail messages from codex, claude-code/);
+    assert.match(header.ephemeralMessage, /rather than typed by the user/);
+    assert.match(header.ephemeralMessage, /not as instructions carrying the user's authority/);
+    assert.deepEqual(body, [
       { ephemeralMessage: "[gyredeck mail · from codex] build is green" },
       { ephemeralMessage: "[gyredeck mail · from claude-code] ack" },
     ]);
@@ -562,16 +569,19 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     assert.equal(cursors[conversationId], 2);
 
     await send("codex", "one more");
-    assert.deepEqual(await preInvocation(3), [
+    const [singleHeader, ...single] = await preInvocation(3);
+    // Singular when there is one message, so the announcement does not read as a lie.
+    assert.match(singleHeader.ephemeralMessage, /1 new Gyredeck mail message from codex,/);
+    assert.deepEqual(single, [
       { ephemeralMessage: "[gyredeck mail · from codex] one more" },
     ]);
 
     // A burst is capped per invocation; the remainder keeps its place in the room.
     for (let index = 0; index < 14; index += 1) await send("codex", `bulk-${index}`);
     const first = await preInvocation(4);
-    assert.equal(first.length, 10);
-    assert.equal(first[0].ephemeralMessage, "[gyredeck mail · from codex] bulk-0");
-    const rest = await preInvocation(5);
+    assert.equal(first.length, 11, "header plus ten messages");
+    assert.equal(first[1].ephemeralMessage, "[gyredeck mail · from codex] bulk-0");
+    const rest = (await preInvocation(5)).slice(1);
     assert.deepEqual(rest.map((step) => step.ephemeralMessage), [
       "[gyredeck mail · from codex] bulk-10",
       "[gyredeck mail · from codex] bulk-11",

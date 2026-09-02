@@ -102,7 +102,7 @@ A room is just a name matching `[A-Za-z0-9_-]{1,64}`, created by whoever sends t
 
 Two ways to receive, because the participants differ in kind:
 
-- **Subscribe** — `GET /mail/<room>/events` holds an SSE connection and is pushed to as messages arrive. Suited to anything long-lived: the desktop app, a session watching its counterpart.
+- **Subscribe** — `GET /mail/<room>/events` holds an SSE connection and is pushed to as messages arrive. Suited to anything long-lived: the desktop app, a session watching its counterpart. Each frame carries `id: <seq>`, so a dropped subscriber resumes rather than skipping the gap — `EventSource` replays the last id it saw as `Last-Event-ID` on its own, and a client that is not `EventSource` can pass `?since=<seq>` for the same effect.
 - **Read the backlog** — `GET /mail/<room>?since=<seq>` returns what came after `seq`. A hook process lives for milliseconds and cannot hold a connection, so without a buffer it would miss everything sent while its agent was idle. `since` is the highest `seq` already handled, which makes repeat reads idempotent.
 
 Unlike `/ingest`, which downgrades an untrusted sender's `runtime` to null but still accepts the event, mail **requires** `x-gyredeck-token` and returns `401` without it. Mail is read and acted on by agents, so an untrusted local process must not be able to put words into another agent's input.

@@ -392,6 +392,11 @@ function startBridge(config) {
     return room;
   };
 
+  // The seq doubles as the SSE event id, which is what lets a dropped subscriber
+  // resume: EventSource replays the last id it saw back as Last-Event-ID.
+  const mailFrame = (message) =>
+    `id: ${message.seq}\nevent: mail\ndata: ${JSON.stringify(message)}\n\n`;
+
   const publishMail = (room, from, text) => {
     room.seq += 1;
     room.touchedAt = Date.now();
@@ -399,7 +404,7 @@ function startBridge(config) {
     room.messages.push(message);
     if (room.messages.length > MAIL_MAX_MESSAGES) room.messages.shift();
 
-    const frame = `event: mail\ndata: ${JSON.stringify(message)}\n\n`;
+    const frame = mailFrame(message);
     for (const res of room.clients) {
       try { res.write(frame); } catch { room.clients.delete(res); }
     }
@@ -565,6 +570,20 @@ function startBridge(config) {
           ...corsHeaders,
         });
         res.write(`: gyredeck mail room ${name} connected ${new Date().toISOString()}\n\n`);
+
+        // Hand back what was missed while disconnected. Without this a subscriber
+        // that drops has no way to close the gap except to fall back to the
+        // read endpoint, and a push-only reader would simply lose those messages.
+        const resumeFrom = Number.parseInt(
+          req.headers["last-event-id"] ?? url.searchParams.get("since") ?? "",
+          10,
+        );
+        if (Number.isInteger(resumeFrom) && resumeFrom > 0) {
+          for (const message of room.messages) {
+            if (message.seq > resumeFrom) res.write(mailFrame(message));
+          }
+        }
+
         room.clients.add(res);
         room.touchedAt = Date.now();
         req.on("close", () => {

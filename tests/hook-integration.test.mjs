@@ -470,6 +470,35 @@ test("bridge mail rooms push to subscribers and buffer for periodic readers", as
     // Rooms do not leak into each other.
     const alpha = await (await fetch(`${base}/mail/alpha`, { headers })).json();
     assert.deepEqual(alpha.messages.map((message) => message.from), ["codex", "claude-code"]);
+
+    // A subscriber that dropped resumes from the last id it saw, so reconnecting
+    // closes the gap instead of silently skipping it. EventSource sends this header
+    // by itself; `?since=` is the same thing for a client that is not EventSource.
+    const resumed = new AbortController();
+    const replayed = [];
+    const replay = fetch(`${base}/mail/alpha/events`, {
+      headers: { ...headers, "last-event-id": "1" },
+      signal: resumed.signal,
+    })
+      .then(async (response) => {
+        let buffered = "";
+        for await (const chunk of response.body) {
+          buffered += Buffer.from(chunk).toString("utf8");
+          for (const line of buffered.split("\n")) {
+            if (line.startsWith("data: ")) {
+              const message = JSON.parse(line.slice(6));
+              if (!replayed.some((seen) => seen.seq === message.seq)) replayed.push(message);
+            }
+          }
+        }
+      })
+      .catch(() => {});
+    for (let attempt = 0; attempt < 100 && replayed.length < 1; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    resumed.abort();
+    await replay;
+    assert.deepEqual(replayed.map((message) => message.seq), [2], "only messages after the last id");
   } finally {
     subscription.abort();
     bridge.stdin.end();

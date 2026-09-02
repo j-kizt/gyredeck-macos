@@ -281,7 +281,7 @@ function startBridge(config) {
 
   const capabilities = {
     events: { lifecycle: true, turns: true, tools: true, compact: true, llm: true },
-    endpoints: { health: true, snapshot: true, sse: true, hookStop: true, hookAttention: true, ingest: true },
+    endpoints: { health: true, snapshot: true, sse: true, hookStop: true, hookAttention: true, ingest: true, mail: true },
     sessionActions: { focusTerminal: false, endSession: false, dismissEnded: true },
   };
 
@@ -360,6 +360,57 @@ function startBridge(config) {
       req.on("error", () => resolve({}));
     });
 
+  // Mail rooms: a named channel for agents on this machine to talk to each other,
+  // multiplexed onto the bridge port so no second listener has to be opened. A room
+  // is just a key. Subscribers holding an SSE connection are pushed to immediately;
+  // peers that can only check in periodically read the backlog instead, which is the
+  // only workable shape for a hook process that lives for milliseconds and would
+  // otherwise miss anything sent while its agent was idle.
+  const MAIL_ROOM_NAME = /^[A-Za-z0-9_-]{1,64}$/;
+  const MAIL_MAX_ROOMS = 32;
+  const MAIL_MAX_MESSAGES = 100;
+  const MAIL_MAX_TEXT = 4_096;
+  const MAIL_MAX_FROM = 64;
+  const MAIL_ROOM_IDLE_MS = 3_600_000;
+  const mailRooms = new Map();
+
+  // Rooms are created by whoever speaks first, so they need an upper bound and a way
+  // to go away again; without both, any local process could grow this map forever.
+  const sweepMailRooms = () => {
+    const now = Date.now();
+    for (const [name, room] of mailRooms) {
+      if (room.clients.size === 0 && now - room.touchedAt > MAIL_ROOM_IDLE_MS) mailRooms.delete(name);
+    }
+  };
+
+  const mailRoomFor = (name, create) => {
+    const existing = mailRooms.get(name);
+    if (existing) return existing;
+    if (!create || mailRooms.size >= MAIL_MAX_ROOMS) return null;
+    const room = { seq: 0, messages: [], clients: new Set(), touchedAt: Date.now() };
+    mailRooms.set(name, room);
+    return room;
+  };
+
+  // The seq doubles as the SSE event id, which is what lets a dropped subscriber
+  // resume: EventSource replays the last id it saw back as Last-Event-ID.
+  const mailFrame = (message) =>
+    `id: ${message.seq}\nevent: mail\ndata: ${JSON.stringify(message)}\n\n`;
+
+  const publishMail = (room, from, text) => {
+    room.seq += 1;
+    room.touchedAt = Date.now();
+    const message = { seq: room.seq, from, text, ts: new Date().toISOString() };
+    room.messages.push(message);
+    if (room.messages.length > MAIL_MAX_MESSAGES) room.messages.shift();
+
+    const frame = mailFrame(message);
+    for (const res of room.clients) {
+      try { res.write(frame); } catch { room.clients.delete(res); }
+    }
+    return message;
+  };
+
   const server = createServer(async (req, res) => {
     if (req.method === "OPTIONS") {
       res.writeHead(204, corsHeaders);
@@ -421,6 +472,128 @@ function startBridge(config) {
       res.write(`: gyredeck standalone bridge connected ${new Date().toISOString()}\n\n`);
       clients.add(res);
       req.on("close", () => clients.delete(res));
+      return;
+    }
+
+    if (req.url === "/mail" || req.url.startsWith("/mail/") || req.url.startsWith("/mail?")) {
+      const sendJson = (status, body) => {
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+        res.end(JSON.stringify(body));
+      };
+
+      // Mail is a channel agents read and act on, not observational data like
+      // /ingest, so an untrusted caller must not be able to put words into another
+      // agent's input. There is no degraded mode here: no token, no access.
+      if (!matchesIngestToken(config.ingestToken, req.headers["x-gyredeck-token"])) {
+        sendJson(401, { ok: false, error: "unauthorized" });
+        return;
+      }
+      sweepMailRooms();
+
+      const url = new URL(req.url, "http://127.0.0.1");
+      const segments = url.pathname.split("/").filter(Boolean);
+
+      // GET /mail — which rooms exist, so a peer can find its counterpart.
+      if (req.method === "GET" && segments.length === 1) {
+        sendJson(200, {
+          ok: true,
+          rooms: [...mailRooms].map(([name, room]) => ({
+            room: name,
+            seq: room.seq,
+            buffered: room.messages.length,
+            subscribers: room.clients.size,
+          })),
+        });
+        return;
+      }
+
+      const name = segments[1] ?? "";
+      const tail = segments[2];
+      // Room names land in a Map key and in URLs, so keep them to a shape that
+      // cannot be confused for a path of its own.
+      if (!MAIL_ROOM_NAME.test(name)) {
+        sendJson(400, { ok: false, error: "invalid_room" });
+        return;
+      }
+      if (segments.length > 3 || (tail !== undefined && tail !== "events")) {
+        sendJson(404, { ok: false, error: "not_found" });
+        return;
+      }
+
+      // POST /mail/<room> — publish. Whoever speaks first creates the room.
+      if (req.method === "POST" && tail === undefined) {
+        const body = await readJsonBody(req);
+        const from = typeof body.from === "string" ? body.from.trim().slice(0, MAIL_MAX_FROM) : "";
+        const text = typeof body.text === "string" ? body.text : "";
+        if (!from || !text || text.length > MAIL_MAX_TEXT) {
+          sendJson(400, { ok: false, error: "invalid_message" });
+          return;
+        }
+        const room = mailRoomFor(name, true);
+        if (!room) {
+          sendJson(429, { ok: false, error: "too_many_rooms" });
+          return;
+        }
+        const message = publishMail(room, from, text);
+        sendJson(202, { ok: true, room: name, seq: message.seq, subscribers: room.clients.size });
+        return;
+      }
+
+      // GET /mail/<room>?since=<seq> — read what was missed. `since` is the highest
+      // seq the caller has already handled, so a hook that runs once per turn can
+      // pick up everything sent while its agent was idle.
+      if (req.method === "GET" && tail === undefined) {
+        const room = mailRoomFor(name, false);
+        const parsed = Number.parseInt(url.searchParams.get("since") ?? "", 10);
+        const since = Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+        sendJson(200, {
+          ok: true,
+          room: name,
+          seq: room?.seq ?? 0,
+          messages: room ? room.messages.filter((message) => message.seq > since) : [],
+        });
+        return;
+      }
+
+      // GET /mail/<room>/events — subscribe and be pushed to.
+      if (req.method === "GET" && tail === "events") {
+        const room = mailRoomFor(name, true);
+        if (!room) {
+          sendJson(429, { ok: false, error: "too_many_rooms" });
+          return;
+        }
+        res.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache, no-transform",
+          connection: "keep-alive",
+          "x-accel-buffering": "no",
+          ...corsHeaders,
+        });
+        res.write(`: gyredeck mail room ${name} connected ${new Date().toISOString()}\n\n`);
+
+        // Hand back what was missed while disconnected. Without this a subscriber
+        // that drops has no way to close the gap except to fall back to the
+        // read endpoint, and a push-only reader would simply lose those messages.
+        const resumeFrom = Number.parseInt(
+          req.headers["last-event-id"] ?? url.searchParams.get("since") ?? "",
+          10,
+        );
+        if (Number.isInteger(resumeFrom) && resumeFrom > 0) {
+          for (const message of room.messages) {
+            if (message.seq > resumeFrom) res.write(mailFrame(message));
+          }
+        }
+
+        room.clients.add(res);
+        room.touchedAt = Date.now();
+        req.on("close", () => {
+          room.clients.delete(res);
+          room.touchedAt = Date.now();
+        });
+        return;
+      }
+
+      sendJson(405, { ok: false, error: "method_not_allowed" });
       return;
     }
 

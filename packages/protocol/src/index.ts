@@ -16,6 +16,7 @@ export interface IGyredeckBridgeCapabilities {
     hookStop: boolean;
     hookAttention: boolean;
     ingest: boolean;
+    mail: boolean;
   };
   sessionActions: {
     focusTerminal: boolean;
@@ -39,6 +40,7 @@ export const createDefaultBridgeCapabilities = (): IGyredeckBridgeCapabilities =
     hookStop: true,
     hookAttention: true,
     ingest: true,
+    mail: false,
   },
   sessionActions: {
     focusTerminal: false,

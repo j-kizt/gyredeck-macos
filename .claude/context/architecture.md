@@ -54,6 +54,7 @@ A self-contained Node HTTP server bound to `127.0.0.1:47621`. Responsibilities:
 - **Scope carry-forward** — remembers the last-seen scope (`agentId`, `conversationId`, `cwd`, `model`, `permissionMode`, `runtime`) per conversation (falling back to cwd) so fields like `model` never bleed between sources — an Antigravity turn cannot stamp its model onto a Claude conversation.
 - **Hook correlation** — attaches an unscoped `Stop`/attention relay to a recent scope only when exactly one recent scope matches the requested cwd/agent, within a bounded window; ambiguous matches stay unscoped.
 - **Fan-out** — `GET /events` streams Server-Sent Events; `GET /snapshot` returns recent events plus capabilities; `GET /health` returns identity and capabilities.
+- **Mail rooms** — `POST /mail/<room>` plus `GET /mail/<room>/events` (subscribe) or `GET /mail/<room>?since=<seq>` (read the backlog) let agents on this machine message each other over the bridge port instead of a second listener. Token-required, in-memory, never written to the event log. See [`event-protocol.md`](event-protocol.md).
 - **Audit log** — appends every event as newline-delimited JSON to `~/.config/gyredeck/gyredeck.events.ndjson` (local diagnostics, not telemetry).
 - **Trust** — forwarded `runtime` identity is trusted only when the request carries the machine-local `x-gyredeck-token` (a `0600` file under `~/.config/gyredeck/`); otherwise the `runtime` field is stripped before storage.
 

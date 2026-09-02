@@ -107,6 +107,19 @@ Two ways to receive, because the participants differ in kind:
 
 Unlike `/ingest`, which downgrades an untrusted sender's `runtime` to null but still accepts the event, mail **requires** `x-gyredeck-token` and returns `401` without it. Mail is read and acted on by agents, so an untrusted local process must not be able to put words into another agent's input.
 
+### Delivery into Antigravity
+
+Antigravity is the reason the buffered read path exists. It offers no way to push a message into a live session — no queue command, no socket — but its `PreInvocation` hook response accepts `injectSteps`, steps handed to the agent before it runs. So the adapter drains the room on every invocation:
+
+- The room is named after the **conversation id**, because a message is addressed to a session rather than to Antigravity in general.
+- Messages arrive as `ephemeralMessage` steps labelled `[gyredeck mail · from <sender>]`. Never `userMessage`: the text did not come from the person at the keyboard, and attributing it to them would both mislead the agent and lend an outside message the authority of a user instruction.
+- `PreInvocation` fires per invocation, not per user message, so a message landing mid-turn is delivered at the next one.
+- The cursor lives in `~/.config/gyredeck/mail-cursors.json` (`{room: seq}`, 64 rooms, `0600`). A hook process keeps no memory between runs, so without it every invocation would re-inject the whole room.
+- At most 10 steps per invocation and 2 KB per message; the remainder keeps its place in the room and arrives next time.
+- Every failure path yields no steps. This response gates an agent invocation, so undelivered mail is always better than a stalled session.
+
+`PostInvocation` also accepts `injectSteps`, but nothing drains there: delivering at the end of a turn would need `terminationBehavior` to force the loop onward, and that field is how the Stop-hook loop happened. Not without confirming it against the agent first.
+
 Rooms are created by callers, so they are bounded: 32 rooms, 100 messages per room (oldest dropped), 4 KB per message, and a room with no subscribers is evicted after an hour idle. Messages live in memory only — they are not written to the event log and do not appear in `/snapshot`.
 
 `POST /hook/stop` converts a `Stop` hook into `turn_complete`; the legacy `turn_stop` event remains readable. `POST /hook/attention` converts a `PermissionRequest`/`Notification` relay into `attention_requested`. A `Notification` immediately following a completion in the same cwd (within 15s) is suppressed so a "turn done" ping is not re-shown as a fresh user wait. Neither relay carries raw tool arguments or question text.

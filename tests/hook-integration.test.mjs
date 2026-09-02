@@ -506,3 +506,89 @@ test("bridge mail rooms push to subscribers and buffer for periodic readers", as
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("antigravity PreInvocation delivers mail into injectSteps exactly once", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-agy-mail-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const conversationId = "0313999f-b335-40b3-bc51-b8a9e65df5ce";
+  const preInvocation = async (invocationNum) => {
+    const result = await runAdapter(
+      "adapters/antigravity/gyredeck-agy-hook.mjs",
+      ["--event", "PreInvocation"],
+      home,
+      { conversationId, invocationNum, workspacePaths: ["/tmp/agy-project"], modelName: "gemini-3-pro" },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    return JSON.parse(result.stdout).injectSteps;
+  };
+
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const send = (from, text) =>
+      fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-gyredeck-token": token },
+        body: JSON.stringify({ from, text }),
+      });
+
+    // An empty room must still answer with the documented shape.
+    assert.deepEqual(await preInvocation(0), []);
+
+    await send("codex", "build is green");
+    await send("claude-code", "ack");
+    // Delivered as ephemeral messages labelled with their sender: this text did not
+    // come from the user, and must not be handed to the agent as though it had.
+    assert.deepEqual(await preInvocation(1), [
+      { ephemeralMessage: "[gyredeck mail · from codex] build is green" },
+      { ephemeralMessage: "[gyredeck mail · from claude-code] ack" },
+    ]);
+
+    // The hook keeps no memory between runs, so the stored cursor is the only thing
+    // stopping the next invocation from re-injecting the whole room.
+    assert.deepEqual(await preInvocation(2), []);
+    const cursors = JSON.parse(await readFile(join(home, ...CONFIG_DIR, "mail-cursors.json"), "utf8"));
+    assert.equal(cursors[conversationId], 2);
+
+    await send("codex", "one more");
+    assert.deepEqual(await preInvocation(3), [
+      { ephemeralMessage: "[gyredeck mail · from codex] one more" },
+    ]);
+
+    // A burst is capped per invocation; the remainder keeps its place in the room.
+    for (let index = 0; index < 14; index += 1) await send("codex", `bulk-${index}`);
+    const first = await preInvocation(4);
+    assert.equal(first.length, 10);
+    assert.equal(first[0].ephemeralMessage, "[gyredeck mail · from codex] bulk-0");
+    const rest = await preInvocation(5);
+    assert.deepEqual(rest.map((step) => step.ephemeralMessage), [
+      "[gyredeck mail · from codex] bulk-10",
+      "[gyredeck mail · from codex] bulk-11",
+      "[gyredeck mail · from codex] bulk-12",
+      "[gyredeck mail · from codex] bulk-13",
+    ]);
+
+    // With the bridge gone the hook must still answer, and quickly: this response
+    // gates an agent invocation, so a stalled session is worse than lost mail.
+    bridge.stdin.end();
+    bridge.kill();
+    const startedAt = Date.now();
+    assert.deepEqual(await preInvocation(6), []);
+    assert.ok(Date.now() - startedAt < 5_000, "hook answered without waiting on a dead bridge");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

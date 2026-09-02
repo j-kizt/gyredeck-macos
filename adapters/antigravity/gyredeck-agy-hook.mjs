@@ -59,6 +59,22 @@ const readInput = async () => {
   }
 };
 
+/** The tool Antigravity calls when it needs an answer from the user. */
+const ASK_QUESTION_TOOL = "ask_question";
+
+/**
+ * Pull the question out of an ask_question call so the panel can show what is being
+ * asked. The argument shape is not pinned by any published contract, so every step is
+ * guarded and an unrecognised shape simply yields no message.
+ */
+const firstQuestionText = (args) => {
+  const question = Array.isArray(args?.questions) ? args.questions[0] : null;
+  const text = typeof question?.question === "string" ? question.question.trim() : "";
+  if (text) return text;
+  const summary = typeof args?.toolSummary === "string" ? args.toolSummary.trim() : "";
+  return summary || null;
+};
+
 /** POST a JSON payload to the Gyredeck bridge. */
 const post = (endpoint, token, path, payload) =>
   new Promise((resolve) => {
@@ -178,6 +194,23 @@ const main = async () => {
         toolName,
         argKeys,
       })));
+      // Antigravity has no notification hook. When it needs an answer it calls the
+      // ask_question tool, so that call is the only signal that the turn has stopped
+      // for the user — the same role AskUserQuestion plays for Claude Code. Relayed
+      // raw so it picks up the bridge's scope correlation and de-dup, and labelled
+      // Notification because that is what makes the bridge file it as a question
+      // rather than a permission prompt.
+      if (toolName === ASK_QUESTION_TOOL) {
+        posts.push(post(endpoint, token, "/hook/attention", {
+          hookId: randomUUID(),
+          hookEventName: "Notification",
+          source: "tool",
+          workingDirectory: cwd,
+          conversationId,
+          toolName,
+          message: firstQuestionText(input.toolCall?.args),
+        }));
+      }
     } else if (eventType === "PostToolUse") {
       const status = input.error ? "error" : "success";
       posts.push(post(endpoint, token, "/ingest", buildEvent("tool_end", {

@@ -458,6 +458,15 @@ test("bridge mail rooms push to subscribers and buffer for periodic readers", as
     }
     assert.deepEqual(pushed.map((message) => `${message.seq}:${message.from}`), ["1:codex", "2:claude-code"]);
 
+    // Nothing has called the read endpoint on alpha, so this is the push alone
+    // counting as delivery — a room whose only reader holds a stream would otherwise
+    // report every message as waiting forever.
+    const pushedRoom = (await (await fetch(`${base}/mail`, { headers })).json())
+      .rooms.find((room) => room.room === "alpha");
+    assert.equal(pushedRoom.readSeq, 2);
+    assert.equal(pushedRoom.pending, 0);
+    assert.ok(pushedRoom.lastReadAt);
+
     // A peer that can only check in periodically — a hook process lives for
     // milliseconds — reads what it missed instead, and `since` makes that repeatable.
     await publish("beta", { from: "claude-code", text: "while you were away" });
@@ -480,8 +489,9 @@ test("bridge mail rooms push to subscribers and buffer for periodic readers", as
     assert.equal(betaRoom.readSeq, 2, "the drain above handed both messages over");
     assert.equal(betaRoom.pending, 0);
     assert.ok(betaRoom.lastReadAt, "a delivery time to show next to the chip");
-    // The isolation check above read alpha, and a read is a read whoever made it —
-    // the number tracks what the room handed over, not who asked for it.
+    // alpha has a live subscriber, and a push is a delivery — a room whose only
+    // reader holds a stream would otherwise report everything as waiting forever,
+    // since nothing ever calls the read endpoint on it.
     const alphaRoom = listed.rooms.find((room) => room.room === "alpha");
     assert.equal(alphaRoom.pending, 0);
     assert.ok(alphaRoom.lastReadAt);

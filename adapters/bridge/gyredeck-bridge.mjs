@@ -411,8 +411,21 @@ function startBridge(config) {
     if (room.messages.length > MAIL_MAX_MESSAGES) room.messages.shift();
 
     const frame = mailFrame(message);
+    let pushed = false;
     for (const res of room.clients) {
-      try { res.write(frame); } catch { room.clients.delete(res); }
+      try {
+        res.write(frame);
+        pushed = true;
+      } catch {
+        room.clients.delete(res);
+      }
+    }
+    // A push is a delivery. Without this a room whose only reader holds a stream
+    // would report every message as still waiting to be picked up forever, because
+    // nothing ever calls the read endpoint on it.
+    if (pushed) {
+      room.readSeq = Math.max(room.readSeq, message.seq);
+      room.lastReadAt = message.ts;
     }
     return message;
   };

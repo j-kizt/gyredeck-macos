@@ -113,7 +113,9 @@ Unlike `/ingest`, which downgrades an untrusted sender's `runtime` to null but s
 
 A room reports `seq` (newest message), `readSeq` (how far it has handed out), and `pending` (the difference), plus `lastMessageAt` and `lastReadAt`. The session card renders that as a chip: a count while messages wait, and a quiet marker with a time once they have been collected.
 
-`readSeq` exists because the reader's own cursor lives in the adapter's `mail-cursors.json`, which the app has no business reading. The room records what it actually handed over on each `GET /mail/<room>` instead, and only ever moves forward — re-reading from an older `since` is an inspection, not an un-read. It is a hint for the UI, not a delivery guarantee: with more than one reader on a room they share the number, and a manual read from a shell counts as a delivery.
+`readSeq` exists because the reader's own cursor lives in the adapter's `mail-cursors.json`, which the app has no business reading. The room records what it actually handed over instead — a `GET /mail/<room>` or a push to a live subscriber both count, since in both cases the reader has the message in hand. Without counting the push, a room whose only reader holds a stream would report everything as waiting forever, because nothing ever calls the read endpoint on it.
+
+It only ever moves forward: re-reading from an older `since` is an inspection, not an un-read, and a resuming subscriber's replay does not rewind it. It is a hint for the UI, not a delivery guarantee: with more than one reader on a room they share the number, and a manual read from a shell counts as a delivery.
 
 The desktop app reads this through the native `mail_rooms` command rather than fetching it in the webview, so the ingest token stays on the native side. Polled every few seconds while the session list is on screen — mail is not part of the event protocol, and letting a message decide a session's presence status would be worse than a few seconds of lag.
 

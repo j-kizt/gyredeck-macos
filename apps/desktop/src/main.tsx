@@ -594,11 +594,12 @@ const App = () => {
     deleteSessions([conversationId]);
   };
 
-  // Claude Code's conversationId IS its resumable session id, so copy a ready
-  // `claude --resume` command. Codex (codex:<cwd>) and Antigravity ids aren't
-  // CLI-resumable, so those fall back to copying the raw id.
+  // Claude Code and Antigravity both report a conversationId that IS their resumable
+  // session id, so copy a ready-to-run command. Codex cannot: its id is synthesised by
+  // the adapter as `codex:<cwd>`, which no CLI accepts, so it falls back to the raw id.
   const resumeCommand = (provider: string, conversationId: string): string | null => {
     if (provider === "Claude Code") return `claude --resume ${conversationId}`;
+    if (provider === "Antigravity") return `agy --conversation=${conversationId}`;
     return null;
   };
 

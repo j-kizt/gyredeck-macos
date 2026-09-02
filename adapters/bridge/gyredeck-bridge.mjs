@@ -387,7 +387,10 @@ function startBridge(config) {
     const existing = mailRooms.get(name);
     if (existing) return existing;
     if (!create || mailRooms.size >= MAIL_MAX_ROOMS) return null;
-    const room = { seq: 0, messages: [], clients: new Set(), touchedAt: Date.now() };
+    // readSeq is how far a reader has got. The reader's own cursor lives in the
+    // adapter, which the app cannot see, so the room records what it has handed out
+    // instead — that is what makes "still waiting to be picked up" observable.
+    const room = { seq: 0, readSeq: 0, messages: [], clients: new Set(), touchedAt: Date.now() };
     mailRooms.set(name, room);
     return room;
   };
@@ -397,10 +400,13 @@ function startBridge(config) {
   const mailFrame = (message) =>
     `id: ${message.seq}\nevent: mail\ndata: ${JSON.stringify(message)}\n\n`;
 
-  const publishMail = (room, from, text) => {
+  const publishMail = (room, from, text, replyTo) => {
     room.seq += 1;
     room.touchedAt = Date.now();
-    const message = { seq: room.seq, from, text, ts: new Date().toISOString() };
+    // replyTo is the sender naming where it is listening. Without it a recipient can
+    // be reached but cannot answer, which is how the first version of this ended up
+    // needing a human to carry every reply by hand.
+    const message = { seq: room.seq, from, text, replyTo: replyTo ?? null, ts: new Date().toISOString() };
     room.messages.push(message);
     if (room.messages.length > MAIL_MAX_MESSAGES) room.messages.shift();
 
@@ -500,8 +506,12 @@ function startBridge(config) {
           rooms: [...mailRooms].map(([name, room]) => ({
             room: name,
             seq: room.seq,
+            readSeq: room.readSeq,
+            pending: Math.max(0, room.seq - room.readSeq),
             buffered: room.messages.length,
             subscribers: room.clients.size,
+            lastMessageAt: room.messages.at(-1)?.ts ?? null,
+            lastReadAt: room.lastReadAt ?? null,
           })),
         });
         return;
@@ -529,12 +539,19 @@ function startBridge(config) {
           sendJson(400, { ok: false, error: "invalid_message" });
           return;
         }
+        // A reply address has to be a room name like any other, since it is handed to
+        // an agent that will put it in a URL.
+        const replyTo = typeof body.replyTo === "string" ? body.replyTo : null;
+        if (replyTo !== null && !MAIL_ROOM_NAME.test(replyTo)) {
+          sendJson(400, { ok: false, error: "invalid_reply_to" });
+          return;
+        }
         const room = mailRoomFor(name, true);
         if (!room) {
           sendJson(429, { ok: false, error: "too_many_rooms" });
           return;
         }
-        const message = publishMail(room, from, text);
+        const message = publishMail(room, from, text, replyTo);
         sendJson(202, { ok: true, room: name, seq: message.seq, subscribers: room.clients.size });
         return;
       }
@@ -546,12 +563,15 @@ function startBridge(config) {
         const room = mailRoomFor(name, false);
         const parsed = Number.parseInt(url.searchParams.get("since") ?? "", 10);
         const since = Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
-        sendJson(200, {
-          ok: true,
-          room: name,
-          seq: room?.seq ?? 0,
-          messages: room ? room.messages.filter((message) => message.seq > since) : [],
-        });
+        const messages = room ? room.messages.filter((message) => message.seq > since) : [];
+        if (room) {
+          // Advance on what was actually handed over, and never backwards: a caller
+          // re-reading from an old `since` is inspecting the room, not un-reading it.
+          room.readSeq = Math.max(room.readSeq, messages.at(-1)?.seq ?? since);
+          room.lastReadAt = new Date().toISOString();
+          room.touchedAt = Date.now();
+        }
+        sendJson(200, { ok: true, room: name, seq: room?.seq ?? 0, messages });
         return;
       }
 

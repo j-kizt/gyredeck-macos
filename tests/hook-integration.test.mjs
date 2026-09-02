@@ -471,6 +471,34 @@ test("bridge mail rooms push to subscribers and buffer for periodic readers", as
     const alpha = await (await fetch(`${base}/mail/alpha`, { headers })).json();
     assert.deepEqual(alpha.messages.map((message) => message.from), ["codex", "claude-code"]);
 
+    // What the app shows on a session card. The reader's own cursor lives in the
+    // adapter, which the app cannot see, so the room reports how far it has handed
+    // out instead — that is the only way "waiting to be picked up" is observable.
+    const listed = await (await fetch(`${base}/mail`, { headers })).json();
+    const betaRoom = listed.rooms.find((room) => room.room === "beta");
+    assert.equal(betaRoom.seq, 2);
+    assert.equal(betaRoom.readSeq, 2, "the drain above handed both messages over");
+    assert.equal(betaRoom.pending, 0);
+    assert.ok(betaRoom.lastReadAt, "a delivery time to show next to the chip");
+    // The isolation check above read alpha, and a read is a read whoever made it —
+    // the number tracks what the room handed over, not who asked for it.
+    const alphaRoom = listed.rooms.find((room) => room.room === "alpha");
+    assert.equal(alphaRoom.pending, 0);
+    assert.ok(alphaRoom.lastReadAt);
+
+    // A room nobody has read reports everything as waiting.
+    await publish("gamma", { from: "codex", text: "nobody has collected this" });
+    const untouched = await (await fetch(`${base}/mail`, { headers })).json();
+    const gammaRoom = untouched.rooms.find((room) => room.room === "gamma");
+    assert.equal(gammaRoom.pending, 1);
+    assert.equal(gammaRoom.readSeq, 0);
+    assert.equal(gammaRoom.lastReadAt, null);
+
+    // Re-reading from an older `since` is an inspection, not an un-read.
+    await fetch(`${base}/mail/beta?since=0`, { headers });
+    const reread = await (await fetch(`${base}/mail`, { headers })).json();
+    assert.equal(reread.rooms.find((room) => room.room === "beta").readSeq, 2);
+
     // A subscriber that dropped resumes from the last id it saw, so reconnecting
     // closes the gap instead of silently skipping it. EventSource sends this header
     // by itself; `?since=` is the same thing for a client that is not EventSource.
@@ -567,6 +595,35 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     assert.deepEqual(await preInvocation(2), []);
     const cursors = JSON.parse(await readFile(join(home, ...CONFIG_DIR, "mail-cursors.json"), "utf8"));
     assert.equal(cursors[conversationId], 2);
+
+    // A reply address has to be a room name: the adapter puts it in a URL and hands
+    // that to an agent to run.
+    const badReply = await fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      body: JSON.stringify({ from: "claude-code", text: "x", replyTo: "has/slash" }),
+    });
+    assert.equal(badReply.status, 400);
+
+    // When a sender names where it is listening, the header carries the command to
+    // answer with — that is the whole outbound path, since Antigravity can already
+    // run shell commands and needs nothing added on its side but the address.
+    await fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      body: JSON.stringify({ from: "claude-code", text: "please answer", replyTo: "claude-inbox" }),
+    });
+    const [replyHeader] = await preInvocation(7);
+    assert.match(replyHeader.ephemeralMessage, /reply room claude-inbox/);
+    assert.match(replyHeader.ephemeralMessage, new RegExp(`/mail/claude-inbox`));
+    // The token is read at send time, never pasted into the conversation store.
+    assert.match(replyHeader.ephemeralMessage, /cat ~\/\.config\/gyredeck\/gyredeck\.ingest-token/);
+    assert.doesNotMatch(replyHeader.ephemeralMessage, new RegExp(token));
+
+    // A message with no reply address gets no command to run.
+    await send("codex", "no reply address");
+    const [plainHeader] = await preInvocation(8);
+    assert.doesNotMatch(plainHeader.ephemeralMessage, /To answer/);
 
     await send("codex", "one more");
     const [singleHeader, ...single] = await preInvocation(3);

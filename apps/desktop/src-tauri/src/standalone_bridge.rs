@@ -304,6 +304,98 @@ fn probe_bridge(endpoint: BridgeEndpoint) -> BridgeProbe {
     }
 }
 
+/// One mail room as the bridge reports it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct MailRoom {
+    pub room: String,
+    pub seq: u32,
+    pub pending: u32,
+    pub subscribers: u32,
+    #[serde(rename = "lastMessageAt")]
+    pub last_message_at: Option<String>,
+    #[serde(rename = "lastReadAt")]
+    pub last_read_at: Option<String>,
+}
+
+/// Read the machine-local ingest token. Mail requires it, and it never leaves the
+/// native side — the webview asks this process for room state instead of holding a
+/// credential it has no other use for.
+fn read_ingest_token() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let token = fs::read_to_string(
+        PathBuf::from(home)
+            .join(".config")
+            .join("gyredeck")
+            .join("gyredeck.ingest-token"),
+    )
+    .ok()?;
+    let token = token.trim().to_string();
+    (token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit())).then_some(token)
+}
+
+/// Ask the bridge which mail rooms exist and how much is waiting in each.
+///
+/// Uses the same raw request as the health probe rather than an HTTP client: this is
+/// one loopback GET, and the bridge answers with Content-Length rather than chunked.
+pub(crate) fn mail_rooms() -> Result<Vec<MailRoom>, String> {
+    let Some(token) = read_ingest_token() else {
+        return Err("Ingest token is not available yet".to_string());
+    };
+    let port = configured_bridge_port();
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+
+    let mut stream = TcpStream::connect_timeout(&address, BRIDGE_PROBE_TIMEOUT)
+        .map_err(|error| format!("Bridge is not reachable: {error}"))?;
+    let _ = stream.set_read_timeout(Some(BRIDGE_PROBE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(BRIDGE_PROBE_TIMEOUT));
+
+    let request = format!(
+        "GET /mail HTTP/1.1\r\nHost: {BRIDGE_HOST}:{port}\r\nAccept: application/json\r\nX-Gyredeck-Token: {token}\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("Failed to ask the bridge for mail rooms: {error}"))?;
+
+    let mut response = String::new();
+    let _ = stream.take(256 * 1024).read_to_string(&mut response);
+
+    let Some((head, body)) = response.split_once("\r\n\r\n") else {
+        return Err("Bridge returned no response body".to_string());
+    };
+    if !head.starts_with("HTTP/1.1 200") {
+        // A bridge predating mail rooms answers 404 here; an unauthorized read is 401.
+        let status = head.lines().next().unwrap_or("unknown status");
+        return Err(format!("Bridge declined the mail room read: {status}"));
+    }
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| format!("Bridge sent malformed JSON: {error}"))?;
+    let Some(rooms) = parsed.get("rooms").and_then(|value| value.as_array()) else {
+        return Ok(Vec::new());
+    };
+
+    Ok(rooms
+        .iter()
+        .filter_map(|room| {
+            let name = room.get("room")?.as_str()?.to_string();
+            let number = |key: &str| room.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let text = |key: &str| {
+                room.get(key)
+                    .and_then(|v| v.as_str())
+                    .map(|value| value.to_string())
+            };
+            Some(MailRoom {
+                room: name,
+                seq: number("seq"),
+                pending: number("pending"),
+                subscribers: number("subscribers"),
+                last_message_at: text("lastMessageAt"),
+                last_read_at: text("lastReadAt"),
+            })
+        })
+        .collect())
+}
+
 fn classify_connect_error(error: &std::io::Error) -> BridgeProbe {
     if error.kind() == ErrorKind::ConnectionRefused {
         BridgeProbe::Offline

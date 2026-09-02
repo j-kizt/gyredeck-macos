@@ -52,6 +52,10 @@ Bound to `127.0.0.1:47621`.
 | POST | `/ingest` | Multi-provider event fan-in (accepts a full envelope). |
 | POST | `/hook/stop` | Turn-completion relay → `turn_complete`. |
 | POST | `/hook/attention` | Attention/permission relay → `attention_requested`. |
+| GET | `/mail` | Mail rooms that currently exist. |
+| POST | `/mail/<room>` | Send a message into a room. |
+| GET | `/mail/<room>?since=<seq>` | Read messages after `seq`. |
+| GET | `/mail/<room>/events` | Subscribe to a room (SSE). |
 
 `GET /health` and `GET /snapshot` include capability metadata so viewers know which event streams and session actions are real:
 
@@ -73,6 +77,7 @@ Bound to `127.0.0.1:47621`.
       hookStop: true,
       hookAttention: true,
       ingest: true,
+      mail: boolean,
     },
     sessionActions: {
       focusTerminal: boolean,
@@ -84,6 +89,25 @@ Bound to `127.0.0.1:47621`.
 ```
 
 The standalone bridge currently reports every event capability `true`, and `sessionActions: { focusTerminal: false, endSession: false, dismissEnded: true }`. `focusTerminal`/`endSession` stay `false` because no adapter exposes a stable scoped process/session-control API; terminal Focus is a separate best-effort native window action (iTerm2 / Ghostty via AppleScript), not a bridge session action.
+
+## Mail rooms
+
+Agents running on this machine have no shared channel: Claude Code sessions can message each other, Codex accepts `codex queue --thread`, and Antigravity accepts nothing at all. Mail rooms give them one, multiplexed onto the bridge port so nothing has to open a second listener.
+
+A room is just a name matching `[A-Za-z0-9_-]{1,64}`, created by whoever sends to it first. Each message gets a monotonic `seq` within its room:
+
+```json
+{ "seq": 3, "from": "codex", "text": "…", "ts": "2026-09-02T07:25:51.512Z" }
+```
+
+Two ways to receive, because the participants differ in kind:
+
+- **Subscribe** — `GET /mail/<room>/events` holds an SSE connection and is pushed to as messages arrive. Suited to anything long-lived: the desktop app, a session watching its counterpart.
+- **Read the backlog** — `GET /mail/<room>?since=<seq>` returns what came after `seq`. A hook process lives for milliseconds and cannot hold a connection, so without a buffer it would miss everything sent while its agent was idle. `since` is the highest `seq` already handled, which makes repeat reads idempotent.
+
+Unlike `/ingest`, which downgrades an untrusted sender's `runtime` to null but still accepts the event, mail **requires** `x-gyredeck-token` and returns `401` without it. Mail is read and acted on by agents, so an untrusted local process must not be able to put words into another agent's input.
+
+Rooms are created by callers, so they are bounded: 32 rooms, 100 messages per room (oldest dropped), 4 KB per message, and a room with no subscribers is evicted after an hour idle. Messages live in memory only — they are not written to the event log and do not appear in `/snapshot`.
 
 `POST /hook/stop` converts a `Stop` hook into `turn_complete`; the legacy `turn_stop` event remains readable. `POST /hook/attention` converts a `PermissionRequest`/`Notification` relay into `attention_requested`. A `Notification` immediately following a completion in the same cwd (within 15s) is suppressed so a "turn done" ping is not re-shown as a fresh user wait. Neither relay carries raw tool arguments or question text.
 

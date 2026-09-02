@@ -394,3 +394,86 @@ test("standalone bridge appends relayed events to the ndjson log", async () => {
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("bridge mail rooms push to subscribers and buffer for periodic readers", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-mail-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const subscription = new AbortController();
+  try {
+    const health = await waitForHealth(port, stderrRef);
+    assert.equal(health.capabilities.endpoints.mail, true);
+
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const publish = (room, body) =>
+      fetch(`${base}/mail/${room}`, { method: "POST", headers, body: JSON.stringify(body) });
+
+    // Mail is acted on by agents, so an untrusted caller gets nothing at all —
+    // unlike /ingest, which downgrades runtime identity but still accepts the event.
+    const unauthorized = await fetch(`${base}/mail/alpha`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: "intruder", text: "do this" }),
+    });
+    assert.equal(unauthorized.status, 401);
+
+    // A room name has to stay a single path segment.
+    assert.equal((await fetch(`${base}/mail/has%2Fslash`, { headers })).status, 400);
+    // A message needs a sender and a body.
+    assert.equal((await publish("alpha", { text: "no sender" })).status, 400);
+
+    // A subscriber holding the stream is pushed to as messages arrive.
+    const pushed = [];
+    const stream = fetch(`${base}/mail/alpha/events`, { headers, signal: subscription.signal })
+      .then(async (response) => {
+        for await (const chunk of response.body) {
+          for (const line of Buffer.from(chunk).toString("utf8").split("\n")) {
+            if (line.startsWith("data: ")) pushed.push(JSON.parse(line.slice(6)));
+          }
+        }
+      })
+      .catch(() => {});
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const rooms = await (await fetch(`${base}/mail`, { headers })).json();
+      if (rooms.rooms.some((room) => room.room === "alpha" && room.subscribers === 1)) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    assert.equal((await publish("alpha", { from: "codex", text: "hello" })).status, 202);
+    assert.equal((await publish("alpha", { from: "claude-code", text: "hi back" })).status, 202);
+    for (let attempt = 0; attempt < 100 && pushed.length < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.deepEqual(pushed.map((message) => `${message.seq}:${message.from}`), ["1:codex", "2:claude-code"]);
+
+    // A peer that can only check in periodically — a hook process lives for
+    // milliseconds — reads what it missed instead, and `since` makes that repeatable.
+    await publish("beta", { from: "claude-code", text: "while you were away" });
+    await publish("beta", { from: "claude-code", text: "and again" });
+    const drained = await (await fetch(`${base}/mail/beta`, { headers })).json();
+    assert.deepEqual(drained.messages.map((message) => message.text), ["while you were away", "and again"]);
+    const empty = await (await fetch(`${base}/mail/beta?since=${drained.seq}`, { headers })).json();
+    assert.deepEqual(empty.messages, []);
+
+    // Rooms do not leak into each other.
+    const alpha = await (await fetch(`${base}/mail/alpha`, { headers })).json();
+    assert.deepEqual(alpha.messages.map((message) => message.from), ["codex", "claude-code"]);
+  } finally {
+    subscription.abort();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

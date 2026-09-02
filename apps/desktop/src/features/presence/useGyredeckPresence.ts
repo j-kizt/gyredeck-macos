@@ -80,6 +80,7 @@ const normalizeCapabilities = (value: unknown): IGyredeckBridgeCapabilities => {
         fallback.endpoints.hookAttention,
       ),
       ingest: readBoolean(record.endpoints, "ingest", fallback.endpoints.ingest),
+      mail: readBoolean(record.endpoints, "mail", fallback.endpoints.mail),
     },
     sessionActions: {
       focusTerminal: readBoolean(

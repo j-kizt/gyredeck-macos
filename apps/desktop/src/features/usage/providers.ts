@@ -33,17 +33,6 @@ export const USAGE_PROVIDERS: IUsageProviderConfig[] = [
       { label: "Console", url: "https://console.anthropic.com/" },
     ],
   },
-  {
-    id: "cursor",
-    label: "Cursor",
-    command: "cursor_usage",
-    iconPath: "/provider-icons/cursor.svg",
-    color: "#ffffff",
-    links: [
-      { label: "Status", url: "https://status.cursor.com/" },
-      { label: "Dashboard", url: "https://www.cursor.com/dashboard" },
-    ],
-  },
 ];
 
 export const USAGE_METRIC_GROUPS: IUsageMetricGroup[] = [

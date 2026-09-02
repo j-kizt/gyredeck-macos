@@ -39,7 +39,7 @@ The app needs a hook to see your sessions. After installing, click the menu-bar 
 | Tab | What it shows |
 | --- | --- |
 | **Sessions** | Workspace-grouped agent sessions with live activity (turn / tool / compaction / done / needs-input), recent-activity detail, clear/dismiss, and a Focus button that jumps to the matching terminal |
-| **Usage** | Local quota/token views for known providers (Claude Code, Codex, Cursor, Antigravity), in-use providers first; truthful unavailable/offline states |
+| **Usage** | Local quota/token views for known providers (Claude Code, Codex, Antigravity), in-use providers first; truthful unavailable/offline states |
 | **Listening Ports** | Locally listening TCP/HTTP services named from their command line, with open-in-browser and guarded stop controls |
 | **Git Monitor** | Per-repo latest commit, CI status (GitHub Actions / GitLab pipelines), and open PRs/MRs across **GitHub & GitLab**; add repos from a picker, sign in via OAuth device flow or import from `gh`/`glab`, and switch/manage accounts inline |
 

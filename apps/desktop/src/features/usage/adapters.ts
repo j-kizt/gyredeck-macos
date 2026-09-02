@@ -201,7 +201,7 @@ export const parseAgentUsageSnapshot = (
           line.type === "barChart" && line.label.toLowerCase() === "usage trend",
       ) ?? null,
     dailyTokenRows:
-      providerId === "codex" || providerId === "cursor"
+      providerId === "codex"
         ? lines
             .filter(
               (line) =>
@@ -215,7 +215,7 @@ export const parseAgentUsageSnapshot = (
             .filter((line) => line.value)
         : [],
     modelShares:
-      providerId === "codex" || providerId === "cursor"
+      providerId === "codex"
         ? lines
             .filter(
               (line) =>
@@ -264,7 +264,7 @@ export const readCachedUsageSnapshots = (): Partial<
     return Object.fromEntries(
       Object.entries(parsed).filter(
         ([providerId, snapshot]) =>
-          ["codex", "agy", "claude", "cursor"].includes(providerId) &&
+          ["codex", "agy", "claude"].includes(providerId) &&
           snapshot &&
           typeof snapshot === "object" &&
           Array.isArray(snapshot.lines) &&

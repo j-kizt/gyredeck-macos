@@ -65,7 +65,7 @@ Tauri v2 shell. Native responsibilities:
 
 - **Tray + window** — a menu-bar tray icon with Show / Hide / Quit; clicking it toggles a standard menu-bar utility window (`show_main_window` / `hide_main_window` / `toggle_main_window`). This is an ordinary titled window, not a notch or popover.
 - **Terminal focus** — `focus_terminal` activates the matching iTerm2 or Ghostty window by cwd/title via AppleScript (`osascript`). This is best-effort UI focus, not process/session control.
-- **Usage providers** — `codex_usage`, `claude_usage`, `cursor_usage`, `agy_usage` run provider CLIs/HTTP off the renderer invoke path (blocking worker pool).
+- **Usage providers** — `codex_usage`, `claude_usage`, `agy_usage` run provider CLIs/HTTP off the renderer invoke path (blocking worker pool).
 - **Services scan** (`local_services.rs`) — enumerates listening TCP sockets via `lsof`, probes HTTP roots, and exposes a guarded stop/force-kill control for eligible current-user listeners. See `services.md`.
 - **Git Monitor** (`github.rs`) — per-repo latest commit, CI status (GitHub Actions / GitLab pipelines), and open PRs/MRs for **GitHub and GitLab** via their REST APIs, using an own provider-tagged token store (`~/.config/gyredeck/github-accounts.json`, `0600`). Accounts are added via OAuth 2.0 device flow (GitLab tokens carry a refresh token + expiry and auto-refresh) or imported from the optional `gh`/`glab` CLIs. A built-in git credential helper (`gyredeck-desktop git-credential`) serves `git push`/`pull` without those CLIs, per-host (A1: fills only hosts with no existing gh/glab helper); GitLab uses username `oauth2`. An optional "Sync git identity" toggle writes the global `user.name`/`user.email` (+ `gh auth switch`) on account switch; with it off, switching is view-only.
 - **Display / keep-awake** — persisted display selection and a keep-display-awake toggle.
@@ -90,7 +90,7 @@ Ordered files under `src/styles/` preserve CSS cascade ownership.
 | Tab | Source | What it shows |
 | --- | --- | --- |
 | **Sessions** | bridge events → presence model | Workspace-grouped agent sessions with live activity (turn / tool / compaction / done / needs-input), recent-activity detail, clear/dismiss, and a Focus button that jumps to the matching terminal. |
-| **Usage** | native provider commands | Local quota/token views for Claude Code, Codex, Cursor, and Antigravity; truthful unavailable/offline states. |
+| **Usage** | native provider commands | Local quota/token views for Claude Code, Codex, and Antigravity; truthful unavailable/offline states. |
 | **Listening Ports** | native `lsof` scan | Locally listening TCP/HTTP services named from their command line, with open-in-browser and guarded stop controls. |
 | **Git Monitor** | GitHub/GitLab REST APIs (own token store; OAuth device flow or `gh`/`glab` import) | Per-repo latest commit, CI status (Actions/pipelines), and open PRs/MRs across GitHub & GitLab; inline account management, optional git-identity sync, and a built-in credential helper for push. |
 

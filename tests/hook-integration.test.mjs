@@ -321,7 +321,8 @@ test("antigravity adapter answers each event with its documented response shape"
       PostToolUse: {},
       PreInvocation: { injectSteps: [] },
       PostInvocation: { injectSteps: [], terminationBehavior: "" },
-      Stop: { decision: "continue", reason: "" },
+      // "allow", never "continue" — see the adapter. A wrong value here loops AGY.
+      Stop: { decision: "allow", reason: "" },
     };
 
     for (const [event, shape] of Object.entries(expected)) {

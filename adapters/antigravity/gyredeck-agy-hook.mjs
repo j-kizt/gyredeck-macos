@@ -129,8 +129,12 @@ const main = async () => {
         return { injectSteps: [] };
       case "PostInvocation":
         return { injectSteps: [], terminationBehavior: "" };
+      // "allow" permits the turn to end. It must never be "continue": AGY reads that
+      // as "keep going" and answers every finished turn with "Stop hook blocked
+      // termination", looping the agent forever. The bridge POST below is what
+      // reports turn completion — it is independent of this decision.
       case "Stop":
-        return { decision: "continue", reason: "" };
+        return { decision: "allow", reason: "" };
       default:
         // PostToolUse (and anything unrecognized) expects a bare object.
         return {};

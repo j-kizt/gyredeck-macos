@@ -116,6 +116,7 @@ const App = () => {
   const [setupOpen, setSetupOpen] = useState(false);
   const [hookStatus, setHookStatus] = useState<IHookStatus>({ path: null, installed: null });
   const [agyStatus, setAgyStatus] = useState<IHookStatus>({ path: null, installed: null });
+  const [codexStatus, setCodexStatus] = useState<IHookStatus>({ path: null, installed: null });
   const [dismissedSessionIds, setDismissedSessionIds] = useState<DismissedSessionRegistry>(readDismissedSessionIds);
   const [deletedSessionIds, setDeletedSessionIds] = useState<DeletedSessionRegistry>(readDeletedSessionIds);
   const [keepAwakeEnabled, setKeepAwakeEnabled] = useState(readKeepAwakeEnabled);
@@ -602,12 +603,18 @@ const App = () => {
     deleteSessions([conversationId]);
   };
 
-  // Claude Code and Antigravity both report a conversationId that IS their resumable
-  // session id, so copy a ready-to-run command. Codex cannot: its id is synthesised by
-  // the adapter as `codex:<cwd>`, which no CLI accepts, so it falls back to the raw id.
+  // Each agent reports a conversationId that is its own resumable session id, so the
+  // copy button hands over a ready-to-run command.
+  //
+  // Codex is conditional. Its hook adapter reports the real session_id, but the older
+  // notify integration synthesised `codex:<cwd>` — not a session id at all — and both
+  // surface under the same provider label. The id itself is what distinguishes them.
   const resumeCommand = (provider: string, conversationId: string): string | null => {
     if (provider === "Claude Code") return `claude --resume ${conversationId}`;
     if (provider === "Antigravity") return `agy --conversation=${conversationId}`;
+    if (provider === "Codex") {
+      return conversationId.startsWith("codex:") ? null : `codex resume ${conversationId}`;
+    }
     return null;
   };
 
@@ -727,6 +734,20 @@ const App = () => {
     }
   };
 
+  const loadCodexStatus = async () => {
+    if (!canUseNativeControls) {
+      clearHookStatus(setCodexStatus);
+      return;
+    }
+
+    try {
+      const [path, installed] = await invoke<[string, boolean]>("codex_hook_status");
+      setCodexStatus({ path, installed });
+    } catch {
+      clearHookStatus(setCodexStatus);
+    }
+  };
+
   const installAgy = async () => {
     if (!canUseNativeControls) {
       setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: "Open with pnpm desktop:dev" });
@@ -741,6 +762,24 @@ const App = () => {
       setNativeAction({
         bridgeOnline: nativeAction.bridgeOnline,
         message: error instanceof Error ? error.message : "Antigravity hook install failed",
+      });
+    }
+  };
+
+  const installCodex = async () => {
+    if (!canUseNativeControls) {
+      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: "Open with pnpm desktop:dev" });
+      return;
+    }
+
+    try {
+      const path = await invoke<string>("install_codex_hook");
+      setCodexStatus({ path, installed: true });
+      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: `Installed → ${shortenPath(path)} · restart Codex` });
+    } catch (error) {
+      setNativeAction({
+        bridgeOnline: nativeAction.bridgeOnline,
+        message: error instanceof Error ? error.message : "Codex hook install failed",
       });
     }
   };
@@ -769,6 +808,7 @@ const App = () => {
     if (setupOpen) {
       void loadHookStatus();
       void loadAgyStatus();
+      void loadCodexStatus();
       void checkBridge();
     }
   }, [setupOpen]);
@@ -850,10 +890,12 @@ const App = () => {
                   keepAwakeError={keepAwakeError}
                   hookStatus={hookStatus}
                   agyStatus={agyStatus}
+                  codexStatus={codexStatus}
                   nativeAction={nativeAction}
                   onCheckBridge={checkBridge}
                   onInstallHook={installHook}
                   onInstallAgy={installAgy}
+                  onInstallCodex={installCodex}
                   onKeepAwakeChange={updateKeepAwakeEnabled}
                   bridgePort={bridgePort}
                   onApplyBridgePort={applyBridgePort}

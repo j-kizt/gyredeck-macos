@@ -434,7 +434,7 @@ fn is_gyredeck_health_response(response: &str) -> bool {
         })
 }
 
-fn find_node_binary() -> Option<PathBuf> {
+pub(crate) fn find_node_binary() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("GYREDECK_NODE_BINARY") {
         let path = PathBuf::from(path);
         if path.is_absolute() && path.is_file() {

@@ -30,10 +30,12 @@ export interface ISetupPanelProps {
   keepAwakeError: string | null;
   hookStatus: { path: string | null; installed: boolean | null };
   agyStatus: { path: string | null; installed: boolean | null };
+  codexStatus: { path: string | null; installed: boolean | null };
   nativeAction: { bridgeOnline: boolean | null; message: string | null };
   onCheckBridge: () => Promise<void> | void;
   onInstallHook: () => Promise<void> | void;
   onInstallAgy: () => Promise<void> | void;
+  onInstallCodex: () => Promise<void> | void;
   onKeepAwakeChange: (enabled: boolean) => void;
   bridgePort: number;
   onApplyBridgePort: (port: number) => Promise<void> | void;
@@ -152,7 +154,7 @@ const UPDATER_DETAIL: Record<IUseUpdater["status"], string> = {
 const MIN_BRIDGE_PORT = 1024;
 const MAX_BRIDGE_PORT = 65535;
 
-export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, agyStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
+export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
   const [activeCategory, setActiveCategory] = useState<SetupCategory>("connection");
   const [compactNavigation, setCompactNavigation] = useState(() => window.matchMedia("(max-width: 380px)").matches);
   const credentialHelper = useGitCredentialHelper(canUseNativeControls);
@@ -246,6 +248,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
             <>
               <div className="setup-section-heading"><span>Plugins</span><small>Agent integrations</small></div>
               <div className="setup-row"><span className="status-slot"><Download className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Antigravity hooks</span><span className="setup-detail">{agyStatus.installed === true ? `Installed · ${shortenPath(agyStatus.path)}` : agyStatus.installed === false ? `Not installed · ${shortenPath(agyStatus.path)}` : canUseNativeControls ? "Checking install state" : "Tauri runtime needed"}</span></span>{agyStatus.installed ? (<span className="setup-installed"><Check size={12} strokeWidth={2.6} />Installed</span>) : (<button className="pill-btn accent" type="button" disabled={pendingAction === "agy"} onClick={() => void runAction("agy", onInstallAgy)} data-tauri-drag-region="false">{pendingAction === "agy" ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : <Download size={12} strokeWidth={2.3} />}{pendingAction === "agy" ? "Installing…" : "Install"}</button>)}</div>
+              <div className="setup-row"><span className="status-slot"><Download className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Codex hooks</span><span className="setup-detail">{codexStatus.installed === true ? `Installed · ${shortenPath(codexStatus.path)}` : codexStatus.installed === false ? `Not installed · ${shortenPath(codexStatus.path)}` : canUseNativeControls ? "Checking install state" : "Tauri runtime needed"}</span></span>{codexStatus.installed ? (<span className="setup-installed"><Check size={12} strokeWidth={2.6} />Installed</span>) : (<button className="pill-btn accent" type="button" disabled={pendingAction === "codex"} onClick={() => void runAction("codex", onInstallCodex)} data-tauri-drag-region="false">{pendingAction === "codex" ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : <Download size={12} strokeWidth={2.3} />}{pendingAction === "codex" ? "Installing…" : "Install"}</button>)}</div>
               <div className="setup-row"><span className="status-slot"><Download className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Claude Code hooks</span><span className="setup-detail">{hookStatus.installed === true ? `Installed · ${shortenPath(hookStatus.path)}` : hookStatus.installed === false ? `Not installed · ${shortenPath(hookStatus.path)}` : canUseNativeControls ? "Checking install state" : "Tauri runtime needed"}</span></span>{hookStatus.installed ? (<span className="setup-installed"><Check size={12} strokeWidth={2.6} />Installed</span>) : (<button className="pill-btn accent" type="button" disabled={pendingAction === "hook"} onClick={() => void runAction("hook", onInstallHook)} data-tauri-drag-region="false">{pendingAction === "hook" ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : <Download size={12} strokeWidth={2.3} />}{pendingAction === "hook" ? "Installing…" : "Install"}</button>)}</div>
             </>
           ) : null}

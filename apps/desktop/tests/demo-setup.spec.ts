@@ -66,14 +66,15 @@ test("setup view stays capability-aware in browser demo", async ({ page }) => {
   await expect(page.getByText("Open desktop runtime")).toBeVisible();
   await expect(page.getByText("Browser demo cannot install or check hooks")).toBeVisible();
 
-  // Plugins: both agent hook rows fall back to "Tauri runtime needed" in the browser demo.
+  // Plugins: every agent hook row falls back to "Tauri runtime needed" in the browser demo.
   await page.getByRole("tab", { name: "Plugins" }).click();
   const claudeRow = page.locator(".setup-row").filter({ hasText: "Claude Code hooks" });
   const agyRow = page.locator(".setup-row").filter({ hasText: "Antigravity hooks" });
-  await expect(claudeRow.getByText("Tauri runtime needed")).toBeVisible();
-  await expect(agyRow.getByText("Tauri runtime needed")).toBeVisible();
-  await expect(claudeRow.getByRole("button", { name: "Install" })).toBeVisible();
-  await expect(agyRow.getByRole("button", { name: "Install" })).toBeVisible();
+  const codexRow = page.locator(".setup-row").filter({ hasText: "Codex hooks" });
+  for (const row of [claudeRow, agyRow, codexRow]) {
+    await expect(row.getByText("Tauri runtime needed")).toBeVisible();
+    await expect(row.getByRole("button", { name: "Install" })).toBeVisible();
+  }
   // Attempting a native install in the browser demo records the runtime hint, which
   // surfaces on the Connection panel.
   await claudeRow.getByRole("button", { name: "Install" }).click();

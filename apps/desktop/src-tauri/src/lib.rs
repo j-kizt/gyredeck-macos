@@ -511,6 +511,13 @@ fn bridge_health() -> bool {
     standalone_bridge::bridge_health()
 }
 
+/// Mail rooms and how much is waiting in each, so a session card can show that a
+/// message arrived without the webview holding the ingest token.
+#[tauri::command]
+fn mail_rooms() -> Result<Vec<standalone_bridge::MailRoom>, String> {
+    standalone_bridge::mail_rooms()
+}
+
 #[tauri::command]
 fn get_bridge_port() -> u16 {
     standalone_bridge::configured_bridge_port()
@@ -4855,6 +4862,7 @@ pub fn run() {
             agy_usage,
             bridge_health,
             get_bridge_port,
+            mail_rooms,
             set_bridge_port,
             claude_usage,
             codex_usage,

@@ -823,3 +823,30 @@
 .footer-done-close {
   margin-left: auto;
 }
+
+/* Mail waiting for, or already handed to, a session. Antigravity collects its mail
+   only when it next runs, and the message it receives is a transient system message
+   its window never draws — so without this the delivery is invisible from outside. */
+.session-mail {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+  align-items: center;
+  padding: 2px 4px;
+  border-radius: 4px;
+  font-size: 8px;
+  font-weight: 650;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.session-mail[data-state="pending"] {
+  color: var(--accent-text);
+  background: rgba(var(--accent-rgb), 0.18);
+}
+
+.session-mail[data-state="delivered"] {
+  padding: 2px 3px;
+  color: var(--text-3);
+  background: rgba(255, 255, 255, 0.055);
+}

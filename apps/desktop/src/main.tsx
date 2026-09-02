@@ -3,6 +3,7 @@ import { BarChart3, Check, ChevronLeft, Copy, Focus, GitBranch, List, Server, Se
 import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState, type ErrorInfo, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import type { GyredeckPresenceStatus } from "@gyredeck/protocol";
+import { useMailRooms } from "./features/mail/useMailRooms";
 import { SessionContextMeter, SessionContextSummary, StatusGlyph, WorkspaceSessionGroupItem } from "./features/session/components";
 import {
   formatTime,
@@ -185,6 +186,13 @@ const App = () => {
     servicesActive: activeMainTab === "ports" && !setupOpen && !selectedSessionId,
     sessions: allSessions,
   });
+  // Mail waiting per session. Gated like the other pollers: the chip only exists on
+  // the session list, so there is nothing to keep fresh when that is not on screen.
+  const mailRooms = useMailRooms({
+    active: activeMainTab === "sessions" && !setupOpen && !selectedSessionId,
+    canUseNativeControls,
+  });
+
   const githubMonitor = useGithubMonitor({
     active: activeMainTab === "git" && !setupOpen && !selectedSessionId,
     canUseNativeControls,
@@ -928,6 +936,7 @@ const App = () => {
                                 expanded={expandedSessionGroupKeys.has(groupKey)}
                                 group={group}
                                 groupKey={groupKey}
+                                mailRooms={mailRooms}
                                 removeGroupArmed={pendingGroupHistoryRemoval === getGroupRemovalId(groupKey, group)}
                                 onClear={dismissSession}
                                 onFocus={(session) => void focusSelectedSession(session)}
@@ -965,6 +974,7 @@ const App = () => {
                                 expanded={expandedSessionGroupKeys.has(groupKey)}
                                 group={group}
                                 groupKey={groupKey}
+                                mailRooms={mailRooms}
                                 removeGroupArmed={pendingGroupHistoryRemoval === getGroupRemovalId(groupKey, group)}
                                 onClear={dismissSession}
                                 onFocus={(session) => void focusSelectedSession(session)}

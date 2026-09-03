@@ -335,26 +335,6 @@ fn read_ingest_token() -> Option<String> {
     (token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit())).then_some(token)
 }
 
-/// One message in a mail room.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct MailMessage {
-    pub seq: u32,
-    pub from: String,
-    pub text: String,
-    #[serde(rename = "replyTo")]
-    pub reply_to: Option<String>,
-    pub ts: Option<String>,
-}
-
-/// Outcome of handing a message to the session a room belongs to.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct MailSendResult {
-    pub seq: u32,
-    /// "queued", "on_next_turn", "unknown_recipient" or "unavailable" — what the
-    /// bridge managed to do, so the UI can say that rather than imply "sent".
-    pub delivery: String,
-}
-
 /// One request to the bridge's mail endpoints.
 ///
 /// Raw HTTP rather than a client crate: this is a single loopback call and the bridge
@@ -400,15 +380,6 @@ fn mail_request(method: &str, path: &str, body: Option<String>) -> Result<serde_
     serde_json::from_str(payload).map_err(|error| format!("Bridge sent malformed JSON: {error}"))
 }
 
-/// Room names must survive being put in a URL, and they come from session ids.
-fn valid_room(room: &str) -> bool {
-    !room.is_empty()
-        && room.len() <= 64
-        && room
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
 /// Ask the bridge which mail rooms exist and how much is waiting in each.
 pub(crate) fn mail_rooms() -> Result<Vec<MailRoom>, String> {
     let parsed = mail_request("GET", "/mail", None)?;
@@ -436,53 +407,6 @@ pub(crate) fn mail_rooms() -> Result<Vec<MailRoom>, String> {
             })
         })
         .collect())
-}
-
-/// Every message in one room, oldest first.
-pub(crate) fn mail_thread(room: &str) -> Result<Vec<MailMessage>, String> {
-    if !valid_room(room) {
-        return Err("Not a valid room name".to_string());
-    }
-    let parsed = mail_request("GET", &format!("/mail/{room}"), None)?;
-    let Some(messages) = parsed.get("messages").and_then(|value| value.as_array()) else {
-        return Ok(Vec::new());
-    };
-
-    Ok(messages
-        .iter()
-        .filter_map(|message| {
-            Some(MailMessage {
-                seq: message.get("seq")?.as_u64()? as u32,
-                from: message.get("from")?.as_str()?.to_string(),
-                text: message.get("text")?.as_str()?.to_string(),
-                reply_to: message
-                    .get("replyTo")
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string()),
-                ts: message.get("ts").and_then(|v| v.as_str()).map(|v| v.to_string()),
-            })
-        })
-        .collect())
-}
-
-/// Send a message to the session a room belongs to.
-pub(crate) fn mail_send(room: &str, from: &str, text: &str) -> Result<MailSendResult, String> {
-    if !valid_room(room) {
-        return Err("Not a valid room name".to_string());
-    }
-    if text.trim().is_empty() {
-        return Err("Message is empty".to_string());
-    }
-    let body = serde_json::json!({ "from": from, "text": text, "replyTo": room }).to_string();
-    let parsed = mail_request("POST", &format!("/mail/{room}"), Some(body))?;
-    Ok(MailSendResult {
-        seq: parsed.get("seq").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        delivery: parsed
-            .get("delivery")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown_recipient")
-            .to_string(),
-    })
 }
 
 fn classify_connect_error(error: &std::io::Error) -> BridgeProbe {
@@ -811,3 +735,4 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
         let _ = fs::remove_dir_all(directory);
     }
 }
+

@@ -119,7 +119,9 @@ Taking delivery has to be **declared**: `GET /mail/<room>?collect=1` advances `r
 
 `readSeq` only ever moves forward: a collector re-reading from an older `since` has not un-taken what it already had, and a resuming subscriber's replay does not rewind it. It stays a hint rather than a delivery guarantee — two collectors on one room share the number.
 
-The desktop app reads this through native commands — `mail_rooms` for the chip, `mail_thread` for one session's messages, `mail_send` to add to them — rather than fetching in the webview, so the ingest token stays on the native side. A message the person sends is recorded as `from: "gyredeck"` rather than as a session, because a reader deciding how much weight to give a message should be able to tell the user from a peer. Polled every few seconds while the session list is on screen — mail is not part of the event protocol, and letting a message decide a session's presence status would be worse than a few seconds of lag.
+The desktop app reads this through the native `mail_rooms` command rather than fetching in the webview, so the ingest token stays on the native side. There is no UI for sending: a conversation between sessions is its own product (**Sync Session**) and lives in a separate project, which drives these endpoints from outside. `from: "gyredeck"` is reserved for a message a person sent through an app rather than a session, because a reader deciding how much weight to give a message should be able to tell the user from a peer.
+
+What was learned building and testing this — which agent can be woken, where context can be injected, the approval cost of asking an agent to reply, and the traps that each cost a live failure — is written up in [`agent-messaging-findings.md`](agent-messaging-findings.md). Polled every few seconds while the session list is on screen — mail is not part of the event protocol, and letting a message decide a session's presence status would be worse than a few seconds of lag.
 
 ### Delivery, per agent
 

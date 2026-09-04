@@ -248,3 +248,48 @@ test("Usage hydrates a persisted last-good snapshot before a reload refresh comp
   await expect(page.getByText("58% left")).toBeVisible();
   await expect(page.locator(".usage-freshness[data-stale='true']")).toContainText("Outdated");
 });
+
+test("refreshing usage says so on the control while the numbers stay put", async ({ page }) => {
+  await page.addInitScript(() => {
+    let release: (() => void) | null = null;
+    (window as typeof window & { __releaseUsage: () => void }).__releaseUsage = () => release?.();
+    (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (command: string) => {
+        if (command === "set_keep_awake") return false;
+        if (command === "codex_usage") {
+          // The first call answers immediately; later ones hang until the test
+          // releases them, which is the window where the spinner should be visible.
+          if (release === null) {
+            release = () => {};
+          } else {
+            await new Promise<void>((resolve) => { release = resolve; });
+          }
+          return {
+            providerId: "codex",
+            displayName: "Codex",
+            plan: "Plus",
+            fetchedAt: new Date().toISOString(),
+            lines: [{ type: "progress", label: "Weekly", used: 42, limit: 100, remainingLabel: "58% left" }],
+          };
+        }
+        throw new Error(`${command} unavailable`);
+      },
+    };
+  });
+
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Usage" }).click();
+  await expect(page.getByText("58% left")).toBeVisible();
+
+  await page.getByRole("button", { name: "Refresh usage" }).click();
+
+  // The control is the only thing that moves: a reading already on screen is the
+  // previous one and must not blink out while a new one is on its way.
+  const refreshing = page.getByRole("button", { name: "Refreshing usage" });
+  await expect(refreshing).toBeDisabled();
+  await expect(refreshing.locator(".usage-spin")).toBeVisible();
+  await expect(page.getByText("58% left")).toBeVisible();
+
+  await page.evaluate(() => (window as typeof window & { __releaseUsage: () => void }).__releaseUsage());
+  await expect(page.getByRole("button", { name: "Refresh usage" })).toBeEnabled();
+});

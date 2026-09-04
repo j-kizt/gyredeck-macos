@@ -547,6 +547,7 @@ const SettingsPanel = ({ settings, onChange }: ISettingsPanelProps) => {
 
 export interface IAgentUsageListProps {
   onRefresh: () => void;
+  refreshing?: boolean;
   onSettingsChange: (settings: IUsageSettings) => void;
   settings: IUsageSettings;
   usages: Record<UsageProviderId, IAgentUsageState>;
@@ -554,6 +555,7 @@ export interface IAgentUsageListProps {
 
 export const AgentUsageList = ({
   onRefresh,
+  refreshing = false,
   onSettingsChange,
   settings,
   usages,
@@ -637,11 +639,13 @@ export const AgentUsageList = ({
               event.stopPropagation();
               onRefresh();
             }}
+            disabled={refreshing}
             data-tauri-drag-region="false"
-            title="Refresh usage"
-            aria-label="Refresh usage"
+            title={refreshing ? "Refreshing usage" : "Refresh usage"}
+            aria-label={refreshing ? "Refreshing usage" : "Refresh usage"}
+            aria-busy={refreshing}
           >
-            <RefreshCw size={12} strokeWidth={2.2} />
+            <RefreshCw size={12} strokeWidth={2.2} className={refreshing ? "usage-spin" : undefined} />
           </button>
         </div>
       </div>

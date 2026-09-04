@@ -757,6 +757,29 @@
   transform: scale(0.92);
 }
 
+/* While a refresh is in flight. The button stops responding to hover and press so it
+   does not look clickable during the one moment it is not, and the icon turns instead
+   — the numbers on screen are the previous reading and stay put, so the spinner is the
+   only thing saying that a fetch is happening. */
+.usage-refresh:disabled {
+  cursor: default;
+  transform: none;
+}
+
+.usage-refresh:disabled:hover {
+  color: var(--text-2);
+  background: var(--fill);
+  transform: none;
+}
+
+.usage-spin {
+  animation: usage-spin 0.9s linear infinite;
+}
+
+@keyframes usage-spin {
+  to { transform: rotate(360deg); }
+}
+
 .usage-refresh svg {
   display: block;
 }

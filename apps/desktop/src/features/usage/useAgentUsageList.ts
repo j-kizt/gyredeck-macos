@@ -20,6 +20,8 @@ import type {
 
 export interface IAgentUsageListResult {
   refresh: () => void;
+  /** True while a refresh is in flight, so the control can say so. */
+  refreshing: boolean;
   usages: Record<UsageProviderId, IAgentUsageState>;
 }
 
@@ -53,6 +55,10 @@ export const useAgentUsageList = (
     Partial<Record<UsageProviderId, IAgentUsageSnapshot>>
   >({});
   const [tick, setTick] = useState(0);
+  // Tracked separately from each provider's status: putting them into "loading" would
+  // blank the numbers they are already showing, and a cached reading staying visible
+  // through a refresh is the whole point of keeping it.
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -120,9 +126,10 @@ export const useAgentUsageList = (
   };
 
   const refresh = (): void => {
-    for (const provider of USAGE_PROVIDERS) {
-      void fetchProvider(provider);
-    }
+    setRefreshing(true);
+    void Promise.all(USAGE_PROVIDERS.map((provider) => fetchProvider(provider))).finally(() => {
+      setRefreshing(false);
+    });
   };
 
   useEffect(() => {
@@ -172,5 +179,5 @@ export const useAgentUsageList = (
     snapshots,
   ]);
 
-  return { refresh, usages };
+  return { refresh, refreshing, usages };
 };

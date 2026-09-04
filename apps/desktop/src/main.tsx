@@ -107,7 +107,7 @@ const App = () => {
   const [bridgePort, setBridgePort] = useState(DEFAULT_BRIDGE_PORT);
   const { capabilities, connection, contextUsage, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO, bridgePort });
   const [usageSettings, setUsageSettings] = useState<IUsageSettings>(readUsageSettings);
-  const { refresh: refreshAgentUsage, usages: agentUsages } = useAgentUsageList(usageSettings, DEMO_MODE);
+  const { refresh: refreshAgentUsage, refreshing: agentUsageRefreshing, usages: agentUsages } = useAgentUsageList(usageSettings, DEMO_MODE);
   const [acknowledgedConversationId, setAcknowledgedConversationId] = useState<string | null>(null);
   const [nativeAction, setNativeAction] = useState<INativeActionState>({ bridgeOnline: null, message: null });
   const [sessionAction, setSessionAction] = useState<ISessionActionState>({ ok: null, message: null });
@@ -942,7 +942,7 @@ const App = () => {
                   )}
                 </div>
               ) : activeMainTab === "usage" ? (
-                <AgentUsageList usages={agentUsages} onRefresh={refreshAgentUsage} settings={usageSettings} onSettingsChange={updateUsageSettings} />
+                <AgentUsageList usages={agentUsages} onRefresh={refreshAgentUsage} refreshing={agentUsageRefreshing} settings={usageSettings} onSettingsChange={updateUsageSettings} />
               ) : activeMainTab === "ports" ? (
                 <Suspense fallback={<div className="empty-text small">Loading Services…</div>}>
                   <LocalServicesPanel monitor={runtimeMonitor} />

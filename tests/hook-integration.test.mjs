@@ -1259,3 +1259,63 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("a session that ends is taken out of its sync room", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-close-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const staying = "session-staying";
+  const leaving = "session-leaving";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const post = (path, body) =>
+      fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
+    const close = (conversationId) =>
+      post("/ingest", {
+        version: 2, id: randomUUID(), type: "conversation_close", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+        data: { reason: "quit" },
+      });
+    const roomFor = (as) => fetch(`${base}/sync/rooms?as=${as}`, { headers }).then((r) => r.json());
+
+    const code = (await post("/sync/rooms", { conversationId: staying, role: "implement" })).room;
+    await post(`/sync/rooms/${code}/members`, { conversationId: leaving, role: "run tests" });
+
+    // An ended session can never collect its mail, so leaving it listed would tell the
+    // other member it is still there — and work handed to it would wait for an answer
+    // that cannot come.
+    await close(leaving);
+    const after = await roomFor(staying);
+    assert.equal(after.room, code, "the room outlives one member leaving");
+    assert.deepEqual(after.members.map((member) => member.conversationId), [staying]);
+
+    // The one that ended is simply out of a room, which is what the panel needs in
+    // order to offer to put it in one again — sessions are resumable and keep their id.
+    assert.equal((await roomFor(leaving)).room, null);
+
+    // And when the last member goes, so does the room: rooms with members are exempt
+    // from the idle sweep, so nothing else would ever reclaim it.
+    await close(staying);
+    assert.equal((await roomFor(staying)).room, null);
+    const listed = await (await fetch(`${base}/mail`, { headers })).json();
+    assert.equal(listed.rooms.some((room) => room.room === code), false);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

@@ -291,9 +291,33 @@ function startBridge(config) {
   const recent = readRecentEvents(config.logFile, maxRecent);
   const tracker = createScopeTracker();
 
+  /**
+   * Take a finished session out of the room it was in.
+   *
+   * A session that has ended can never collect its mail again, so leaving it in place
+   * would tell everyone else it is still there — and an agent handing work to a
+   * member that will never read it waits for an answer that cannot come. Its `pending`
+   * would also climb forever, and a room with members is exempt from the idle sweep,
+   * so nothing would ever reclaim it.
+   *
+   * Sessions are resumable and keep their id, so a resumed one finds itself out of the
+   * room and has to be put back. That is one action for the person, against a peer
+   * that silently is not there.
+   */
+  const releaseClosedSession = (conversationId) => {
+    const found = syncRoomFor(conversationId);
+    if (!found) return;
+    found.room.members.delete(conversationId);
+    found.room.touchedAt = Date.now();
+    if (found.room.members.size === 0 && found.room.clients.size === 0) mailRooms.delete(found.name);
+  };
+
   const emitLocal = (payload) => {
     tracker.rememberScope(payload);
     rememberProvider(payload);
+    if (payload.type === "conversation_close" && typeof payload.conversationId === "string") {
+      releaseClosedSession(payload.conversationId);
+    }
     recent.push(payload);
     if (recent.length > maxRecent) recent.shift();
 

@@ -124,6 +124,8 @@ A session belongs to **at most one** room. Creating or joining while already in 
 
 Rooms with members are exempt from the idle sweep — they were set up deliberately and last until the final member leaves, at which point the room goes too.
 
+A `conversation_close` takes that session out of its room. An ended session can never collect its mail, so leaving it listed would tell everyone else it is still there, and an agent handing work to it would wait for an answer that cannot come; its `pending` would also climb forever with nothing to reclaim it. Sessions are resumable and keep their id, so a resumed one finds itself out of the room and has to be put back — one action for the person, against a peer that silently is not there.
+
 ### One inbox per session
 
 `GET /mail/inbox?as=<id>` answers "what is for me" across every room the session belongs to — its own mailbox and the sync room it was put into — oldest first, each message labelled with the room it came from. The same response names the room and its members with roles, because the caller is a hook with a sub-second budget and would otherwise need a second request to know who it is talking to.

@@ -141,8 +141,11 @@ the person is meant to be reading terminals, not the app.
 
 ## Build order
 
-1. Room membership in the bridge, plus per-member read positions
-2. `/mail/inbox?as=` and the adapter switch to it
-3. Role-aware injection: the three-tier rule, and asking for both directions of narration
-4. The panel: create, join, connected, disconnect
-5. Auto-remove on `conversation_close`
+1. ~~Room membership in the bridge, plus per-member read positions~~ — done
+2. ~~`/mail/inbox?as=` and the adapter switch to it~~ — done
+3. ~~Role-aware injection: the three-tier rule, and both directions of narration~~ — done
+4. ~~The panel: create, join, connected, disconnect~~ — done
+5. ~~Auto-remove on `conversation_close`~~ — done
+
+What is left is not on this list: nothing tells the person a reply arrived, and only
+Codex can be reached while idle. Both are recorded under Known limits above.

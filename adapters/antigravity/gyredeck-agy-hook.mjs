@@ -1,5 +1,5 @@
 import { request } from "node:http";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -126,8 +126,6 @@ const post = (endpoint, token, path, payload) =>
  * session rather than to Antigravity in general.
  */
 const MAIL_ROOM_NAME = /^[A-Za-z0-9_-]{1,64}$/;
-const MAIL_CURSOR_FILE = join(CONFIG_DIR, "mail-cursors.json");
-const MAIL_CURSOR_MAX = 64;
 const MAIL_MAX_STEPS = 10;
 const MAIL_MAX_TEXT = 2_000;
 /** `from` the desktop app uses when the person sends a message themselves. */
@@ -162,39 +160,6 @@ const getJson = (endpoint, token, path) =>
     req.on("timeout", () => { req.destroy(); resolve(null); });
     req.end();
   });
-
-/**
- * Highest message seq already delivered to this conversation. The hook keeps no
- * memory between runs, so without a stored cursor every invocation would re-inject
- * the whole room.
- *
- * It outlives the room it refers to — see the reset check in drainMailIntoSteps.
- */
-const readMailCursor = async (room) => {
-  try {
-    const cursors = JSON.parse(await readFile(MAIL_CURSOR_FILE, "utf8"));
-    const seq = cursors?.[room];
-    return Number.isInteger(seq) && seq > 0 ? seq : 0;
-  } catch {
-    return 0;
-  }
-};
-
-const writeMailCursor = async (room, seq) => {
-  try {
-    let cursors = {};
-    try {
-      const parsed = JSON.parse(await readFile(MAIL_CURSOR_FILE, "utf8"));
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) cursors = parsed;
-    } catch {}
-    // Re-inserting moves this room to the end, so the oldest untouched conversations
-    // are the ones dropped when the file is trimmed.
-    delete cursors[room];
-    cursors[room] = seq;
-    const trimmed = Object.fromEntries(Object.entries(cursors).slice(-MAIL_CURSOR_MAX));
-    await writeFile(MAIL_CURSOR_FILE, `${JSON.stringify(trimmed)}\n`, { mode: 0o600 });
-  } catch {}
-};
 
 /**
  * Read the conversation's room and turn new messages into inject steps.
@@ -250,32 +215,22 @@ const replyInstruction = (endpoint, room, replyRooms) => {
 const drainMailIntoSteps = async (endpoint, token, room) => {
   if (!token || !MAIL_ROOM_NAME.test(room)) return [];
 
-  const since = await readMailCursor(room);
-  // collect=1: this is the session's own reader taking delivery, not something
-  // looking at the room. Without it the room could not tell the two apart.
-  let result = await getJson(endpoint, token, `/mail/${room}?since=${since}&collect=1`);
-
-  // Rooms live in the bridge's memory and this cursor lives on disk, so a bridge
-  // restart takes a room's seq back to zero while the cursor keeps counting. Asking
-  // for messages after a seq the new room will not reach for a while discards every
-  // one of them, silently, with the hook reporting success. A room behind the cursor
-  // can only be a new room, so read it from the start.
-  if (since > 0 && Number.isInteger(result?.seq) && result.seq < since) {
-    result = await getJson(endpoint, token, `/mail/${room}?since=0&collect=1`);
-  }
-
+  // One call answers everything: what is waiting, which room this session is in, and
+  // who else is in it. The bridge keeps each reader's position with the room, so there
+  // is no cursor here to fall out of step with one.
+  // The cap goes to the bridge rather than being applied here: it is what advances
+  // this reader's position, and trimming afterwards would mark the remainder read
+  // without ever delivering it.
+  const result = await getJson(endpoint, token, `/mail/inbox?as=${room}&collect=1&limit=${MAIL_MAX_STEPS}`);
   const messages = Array.isArray(result?.messages) ? result.messages : [];
   const delivered = messages
     .filter((message) => Number.isInteger(message?.seq) && typeof message?.text === "string")
     // Replies land in the same room they answer, which is what makes the desktop panel
     // read as one thread. The cost is that a session would otherwise be handed its own
     // last reply back as fresh mail on its next turn, and answer itself forever.
-    .filter((message) => message.from !== room)
-    .slice(0, MAIL_MAX_STEPS);
+    .filter((message) => message.from !== room);
   if (delivered.length === 0) return [];
 
-  // Anything beyond the cap keeps its place in the room and arrives next invocation.
-  await writeMailCursor(room, delivered.at(-1).seq);
 
   // A message sent from the desktop app came from the person, and one sent by another
   // session did not. Saying "not from the user" about the user's own message would be

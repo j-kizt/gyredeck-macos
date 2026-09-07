@@ -55,6 +55,7 @@ Bound to `127.0.0.1:47621`.
 | GET | `/mail` | Mail rooms that currently exist, with how much is waiting in each. |
 | POST | `/mail/<room>` | Send a message into a room, and deliver it to the session that room belongs to. |
 | GET | `/mail/<room>?since=<seq>` | Read messages after `seq`. |
+| GET | `/mail/inbox?as=<id>` | Everything addressed to one session, across its rooms. |
 | GET | `/mail/<room>/events` | Subscribe to a room (SSE). |
 | POST | `/sync/rooms` | Create a sync room and join it. |
 | POST | `/sync/rooms/<code>/members` | Join a room, or restate a role. |
@@ -122,6 +123,14 @@ Codes look like `sync-4f2a` — short enough to read off one screen and type int
 A session belongs to **at most one** room. Creating or joining while already in another answers `409 already_in_room` rather than moving silently, so the panel's buttons keep one meaning each. Joining a room you are already in restates your role, which is how the role field is edited without a second verb. An unknown code answers `404`, which is what lets the join field show an error.
 
 Rooms with members are exempt from the idle sweep — they were set up deliberately and last until the final member leaves, at which point the room goes too.
+
+### One inbox per session
+
+`GET /mail/inbox?as=<id>` answers "what is for me" across every room the session belongs to — its own mailbox and the sync room it was put into — oldest first, each message labelled with the room it came from. The same response names the room and its members with roles, because the caller is a hook with a sub-second budget and would otherwise need a second request to know who it is talking to.
+
+This is what the adapters use, and it is why they hold no cursor. The position each reader has reached lives with the room whose messages it counts, so the two are lost together on a restart. An on-disk cursor could outlive the room it pointed at, keep counting past a `seq` the new room would not reach for a while, and silently discard everything sent afterwards while the hook reported success — which is exactly what happened once.
+
+`limit` caps the batch, and it is applied **by the bridge** rather than by the caller. Whoever advances the position has to be the one that trims: a caller that took the first ten of fourteen would leave four marked as read and never delivered. Only what is actually handed over moves the position, per room.
 
 ### Read position is per member
 

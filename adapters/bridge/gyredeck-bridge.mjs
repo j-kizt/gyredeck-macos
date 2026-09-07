@@ -896,6 +896,73 @@ function startBridge(config) {
         return;
       }
 
+      // GET /mail/inbox?as=<id> — everything addressed to one session, wherever it
+      // lives: its own mailbox and the sync room it was put into. The reader asks what
+      // is for it rather than naming rooms, so a hook needs no idea that rooms exist
+      // and no cursor of its own — the position each reader has reached lives with the
+      // room it belongs to, and the two are lost together on a restart instead of the
+      // cursor outliving the room and silently discarding everything after it.
+      //
+      // Room and roles come back in the same response because the caller is a hook
+      // with a sub-second budget and would otherwise need a second request to say who
+      // it is talking to.
+      if (req.method === "GET" && segments.length === 2 && segments[1] === "inbox") {
+        const as = url.searchParams.get("as") ?? "";
+        if (!MAIL_ROOM_NAME.test(as)) {
+          sendJson(400, { ok: false, error: "invalid_session" });
+          return;
+        }
+        const collect = url.searchParams.get("collect") === "1";
+        const at = new Date().toISOString();
+        // The cap has to be applied by whoever advances the position. A caller that
+        // trimmed the list itself would leave the rest marked as read and never
+        // delivered — the position must only ever move as far as what was handed over.
+        const requested = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+        const limit = Number.isInteger(requested) && requested > 0
+          ? Math.min(requested, MAIL_MAX_MESSAGES)
+          : MAIL_MAX_MESSAGES;
+
+        const sync = syncRoomFor(as);
+        const sources = [[as, mailRoomFor(as, false)], ...(sync ? [[sync.name, sync.room]] : [])];
+        const fresh = [];
+        for (const [roomName, room] of sources) {
+          if (!room) continue;
+          const reader = readerFor(room, as);
+          for (const message of room.messages) {
+            if (message.seq > reader.readSeq) fresh.push({ room: roomName, ...message });
+          }
+          room.touchedAt = Date.now();
+        }
+
+        // Oldest first across both rooms, so a batch reads in the order it was said
+        // rather than grouped by where it came from.
+        fresh.sort((left, right) => (left.ts < right.ts ? -1 : left.ts > right.ts ? 1 : left.seq - right.seq));
+        const collected = fresh.slice(0, limit);
+
+        if (collect) {
+          for (const [roomName, room] of sources) {
+            if (!room) continue;
+            const taken = collected.filter((message) => message.room === roomName);
+            if (taken.length > 0) markRead(room, as, taken.at(-1).seq, at);
+          }
+        }
+        sendJson(200, {
+          ok: true,
+          messages: collected,
+          ...(sync
+            ? {
+                room: sync.name,
+                members: [...sync.room.members].map(([conversationId, member]) => ({
+                  conversationId,
+                  role: member.role,
+                  you: conversationId === as,
+                })),
+              }
+            : { room: null, members: [] }),
+        });
+        return;
+      }
+
       const name = segments[1] ?? "";
       const tail = segments[2];
       // Room names land in a Map key and in URLs, so keep them to a shape that

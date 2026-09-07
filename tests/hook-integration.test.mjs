@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -711,11 +712,11 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
       { ephemeralMessage: "[gyredeck mail · from claude-code] ack" },
     ]);
 
-    // The hook keeps no memory between runs, so the stored cursor is the only thing
-    // stopping the next invocation from re-injecting the whole room.
+    // The hook keeps no memory between runs. What stops the next invocation
+    // re-injecting the room is the position the bridge holds for this reader — there
+    // is no cursor on disk to fall out of step with the room it points at.
     assert.deepEqual(await preInvocation(2), []);
-    const cursors = JSON.parse(await readFile(join(home, ...CONFIG_DIR, "mail-cursors.json"), "utf8"));
-    assert.equal(cursors[conversationId], 2);
+    assert.equal(existsSync(join(home, ...CONFIG_DIR, "mail-cursors.json")), false);
 
     // A reply address has to be a room name: the adapter puts it in a URL and hands
     // that to an agent to run.
@@ -806,7 +807,7 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
   }
 });
 
-test("antigravity recovers when its mail cursor outlives the room", async () => {
+test("a bridge restart cannot leave a reader stranded past its room", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-mail-reset-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const port = await freePort();
@@ -858,13 +859,14 @@ test("antigravity recovers when its mail cursor outlives the room", async () => 
 
     for (const text of ["one", "two", "three"]) await send(text);
     assert.deepEqual(await deliveredTexts(1), ["one", "two", "three"]);
-    const cursors = JSON.parse(await readFile(join(home, ...CONFIG_DIR, "mail-cursors.json"), "utf8"));
-    assert.equal(cursors[conversationId], 3);
+    // Nothing is written that could survive the room: the reader's position lives in
+    // the bridge, beside the messages it counts.
+    assert.equal(existsSync(join(home, ...CONFIG_DIR, "mail-cursors.json")), false);
 
-    // Rooms live in the bridge's memory while the cursor lives on disk, so a restart
-    // takes the room's seq back to zero and leaves the cursor counting from three.
-    // Asking for messages after a seq the new room will not reach for a while
-    // discarded every one of them, silently, with the hook still reporting success.
+    // Rooms are held in memory, so a restart takes the room and the positions in it
+    // together. This used to be the shape of a silent failure — an on-disk cursor kept
+    // counting past a room that had gone back to zero, and everything sent afterwards
+    // was skipped while the hook still reported success.
     await stopBridge(bridge);
     bridge = await startBridge();
     await send("after restart");
@@ -977,10 +979,10 @@ test("claude UserPromptSubmit delivers mail as additional context exactly once",
     assert.match(context, new RegExp("/mail/codex-room"));
     assert.doesNotMatch(context, new RegExp(token), "the token is read at send time, not pasted in");
 
-    // The stored cursor is the only thing stopping the next prompt re-delivering it.
+    // What stops the next prompt re-delivering it is the position the bridge holds for
+    // this reader; nothing is written to disk that could outlive the room.
     assert.equal(await prompt(), "");
-    const cursors = JSON.parse(await readFile(join(home, ...CONFIG_DIR, "mail-cursors.json"), "utf8"));
-    assert.equal(cursors[conversationId], 1);
+    assert.equal(existsSync(join(home, ...CONFIG_DIR, "mail-cursors.json")), false);
 
     // A message the person sent through the app is the user speaking, not a peer.
     await send("gyredeck", "from the person");
@@ -1091,6 +1093,74 @@ test("a sync room gives each member its own read position", async () => {
     // The room goes with its last member: an empty code is useful to nobody.
     await call("DELETE", `/sync/rooms/${code}/members/${first}`);
     assert.equal((await call("GET", `/sync/rooms?as=${first}`)).body.room, null);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("an inbox merges a session's mailbox with its sync room, and the cap cannot eat messages", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-inbox-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const me = "session-me";
+  const peer = "session-peer";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const post = (path, body) =>
+      fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
+    const inbox = async (limit) =>
+      (await (await fetch(`${base}/mail/inbox?as=${me}&collect=1&limit=${limit}`, { headers })).json());
+
+    const code = (await post("/sync/rooms", { conversationId: me, role: "implement" })).room;
+    await post(`/sync/rooms/${code}/members`, { conversationId: peer, role: "test" });
+
+    // One message to this session directly, one to the room it was put into.
+    await post(`/mail/${me}`, { from: "gyredeck", text: "from the person" });
+    await post(`/mail/${code}`, { from: peer, text: "from my peer" });
+
+    const merged = await inbox(10);
+    // Both arrive from one call, and the reader is told which room each came from.
+    assert.deepEqual(merged.messages.map((message) => [message.room, message.text]), [
+      [me, "from the person"],
+      [code, "from my peer"],
+    ]);
+    // The same call names the room and who is in it, so a hook with a sub-second
+    // budget does not need a second request to know who it is talking to.
+    assert.equal(merged.room, code);
+    assert.deepEqual(
+      merged.members.map((member) => [member.role, member.you]).sort(),
+      [["implement", true], ["test", false]].sort(),
+    );
+
+    // Collected, so a second look is empty.
+    assert.deepEqual((await inbox(10)).messages, []);
+
+    // The cap belongs to whoever advances the position. A caller that trimmed the
+    // list itself would leave the remainder marked read and never delivered.
+    for (let index = 0; index < 5; index += 1) await post(`/mail/${code}`, { from: peer, text: `bulk-${index}` });
+    assert.deepEqual((await inbox(2)).messages.map((message) => message.text), ["bulk-0", "bulk-1"]);
+    assert.deepEqual((await inbox(2)).messages.map((message) => message.text), ["bulk-2", "bulk-3"]);
+    assert.deepEqual((await inbox(10)).messages.map((message) => message.text), ["bulk-4"]);
+
+    // A look does not collect, so opening a panel cannot mark mail delivered.
+    await post(`/mail/${code}`, { from: peer, text: "unread" });
+    await fetch(`${base}/mail/inbox?as=${me}`, { headers });
+    assert.deepEqual((await inbox(10)).messages.map((message) => message.text), ["unread"]);
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();

@@ -103,3 +103,14 @@ test("keep awake already enabled reports the missing runtime in browser demo", a
   await expect(keepAwakeRow.getByText("Desktop runtime required")).toBeVisible();
   await expect(keepAwakeRow.getByRole("switch", { name: "Disable keep display awake" })).toBeDisabled();
 });
+
+test("the footer says local rather than a version when the frontend is being served", async ({ page }) => {
+  await page.goto("/?demo=1");
+
+  // A local run and the installed app report the same version, because both read it
+  // from tauri.conf.json — so the version cannot say which one is on screen. The test
+  // suite runs against the dev server, which is exactly the case being marked.
+  const version = page.locator(".footer-version");
+  await expect(version).toHaveText("local");
+  await expect(version).toHaveAttribute("data-local", "true");
+});

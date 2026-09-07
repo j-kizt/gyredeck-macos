@@ -25,7 +25,7 @@ notify = ["node", "/Users/<you>/.config/gyredeck/gyredeck-codex-notify.mjs"]
 
 ```bash
 pnpm check              # typecheck root + desktop
-pnpm desktop:dev        # run the Tauri app in dev mode (menu-bar window)
+pnpm desktop:dev        # run the Tauri app in dev mode (menu-bar window; footer reads "local")
 pnpm desktop:web        # browser-only demo/dev server (no native features)
 pnpm mod:tail           # tail the local NDJSON event log
 pnpm test:demo          # browser demo Playwright suite

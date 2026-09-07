@@ -1092,7 +1092,17 @@ const App = () => {
                 ) : (
                   <>
                     <span className="footer-copyright">© 2026 Gyredeck · J-Kitz</span>
-                    <span className="footer-version">{updater.currentVersion ? `v${updater.currentVersion}` : ""}</span>
+                    {/* A local run reports the same version as the installed app, since
+                        both read it from tauri.conf.json — so the version cannot say
+                        which one is on screen. Vite's dev flag can: `desktop:dev`
+                        serves the frontend, `desktop:install` builds it. */}
+                    <span className="footer-version" data-local={import.meta.env.DEV}>
+                      {import.meta.env.DEV
+                        ? "local"
+                        : updater.currentVersion
+                          ? `v${updater.currentVersion}`
+                          : ""}
+                    </span>
                   </>
                 )}
               </div>

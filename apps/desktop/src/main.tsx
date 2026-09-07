@@ -116,6 +116,10 @@ const App = () => {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
   const [hookStatus, setHookStatus] = useState<IHookStatus>({ path: null, installed: null });
+  // Whether a session may answer its room without being approved each time. Null until
+  // read, so the switch does not flicker through "off" on the way to its real state.
+  const [syncRepliesAllowed, setSyncRepliesAllowed] = useState<boolean | null>(null);
+  const [syncRepliesBusy, setSyncRepliesBusy] = useState(false);
   const [agyStatus, setAgyStatus] = useState<IHookStatus>({ path: null, installed: null });
   const [codexStatus, setCodexStatus] = useState<IHookStatus>({ path: null, installed: null });
   const [dismissedSessionIds, setDismissedSessionIds] = useState<DismissedSessionRegistry>(readDismissedSessionIds);
@@ -675,6 +679,31 @@ const App = () => {
     }
   };
 
+  const loadSyncReplies = async () => {
+    if (!canUseNativeControls) {
+      setSyncRepliesAllowed(null);
+      return;
+    }
+    try {
+      setSyncRepliesAllowed(await invoke<boolean>("sync_replies_allowed"));
+    } catch {
+      setSyncRepliesAllowed(null);
+    }
+  };
+
+  const changeSyncReplies = async (next: boolean) => {
+    setSyncRepliesBusy(true);
+    try {
+      await invoke("set_sync_replies_allowed", { enabled: next });
+      setSyncRepliesAllowed(next);
+    } catch {
+      // The switch stays where it was; a failed write has not changed anything.
+      await loadSyncReplies();
+    } finally {
+      setSyncRepliesBusy(false);
+    }
+  };
+
   const loadAgyStatus = async () => {
     if (!canUseNativeControls) {
       clearHookStatus(setAgyStatus);
@@ -810,6 +839,7 @@ const App = () => {
       void loadHookStatus();
       void loadAgyStatus();
       void loadCodexStatus();
+      void loadSyncReplies();
       void checkBridge();
     }
   }, [setupOpen]);
@@ -890,6 +920,9 @@ const App = () => {
                   keepAwakeEnabled={keepAwakeEnabled}
                   keepAwakeError={keepAwakeError}
                   hookStatus={hookStatus}
+                  syncRepliesAllowed={syncRepliesAllowed}
+                  syncRepliesBusy={syncRepliesBusy}
+                  onSyncRepliesChange={changeSyncReplies}
                   agyStatus={agyStatus}
                   codexStatus={codexStatus}
                   nativeAction={nativeAction}

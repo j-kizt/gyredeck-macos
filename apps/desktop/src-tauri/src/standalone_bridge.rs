@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const BRIDGE_HOST: &str = "127.0.0.1";
+pub(crate) const BRIDGE_HOST: &str = "127.0.0.1";
 pub(crate) const BRIDGE_PORT: u16 = 47_621;
 const BRIDGE_MIN_PORT: u16 = 1024;
 const BRIDGE_PROBE_TIMEOUT: Duration = Duration::from_millis(350);
@@ -45,6 +45,39 @@ pub(crate) fn configured_bridge_port() -> u16 {
 }
 
 /// Persist `port` into the shared bridge config, preserving any other keys.
+/// Read a boolean preference from the Gyredeck config, defaulting when absent.
+///
+/// Absent has to mean the default rather than false: an install that predates a
+/// setting has no opinion recorded, and reading that as "off" would silently opt
+/// existing users out of something new that is meant to be on.
+pub(crate) fn config_flag(key: &str, fallback: bool) -> bool {
+    bridge_config_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .and_then(|value| value.get(key).and_then(serde_json::Value::as_bool))
+        .unwrap_or(fallback)
+}
+
+pub(crate) fn write_config_flag(key: &str, value: bool) -> Result<(), String> {
+    let path =
+        bridge_config_path().ok_or_else(|| "Could not resolve Gyredeck config directory".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Gyredeck config path has no parent directory".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create Gyredeck config directory: {error}"))?;
+    let mut config = fs::read_to_string(&path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    config.insert(key.to_string(), serde_json::Value::from(value));
+    let contents = serde_json::to_vec_pretty(&serde_json::Value::Object(config))
+        .map_err(|error| format!("Could not serialise Gyredeck config: {error}"))?;
+    fs::write(&path, contents)
+        .map_err(|error| format!("Could not write Gyredeck config: {error}"))
+}
+
 pub(crate) fn write_configured_port(port: u16) -> Result<(), String> {
     if port < BRIDGE_MIN_PORT {
         return Err(format!(

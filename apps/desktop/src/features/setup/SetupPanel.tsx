@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, Trash2 } from "lucide-react";
+import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, Trash2 } from "lucide-react";
 import type { IGyredeckBridgeCapabilities } from "@gyredeck/protocol";
 import { shortenPath } from "../session/activity";
 import type { IUseUpdater } from "../updater/useUpdater";
@@ -29,6 +29,10 @@ export interface ISetupPanelProps {
   keepAwakeEnabled: boolean;
   keepAwakeError: string | null;
   hookStatus: { path: string | null; installed: boolean | null };
+  /** Null while unknown, so the switch does not claim "off" before it has looked. */
+  syncRepliesAllowed: boolean | null;
+  syncRepliesBusy: boolean;
+  onSyncRepliesChange: (next: boolean) => Promise<void>;
   agyStatus: { path: string | null; installed: boolean | null };
   codexStatus: { path: string | null; installed: boolean | null };
   nativeAction: { bridgeOnline: boolean | null; message: string | null };
@@ -154,7 +158,7 @@ const UPDATER_DETAIL: Record<IUseUpdater["status"], string> = {
 const MIN_BRIDGE_PORT = 1024;
 const MAX_BRIDGE_PORT = 65535;
 
-export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
+export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, syncRepliesAllowed, syncRepliesBusy, onSyncRepliesChange, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
   const [activeCategory, setActiveCategory] = useState<SetupCategory>("connection");
   const [compactNavigation, setCompactNavigation] = useState(() => window.matchMedia("(max-width: 380px)").matches);
   const credentialHelper = useGitCredentialHelper(canUseNativeControls);
@@ -240,6 +244,12 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
               <div className="setup-row"><span className="bridge-dot" data-connected={isConnected} title={connectionTitle} /><span className="setup-copy"><span className="setup-title">Bridge</span><span className="setup-detail">{connectionTitle}</span></span>{!isConnected ? <button className="pill-btn" type="button" disabled={pendingAction === "bridge"} onClick={() => void runAction("bridge", onCheckBridge)} data-tauri-drag-region="false" aria-label="Reconnect bridge">{pendingAction === "bridge" ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : <PlugZap size={12} strokeWidth={2.3} />}{pendingAction === "bridge" ? "Reconnecting…" : "Reconnect"}</button> : null}</div>
               <div className="setup-row setup-row-stack"><div className="setup-row-main"><span className="status-slot"><PlugZap className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Bridge port</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : portStatus ?? `Local bridge port · ${bridgePort}`}</span></span>{canUseNativeControls ? <button className="pill-btn" type="button" onClick={toggleEditPort} data-tauri-drag-region="false" aria-expanded={editingPort} aria-label="Edit bridge port"><Pencil size={12} strokeWidth={2.3} />Edit</button> : null}</div>{editingPort ? <span className="setup-row-actions full"><input className="setup-input" type="number" min={MIN_BRIDGE_PORT} max={MAX_BRIDGE_PORT} value={portField} onChange={(event) => setPortField(event.target.value)} disabled={portBusy} data-tauri-drag-region="false" aria-label="Bridge port" autoFocus /><button className="pill-btn accent" type="button" onClick={() => void applyPort()} disabled={!canApplyPort} data-tauri-drag-region="false"><Check size={12} strokeWidth={2.3} />Apply</button></span> : null}</div>
               <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{guidance.title}</span><span className="setup-detail">{guidance.detail}</span></span></div>
+              {hookStatus.installed ? (
+                // Only meaningful once the hook is in: without it nothing sends a reply
+                // to permit. Shown here rather than under Plugins because it is about
+                // how a connected session talks, not about what is installed.
+                <div className="setup-row"><span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Allow sync replies without asking</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : syncRepliesAllowed === null ? "Checking…" : syncRepliesAllowed ? "On · a session answers its room without a prompt each time" : "Off · Claude Code asks before every reply and every wait"}</span></span><button className="switch-toggle" type="button" role="switch" aria-checked={syncRepliesAllowed === true} data-on={syncRepliesAllowed === true} disabled={!canUseNativeControls || syncRepliesBusy || syncRepliesAllowed === null} onClick={() => void onSyncRepliesChange(!syncRepliesAllowed)} data-tauri-drag-region="false" aria-label={`${syncRepliesAllowed ? "Stop allowing" : "Allow"} sync replies without asking`}><span className="switch-thumb" /></button></div>
+              ) : null}
               {nativeAction.message ? <div className="notice-row" data-online={nativeAction.bridgeOnline === true} role="status" aria-live="polite">{nativeAction.message}</div> : null}
             </>
           ) : null}

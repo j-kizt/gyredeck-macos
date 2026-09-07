@@ -559,6 +559,32 @@ fn mail_rooms() -> Result<Vec<standalone_bridge::MailRoom>, String> {
     standalone_bridge::mail_rooms()
 }
 
+/// Which sync room a session is in, so its panel can show the room instead of the
+/// buttons that would put it in one.
+#[tauri::command]
+fn sync_room(conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
+    standalone_bridge::sync_room(&conversation_id)
+}
+
+#[tauri::command]
+fn sync_create(conversation_id: String, role: String) -> Result<standalone_bridge::SyncRoom, String> {
+    standalone_bridge::sync_create(&conversation_id, &role)
+}
+
+#[tauri::command]
+fn sync_join(
+    code: String,
+    conversation_id: String,
+    role: String,
+) -> Result<standalone_bridge::SyncRoom, String> {
+    standalone_bridge::sync_join(&code, &conversation_id, &role)
+}
+
+#[tauri::command]
+fn sync_leave(code: String, conversation_id: String) -> Result<(), String> {
+    standalone_bridge::sync_leave(&code, &conversation_id)
+}
+
 #[tauri::command]
 fn get_bridge_port() -> u16 {
     standalone_bridge::configured_bridge_port()
@@ -5055,6 +5081,10 @@ pub fn run() {
             bridge_health,
             get_bridge_port,
             mail_rooms,
+            sync_room,
+            sync_create,
+            sync_join,
+            sync_leave,
             set_bridge_port,
             claude_usage,
             codex_usage,

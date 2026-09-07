@@ -340,7 +340,17 @@ fn read_ingest_token() -> Option<String> {
 /// Raw HTTP rather than a client crate: this is a single loopback call and the bridge
 /// answers with Content-Length rather than chunked. The token is attached here and
 /// never handed to the webview, which has no other use for it.
-fn mail_request(method: &str, path: &str, body: Option<String>) -> Result<serde_json::Value, String> {
+/// A bridge call whose status code reaches the caller.
+///
+/// Sync rooms answer with statuses that are not failures to be hidden: an unknown code
+/// is a 404 the join field has to render as "no room with that code", and a session
+/// already in a room is a 409. Collapsing those into one error string would leave the
+/// panel unable to say which happened.
+fn bridge_request(
+    method: &str,
+    path: &str,
+    body: Option<String>,
+) -> Result<(u16, serde_json::Value), String> {
     let Some(token) = read_ingest_token() else {
         return Err("Ingest token is not available yet".to_string());
     };
@@ -372,12 +382,156 @@ fn mail_request(method: &str, path: &str, body: Option<String>) -> Result<serde_
     let Some((head, payload)) = response.split_once("\r\n\r\n") else {
         return Err("Bridge returned no response body".to_string());
     };
-    if !(head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.1 202")) {
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| "Bridge returned no status line".to_string())?;
+    let value = serde_json::from_str(payload)
+        .unwrap_or(serde_json::Value::Null);
+    Ok((status, value))
+}
+
+/// A bridge call where anything but success is a failure, which is every mail read.
+fn mail_request(method: &str, path: &str, body: Option<String>) -> Result<serde_json::Value, String> {
+    let (status, value) = bridge_request(method, path, body)?;
+    if !(200..300).contains(&status) {
         // A bridge predating mail rooms answers 404 here; an unauthorized read is 401.
-        let status = head.lines().next().unwrap_or("unknown status");
-        return Err(format!("Bridge declined the mail request: {status}"));
+        return Err(format!("Bridge declined the mail request: HTTP {status}"));
     }
-    serde_json::from_str(payload).map_err(|error| format!("Bridge sent malformed JSON: {error}"))
+    Ok(value)
+}
+
+/// One member of a sync room.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct SyncMember {
+    #[serde(rename = "conversationId")]
+    pub conversation_id: String,
+    /// "Claude Code", "Codex", "Antigravity" — a conversation id reads as nothing, so
+    /// the bridge labels each member from the runtime kind on its events.
+    pub provider: String,
+    pub role: String,
+    pub pending: u32,
+    pub you: bool,
+}
+
+/// The room a session is in, or the absence of one.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct SyncRoom {
+    pub room: Option<String>,
+    pub members: Vec<SyncMember>,
+}
+
+fn parse_sync_room(value: &serde_json::Value, as_id: &str) -> SyncRoom {
+    let members = value
+        .get("members")
+        .and_then(|value| value.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|member| {
+                    let conversation_id = member.get("conversationId")?.as_str()?.to_string();
+                    Some(SyncMember {
+                        you: conversation_id == as_id,
+                        conversation_id,
+                        provider: member
+                            .get("provider")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("Agent")
+                            .to_string(),
+                        role: member
+                            .get("role")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        pending: member.get("pending").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    SyncRoom {
+        room: value.get("room").and_then(|value| value.as_str()).map(ToOwned::to_owned),
+        members,
+    }
+}
+
+/// Turn a refusal into something the panel can put next to the field that caused it.
+fn sync_error(status: u16, value: &serde_json::Value) -> String {
+    let code = value.get("error").and_then(|value| value.as_str()).unwrap_or("");
+    match (status, code) {
+        (404, _) => "No room with that code".to_string(),
+        (409, _) => "This session is already in another room".to_string(),
+        (429, "room_full") => "That room is full".to_string(),
+        (429, _) => "Too many rooms are open".to_string(),
+        (401, _) => "Gyredeck could not authenticate to its own bridge".to_string(),
+        (400, _) => "That code is not a valid room name".to_string(),
+        _ => format!("The bridge refused the request (HTTP {status})"),
+    }
+}
+
+/// Which room a session is in. Absence is an answer, not a failure.
+pub(crate) fn sync_room(conversation_id: &str) -> Result<SyncRoom, String> {
+    if !valid_room(conversation_id) {
+        return Err("Not a valid session id".to_string());
+    }
+    let (status, value) = bridge_request("GET", &format!("/sync/rooms?as={conversation_id}"), None)?;
+    if !(200..300).contains(&status) {
+        return Err(sync_error(status, &value));
+    }
+    Ok(parse_sync_room(&value, conversation_id))
+}
+
+/// Create a room and put this session in it. Creating without joining would leave a
+/// code nobody is in, which is never what the button means.
+pub(crate) fn sync_create(conversation_id: &str, role: &str) -> Result<SyncRoom, String> {
+    if !valid_room(conversation_id) {
+        return Err("Not a valid session id".to_string());
+    }
+    let body = serde_json::json!({ "conversationId": conversation_id, "role": role }).to_string();
+    let (status, value) = bridge_request("POST", "/sync/rooms", Some(body))?;
+    if !(200..300).contains(&status) {
+        return Err(sync_error(status, &value));
+    }
+    Ok(parse_sync_room(&value, conversation_id))
+}
+
+/// Join a room by code, or restate this session's role in the one it is already in.
+pub(crate) fn sync_join(code: &str, conversation_id: &str, role: &str) -> Result<SyncRoom, String> {
+    if !valid_room(conversation_id) {
+        return Err("Not a valid session id".to_string());
+    }
+    if !valid_room(code) {
+        return Err("No room with that code".to_string());
+    }
+    let body = serde_json::json!({ "conversationId": conversation_id, "role": role }).to_string();
+    let (status, value) = bridge_request("POST", &format!("/sync/rooms/{code}/members"), Some(body))?;
+    if !(200..300).contains(&status) {
+        return Err(sync_error(status, &value));
+    }
+    Ok(parse_sync_room(&value, conversation_id))
+}
+
+pub(crate) fn sync_leave(code: &str, conversation_id: &str) -> Result<(), String> {
+    if !valid_room(code) || !valid_room(conversation_id) {
+        return Err("Not a valid room".to_string());
+    }
+    let (status, value) =
+        bridge_request("DELETE", &format!("/sync/rooms/{code}/members/{conversation_id}"), None)?;
+    // Already gone is the state the caller wanted.
+    if status == 404 || (200..300).contains(&status) {
+        return Ok(());
+    }
+    Err(sync_error(status, &value))
+}
+
+/// Room names must survive being put in a URL, and they come from session ids.
+fn valid_room(room: &str) -> bool {
+    !room.is_empty()
+        && room.len() <= 64
+        && room
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Ask the bridge which mail rooms exist and how much is waiting in each.

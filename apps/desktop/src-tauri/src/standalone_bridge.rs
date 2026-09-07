@@ -387,9 +387,46 @@ fn bridge_request(
         .nth(1)
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or_else(|| "Bridge returned no status line".to_string())?;
-    let value = serde_json::from_str(payload)
-        .unwrap_or(serde_json::Value::Null);
+    let body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        dechunk(payload).ok_or_else(|| "Bridge sent a malformed chunked body".to_string())?
+    } else {
+        payload.to_string()
+    };
+
+    // A body that will not parse must not become an empty answer. Defaulting to null
+    // here made "the bridge said you are in no room" and "I could not read the reply"
+    // indistinguishable, and the panel believed the first for an hour.
+    let value = serde_json::from_str(&body).map_err(|error| {
+        format!("Bridge sent an unparsable body ({error}): {}", body.chars().take(200).collect::<String>())
+    })?;
     Ok((status, value))
+}
+
+/// Join the pieces of a chunked body.
+///
+/// Node does not send Content-Length unless the handler sets one, so the bridge
+/// answers chunked and the body arrives as `2f\r\n{...}\r\n0\r\n\r\n`. Reading it
+/// raw yields a hex length where JSON was expected, and every reply looked empty.
+fn dechunk(payload: &str) -> Option<String> {
+    let mut rest = payload;
+    let mut body = String::new();
+    loop {
+        let (header, tail) = rest.split_once("\r\n")?;
+        // A chunk header may carry extensions after a semicolon; the size is the part
+        // before it.
+        let size = usize::from_str_radix(header.split(';').next()?.trim(), 16).ok()?;
+        if size == 0 {
+            return Some(body);
+        }
+        if tail.len() < size {
+            return None;
+        }
+        body.push_str(&tail[..size]);
+        rest = tail.get(size + 2..)?;
+    }
 }
 
 /// A bridge call where anything but success is a failure, which is every mail read.
@@ -410,7 +447,6 @@ pub(crate) struct SyncMember {
     /// "Claude Code", "Codex", "Antigravity" — a conversation id reads as nothing, so
     /// the bridge labels each member from the runtime kind on its events.
     pub provider: String,
-    pub role: String,
     pub pending: u32,
     pub you: bool,
 }
@@ -438,11 +474,6 @@ fn parse_sync_room(value: &serde_json::Value, as_id: &str) -> SyncRoom {
                             .get("provider")
                             .and_then(|value| value.as_str())
                             .unwrap_or("Agent")
-                            .to_string(),
-                        role: member
-                            .get("role")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or_default()
                             .to_string(),
                         pending: member.get("pending").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                     })
@@ -484,11 +515,11 @@ pub(crate) fn sync_room(conversation_id: &str) -> Result<SyncRoom, String> {
 
 /// Create a room and put this session in it. Creating without joining would leave a
 /// code nobody is in, which is never what the button means.
-pub(crate) fn sync_create(conversation_id: &str, role: &str) -> Result<SyncRoom, String> {
+pub(crate) fn sync_create(conversation_id: &str) -> Result<SyncRoom, String> {
     if !valid_room(conversation_id) {
         return Err("Not a valid session id".to_string());
     }
-    let body = serde_json::json!({ "conversationId": conversation_id, "role": role }).to_string();
+    let body = serde_json::json!({ "conversationId": conversation_id }).to_string();
     let (status, value) = bridge_request("POST", "/sync/rooms", Some(body))?;
     if !(200..300).contains(&status) {
         return Err(sync_error(status, &value));
@@ -496,15 +527,15 @@ pub(crate) fn sync_create(conversation_id: &str, role: &str) -> Result<SyncRoom,
     Ok(parse_sync_room(&value, conversation_id))
 }
 
-/// Join a room by code, or restate this session's role in the one it is already in.
-pub(crate) fn sync_join(code: &str, conversation_id: &str, role: &str) -> Result<SyncRoom, String> {
+/// Join a room by code. Idempotent, so pressing Connect twice is not an error.
+pub(crate) fn sync_join(code: &str, conversation_id: &str) -> Result<SyncRoom, String> {
     if !valid_room(conversation_id) {
         return Err("Not a valid session id".to_string());
     }
     if !valid_room(code) {
         return Err("No room with that code".to_string());
     }
-    let body = serde_json::json!({ "conversationId": conversation_id, "role": role }).to_string();
+    let body = serde_json::json!({ "conversationId": conversation_id }).to_string();
     let (status, value) = bridge_request("POST", &format!("/sync/rooms/{code}/members"), Some(body))?;
     if !(200..300).contains(&status) {
         return Err(sync_error(status, &value));

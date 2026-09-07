@@ -307,9 +307,14 @@ function startBridge(config) {
   const releaseClosedSession = (conversationId) => {
     const found = syncRoomFor(conversationId);
     if (!found) return;
+    const label = providerLabelFor(conversationId);
     found.room.members.delete(conversationId);
     found.room.touchedAt = Date.now();
-    if (found.room.members.size === 0 && found.room.clients.size === 0) mailRooms.delete(found.name);
+    if (found.room.members.size === 0 && found.room.clients.size === 0) {
+      mailRooms.delete(found.name);
+    } else if (found.room.members.size > 0) {
+      announceMembership(found.name, found.room, `${label} ended its session and left this room.`);
+    }
   };
 
   const emitLocal = (payload) => {
@@ -498,7 +503,6 @@ function startBridge(config) {
   const MAIL_MAX_FROM = 64;
   const MAIL_ROOM_IDLE_MS = 3_600_000;
   const MAIL_MAX_MEMBERS = 8;
-  const MAIL_MAX_ROLE = 200;
   // Codes are read off one screen and typed into another, so the alphabet leaves out
   // characters that get confused by eye: 0/O, 1/l/I.
   const SYNC_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
@@ -579,13 +583,31 @@ function startBridge(config) {
     members: [...room.members].map(([conversationId, member]) => ({
       conversationId,
       provider: providerLabelFor(conversationId),
-      role: member.role,
       joinedAt: member.joinedAt,
       pending: Math.max(0, room.seq - member.readSeq),
       lastReadAt: member.lastReadAt ?? null,
     })),
     you: as && room.members.has(as) ? as : null,
   });
+
+  /**
+   * Sender used when the room itself has something to say.
+   *
+   * Reserved rather than a member id: a membership change is a fact about the room, not
+   * a request from a peer, and the framing an agent gets has to be able to tell those
+   * apart. It reuses the message path so the news travels the way everything else does
+   * — instantly for Codex, on the next turn for the others.
+   */
+  const ROOM_SENDER = "gyredeck-room";
+
+  const announceMembership = (name, room, note) => {
+    const present = [...room.members.keys()].map(providerLabelFor);
+    const text = `${note} Members now: ${present.join(", ") || "nobody"}.`;
+    publishMail(room, ROOM_SENDER, text, null);
+    // News about the room travels the same way anything else does, or a Codex member
+    // would never hear it: it does not read an inbox, it is pushed to.
+    deliverMail(name, room, text, ROOM_SENDER);
+  };
 
   const newSyncCode = () => {
     for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -649,13 +671,13 @@ function startBridge(config) {
    * Fire-and-forget on purpose: the POST that triggered this has already been answered,
    * and a session that never replies must not leave a request hanging.
    */
-  const deliverToCodex = (roomName, room, text) => {
+  const deliverToCodex = (threadId, room, text) => {
     const binary = findAgentBinary("codex");
     if (!binary) return "unavailable";
 
-    const rolloutPath = codexRolloutFor(roomName);
+    const rolloutPath = codexRolloutFor(threadId);
     const since = Date.now();
-    const child = spawn(binary, ["queue", "--thread", roomName, "--message", text], {
+    const child = spawn(binary, ["queue", "--thread", threadId, "--message", text], {
       stdio: ["ignore", "ignore", "ignore"],
     });
     child.on("error", () => {});
@@ -671,7 +693,7 @@ function startBridge(config) {
         const key = reply.turnId ?? reply.text;
         if (seen.has(key)) continue;
         seen.add(key);
-        publishMail(room, roomName, reply.text, null, true);
+        publishMail(room, threadId, reply.text, null, true);
       }
       if (seen.size === 0 && Date.now() < deadline) setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
     };
@@ -679,13 +701,41 @@ function startBridge(config) {
     return "queued";
   };
 
-  /** How a message reaches the session a room belongs to, if it can at all. */
-  const deliverMail = (roomName, room, text) => {
-    const provider = providerByConversation.get(roomName);
-    if (provider === "codexCliHook") return deliverToCodex(roomName, room, text);
-    // The others are handed their mail by their own hook, which only runs when the
-    // session next does — nothing to push, and nothing to wait for.
-    if (provider === "agyHost" || provider === "claudeCodeHook") return "on_next_turn";
+  /**
+   * How a message reaches the sessions it is addressed to, if it can at all.
+   *
+   * A private mailbox is named after its one session. A sync room is named after
+   * nothing, and its recipients are its members — so the room has to be fanned out.
+   * Codex is the only one that can be pushed to; the others collect through a hook
+   * that runs when their session next does, so there is nothing to send and nothing
+   * to wait for.
+   */
+  const deliverMail = (roomName, room, text, from) => {
+    const recipients = room.members.size > 0
+      // Nobody is delivered their own message, and a notice from the room itself goes
+      // to everyone.
+      ? [...room.members.keys()].filter((id) => id !== from)
+      : [roomName];
+    if (recipients.length === 0) return "no_recipients";
+
+    let queued = false;
+    let waiting = false;
+    let unavailable = false;
+    for (const recipient of recipients) {
+      const provider = providerByConversation.get(recipient);
+      if (provider === "codexCliHook") {
+        const outcome = deliverToCodex(recipient, room, text);
+        if (outcome === "queued") queued = true;
+        else unavailable = true;
+      } else if (provider === "agyHost" || provider === "claudeCodeHook") {
+        waiting = true;
+      }
+    }
+    // The best outcome any recipient got, because that is what the sender can act on:
+    // something is on its way, or everything is waiting for a turn.
+    if (queued) return "queued";
+    if (waiting) return "on_next_turn";
+    if (unavailable) return "unavailable";
     return "unknown_recipient";
   };
 
@@ -754,8 +804,10 @@ function startBridge(config) {
     }
 
     // Sync rooms: a mail room that people were deliberately put into, each with a
-    // stated role. The room is the same object mail already uses — membership is the
-    // only thing added, so nothing about messages is duplicated here.
+    // Being in the room together is the whole of the arrangement: what each session is
+    // for is something its own user tells it in its own terminal, not something
+    // restated here. The room is the same object mail already uses, so nothing about
+    // messages is duplicated.
     if (req.url === "/sync/rooms" || req.url.startsWith("/sync/rooms/") || req.url.startsWith("/sync/rooms?")) {
       const sendJson = (status, body) => {
         res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
@@ -770,8 +822,6 @@ function startBridge(config) {
       const url = new URL(req.url, "http://127.0.0.1");
       const segments = url.pathname.split("/").filter(Boolean);
       const code = segments[2];
-      const readRole = (value) =>
-        typeof value === "string" ? value.trim().replace(/\s+/g, " ").slice(0, MAIL_MAX_ROLE) : "";
 
       // GET /sync/rooms?as=<id> — which room this session is in, if any.
       if (req.method === "GET" && segments.length === 2) {
@@ -812,7 +862,6 @@ function startBridge(config) {
           return;
         }
         room.members.set(conversationId, {
-          role: readRole(body.role),
           joinedAt: new Date().toISOString(),
           // Joining mid-conversation should not replay what was said before: a member
           // starts from where the room is now.
@@ -824,8 +873,8 @@ function startBridge(config) {
         return;
       }
 
-      // POST /sync/rooms/<code>/members — join, or restate a role. Idempotent so the
-      // role field can be edited without a second verb.
+      // POST /sync/rooms/<code>/members — join. Idempotent, so a second press of
+      // Connect is not an error.
       if (req.method === "POST" && segments.length === 4 && segments[3] === "members") {
         const body = await readJsonBody(req);
         const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
@@ -845,20 +894,20 @@ function startBridge(config) {
           sendJson(409, { ok: false, error: "already_in_room", room: existing.name });
           return;
         }
-        const member = room.members.get(conversationId);
-        if (member) {
-          member.role = readRole(body.role);
-        } else {
+        const joining = !room.members.has(conversationId);
+        if (joining) {
           if (room.members.size >= MAIL_MAX_MEMBERS) {
             sendJson(429, { ok: false, error: "room_full" });
             return;
           }
           room.members.set(conversationId, {
-            role: readRole(body.role),
             joinedAt: new Date().toISOString(),
+            // Announced after the member is added, so its own read position is behind
+            // the notice and it learns who else is here too.
             readSeq: room.seq,
             lastReadAt: null,
           });
+          announceMembership(code, room, `${providerLabelFor(conversationId)} joined this room.`);
         }
         room.touchedAt = Date.now();
         sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
@@ -878,9 +927,13 @@ function startBridge(config) {
           sendJson(404, { ok: false, error: "not_a_member" });
           return;
         }
+        const label = providerLabelFor(conversationId);
         room.members.delete(conversationId);
         room.touchedAt = Date.now();
         if (room.members.size === 0 && room.clients.size === 0) mailRooms.delete(code);
+        // Whoever is left was told this member was here, and might be about to ask it
+        // something.
+        else if (room.members.size > 0) announceMembership(code, room, `${label} left this room.`);
         sendJson(200, { ok: true, room: code, members: [...(mailRooms.get(code)?.members.keys() ?? [])] });
         return;
       }
@@ -939,7 +992,7 @@ function startBridge(config) {
       // room it belongs to, and the two are lost together on a restart instead of the
       // cursor outliving the room and silently discarding everything after it.
       //
-      // Room and roles come back in the same response because the caller is a hook
+      // Room and members come back in the same response because the caller is a hook
       // with a sub-second budget and would otherwise need a second request to say who
       // it is talking to.
       if (req.method === "GET" && segments.length === 2 && segments[1] === "inbox") {
@@ -991,7 +1044,6 @@ function startBridge(config) {
                 members: [...sync.room.members].map(([conversationId, member]) => ({
                   conversationId,
                   provider: providerLabelFor(conversationId),
-                  role: member.role,
                   you: conversationId === as,
                 })),
               }
@@ -1037,7 +1089,7 @@ function startBridge(config) {
         const message = publishMail(room, from, text, replyTo);
         // Delivery is per-agent and reported back so a caller can say what will happen
         // rather than guess: "queued" reaches an idle session, "on_next_turn" waits.
-        const delivery = deliverMail(name, room, text);
+        const delivery = deliverMail(name, room, text, from);
         // A queued message is in the session's hands whether or not it answers, so it
         // is not still waiting to be collected. Leaving it pending would light the
         // chip on a session that had already been handed the message.

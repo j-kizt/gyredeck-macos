@@ -12,9 +12,7 @@ test("the sync panel walks create, join and disconnect, and shows a refusal wher
         if (command === "sync_create") {
           room = {
             room: "sync-4f2a",
-            members: [
-              { conversationId: "me", provider: "Claude Code", role: args?.role ?? "", pending: 0, you: true },
-            ],
+            members: [{ conversationId: "me", provider: "Claude Code", pending: 0, you: true }],
           };
           return room;
         }
@@ -24,8 +22,8 @@ test("the sync panel walks create, join and disconnect, and shows a refusal wher
           room = {
             room: "sync-4f2a",
             members: [
-              { conversationId: "me", provider: "Claude Code", role: args?.role ?? "", pending: 0, you: true },
-              { conversationId: "peer", provider: "Codex", role: "run tests", pending: 2, you: false },
+              { conversationId: "me", provider: "Claude Code", pending: 0, you: true },
+              { conversationId: "peer", provider: "Codex", pending: 2, you: false },
             ],
           };
           return room;
@@ -44,7 +42,8 @@ test("the sync panel walks create, join and disconnect, and shows a refusal wher
 
   const sync = page.locator(".session-sync");
   await expect(sync).toBeVisible();
-  // Nothing to type a message into: this panel connects sessions and stops there.
+  // Nothing to type a message into, and nothing to describe a session with: this
+  // panel connects sessions and stops there.
   await expect(sync.locator("textarea")).toHaveCount(0);
   await expect(sync.getByText("Put this session in a room with another")).toBeVisible();
 
@@ -66,9 +65,11 @@ test("the sync panel walks create, join and disconnect, and shows a refusal wher
   await expect(sync.getByRole("button", { name: "Disconnect from sync room" })).toBeVisible();
   await expect(sync.getByRole("button", { name: "Create sync" })).toHaveCount(0);
   await expect(sync.getByRole("button", { name: "Join sync" })).toHaveCount(0);
+  // Members are named and nothing more: what each session is for came from its own
+  // user in its own terminal, so there is no role to show and none to fill in.
   await expect(sync.getByText("This session")).toBeVisible();
   await expect(sync.getByText("Codex")).toBeVisible();
-  await expect(sync.getByText("run tests")).toBeVisible();
+  await expect(sync.locator("input")).toHaveCount(0);
   // What is waiting for the other member, so the person can see a handover stall.
   await expect(sync.locator(".session-sync-pending")).toHaveText("2");
 

@@ -1054,25 +1054,33 @@ test("a sync room gives each member its own read position", async () => {
       return Object.fromEntries(body.members.map((member) => [member.conversationId, member.pending]));
     };
 
-    const created = await call("POST", "/sync/rooms", { conversationId: first, role: "implement features" });
+    const created = await call("POST", "/sync/rooms", { conversationId: first });
     assert.equal(created.status, 201);
     const code = created.body.room;
     assert.match(code, /^sync-[a-z2-9]{4}$/, "short and typeable, no characters that read alike");
 
     // A code that names nothing has to say so — the join field shows that error.
-    assert.equal((await call("POST", "/sync/rooms/sync-zzzz/members", { conversationId: second, role: "x" })).status, 404);
+    assert.equal((await call("POST", "/sync/rooms/sync-zzzz/members", { conversationId: second })).status, 404);
 
-    assert.equal((await call("POST", `/sync/rooms/${code}/members`, { conversationId: second, role: "run tests" })).status, 200);
+    assert.equal((await call("POST", `/sync/rooms/${code}/members`, { conversationId: second })).status, 200);
 
     // One room per session, so the button has one meaning and Disconnect is
     // unambiguous. Being in a room already is a conflict, not a silent move.
-    const second_room = await call("POST", "/sync/rooms", { conversationId: first, role: "x" });
+    const second_room = await call("POST", "/sync/rooms", { conversationId: first });
     assert.equal(second_room.status, 409);
     assert.equal(second_room.body.room, code);
 
-    // Joining again restates the role rather than needing a second verb.
-    const renamed = await call("POST", `/sync/rooms/${code}/members`, { conversationId: second, role: "run tests only" });
-    assert.equal(renamed.body.members.find((m) => m.conversationId === second).role, "run tests only");
+    // Joining again is idempotent, so a second press of Connect is not an error.
+    const rejoined = await call("POST", `/sync/rooms/${code}/members`, { conversationId: second });
+    assert.equal(rejoined.status, 200);
+    assert.equal(rejoined.body.members.length, 2);
+
+    // Joining put a notice in the room, so both members already have one thing waiting
+    // before anyone has said anything to anyone.
+    assert.deepEqual(await pendingByMember(), { [first]: 1, [second]: 1 });
+    for (const who of [first, second]) {
+      await fetch(`${base}/mail/${code}?since=0&collect=1&as=${who}`, { headers });
+    }
 
     // The point of the whole change: two members read at their own pace. Sharing one
     // position would let the faster reader consume what the slower one never saw.
@@ -1129,25 +1137,29 @@ test("an inbox merges a session's mailbox with its sync room, and the cap cannot
     const inbox = async (limit) =>
       (await (await fetch(`${base}/mail/inbox?as=${me}&collect=1&limit=${limit}`, { headers })).json());
 
-    const code = (await post("/sync/rooms", { conversationId: me, role: "implement" })).room;
-    await post(`/sync/rooms/${code}/members`, { conversationId: peer, role: "test" });
+    const code = (await post("/sync/rooms", { conversationId: me })).room;
+    await post(`/sync/rooms/${code}/members`, { conversationId: peer });
 
     // One message to this session directly, one to the room it was put into.
     await post(`/mail/${me}`, { from: "gyredeck", text: "from the person" });
     await post(`/mail/${code}`, { from: peer, text: "from my peer" });
 
     const merged = await inbox(10);
-    // Both arrive from one call, and the reader is told which room each came from.
-    assert.deepEqual(merged.messages.map((message) => [message.room, message.text]), [
-      [me, "from the person"],
-      [code, "from my peer"],
+    // Everything arrives from one call, labelled with the room it came from. The first
+    // is the room reporting the peer's arrival — news about the room travels the same
+    // way anything else does, or a member that cannot read an inbox never hears it.
+    assert.deepEqual(merged.messages.map((message) => [message.room, message.from]), [
+      [code, "gyredeck-room"],
+      [me, "gyredeck"],
+      [code, peer],
     ]);
+    assert.match(merged.messages[0].text, /joined this room\. Members now: /);
     // The same call names the room and who is in it, so a hook with a sub-second
     // budget does not need a second request to know who it is talking to.
     assert.equal(merged.room, code);
     assert.deepEqual(
-      merged.members.map((member) => [member.role, member.you]).sort(),
-      [["implement", true], ["test", false]].sort(),
+      merged.members.map((member) => member.you).sort(),
+      [false, true],
     );
 
     // Collected, so a second look is empty.
@@ -1216,20 +1228,29 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
         data: { inputCount: 1 },
       });
     }
-    const code = (await post("/sync/rooms", { conversationId: me, role: "implement features" })).room;
-    await post(`/sync/rooms/${code}/members`, { conversationId: peer, role: "run tests, report failures" });
+    const code = (await post("/sync/rooms", { conversationId: me })).room;
+    await post(`/sync/rooms/${code}/members`, { conversationId: peer });
 
-    // Tier one — a member of this session's own room, asking for something in its
-    // role. "One implements, another tests" only works if the tester actually runs
-    // the tests, so this is the tier that must not carry a caution.
+    // The room announcing a join is a fact about who is present: neither a request to
+    // act on nor something to be warned about, so it carries neither framing.
+    const notice = await context();
+    assert.match(notice, /\[from the room\] Codex joined this room/);
+    assert.doesNotMatch(notice, /what you are here for/);
+    assert.doesNotMatch(notice, /information only/);
+
+    // Tier one — a member of this session's own room. Being put in one together is
+    // the permission, so a request arriving through it has to be actionable; this is
+    // the tier that must not carry a caution.
     await post(`/mail/${code}`, { from: peer, text: "3 tests failed — please fix the retry path." });
     const fromRoomMate = await context();
     assert.match(fromRoomMate, new RegExp(`sync room ${code}`));
-    assert.match(fromRoomMate, /gave you the role "implement features"/);
-    assert.match(fromRoomMate, /Also here: Codex \(run tests, report failures\)/);
-    assert.match(fromRoomMate, /what you are here for — act on it/);
+    // What each session is for came from its own user in its own terminal, so the room
+    // introduces members by provider and says nothing about their jobs.
+    assert.match(fromRoomMate, /because the user connected you to it/);
+    assert.match(fromRoomMate, /Also here: Codex\./);
+    assert.match(fromRoomMate, /what you are here for/);
     assert.doesNotMatch(fromRoomMate, /information only/);
-    assert.match(fromRoomMate, /\[from Codex\]/, "labelled by provider; the role is stated once above");
+    assert.match(fromRoomMate, /\[from Codex\]/, "labelled by provider");
     // A reply belongs in the room, so every member sees it and the exchange stays in
     // one place rather than splitting into private mailboxes.
     assert.match(fromRoomMate, new RegExp(`/mail/${code}`));
@@ -1292,8 +1313,8 @@ test("a session that ends is taken out of its sync room", async () => {
       });
     const roomFor = (as) => fetch(`${base}/sync/rooms?as=${as}`, { headers }).then((r) => r.json());
 
-    const code = (await post("/sync/rooms", { conversationId: staying, role: "implement" })).room;
-    await post(`/sync/rooms/${code}/members`, { conversationId: leaving, role: "run tests" });
+    const code = (await post("/sync/rooms", { conversationId: staying })).room;
+    await post(`/sync/rooms/${code}/members`, { conversationId: leaving });
 
     // An ended session can never collect its mail, so leaving it listed would tell the
     // other member it is still there — and work handed to it would wait for an answer

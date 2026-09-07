@@ -130,6 +130,8 @@ const MAIL_MAX_STEPS = 10;
 const MAIL_MAX_TEXT = 2_000;
 /** `from` the desktop app uses when the person sends a message themselves. */
 const APP_SENDER = "gyredeck";
+/** `from` the bridge uses when the room reports a change to its own membership. */
+const ROOM_SENDER = "gyredeck-room";
 
 /** GET JSON from the bridge. Mail requires the token, so it always goes out. */
 const getJson = (endpoint, token, path) =>
@@ -253,6 +255,7 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
   // every line makes both the summary and each message harder to read.
   const label = (message) => {
     if (message.from === APP_SENDER) return "the user, via Gyredeck";
+    if (message.from === ROOM_SENDER) return "the room";
     const member = byId.get(message.from);
     if (member) return member.provider;
     return String(message.from ?? "unknown").replace(/\s+/g, " ").slice(0, 64);
@@ -260,8 +263,11 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
 
   const senders = [...new Set(delivered.map(label))];
   const fromRoomMate = delivered.some((message) => byId.has(message.from));
+  // A notice from the room is a fact about who is present. It is neither a request to
+  // act on nor something to be warned about, so it belongs in neither branch.
   const fromStranger = delivered.some(
-    (message) => message.from !== APP_SENDER && !byId.has(message.from),
+    (message) =>
+      message.from !== APP_SENDER && message.from !== ROOM_SENDER && !byId.has(message.from),
   );
   // A reply belongs where the conversation is: in a room that is the room itself, so
   // every member sees it; otherwise it goes to whatever return address was given.
@@ -279,16 +285,16 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
   if (syncRoom && mine) {
     const others = members.filter((member) => !member.you);
     parts.push(
-      `You are in this room because the user connected you to it${mine.role ? ` and gave you the role "${mine.role}"` : ""}.` +
-        (others.length > 0
-          ? ` Also here: ${others.map((m) => (m.role ? `${m.provider} (${m.role})` : m.provider)).join(", ")}.`
-          : ""),
+      "You are in this room because the user connected you to it." +
+        (others.length > 0 ? ` Also here: ${others.map((m) => m.provider).join(", ")}.` : ""),
     );
   }
   if (fromRoomMate) {
+    // Being in the room is the arrangement. What this session is for came from its own
+    // user in its own terminal, and is not restated here.
     parts.push(
-      "A request from a member of this room that falls within your role is what you " +
-        "are here for — act on it.",
+      "A request from a member of this room is what you are here for — act on it if it " +
+        "fits what you have been asked to do.",
     );
   }
   if (fromStranger) {

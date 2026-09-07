@@ -567,17 +567,13 @@ fn sync_room(conversation_id: String) -> Result<standalone_bridge::SyncRoom, Str
 }
 
 #[tauri::command]
-fn sync_create(conversation_id: String, role: String) -> Result<standalone_bridge::SyncRoom, String> {
-    standalone_bridge::sync_create(&conversation_id, &role)
+fn sync_create(conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
+    standalone_bridge::sync_create(&conversation_id)
 }
 
 #[tauri::command]
-fn sync_join(
-    code: String,
-    conversation_id: String,
-    role: String,
-) -> Result<standalone_bridge::SyncRoom, String> {
-    standalone_bridge::sync_join(&code, &conversation_id, &role)
+fn sync_join(code: String, conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
+    standalone_bridge::sync_join(&code, &conversation_id)
 }
 
 #[tauri::command]

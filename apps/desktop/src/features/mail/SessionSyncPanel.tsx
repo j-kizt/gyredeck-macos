@@ -24,15 +24,7 @@ export const SessionSyncPanel = ({
   });
   const [mode, setMode] = useState<"idle" | "joining">("idle");
   const [code, setCode] = useState("");
-  const [role, setRole] = useState("");
   const [copied, setCopied] = useState(false);
-
-  const mine = members.find((member) => member.you);
-  // The role field starts from whatever this session already told the room, so editing
-  // it does not begin by wiping it.
-  useEffect(() => {
-    setRole(mine?.role ?? "");
-  }, [mine?.role]);
 
   useEffect(() => {
     if (!room) return;
@@ -95,33 +87,18 @@ export const SessionSyncPanel = ({
       </div>
 
       {room ? (
-        <>
-          <ul className="session-sync-members">
+        <ul className="session-sync-members">
             {members.map((member) => (
               <li className="session-sync-member" key={member.conversationId} data-you={member.you}>
                 <span className="session-sync-provider">{member.you ? "This session" : member.provider}</span>
-                <span className="session-sync-role">{member.role || "no role set"}</span>
                 {member.pending > 0 && !member.you ? (
                   <span className="session-sync-pending" title={`${member.pending} waiting to be collected`}>
                     {member.pending}
                   </span>
                 ) : null}
               </li>
-            ))}
-          </ul>
-          <input
-            className="session-sync-input"
-            value={role}
-            placeholder="What is this session for?"
-            disabled={busy}
-            onChange={(event) => setRole(event.target.value)}
-            onBlur={() => { if (room && role !== (mine?.role ?? "")) void join(room, role); }}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && room) void join(room, role);
-            }}
-            aria-label="This session's role in the room"
-          />
-        </>
+          ))}
+        </ul>
       ) : mode === "joining" ? (
         <div className="session-sync-row">
           <input
@@ -132,7 +109,7 @@ export const SessionSyncPanel = ({
             autoFocus
             onChange={(event) => { setCode(event.target.value); clearError(); }}
             onKeyDown={(event) => {
-              if (event.key === "Enter") void join(code, role);
+              if (event.key === "Enter") void join(code);
               if (event.key === "Escape") { setMode("idle"); clearError(); }
             }}
             aria-label="Room code to join"
@@ -140,7 +117,7 @@ export const SessionSyncPanel = ({
           <button
             className="session-sync-btn primary"
             type="button"
-            onClick={() => void join(code, role)}
+            onClick={() => void join(code)}
             disabled={busy || code.trim().length === 0}
             data-tauri-drag-region="false"
           >
@@ -152,7 +129,7 @@ export const SessionSyncPanel = ({
           <button
             className="session-sync-btn"
             type="button"
-            onClick={() => void create(role)}
+            onClick={() => void create()}
             disabled={busy || !canAct}
             data-tauri-drag-region="false"
           >

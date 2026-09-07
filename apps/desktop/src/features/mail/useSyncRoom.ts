@@ -4,7 +4,6 @@ import { useCallback, useEffect, useState } from "react";
 export interface ISyncMember {
   conversationId: string;
   provider: string;
-  role: string;
   pending: number;
   you: boolean;
 }
@@ -18,8 +17,8 @@ export interface ISyncRoomState {
   error: string | null;
   /** False when the room could not be read at all, so acting on it would guess. */
   canAct: boolean;
-  create: (role: string) => Promise<void>;
-  join: (code: string, role: string) => Promise<void>;
+  create: () => Promise<void>;
+  join: (code: string) => Promise<void>;
   leave: () => Promise<void>;
   clearError: () => void;
 }
@@ -55,8 +54,15 @@ export const useSyncRoom = ({
   const read = useCallback(async () => {
     if (!conversationId || !canUseNativeControls) return;
     try {
-      apply(await invoke("sync_room", { conversationId }));
+      const next = await invoke<{ room: string | null; members: ISyncMember[] }>("sync_room", {
+        conversationId,
+      });
+      apply(next);
       setReadFailure(null);
+      // A read that succeeds is the newer truth about the room, so a refusal from an
+      // earlier action stops applying. Without this a 409 from Create stayed on screen
+      // beside the very state it was complaining about.
+      if (next.room) setError(null);
     } catch (cause) {
       // "No room" and "could not ask" have to stay distinguishable. Treating a failed
       // read as an empty room offers Create on a session that is already in one, and
@@ -107,8 +113,8 @@ export const useSyncRoom = ({
     // An action's refusal is the more specific of the two and wins; a read that cannot
     // reach the bridge still has to say so rather than look like an empty room.
     error: error ?? readFailure,
-    create: (role) => act("sync_create", { role }),
-    join: (code, role) => act("sync_join", { code: code.trim(), role }),
+    create: () => act("sync_create", {}),
+    join: (code) => act("sync_join", { code: code.trim() }),
     leave: () => act("sync_leave", { code: room }),
     clearError: () => setError(null),
     canAct: readFailure === null,

@@ -945,20 +945,10 @@
 }
 
 .session-sync-provider {
-  flex: none;
+  flex: 1 1 auto;
   color: var(--text);
   font-size: 10px;
   font-weight: 650;
-}
-
-.session-sync-role {
-  min-width: 0;
-  flex: 1 1 auto;
-  overflow: hidden;
-  color: var(--text-2);
-  font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .session-sync-pending {

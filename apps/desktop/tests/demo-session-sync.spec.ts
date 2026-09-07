@@ -58,8 +58,12 @@ test("the sync panel walks create, join and disconnect, and shows a refusal wher
   await sync.getByRole("button", { name: "Connect" }).click();
 
   // Connected: the code and who is in the room take the place of the buttons that put
-  // it there, so Create and Join cannot be pressed again by mistake.
+  // it there, so Create and Join cannot be pressed again by mistake. Create already
+  // joined, so nothing is left to confirm — just the code and the two things worth
+  // doing with it.
+  await expect(sync.locator(".session-sync-code")).toHaveText("sync-4f2a");
   await expect(sync.getByRole("button", { name: "Copy room code sync-4f2a" })).toBeVisible();
+  await expect(sync.getByRole("button", { name: "Disconnect from sync room" })).toBeVisible();
   await expect(sync.getByRole("button", { name: "Create sync" })).toHaveCount(0);
   await expect(sync.getByRole("button", { name: "Join sync" })).toHaveCount(0);
   await expect(sync.getByText("This session")).toBeVisible();

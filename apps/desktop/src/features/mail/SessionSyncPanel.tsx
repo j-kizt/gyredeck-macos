@@ -18,7 +18,7 @@ export const SessionSyncPanel = ({
   session: ISessionSummary;
   canUseNativeControls: boolean;
 }) => {
-  const { room, members, busy, error, create, join, leave, clearError } = useSyncRoom({
+  const { room, members, busy, error, canAct, create, join, leave, clearError } = useSyncRoom({
     conversationId: session.conversationId,
     canUseNativeControls,
   });
@@ -65,17 +65,32 @@ export const SessionSyncPanel = ({
       <div className="session-sync-head">
         <span id="session-sync-heading">Sync</span>
         {room ? (
-          <button
-            className="session-sync-code"
-            type="button"
-            onClick={() => void copyCode()}
-            data-tauri-drag-region="false"
-            title="Copy room code"
-            aria-label={`Copy room code ${room}`}
-          >
-            {room}
-            {copied ? <Check size={10} strokeWidth={2.6} /> : <Copy size={10} strokeWidth={2.4} />}
-          </button>
+          // Create already puts this session in the room, so there is nothing left to
+          // confirm: the code and the two things worth doing with it are all there is.
+          <span className="session-sync-room">
+            <span className="session-sync-code">{room}</span>
+            <button
+              className="session-sync-icon"
+              type="button"
+              onClick={() => void copyCode()}
+              data-tauri-drag-region="false"
+              title="Copy room code"
+              aria-label={`Copy room code ${room}`}
+            >
+              {copied ? <Check size={11} strokeWidth={2.6} /> : <Copy size={11} strokeWidth={2.3} />}
+            </button>
+            <button
+              className="session-sync-icon"
+              type="button"
+              onClick={() => void leave()}
+              disabled={busy}
+              data-tauri-drag-region="false"
+              title="Disconnect from this room"
+              aria-label="Disconnect from sync room"
+            >
+              <Link2Off size={11} strokeWidth={2.3} />
+            </button>
+          </span>
         ) : null}
       </div>
 
@@ -94,31 +109,18 @@ export const SessionSyncPanel = ({
               </li>
             ))}
           </ul>
-          <div className="session-sync-row">
-            <input
-              className="session-sync-input"
-              value={role}
-              placeholder="What is this session for?"
-              disabled={busy}
-              onChange={(event) => setRole(event.target.value)}
-              onBlur={() => { if (room && role !== (mine?.role ?? "")) void join(room, role); }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && room) void join(room, role);
-              }}
-              aria-label="This session's role in the room"
-            />
-            <button
-              className="session-sync-btn"
-              type="button"
-              onClick={() => void leave()}
-              disabled={busy}
-              data-tauri-drag-region="false"
-              aria-label="Disconnect from sync room"
-            >
-              <Link2Off size={11} strokeWidth={2.3} />
-              Disconnect
-            </button>
-          </div>
+          <input
+            className="session-sync-input"
+            value={role}
+            placeholder="What is this session for?"
+            disabled={busy}
+            onChange={(event) => setRole(event.target.value)}
+            onBlur={() => { if (room && role !== (mine?.role ?? "")) void join(room, role); }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && room) void join(room, role);
+            }}
+            aria-label="This session's role in the room"
+          />
         </>
       ) : mode === "joining" ? (
         <div className="session-sync-row">
@@ -151,7 +153,7 @@ export const SessionSyncPanel = ({
             className="session-sync-btn"
             type="button"
             onClick={() => void create(role)}
-            disabled={busy}
+            disabled={busy || !canAct}
             data-tauri-drag-region="false"
           >
             <Link2 size={11} strokeWidth={2.3} />
@@ -161,7 +163,7 @@ export const SessionSyncPanel = ({
             className="session-sync-btn"
             type="button"
             onClick={() => { setMode("joining"); clearError(); }}
-            disabled={busy}
+            disabled={busy || !canAct}
             data-tauri-drag-region="false"
           >
             Join sync

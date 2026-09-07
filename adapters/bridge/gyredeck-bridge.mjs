@@ -367,6 +367,17 @@ function startBridge(config) {
   // agent: Codex takes a queued message and wakes to read it, while the others are
   // handed theirs by their own hook on their next turn.
   const providerByConversation = new Map();
+  // A member is addressed by conversation id, which says nothing a person or an agent
+  // can read. The runtime kind the events carry is the only name available.
+  const PROVIDER_LABELS = {
+    claudeCodeHook: "Claude Code",
+    codexCliHook: "Codex",
+    "codex-notify": "Codex",
+    codex: "Codex",
+    agyHost: "Antigravity",
+  };
+  const providerLabelFor = (conversationId) =>
+    PROVIDER_LABELS[providerByConversation.get(conversationId)] ?? "Agent";
   const rememberProvider = (payload) => {
     const conversationId = payload?.conversationId;
     const sourceKind = payload?.runtime?.sourceKind;
@@ -543,6 +554,7 @@ function startBridge(config) {
     seq: room.seq,
     members: [...room.members].map(([conversationId, member]) => ({
       conversationId,
+      provider: providerLabelFor(conversationId),
       role: member.role,
       joinedAt: member.joinedAt,
       pending: Math.max(0, room.seq - member.readSeq),
@@ -954,6 +966,7 @@ function startBridge(config) {
                 room: sync.name,
                 members: [...sync.room.members].map(([conversationId, member]) => ({
                   conversationId,
+                  provider: providerLabelFor(conversationId),
                   role: member.role,
                   you: conversationId === as,
                 })),

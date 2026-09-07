@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import type { IGyredeckBridgeCapabilities } from "@gyredeck/protocol";
 import { shortenPath } from "../session/activity";
 import type { IUseUpdater } from "../updater/useUpdater";
@@ -254,15 +254,14 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
           {activeCategory === "permission" ? (
             <>
               <div className="setup-section-heading"><span>Permission</span><small>What an agent may do unprompted</small></div>
-              {hookStatus.installed ? (
-                // Only meaningful once the hook is in: without it nothing sends a reply
-                // to permit. Shown here rather than under Plugins because it is about
-                // how a connected session talks, not about what is installed.
-                <div className="setup-row"><span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Allow sync replies without asking</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : syncRepliesAllowed === null ? "Checking…" : syncRepliesAllowed ? "On · a session answers its room without a prompt each time" : "Off · Claude Code asks before every reply and every wait"}</span></span><button className="switch-toggle" type="button" role="switch" aria-checked={syncRepliesAllowed === true} data-on={syncRepliesAllowed === true} disabled={!canUseNativeControls || syncRepliesBusy || syncRepliesAllowed === null} onClick={() => void onSyncRepliesChange(!syncRepliesAllowed)} data-tauri-drag-region="false" aria-label={`${syncRepliesAllowed ? "Stop allowing" : "Allow"} sync replies without asking`}><span className="switch-thumb" /></button></div>
-              ) : null}
-              {!hookStatus.installed ? (
-                <div className="setup-row passive"><span className="status-slot"><ShieldCheck className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Nothing to permit yet</span><span className="setup-detail">Install the Claude Code hook under Plugins first — until then no session sends a reply that needs approving.</span></span></div>
-              ) : null}
+              <div className="setup-row"><span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Allow sync replies without asking</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : !hookStatus.installed ? "Needs the Claude Code hook — install it under Plugins" : syncRepliesAllowed === null ? "Checking…" : syncRepliesAllowed ? "On · a session answers its room without a prompt each time" : "Off · Claude Code asks before every reply and every wait"}</span></span>{!hookStatus.installed ? (
+                // Shown but locked rather than hidden: the setting exists and its state
+                // is worth seeing. A padlock says why it cannot be moved, where a greyed
+                // switch would only say that it cannot.
+                <span className="setup-locked" title="Install the Claude Code hook first"><Lock size={12} strokeWidth={2.4} /></span>
+              ) : (
+                <button className="switch-toggle" type="button" role="switch" aria-checked={syncRepliesAllowed === true} data-on={syncRepliesAllowed === true} disabled={!canUseNativeControls || syncRepliesBusy || syncRepliesAllowed === null} onClick={() => void onSyncRepliesChange(!syncRepliesAllowed)} data-tauri-drag-region="false" aria-label={`${syncRepliesAllowed ? "Stop allowing" : "Allow"} sync replies without asking`}><span className="switch-thumb" /></button>
+              )}</div>
             </>
           ) : null}
 

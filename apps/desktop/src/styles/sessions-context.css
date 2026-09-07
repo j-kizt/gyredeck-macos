@@ -820,6 +820,12 @@
   font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
 }
 
+/* Worth noticing rather than blending in: the point of the marker is to stop a local
+   run being mistaken for the installed app. */
+.footer-version[data-local="true"] {
+  color: var(--accent-text);
+}
+
 .footer-done-close {
   margin-left: auto;
 }

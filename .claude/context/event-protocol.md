@@ -140,8 +140,14 @@ held rather than returned. A session that has asked a room-mate for something it
 waits there instead of ending its turn, and the reply arrives as the result of the call
 it is already blocked on — which is how the return leg of a handover completes with
 nobody at a keyboard. It answers with `timedOut: true` when the wait expires (default
-60s, capped at 300s), holds at most 16 waiters before answering `429 too_many_waiters`,
-and drops a waiter without advancing its read position if the client hangs up.
+60s, capped at 300s), and drops a waiter without advancing its read position if the
+client hangs up.
+
+**One wait per session**, answered `409 already_waiting`, with a global cap of 16 before
+`429 too_many_waiters`. The instruction given to an agent says to wait only while an
+answer is outstanding, but an agent that ignores it would stack waits into the listen
+loop this is meant not to be — and a session holding several has stopped working. The
+limit is per reader, so one session waiting never blocks another.
 
 This is not a listen loop and must not be described to an agent as one: an agent told it
 "can wait for replies" waits when nothing is outstanding, and a session blocked on an

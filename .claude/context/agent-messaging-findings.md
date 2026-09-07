@@ -74,7 +74,14 @@ carries the whole answer in `last_agent_message`, already bounded to a turn:
 ```
 
 Filter by the log entry's `timestamp` against when the message was queued and nothing
-the session said beforehand is ever read. It also carries `duration_ms` and
+the session said beforehand is ever read.
+
+**Deduplicate per thread, not per harvest.** Every delivery starts its own harvest with
+its own window, and windows overlap — a room notice and a question sent moments apart
+both see the one answer Codex writes. A harvest that only remembers what it published
+itself posts that answer twice, and a session waiting for a *new* reply then wakes on
+the stale copy. Key on the turn id **and** the text: a retried turn repeats the text
+under a new id, and a re-read of the log repeats the id with the same text. It also carries `duration_ms` and
 `time_to_first_token_ms`, which would make a per-turn latency display trivial.
 
 ## Traps, each of which cost a live failure

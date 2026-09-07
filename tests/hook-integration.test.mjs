@@ -1247,6 +1247,19 @@ test("a session can wait inside its turn for an answer it needs", async () => {
     const after = await call("GET", `/mail/wait?as=${asker}&timeout=1`);
     assert.equal(after.body.timedOut, true);
     assert.deepEqual(after.body.messages, []);
+
+    // One wait per session, enforced rather than asked for: an agent that ignores the
+    // instruction and stacks waits would turn this into the listen loop it must not
+    // be, and a session holding several has stopped working.
+    const held = call("GET", `/mail/wait?as=${asker}&timeout=3`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const second = await call("GET", `/mail/wait?as=${asker}&timeout=3`);
+    assert.equal(second.status, 409);
+    assert.equal(second.body.error, "already_waiting");
+    // A different session is unaffected — the limit is per reader, not a global lock.
+    const other = await call("GET", `/mail/wait?as=${answerer}&timeout=1`);
+    assert.equal(other.status, 200);
+    await held;
   } finally {
     bridge.kill("SIGTERM");
     await rm(home, { recursive: true, force: true });

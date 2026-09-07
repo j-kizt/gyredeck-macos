@@ -472,6 +472,41 @@ function startBridge(config) {
    * is ever reused. Reading `task_complete` costs nothing and needs no permission: the
    * whole answer is one field, already bounded to a turn.
    */
+  /**
+   * Replies already put in a room, per Codex thread.
+   *
+   * Each delivery starts its own harvest with its own window, and windows overlap: a
+   * room notice and a question sent moments apart both see the one answer Codex
+   * writes, and both publish it. Deduplication therefore cannot live inside a single
+   * harvest — it has to be per thread, outliving any one of them.
+   */
+  const codexPublished = new Map();
+  const CODEX_PUBLISHED_MEMORY = 64;
+
+  const claimCodexReply = (threadId, reply) => {
+    let published = codexPublished.get(threadId);
+    if (!published) {
+      published = new Set();
+      codexPublished.set(threadId, published);
+    }
+    // Both, because a retried turn repeats the text under a new id, and a re-read of
+    // the log repeats the id with the same text.
+    const key = `${reply.turnId ?? ""}\u0000${reply.text}`;
+    if (published.has(key)) return false;
+    published.add(key);
+    // Bounded: a long-lived thread must not grow this without limit. The oldest keys
+    // are the least likely to reappear, so dropping them first is safe.
+    if (published.size > CODEX_PUBLISHED_MEMORY) {
+      const excess = published.size - CODEX_PUBLISHED_MEMORY;
+      let dropped = 0;
+      for (const stale of published) {
+        published.delete(stale);
+        if (++dropped >= excess) break;
+      }
+    }
+    return true;
+  };
+
   const readCodexReplies = (rolloutPath, sinceMs) => {
     const replies = [];
     let content = "";
@@ -730,12 +765,13 @@ function startBridge(config) {
     if (!rolloutPath) return "queued";
 
     const deadline = since + CODEX_REPLY_TIMEOUT_MS;
+    // Local, and only to decide when to stop looking. Whether a reply is published is
+    // not this harvest's call to make — an overlapping one may already have posted it.
     const seen = new Set();
     const poll = () => {
       for (const reply of readCodexReplies(rolloutPath, since)) {
-        const key = reply.turnId ?? reply.text;
-        if (seen.has(key)) continue;
-        seen.add(key);
+        seen.add(reply.turnId ?? reply.text);
+        if (!claimCodexReply(threadId, reply)) continue;
         publishMail(room, threadId, reply.text, null, true);
       }
       if (seen.size === 0 && Date.now() < deadline) setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
@@ -1104,6 +1140,16 @@ function startBridge(config) {
             answer(first.collected, first.sync, false);
             return;
           }
+          // One wait per session, enforced rather than asked for. The instruction says
+          // to wait only while an answer is outstanding, but an agent that ignores it
+          // would otherwise stack waits into the listen loop this is meant not to be —
+          // and a session holding several is a session that has stopped working.
+          for (const existing of mailWaiters) {
+            if (existing.as === as) {
+              sendJson(409, { ok: false, error: "already_waiting" });
+              return;
+            }
+          }
           // A held request costs a socket and a timer. Past the cap, say so rather than
           // accumulating waiters nobody is counting.
           if (mailWaiters.size >= MAIL_MAX_WAITERS) {
@@ -1111,7 +1157,7 @@ function startBridge(config) {
             return;
           }
 
-          const waiter = { check: null };
+          const waiter = { as, check: null };
           let done = false;
           const finish = (collected, sync, timedOut) => {
             if (done) return;
@@ -1123,7 +1169,9 @@ function startBridge(config) {
           const timer = setTimeout(() => finish([], syncRoomFor(as), true), waitMs);
           timer.unref?.();
           waiter.check = () => {
-            if (done) return;
+            // A request already gone must not have its position advanced: collect=1
+            // would mark messages delivered into a socket nobody is reading.
+            if (done || req.destroyed) return;
             const next = collectInbox();
             if (next.collected.length > 0) finish(next.collected, next.sync, false);
           };

@@ -147,6 +147,15 @@ the same problem by polling every 3 seconds from a shell loop, which is the same
 the session is occupied either way, and holding one request is cheaper than twenty a
 minute.
 
+A subagent holding the wait instead was considered and rejected. It would let the asker
+carry on working, and a background one completing may even re-invoke an idle parent —
+which would be a way to wake a Claude Code session without private sockets or preview
+flags. It is not worth it here: a whole model context to hold one HTTP request open is
+several times the cost of the `curl` it replaces, the asker is blocked on the answer
+anyway so has nothing to do with the freedom, a 300s cap means a longer handover needs
+repeated subagents, and it exists only on Claude Code — so the instruction would have to
+differ per provider, which is the thing this file's own findings warn against.
+
 Waking a session that is genuinely idle was investigated and has no shippable answer.
 Claude Code can do it two ways, neither usable here: **channels** (an MCP server pushing
 `notifications/claude/channel`) need the session started with `--channels`, and during

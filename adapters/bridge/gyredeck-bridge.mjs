@@ -282,7 +282,7 @@ function startBridge(config) {
 
   const capabilities = {
     events: { lifecycle: true, turns: true, tools: true, compact: true, llm: true },
-    endpoints: { health: true, snapshot: true, sse: true, hookStop: true, hookAttention: true, ingest: true, mail: true },
+    endpoints: { health: true, snapshot: true, sse: true, hookStop: true, hookAttention: true, ingest: true, mail: true, syncRooms: true },
     sessionActions: { focusTerminal: false, endSession: false, dismissEnded: true },
   };
 
@@ -462,6 +462,11 @@ function startBridge(config) {
   const MAIL_MAX_TEXT = 4_096;
   const MAIL_MAX_FROM = 64;
   const MAIL_ROOM_IDLE_MS = 3_600_000;
+  const MAIL_MAX_MEMBERS = 8;
+  const MAIL_MAX_ROLE = 200;
+  // Codes are read off one screen and typed into another, so the alphabet leaves out
+  // characters that get confused by eye: 0/O, 1/l/I.
+  const SYNC_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
   const mailRooms = new Map();
 
   // Rooms are created by whoever speaks first, so they need an upper bound and a way
@@ -469,6 +474,9 @@ function startBridge(config) {
   const sweepMailRooms = () => {
     const now = Date.now();
     for (const [name, room] of mailRooms) {
+      // A room with members was set up deliberately and stays until its last member
+      // leaves; only unattended mailboxes age out.
+      if (room.members.size > 0) continue;
       if (room.clients.size === 0 && now - room.touchedAt > MAIL_ROOM_IDLE_MS) mailRooms.delete(name);
     }
   };
@@ -480,7 +488,19 @@ function startBridge(config) {
     // readSeq is how far a reader has got. The reader's own cursor lives in the
     // adapter, which the app cannot see, so the room records what it has handed out
     // instead — that is what makes "still waiting to be picked up" observable.
-    const room = { seq: 0, readSeq: 0, messages: [], clients: new Set(), touchedAt: Date.now() };
+    //
+    // The room-level number is the furthest *anyone* has read. A room with members
+    // also tracks each one separately, because two sessions reading at different
+    // rates would otherwise share a single position and the slower one would lose
+    // whatever the faster one collected.
+    const room = {
+      seq: 0,
+      readSeq: 0,
+      messages: [],
+      clients: new Set(),
+      members: new Map(),
+      touchedAt: Date.now(),
+    };
     mailRooms.set(name, room);
     return room;
   };
@@ -489,6 +509,58 @@ function startBridge(config) {
   // resume: EventSource replays the last id it saw back as Last-Event-ID.
   const mailFrame = (message) =>
     `id: ${message.seq}\nevent: mail\ndata: ${JSON.stringify(message)}\n\n`;
+
+  /**
+   * Read position for one reader of a room.
+   *
+   * A member gets its own; anyone reading without saying who they are shares the
+   * room-level number, which is what a session's private mailbox has always used and
+   * what the shipped adapters still expect.
+   */
+  const readerFor = (room, as) => (as && room.members.get(as)) || room;
+
+  const markRead = (room, as, seq, at) => {
+    const reader = readerFor(room, as);
+    // Never backwards: re-reading from an older `since` has not un-taken anything.
+    reader.readSeq = Math.max(reader.readSeq, seq);
+    reader.lastReadAt = at;
+    // The room-level number stays "the furthest anyone got", so a chip that does not
+    // identify a reader still shows something truthful.
+    room.readSeq = Math.max(room.readSeq, reader.readSeq);
+    room.lastReadAt = at;
+  };
+
+  /** Which room a session has been put into, if any. A session belongs to at most one. */
+  const syncRoomFor = (conversationId) => {
+    for (const [name, room] of mailRooms) {
+      if (room.members.has(conversationId)) return { name, room };
+    }
+    return null;
+  };
+
+  const describeRoom = (name, room, as) => ({
+    room: name,
+    seq: room.seq,
+    members: [...room.members].map(([conversationId, member]) => ({
+      conversationId,
+      role: member.role,
+      joinedAt: member.joinedAt,
+      pending: Math.max(0, room.seq - member.readSeq),
+      lastReadAt: member.lastReadAt ?? null,
+    })),
+    you: as && room.members.has(as) ? as : null,
+  });
+
+  const newSyncCode = () => {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const suffix = Array.from(randomBytes(4))
+        .map((byte) => SYNC_CODE_ALPHABET[byte % SYNC_CODE_ALPHABET.length])
+        .join("");
+      const code = `sync-${suffix}`;
+      if (!mailRooms.has(code)) return code;
+    }
+    return null;
+  };
 
   const publishMail = (room, from, text, replyTo, fromSession = false) => {
     room.seq += 1;
@@ -518,6 +590,14 @@ function startBridge(config) {
     if (pushed || fromSession) {
       room.readSeq = Math.max(room.readSeq, message.seq);
       room.lastReadAt = message.ts;
+    }
+    // A push does not count for the members: the stream and the membership are
+    // different things, and a member reads on its own schedule. The author is the
+    // exception — nobody waits to be handed what they just wrote.
+    const author = room.members.get(from);
+    if (author) {
+      author.readSeq = Math.max(author.readSeq, message.seq);
+      author.lastReadAt = message.ts;
     }
     return message;
   };
@@ -637,6 +717,142 @@ function startBridge(config) {
       return;
     }
 
+    // Sync rooms: a mail room that people were deliberately put into, each with a
+    // stated role. The room is the same object mail already uses — membership is the
+    // only thing added, so nothing about messages is duplicated here.
+    if (req.url === "/sync/rooms" || req.url.startsWith("/sync/rooms/") || req.url.startsWith("/sync/rooms?")) {
+      const sendJson = (status, body) => {
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+        res.end(JSON.stringify(body));
+      };
+      if (!matchesIngestToken(config.ingestToken, req.headers["x-gyredeck-token"])) {
+        sendJson(401, { ok: false, error: "unauthorized" });
+        return;
+      }
+      sweepMailRooms();
+
+      const url = new URL(req.url, "http://127.0.0.1");
+      const segments = url.pathname.split("/").filter(Boolean);
+      const code = segments[2];
+      const readRole = (value) =>
+        typeof value === "string" ? value.trim().replace(/\s+/g, " ").slice(0, MAIL_MAX_ROLE) : "";
+
+      // GET /sync/rooms?as=<id> — which room this session is in, if any.
+      if (req.method === "GET" && segments.length === 2) {
+        const as = url.searchParams.get("as") ?? "";
+        if (!MAIL_ROOM_NAME.test(as)) {
+          sendJson(400, { ok: false, error: "invalid_session" });
+          return;
+        }
+        const found = syncRoomFor(as);
+        sendJson(200, { ok: true, ...(found ? describeRoom(found.name, found.room, as) : { room: null, members: [], you: null }) });
+        return;
+      }
+
+      // POST /sync/rooms — create a room and put the caller in it. Creating without
+      // joining would leave a code nobody is in, which is never what the button means.
+      if (req.method === "POST" && segments.length === 2) {
+        const body = await readJsonBody(req);
+        const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
+        if (!MAIL_ROOM_NAME.test(conversationId)) {
+          sendJson(400, { ok: false, error: "invalid_session" });
+          return;
+        }
+        // One room per session, so the button has one meaning and Disconnect is
+        // unambiguous. Being in a room already is a conflict, not a silent move.
+        const existing = syncRoomFor(conversationId);
+        if (existing) {
+          sendJson(409, { ok: false, error: "already_in_room", room: existing.name });
+          return;
+        }
+        const name = newSyncCode();
+        if (!name) {
+          sendJson(429, { ok: false, error: "too_many_rooms" });
+          return;
+        }
+        const room = mailRoomFor(name, true);
+        if (!room) {
+          sendJson(429, { ok: false, error: "too_many_rooms" });
+          return;
+        }
+        room.members.set(conversationId, {
+          role: readRole(body.role),
+          joinedAt: new Date().toISOString(),
+          // Joining mid-conversation should not replay what was said before: a member
+          // starts from where the room is now.
+          readSeq: room.seq,
+          lastReadAt: null,
+        });
+        room.touchedAt = Date.now();
+        sendJson(201, { ok: true, ...describeRoom(name, room, conversationId) });
+        return;
+      }
+
+      // POST /sync/rooms/<code>/members — join, or restate a role. Idempotent so the
+      // role field can be edited without a second verb.
+      if (req.method === "POST" && segments.length === 4 && segments[3] === "members") {
+        const body = await readJsonBody(req);
+        const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
+        if (!MAIL_ROOM_NAME.test(code) || !MAIL_ROOM_NAME.test(conversationId)) {
+          sendJson(400, { ok: false, error: "invalid_session" });
+          return;
+        }
+        const room = mailRoomFor(code, false);
+        // A code that names nothing is a typo, and saying so is the whole reason the
+        // join field can show an error.
+        if (!room || room.members.size === 0) {
+          sendJson(404, { ok: false, error: "unknown_room" });
+          return;
+        }
+        const existing = syncRoomFor(conversationId);
+        if (existing && existing.name !== code) {
+          sendJson(409, { ok: false, error: "already_in_room", room: existing.name });
+          return;
+        }
+        const member = room.members.get(conversationId);
+        if (member) {
+          member.role = readRole(body.role);
+        } else {
+          if (room.members.size >= MAIL_MAX_MEMBERS) {
+            sendJson(429, { ok: false, error: "room_full" });
+            return;
+          }
+          room.members.set(conversationId, {
+            role: readRole(body.role),
+            joinedAt: new Date().toISOString(),
+            readSeq: room.seq,
+            lastReadAt: null,
+          });
+        }
+        room.touchedAt = Date.now();
+        sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
+        return;
+      }
+
+      // DELETE /sync/rooms/<code>/members/<id> — leave. The room goes with the last
+      // member: an empty room is a code nobody can use for anything.
+      if (req.method === "DELETE" && segments.length === 5 && segments[3] === "members") {
+        const conversationId = segments[4];
+        if (!MAIL_ROOM_NAME.test(code) || !MAIL_ROOM_NAME.test(conversationId)) {
+          sendJson(400, { ok: false, error: "invalid_session" });
+          return;
+        }
+        const room = mailRoomFor(code, false);
+        if (!room || !room.members.has(conversationId)) {
+          sendJson(404, { ok: false, error: "not_a_member" });
+          return;
+        }
+        room.members.delete(conversationId);
+        room.touchedAt = Date.now();
+        if (room.members.size === 0 && room.clients.size === 0) mailRooms.delete(code);
+        sendJson(200, { ok: true, room: code, members: [...(mailRooms.get(code)?.members.keys() ?? [])] });
+        return;
+      }
+
+      sendJson(404, { ok: false, error: "not_found" });
+      return;
+    }
+
     if (req.url === "/mail" || req.url.startsWith("/mail/") || req.url.startsWith("/mail?")) {
       const sendJson = (status, body) => {
         res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
@@ -659,16 +875,23 @@ function startBridge(config) {
       if (req.method === "GET" && segments.length === 1) {
         sendJson(200, {
           ok: true,
-          rooms: [...mailRooms].map(([name, room]) => ({
-            room: name,
-            seq: room.seq,
-            readSeq: room.readSeq,
-            pending: Math.max(0, room.seq - room.readSeq),
-            buffered: room.messages.length,
-            subscribers: room.clients.size,
-            lastMessageAt: room.messages.at(-1)?.ts ?? null,
-            lastReadAt: room.lastReadAt ?? null,
-          })),
+          rooms: [...mailRooms].map(([name, room]) => {
+            // `as` asks "what is waiting for me", which in a room with members is the
+            // only question with one answer — the room-level number is the furthest
+            // anyone got and says nothing about the reader who is behind.
+            const reader = readerFor(room, url.searchParams.get("as"));
+            return {
+              room: name,
+              seq: room.seq,
+              readSeq: reader.readSeq,
+              pending: Math.max(0, room.seq - reader.readSeq),
+              buffered: room.messages.length,
+              subscribers: room.clients.size,
+              members: [...room.members.keys()],
+              lastMessageAt: room.messages.at(-1)?.ts ?? null,
+              lastReadAt: reader.lastReadAt ?? null,
+            };
+          }),
         });
         return;
       }
@@ -744,10 +967,7 @@ function startBridge(config) {
         if (room) {
           room.touchedAt = Date.now();
           if (url.searchParams.get("collect") === "1") {
-            // Never backwards: a collector re-reading from an old `since` has not
-            // un-taken what it already had.
-            room.readSeq = Math.max(room.readSeq, messages.at(-1)?.seq ?? since);
-            room.lastReadAt = new Date().toISOString();
+            markRead(room, url.searchParams.get("as"), messages.at(-1)?.seq ?? since, new Date().toISOString());
           }
         }
         sendJson(200, { ok: true, room: name, seq: room?.seq ?? 0, messages });

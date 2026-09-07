@@ -1012,3 +1012,88 @@ test("claude UserPromptSubmit delivers mail as additional context exactly once",
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("a sync room gives each member its own read position", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-sync-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const first = "session-one";
+  const second = "session-two";
+  try {
+    const health = await waitForHealth(port, stderrRef);
+    assert.equal(health.capabilities.endpoints.syncRooms, true);
+
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(base + path, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const pendingByMember = async () => {
+      const { body } = await call("GET", `/sync/rooms?as=${first}`);
+      return Object.fromEntries(body.members.map((member) => [member.conversationId, member.pending]));
+    };
+
+    const created = await call("POST", "/sync/rooms", { conversationId: first, role: "implement features" });
+    assert.equal(created.status, 201);
+    const code = created.body.room;
+    assert.match(code, /^sync-[a-z2-9]{4}$/, "short and typeable, no characters that read alike");
+
+    // A code that names nothing has to say so — the join field shows that error.
+    assert.equal((await call("POST", "/sync/rooms/sync-zzzz/members", { conversationId: second, role: "x" })).status, 404);
+
+    assert.equal((await call("POST", `/sync/rooms/${code}/members`, { conversationId: second, role: "run tests" })).status, 200);
+
+    // One room per session, so the button has one meaning and Disconnect is
+    // unambiguous. Being in a room already is a conflict, not a silent move.
+    const second_room = await call("POST", "/sync/rooms", { conversationId: first, role: "x" });
+    assert.equal(second_room.status, 409);
+    assert.equal(second_room.body.room, code);
+
+    // Joining again restates the role rather than needing a second verb.
+    const renamed = await call("POST", `/sync/rooms/${code}/members`, { conversationId: second, role: "run tests only" });
+    assert.equal(renamed.body.members.find((m) => m.conversationId === second).role, "run tests only");
+
+    // The point of the whole change: two members read at their own pace. Sharing one
+    // position would let the faster reader consume what the slower one never saw.
+    const send = (from, text) => call("POST", `/mail/${code}`, { from, text });
+    await send(first, "first");
+    await send(first, "second");
+    assert.deepEqual(await pendingByMember(), { [first]: 0, [second]: 2 }, "nobody waits for what they wrote");
+
+    await fetch(`${base}/mail/${code}?since=0&collect=1&as=${second}`, { headers });
+    assert.deepEqual(await pendingByMember(), { [first]: 0, [second]: 0 });
+
+    await send(second, "reply");
+    assert.deepEqual(await pendingByMember(), { [first]: 1, [second]: 0 }, "positions moved independently");
+
+    // A room people were put into does not age out; only unattended mailboxes do.
+    const listed = await (await fetch(`${base}/mail`, { headers })).json();
+    assert.deepEqual(listed.rooms.find((room) => room.room === code).members.sort(), [first, second].sort());
+
+    assert.equal((await call("DELETE", `/sync/rooms/${code}/members/${second}`)).status, 200);
+    assert.equal((await call("DELETE", `/sync/rooms/${code}/members/${second}`)).status, 404);
+    // The room goes with its last member: an empty code is useful to nobody.
+    await call("DELETE", `/sync/rooms/${code}/members/${first}`);
+    assert.equal((await call("GET", `/sync/rooms?as=${first}`)).body.room, null);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

@@ -56,6 +56,10 @@ Bound to `127.0.0.1:47621`.
 | POST | `/mail/<room>` | Send a message into a room, and deliver it to the session that room belongs to. |
 | GET | `/mail/<room>?since=<seq>` | Read messages after `seq`. |
 | GET | `/mail/<room>/events` | Subscribe to a room (SSE). |
+| POST | `/sync/rooms` | Create a sync room and join it. |
+| POST | `/sync/rooms/<code>/members` | Join a room, or restate a role. |
+| DELETE | `/sync/rooms/<code>/members/<id>` | Leave a room. |
+| GET | `/sync/rooms?as=<id>` | Which room a session is in, with roles. |
 
 `GET /health` and `GET /snapshot` include capability metadata so viewers know which event streams and session actions are real:
 
@@ -108,6 +112,24 @@ Two ways to receive, because the participants differ in kind:
 - **Read the backlog** — `GET /mail/<room>?since=<seq>` returns what came after `seq`. A hook process lives for milliseconds and cannot hold a connection, so without a buffer it would miss everything sent while its agent was idle. `since` is the highest `seq` already handled, which makes repeat reads idempotent.
 
 Unlike `/ingest`, which downgrades an untrusted sender's `runtime` to null but still accepts the event, mail **requires** `x-gyredeck-token` and returns `401` without it. Mail is read and acted on by agents, so an untrusted local process must not be able to put words into another agent's input.
+
+## Sync rooms
+
+A sync room is a mail room with members. Nothing about messages is duplicated: the room is the same object, and membership is the only thing added on top. See [`sync-session-plan.md`](sync-session-plan.md) for what it is for.
+
+Codes look like `sync-4f2a` — short enough to read off one screen and type into another, and drawn from an alphabet without `0/O` or `1/l/I`. They are **names, not secrets**: every call already requires `x-gyredeck-token`, so knowing a code grants nothing by itself.
+
+A session belongs to **at most one** room. Creating or joining while already in another answers `409 already_in_room` rather than moving silently, so the panel's buttons keep one meaning each. Joining a room you are already in restates your role, which is how the role field is edited without a second verb. An unknown code answers `404`, which is what lets the join field show an error.
+
+Rooms with members are exempt from the idle sweep — they were set up deliberately and last until the final member leaves, at which point the room goes too.
+
+### Read position is per member
+
+Each member carries its own `readSeq` and `lastReadAt`. The room keeps a number too, but it means "the furthest anyone got" and is only for a caller that has not said who it is — which is every reader of a private mailbox, and the shape the shipped adapters still use.
+
+This distinction is the reason membership needed building carefully rather than as a list of names. With one position per room, two members reading at different rates share it, and whatever the faster one collects is marked delivered for the slower one as well — the same silent loss as a cursor that outlives its room.
+
+`?as=<conversationId>` selects the reader on `GET /mail/<room>` and on `GET /mail`, so `pending` answers "what is waiting for me" rather than "what is waiting for whoever is furthest behind". Nobody waits for their own message: publishing credits the author's position immediately.
 
 ### Seeing that mail arrived
 

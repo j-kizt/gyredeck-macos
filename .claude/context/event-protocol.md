@@ -62,8 +62,8 @@ Bound to `127.0.0.1:47621`.
 | DELETE | `/sync/rooms/<code>/members/<id>` | Leave a room. |
 | GET | `/sync/rooms?as=<id>` | Which room a session is in, and who else. |
 | GET | `/mail/wait?as=<id>` | Long poll: the inbox, held until something arrives. |
-| POST | `/sync/rooms/<code>/passwords` | The founder mints a one-time password. |
-| POST | `/sync/rooms/<code>/confirm` | A joined session spends one and may then speak. |
+| POST | `/sync/rooms/<code>/passwords` | The founder reads the room's token. |
+| POST | `/sync/rooms/<code>/confirm` | A joined session presents it and may then speak. |
 
 `GET /health` and `GET /snapshot` include capability metadata so viewers know which event streams and session actions are real:
 
@@ -125,11 +125,22 @@ Codes look like `sync-4f2a` — short enough to read off one screen and type int
 
 A session belongs to **at most one** room. Creating or joining while already in another answers `409 already_in_room` rather than moving silently, so the panel's buttons keep one meaning each. Joining a room you are already in is idempotent, so a second press of Connect is not an error. An unknown code answers `404`, which is what lets the join field show an error.
 
-Joining a room lets a session **read** it. Speaking in it is granted separately: the founder mints a one-time password, the person copies it and types it into the joining session's own terminal, and that session presents it to `/sync/rooms/<code>/confirm`. Until then `POST /mail/<code>` answers `403 not_confirmed`, and a non-member answers `403 not_a_member`. The founder needs no password — pressing Create in that session's own detail panel is the same act of intent.
+**Create and join need no credential; reading and sending in a room need the room's own token.** Putting a session into a room grants it nothing, so gating that would only prove what every local caller can prove anyway. The room's token is created with the room, copied from the founder's key button, and typed by hand into the terminal of the session being let in. From then on that session presents it in the `x-gyredeck-token` header of every read and every send — which is where a credential already travels, so "attach it to every message" needs no second mechanism and no new field.
 
-The password is **one-time** because it travels through a conversation. Typing a secret into a terminal puts it in that session's transcript for as long as the session is kept, which is the trap already recorded for the ingest token; a password spent the moment it is used is safe to leave lying there. It is deliberately *not* the ingest token: every agent already reads that file to make any call at all, so a session could confirm itself and the person's grant would mean nothing.
+Two credentials reach `/mail` and they mean different things:
 
-Confirming is also the moment worth telling a session to start watching its room. Before it the session had nothing it was allowed to say; after it, one instruction covers both facts at once, in the terminal where the person is present.
+| | proves | opens |
+| --- | --- | --- |
+| the machine's ingest token | this call is local | `GET /mail` (the app's own listing) |
+| a room's token | a person let this session into this room | that room's reads and sends |
+
+The ingest token is deliberately **not** accepted for a room's messages or its stream. Every agent reads that file to make any call at all, so accepting it would let anything speak in, or watch, a conversation it was never let into — and the framing tells an agent that a request from a member is what it is there for.
+
+`POST /mail/<code>` without the room token answers `403 not_confirmed` with a message naming what to ask for; a non-member answers `403 not_a_member`. The founder needs no token of its own — pressing Create in that session's detail panel is the same act of intent, made in the same place.
+
+Presenting the token once is **remembered**, because Codex never posts for itself: the bridge reads its answer out of its own rollout log and publishes on its behalf, with no header to carry anything. Without that, a confirmed Codex session still could not speak.
+
+**Subscribing must not bring a sync room into being.** `GET /mail/<code>/events` on a code nothing is open under answers `404`, rather than creating an empty room the watcher then watches forever with no way to tell that from silence — the same shape as the cursor that outlived its room and reported success while discarding everything. A mailbox is different: it is named after one session, and watching it before anything is sent is ordinary.
 
 When a session joins or leaves, the room says so: a message from the reserved sender `gyredeck-room`, naming who changed and who is present now. It travels the ordinary delivery path, which is the point — a Codex member does not read an inbox, it is pushed to, so news it never hears is news that did not happen. The framing treats it as a third kind of sender: a fact about who is present is neither a request to act on nor something to be warned about.
 

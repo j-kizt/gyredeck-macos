@@ -344,6 +344,8 @@ fn probe_bridge(endpoint: BridgeEndpoint) -> BridgeProbe {
 pub(crate) struct MailRoom {
     pub room: String,
     pub seq: u32,
+    /// Provider names of the sessions put into this room, empty for a plain mailbox.
+    pub members: Vec<String>,
     pub pending: u32,
     pub subscribers: u32,
     #[serde(rename = "lastMessageAt")]
@@ -654,6 +656,15 @@ pub(crate) fn mail_rooms() -> Result<Vec<MailRoom>, String> {
                     .map(|value| value.to_string())
             };
             Some(MailRoom {
+                members: room
+                    .get("members")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 room: name,
                 seq: number("seq"),
                 pending: number("pending"),

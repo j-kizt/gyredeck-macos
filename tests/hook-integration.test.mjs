@@ -1084,36 +1084,57 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
     assert.equal(refused.body.error, "not_the_founder");
 
     const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
-    assert.equal(minted.status, 201);
+    assert.equal(minted.status, 200);
     assert.match(minted.body.password, /^gk-[a-z2-9]{10}$/);
 
-    // A wrong password is refused without consuming the real one.
+    // The room's token is what authorises, and it travels in the header — the same
+    // place a credential already goes, so "attach it to every message" costs nothing.
+    const asRoom = async (path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-gyredeck-token": minted.body.password },
+        body: JSON.stringify(body),
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    const spoke = await asRoom(`/mail/${code}`, { from: joiner, text: "yes" });
+    assert.equal(spoke.status, 202);
+
+    // Presenting it once is remembered, because Codex never posts for itself: the
+    // bridge reads its answer out of its own log and publishes with no header at all.
     assert.equal(
-      (await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: joiner, password: "gk-wrongwrong" })).status,
-      403,
+      (await call("GET", `/sync/rooms?as=${joiner}`)).body.members.find((m) => m.conversationId === joiner).confirmed,
+      true,
     );
+    assert.equal((await call("POST", `/mail/${code}`, { from: joiner, text: "again" })).status, 202);
 
-    const confirmed = await call("POST", `/sync/rooms/${code}/confirm`, {
-      conversationId: joiner,
-      password: minted.body.password,
-    });
-    assert.equal(confirmed.status, 200);
-    assert.equal(confirmed.body.members.find((m) => m.conversationId === joiner).confirmed, true);
-    assert.equal((await call("POST", `/mail/${code}`, { from: joiner, text: "yes" })).status, 202);
-
-    // One-time: the copy of the password left in a session's transcript is worthless
-    // afterwards, which is the only safe way to put a secret through a conversation.
+    // A session that was never given the token cannot speak, and is told what to ask
+    // for rather than left to guess.
     await call("POST", `/sync/rooms/${code}/members`, { conversationId: stranger });
-    const reused = await call("POST", `/sync/rooms/${code}/confirm`, {
-      conversationId: stranger,
-      password: minted.body.password,
-    });
-    assert.equal(reused.status, 403);
-    assert.equal(reused.body.error, "bad_password");
-    assert.equal((await call("POST", `/mail/${code}`, { from: stranger, text: "let me in" })).status, 403);
+    const muted2 = await call("POST", `/mail/${code}`, { from: stranger, text: "let me in" });
+    assert.equal(muted2.status, 403);
+    assert.equal(muted2.body.error, "not_confirmed");
+    assert.match(muted2.body.message, /Ask the person at this terminal for the room password/);
 
-    // Someone who never joined is refused before any password question arises.
+    // Someone who never joined is refused before any token question arises.
     assert.equal((await call("POST", `/mail/${code}`, { from: "pass-outsider", text: "hello" })).body.error, "not_a_member");
+
+    // The machine token is not a way in: it proves the call is local, which every local
+    // caller can prove, and says nothing about who a person let into this room. Even
+    // the stream is gated, or it would be the way around the door.
+    const watched = await fetch(`http://127.0.0.1:${port}/mail/${code}/events`, { headers });
+    assert.equal(watched.status, 403);
+    const allowed = await fetch(`http://127.0.0.1:${port}/mail/${code}/events`, {
+      headers: { "x-gyredeck-token": minted.body.password },
+    });
+    assert.equal(allowed.status, 200, "the room's own token opens its stream");
+    allowed.body?.cancel();
+
+    // A code nobody is in cannot be watched into existence: a watcher on a dead room
+    // would see nothing forever and have no way to tell that from silence.
+    const dead = await fetch(`http://127.0.0.1:${port}/mail/sync-zzzz/events`, { headers });
+    assert.equal(dead.status, 404);
   } finally {
     bridge.kill("SIGTERM");
     await rm(home, { recursive: true, force: true });
@@ -1197,9 +1218,13 @@ test("a sync room gives each member its own read position", async () => {
     await send(second, "reply");
     assert.deepEqual(await pendingByMember(), { [first]: 1, [second]: 0 }, "positions moved independently");
 
-    // A room people were put into does not age out; only unattended mailboxes do.
+    // A room people were put into does not age out; only unattended mailboxes do. The
+    // listing names members by provider rather than by conversation id, because it is
+    // read by a person in Settings and an id tells them nothing.
     const listed = await (await fetch(`${base}/mail`, { headers })).json();
-    assert.deepEqual(listed.rooms.find((room) => room.room === code).members.sort(), [first, second].sort());
+    const entry = listed.rooms.find((room) => room.room === code);
+    assert.equal(entry.members.length, 2);
+    assert.ok(entry.members.every((name) => typeof name === "string" && !name.includes("session-")));
 
     assert.equal((await call("DELETE", `/sync/rooms/${code}/members/${second}`)).status, 200);
     assert.equal((await call("DELETE", `/sync/rooms/${code}/members/${second}`)).status, 404);

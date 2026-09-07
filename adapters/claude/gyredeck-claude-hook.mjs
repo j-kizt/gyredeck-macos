@@ -253,15 +253,15 @@ const getJson = (endpoint, token, path) =>
  * Every failure path yields nothing. This runs before a prompt is answered, so an
  * undelivered message is always better than a stalled prompt.
  */
-/** A room password as the app hands it out. */
+/** A room's own token, as the app hands it out from the founder's key. */
 const ROOM_PASSWORD = /\bgk-[a-z2-9]{10}\b/;
 
 /**
  * Take a room password out of what the person typed and present it to the bridge.
  *
- * This is how a session earns the right to speak in a room it was joined to: the
- * person copies a one-time password from the room's owner and types it in here, where
- * the session lives. Joining happens in the app; consenting happens in the terminal.
+ * This is how a session earns the right to read and speak in a room it was joined to:
+ * the person copies the room's password from its owner and types it in here, where the
+ * session lives. Joining happens in the app; consenting happens in the terminal.
  *
  * Returns the room it confirmed, or null. Failure is deliberately quiet — a prompt that
  * merely looks like a password is not worth an error in front of the person.

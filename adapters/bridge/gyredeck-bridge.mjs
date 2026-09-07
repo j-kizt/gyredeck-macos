@@ -544,6 +544,8 @@ function startBridge(config) {
   // Codes are read off one screen and typed into another, so the alphabet leaves out
   // characters that get confused by eye: 0/O, 1/l/I.
   const SYNC_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+  /** A room code, as opposed to a conversation id used as a mailbox name. */
+  const SYNC_CODE = /^sync-[a-z2-9]{4}$/;
   const mailRooms = new Map();
 
   // Rooms are created by whoever speaks first, so they need an upper bound and a way
@@ -575,9 +577,11 @@ function startBridge(config) {
       // Who pressed Create. Only they are offered the key, because handing out the
       // right to speak is the founder's act, not something any member can pass on.
       createdBy: null,
-      // Unused one-time passwords. A used one is deleted rather than marked, so the
-      // copy that stays in a session's transcript forever is worthless afterwards.
-      passwords: new Set(),
+      // The room's own credential. Presented in the x-gyredeck-token header for any
+      // read or send in this room, which is where a credential already travels — so
+      // "attach it to every message" needs no new field and no second mechanism.
+      // Created with the room; the founder's key button is how a person copies it.
+      token: null,
       readSeq: 0,
       messages: [],
       clients: new Set(),
@@ -657,7 +661,6 @@ function startBridge(config) {
     deliverMail(name, room, text, ROOM_SENDER);
   };
 
-  const MAIL_MAX_PASSWORDS = 8;
 
   // Longer than a room code and from the same alphabet. A code is a name people say to
   // each other; this is the thing that grants the right to speak, so it is not meant to
@@ -727,6 +730,35 @@ function startBridge(config) {
    * routinely land in the same millisecond.
    */
   let mailOrdinal = 0;
+
+  /**
+   * Whether a sender may speak in this room, or null when it may.
+   *
+   * This lives with publishing rather than with the HTTP route because publishing has
+   * more than one door. Codex never posts: the bridge reads its answer out of its own
+   * log and publishes on its behalf, so a check on the POST handler let Codex speak in
+   * a room nobody had confirmed it for — found by asking who had told Codex the
+   * password, and the answer was that nobody had to.
+   */
+  /**
+   * Whether a request carries this room's credential.
+   *
+   * The room's token, not the machine's: every agent can read the ingest token file, so
+   * that one proves only "this call came from this machine" and can never carry the
+   * person's decision to let one particular session in. The room token is copied by
+   * hand from the founder's panel into the joining session's terminal.
+   */
+  const holdsRoomToken = (room, headerValue) =>
+    typeof room.token === "string" && matchesIngestToken(room.token, headerValue);
+
+  const refuseToPublish = (room, from) => {
+    if (room.members.size === 0) return null;
+    if (from === ROOM_SENDER) return null;
+    const sender = room.members.get(from);
+    if (!sender) return "not_a_member";
+    if (sender.confirmed !== true) return "not_confirmed";
+    return null;
+  };
 
   const publishMail = (room, from, text, replyTo, fromSession = false) => {
     room.seq += 1;
@@ -811,6 +843,10 @@ function startBridge(config) {
       for (const reply of readCodexReplies(rolloutPath, since)) {
         seen.add(reply.turnId ?? reply.text);
         if (!claimCodexReply(threadId, reply)) continue;
+        // A harvested answer is still that session speaking, and a session nobody
+        // confirmed does not get to speak just because the bridge is the one holding
+        // the pen.
+        if (refuseToPublish(room, threadId)) continue;
         publishMail(room, threadId, reply.text, null, true);
       }
       if (seen.size === 0 && Date.now() < deadline) setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
@@ -841,8 +877,18 @@ function startBridge(config) {
     let unavailable = false;
     for (const recipient of recipients) {
       const provider = providerByConversation.get(recipient);
+      // A member that has not been confirmed can read the room but not answer it. Say
+      // so in the same breath as the message, or it tries to reply, is refused, and has
+      // no idea why — Codex especially, which has no hook that could tell it separately
+      // and only ever learns about a room from what is pushed to it.
+      const muted =
+        room.members.size > 0 && room.members.get(recipient)?.confirmed !== true
+          ? "[Gyredeck: you are in this room but not yet allowed to answer in it. Ask the" +
+            " person at this terminal for the room's one-time password and wait for it —" +
+            " do not retry and do not work around it.]\n\n"
+          : "";
       if (provider === "codexCliHook") {
-        const outcome = deliverToCodex(recipient, room, text);
+        const outcome = deliverToCodex(recipient, room, `${muted}${text}`);
         if (outcome === "queued") queued = true;
         else unavailable = true;
       } else if (provider === "agyHost" || provider === "claudeCodeHook") {
@@ -931,10 +977,9 @@ function startBridge(config) {
         res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
         res.end(JSON.stringify(body));
       };
-      if (!matchesIngestToken(config.ingestToken, req.headers["x-gyredeck-token"])) {
-        sendJson(401, { ok: false, error: "unauthorized" });
-        return;
-      }
+      // Create and join are deliberately open. Putting a session into a room lets it
+      // neither read nor say anything — the room's own token gates both — and asking
+      // for the machine token here would only prove what every local caller can prove.
       sweepMailRooms();
 
       const url = new URL(req.url, "http://127.0.0.1");
@@ -980,6 +1025,7 @@ function startBridge(config) {
           return;
         }
         room.createdBy = conversationId;
+        room.token = newRoomPassword();
         room.members.set(conversationId, {
           // Pressing Create in this session's own detail panel is the same act of
           // intent the password exists to capture, so the founder needs no password.
@@ -991,7 +1037,9 @@ function startBridge(config) {
           lastReadAt: null,
         });
         room.touchedAt = Date.now();
-        sendJson(201, { ok: true, ...describeRoom(name, room, conversationId) });
+        // The founder is handed the room's token once, here; everyone else gets it
+        // from them, by hand, into the terminal of the session being let in.
+        sendJson(201, { ok: true, token: room.token, ...describeRoom(name, room, conversationId) });
         return;
       }
 
@@ -1011,14 +1059,8 @@ function startBridge(config) {
           sendJson(403, { ok: false, error: "not_the_founder" });
           return;
         }
-        if (room.passwords.size >= MAIL_MAX_PASSWORDS) {
-          sendJson(429, { ok: false, error: "too_many_passwords" });
-          return;
-        }
-        const password = newRoomPassword();
-        room.passwords.add(password);
         room.touchedAt = Date.now();
-        sendJson(201, { ok: true, room: code, password });
+        sendJson(200, { ok: true, room: code, password: room.token });
         return;
       }
 
@@ -1038,7 +1080,7 @@ function startBridge(config) {
           sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
           return;
         }
-        if (!room.passwords.delete(password)) {
+        if (!holdsRoomToken(room, password)) {
           sendJson(403, { ok: false, error: "bad_password" });
           return;
         }
@@ -1136,7 +1178,14 @@ function startBridge(config) {
       // Mail is a channel agents read and act on, not observational data like
       // /ingest, so an untrusted caller must not be able to put words into another
       // agent's input. There is no degraded mode here: no token, no access.
-      if (!matchesIngestToken(config.ingestToken, req.headers["x-gyredeck-token"])) {
+      // Two credentials reach here and they mean different things. The machine token is
+      // what the app itself holds; it lists rooms and draws the UI. A room's own token
+      // is what a session is given by hand, and it is the only thing that says a person
+      // let this session into this room. Either opens the door; which one came in
+      // decides what is allowed once inside.
+      const headerToken = req.headers["x-gyredeck-token"];
+      const machineToken = matchesIngestToken(config.ingestToken, headerToken);
+      if (!machineToken && typeof headerToken !== "string") {
         sendJson(401, { ok: false, error: "unauthorized" });
         return;
       }
@@ -1161,7 +1210,9 @@ function startBridge(config) {
               pending: Math.max(0, room.seq - reader.readSeq),
               buffered: room.messages.length,
               subscribers: room.clients.size,
-              members: [...room.members.keys()],
+              // Named, not raw ids: this list is read by a person in Settings, and a
+      // conversation id tells them nothing.
+      members: [...room.members.keys()].map(providerLabelFor),
               lastMessageAt: room.messages.at(-1)?.ts ?? null,
               lastReadAt: reader.lastReadAt ?? null,
             };
@@ -1337,19 +1388,26 @@ function startBridge(config) {
         // This is where the password earns its place. A room with members is one people
         // were put into deliberately, and the framing tells an agent that a request
         // from a member is what it is there for — so being able to post as a member has
-        // to be granted, not assumed. Anything that is not a confirmed member is
-        // refused, including the room's own notices only in appearance: those are
-        // published directly and never pass through here.
-        if (room.members.size > 0) {
-          const sender = room.members.get(from);
-          if (!sender) {
-            sendJson(403, { ok: false, error: "not_a_member" });
-            return;
-          }
-          if (sender.confirmed !== true) {
-            sendJson(403, { ok: false, error: "not_confirmed" });
-            return;
-          }
+        // to be granted, not assumed.
+        // Presenting the room's token is the whole of the authorisation, and it is
+        // presented on every call because that is where a credential already travels.
+        // The first time it arrives from a member, remember it: Codex never posts for
+        // itself — the bridge reads its answer out of its own log and publishes on its
+        // behalf, with no header to carry anything.
+        if (room.members.has(from) && holdsRoomToken(room, headerToken)) {
+          room.members.get(from).confirmed = true;
+        }
+        const refusal = refuseToPublish(room, from);
+        if (refusal) {
+          sendJson(403, {
+            ok: false,
+            error: refusal,
+            message:
+              refusal === "not_confirmed"
+                ? "This room needs its own token. Ask the person at this terminal for the room password and send it as the x-gyredeck-token header."
+                : "You are not in this room.",
+          });
+          return;
         }
         const message = publishMail(room, from, text, replyTo);
         // Delivery is per-agent and reported back so a caller can say what will happen
@@ -1397,9 +1455,31 @@ function startBridge(config) {
 
       // GET /mail/<room>/events — subscribe and be pushed to.
       if (req.method === "GET" && tail === "events") {
-        const room = mailRoomFor(name, true);
+        // Subscribing must not bring a *sync room* into being. A watcher that
+        // resurrects a room code gets a stream nothing will ever flow through and no
+        // way to tell — the same shape as the cursor that outlived its room and
+        // reported success while discarding everything. A mailbox is different: it is
+        // named after one session and watching it before anything is sent is normal.
+        const room = SYNC_CODE.test(name) ? mailRooms.get(name) : mailRoomFor(name, true);
         if (!room) {
-          sendJson(429, { ok: false, error: "too_many_rooms" });
+          sendJson(SYNC_CODE.test(name) ? 404 : 429, {
+            ok: false,
+            error: SYNC_CODE.test(name) ? "no_such_room" : "too_many_rooms",
+            ...(SYNC_CODE.test(name)
+              ? { message: "Nothing by that code is open. A room ends with its last member." }
+              : {}),
+          });
+          return;
+        }
+        // Reading a room people were put into needs that room's token — not the
+        // machine's. Every agent can read the machine token, so accepting it here would
+        // let anything watch a conversation it was never let into.
+        if (room.members.size > 0 && !holdsRoomToken(room, headerToken)) {
+          sendJson(403, {
+            ok: false,
+            error: "not_confirmed",
+            message: "This room needs its own token. Ask the person at this terminal for the room password.",
+          });
           return;
         }
         res.writeHead(200, {

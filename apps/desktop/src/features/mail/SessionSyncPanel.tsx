@@ -37,9 +37,10 @@ export const SessionSyncPanel = ({
     setCode("");
   }, [room]);
 
-  // The key hands out one grant, to one session, once. What is copied has to be typed
-  // into that session's own terminal — which is the point: the person authorises where
-  // the session lives, not from another window.
+  // The key copies the room's own token. It has to be typed into the terminal of the
+  // session being let in — which is the point: the person authorises where the session
+  // lives, not from another window. From then on that session presents it in the header
+  // of every read and every send, so authorisation and authentication are one thing.
   const copyInvite = async () => {
     const password = await issuePassword();
     if (!password) return;
@@ -50,7 +51,7 @@ export const SessionSyncPanel = ({
     } catch {
       // Denied clipboard access would leave the password minted and unusable, so say so
       // rather than pretending it was copied.
-      window.prompt("Copy this room password and paste it into the joining session", password);
+      window.prompt("Copy this room's password and paste it into the joining session", password);
     }
   };
 
@@ -90,19 +91,6 @@ export const SessionSyncPanel = ({
           // confirm: the code and the two things worth doing with it are all there is.
           <span className="session-sync-room">
             <span className="session-sync-code">{room}</span>
-            {isFounder ? (
-              <button
-                className="session-sync-icon"
-                type="button"
-                onClick={() => void copyInvite()}
-                disabled={busy}
-                data-tauri-drag-region="false"
-                title="Copy a one-time password for a session you are inviting"
-                aria-label="Copy a one-time room password"
-              >
-                {invited ? <Check size={13} strokeWidth={2.6} /> : <KeyRound size={13} strokeWidth={2.3} />}
-              </button>
-            ) : null}
             <button
               className="session-sync-icon"
               type="button"
@@ -113,6 +101,19 @@ export const SessionSyncPanel = ({
             >
               {copied ? <Check size={13} strokeWidth={2.6} /> : <Copy size={13} strokeWidth={2.3} />}
             </button>
+            {isFounder ? (
+              <button
+                className="session-sync-icon"
+                type="button"
+                onClick={() => void copyInvite()}
+                disabled={busy}
+                data-tauri-drag-region="false"
+                title="Copy this room's password for a session you are inviting"
+                aria-label="Copy this room's password"
+              >
+                {invited ? <Check size={13} strokeWidth={2.6} /> : <KeyRound size={13} strokeWidth={2.3} />}
+              </button>
+            ) : null}
             <button
               className="session-sync-icon danger"
               type="button"
@@ -184,7 +185,7 @@ export const SessionSyncPanel = ({
             ? invited
               ? "Password copied — paste it into the joining session's terminal."
               : isFounder
-                ? "Key copies a one-time password. Paste it into a joining session to let it speak here."
+                ? "Key copies this room's password. Paste it into a joining session to let it read and speak here."
                 : "Messages between members arrive in each session's own terminal."
             : "Put this session in a room with another, then say what each is for."}
       </p>

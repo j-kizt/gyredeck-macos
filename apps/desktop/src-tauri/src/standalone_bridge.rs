@@ -480,6 +480,8 @@ pub(crate) struct SyncMember {
     /// "Claude Code", "Codex", "Antigravity" — a conversation id reads as nothing, so
     /// the bridge labels each member from the runtime kind on its events.
     pub provider: String,
+    /// Whether this member may speak in the room, not merely read it.
+    pub confirmed: bool,
     pub pending: u32,
     pub you: bool,
 }
@@ -488,6 +490,7 @@ pub(crate) struct SyncMember {
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct SyncRoom {
     pub room: Option<String>,
+    pub founder: Option<String>,
     pub members: Vec<SyncMember>,
 }
 
@@ -503,6 +506,10 @@ fn parse_sync_room(value: &serde_json::Value, as_id: &str) -> SyncRoom {
                     Some(SyncMember {
                         you: conversation_id == as_id,
                         conversation_id,
+                        confirmed: member
+                            .get("confirmed")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
                         provider: member
                             .get("provider")
                             .and_then(|value| value.as_str())
@@ -516,6 +523,10 @@ fn parse_sync_room(value: &serde_json::Value, as_id: &str) -> SyncRoom {
         .unwrap_or_default();
     SyncRoom {
         room: value.get("room").and_then(|value| value.as_str()).map(ToOwned::to_owned),
+        founder: value
+            .get("founder")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned),
         members,
     }
 }
@@ -558,6 +569,33 @@ pub(crate) fn sync_create(conversation_id: &str) -> Result<SyncRoom, String> {
         return Err(sync_error(status, &value));
     }
     Ok(parse_sync_room(&value, conversation_id))
+}
+
+/// Mint a one-time password for one joining session.
+///
+/// Only the founder may: handing out the right to speak in a room is the act of
+/// whoever set it up, not something a member can pass along. One-time because the
+/// person types it into another session's terminal, where it stays in that
+/// conversation's transcript forever — a password that is already spent is safe to
+/// leave lying there.
+pub(crate) fn sync_issue_password(code: &str, conversation_id: &str) -> Result<String, String> {
+    if !valid_room(code) || !valid_room(conversation_id) {
+        return Err("Not a valid room".to_string());
+    }
+    let body = serde_json::json!({ "conversationId": conversation_id }).to_string();
+    let (status, value) = bridge_request("POST", &format!("/sync/rooms/{code}/passwords"), Some(body))?;
+    if !(200..300).contains(&status) {
+        return Err(match value.get("error").and_then(serde_json::Value::as_str) {
+            Some("not_the_founder") => "Only the session that created this room can invite".to_string(),
+            Some("too_many_passwords") => "Too many unused invites — hand one out first".to_string(),
+            _ => sync_error(status, &value),
+        });
+    }
+    value
+        .get("password")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "Bridge minted no password".to_string())
 }
 
 /// Join a room by code. Idempotent, so pressing Connect twice is not an error.

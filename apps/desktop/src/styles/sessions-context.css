@@ -864,8 +864,8 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-top: 10px;
-  padding-top: 10px;
+  margin-top: 4px;
+  padding-top: 8px;
   border-top: 1px solid var(--line);
 }
 
@@ -888,7 +888,10 @@
 }
 
 .session-sync-code {
-  padding: 2px 6px;
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 8px;
   border-radius: 5px;
   color: var(--accent-text);
   background: rgba(var(--accent-rgb), 0.14);
@@ -903,11 +906,11 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 20px;
-  height: 20px;
+  width: 26px;
+  height: 26px;
   border: 1px solid var(--hair);
-  border-radius: 5px;
-  color: var(--text-3);
+  border-radius: 6px;
+  color: var(--text-2);
   background: var(--fill);
   cursor: pointer;
 }
@@ -915,6 +918,17 @@
 .session-sync-icon:hover:not(:disabled) {
   color: var(--text);
   background: var(--fill-2);
+}
+
+/* Leaving a room is the one destructive thing here, so it reads as one. */
+.session-sync-icon.danger {
+  color: var(--danger);
+}
+
+.session-sync-icon.danger:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: rgba(255, 107, 102, 0.14);
 }
 
 .session-sync-icon:disabled {
@@ -967,6 +981,13 @@
   align-items: center;
 }
 
+/* Two equal halves across the full width. The pair is one choice — create a room or
+   join one — so neither should look like the main one by being wider. */
+.session-sync-row[data-split="true"] {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
 .session-sync-input {
   min-width: 0;
   flex: 1 1 auto;
@@ -989,6 +1010,8 @@
   flex: none;
   gap: 4px;
   align-items: center;
+  justify-content: center;
+  min-width: 0;
   padding: 5px 9px;
   border: 1px solid var(--line);
   border-radius: 6px;

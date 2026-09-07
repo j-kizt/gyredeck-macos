@@ -62,6 +62,8 @@ Bound to `127.0.0.1:47621`.
 | DELETE | `/sync/rooms/<code>/members/<id>` | Leave a room. |
 | GET | `/sync/rooms?as=<id>` | Which room a session is in, and who else. |
 | GET | `/mail/wait?as=<id>` | Long poll: the inbox, held until something arrives. |
+| POST | `/sync/rooms/<code>/passwords` | The founder mints a one-time password. |
+| POST | `/sync/rooms/<code>/confirm` | A joined session spends one and may then speak. |
 
 `GET /health` and `GET /snapshot` include capability metadata so viewers know which event streams and session actions are real:
 
@@ -123,6 +125,12 @@ Codes look like `sync-4f2a` — short enough to read off one screen and type int
 
 A session belongs to **at most one** room. Creating or joining while already in another answers `409 already_in_room` rather than moving silently, so the panel's buttons keep one meaning each. Joining a room you are already in is idempotent, so a second press of Connect is not an error. An unknown code answers `404`, which is what lets the join field show an error.
 
+Joining a room lets a session **read** it. Speaking in it is granted separately: the founder mints a one-time password, the person copies it and types it into the joining session's own terminal, and that session presents it to `/sync/rooms/<code>/confirm`. Until then `POST /mail/<code>` answers `403 not_confirmed`, and a non-member answers `403 not_a_member`. The founder needs no password — pressing Create in that session's own detail panel is the same act of intent.
+
+The password is **one-time** because it travels through a conversation. Typing a secret into a terminal puts it in that session's transcript for as long as the session is kept, which is the trap already recorded for the ingest token; a password spent the moment it is used is safe to leave lying there. It is deliberately *not* the ingest token: every agent already reads that file to make any call at all, so a session could confirm itself and the person's grant would mean nothing.
+
+Confirming is also the moment worth telling a session to start watching its room. Before it the session had nothing it was allowed to say; after it, one instruction covers both facts at once, in the terminal where the person is present.
+
 When a session joins or leaves, the room says so: a message from the reserved sender `gyredeck-room`, naming who changed and who is present now. It travels the ordinary delivery path, which is the point — a Codex member does not read an inbox, it is pushed to, so news it never hears is news that did not happen. The framing treats it as a third kind of sender: a fact about who is present is neither a request to act on nor something to be warned about.
 
 That also means **a message to a sync room fans out to its members**. A private mailbox is named after its one session, but a room is named after nothing, so delivery resolves each member separately: Codex members are queued to, the rest are left for their own hook. The reported `delivery` is the best outcome any recipient got, since that is what the sender can act on.
@@ -134,6 +142,12 @@ Rooms with members are exempt from the idle sweep — they were set up deliberat
 A `conversation_close` takes that session out of its room. An ended session can never collect its mail, so leaving it listed would tell everyone else it is still there, and an agent handing work to it would wait for an answer that cannot come; its `pending` would also climb forever with nothing to reclaim it. Sessions are resumable and keep their id, so a resumed one finds itself out of the room and has to be put back — one action for the person, against a peer that silently is not there.
 
 ### One inbox per session
+
+Merged reads are ordered by a **bridge-wide publish ordinal**, not by `seq`. `seq`
+counts within one room, so tie-breaking two rooms on it compares numbers that mean
+different things — one room's second message can sort ahead of another's first when
+both land in the same millisecond. That was latent while a room produced one notice and
+surfaced the moment confirmation added a second.
 
 `GET /mail/wait?as=<id>&timeout=<seconds>` is the same answer, except an empty one is
 held rather than returned. A session that has asked a room-mate for something it needs

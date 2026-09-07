@@ -1018,6 +1018,108 @@ test("claude UserPromptSubmit delivers mail as additional context exactly once",
   }
 });
 
+/**
+ * Join a room and earn the right to speak in it.
+ *
+ * Joining is the app's half; speaking needs the founder's password, which a person
+ * types into the joining session's own terminal. Tests do both because a member that
+ * cannot post is not a member any exchange can use.
+ */
+const joinConfirmed = async (call, code, founder, joiner) => {
+  await call("POST", `/sync/rooms/${code}/members`, { conversationId: joiner });
+  const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+  const confirmed = await call("POST", `/sync/rooms/${code}/confirm`, {
+    conversationId: joiner,
+    password: minted.body.password,
+  });
+  return confirmed;
+};
+
+test("speaking in a room is granted by the founder, one session at a time", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-pass-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "pass-founder";
+  const joiner = "pass-joiner";
+  const stranger = "pass-stranger";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    const code = (await call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    // Pressing Create is the same act of intent the password captures, so the founder
+    // can speak without presenting one.
+    assert.equal((await call("POST", `/mail/${code}`, { from: founder, text: "first" })).status, 202);
+
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: joiner });
+    // Joined but not confirmed: in the room, reading, and unable to speak. That gap is
+    // the whole point — being in a room is what the app can do, and granting the right
+    // to act on the room's behalf is what a person does.
+    const muted = await call("POST", `/mail/${code}`, { from: joiner, text: "may I?" });
+    assert.equal(muted.status, 403);
+    assert.equal(muted.body.error, "not_confirmed");
+
+    // Only the founder mints, and only for their own room.
+    const refused = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: joiner });
+    assert.equal(refused.status, 403);
+    assert.equal(refused.body.error, "not_the_founder");
+
+    const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+    assert.equal(minted.status, 201);
+    assert.match(minted.body.password, /^gk-[a-z2-9]{10}$/);
+
+    // A wrong password is refused without consuming the real one.
+    assert.equal(
+      (await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: joiner, password: "gk-wrongwrong" })).status,
+      403,
+    );
+
+    const confirmed = await call("POST", `/sync/rooms/${code}/confirm`, {
+      conversationId: joiner,
+      password: minted.body.password,
+    });
+    assert.equal(confirmed.status, 200);
+    assert.equal(confirmed.body.members.find((m) => m.conversationId === joiner).confirmed, true);
+    assert.equal((await call("POST", `/mail/${code}`, { from: joiner, text: "yes" })).status, 202);
+
+    // One-time: the copy of the password left in a session's transcript is worthless
+    // afterwards, which is the only safe way to put a secret through a conversation.
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: stranger });
+    const reused = await call("POST", `/sync/rooms/${code}/confirm`, {
+      conversationId: stranger,
+      password: minted.body.password,
+    });
+    assert.equal(reused.status, 403);
+    assert.equal(reused.body.error, "bad_password");
+    assert.equal((await call("POST", `/mail/${code}`, { from: stranger, text: "let me in" })).status, 403);
+
+    // Someone who never joined is refused before any password question arises.
+    assert.equal((await call("POST", `/mail/${code}`, { from: "pass-outsider", text: "hello" })).body.error, "not_a_member");
+  } finally {
+    bridge.kill("SIGTERM");
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("a sync room gives each member its own read position", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-sync-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
@@ -1062,7 +1164,7 @@ test("a sync room gives each member its own read position", async () => {
     // A code that names nothing has to say so — the join field shows that error.
     assert.equal((await call("POST", "/sync/rooms/sync-zzzz/members", { conversationId: second })).status, 404);
 
-    assert.equal((await call("POST", `/sync/rooms/${code}/members`, { conversationId: second })).status, 200);
+    assert.equal((await joinConfirmed(call, code, first, second)).status, 200);
 
     // One room per session, so the button has one meaning and Disconnect is
     // unambiguous. Being in a room already is a conflict, not a silent move.
@@ -1075,9 +1177,9 @@ test("a sync room gives each member its own read position", async () => {
     assert.equal(rejoined.status, 200);
     assert.equal(rejoined.body.members.length, 2);
 
-    // Joining put a notice in the room, so both members already have one thing waiting
-    // before anyone has said anything to anyone.
-    assert.deepEqual(await pendingByMember(), { [first]: 1, [second]: 1 });
+    // Two notices are in the room before anyone says anything: one for the join, one
+    // for the confirmation that followed it.
+    assert.deepEqual(await pendingByMember(), { [first]: 2, [second]: 2 });
     for (const who of [first, second]) {
       await fetch(`${base}/mail/${code}?since=0&collect=1&as=${who}`, { headers });
     }
@@ -1139,21 +1241,28 @@ test("an inbox merges a session's mailbox with its sync room, and the cap cannot
 
     const code = (await post("/sync/rooms", { conversationId: me })).room;
     await post(`/sync/rooms/${code}/members`, { conversationId: peer });
+    // Joining does not confer the right to speak; the founder's password does, and a
+    // person types it into the joining session. Without this the peer cannot post.
+    const minted = await post(`/sync/rooms/${code}/passwords`, { conversationId: me });
+    await post(`/sync/rooms/${code}/confirm`, { conversationId: peer, password: minted.password });
 
     // One message to this session directly, one to the room it was put into.
     await post(`/mail/${me}`, { from: "gyredeck", text: "from the person" });
     await post(`/mail/${code}`, { from: peer, text: "from my peer" });
 
     const merged = await inbox(10);
-    // Everything arrives from one call, labelled with the room it came from. The first
-    // is the room reporting the peer's arrival — news about the room travels the same
-    // way anything else does, or a member that cannot read an inbox never hears it.
+    // Everything arrives from one call, labelled with the room it came from. The room
+    // speaks first and twice: the peer arrived, then the peer was confirmed. News about
+    // the room travels the same way anything else does, or a member that cannot read an
+    // inbox never hears it.
     assert.deepEqual(merged.messages.map((message) => [message.room, message.from]), [
+      [code, "gyredeck-room"],
       [code, "gyredeck-room"],
       [me, "gyredeck"],
       [code, peer],
     ]);
     assert.match(merged.messages[0].text, /joined this room\. Members now: /);
+    assert.match(merged.messages[1].text, /was confirmed by the room's owner/);
     // The same call names the room and who is in it, so a hook with a sub-second
     // budget does not need a second request to know who it is talking to.
     assert.equal(merged.room, code);
@@ -1214,7 +1323,7 @@ test("a session can wait inside its turn for an answer it needs", async () => {
     };
 
     const code = (await call("POST", "/sync/rooms", { conversationId: asker })).body.room;
-    await call("POST", `/sync/rooms/${code}/members`, { conversationId: answerer });
+    await joinConfirmed(call, code, asker, answerer);
     // The join notice is a real message; take it so the wait below measures only the
     // answer this test is about.
     await call("GET", `/mail/inbox?as=${asker}&collect=1`);
@@ -1313,6 +1422,10 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     }
     const code = (await post("/sync/rooms", { conversationId: me })).room;
     await post(`/sync/rooms/${code}/members`, { conversationId: peer });
+    // Joining does not confer the right to speak; the founder's password does, and a
+    // person types it into the joining session. Without this the peer cannot post.
+    const minted = await post(`/sync/rooms/${code}/passwords`, { conversationId: me });
+    await post(`/sync/rooms/${code}/confirm`, { conversationId: peer, password: minted.password });
 
     // The room announcing a join is a fact about who is present: neither a request to
     // act on nor something to be warned about, so it carries neither framing.

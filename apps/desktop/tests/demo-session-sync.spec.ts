@@ -8,6 +8,9 @@ test("the sync panel walks create, join and disconnect, and shows a refusal wher
     (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
       invoke: async (command: string, args?: Record<string, string>) => {
         if (command === "set_keep_awake") return false;
+        // Sync session is offered only where that agent's hook is installed, so the
+        // panel does not appear at all without this.
+        if (command.endsWith("_hook_status")) return ["/Users/demo/.config/gyredeck/hook.mjs", true];
         if (command === "sync_room") return room;
         if (command === "sync_create") {
           room = {
@@ -65,13 +68,14 @@ test("the sync panel walks create, join and disconnect, and shows a refusal wher
   await expect(sync.getByRole("button", { name: "Disconnect from sync room" })).toBeVisible();
   await expect(sync.getByRole("button", { name: "Create sync" })).toHaveCount(0);
   await expect(sync.getByRole("button", { name: "Join sync" })).toHaveCount(0);
-  // Members are named and nothing more: what each session is for came from its own
-  // user in its own terminal, so there is no role to show and none to fill in.
-  await expect(sync.getByText("This session")).toBeVisible();
-  await expect(sync.getByText("Codex")).toBeVisible();
+  // No roster either: who is in the room is not something the person has to act on,
+  // and the exchange they would be reading it for happens in the terminals.
+  await expect(sync.getByText("This session")).toHaveCount(0);
+  await expect(sync.locator(".session-sync-members")).toHaveCount(0);
   await expect(sync.locator("input")).toHaveCount(0);
   // What is waiting for the other member, so the person can see a handover stall.
-  await expect(sync.locator(".session-sync-pending")).toHaveText("2");
+  // Disconnect is the destructive one and says so.
+  await expect(sync.locator(".session-sync-icon.danger")).toBeVisible();
 
   await sync.getByRole("button", { name: "Disconnect from sync room" }).click();
   await expect(sync.getByRole("button", { name: "Create sync" })).toBeVisible();

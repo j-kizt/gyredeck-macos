@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 export interface ISyncMember {
   conversationId: string;
   provider: string;
+  /** Whether this member may speak in the room, not merely read it. */
+  confirmed: boolean;
   pending: number;
   you: boolean;
 }
@@ -17,6 +19,10 @@ export interface ISyncRoomState {
   error: string | null;
   /** False when the room could not be read at all, so acting on it would guess. */
   canAct: boolean;
+  /** True when this session created the room, which is who may invite. */
+  isFounder: boolean;
+  /** Mint a one-time password to hand to one joining session. */
+  issuePassword: () => Promise<string | null>;
   create: () => Promise<void>;
   join: (code: string) => Promise<void>;
   leave: () => Promise<void>;
@@ -45,16 +51,18 @@ export const useSyncRoom = ({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [readFailure, setReadFailure] = useState<string | null>(null);
+  const [founder, setFounder] = useState<string | null>(null);
 
-  const apply = (next: { room: string | null; members: ISyncMember[] }) => {
+  const apply = (next: { room: string | null; founder?: string | null; members: ISyncMember[] }) => {
     setRoom(next.room ?? null);
+    setFounder(next.founder ?? null);
     setMembers(Array.isArray(next.members) ? next.members : []);
   };
 
   const read = useCallback(async () => {
     if (!conversationId || !canUseNativeControls) return;
     try {
-      const next = await invoke<{ room: string | null; members: ISyncMember[] }>("sync_room", {
+      const next = await invoke<{ room: string | null; founder: string | null; members: ISyncMember[] }>("sync_room", {
         conversationId,
       });
       apply(next);
@@ -88,7 +96,7 @@ export const useSyncRoom = ({
       setBusy(true);
       setError(null);
       try {
-        const next = await invoke<{ room: string | null; members: ISyncMember[] } | null>(command, {
+        const next = await invoke<{ room: string | null; founder: string | null; members: ISyncMember[] } | null>(command, {
           conversationId,
           ...args,
         });
@@ -113,6 +121,20 @@ export const useSyncRoom = ({
     // An action's refusal is the more specific of the two and wins; a read that cannot
     // reach the bridge still has to say so rather than look like an empty room.
     error: error ?? readFailure,
+    isFounder: founder !== null && founder === conversationId,
+    issuePassword: async () => {
+      if (!conversationId || !canUseNativeControls || !room) return null;
+      setBusy(true);
+      setError(null);
+      try {
+        return await invoke<string>("sync_issue_password", { code: room, conversationId });
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+        return null;
+      } finally {
+        setBusy(false);
+      }
+    },
     create: () => act("sync_create", {}),
     join: (code) => act("sync_join", { code: code.trim() }),
     leave: () => act("sync_leave", { code: room }),

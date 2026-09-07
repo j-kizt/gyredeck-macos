@@ -572,6 +572,12 @@ function startBridge(config) {
     // whatever the faster one collected.
     const room = {
       seq: 0,
+      // Who pressed Create. Only they are offered the key, because handing out the
+      // right to speak is the founder's act, not something any member can pass on.
+      createdBy: null,
+      // Unused one-time passwords. A used one is deleted rather than marked, so the
+      // copy that stays in a session's transcript forever is worthless afterwards.
+      passwords: new Set(),
       readSeq: 0,
       messages: [],
       clients: new Set(),
@@ -621,11 +627,15 @@ function startBridge(config) {
     members: [...room.members].map(([conversationId, member]) => ({
       conversationId,
       provider: providerLabelFor(conversationId),
+      confirmed: member.confirmed === true,
       joinedAt: member.joinedAt,
       pending: Math.max(0, room.seq - member.readSeq),
       lastReadAt: member.lastReadAt ?? null,
     })),
     you: as && room.members.has(as) ? as : null,
+    // Named rather than inferred: a confirmed joiner looks identical to a founder from
+    // the outside, and only the founder may hand out the right to speak.
+    founder: room.createdBy ?? null,
   });
 
   /**
@@ -646,6 +656,16 @@ function startBridge(config) {
     // would never hear it: it does not read an inbox, it is pushed to.
     deliverMail(name, room, text, ROOM_SENDER);
   };
+
+  const MAIL_MAX_PASSWORDS = 8;
+
+  // Longer than a room code and from the same alphabet. A code is a name people say to
+  // each other; this is the thing that grants the right to speak, so it is not meant to
+  // be guessable or memorable.
+  const newRoomPassword = () =>
+    `gk-${Array.from(randomBytes(10))
+      .map((byte) => SYNC_CODE_ALPHABET[byte % SYNC_CODE_ALPHABET.length])
+      .join("")}`;
 
   const newSyncCode = () => {
     for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -681,9 +701,10 @@ function startBridge(config) {
     ...(sync
       ? {
           room: sync.name,
-          members: [...sync.room.members].map(([conversationId]) => ({
+          members: [...sync.room.members].map(([conversationId, member]) => ({
             conversationId,
             provider: providerLabelFor(conversationId),
+            confirmed: member.confirmed === true,
             you: conversationId === as,
           })),
         }
@@ -697,13 +718,31 @@ function startBridge(config) {
     for (const waiter of [...mailWaiters]) waiter.check();
   };
 
+  /**
+   * Publish order across every room, which `seq` cannot give.
+   *
+   * `seq` counts within one room, so merging two rooms and tie-breaking on it compares
+   * numbers that mean different things — a room's second message can sort ahead of
+   * another room's first. Timestamps alone are not enough either: several messages
+   * routinely land in the same millisecond.
+   */
+  let mailOrdinal = 0;
+
   const publishMail = (room, from, text, replyTo, fromSession = false) => {
     room.seq += 1;
+    mailOrdinal += 1;
     room.touchedAt = Date.now();
     // replyTo is the sender naming where it is listening. Without it a recipient can
     // be reached but cannot answer, which is how the first version of this ended up
     // needing a human to carry every reply by hand.
-    const message = { seq: room.seq, from, text, replyTo: replyTo ?? null, ts: new Date().toISOString() };
+    const message = {
+      seq: room.seq,
+      ord: mailOrdinal,
+      from,
+      text,
+      replyTo: replyTo ?? null,
+      ts: new Date().toISOString(),
+    };
     room.messages.push(message);
     if (room.messages.length > MAIL_MAX_MESSAGES) room.messages.shift();
 
@@ -940,7 +979,11 @@ function startBridge(config) {
           sendJson(429, { ok: false, error: "too_many_rooms" });
           return;
         }
+        room.createdBy = conversationId;
         room.members.set(conversationId, {
+          // Pressing Create in this session's own detail panel is the same act of
+          // intent the password exists to capture, so the founder needs no password.
+          confirmed: true,
           joinedAt: new Date().toISOString(),
           // Joining mid-conversation should not replay what was said before: a member
           // starts from where the room is now.
@@ -949,6 +992,64 @@ function startBridge(config) {
         });
         room.touchedAt = Date.now();
         sendJson(201, { ok: true, ...describeRoom(name, room, conversationId) });
+        return;
+      }
+
+      // POST /sync/rooms/<code>/passwords — the founder mints a one-time password to
+      // hand to one joining session. One-time on purpose: the copy that ends up in
+      // that session's transcript is worthless the moment it has been used, which is
+      // the only way to put a secret through a conversation store safely.
+      if (req.method === "POST" && segments.length === 4 && segments[3] === "passwords") {
+        const body = await readJsonBody(req);
+        const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
+        const room = mailRooms.get(code);
+        if (!room || room.members.size === 0) {
+          sendJson(404, { ok: false, error: "no_such_room" });
+          return;
+        }
+        if (room.createdBy !== conversationId) {
+          sendJson(403, { ok: false, error: "not_the_founder" });
+          return;
+        }
+        if (room.passwords.size >= MAIL_MAX_PASSWORDS) {
+          sendJson(429, { ok: false, error: "too_many_passwords" });
+          return;
+        }
+        const password = newRoomPassword();
+        room.passwords.add(password);
+        room.touchedAt = Date.now();
+        sendJson(201, { ok: true, room: code, password });
+        return;
+      }
+
+      // POST /sync/rooms/<code>/confirm — a joined session presents the password its
+      // person typed into it, and earns the right to speak in the room.
+      if (req.method === "POST" && segments.length === 4 && segments[3] === "confirm") {
+        const body = await readJsonBody(req);
+        const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
+        const password = typeof body.password === "string" ? body.password.trim() : "";
+        const room = mailRooms.get(code);
+        if (!room || !room.members.has(conversationId)) {
+          sendJson(404, { ok: false, error: "not_a_member" });
+          return;
+        }
+        const member = room.members.get(conversationId);
+        if (member.confirmed === true) {
+          sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
+          return;
+        }
+        if (!room.passwords.delete(password)) {
+          sendJson(403, { ok: false, error: "bad_password" });
+          return;
+        }
+        member.confirmed = true;
+        room.touchedAt = Date.now();
+        announceMembership(
+          code,
+          room,
+          `${providerLabelFor(conversationId)} was confirmed by the room's owner and can now speak here.`,
+        );
+        sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
         return;
       }
 
@@ -980,6 +1081,11 @@ function startBridge(config) {
             return;
           }
           room.members.set(conversationId, {
+            // Joining puts a session in the room; it does not yet let it speak. The
+            // person confirms that separately, by typing the room's password into this
+            // session's own terminal — an act performed where the session lives rather
+            // than in another window.
+            confirmed: false,
             joinedAt: new Date().toISOString(),
             // Announced after the member is added, so its own read position is behind
             // the notice and it learns who else is here too.
@@ -1108,8 +1214,10 @@ function startBridge(config) {
           }
 
           // Oldest first across both rooms, so a batch reads in the order it was said
-          // rather than grouped by where it came from.
-          fresh.sort((left, right) => (left.ts < right.ts ? -1 : left.ts > right.ts ? 1 : left.seq - right.seq));
+          // rather than grouped by where it came from. Ordered by the bridge-wide
+          // publish order: within a millisecond, one room's seq says nothing about
+          // another's.
+          fresh.sort((left, right) => (left.ord ?? 0) - (right.ord ?? 0));
           const collected = fresh.slice(0, limit);
 
           if (collect) {
@@ -1225,6 +1333,23 @@ function startBridge(config) {
         if (!room) {
           sendJson(429, { ok: false, error: "too_many_rooms" });
           return;
+        }
+        // This is where the password earns its place. A room with members is one people
+        // were put into deliberately, and the framing tells an agent that a request
+        // from a member is what it is there for — so being able to post as a member has
+        // to be granted, not assumed. Anything that is not a confirmed member is
+        // refused, including the room's own notices only in appearance: those are
+        // published directly and never pass through here.
+        if (room.members.size > 0) {
+          const sender = room.members.get(from);
+          if (!sender) {
+            sendJson(403, { ok: false, error: "not_a_member" });
+            return;
+          }
+          if (sender.confirmed !== true) {
+            sendJson(403, { ok: false, error: "not_confirmed" });
+            return;
+          }
         }
         const message = publishMail(room, from, text, replyTo);
         // Delivery is per-agent and reported back so a caller can say what will happen

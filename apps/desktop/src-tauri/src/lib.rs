@@ -720,6 +720,11 @@ fn sync_create(conversation_id: String) -> Result<standalone_bridge::SyncRoom, S
 }
 
 #[tauri::command]
+fn sync_issue_password(code: String, conversation_id: String) -> Result<String, String> {
+    standalone_bridge::sync_issue_password(&code, &conversation_id)
+}
+
+#[tauri::command]
 fn sync_join(code: String, conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
     standalone_bridge::sync_join(&code, &conversation_id)
 }
@@ -5242,6 +5247,7 @@ pub fn run() {
             sync_room,
             sync_create,
             sync_join,
+            sync_issue_password,
             sync_leave,
             set_bridge_port,
             claude_usage,

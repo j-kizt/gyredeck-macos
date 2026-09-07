@@ -844,6 +844,16 @@ const App = () => {
     }
   }, [setupOpen]);
 
+  // Also on mount, because the session detail decides whether to offer Sync session by
+  // whether that agent's hook is installed. Loading these only when Settings opens hid
+  // the panel until someone had been there once.
+  useEffect(() => {
+    if (!canUseNativeControls) return;
+    void loadHookStatus();
+    void loadAgyStatus();
+    void loadCodexStatus();
+  }, [canUseNativeControls]);
+
   return (
     <main className="overlay-root" data-live={hasAgentLiveActivity ? "true" : "false"} data-running={isWorkingActivity ? "true" : "false"} data-status={activityViewStatus}>
         <div
@@ -955,7 +965,19 @@ const App = () => {
                   {sessionAction.message ? (
                     <div className="notice-row compact" data-online={sessionAction.ok === true} role="status" aria-live="polite">{sessionAction.message}</div>
                   ) : null}
-                  <SessionSyncPanel session={selectedSession} canUseNativeControls={canUseNativeControls} />
+                  <SessionSyncPanel
+                    session={selectedSession}
+                    canUseNativeControls={canUseNativeControls}
+                    hookInstalled={
+                      selectedSession.provider === "Claude Code"
+                        ? hookStatus.installed
+                        : selectedSession.provider === "Antigravity"
+                          ? agyStatus.installed
+                          : selectedSession.provider === "Codex"
+                            ? codexStatus.installed
+                            : false
+                    }
+                  />
                   <div className="detail-section-label">Recent activity</div>
                   {selectedSessionActivityEvents.length === 0 ? (
                     <div className="empty-text small">No events captured yet</div>

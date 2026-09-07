@@ -178,6 +178,41 @@ const APP_SENDER = "gyredeck";
 const ROOM_SENDER = "gyredeck-room";
 
 /** GET JSON from the bridge. Mail requires the token, so it always goes out. */
+/** A POST whose answer matters, unlike the fire-and-forget event relay above. */
+const postJson = (endpoint, token, path, payload) =>
+  new Promise((resolve) => {
+    const body = JSON.stringify(payload);
+    const req = request(
+      {
+        hostname: endpoint.hostname,
+        port: endpoint.port,
+        path,
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+          "x-gyredeck-token": token,
+        },
+        timeout: 750,
+      },
+      (res) => {
+        let text = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          text += chunk;
+          if (text.length > 65_536) { req.destroy(); resolve(null); }
+        });
+        res.on("end", () => {
+          try { resolve(JSON.parse(text)); } catch { resolve(null); }
+        });
+      },
+    );
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.end(body);
+  });
+
 const getJson = (endpoint, token, path) =>
   new Promise((resolve) => {
     const req = request(
@@ -218,7 +253,34 @@ const getJson = (endpoint, token, path) =>
  * Every failure path yields nothing. This runs before a prompt is answered, so an
  * undelivered message is always better than a stalled prompt.
  */
-const drainMailIntoContext = async (endpoint, token, room) => {
+/** A room password as the app hands it out. */
+const ROOM_PASSWORD = /\bgk-[a-z2-9]{10}\b/;
+
+/**
+ * Take a room password out of what the person typed and present it to the bridge.
+ *
+ * This is how a session earns the right to speak in a room it was joined to: the
+ * person copies a one-time password from the room's owner and types it in here, where
+ * the session lives. Joining happens in the app; consenting happens in the terminal.
+ *
+ * Returns the room it confirmed, or null. Failure is deliberately quiet — a prompt that
+ * merely looks like a password is not worth an error in front of the person.
+ */
+const confirmRoomPassword = async (endpoint, token, room, prompt) => {
+  if (!token || typeof prompt !== "string") return null;
+  const match = prompt.match(ROOM_PASSWORD);
+  if (!match) return null;
+  const membership = await getJson(endpoint, token, `/sync/rooms?as=${room}`);
+  const code = typeof membership?.room === "string" ? membership.room : null;
+  if (!code) return null;
+  const answer = await postJson(endpoint, token, `/sync/rooms/${code}/confirm`, {
+    conversationId: room,
+    password: match[0],
+  });
+  return answer?.ok === true ? code : null;
+};
+
+const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null) => {
   if (!token || !MAIL_ROOM_NAME.test(room)) return null;
 
   // One call answers everything: what is waiting, which room this session is in, and
@@ -234,7 +296,10 @@ const drainMailIntoContext = async (endpoint, token, room) => {
     // Never hand a session its own output back: replies land in the room they answer,
     // so without this it would read its last answer as fresh mail and reply to itself.
     .filter((message) => message.from !== room);
-  if (delivered.length === 0) return null;
+  // Nothing waiting is normally nothing to say. A confirmation is the exception: the
+  // session has just been given the right to speak here and has to be told, or the
+  // grant the person just made goes unnoticed.
+  if (delivered.length === 0 && !justConfirmed) return null;
 
 
   // Who a message is from decides what the agent may do about it, and there are three
@@ -277,6 +342,21 @@ const drainMailIntoContext = async (endpoint, token, room) => {
       `from ${senders.join(", ")}.`;
 
   const standing = [];
+  if (justConfirmed) {
+    // The one moment worth spending an instruction on. The person has just granted this
+    // session the right to speak here, and the same act is the natural time to start
+    // watching — everything before it had nothing to watch for. Framed as once, and
+    // narrow, because a watch on every message in a busy room pulls the session back
+    // for each acknowledgement anyone posts.
+    standing.push(
+      `The password you were just given has been accepted: you may now post in room ${justConfirmed}.` +
+        " If you have no watch on this room yet, start one now so a message reaches you" +
+        " without waiting to be typed at — a background watch on" +
+        ` GET /mail/${justConfirmed}/events with the x-gyredeck-token header, filtering to` +
+        " messages that name you or answer something you asked, and not every message in" +
+        " the room. Start it once; do not start a second one later.",
+    );
+  }
   if (room_ && mine) {
     const others = members.filter((member) => !member.you);
     standing.push(
@@ -429,7 +509,14 @@ const main = async () => {
         // prompt is held until this hook answers.
         if (conversationId) {
           respondingEvent = eventType;
-          mailDrain = drainMailIntoContext(endpoint, token, conversationId);
+          // A password in the prompt is consent, and it has to be spent before the
+          // drain: confirming first means the same turn can be told it may now speak,
+          // and the notice the confirmation puts in the room arrives with everything
+          // else rather than a turn later.
+          mailDrain = confirmRoomPassword(endpoint, token, conversationId, input.prompt)
+            .then((confirmed) =>
+              drainMailIntoContext(endpoint, token, conversationId, confirmed),
+            );
         }
         break;
       case "PreToolUse":

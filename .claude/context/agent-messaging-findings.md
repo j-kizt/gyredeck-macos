@@ -19,14 +19,30 @@ This document is the ground truth it is built on.
 | **Antigravity** | ✗ | `PreInvocation` → `injectSteps` | ✅ it runs `curl` unprompted |
 | **Claude Code** | ✗ | `UserPromptSubmit` → `additionalContext` | ✅ it runs `curl` unprompted |
 
-**Only Codex can be woken.** Measured against a thread idle for 78 minutes: `turn_start`
+**Corrected, 2026-09-07: Claude Code can be woken too — by watching its own room.** The
+table above is about being *reached from outside*, and that framing is what hid the
+answer for a day. An agent can arm a background watch on `GET /mail/<room>/events`
+itself; each message then becomes a notification that re-invokes the session. Verified
+three times, with the runtime confirming no human input. The lesson is the shape of the
+mistake: every option considered was a way *in* (a CLI, a channel, a socket), and none
+was the agent arming a watch on its own behalf.
+
+The cost is real and was measured: a watch on every message in a three-member room woke
+the session three times in a row for acknowledgements with no content. Filter to messages
+that name the session, not to the room.
+
+**Only Codex can be woken from outside.** Measured against a thread idle for 78 minutes: `turn_start`
 at +2s, answer written at +3s, `turn_complete` at +4s, with nobody at the keyboard. The
 other two collect their mail through a hook, and a hook only runs when the session does
 — so a message waits until the person types into that terminal again.
 
-There is no way around that with the tools these CLIs expose. Injecting keystrokes into
-a PTY would mean guessing terminal state and impersonating the user; it was considered
-and rejected.
+No *external* mechanism works: injecting keystrokes into a PTY would mean guessing
+terminal state and impersonating the user, and was rejected. Claude Code's channels need
+the session started with `--channels` and, during the research preview, an allowlisted
+plugin; its peer socket at `/tmp/cc-socks` does wake an idle session but is an
+undocumented frame needing another app's per-session key. Checked against Claude Code
+2.1.231/2.1.236 — `remote-control` exists but routes through claude.ai, and there is no
+`channels`, `send`, `message` or `queue` subcommand. Antigravity has nothing equivalent.
 
 ## Where context can be injected
 

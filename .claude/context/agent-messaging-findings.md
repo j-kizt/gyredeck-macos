@@ -5,10 +5,11 @@ and Antigravity sessions, 2026-09-02. Everything here was measured against live
 sessions on macOS, not read from documentation — where a claim came from docs it says
 so, and where a guess was wrong it says that too.
 
-The product this was heading towards (**Sync Session** — rooms that two sessions are
-put into and talk inside) is out of scope for Gyredeck and belongs in its own project.
-What stayed here is the transport: `/mail` on the bridge, and the adapter code that
-delivers into each agent. This document is the ground truth for whoever builds on it.
+The product this was heading towards is **Sync Session**: rooms that two sessions are
+put into, told what each other is for, and left to work. It was briefly taken out of
+scope and has since been brought back — as wiring rather than as a chat surface, which
+is the distinction that made it fit. See [`sync-session-plan.md`](sync-session-plan.md).
+This document is the ground truth it is built on.
 
 ## What each agent can actually do
 
@@ -161,4 +162,6 @@ The text injected alongside a message is not decoration; the agent acts on it.
 `/mail` on the bridge (rooms, SSE with resume, buffered reads, `collect=1`, per-agent
 delivery), the drains in the Claude Code and Antigravity adapters, the Codex queue-and-
 harvest path, and the mail chip on a session card. See `event-protocol.md` for the
-endpoints. There is no UI for sending — that was removed when Sync Session moved out.
+endpoints. There is no UI for sending a message and there will not be one: Sync Session
+wires sessions together and shows who is in a room, and the talking happens in the
+agents' own terminals.

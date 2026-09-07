@@ -1183,6 +1183,76 @@ test("an inbox merges a session's mailbox with its sync room, and the cap cannot
   }
 });
 
+test("a session can wait inside its turn for an answer it needs", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-wait-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const asker = "wait-asker";
+  const answerer = "wait-answerer";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(base + path, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    const code = (await call("POST", "/sync/rooms", { conversationId: asker })).body.room;
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: answerer });
+    // The join notice is a real message; take it so the wait below measures only the
+    // answer this test is about.
+    await call("GET", `/mail/inbox?as=${asker}&collect=1`);
+
+    // Nothing outstanding: the wait is held and then gives up, rather than answering
+    // an empty inbox at once the way the plain read does.
+    const started = Date.now();
+    const quiet = await call("GET", `/mail/wait?as=${asker}&timeout=1`);
+    assert.equal(quiet.body.timedOut, true);
+    assert.deepEqual(quiet.body.messages, []);
+    assert.ok(Date.now() - started >= 900, "held for the timeout rather than returning at once");
+
+    // The point of the endpoint: the answer arrives as the result of the call the
+    // asker is already blocked on, so the round trip needs nobody at a keyboard.
+    const waiting = call("GET", `/mail/wait?as=${asker}&timeout=20&collect=1`);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await call("POST", `/mail/${code}`, { from: answerer, text: "the retry window was 30s" });
+
+    const woken = await waiting;
+    assert.equal(woken.body.timedOut, false);
+    assert.deepEqual(
+      woken.body.messages.map((message) => [message.from, message.text]),
+      [[answerer, "the retry window was 30s"]],
+    );
+    // Room and members travel with it, so the caller needs no second request to know
+    // who it is talking to.
+    assert.equal(woken.body.room, code);
+
+    // collect=1 took delivery, so the same answer is not handed over twice.
+    const after = await call("GET", `/mail/wait?as=${asker}&timeout=1`);
+    assert.equal(after.body.timedOut, true);
+    assert.deepEqual(after.body.messages, []);
+  } finally {
+    bridge.kill("SIGTERM");
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("what an agent may act on depends on who sent it, in three tiers", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-tiers-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });

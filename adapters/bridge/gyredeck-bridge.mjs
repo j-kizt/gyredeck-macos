@@ -503,6 +503,9 @@ function startBridge(config) {
   const MAIL_MAX_FROM = 64;
   const MAIL_ROOM_IDLE_MS = 3_600_000;
   const MAIL_MAX_MEMBERS = 8;
+  const MAIL_WAIT_DEFAULT_MS = 60_000;
+  const MAIL_WAIT_MAX_MS = 300_000;
+  const MAIL_MAX_WAITERS = 16;
   // Codes are read off one screen and typed into another, so the alphabet leaves out
   // characters that get confused by eye: 0/O, 1/l/I.
   const SYNC_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
@@ -620,6 +623,45 @@ function startBridge(config) {
     return null;
   };
 
+  /**
+   * Readers holding a long poll open, waiting for something addressed to them.
+   *
+   * A session that has just asked a room-mate for something it needs in order to
+   * continue would otherwise have to end its turn and wait to be typed at again. This
+   * lets it wait inside the turn instead — the answer comes back as the result of the
+   * call it is already blocked on. Bounded on purpose: this is one wait for one
+   * outstanding answer, not a listen loop holding a session open indefinitely.
+   */
+  const mailWaiters = new Set();
+
+  /**
+   * The body both inbox reads answer with.
+   *
+   * Room and members travel with the messages because the caller is a hook with a
+   * sub-second budget and would otherwise need a second request to know who it is
+   * talking to.
+   */
+  const describeInbox = (messages, sync, as) => ({
+    messages,
+    ...(sync
+      ? {
+          room: sync.name,
+          members: [...sync.room.members].map(([conversationId]) => ({
+            conversationId,
+            provider: providerLabelFor(conversationId),
+            you: conversationId === as,
+          })),
+        }
+      : { room: null, members: [] }),
+  });
+
+  const wakeMailWaiters = () => {
+    // Every waiter re-checks rather than being told what changed. There are at most a
+    // handful, and the alternative — working out which readers a publish affected —
+    // duplicates the merge logic the inbox already owns.
+    for (const waiter of [...mailWaiters]) waiter.check();
+  };
+
   const publishMail = (room, from, text, replyTo, fromSession = false) => {
     room.seq += 1;
     room.touchedAt = Date.now();
@@ -657,6 +699,7 @@ function startBridge(config) {
       author.readSeq = Math.max(author.readSeq, message.seq);
       author.lastReadAt = message.ts;
     }
+    wakeMailWaiters();
     return message;
   };
 
@@ -995,14 +1038,17 @@ function startBridge(config) {
       // Room and members come back in the same response because the caller is a hook
       // with a sub-second budget and would otherwise need a second request to say who
       // it is talking to.
-      if (req.method === "GET" && segments.length === 2 && segments[1] === "inbox") {
+      if (
+        req.method === "GET" &&
+        segments.length === 2 &&
+        (segments[1] === "inbox" || segments[1] === "wait")
+      ) {
         const as = url.searchParams.get("as") ?? "";
         if (!MAIL_ROOM_NAME.test(as)) {
           sendJson(400, { ok: false, error: "invalid_session" });
           return;
         }
         const collect = url.searchParams.get("collect") === "1";
-        const at = new Date().toISOString();
         // The cap has to be applied by whoever advances the position. A caller that
         // trimmed the list itself would leave the rest marked as read and never
         // delivered — the position must only ever move as far as what was handed over.
@@ -1011,44 +1057,90 @@ function startBridge(config) {
           ? Math.min(requested, MAIL_MAX_MESSAGES)
           : MAIL_MAX_MESSAGES;
 
-        const sync = syncRoomFor(as);
-        const sources = [[as, mailRoomFor(as, false)], ...(sync ? [[sync.name, sync.room]] : [])];
-        const fresh = [];
-        for (const [roomName, room] of sources) {
-          if (!room) continue;
-          const reader = readerFor(room, as);
-          for (const message of room.messages) {
-            if (message.seq > reader.readSeq) fresh.push({ room: roomName, ...message });
-          }
-          room.touchedAt = Date.now();
-        }
-
-        // Oldest first across both rooms, so a batch reads in the order it was said
-        // rather than grouped by where it came from.
-        fresh.sort((left, right) => (left.ts < right.ts ? -1 : left.ts > right.ts ? 1 : left.seq - right.seq));
-        const collected = fresh.slice(0, limit);
-
-        if (collect) {
+        const collectInbox = () => {
+          const at = new Date().toISOString();
+          const sync = syncRoomFor(as);
+          const sources = [[as, mailRoomFor(as, false)], ...(sync ? [[sync.name, sync.room]] : [])];
+          const fresh = [];
           for (const [roomName, room] of sources) {
             if (!room) continue;
-            const taken = collected.filter((message) => message.room === roomName);
-            if (taken.length > 0) markRead(room, as, taken.at(-1).seq, at);
+            const reader = readerFor(room, as);
+            for (const message of room.messages) {
+              if (message.seq > reader.readSeq) fresh.push({ room: roomName, ...message });
+            }
+            room.touchedAt = Date.now();
           }
+
+          // Oldest first across both rooms, so a batch reads in the order it was said
+          // rather than grouped by where it came from.
+          fresh.sort((left, right) => (left.ts < right.ts ? -1 : left.ts > right.ts ? 1 : left.seq - right.seq));
+          const collected = fresh.slice(0, limit);
+
+          if (collect) {
+            for (const [roomName, room] of sources) {
+              if (!room) continue;
+              const taken = collected.filter((message) => message.room === roomName);
+              if (taken.length > 0) markRead(room, as, taken.at(-1).seq, at);
+            }
+          }
+          return { collected, sync };
+        };
+
+        // GET /mail/wait?as=<id> — the same answer as the inbox, except that an empty
+        // one is held rather than returned. A session that has asked for something it
+        // needs waits here instead of ending its turn, and the reply arrives as the
+        // result of the call it is already blocked on.
+        if (segments[1] === "wait") {
+          const requestedWait = Number.parseInt(url.searchParams.get("timeout") ?? "", 10);
+          const waitMs = Number.isInteger(requestedWait) && requestedWait > 0
+            ? Math.min(requestedWait * 1_000, MAIL_WAIT_MAX_MS)
+            : MAIL_WAIT_DEFAULT_MS;
+
+          const answer = (collected, sync, timedOut) =>
+            sendJson(200, { ok: true, timedOut, ...describeInbox(collected, sync, as) });
+
+          const first = collectInbox();
+          if (first.collected.length > 0) {
+            answer(first.collected, first.sync, false);
+            return;
+          }
+          // A held request costs a socket and a timer. Past the cap, say so rather than
+          // accumulating waiters nobody is counting.
+          if (mailWaiters.size >= MAIL_MAX_WAITERS) {
+            sendJson(429, { ok: false, error: "too_many_waiters" });
+            return;
+          }
+
+          const waiter = { check: null };
+          let done = false;
+          const finish = (collected, sync, timedOut) => {
+            if (done) return;
+            done = true;
+            mailWaiters.delete(waiter);
+            clearTimeout(timer);
+            answer(collected, sync, timedOut);
+          };
+          const timer = setTimeout(() => finish([], syncRoomFor(as), true), waitMs);
+          timer.unref?.();
+          waiter.check = () => {
+            if (done) return;
+            const next = collectInbox();
+            if (next.collected.length > 0) finish(next.collected, next.sync, false);
+          };
+          // A client that hangs up must not leave a timer and a closure behind, and
+          // must not have its read position advanced on the way out.
+          req.on("close", () => {
+            if (done) return;
+            done = true;
+            mailWaiters.delete(waiter);
+            clearTimeout(timer);
+          });
+          mailWaiters.add(waiter);
+          return;
         }
-        sendJson(200, {
-          ok: true,
-          messages: collected,
-          ...(sync
-            ? {
-                room: sync.name,
-                members: [...sync.room.members].map(([conversationId, member]) => ({
-                  conversationId,
-                  provider: providerLabelFor(conversationId),
-                  you: conversationId === as,
-                })),
-              }
-            : { room: null, members: [] }),
-        });
+
+        const { collected, sync } = collectInbox();
+        sendJson(200, { ok: true, ...describeInbox(collected, sync, as) });
         return;
       }
 

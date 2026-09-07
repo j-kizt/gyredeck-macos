@@ -136,10 +136,25 @@ Claude implements  →  hands to Codex     delivered in ~2s, nobody types anythi
 Codex reports back →  to Claude          waits until someone types in Claude's terminal
 ```
 
-The round trip needs one keystroke on the non-Codex side. An untested idea that would
-close it: have the sender poll for a reply inside its own turn with a bounded wait, so
-the answer arrives as tool output rather than needing a new turn. That is not a listen
-loop — it does not hold the session open indefinitely — but it has not been tried.
+The round trip used to need one keystroke on the non-Codex side. `GET /mail/wait` closes
+it: the sender waits for the answer inside its own turn, so the reply comes back as the
+result of the call it is blocked on rather than needing a new turn. Measured at 1.5s from
+publish to wake — the message wakes the waiter rather than being found by the next poll.
+
+What this is not is a way to wake an idle session. The asker chooses to wait; nothing
+reaches a session that has already finished its turn. `claude-code-session-bridge` solves
+the same problem by polling every 3 seconds from a shell loop, which is the same trade —
+the session is occupied either way, and holding one request is cheaper than twenty a
+minute.
+
+Waking a session that is genuinely idle was investigated and has no shippable answer.
+Claude Code can do it two ways, neither usable here: **channels** (an MCP server pushing
+`notifications/claude/channel`) need the session started with `--channels`, and during
+the research preview only allowlisted plugins register — a Gyredeck channel would need
+`--dangerously-load-development-channels` on someone else's machine. Its **peer socket**
+(`/tmp/cc-socks/<pid>.sock`, `peerFeatures: ["notify_idle"]`) does wake an idle session,
+but it is an undocumented zod-validated frame, needs another app's per-session key, and
+gates inbound messages anyway. Antigravity has nothing equivalent at all.
 
 **The narration is a request, not a guarantee.** An agent may simply not mention what
 it received. The bridge sees every message either way, so if agents turn out to stay

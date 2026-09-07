@@ -329,6 +329,22 @@ const drainMailIntoContext = async (endpoint, token, room) => {
         `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}"}'`,
     );
   }
+  // Waiting is offered only where there is someone to ask, and has to be described
+  // tightly: an agent told it "can wait for replies" will wait when nothing is
+  // outstanding, and a session blocked on an answer nobody is writing is worse than
+  // one that simply ended its turn.
+  if (room_) {
+    lines.push(
+      "If you send a request whose answer you need before you can carry on, you may " +
+        "wait for it instead of ending your turn \u2014 run this once, and only while " +
+        "an answer is genuinely outstanding:\n" +
+        "  TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); " +
+        `curl -s "http://${endpoint.hostname}:${endpoint.port}/mail/wait?as=${room}&timeout=60&collect=1" ` +
+        "-H \"x-gyredeck-token: $TOKEN\"\n" +
+        "It returns as soon as something arrives, or after the timeout with " +
+        "\"timedOut\": true \u2014 if that happens, say so and stop rather than waiting again.",
+    );
+  }
 
   return lines.join("\n\n");
 };

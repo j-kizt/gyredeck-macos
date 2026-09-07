@@ -61,6 +61,7 @@ Bound to `127.0.0.1:47621`.
 | POST | `/sync/rooms/<code>/members` | Join a room. |
 | DELETE | `/sync/rooms/<code>/members/<id>` | Leave a room. |
 | GET | `/sync/rooms?as=<id>` | Which room a session is in, and who else. |
+| GET | `/mail/wait?as=<id>` | Long poll: the inbox, held until something arrives. |
 
 `GET /health` and `GET /snapshot` include capability metadata so viewers know which event streams and session actions are real:
 
@@ -133,6 +134,20 @@ Rooms with members are exempt from the idle sweep — they were set up deliberat
 A `conversation_close` takes that session out of its room. An ended session can never collect its mail, so leaving it listed would tell everyone else it is still there, and an agent handing work to it would wait for an answer that cannot come; its `pending` would also climb forever with nothing to reclaim it. Sessions are resumable and keep their id, so a resumed one finds itself out of the room and has to be put back — one action for the person, against a peer that silently is not there.
 
 ### One inbox per session
+
+`GET /mail/wait?as=<id>&timeout=<seconds>` is the same answer, except an empty one is
+held rather than returned. A session that has asked a room-mate for something it needs
+waits there instead of ending its turn, and the reply arrives as the result of the call
+it is already blocked on — which is how the return leg of a handover completes with
+nobody at a keyboard. It answers with `timedOut: true` when the wait expires (default
+60s, capped at 300s), holds at most 16 waiters before answering `429 too_many_waiters`,
+and drops a waiter without advancing its read position if the client hangs up.
+
+This is not a listen loop and must not be described to an agent as one: an agent told it
+"can wait for replies" waits when nothing is outstanding, and a session blocked on an
+answer nobody is writing is worse than one that simply ended its turn. The injected
+instruction says *only while an answer is genuinely outstanding*, and *say so and stop*
+on a timeout.
 
 `GET /mail/inbox?as=<id>` answers "what is for me" across every room the session belongs to — its own mailbox and the sync room it was put into — oldest first, each message labelled with the room it came from. The same response names the room and its members, because the caller is a hook with a sub-second budget and would otherwise need a second request to know who it is talking to.
 

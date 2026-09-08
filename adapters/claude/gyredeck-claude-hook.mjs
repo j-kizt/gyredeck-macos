@@ -402,7 +402,12 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
         "The stream itself is closed after five minutes and says so before it goes; that" +
         " is routine, not the end, so open a new one straight away. Do the same if you" +
         " ever notice you have no watch running — after answering, check, and re-open if" +
-        " it is gone. One at a time, never two.",
+        " it is gone. One at a time, never two.\n" +
+        "Reconnect with `?since=<last seq you saw>` on the URL, or the equivalent" +
+        " Last-Event-ID header. Every frame carries its seq as its id. Without it the" +
+        " new stream starts from now, and anything published in the gap between the old" +
+        " one closing and the new one opening is lost — silently, since a message you" +
+        " never receive looks the same as one nobody sent.",
     );
   }
   if (room_ && mine) {

@@ -83,10 +83,13 @@ live session; do not repeat that.
 
 Asking an agent to reply *through* the bridge means asking it to run a shell command.
 
-- **Codex cannot reach the bridge at all.** Found 2026-09-08: its sandbox has no
-  network, so `curl` to `127.0.0.1:47621` fails before leaving the process — *"Couldn't
+- **Codex cannot reach the bridge at all, for two reasons that stack.** Its sandbox has
+  no network, so `curl` to `127.0.0.1:47621` fails before leaving the process — *"Couldn't
   connect to server after 0 ms"*, which is the tell: not a timeout, not a refusal, but
-  a block on the way out. This is the real reason its replies are harvested from its
+  a block on the way out. And a room's password is the `x-gyredeck-token` header on
+  every call about that room, which is precisely what an unconfirmed session does not
+  have. Either alone would be enough; keeping both written down matters because the
+  sandbox could change and the credential would still stop it. This is the real reason its replies are harvested from its
   rollout log rather than requested, and it holds even where the approval below would
   not. `codex queue` still works because that runs from outside, going in.
 - **Codex asks every single time** for any command it *can* run. The message text is

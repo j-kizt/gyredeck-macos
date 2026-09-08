@@ -149,8 +149,9 @@ adding them turned 5.4% into 10.4% on a live thread. Antigravity reports neither
 its meter stays empty rather than guessing.
 
 Codex is **confirmed by the founder reading the password out**, not by presenting it.
-It has no network from inside its sandbox, so asking it to call `/confirm` asks for
-something impossible — the key press is the consent, and it is applied on Codex's
+Its sandbox denies the network syscall itself — a request to `127.0.0.1` fails at
+`connect`, not in transit — so asking it to call `/confirm` asks for something
+impossible — the key press is the consent, and it is applied on Codex's
 behalf at that moment. Agents that can make the call still have to: the password
 reaching that session's own terminal is what the step exists to capture, and only
 where it cannot be captured is it inferred.

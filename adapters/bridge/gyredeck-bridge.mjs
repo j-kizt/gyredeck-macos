@@ -822,16 +822,27 @@ function startBridge(config) {
       : " Nobody else is in it yet.";
     const text =
       `[Gyredeck: you are now in sync room ${name} — ${how}.${company}` +
-      (confirmed
-        ? " You can read it and post to it already. The room also has a password, and it" +
-          " is not yours to use: it is what the person at this terminal hands to another" +
-          " session so that one can join and speak here. If a long string of hex arrives" +
-          " in this terminal, that is what it is, and there is nothing for you to do" +
-          " with it."
-        : " You cannot read or post there yet: that needs the room's password, which the" +
-          " person at this terminal has to give you. If a long string of hex arrives" +
-          " with no explanation, that is it — and the room starts reaching you shortly" +
-          " after.") +
+      // What the password is for differs by what this session can do with it. Codex
+      // cannot open a stream and cannot call the bridge at all, so for it the password
+      // really is somebody else's business. Everyone else needs it in hand: it is the
+      // header on every call about this room, the watch included.
+      (providerByConversation.get(conversationId) === "codexCliHook"
+        ? confirmed
+          ? " You can read it and post to it already, and messages are pushed into your" +
+            " session, so there is nothing to set up. The room's password is what the" +
+            " person hands to another session so that one can join; a long string of hex" +
+            " arriving here is that, and there is nothing for you to do with it."
+          : " You cannot read or post there yet. The person at this terminal will be" +
+            " given the room's password, and you are let in the moment they read it out" +
+            " — you do not present it yourself and there is nothing to run."
+        : confirmed
+          ? " You can read it and post to it, but you need the room's password in hand to" +
+            " do either: it is the x-gyredeck-token header on every call about this room," +
+            " including the watch you should be running on it. A long string of hex" +
+            " arriving in this terminal is that password."
+          : " You cannot read or post there yet: that needs the room's password, which the" +
+            " person at this terminal has to give you. A long string of hex arriving with" +
+            " no explanation is it — present it, and then keep a watch on the room.") +
       "]";
     publishMail(mailbox, ROOM_SENDER, text, null);
     deliverMail(conversationId, mailbox, text, ROOM_SENDER);
@@ -1081,13 +1092,15 @@ function startBridge(config) {
         const notice =
           provider === "codexCliHook"
             ? "[Gyredeck: you have been put in a room here, but until someone gives you" +
-              " its password you can neither read what is said in it nor answer. Ask the" +
-              " person at this terminal for the room's password, then wait — do not try" +
-              " to send it anywhere yourself. Your sandbox has no network, so a curl to" +
-              " Gyredeck fails before it leaves this process. Asking is the whole of" +
-              " your part: when they read the password out of Gyredeck, you are let in" +
-              " there and then, and the room simply starts arriving. Nothing further" +
-              " will reach you until that happens.]"
+              " its password you can neither read what is said in it nor answer. Two" +
+              " things stop you calling Gyredeck about it, and both hold: the room's" +
+              " password is the x-gyredeck-token header on every such call and you do" +
+              " not have it, and your sandbox denies network syscalls outright, so even" +
+              " a request to 127.0.0.1 fails at connect rather than in transit. Ask the person at this" +
+              " terminal for the password and then wait — asking is the whole of your" +
+              " part. When they read it out of Gyredeck you are let in there and then," +
+              " and the room simply starts arriving. Nothing further will reach you" +
+              " until that happens.]"
             : "[Gyredeck: you have been put in a room here, but until someone gives you" +
               " its password you can neither read what is said in it nor answer. Ask the" +
               " person at this terminal for the room's password. When they give it to" +
@@ -1109,18 +1122,17 @@ function startBridge(config) {
         // Codex is the one agent nothing can be injected into — its hook fires but the
         // text never reaches the model — so a queued message is the only channel there
         // is, and the standing instructions ride along with the first one it gets in a
-        // room. What they say is the opposite of what the others are told: Codex runs
-        // sandboxed with no network, so `curl` to this bridge fails before it leaves
-        // the process ("Couldn't connect ... after 0 ms"). It answers by writing its
+        // room. What they say is the opposite of what the others are told: Codex's
+        // sandbox denies the network syscall itself, so `curl` fails at connect even
+        // for loopback ("Couldn't connect ... after 0 ms" — the timing is the tell). It answers by writing its
         // answer as ordinary text, which the bridge harvests from its own rollout log.
         let outgoing = text;
         if (member && !member.toldHowToAnswer) {
           member.toldHowToAnswer = true;
           outgoing =
             `[Gyredeck: this arrived from room ${roomName}. Answer by writing your reply` +
-            " as ordinary text in this turn — do not try to reach Gyredeck over the" +
-            " network. Your sandbox has no network access, so curl to 127.0.0.1 will" +
-            " fail immediately; the bridge reads your answer from your own session log" +
+            " as ordinary text in this turn — do not try to call Gyredeck. Your sandbox" +
+            " denies network syscalls, so curl fails at connect even for 127.0.0.1; the bridge reads your answer from your own session log" +
             " and puts it in the room for you. You also need no watch on the room:" +
             " messages are pushed into your session whether or not you are doing" +
             " anything. Say what came in and who sent it, and after you answer, say" +
@@ -1344,7 +1356,7 @@ function startBridge(config) {
         room.touchedAt = Date.now();
         // Reading the password out is the founder's act of letting people in, and for
         // an agent that cannot present it there is nothing further to wait for. Codex
-        // has no network from inside its sandbox, so asking it to confirm itself asks
+        // cannot open a socket from inside its sandbox, so asking it to confirm itself asks
         // for something impossible; the key press is the consent, and it is applied
         // here on its behalf.
         for (const [conversationId, member] of room.members) {

@@ -139,6 +139,13 @@ Password and token are one thing said two ways: a password to the person copying
 
 `POST /mail/<code>` without the room's password answers `403 not_confirmed` with a message naming what to ask for; a non-member answers `403 not_a_member`. The founder needs no password of its own — pressing Create in that session's detail panel is the same act of intent, made in the same place.
 
+Codex is **confirmed by the founder reading the password out**, not by presenting it.
+It has no network from inside its sandbox, so asking it to call `/confirm` asks for
+something impossible — the key press is the consent, and it is applied on Codex's
+behalf at that moment. Agents that can make the call still have to: the password
+reaching that session's own terminal is what the step exists to capture, and only
+where it cannot be captured is it inferred.
+
 Codex is told the opposite of what the others are told, on the first message it
 receives in a room. It runs sandboxed with no network, so it cannot post to the bridge
 and must not be asked to: it answers by writing ordinary text, which the bridge

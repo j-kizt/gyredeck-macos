@@ -994,15 +994,29 @@ function startBridge(config) {
       if (member && member.confirmed !== true) {
         if (member.toldUnconfirmed) continue;
         member.toldUnconfirmed = true;
+        // What to do with the password differs by agent, and telling everyone the same
+        // thing is how Codex ended up being asked to run a call its sandbox forbids.
+        // It cannot reach the bridge at all; the person types the password and Gyredeck
+        // does the rest, so its instruction is to ask and then wait.
         const notice =
-          "[Gyredeck: you have been put in a room here, but until someone gives you its" +
-          " password you can neither read what is said in it nor answer. Ask the person at" +
-          " this terminal for the room's password. When they give it to you, use it" +
-          " yourself: send it as the x-gyredeck-token header on every call about this" +
-          ` room, starting with POST http://127.0.0.1:${config.port}/sync/rooms/${roomName}/confirm` +
-          ` with {\"conversationId\":\"${recipient}\",\"password\":\"THE PASSWORD\"}. Nobody` +
-          " will confirm you; presenting it is what lets you in. Until then, do not retry" +
-          " and do not look for another way in — nothing further will reach you.]";
+          provider === "codexCliHook"
+            ? "[Gyredeck: you have been put in a room here, but until someone gives you" +
+              " its password you can neither read what is said in it nor answer. Ask the" +
+              " person at this terminal for the room's password, then wait — do not try" +
+              " to send it anywhere yourself. Your sandbox has no network, so a curl to" +
+              " Gyredeck fails before it leaves this process. Asking is the whole of" +
+              " your part: when they read the password out of Gyredeck, you are let in" +
+              " there and then, and the room simply starts arriving. Nothing further" +
+              " will reach you until that happens.]"
+            : "[Gyredeck: you have been put in a room here, but until someone gives you" +
+              " its password you can neither read what is said in it nor answer. Ask the" +
+              " person at this terminal for the room's password. When they give it to" +
+              " you, use it yourself: send it as the x-gyredeck-token header on every" +
+              ` call about this room, starting with POST http://127.0.0.1:${config.port}` +
+              `/sync/rooms/${roomName}/confirm with {\"conversationId\":\"${recipient}\",` +
+              ' \"password\":\"THE PASSWORD\"}. Nobody will confirm you; presenting it is' +
+              " what lets you in. Until then, do not retry and do not look for another" +
+              " way in — nothing further will reach you.]";
         if (provider === "codexCliHook") {
           if (deliverToCodex(recipient, room, notice) === "queued") queued = true;
           else unavailable = true;
@@ -1246,6 +1260,24 @@ function startBridge(config) {
           return;
         }
         room.touchedAt = Date.now();
+        // Reading the password out is the founder's act of letting people in, and for
+        // an agent that cannot present it there is nothing further to wait for. Codex
+        // has no network from inside its sandbox, so asking it to confirm itself asks
+        // for something impossible; the key press is the consent, and it is applied
+        // here on its behalf.
+        for (const [conversationId, member] of room.members) {
+          if (member.confirmed === true) continue;
+          if (providerByConversation.get(conversationId) !== "codexCliHook") continue;
+          member.confirmed = true;
+          member.toldUnconfirmed = false;
+          member.toldHowToAnswer = false;
+          const labels = memberLabelsFor(room.members.keys());
+          announceMembership(
+            code,
+            room,
+            `${labels.get(conversationId) ?? providerLabelFor(conversationId)} was confirmed by the room's owner and can now speak here.`,
+          );
+        }
         sendJson(200, { ok: true, room: code, password: room.password });
         return;
       }

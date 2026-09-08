@@ -181,7 +181,7 @@ const SyncRoomList = ({
       <div className="setup-subheading">Sync rooms</div>
       <div className="setup-account-list">
       {open.map((entry) => (
-        <div className="setup-account-row" key={entry.room}>
+        <div className="setup-account-row" key={entry.room} data-closing={closing === entry.room}>
           <span className="setup-account-icon"><Link2 size={15} strokeWidth={2.3} /></span>
           <span className="setup-account-main">
             <span className="setup-account-login">{entry.room}</span>
@@ -201,7 +201,9 @@ const SyncRoomList = ({
           ) : null}
           {entry.founder ? (
             // Closing ends the room for everyone in it, so it belongs to whoever opened
-            // it — the same hand that gave out the password.
+            // it — the same hand that gave out the password. It is not instant either:
+            // every member is told and every stream is cut before the room goes, so the
+            // button says it is working rather than sitting dead until the row leaves.
             <button
               className="gh-icon-btn danger"
               type="button"
@@ -211,10 +213,14 @@ const SyncRoomList = ({
                 void onCloseRoom(entry.room, entry.founder ?? "").finally(() => setClosing(null));
               }}
               data-tauri-drag-region="false"
-              title="Close this room for everyone in it"
-              aria-label={`Close room ${entry.room}`}
+              title={closing === entry.room ? "Closing…" : "Close this room for everyone in it"}
+              aria-label={closing === entry.room ? `Closing room ${entry.room}` : `Close room ${entry.room}`}
             >
-              <X size={13} strokeWidth={2.4} />
+              {closing === entry.room ? (
+                <RefreshCw className="setup-spin" size={13} strokeWidth={2.4} />
+              ) : (
+                <Trash2 size={13} strokeWidth={2.3} />
+              )}
             </button>
           ) : null}
         </div>

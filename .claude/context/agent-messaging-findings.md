@@ -83,9 +83,15 @@ live session; do not repeat that.
 
 Asking an agent to reply *through* the bridge means asking it to run a shell command.
 
-- **Codex asks every single time.** The message text is part of the `curl`, so the
-  command string differs per message and an approved prefix never matches the next one.
-  One reply, one keypress. This makes agent-initiated messaging unusable for Codex.
+- **Codex cannot reach the bridge at all.** Found 2026-09-08: its sandbox has no
+  network, so `curl` to `127.0.0.1:47621` fails before leaving the process — *"Couldn't
+  connect to server after 0 ms"*, which is the tell: not a timeout, not a refusal, but
+  a block on the way out. This is the real reason its replies are harvested from its
+  rollout log rather than requested, and it holds even where the approval below would
+  not. `codex queue` still works because that runs from outside, going in.
+- **Codex asks every single time** for any command it *can* run. The message text is
+  part of the `curl`, so the command string differs per message and an approved prefix
+  never matches the next one.
 - **Antigravity and Claude Code do not ask** — both ran the reply `curl` unprompted.
 
 So for Codex the reply is read out of its own rollout log instead. `task_complete`

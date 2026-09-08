@@ -944,7 +944,28 @@ function startBridge(config) {
         continue;
       }
       if (provider === "codexCliHook") {
-        const outcome = deliverToCodex(recipient, room, text);
+        // Codex is the one agent nothing can be injected into — its hook fires but the
+        // text never reaches the model — so a queued message is the only channel there
+        // is, and the standing instructions ride along with the first one it gets in a
+        // room. What they say is the opposite of what the others are told: Codex runs
+        // sandboxed with no network, so `curl` to this bridge fails before it leaves
+        // the process ("Couldn't connect ... after 0 ms"). It answers by writing its
+        // answer as ordinary text, which the bridge harvests from its own rollout log.
+        let outgoing = text;
+        if (member && !member.toldHowToAnswer) {
+          member.toldHowToAnswer = true;
+          outgoing =
+            `[Gyredeck: this arrived from room ${roomName}. Answer by writing your reply` +
+            " as ordinary text in this turn — do not try to reach Gyredeck over the" +
+            " network. Your sandbox has no network access, so curl to 127.0.0.1 will" +
+            " fail immediately; the bridge reads your answer from your own session log" +
+            " and puts it in the room for you. You also need no watch on the room:" +
+            " messages are pushed into your session whether or not you are doing" +
+            " anything. Say what came in and who sent it, and after you answer, say" +
+            " what you sent back.]\n\n" +
+            text;
+        }
+        const outcome = deliverToCodex(recipient, room, outgoing);
         if (outcome === "queued") queued = true;
         else unavailable = true;
       } else if (provider === "agyHost" || provider === "claudeCodeHook") {
@@ -1142,6 +1163,9 @@ function startBridge(config) {
         }
         member.confirmed = true;
         member.toldUnconfirmed = false;
+        // Being let in is a fresh start: the standing instructions are worth one more
+        // airing now that they can be acted on.
+        member.toldHowToAnswer = false;
         room.touchedAt = Date.now();
         announceMembership(
           code,

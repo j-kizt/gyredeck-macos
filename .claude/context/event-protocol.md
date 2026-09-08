@@ -138,6 +138,13 @@ Password and token are one thing said two ways: a password to the person copying
 
 `POST /mail/<code>` without the room's password answers `403 not_confirmed` with a message naming what to ask for; a non-member answers `403 not_a_member`. The founder needs no password of its own — pressing Create in that session's detail panel is the same act of intent, made in the same place.
 
+Codex is told the opposite of what the others are told, on the first message it
+receives in a room. It runs sandboxed with no network, so it cannot post to the bridge
+and must not be asked to: it answers by writing ordinary text, which the bridge
+harvests from its rollout log. It needs no watch either, since messages are pushed into
+its session regardless. Nothing can be injected into Codex through its hook, so this
+brief rides along with a queued message, once per confirmation.
+
 Presenting the token once is **remembered**, because Codex never posts for itself: the bridge reads its answer out of its own rollout log and publishes on its behalf, with no header to carry anything. Without that, a confirmed Codex session still could not speak.
 
 **Subscribing must not bring a sync room into being.** `GET /mail/<code>/events` on a code nothing is open under answers `404`, rather than creating an empty room the watcher then watches forever with no way to tell that from silence — the same shape as the cursor that outlived its room and reported success while discarding everything. A mailbox is different: it is named after one session, and watching it before anything is sent is ordinary.

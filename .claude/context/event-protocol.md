@@ -252,6 +252,13 @@ The trailing clause carries the limit. Whether a request fits is judged against 
 
 Every tier asks the agent to say what came in **and** what it sent back. With ordinary mail a person had typed something and was waiting; inside a room they may have started nothing at all, and the terminal is their only window onto an exchange they set up and stepped away from.
 
+Members are named by provider, **qualified by workspace only when two of the same agent
+share a room**: a lone Codex is "Codex", and two of them are "Codex · J-Kitz" and
+"Codex · AD1". An unqualified duplicate names nobody — a request addressed to "Codex"
+in a room holding two of them is a request to neither — while qualifying every mention
+would lengthen them all to fix a collision that usually is not there. The workspace is
+the last segment of the session's `cwd`, which is what a person already calls it.
+
 A reply goes to the room when there is one, so every member sees it and the exchange stays in one place instead of splitting into private mailboxes. Members are introduced by provider name and nothing else — a conversation id reads as nothing — which is why the bridge attaches a label drawn from the `runtime.sourceKind` it has already seen on that session's events.
 
 ### Delivery into Claude Code

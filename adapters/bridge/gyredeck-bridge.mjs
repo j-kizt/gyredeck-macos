@@ -408,6 +408,48 @@ function startBridge(config) {
     codex: "Codex",
     agyHost: "Antigravity",
   };
+  /**
+   * The workspace a session is working in, which is what tells two of the same agent
+   * apart. "Codex" and "Codex" in one room name nobody; "Codex · J-Kitz" and
+   * "Codex · AD1" name two particular sessions, and they are the names the person
+   * already uses for them.
+   */
+  const workspaceByConversation = new Map();
+
+  const workspaceFor = (conversationId) => {
+    const cwd = workspaceByConversation.get(conversationId);
+    if (typeof cwd !== "string" || cwd.length === 0) return null;
+    const leaf = cwd.split("/").filter(Boolean).pop();
+    return leaf && leaf.length > 0 ? leaf : null;
+  };
+
+  /**
+   * How a member is named to people and to other agents.
+   *
+   * Qualified by workspace only when it has to be: a lone Codex is "Codex", and two of
+   * them are "Codex · J-Kitz" and "Codex · AD1". Adding the workspace unconditionally
+   * would make every mention longer to no purpose, and the ambiguity it fixes only
+   * exists when the room actually holds two of the same agent.
+   */
+  const memberLabelsFor = (conversationIds) => {
+    const ids = [...conversationIds];
+    const counts = new Map();
+    for (const id of ids) {
+      const provider = providerLabelFor(id);
+      counts.set(provider, (counts.get(provider) ?? 0) + 1);
+    }
+    return new Map(
+      ids.map((id) => {
+        const provider = providerLabelFor(id);
+        if ((counts.get(provider) ?? 0) < 2) return [id, provider];
+        const workspace = workspaceFor(id);
+        // Falling back to a short id is ugly, but an ambiguous name is worse: it makes
+        // a request to one session look like a request to the other.
+        return [id, workspace ? `${provider} · ${workspace}` : `${provider} · ${id.slice(0, 6)}`];
+      }),
+    );
+  };
+
   const providerLabelFor = (conversationId) =>
     PROVIDER_LABELS[providerByConversation.get(conversationId)] ?? "Agent";
   const rememberProvider = (payload) => {
@@ -415,6 +457,9 @@ function startBridge(config) {
     const sourceKind = payload?.runtime?.sourceKind;
     if (typeof conversationId === "string" && typeof sourceKind === "string") {
       providerByConversation.set(conversationId, sourceKind);
+    }
+    if (typeof conversationId === "string" && typeof payload?.cwd === "string") {
+      workspaceByConversation.set(conversationId, payload.cwd);
     }
   };
 
@@ -636,14 +681,17 @@ function startBridge(config) {
   const describeRoom = (name, room, as) => ({
     room: name,
     seq: room.seq,
-    members: [...room.members].map(([conversationId, member]) => ({
-      conversationId,
-      provider: providerLabelFor(conversationId),
-      confirmed: member.confirmed === true,
-      joinedAt: member.joinedAt,
-      pending: Math.max(0, room.seq - member.readSeq),
-      lastReadAt: member.lastReadAt ?? null,
-    })),
+    members: (() => {
+      const labels = memberLabelsFor(room.members.keys());
+      return [...room.members].map(([conversationId, member]) => ({
+        conversationId,
+        provider: labels.get(conversationId) ?? providerLabelFor(conversationId),
+        confirmed: member.confirmed === true,
+        joinedAt: member.joinedAt,
+        pending: Math.max(0, room.seq - member.readSeq),
+        lastReadAt: member.lastReadAt ?? null,
+      }));
+    })(),
     you: as && room.members.has(as) ? as : null,
     // Named rather than inferred: a confirmed joiner looks identical to a founder from
     // the outside, and only the founder may hand out the right to speak.
@@ -693,7 +741,8 @@ function startBridge(config) {
   };
 
   const announceMembership = (name, room, note) => {
-    const present = [...room.members.keys()].map(providerLabelFor);
+    const labels = memberLabelsFor(room.members.keys());
+    const present = [...room.members.keys()].map((id) => labels.get(id) ?? providerLabelFor(id));
     const text = `${note} Members now: ${present.join(", ") || "nobody"}.`;
     publishMail(room, ROOM_SENDER, text, null);
     // News about the room travels the same way anything else does, or a Codex member
@@ -744,12 +793,15 @@ function startBridge(config) {
     ...(sync
       ? {
           room: sync.name,
-          members: [...sync.room.members].map(([conversationId, member]) => ({
-            conversationId,
-            provider: providerLabelFor(conversationId),
-            confirmed: member.confirmed === true,
-            you: conversationId === as,
-          })),
+          members: (() => {
+            const labels = memberLabelsFor(sync.room.members.keys());
+            return [...sync.room.members].map(([conversationId, member]) => ({
+              conversationId,
+              provider: labels.get(conversationId) ?? providerLabelFor(conversationId),
+              confirmed: member.confirmed === true,
+              you: conversationId === as,
+            }));
+          })(),
         }
       : { room: null, members: [] }),
   });
@@ -1215,7 +1267,7 @@ function startBridge(config) {
             readSeq: room.seq,
             lastReadAt: null,
           });
-          announceMembership(code, room, `${providerLabelFor(conversationId)} joined this room.`);
+          announceMembership(code, room, `${memberLabelsFor(room.members.keys()).get(conversationId) ?? providerLabelFor(conversationId)} joined this room.`);
         }
         room.touchedAt = Date.now();
         sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
@@ -1295,7 +1347,10 @@ function startBridge(config) {
               subscribers: room.clients.size,
               // Named, not raw ids: this list is read by a person in Settings, and a
       // conversation id tells them nothing.
-      members: [...room.members.keys()].map(providerLabelFor),
+      members: (() => {
+        const labels = memberLabelsFor(room.members.keys());
+        return [...room.members.keys()].map((id) => labels.get(id) ?? providerLabelFor(id));
+      })(),
               lastMessageAt: room.messages.at(-1)?.ts ?? null,
               lastReadAt: reader.lastReadAt ?? null,
             };

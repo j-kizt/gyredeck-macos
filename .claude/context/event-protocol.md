@@ -172,6 +172,14 @@ room other people are working in is not something any member should be able to d
 the others. Codex is told the same way it is told anything, through its own mailbox and
 a push, so it stops treating the room as live even though it has no stream to sever.
 
+**Being put in a room is announced to the session itself, in its own mailbox.** The room
+cannot carry that news: an unconfirmed member cannot read the room, so an announcement
+posted there is invisible to precisely the session that needs it. Creating a room is
+announced the same way, since the founder was told nothing at all before. The notice
+names the room, who else is in it, and — for a session that cannot speak yet — what the
+password it is about to be handed is for. Without it, a password arrives as a bare
+string for a room the session does not know it is in.
+
 A watch is meant to stay up for as long as the session is in the room, not only while
 it is waiting on a reply — a session that closes its watch when it thinks nothing is
 outstanding is unreachable for everything that arrives next. Exactly two messages end

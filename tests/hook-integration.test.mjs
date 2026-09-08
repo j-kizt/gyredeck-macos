@@ -1324,14 +1324,18 @@ test("an inbox merges a session's mailbox with its sync room, and the cap cannot
     // speaks first and twice: the peer arrived, then the peer was confirmed. News about
     // the room travels the same way anything else does, or a member that cannot read an
     // inbox never hears it.
+    // The first is this session's own mailbox telling it that it is in a room — the
+    // room cannot carry that, since an unconfirmed member cannot read the room.
     assert.deepEqual(merged.messages.map((message) => [message.room, message.from]), [
+      [me, "gyredeck-room"],
       [code, "gyredeck-room"],
       [code, "gyredeck-room"],
       [me, "gyredeck"],
       [code, peer],
     ]);
-    assert.match(merged.messages[0].text, /joined this room\. Members now: /);
-    assert.match(merged.messages[1].text, /was confirmed by the room's owner/);
+    assert.match(merged.messages[0].text, /you are now in sync room .*you created it/s);
+    assert.match(merged.messages[1].text, /joined this room\. Members now: /);
+    assert.match(merged.messages[2].text, /was confirmed by the room's owner/);
     // The same call names the room and who is in it, so a hook with a sub-second
     // budget does not need a second request to know who it is talking to.
     assert.equal(merged.room, code);

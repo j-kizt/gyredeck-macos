@@ -802,6 +802,36 @@ function startBridge(config) {
     deliverMail(conversationId, mailbox, text, ROOM_SENDER);
   };
 
+  /**
+   * Tell a session, in its own mailbox, that it has been put in a room.
+   *
+   * The room itself cannot carry this: a member that has not been confirmed cannot read
+   * the room, so an announcement posted there is invisible to exactly the session that
+   * needs it. Without this a session first learns of a room when a password arrives
+   * with no explanation of what it is for — which is what happened to Codex, told a
+   * secret for a room it did not know it was in.
+   */
+  const tellJoined = (name, room, conversationId, how) => {
+    const mailbox = mailRoomFor(conversationId, true);
+    if (!mailbox) return;
+    const confirmed = room.members.get(conversationId)?.confirmed === true;
+    const others = [...room.members.keys()].filter((id) => id !== conversationId);
+    const labels = memberLabelsFor(room.members.keys());
+    const company = others.length > 0
+      ? ` Also here: ${others.map((id) => labels.get(id) ?? providerLabelFor(id)).join(", ")}.`
+      : " Nobody else is in it yet.";
+    const text =
+      `[Gyredeck: you are now in sync room ${name} — ${how}.${company}` +
+      (confirmed
+        ? " You can read it and post to it."
+        : " You cannot read or post there yet: that needs the room's password, which the" +
+          " person at this terminal has to give you. If one arrives with no explanation," +
+          " this is what it is for.") +
+      "]";
+    publishMail(mailbox, ROOM_SENDER, text, null);
+    deliverMail(conversationId, mailbox, text, ROOM_SENDER);
+  };
+
   const announceMembership = (name, room, note) => {
     const labels = memberLabelsFor(room.members.keys());
     const present = [...room.members.keys()].map((id) => labels.get(id) ?? providerLabelFor(id));
@@ -1241,6 +1271,8 @@ function startBridge(config) {
           lastReadAt: null,
         });
         room.touchedAt = Date.now();
+        // Told after the room exists, so the notice can name it and say who is there.
+        tellJoined(name, room, conversationId, "you created it");
         // The founder is handed the room's token once, here; everyone else gets it
         // from them, by hand, into the terminal of the session being let in.
         sendJson(201, { ok: true, password: room.password, ...describeRoom(name, room, conversationId) });
@@ -1402,6 +1434,9 @@ function startBridge(config) {
             lastReadAt: null,
           });
           announceMembership(code, room, `${memberLabelsFor(room.members.keys()).get(conversationId) ?? providerLabelFor(conversationId)} joined this room.`);
+          // The room's own announcement reaches everyone who can already read it; the
+          // one being added usually cannot, and hears about it here instead.
+          tellJoined(code, room, conversationId, "someone put you in it from the app");
         }
         room.touchedAt = Date.now();
         sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });

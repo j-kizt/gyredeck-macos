@@ -1085,7 +1085,7 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
 
     const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
     assert.equal(minted.status, 200);
-    assert.match(minted.body.password, /^gk-[a-z2-9]{10}$/);
+    assert.match(minted.body.password, /^[0-9a-f]{32}$/, "the length and shape of an MD5 digest");
 
     // The room's token is what authorises, and it travels in the header — the same
     // place a credential already goes, so "attach it to every message" costs nothing.

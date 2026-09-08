@@ -253,8 +253,15 @@ const getJson = (endpoint, token, path) =>
  * Every failure path yields nothing. This runs before a prompt is answered, so an
  * undelivered message is always better than a stalled prompt.
  */
-/** A room's own token, as the app hands it out from the founder's key. */
-const ROOM_PASSWORD = /\bgk-[a-z2-9]{10}\b/;
+/**
+ * A room password as the app hands it out: thirty-two hex characters, the shape of an
+ * MD5 digest.
+ *
+ * Anchored on word boundaries so it is found in a line of prose — the person pastes it
+ * and usually says something around it. Nothing else of this shape is likely to be
+ * typed here, and a false match costs only a refused confirmation.
+ */
+const ROOM_PASSWORD = /\b[0-9a-f]{32}\b/;
 
 /**
  * Take a room password out of what the person typed and present it to the bridge.

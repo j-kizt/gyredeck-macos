@@ -812,13 +812,12 @@ function startBridge(config) {
   };
 
 
-  // Longer than a room code and from the same alphabet. A code is a name people say to
-  // each other; this is the thing that grants the right to speak, so it is not meant to
-  // be guessable or memorable.
-  const newRoomPassword = () =>
-    `gk-${Array.from(randomBytes(10))
-      .map((byte) => SYNC_CODE_ALPHABET[byte % SYNC_CODE_ALPHABET.length])
-      .join("")}`;
+  // Thirty-two hex characters, the length and shape of an MD5 digest. A room code is a
+  // name people say to each other and is kept short for that; this is the thing that
+  // grants the right to speak, and nobody types it — it is copied from the panel and
+  // pasted into a terminal — so length costs nothing and buys the difference between
+  // fifty bits and a hundred and twenty-eight.
+  const newRoomPassword = () => randomBytes(16).toString("hex");
 
   const newSyncCode = () => {
     for (let attempt = 0; attempt < 20; attempt += 1) {

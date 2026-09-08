@@ -1115,7 +1115,7 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
     const muted2 = await call("POST", `/mail/${code}`, { from: stranger, text: "let me in" });
     assert.equal(muted2.status, 403);
     assert.equal(muted2.body.error, "not_confirmed");
-    assert.match(muted2.body.message, /Ask the person at this terminal for the room password/);
+    assert.match(muted2.body.message, /needs its own password.*x-gyredeck-token header/);
 
     // Someone who never joined is refused before any token question arises.
     assert.equal((await call("POST", `/mail/${code}`, { from: "pass-outsider", text: "hello" })).body.error, "not_a_member");

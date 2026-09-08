@@ -62,7 +62,7 @@ Bound to `127.0.0.1:47621`.
 | DELETE | `/sync/rooms/<code>/members/<id>` | Leave a room. |
 | GET | `/sync/rooms?as=<id>` | Which room a session is in, and who else. |
 | GET | `/mail/wait?as=<id>` | Long poll: the inbox, held until something arrives. |
-| POST | `/sync/rooms/<code>/passwords` | The founder reads the room's token. |
+| POST | `/sync/rooms/<code>/passwords` | The founder reads the room's password. |
 | POST | `/sync/rooms/<code>/confirm` | A joined session presents it and may then speak. |
 
 `GET /health` and `GET /snapshot` include capability metadata so viewers know which event streams and session actions are real:
@@ -125,18 +125,18 @@ Codes look like `sync-4f2a` — short enough to read off one screen and type int
 
 A session belongs to **at most one** room. Creating or joining while already in another answers `409 already_in_room` rather than moving silently, so the panel's buttons keep one meaning each. Joining a room you are already in is idempotent, so a second press of Connect is not an error. An unknown code answers `404`, which is what lets the join field show an error.
 
-**Create and join need no credential; reading and sending in a room need the room's own token.** Putting a session into a room grants it nothing, so gating that would only prove what every local caller can prove anyway. The room's token is created with the room, copied from the founder's key button, and typed by hand into the terminal of the session being let in. From then on that session presents it in the `x-gyredeck-token` header of every read and every send — which is where a credential already travels, so "attach it to every message" needs no second mechanism and no new field.
+**Create and join need no credential; reading and sending in a room need the room's own password.** Putting a session into a room grants it nothing, so gating that would only prove what every local caller can prove anyway. The room's password is created with the room, copied from the founder's key button, and typed by hand into the terminal of the session being let in. From then on that session presents it in the `x-gyredeck-token` header of every read and every send — which is where a credential already travels, so "attach it to every message" needs no second mechanism and no new field.
 
 Two credentials reach `/mail` and they mean different things:
 
 | | proves | opens |
 | --- | --- | --- |
 | the machine's ingest token | this call is local | `GET /mail` (the app's own listing) |
-| a room's token | a person let this session into this room | that room's reads and sends |
+| a room's password | a person let this session into this room | that room's reads and sends |
 
-The ingest token is deliberately **not** accepted for a room's messages or its stream. Every agent reads that file to make any call at all, so accepting it would let anything speak in, or watch, a conversation it was never let into — and the framing tells an agent that a request from a member is what it is there for.
+Password and token are one thing said two ways: a password to the person copying it out of the panel, a token to the `x-gyredeck-token` header carrying it. The machine's ingest token is deliberately **not** accepted for a room's messages or its stream. Every agent reads that file to make any call at all, so accepting it would let anything speak in, or watch, a conversation it was never let into — and the framing tells an agent that a request from a member is what it is there for.
 
-`POST /mail/<code>` without the room token answers `403 not_confirmed` with a message naming what to ask for; a non-member answers `403 not_a_member`. The founder needs no token of its own — pressing Create in that session's detail panel is the same act of intent, made in the same place.
+`POST /mail/<code>` without the room's password answers `403 not_confirmed` with a message naming what to ask for; a non-member answers `403 not_a_member`. The founder needs no password of its own — pressing Create in that session's detail panel is the same act of intent, made in the same place.
 
 Presenting the token once is **remembered**, because Codex never posts for itself: the bridge reads its answer out of its own rollout log and publishes on its behalf, with no header to carry anything. Without that, a confirmed Codex session still could not speak.
 

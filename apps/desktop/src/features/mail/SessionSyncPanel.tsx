@@ -37,10 +37,11 @@ export const SessionSyncPanel = ({
     setCode("");
   }, [room]);
 
-  // The key copies the room's own token. It has to be typed into the terminal of the
+  // The key copies the room's password. It has to be typed into the terminal of the
   // session being let in — which is the point: the person authorises where the session
-  // lives, not from another window. From then on that session presents it in the header
-  // of every read and every send, so authorisation and authentication are one thing.
+  // lives, not from another window. From then on that session presents it in the
+  // x-gyredeck-token header of every read and every send: password and token are one
+  // thing said two ways, so authorising and authenticating are the same act.
   const copyInvite = async () => {
     const password = await issuePassword();
     if (!password) return;

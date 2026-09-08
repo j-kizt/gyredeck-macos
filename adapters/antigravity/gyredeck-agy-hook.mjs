@@ -282,6 +282,20 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
       : `You have ${delivered.length} new Gyredeck mail message` +
         `${delivered.length === 1 ? "" : "s"} from ${senders.join(", ")}.`,
   ];
+  // A member that has not been given the room's password can read what is addressed to
+  // it and answer nothing. Saying so here, rather than leaving it to work the refusal
+  // out from a 403, is the difference between asking the person for what it needs and
+  // guessing — and an agent that guesses retries, or invents a way round.
+  if (syncRoom && mine && mine.confirmed === false) {
+    parts.push(
+      `You are in room ${syncRoom} but have not been given its password, so you cannot` +
+        " post here or watch it yet. Ask the person at this terminal for the room's" +
+        " password — they copy it from the key beside the room code in Gyredeck. Once" +
+        " you have it, send it as the x-gyredeck-token header instead of the machine" +
+        " token on any call about this room. Do not retry without it and do not look" +
+        " for another way in.",
+    );
+  }
   if (syncRoom && mine) {
     const others = members.filter((member) => !member.you);
     parts.push(

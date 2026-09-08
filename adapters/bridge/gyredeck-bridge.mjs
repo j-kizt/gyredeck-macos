@@ -538,6 +538,11 @@ function startBridge(config) {
   const MAIL_MAX_FROM = 64;
   const MAIL_ROOM_IDLE_MS = 3_600_000;
   const MAIL_MAX_MEMBERS = 8;
+  // A stream is closed after this long whether anything happened or not. A watcher
+  // that is never hung up on outlives the reason it was armed: the room ends, the
+  // session moves on, and the connection sits there proving nothing. Ending it on a
+  // known schedule makes re-arming a decision someone takes again.
+  const MAIL_STREAM_MAX_MS = 300_000;
   const MAIL_WAIT_DEFAULT_MS = 60_000;
   const MAIL_WAIT_MAX_MS = 300_000;
   const MAIL_MAX_WAITERS = 16;
@@ -577,11 +582,11 @@ function startBridge(config) {
       // Who pressed Create. Only they are offered the key, because handing out the
       // right to speak is the founder's act, not something any member can pass on.
       createdBy: null,
-      // The room's own credential. Presented in the x-gyredeck-token header for any
-      // read or send in this room, which is where a credential already travels — so
-      // "attach it to every message" needs no new field and no second mechanism.
-      // Created with the room; the founder's key button is how a person copies it.
-      token: null,
+      // The room's password: one string, created with the room, presented in the
+      // x-gyredeck-token header for every read and every send here. Password and token
+      // are the same thing said two ways — it is a password to the person copying it
+      // out of the panel, and a token to the header carrying it.
+      password: null,
       readSeq: 0,
       messages: [],
       clients: new Set(),
@@ -743,13 +748,13 @@ function startBridge(config) {
   /**
    * Whether a request carries this room's credential.
    *
-   * The room's token, not the machine's: every agent can read the ingest token file, so
-   * that one proves only "this call came from this machine" and can never carry the
-   * person's decision to let one particular session in. The room token is copied by
-   * hand from the founder's panel into the joining session's terminal.
+   * The room's password, not the machine's token: every agent can read the ingest token
+   * file, so that one proves only "this call came from this machine" and can never
+   * carry the person's decision to let one particular session in. The room's password
+   * is copied by hand from the founder's panel into the joining session's terminal.
    */
-  const holdsRoomToken = (room, headerValue) =>
-    typeof room.token === "string" && matchesIngestToken(room.token, headerValue);
+  const holdsRoomPassword = (room, headerValue) =>
+    typeof room.password === "string" && matchesIngestToken(room.password, headerValue);
 
   const refuseToPublish = (room, from) => {
     if (room.members.size === 0) return null;
@@ -884,7 +889,7 @@ function startBridge(config) {
       const muted =
         room.members.size > 0 && room.members.get(recipient)?.confirmed !== true
           ? "[Gyredeck: you are in this room but not yet allowed to answer in it. Ask the" +
-            " person at this terminal for the room's one-time password and wait for it —" +
+            " person at this terminal for the room's password and wait for it —" +
             " do not retry and do not work around it.]\n\n"
           : "";
       if (provider === "codexCliHook") {
@@ -1025,7 +1030,7 @@ function startBridge(config) {
           return;
         }
         room.createdBy = conversationId;
-        room.token = newRoomPassword();
+        room.password = newRoomPassword();
         room.members.set(conversationId, {
           // Pressing Create in this session's own detail panel is the same act of
           // intent the password exists to capture, so the founder needs no password.
@@ -1039,7 +1044,7 @@ function startBridge(config) {
         room.touchedAt = Date.now();
         // The founder is handed the room's token once, here; everyone else gets it
         // from them, by hand, into the terminal of the session being let in.
-        sendJson(201, { ok: true, token: room.token, ...describeRoom(name, room, conversationId) });
+        sendJson(201, { ok: true, password: room.password, ...describeRoom(name, room, conversationId) });
         return;
       }
 
@@ -1060,7 +1065,7 @@ function startBridge(config) {
           return;
         }
         room.touchedAt = Date.now();
-        sendJson(200, { ok: true, room: code, password: room.token });
+        sendJson(200, { ok: true, room: code, password: room.password });
         return;
       }
 
@@ -1080,7 +1085,7 @@ function startBridge(config) {
           sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
           return;
         }
-        if (!holdsRoomToken(room, password)) {
+        if (!holdsRoomPassword(room, password)) {
           sendJson(403, { ok: false, error: "bad_password" });
           return;
         }
@@ -1394,7 +1399,7 @@ function startBridge(config) {
         // The first time it arrives from a member, remember it: Codex never posts for
         // itself — the bridge reads its answer out of its own log and publishes on its
         // behalf, with no header to carry anything.
-        if (room.members.has(from) && holdsRoomToken(room, headerToken)) {
+        if (room.members.has(from) && holdsRoomPassword(room, headerToken)) {
           room.members.get(from).confirmed = true;
         }
         const refusal = refuseToPublish(room, from);
@@ -1404,7 +1409,7 @@ function startBridge(config) {
             error: refusal,
             message:
               refusal === "not_confirmed"
-                ? "This room needs its own token. Ask the person at this terminal for the room password and send it as the x-gyredeck-token header."
+                ? "This room needs its own password. Ask the person at this terminal for it, then send it as the x-gyredeck-token header."
                 : "You are not in this room.",
           });
           return;
@@ -1474,11 +1479,11 @@ function startBridge(config) {
         // Reading a room people were put into needs that room's token — not the
         // machine's. Every agent can read the machine token, so accepting it here would
         // let anything watch a conversation it was never let into.
-        if (room.members.size > 0 && !holdsRoomToken(room, headerToken)) {
+        if (room.members.size > 0 && !holdsRoomPassword(room, headerToken)) {
           sendJson(403, {
             ok: false,
             error: "not_confirmed",
-            message: "This room needs its own token. Ask the person at this terminal for the room password.",
+            message: "This room needs its own password. Ask the person at this terminal for it, then send it as the x-gyredeck-token header.",
           });
           return;
         }
@@ -1489,7 +1494,22 @@ function startBridge(config) {
           "x-accel-buffering": "no",
           ...corsHeaders,
         });
-        res.write(`: gyredeck mail room ${name} connected ${new Date().toISOString()}\n\n`);
+        res.write(
+          `: gyredeck mail room ${name} connected ${new Date().toISOString()}` +
+            ` expires in ${MAIL_STREAM_MAX_MS / 1000}s\n\n`,
+        );
+        // Said in the stream as well as enforced, so a watcher can tell a deliberate
+        // expiry from a connection that dropped.
+        const expiry = setTimeout(() => {
+          try {
+            res.write(`: gyredeck stream expired after ${MAIL_STREAM_MAX_MS / 1000}s\n\n`);
+            res.end();
+          } catch {
+            // Already gone; the close handler has cleaned up.
+          }
+        }, MAIL_STREAM_MAX_MS);
+        expiry.unref?.();
+        res.on("close", () => clearTimeout(expiry));
 
         // Hand back what was missed while disconnected. Without this a subscriber
         // that drops has no way to close the gap except to fall back to the

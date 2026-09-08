@@ -352,9 +352,25 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
       `The password you were just given has been accepted: you may now post in room ${justConfirmed}.` +
         " If you have no watch on this room yet, start one now so a message reaches you" +
         " without waiting to be typed at — a background watch on" +
-        ` GET /mail/${justConfirmed}/events with the x-gyredeck-token header, filtering to` +
-        " messages that name you or answer something you asked, and not every message in" +
-        " the room. Start it once; do not start a second one later.",
+        ` GET /mail/${justConfirmed}/events, sending this room's password as the` +
+        " x-gyredeck-token header, filtering to messages that name you or answer" +
+        " something you asked rather than every message in the room. The stream is" +
+        " closed after five minutes and says so before it goes; re-arm it then if you" +
+        " are still waiting on something. Start one at a time, never two.",
+    );
+  }
+  // A member that has not been given the room's password can read what is addressed to
+  // it and answer nothing. Saying so here, rather than leaving it to work the refusal
+  // out from a 403, is the difference between asking the person for what it needs and
+  // guessing — and an agent that guesses retries, or invents a way round.
+  if (room_ && mine && mine.confirmed === false) {
+    standing.push(
+      `You are in room ${room_} but have not been given its password, so you cannot` +
+        " post here or watch it yet. Ask the person at this terminal for the room's" +
+        " password — they copy it from the key beside the room code in Gyredeck. Once" +
+        " you have it, send it as the x-gyredeck-token header instead of the machine" +
+        " token on any call about this room. Do not retry without it and do not look" +
+        " for another way in.",
     );
   }
   if (room_ && mine) {

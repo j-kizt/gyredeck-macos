@@ -573,13 +573,12 @@ pub(crate) fn sync_create(conversation_id: &str) -> Result<SyncRoom, String> {
     Ok(parse_sync_room(&value, conversation_id))
 }
 
-/// Mint a one-time password for one joining session.
+/// Read the room's password, so the founder can copy it out.
 ///
-/// Only the founder may: handing out the right to speak in a room is the act of
-/// whoever set it up, not something a member can pass along. One-time because the
-/// person types it into another session's terminal, where it stays in that
-/// conversation's transcript forever — a password that is already spent is safe to
-/// leave lying there.
+/// Only the founder may: handing out the right to speak in a room is the act of whoever
+/// set it up, not something a member can pass along. Password and token are one thing
+/// said two ways — a password to the person copying it, a token to the header that
+/// carries it on every read and send.
 pub(crate) fn sync_issue_password(code: &str, conversation_id: &str) -> Result<String, String> {
     if !valid_room(code) || !valid_room(conversation_id) {
         return Err("Not a valid room".to_string());
@@ -589,7 +588,6 @@ pub(crate) fn sync_issue_password(code: &str, conversation_id: &str) -> Result<S
     if !(200..300).contains(&status) {
         return Err(match value.get("error").and_then(serde_json::Value::as_str) {
             Some("not_the_founder") => "Only the session that created this room can invite".to_string(),
-            Some("too_many_passwords") => "Too many unused invites — hand one out first".to_string(),
             _ => sync_error(status, &value),
         });
     }
@@ -597,7 +595,7 @@ pub(crate) fn sync_issue_password(code: &str, conversation_id: &str) -> Result<S
         .get("password")
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
-        .ok_or_else(|| "Bridge minted no password".to_string())
+        .ok_or_else(|| "Bridge returned no password".to_string())
 }
 
 /// Join a room by code. Idempotent, so pressing Connect twice is not an error.

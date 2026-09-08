@@ -172,6 +172,13 @@ room other people are working in is not something any member should be able to d
 the others. Codex is told the same way it is told anything, through its own mailbox and
 a push, so it stops treating the room as live even though it has no stream to sever.
 
+A watch is meant to stay up for as long as the session is in the room, not only while
+it is waiting on a reply — a session that closes its watch when it thinks nothing is
+outstanding is unreachable for everything that arrives next. Exactly two messages end
+it: the room was closed, or this session was disconnected from it. The five-minute
+stream expiry is not one of them; it is routine, and the instruction says to open a new
+stream straight away, and to re-open if the session ever notices it has no watch at all.
+
 **Subscribing must not bring a sync room into being.** `GET /mail/<code>/events` on a code nothing is open under answers `404`, rather than creating an empty room the watcher then watches forever with no way to tell that from silence — the same shape as the cursor that outlived its room and reported success while discarding everything. A mailbox is different: it is named after one session, and watching it before anything is sent is ordinary.
 
 When a session joins or leaves, the room says so: a message from the reserved sender `gyredeck-room`, naming who changed and who is present now. It travels the ordinary delivery path, which is the point — a Codex member does not read an inbox, it is pushed to, so news it never hears is news that did not happen. The framing treats it as a third kind of sender: a fact about who is present is neither a request to act on nor something to be warned about.

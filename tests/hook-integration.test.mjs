@@ -1150,7 +1150,7 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
     const told = await call("GET", `/mail/inbox?as=${joiner}`);
     assert.match(
       told.body.messages.at(-1).text,
-      /no longer in room .*stop it: it has been closed from this end/s,
+      /no longer in room .*stop yours and do not open another/s,
     );
 
     // Closing is the room's end, not one member's exit: everyone is told, every stream

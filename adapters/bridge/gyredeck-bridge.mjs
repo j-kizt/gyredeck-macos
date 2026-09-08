@@ -793,10 +793,11 @@ function startBridge(config) {
     if (!mailbox) return;
     const text =
       `[Gyredeck: you are no longer in room ${name} — ${why}. You can neither read it` +
-      " nor post to it now, and its password will not let you back in. If you have a" +
-      " watch running on that room, stop it: it has been closed from this end and" +
-      " re-arming it will be refused. Nothing about this room will reach you again" +
-      " unless someone puts you back in it.]";
+      " nor post to it now, and its password will not let you back in. This is one of" +
+      " the two messages that end a watch on that room: stop yours and do not open" +
+      " another, since it has been closed from this end and re-opening will be refused." +
+      " Nothing about this room will reach you again unless someone puts you back in" +
+      " it.]";
     publishMail(mailbox, ROOM_SENDER, text, null);
     deliverMail(conversationId, mailbox, text, ROOM_SENDER);
   };

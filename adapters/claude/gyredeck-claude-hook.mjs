@@ -388,11 +388,15 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
         " you without waiting to be typed at: one background call to" +
         ` GET /mail/${room_}/events, sending this room's password as the` +
         " x-gyredeck-token header, reacting only to messages that name you or answer" +
-        " something you asked rather than to every message in the room. The stream is" +
-        " closed after five minutes and says so before it goes; re-arm it then if you" +
-        " are still waiting on something. One at a time, never two — and stop for good" +
-        " if a re-arm is refused or you are told you have left the room: the room has" +
-        " ended, and retrying only hammers a code that no longer exists.",
+        " something you asked rather than to every message in the room.\n" +
+        "The watch stays up for as long as you are in the room — not only while you are" +
+        " waiting on a reply. Two things end it, and nothing else: a message saying the" +
+        " room was closed, or one saying you were disconnected from it. Until one of" +
+        " those arrives, keep a watch running.\n" +
+        "The stream itself is closed after five minutes and says so before it goes; that" +
+        " is routine, not the end, so open a new one straight away. Do the same if you" +
+        " ever notice you have no watch running — after answering, check, and re-open if" +
+        " it is gone. One at a time, never two.",
     );
   }
   if (room_ && mine) {

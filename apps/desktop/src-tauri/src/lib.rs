@@ -706,8 +706,12 @@ fn agy_usage_blocking() -> Result<CodexUsageSnapshot, String> {
             "Agy is running, but its session is not signed in. Sign in to Agy or Antigravity, then refresh.".to_string()
         });
     }
+    // Nothing is running and the cloud endpoint answered without quota in it. Waiting
+    // does not help — that combination means either no active plan, or simply that the
+    // numbers only exist while a local session is up. Starting one is the actionable
+    // half, so say that rather than "try again shortly".
     Err(if has_local_credentials {
-        "Antigravity usage is temporarily unavailable. Local credentials were found, but Cloud Code did not return quota data. Try again shortly.".to_string()
+        "Antigravity usage needs a running session. Start `agy` or Antigravity and refresh — signed-in credentials alone do not return quota.".to_string()
     } else {
         "Antigravity usage unavailable. Start `agy` or Antigravity, then refresh.".to_string()
     })

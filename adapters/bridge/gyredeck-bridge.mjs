@@ -823,10 +823,15 @@ function startBridge(config) {
     const text =
       `[Gyredeck: you are now in sync room ${name} — ${how}.${company}` +
       (confirmed
-        ? " You can read it and post to it."
+        ? " You can read it and post to it already. The room also has a password, and it" +
+          " is not yours to use: it is what the person at this terminal hands to another" +
+          " session so that one can join and speak here. If a long string of hex arrives" +
+          " in this terminal, that is what it is, and there is nothing for you to do" +
+          " with it."
         : " You cannot read or post there yet: that needs the room's password, which the" +
-          " person at this terminal has to give you. If one arrives with no explanation," +
-          " this is what it is for.") +
+          " person at this terminal has to give you. If a long string of hex arrives" +
+          " with no explanation, that is it — and the room starts reaching you shortly" +
+          " after.") +
       "]";
     publishMail(mailbox, ROOM_SENDER, text, null);
     deliverMail(conversationId, mailbox, text, ROOM_SENDER);

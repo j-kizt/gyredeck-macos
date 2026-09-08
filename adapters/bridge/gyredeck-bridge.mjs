@@ -22,7 +22,7 @@
  *   POST /ingest    - Multi-provider event fan-in
  */
 
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
@@ -377,6 +377,44 @@ function startBridge(config) {
     };
   };
 
+  /**
+   * Put whatever a Codex session just said into the room it is in.
+   *
+   * Codex cannot post for itself, so the bridge speaks on its behalf — but it used to do
+   * that only while a harvest was running, and a harvest only started when somebody
+   * pushed a message in. A Codex session told by its own user to say something wrote the
+   * message and it reached nobody. Reading its log whenever it finishes a turn covers
+   * both cases with one path.
+   *
+   * Nothing is published twice: the same per-thread claim guards this and the harvest
+   * that follows a push.
+   */
+  /** Where the last harvest of each Codex log stopped, as a byte offset into it. */
+  const harvestAt = new Map();
+  const harvestCodexTurn = (conversationId) => {
+    const found = syncRoomFor(conversationId);
+    const member = found?.room.members.get(conversationId);
+    if (!member || member.confirmed !== true) return;
+    const path = codexRolloutFor(conversationId);
+    if (!path) return;
+    // A log nobody has read yet starts at the moment this session joined the room, so a
+    // conversation that was already long does not arrive in the room all at once. Every
+    // read after that resumes from a byte offset, which cannot step over a line.
+    const resuming = harvestAt.get(path);
+    const { replies, offset } = readCodexLog(
+      path,
+      resuming ?? 0,
+      resuming === undefined ? Date.parse(member.joinedAt) || 0 : 0,
+    );
+    harvestAt.set(path, offset);
+    for (const reply of replies) {
+      if (!claimCodexReply(conversationId, reply)) continue;
+      if (refuseToPublish(found.room, conversationId)) continue;
+      publishMail(found.room, conversationId, reply.text, null, true);
+      deliverMail(found.name, found.room, reply.text, conversationId);
+    }
+  };
+
   const emitHookStop = (data = {}) => {
     const now = Date.now();
     const scope = tracker.hookScope(data, now);
@@ -397,6 +435,15 @@ function startBridge(config) {
             : null,
       },
     });
+
+    // A Codex turn ending is the only signal that it has said something, and until now
+    // its words were only collected while a harvest happened to be running — which
+    // started only when somebody pushed a message to it. Told to speak by its own user,
+    // it wrote a perfectly good reply that reached nobody. Its log is read on every turn
+    // it completes, so what it says in a room arrives whoever prompted it.
+    if (providerByConversation.get(scope.conversationId) === "codexCliHook") {
+      harvestCodexTurn(scope.conversationId);
+    }
   };
 
   const emitHookAttention = (data = {}) => {
@@ -616,22 +663,71 @@ function startBridge(config) {
     return true;
   };
 
+  /** One line of a Codex rollout as a reply, or null when the line is anything else. */
+  const codexReplyFromLine = (line, sinceMs) => {
+    if (!line.trim()) return null;
+    let entry;
+    try { entry = JSON.parse(line); } catch { return null; }
+    if (entry.type !== "event_msg" || entry.payload?.type !== "task_complete") return null;
+    const text = entry.payload.last_agent_message;
+    if (typeof text !== "string" || !text.trim()) return null;
+    const at = Date.parse(entry.timestamp ?? "");
+    if (Number.isFinite(at) && at < sinceMs) return null;
+    return { turnId: entry.payload.turn_id ?? null, text: text.trim() };
+  };
+
   const readCodexReplies = (rolloutPath, sinceMs) => {
     const replies = [];
     let content = "";
     try { content = readFileSync(rolloutPath, "utf8"); } catch { return replies; }
     for (const line of content.split("\n")) {
-      if (!line.trim()) continue;
-      let entry;
-      try { entry = JSON.parse(line); } catch { continue; }
-      if (entry.type !== "event_msg" || entry.payload?.type !== "task_complete") continue;
-      const text = entry.payload.last_agent_message;
-      if (typeof text !== "string" || !text.trim()) continue;
-      const at = Date.parse(entry.timestamp ?? "");
-      if (Number.isFinite(at) && at < sinceMs) continue;
-      replies.push({ turnId: entry.payload.turn_id ?? null, text: text.trim() });
+      const reply = codexReplyFromLine(line, sinceMs);
+      if (reply) replies.push(reply);
     }
     return replies;
+  };
+
+  /**
+   * Everything Codex has said past `offset`, and the offset to resume from next time.
+   *
+   * A byte cursor rather than a clock, because this one advances and a clock cannot
+   * advance safely: the old cursor moved to "now" before the file was read, so a line
+   * flushed a moment late fell below the next read's floor and was never published. The
+   * per-thread claim stops a reply being said twice; nothing stopped one being skipped.
+   *
+   * Only whole lines are consumed. A log caught mid-write ends in a partial line, and
+   * the returned offset stops in front of it so the next read sees it complete.
+   */
+  const readCodexLog = (rolloutPath, offset, sinceMs) => {
+    let size = 0;
+    try { size = statSync(rolloutPath).size; } catch { return { replies: [], offset }; }
+    // A file smaller than its cursor was rotated or rewritten, and the cursor now points
+    // into a log that no longer exists.
+    const from = offset > size ? 0 : offset;
+    if (from >= size) return { replies: [], offset: size };
+    let chunk = "";
+    let fd = null;
+    try {
+      fd = openSync(rolloutPath, "r");
+      const buffer = Buffer.allocUnsafe(size - from);
+      const read = readSync(fd, buffer, 0, buffer.length, from);
+      // Safe to decode from here: an offset only ever lands just past a newline, so it
+      // never cuts a multi-byte character in half.
+      chunk = buffer.subarray(0, read).toString("utf8");
+    } catch {
+      return { replies: [], offset };
+    } finally {
+      if (fd !== null) { try { closeSync(fd); } catch {} }
+    }
+    const lastBreak = chunk.lastIndexOf("\n");
+    if (lastBreak < 0) return { replies: [], offset: from };
+    const whole = chunk.slice(0, lastBreak);
+    const replies = [];
+    for (const line of whole.split("\n")) {
+      const reply = codexReplyFromLine(line, sinceMs);
+      if (reply) replies.push(reply);
+    }
+    return { replies, offset: from + Buffer.byteLength(whole, "utf8") + 1 };
   };
 
   // Mail rooms: a named channel for agents on this machine to talk to each other,

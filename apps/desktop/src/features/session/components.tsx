@@ -48,7 +48,10 @@ export const SessionContextMeter = ({
 }: { session: ISessionDetail; usage: IContextUsageSnapshot | null | undefined }) => {
   const meter = buildContextMeter(usage, session.model);
   if (!meter) return null;
-  const percent = meter.ratio === null ? null : Math.round(meter.ratio * 100);
+  // One decimal place: whole numbers hid movement early in a long window, where a
+  // 1M-token context spends thousands of tokens without the figure changing at all.
+  // Floored rather than rounded, so a window with room left never reads as 100%.
+  const percent = meter.ratio === null ? null : Math.floor(meter.ratio * 1000) / 10;
   const breakdown = [
     meter.cacheReadTokens > 0 ? `${compactNumber(meter.cacheReadTokens)} cached` : null,
     meter.cacheCreationTokens > 0 ? `${compactNumber(meter.cacheCreationTokens)} new` : null,
@@ -61,7 +64,7 @@ export const SessionContextMeter = ({
         <span className="context-meter-value">
           {compactNumber(meter.used)}
           {meter.window ? <span className="context-meter-window"> / {compactNumber(meter.window)}</span> : null}
-          {percent === null ? null : <span className="context-meter-percent" data-high={percent >= 80}>{percent}%</span>}
+          {percent === null ? null : <span className="context-meter-percent" data-high={percent >= 80}>{percent.toFixed(1)}%</span>}
         </span>
       </div>
       {meter.ratio === null ? null : (

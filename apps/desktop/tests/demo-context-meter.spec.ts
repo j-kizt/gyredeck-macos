@@ -170,14 +170,19 @@ test("session detail shows the context meter for Claude and omits it otherwise",
   const meter = page.locator(".session-context-meter");
   await expect(meter).toContainText("302.6K");
   await expect(meter).toContainText("1M");
-  await expect(meter).toContainText("30%");
+  // One decimal place, floored: a whole number hides thousands of tokens of movement
+  // inside a million-token window, and rounding up would show a full context that
+  // still has room in it.
+  await expect(meter).toContainText("30.2%");
   await expect(meter).toContainText("301.9K cached");
   // The number is measured when the Stop hook fires, so it is labelled as such.
   await expect(meter).toContainText("last turn");
 
   const bar = meter.getByRole("progressbar");
-  await expect(bar).toHaveAttribute("aria-valuenow", "30");
-  await expect(bar).toHaveAttribute("aria-valuetext", "30% of context used");
+  // The announced value matches the printed one; a screen reader hearing "30" while
+  // the screen says 30.2 is two different readings of the same meter.
+  await expect(bar).toHaveAttribute("aria-valuenow", "30.2");
+  await expect(bar).toHaveAttribute("aria-valuetext", "30.2% of context used");
 
   // Antigravity reports no token usage, so its sessions carry no meter at all.
   await page.goto("/?demo=1&demoScenario=done");

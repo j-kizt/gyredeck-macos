@@ -1125,11 +1125,33 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
     // the stream is gated, or it would be the way around the door.
     const watched = await fetch(`http://127.0.0.1:${port}/mail/${code}/events`, { headers });
     assert.equal(watched.status, 403);
-    const allowed = await fetch(`http://127.0.0.1:${port}/mail/${code}/events`, {
+    // The password alone is not enough: a watcher names itself, and only a confirmed
+    // member may watch. Otherwise a session that had been disconnected would keep
+    // watching on a password it still remembers.
+    const anonymous = await fetch(`http://127.0.0.1:${port}/mail/${code}/events`, {
       headers: { "x-gyredeck-token": minted.body.password },
     });
-    assert.equal(allowed.status, 200, "the room's own token opens its stream");
+    assert.equal(anonymous.status, 403);
+    assert.equal((await anonymous.json()).error, "not_a_member");
+
+    const allowed = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${joiner}`, {
+      headers: { "x-gyredeck-token": minted.body.password },
+    });
+    assert.equal(allowed.status, 200, "a confirmed member with the room's password may watch");
     allowed.body?.cancel();
+
+    // Disconnecting closes the door behind them: the password they still hold stops
+    // working, and their own mailbox is told why.
+    await call("DELETE", `/sync/rooms/${code}/members/${joiner}`);
+    const afterLeaving = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${joiner}`, {
+      headers: { "x-gyredeck-token": minted.body.password },
+    });
+    assert.equal(afterLeaving.status, 403);
+    const told = await call("GET", `/mail/inbox?as=${joiner}`);
+    assert.match(
+      told.body.messages.at(-1).text,
+      /no longer in room .*stop it: it has been closed from this end/s,
+    );
 
     // A code nobody is in cannot be watched into existence: a watcher on a dead room
     // would see nothing forever and have no way to tell that from silence.

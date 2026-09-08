@@ -310,6 +310,9 @@ function startBridge(config) {
     const label = providerLabelFor(conversationId);
     found.room.members.delete(conversationId);
     found.room.touchedAt = Date.now();
+    // A session that has ended cannot read the notice, but its stream is still open
+    // until something closes it, and this is that something.
+    partWithMember(found.name, found.room, conversationId, "its session ended");
     if (found.room.members.size === 0 && found.room.clients.size === 0) {
       mailRooms.delete(found.name);
     } else if (found.room.members.size > 0) {
@@ -656,6 +659,38 @@ function startBridge(config) {
    * — instantly for Codex, on the next turn for the others.
    */
   const ROOM_SENDER = "gyredeck-room";
+
+  /**
+   * Tell a session it is out, and cut anything it left running.
+   *
+   * The notice cannot go to the room — it is no longer allowed to read it — so it goes
+   * to the session's own mailbox, where its next drain will find it, and is pushed to
+   * Codex, which has no drain. Any stream it holds on this room is ended here rather
+   * than left to fail quietly on the next message: a watch that outlives its membership
+   * looks exactly like a quiet room.
+   */
+  const partWithMember = (name, room, conversationId, why) => {
+    for (const res of [...room.clients]) {
+      if (res.gyredeckWatcher !== conversationId) continue;
+      try {
+        res.write(`: gyredeck removed from room ${name}\n\n`);
+        res.end();
+      } catch {
+        // Already gone; its close handler has cleaned up.
+      }
+      room.clients.delete(res);
+    }
+    const mailbox = mailRoomFor(conversationId, true);
+    if (!mailbox) return;
+    const text =
+      `[Gyredeck: you are no longer in room ${name} — ${why}. You can neither read it` +
+      " nor post to it now, and its password will not let you back in. If you have a" +
+      " watch running on that room, stop it: it has been closed from this end and" +
+      " re-arming it will be refused. Nothing about this room will reach you again" +
+      " unless someone puts you back in it.]";
+    publishMail(mailbox, ROOM_SENDER, text, null);
+    deliverMail(conversationId, mailbox, text, ROOM_SENDER);
+  };
 
   const announceMembership = (name, room, note) => {
     const present = [...room.members.keys()].map(providerLabelFor);
@@ -1179,6 +1214,8 @@ function startBridge(config) {
         const label = providerLabelFor(conversationId);
         room.members.delete(conversationId);
         room.touchedAt = Date.now();
+        // The one leaving is told first, while the room object is still here to name.
+        partWithMember(code, room, conversationId, "someone disconnected it from the app");
         if (room.members.size === 0 && room.clients.size === 0) mailRooms.delete(code);
         // Whoever is left was told this member was here, and might be about to ask it
         // something.
@@ -1502,16 +1539,29 @@ function startBridge(config) {
           });
           return;
         }
-        // Reading a room people were put into needs that room's token — not the
-        // machine's. Every agent can read the machine token, so accepting it here would
-        // let anything watch a conversation it was never let into.
-        if (room.members.size > 0 && !holdsRoomPassword(room, headerToken)) {
-          sendJson(403, {
-            ok: false,
-            error: "not_confirmed",
-            message: "This room needs its own password. Ask the person at this terminal for it, then send it as the x-gyredeck-token header.",
-          });
-          return;
+        // Reading a room people were put into needs that room's password — not the
+        // machine's, which every agent can read — and it needs the reader to still be
+        // in the room. The password alone is not enough: a session that has been
+        // disconnected still remembers it, and without this its watch would keep
+        // running on a room it was removed from.
+        const watcher = url.searchParams.get("as") ?? null;
+        if (room.members.size > 0) {
+          if (!holdsRoomPassword(room, headerToken)) {
+            sendJson(403, {
+              ok: false,
+              error: "not_confirmed",
+              message: "This room needs its own password. Ask the person at this terminal for it, then send it as the x-gyredeck-token header.",
+            });
+            return;
+          }
+          if (!watcher || room.members.get(watcher)?.confirmed !== true) {
+            sendJson(403, {
+              ok: false,
+              error: "not_a_member",
+              message: "Name yourself with ?as=<conversationId>; only a confirmed member of this room may watch it.",
+            });
+            return;
+          }
         }
         res.writeHead(200, {
           "content-type": "text/event-stream; charset=utf-8",
@@ -1550,6 +1600,10 @@ function startBridge(config) {
           }
         }
 
+        // Tagged so the stream can be closed if this member is later removed. A watch
+        // that outlives its membership is the same silent failure as watching a room
+        // that no longer exists.
+        res.gyredeckWatcher = watcher;
         room.clients.add(res);
         room.touchedAt = Date.now();
         req.on("close", () => {

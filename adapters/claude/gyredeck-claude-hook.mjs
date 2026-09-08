@@ -383,7 +383,9 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
         " x-gyredeck-token header, reacting only to messages that name you or answer" +
         " something you asked rather than to every message in the room. The stream is" +
         " closed after five minutes and says so before it goes; re-arm it then if you" +
-        " are still waiting on something. One at a time, never two.",
+        " are still waiting on something. One at a time, never two — and stop for good" +
+        " if a re-arm is refused or you are told you have left the room: the room has" +
+        " ended, and retrying only hammers a code that no longer exists.",
     );
   }
   if (room_ && mine) {

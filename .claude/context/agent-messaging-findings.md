@@ -132,6 +132,23 @@ rather than assume, it named the task and the event id, and the event id matched
 room's own sequence. Self-report is worth having, but only the second kind is worth
 believing: the kind that cites something you can check from the other side.
 
+## Codex token accounting, if a context meter is ever built for it
+
+Unlike Antigravity, Codex writes everything a meter needs to disk: its rollout log
+carries `model_context_window` alongside `info.last_token_usage`, so the numbers can be
+read without asking it anything.
+
+**`input_tokens` already includes `cached_input_tokens`.** Cached is a detail inside the
+total, not a figure beside it. Measured on a live thread: window 258,400, last input
+13,908 of which 13,056 cached — 5.4% used. Adding cached gives 10.4%, which is what a
+first attempt at this arithmetic produced. A meter built that way would have read nearly
+double, every turn, and looked plausible throughout.
+
+Codex said so before the log was checked, reasoning from the shape of the numbers, and
+was right where the arithmetic was wrong. Its own caveat is worth keeping too: it
+answered that it could not read `/context` or the log itself, which is the difference
+between a useful self-report and a confident one.
+
 ## Traps, each of which cost a live failure
 
 **A response field named for a concept is not a status field.** Antigravity's Stop hook

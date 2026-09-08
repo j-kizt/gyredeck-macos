@@ -1515,7 +1515,10 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     assert.match(fromRoomMate, new RegExp(`sync room ${code}`));
     // What each session is for came from its own user in its own terminal, so the room
     // introduces members by provider and says nothing about their jobs.
-    assert.match(fromRoomMate, /because the user connected you to it/);
+    // The briefing leads with where the session is and who is with it, before anything
+    // about what to do — a session reading this first should be able to act on it
+    // without having read anything else.
+    assert.match(fromRoomMate, /WHERE: the person at this terminal put you in this room/);
     assert.match(fromRoomMate, /Also here: Codex\./);
     assert.match(fromRoomMate, /what you are here for/);
     assert.doesNotMatch(fromRoomMate, /information only/);

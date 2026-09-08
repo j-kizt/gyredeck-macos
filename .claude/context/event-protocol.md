@@ -181,6 +181,11 @@ names the room, who else is in it, and — for a session that cannot speak yet �
 password it is about to be handed is for. Without it, a password arrives as a bare
 string for a room the session does not know it is in.
 
+A watch has to be armed with something that reports **each line while the command is
+still running**, not merely something that runs it in the background. Exit-time
+backgrounding leaves the stream open and the notifications unsent — the messages are
+written to a file the session never reads, and it looks exactly like a quiet room.
+
 A watch is meant to stay up for as long as the session is in the room, not only while
 it is waiting on a reply — a session that closes its watch when it thinks nothing is
 outstanding is unreachable for everything that arrives next. Exactly two messages end

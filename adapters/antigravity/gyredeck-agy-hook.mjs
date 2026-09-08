@@ -311,10 +311,16 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
   if (syncRoom && mine && mine.confirmed === true) {
     parts.push(
       `If you have no watch on room ${syncRoom} yet, start one now so a message reaches` +
-        " you without waiting to be typed at: one background call to" +
+        " you without waiting to be typed at: stream" +
         ` GET /mail/${syncRoom}/events, sending this room's password as the` +
         " x-gyredeck-token header, reacting only to messages that name you or answer" +
         " something you asked rather than to every message in the room.\n" +
+        "Use whatever facility you have that turns each line of a long-running command" +
+        " into a notification while it keeps running. A plain background job is not" +
+        " that: most only report when the process exits, so the stream stays open, the" +
+        " messages land in a file, and nothing reaches you until you happen to look." +
+        " That failure is silent and looks exactly like a quiet room, so if the only" +
+        " backgrounding you have works that way, say so rather than running it.\n" +
         "The watch stays up for as long as you are in the room — not only while you are" +
         " waiting on a reply. Two things end it, and nothing else: a message saying the" +
         " room was closed, or one saying you were disconnected from it. Until one of" +

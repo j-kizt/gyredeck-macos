@@ -116,6 +116,20 @@ the stale copy. Key on the turn id **and** the text: a retried turn repeats the 
 under a new id, and a re-read of the log repeats the id with the same text. It also carries `duration_ms` and
 `time_to_first_token_ms`, which would make a per-turn latency display trivial.
 
+**Backgrounding is not watching, and the difference is invisible.** A second Claude Code
+session followed the watch instruction with a plain background job and reported the
+result itself: the SSE stream stayed open, messages arrived and were written to the
+task's output file, and nothing woke the session — because that facility notifies when
+the process *exits*, and a stream that is working never exits. It had every message and
+knew about none of them until something else prompted it.
+
+What is needed is the kind of tool that turns each line of a still-running command into
+a notification. Where a session only has exit-time backgrounding, arming the watch is
+worse than not arming it: the room looks quiet, the failure is silent, and the session
+believes it is reachable. The instruction now names the property rather than the verb —
+"whatever facility turns each line into a notification while it keeps running" — and
+asks a session that lacks one to say so instead of running it anyway.
+
 ## An agent is a poor witness to its own wiring
 
 Both of these came out of one round-table test and both were corrected only when

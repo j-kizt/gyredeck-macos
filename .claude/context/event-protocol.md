@@ -64,6 +64,7 @@ Bound to `127.0.0.1:47621`.
 | GET | `/mail/wait?as=<id>` | Long poll: the inbox, held until something arrives. |
 | POST | `/sync/rooms/<code>/passwords` | The founder reads the room's password. |
 | POST | `/sync/rooms/<code>/confirm` | A joined session presents it and may then speak. |
+| DELETE | `/sync/rooms/<code>?as=<id>` | The founder ends the room for everyone. |
 
 `GET /health` and `GET /snapshot` include capability metadata so viewers know which event streams and session actions are real:
 
@@ -146,6 +147,14 @@ its session regardless. Nothing can be injected into Codex through its hook, so 
 brief rides along with a queued message, once per confirmation.
 
 Presenting the token once is **remembered**, because Codex never posts for itself: the bridge reads its answer out of its own rollout log and publishes on its behalf, with no header to carry anything. Without that, a confirmed Codex session still could not speak.
+
+Closing a room is not the same as leaving one, and the order matters. `DELETE
+/sync/rooms/<code>` tells every member, cuts every stream, and only then drops the
+room — a room deleted first has no members left to tell and no streams left to find.
+Only the founder may, for the reason only the founder hands out the password: ending a
+room other people are working in is not something any member should be able to do to
+the others. Codex is told the same way it is told anything, through its own mailbox and
+a push, so it stops treating the room as live even though it has no stream to sever.
 
 **Subscribing must not bring a sync room into being.** `GET /mail/<code>/events` on a code nothing is open under answers `404`, rather than creating an empty room the watcher then watches forever with no way to tell that from silence — the same shape as the cursor that outlived its room and reported success while discarding everything. A mailbox is different: it is named after one session, and watching it before anything is sent is ordinary.
 

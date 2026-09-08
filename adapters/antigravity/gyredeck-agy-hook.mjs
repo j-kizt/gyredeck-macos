@@ -275,12 +275,19 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
     ? [syncRoom]
     : [...new Set(delivered.map((message) => message.replyTo).filter((value) => typeof value === "string"))];
 
+  // Counting an empty delivery produced "0 messages from ." — a quantity of nothing
+  // and a sender who does not exist. Nothing waiting means the heading says nothing
+  // about it.
+  const tally = delivered.length === 0
+    ? null
+    : `${delivered.length} message${delivered.length === 1 ? "" : "s"} from ${senders.join(", ")}`;
   const parts = [
     syncRoom
-      ? `Gyredeck sync room ${syncRoom} — ${delivered.length} message` +
-        `${delivered.length === 1 ? "" : "s"} from ${senders.join(", ")}.`
-      : `You have ${delivered.length} new Gyredeck mail message` +
-        `${delivered.length === 1 ? "" : "s"} from ${senders.join(", ")}.`,
+      ? `Gyredeck sync room ${syncRoom}${tally ? ` — ${tally}` : ""}.`
+      : tally
+        ? `You have ${delivered.length} new Gyredeck mail message` +
+          `${delivered.length === 1 ? "" : "s"} from ${senders.join(", ")}.`
+        : "Gyredeck mail.",
   ];
   // A member that has not been given the room's password can read what is addressed to
   // it and answer nothing. Saying so here, rather than leaving it to work the refusal

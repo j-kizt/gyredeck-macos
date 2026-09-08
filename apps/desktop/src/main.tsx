@@ -933,6 +933,14 @@ const App = () => {
                   keepAwakeError={keepAwakeError}
                   hookStatus={hookStatus}
                   mailRooms={mailRooms}
+                  onCloseRoom={async (room, founder) => {
+                    try {
+                      await invoke("sync_close", { code: room, conversationId: founder });
+                    } catch {
+                      // The list re-reads on its own; a refusal shows as the room simply
+                      // still being there.
+                    }
+                  }}
                   syncRepliesAllowed={syncRepliesAllowed}
                   syncRepliesBusy={syncRepliesBusy}
                   onSyncRepliesChange={changeSyncReplies}

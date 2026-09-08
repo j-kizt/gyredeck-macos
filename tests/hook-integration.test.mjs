@@ -1153,6 +1153,28 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
       /no longer in room .*stop it: it has been closed from this end/s,
     );
 
+    // Closing is the room's end, not one member's exit: everyone is told, every stream
+    // is cut, and only then does the room go. Doing it in the other order would leave
+    // nobody to tell and no stream to find.
+    // `joiner` was disconnected earlier in this test, so bring someone back in to be
+    // the member who gets told — closing an empty-but-for-the-founder room proves
+    // nothing about telling anyone.
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: stranger });
+    const outsiderClose = await fetch(`http://127.0.0.1:${port}/sync/rooms/${code}?as=${stranger}`, {
+      method: "DELETE",
+      headers,
+    });
+    assert.equal(outsiderClose.status, 403, "only the founder ends a room others are in");
+
+    const closed = await fetch(`http://127.0.0.1:${port}/sync/rooms/${code}?as=${founder}`, {
+      method: "DELETE",
+      headers,
+    });
+    assert.equal(closed.status, 200);
+    const closeNotice = await call("GET", `/mail/inbox?as=${stranger}`);
+    assert.match(closeNotice.body.messages.at(-1).text, /no longer in room .*the room was closed/s);
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, null);
+
     // A code nobody is in cannot be watched into existence: a watcher on a dead room
     // would see nothing forever and have no way to tell that from silence.
     const dead = await fetch(`http://127.0.0.1:${port}/mail/sync-zzzz/events`, { headers });

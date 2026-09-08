@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, Link2, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, Link2, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, ShieldCheck, Trash2, X } from "lucide-react";
 import type { IGyredeckBridgeCapabilities } from "@gyredeck/protocol";
 import { shortenPath } from "../session/activity";
 import type { IUseUpdater } from "../updater/useUpdater";
@@ -32,7 +32,8 @@ export interface ISetupPanelProps {
   keepAwakeError: string | null;
   hookStatus: { path: string | null; installed: boolean | null };
   /** Rooms the bridge currently holds, keyed by code. Only ones with members are shown. */
-  mailRooms: Record<string, { room: string; members: string[]; pending: number }>;
+  mailRooms: Record<string, { room: string; members: string[]; pending: number; founder: string | null }>;
+  onCloseRoom: (room: string, founder: string) => Promise<void>;
   /** Null while unknown, so the switch does not claim "off" before it has looked. */
   syncRepliesAllowed: boolean | null;
   syncRepliesBusy: boolean;
@@ -162,10 +163,13 @@ const GitAccountList = ({ accounts, canUseNativeControls, onSetActive, onRemove 
 const SyncRoomList = ({
   rooms,
   canUseNativeControls,
+  onCloseRoom,
 }: {
-  rooms: Record<string, { room: string; members: string[]; pending: number }>;
+  rooms: Record<string, { room: string; members: string[]; pending: number; founder: string | null }>;
   canUseNativeControls: boolean;
+  onCloseRoom: (room: string, founder: string) => Promise<void>;
 }) => {
+  const [closing, setClosing] = useState<string | null>(null);
   if (!canUseNativeControls) return null;
   const open = Object.values(rooms).filter((entry) => entry.members.length > 0);
   // Absent rather than empty. A room exists only while people are using one, so "none
@@ -195,6 +199,24 @@ const SyncRoomList = ({
               {entry.pending} waiting
             </span>
           ) : null}
+          {entry.founder ? (
+            // Closing ends the room for everyone in it, so it belongs to whoever opened
+            // it — the same hand that gave out the password.
+            <button
+              className="gh-icon-btn danger"
+              type="button"
+              disabled={closing === entry.room}
+              onClick={() => {
+                setClosing(entry.room);
+                void onCloseRoom(entry.room, entry.founder ?? "").finally(() => setClosing(null));
+              }}
+              data-tauri-drag-region="false"
+              title="Close this room for everyone in it"
+              aria-label={`Close room ${entry.room}`}
+            >
+              <X size={13} strokeWidth={2.4} />
+            </button>
+          ) : null}
         </div>
         ))}
       </div>
@@ -214,7 +236,7 @@ const UPDATER_DETAIL: Record<IUseUpdater["status"], string> = {
 const MIN_BRIDGE_PORT = 1024;
 const MAX_BRIDGE_PORT = 65535;
 
-export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, mailRooms, syncRepliesAllowed, syncRepliesBusy, onSyncRepliesChange, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
+export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, mailRooms, onCloseRoom, syncRepliesAllowed, syncRepliesBusy, onSyncRepliesChange, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
   const [activeCategory, setActiveCategory] = useState<SetupCategory>("connection");
   const [compactNavigation, setCompactNavigation] = useState(() => window.matchMedia("(max-width: 380px)").matches);
   const credentialHelper = useGitCredentialHelper(canUseNativeControls);
@@ -302,7 +324,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
               <div className="setup-row setup-row-stack"><div className="setup-row-main"><span className="status-slot"><PlugZap className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Bridge port</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : portStatus ?? `Local bridge port · ${bridgePort}`}</span></span>{canUseNativeControls ? <button className="pill-btn" type="button" onClick={toggleEditPort} data-tauri-drag-region="false" aria-expanded={editingPort} aria-label="Edit bridge port"><Pencil size={12} strokeWidth={2.3} />Edit</button> : null}</div>{editingPort ? <span className="setup-row-actions full"><input className="setup-input" type="number" min={MIN_BRIDGE_PORT} max={MAX_BRIDGE_PORT} value={portField} onChange={(event) => setPortField(event.target.value)} disabled={portBusy} data-tauri-drag-region="false" aria-label="Bridge port" autoFocus /><button className="pill-btn accent" type="button" onClick={() => void applyPort()} disabled={!canApplyPort} data-tauri-drag-region="false"><Check size={12} strokeWidth={2.3} />Apply</button></span> : null}</div>
               <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{guidance.title}</span><span className="setup-detail">{guidance.detail}</span></span></div>
               {nativeAction.message ? <div className="notice-row" data-online={nativeAction.bridgeOnline === true} role="status" aria-live="polite">{nativeAction.message}</div> : null}
-              <SyncRoomList rooms={mailRooms} canUseNativeControls={canUseNativeControls} />
+              <SyncRoomList rooms={mailRooms} canUseNativeControls={canUseNativeControls} onCloseRoom={onCloseRoom} />
             </>
           ) : null}
 

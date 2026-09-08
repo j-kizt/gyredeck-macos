@@ -91,6 +91,17 @@
     transform 120ms ease;
 }
 
+/* Closing a room ends it for everyone in it — the one destructive thing in this list. */
+.gh-icon-btn.danger {
+  color: var(--danger);
+}
+
+.gh-icon-btn.danger:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: rgba(255, 107, 102, 0.14);
+}
+
 .gh-icon-btn:hover {
   background: var(--fill-2);
   color: var(--text);

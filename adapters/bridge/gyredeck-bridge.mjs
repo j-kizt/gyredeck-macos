@@ -1188,6 +1188,47 @@ function startBridge(config) {
         return;
       }
 
+      // DELETE /sync/rooms/<code> — close the room for everyone.
+      //
+      // Leaving is one member's business; closing is the room's end, and the difference
+      // matters to what is still running. Every member is told, every stream is cut,
+      // and only then is the room dropped — in that order, because a room deleted first
+      // has no members left to tell and no streams left to find.
+      if (req.method === "DELETE" && segments.length === 3) {
+        const room = mailRooms.get(code);
+        if (!room || room.members.size === 0) {
+          sendJson(404, { ok: false, error: "no_such_room" });
+          return;
+        }
+        const closer = url.searchParams.get("as");
+        if (closer && room.createdBy !== closer) {
+          sendJson(403, {
+            ok: false,
+            error: "not_the_founder",
+            message: "Only the session that created this room can close it.",
+          });
+          return;
+        }
+        for (const conversationId of [...room.members.keys()]) {
+          room.members.delete(conversationId);
+          partWithMember(code, room, conversationId, "the room was closed");
+        }
+        // Anything still holding the stream that was not a member — nothing should be,
+        // but a socket outliving its membership is exactly the bug this guards.
+        for (const res of [...room.clients]) {
+          try {
+            res.write(`: gyredeck room ${code} closed\n\n`);
+            res.end();
+          } catch {
+            // Already gone.
+          }
+        }
+        room.clients.clear();
+        mailRooms.delete(code);
+        sendJson(200, { ok: true, room: code, closed: true });
+        return;
+      }
+
       // POST /sync/rooms/<code>/passwords — the founder reads the room's password, to
       // hand to a session being let in. The same string every time: it is presented in
       // the x-gyredeck-token header of every read and send in this room, so it has to
@@ -1367,6 +1408,8 @@ function startBridge(config) {
         const labels = memberLabelsFor(room.members.keys());
         return [...room.members.keys()].map((id) => labels.get(id) ?? providerLabelFor(id));
       })(),
+      // Named so a listing can tell which rooms the person may close from here.
+      founder: room.createdBy ?? null,
               lastMessageAt: room.messages.at(-1)?.ts ?? null,
               lastReadAt: reader.lastReadAt ?? null,
             };

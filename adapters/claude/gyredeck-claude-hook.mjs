@@ -335,11 +335,15 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
       message.from !== APP_SENDER && message.from !== ROOM_SENDER && !byId.has(message.from),
   );
 
+  // A confirmation with nothing waiting is the one case that reaches here with no
+  // messages, and counting them produced "0 messages from ." — a sentence naming a
+  // quantity of nothing and a sender who does not exist.
+  const tally = delivered.length === 0
+    ? null
+    : `${delivered.length} message${delivered.length === 1 ? "" : "s"} from ${senders.join(", ")}`;
   const heading = room_
-    ? `Gyredeck sync room ${room_} — ${delivered.length} message` +
-      `${delivered.length === 1 ? "" : "s"} from ${senders.join(", ")}.`
-    : `Gyredeck mail: ${delivered.length} message${delivered.length === 1 ? "" : "s"} ` +
-      `from ${senders.join(", ")}.`;
+    ? `Gyredeck sync room ${room_}${tally ? ` — ${tally}` : ""}.`
+    : `Gyredeck mail${tally ? `: ${tally}` : ""}.`;
 
   const standing = [];
   if (justConfirmed) {

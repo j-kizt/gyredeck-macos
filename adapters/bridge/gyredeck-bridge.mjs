@@ -438,14 +438,30 @@ function startBridge(config) {
       const provider = providerLabelFor(id);
       counts.set(provider, (counts.get(provider) ?? 0) + 1);
     }
-    return new Map(
+    // Provider alone where it is unique; provider and workspace where that is enough;
+    // a short id on top where it is not. Two sessions of one agent in one checkout is
+    // an ordinary thing to be doing, and it is exactly the case where telling them
+    // apart matters most.
+    const qualified = new Map(
       ids.map((id) => {
         const provider = providerLabelFor(id);
         if ((counts.get(provider) ?? 0) < 2) return [id, provider];
         const workspace = workspaceFor(id);
-        // Falling back to a short id is ugly, but an ambiguous name is worse: it makes
-        // a request to one session look like a request to the other.
-        return [id, workspace ? `${provider} · ${workspace}` : `${provider} · ${id.slice(0, 6)}`];
+        return [id, workspace ? `${provider} · ${workspace}` : provider];
+      }),
+    );
+    const stillClashing = new Map();
+    for (const label of qualified.values()) {
+      stillClashing.set(label, (stillClashing.get(label) ?? 0) + 1);
+    }
+    return new Map(
+      ids.map((id) => {
+        const label = qualified.get(id);
+        if ((stillClashing.get(label) ?? 0) < 2) return [id, label];
+        // The id is meaningless to a person, which is why it is last and short. It is
+        // still better than a name that points at two sessions at once: a request to
+        // one of them would read as a request to the other.
+        return [id, `${label} #${id.slice(0, 6)}`];
       }),
     );
   };

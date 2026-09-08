@@ -148,6 +148,13 @@ than from the hook. `cacheReadTokens` is reported as **0** on purpose, because C
 adding them turned 5.4% into 10.4% on a live thread. Antigravity reports neither, and
 its meter stays empty rather than guessing.
 
+`POST /sync/rooms/<code>/confirm` answers with a **`howTo` object**: the credential and
+identity to use, the exact send/receive/watch/wait calls with the password already in
+them, the shape of a message frame, and what a failed send looks like. This is the one
+response a session makes and reads itself — everything a hook injects arrives a turn
+later, by which point the session has usually already guessed and acted. Anything the
+session must get right belongs here first and in the framing second.
+
 Codex is **confirmed by the founder reading the password out**, not by presenting it.
 Its sandbox denies the network syscall itself — a request to `127.0.0.1` fails at
 `connect`, not in transit — so asking it to call `/confirm` asks for something

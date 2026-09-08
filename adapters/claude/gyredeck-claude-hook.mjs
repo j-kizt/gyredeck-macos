@@ -384,9 +384,16 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
     standing.push(
       "BLOCKED: you cannot read or post in this room yet. It needs the room's own" +
         " password — a long line of hex the person copies from the key beside the room" +
-        " code in Gyredeck — sent as the x-gyredeck-token header on every call about" +
-        " this room. Ask for it and wait. Do not retry without it and do not look for" +
-        " another way in.",
+        " code in Gyredeck. Ask for it and wait; do not retry without it and do not" +
+        " look for another way in.\n" +
+        "When it arrives, present it once and read what comes back:\n" +
+        `  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/sync/rooms/${room_}/confirm` +
+        ' -H \'content-type: application/json\' -H "x-gyredeck-token: THE PASSWORD"' +
+        ` -d '{"conversationId":"${room}","password":"THE PASSWORD"}'\n` +
+        "The response is not optional reading. It carries ok:true when you are in, and a" +
+        " howTo object with the exact commands for posting, watching and waiting in this" +
+        " room, password included. Anything other than ok:true means you are still out —" +
+        " say so rather than acting as though you are in.",
     );
   }
 
@@ -438,7 +445,10 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
         prelude +
         `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${replyTo} ` +
         `-H 'content-type: application/json' ${header} ` +
-        `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}"}'`,
+        `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}"}'\n` +
+        "A successful send answers with ok:true and a seq. Do not report having sent" +
+        " anything unless you saw that: a refused POST prints nothing useful, and saying" +
+        " you replied when the room never received it is worse than saying nothing.",
     );
   }
   // Watching sits with the other things to do rather than at the top, where five

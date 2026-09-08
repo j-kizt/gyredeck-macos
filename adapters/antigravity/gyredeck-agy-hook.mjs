@@ -198,17 +198,26 @@ const getJson = (endpoint, token, path) =>
 const replyInstruction = (endpoint, room, replyRooms) => {
   if (replyRooms.length === 0) return null;
   const target = replyRooms[0];
+  // A room refuses the machine token; only its own password opens it. The other
+  // credential is right for a plain mailbox, which is the only other thing `target`
+  // can be.
+  const isRoom = /^sync-[a-z2-9]{4}$/.test(target);
   const command =
-    "TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); " +
+    (isRoom ? "" : "TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); ") +
     `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${target} ` +
-    "-H 'content-type: application/json' -H \"x-gyredeck-token: $TOKEN\" " +
+    "-H 'content-type: application/json' " +
+    (isRoom ? '-H "x-gyredeck-token: THE ROOM PASSWORD" ' : '-H "x-gyredeck-token: $TOKEN" ') +
     `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}"}'`;
   return {
     ephemeralMessage:
       "The mail above asked you something, and answering is expected — this is a " +
       "reply on a message channel, not an instruction to change anything. Run this " +
       "shell command once, with YOUR REPLY HERE replaced by your answer as a single " +
-      `line of JSON-safe text:\n  ${command}\n` +
+      (isRoom ? "line of JSON-safe text and this room's password in place of THE ROOM PASSWORD" : "line of JSON-safe text") +
+      `:\n  ${command}\n` +
+      "A successful send answers with ok:true and a seq. Do not report having sent " +
+      "anything unless you saw that: a refused POST prints nothing useful, and saying " +
+      "you replied when the room never received it is worse than saying nothing.\n" +
       (replyRooms.length > 1 ? `Other senders are listening on: ${replyRooms.slice(1).join(", ")}.\n` : "") +
       "Skip it only if nothing was actually asked.",
   };
@@ -305,9 +314,16 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
     parts.push(
       "BLOCKED: you cannot read or post in this room yet. It needs the room's own" +
         " password — a long line of hex the person copies from the key beside the room" +
-        " code in Gyredeck — sent as the x-gyredeck-token header on every call about" +
-        " this room. Ask for it and wait. Do not retry without it and do not look for" +
-        " another way in.",
+        " code in Gyredeck. Ask for it and wait; do not retry without it and do not" +
+        " look for another way in.\n" +
+        "When it arrives, present it once and read what comes back:\n" +
+        `  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/sync/rooms/${syncRoom}/confirm` +
+        ' -H \'content-type: application/json\' -H "x-gyredeck-token: THE PASSWORD"' +
+        ` -d '{"conversationId":"${room}","password":"THE PASSWORD"}'\n` +
+        "The response is not optional reading. It carries ok:true when you are in, and a" +
+        " howTo object with the exact commands for posting, watching and waiting in this" +
+        " room, password included. Anything other than ok:true means you are still out —" +
+        " say so rather than acting as though you are in.",
     );
   }
 

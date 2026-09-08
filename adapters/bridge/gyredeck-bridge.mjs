@@ -848,6 +848,104 @@ function startBridge(config) {
     deliverMail(conversationId, mailbox, text, ROOM_SENDER);
   };
 
+  /**
+   * What a session can do in a room, written where it will actually be read.
+   *
+   * A confirm is a call the session makes itself and reads the answer to, so it is the
+   * one place an instruction is certain to land — anything a hook injects arrives a turn
+   * later, by which point the session has usually guessed. The commands come with the
+   * password already in them: a session that just presented it plainly has it.
+   */
+  const howToUseRoom = (name, password, conversationId, host, port) => ({
+    credential: {
+      header: "x-gyredeck-token",
+      value: password,
+      note:
+        "This room's own password, on every call below. The machine's ingest token is" +
+        " not accepted for a room, and neither is another room's password.",
+    },
+    identity: {
+      as: conversationId,
+      note:
+        "Name yourself with this wherever a call takes `as` or `from`. A stream without" +
+        " it is refused; a message without it is not attributed to you.",
+    },
+    send: {
+      what: "Post a message everyone in the room sees.",
+      method: "POST",
+      url: `http://${host}:${port}/mail/${name}`,
+      body: {
+        from: conversationId,
+        text: "<your message, plain text>",
+        replyTo: conversationId,
+      },
+      command:
+        `curl -s -X POST http://${host}:${port}/mail/${name}` +
+        ` -H 'content-type: application/json' -H 'x-gyredeck-token: ${password}'` +
+        ` -d '{"from":"${conversationId}","text":"YOUR TEXT","replyTo":"${conversationId}"}'`,
+      success: '{"ok":true,"seq":<number>} — the seq is the room-wide sequence of your message.',
+      failure: {
+        403: "not_a_member or not_confirmed — you are out of the room, or have not presented its password.",
+        400: "invalid_message — from or text missing.",
+      },
+      rule:
+        "Treat a send as failed unless you saw ok:true and a seq. A refused POST prints" +
+        " little or nothing, and reporting a message you did not send is worse than" +
+        " reporting nothing.",
+    },
+    receive: {
+      what: "Each message arrives as one Server-Sent Event on the stream below.",
+      frame: "id: <seq>\\nevent: mail\\ndata: <json>\\n\\n",
+      dataShape: {
+        seq: "<number> — room-wide, increasing; the resume point",
+        from: "<conversationId of the sender, or gyredeck-room for the room itself, or gyredeck for the person>",
+        text: "<the message>",
+        replyTo: "<where to answer, usually the sender>",
+        ts: "<ISO timestamp>",
+      },
+      note:
+        "Ignore frames whose from is your own id — your posts come back on your own" +
+        " stream. Frames from gyredeck-room are facts about membership, not requests.",
+    },
+    watch: {
+      what: "Be woken when a message arrives, rather than waiting to be typed at.",
+      method: "GET",
+      url: `http://${host}:${port}/mail/${name}/events?as=${conversationId}`,
+      command:
+        `curl -sN "http://${host}:${port}/mail/${name}/events?as=${conversationId}"` +
+        ` -H 'x-gyredeck-token: ${password}'`,
+      runner:
+        "Run it with a facility that turns each line into a notification while the" +
+        " command is still running. A plain background job will not do: most report only" +
+        " when the process exits, and a working stream never exits — the messages land" +
+        " in a file and nothing reaches you. If that is all you have, say so rather than" +
+        " arming it, because the failure is silent and looks like a quiet room.",
+      lifetime:
+        "Keep exactly one running for as long as you are in the room, not only while" +
+        " awaiting a reply. The stream closes after five minutes and says so first;" +
+        " that is routine — reopen at once.",
+      resume:
+        `Reopen with &since=<the last seq you saw>, e.g.` +
+        ` .../mail/${name}/events?as=${conversationId}&since=12 . Without it the new` +
+        " stream starts from now and anything published in the gap is lost silently.",
+      stop:
+        "Stop for good on either of two messages, and only those: the room was closed," +
+        " or you were disconnected from it.",
+    },
+    wait: {
+      what: "Block inside this turn for an answer you need before you can carry on.",
+      method: "GET",
+      url: `http://${host}:${port}/mail/wait?as=${conversationId}&timeout=60&collect=1`,
+      command:
+        `curl -s "http://${host}:${port}/mail/wait?as=${conversationId}&timeout=60&collect=1"` +
+        ` -H 'x-gyredeck-token: ${password}'`,
+      success: '{"ok":true,"timedOut":false,"messages":[...]} — same message shape as the stream.',
+      rule:
+        "Only while an answer is genuinely outstanding. It answers timedOut:true if" +
+        " none arrives; one wait at a time per session, a second is refused.",
+    },
+  });
+
   const announceMembership = (name, room, note) => {
     const labels = memberLabelsFor(room.members.keys());
     const present = [...room.members.keys()].map((id) => labels.get(id) ?? providerLabelFor(id));
@@ -1126,19 +1224,21 @@ function startBridge(config) {
         // sandbox denies the network syscall itself, so `curl` fails at connect even
         // for loopback ("Couldn't connect ... after 0 ms" — the timing is the tell). It answers by writing its
         // answer as ordinary text, which the bridge harvests from its own rollout log.
-        let outgoing = text;
-        if (member && !member.toldHowToAnswer) {
-          member.toldHowToAnswer = true;
-          outgoing =
-            `[Gyredeck: this arrived from room ${roomName}. Answer by writing your reply` +
-            " as ordinary text in this turn — do not try to call Gyredeck. Your sandbox" +
-            " denies network syscalls, so curl fails at connect even for 127.0.0.1; the bridge reads your answer from your own session log" +
-            " and puts it in the room for you. You also need no watch on the room:" +
-            " messages are pushed into your session whether or not you are doing" +
-            " anything. Say what came in and who sent it, and after you answer, say" +
-            " what you sent back.]\n\n" +
-            text;
-        }
+        // Repeated on every message, not once. Told a single time, Codex forgot by the
+        // next turn and went back to curl — which its sandbox refuses at connect, so
+        // the POST failed silently and it reported "sent" for messages the room never
+        // received. A standing rule has to stand where it is read.
+        const outgoing =
+          `[Gyredeck · room ${roomName} — how to answer: write your reply as ordinary` +
+          " text in this turn. Do not call Gyredeck: your sandbox refuses the network" +
+          " syscall, so curl fails at connect even for 127.0.0.1, and a failed POST" +
+          " looks like nothing at all. The bridge reads what you write from your own" +
+          " session log and puts it in the room for you — that is the only path that" +
+          " works, and it needs nothing from you but the words. You also need no watch:" +
+          " messages are pushed into your session whether or not you are doing anything." +
+          " Never say you have sent something unless you saw a reply carrying ok:true" +
+          " and a seq; if you did not see one, you did not send it.]\n\n" +
+          text;
         const outcome = deliverToCodex(recipient, room, outgoing);
         if (outcome === "queued") queued = true;
         else unavailable = true;
@@ -1364,7 +1464,6 @@ function startBridge(config) {
           if (providerByConversation.get(conversationId) !== "codexCliHook") continue;
           member.confirmed = true;
           member.toldUnconfirmed = false;
-          member.toldHowToAnswer = false;
           const labels = memberLabelsFor(room.members.keys());
           announceMembership(
             code,
@@ -1389,7 +1488,16 @@ function startBridge(config) {
         }
         const member = room.members.get(conversationId);
         if (member.confirmed === true) {
-          sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
+          sendJson(200, {
+            ok: true,
+            ...describeRoom(code, room, conversationId),
+            // The answer to a call the session made itself, and so the one place an
+            // instruction is certain to be read — everything a hook injects lands a turn
+            // later, by which point the session has usually guessed.
+            ...(room.members.get(conversationId)?.confirmed === true
+              ? { howTo: howToUseRoom(code, room.password, conversationId, BRIDGE_HOST, config.port) }
+              : {}),
+          });
           return;
         }
         if (!holdsRoomPassword(room, password)) {
@@ -1398,16 +1506,22 @@ function startBridge(config) {
         }
         member.confirmed = true;
         member.toldUnconfirmed = false;
-        // Being let in is a fresh start: the standing instructions are worth one more
-        // airing now that they can be acted on.
-        member.toldHowToAnswer = false;
         room.touchedAt = Date.now();
         announceMembership(
           code,
           room,
           `${providerLabelFor(conversationId)} was confirmed by the room's owner and can now speak here.`,
         );
-        sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
+        sendJson(200, {
+          ok: true,
+          ...describeRoom(code, room, conversationId),
+          // The answer to a call the session made itself, and so the one place an
+          // instruction is certain to be read — everything a hook injects lands a turn
+          // later, by which point the session has usually guessed.
+          ...(room.members.get(conversationId)?.confirmed === true
+            ? { howTo: howToUseRoom(code, room.password, conversationId, BRIDGE_HOST, config.port) }
+            : {}),
+        });
         return;
       }
 
@@ -1456,7 +1570,16 @@ function startBridge(config) {
           tellJoined(code, room, conversationId, "someone put you in it from the app");
         }
         room.touchedAt = Date.now();
-        sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
+        sendJson(200, {
+          ok: true,
+          ...describeRoom(code, room, conversationId),
+          // The answer to a call the session made itself, and so the one place an
+          // instruction is certain to be read — everything a hook injects lands a turn
+          // later, by which point the session has usually guessed.
+          ...(room.members.get(conversationId)?.confirmed === true
+            ? { howTo: howToUseRoom(code, room.password, conversationId, BRIDGE_HOST, config.port) }
+            : {}),
+        });
         return;
       }
 

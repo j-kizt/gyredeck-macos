@@ -338,6 +338,45 @@ function startBridge(config) {
     }
   };
 
+  /**
+   * What a Codex thread has in its context window, read from its own rollout log.
+   *
+   * Codex's hook payload carries no token counts, but the log it writes anyway does —
+   * so the numbers arrive without asking the session for anything. `input_tokens`
+   * already contains `cached_input_tokens`; adding them double-counts, which on a live
+   * thread turned 5.4% into 10.4%. Reported here in the shape the meter reads, with the
+   * cache fields zeroed rather than omitted, because the meter sums all three.
+   */
+  const codexUsageFor = (threadId) => {
+    const path = codexRolloutFor(threadId);
+    if (!path) return null;
+    let window = null;
+    let last = null;
+    try {
+      for (const line of readFileSync(path, "utf8").split("\n")) {
+        if (!line.trim()) continue;
+        let entry;
+        try { entry = JSON.parse(line); } catch { continue; }
+        const payload = entry?.payload;
+        if (!payload) continue;
+        const seen = payload.model_context_window ?? payload.info?.model_context_window;
+        if (Number.isFinite(seen)) window = seen;
+        const usage = payload.info?.last_token_usage;
+        if (usage && Number.isFinite(usage.input_tokens)) last = usage;
+      }
+    } catch {
+      return null;
+    }
+    if (!last) return null;
+    return {
+      inputTokens: last.input_tokens,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      outputTokens: Number.isFinite(last.output_tokens) ? last.output_tokens : null,
+      contextWindow: window,
+    };
+  };
+
   const emitHookStop = (data = {}) => {
     const now = Date.now();
     const scope = tracker.hookScope(data, now);
@@ -349,7 +388,13 @@ function startBridge(config) {
         hookEventName: typeof data.hookEventName === "string" ? data.hookEventName : "Stop",
         source: typeof data.source === "string" ? data.source : "hook",
         message: typeof data.message === "string" ? data.message : null,
-        usage: data.usage && typeof data.usage === "object" ? data.usage : null,
+        // A hook that reports its own usage is believed; Codex reports none, so its log
+        // is read instead. Only for Codex — the others put real numbers in the payload.
+        usage: data.usage && typeof data.usage === "object"
+          ? data.usage
+          : providerByConversation.get(scope.conversationId) === "codexCliHook"
+            ? codexUsageFor(scope.conversationId)
+            : null,
       },
     });
   };

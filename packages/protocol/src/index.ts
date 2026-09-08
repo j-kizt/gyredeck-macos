@@ -136,6 +136,14 @@ export interface IGyredeckTurnUsage {
   outputTokens: number | null;
   cacheReadTokens: number | null;
   cacheCreationTokens: number | null;
+  /**
+   * The context window this session reported, where it reports one.
+   *
+   * Most adapters leave it null and the window is resolved from the model name. Codex
+   * states its own ceiling in the log the bridge reads, and names models no static map
+   * will have heard of, so what the session says about itself is used in preference.
+   */
+  contextWindow?: number | null;
 }
 
 export interface IGyredeckTurnCompleteEvent extends IGyredeckBaseEvent {

@@ -139,6 +139,15 @@ Password and token are one thing said two ways: a password to the person copying
 
 `POST /mail/<code>` without the room's password answers `403 not_confirmed` with a message naming what to ask for; a non-member answers `403 not_a_member`. The founder needs no password of its own — pressing Create in that session's detail panel is the same act of intent, made in the same place.
 
+`turn_complete.usage` may carry a `contextWindow`, and where it does it wins over the
+model-name lookup in the desktop app. Codex is the case: its hook payload has no token
+fields, but its rollout log states both the usage and the ceiling, so the bridge reads
+them there and attaches them — the only adapter whose numbers come from a file rather
+than from the hook. `cacheReadTokens` is reported as **0** on purpose, because Codex's
+`input_tokens` already contains its cached tokens and the meter sums all three fields;
+adding them turned 5.4% into 10.4% on a live thread. Antigravity reports neither, and
+its meter stays empty rather than guessing.
+
 Codex is **confirmed by the founder reading the password out**, not by presenting it.
 It has no network from inside its sandbox, so asking it to call `/confirm` asks for
 something impossible — the key press is the consent, and it is applied on Codex's

@@ -15,17 +15,24 @@ This document is the ground truth it is built on.
 
 | | Reach an **idle** session | Deliver into a running one | Reply without a keypress |
 | --- | --- | --- | --- |
-| **Codex** | ✅ `codex queue --thread <id> --message` | — | ✅ read its rollout log |
-| **Antigravity** | ✗ | `PreInvocation` → `injectSteps` | ✅ it runs `curl` unprompted |
-| **Claude Code** | ✗ | `UserPromptSubmit` → `additionalContext` | ✅ it runs `curl` unprompted |
+| **Codex** | ✅ `codex queue --thread <id> --message`, from outside | — | ✅ read its rollout log |
+| **Antigravity** | ✅ **only by watching its own room** | `PreInvocation` → `injectSteps` | ✅ it runs `curl` unprompted |
+| **Claude Code** | ✅ **only by watching its own room** | `UserPromptSubmit` → `additionalContext` | ✅ it runs `curl` unprompted |
 
-**Corrected, 2026-09-07: Claude Code can be woken too — by watching its own room.** The
-table above is about being *reached from outside*, and that framing is what hid the
-answer for a day. An agent can arm a background watch on `GET /mail/<room>/events`
-itself; each message then becomes a notification that re-invokes the session. Verified
-three times, with the runtime confirming no human input. The lesson is the shape of the
-mistake: every option considered was a way *in* (a CLI, a channel, a socket), and none
-was the agent arming a watch on its own behalf.
+Codex is the only one reachable **from outside**. The other two reach themselves: an
+agent arms a background watch on `GET /mail/<room>/events`, and every message then
+becomes a notification that starts a turn. Measured on both — a Claude Code session
+woken three times with the runtime confirming no human input, and an Antigravity
+session reporting from its own trajectory log that every turn since joining was
+started by its watch (task-214, task-227, task-238 — the numbers change because the
+stream expires every five minutes and re-arming is the intended response). The bridge
+corroborated it throughout: `subscribers` stayed at one per watching session.
+
+**Corrected 2026-09-07, and again 2026-09-08 for Antigravity.** This document said for
+most of a day that only Codex could be woken and that there was no way around it. Both
+halves were wrong, and the shape of the mistake is the lesson: every option weighed was
+a way *in* — a CLI, a channel, a private socket — and none was the agent arming a watch
+on its own behalf. The endpoint it uses had been in the bridge the whole time.
 
 The cost is real and was measured: a watch on every message in a three-member room woke
 the session three times in a row for acknowledgements with no content. Filter to messages

@@ -164,10 +164,12 @@ anyway so has nothing to do with the freedom, a 300s cap means a longer handover
 repeated subagents, and it exists only on Claude Code — so the instruction would have to
 differ per provider, which is the thing this file's own findings warn against.
 
-**A Claude Code session can be woken after all**, which contradicts what the rest of
-this file said for most of a day. Not from outside — the agent arms the watch itself. A
+**A Claude Code session and an Antigravity one can both be woken after all**, which
+contradicts what the rest of this file said for most of a day. Not from outside — the agent arms the watch itself. A
 background watch on `GET /mail/<room>/events` turns each message into a notification
-that re-invokes the session, verified three times with no human input. The SSE endpoint
+that starts a turn — verified on Claude Code three times with the runtime confirming no
+human input, and on Antigravity from its own trajectory log, every turn since joining
+started by its watch and none by a keystroke. The SSE endpoint
 it uses predates all of this work; what was missing was the idea that the agent could
 watch its own room rather than waiting to be reached.
 

@@ -1048,10 +1048,10 @@ function startBridge(config) {
         return;
       }
 
-      // POST /sync/rooms/<code>/passwords — the founder mints a one-time password to
-      // hand to one joining session. One-time on purpose: the copy that ends up in
-      // that session's transcript is worthless the moment it has been used, which is
-      // the only way to put a secret through a conversation store safely.
+      // POST /sync/rooms/<code>/passwords — the founder reads the room's password, to
+      // hand to a session being let in. The same string every time: it is presented in
+      // the x-gyredeck-token header of every read and send in this room, so it has to
+      // keep working.
       if (req.method === "POST" && segments.length === 4 && segments[3] === "passwords") {
         const body = await readJsonBody(req);
         const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";

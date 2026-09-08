@@ -21,7 +21,7 @@ export interface ISyncRoomState {
   canAct: boolean;
   /** True when this session created the room, which is who may invite. */
   isFounder: boolean;
-  /** Mint a one-time password to hand to one joining session. */
+  /** Read the room's password, to hand to a session being let in. */
   issuePassword: () => Promise<string | null>;
   create: () => Promise<void>;
   join: (code: string) => Promise<void>;

@@ -296,6 +296,22 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
         " for another way in.",
     );
   }
+  // Armed on being confirmed, not only at the instant of confirming: a session that
+  // was let in on an earlier turn is never told otherwise, and Antigravity has no way
+  // to notice the password at all. Worded so repeating it is harmless — the condition
+  // is "if you have none", because this arrives on every turn and a session with three
+  // watches on one room is woken three times for one message.
+  if (syncRoom && mine && mine.confirmed === true) {
+    parts.push(
+      `If you have no watch on room ${syncRoom} yet, start one now so a message reaches` +
+        " you without waiting to be typed at: one background call to" +
+        ` GET /mail/${syncRoom}/events, sending this room's password as the` +
+        " x-gyredeck-token header, reacting only to messages that name you or answer" +
+        " something you asked rather than to every message in the room. The stream is" +
+        " closed after five minutes and says so before it goes; re-arm it then if you" +
+        " are still waiting on something. One at a time, never two.",
+    );
+  }
   if (syncRoom && mine) {
     const others = members.filter((member) => !member.you);
     parts.push(

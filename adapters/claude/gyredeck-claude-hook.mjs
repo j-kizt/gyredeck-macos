@@ -349,14 +349,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
     // narrow, because a watch on every message in a busy room pulls the session back
     // for each acknowledgement anyone posts.
     standing.push(
-      `The password you were just given has been accepted: you may now post in room ${justConfirmed}.` +
-        " If you have no watch on this room yet, start one now so a message reaches you" +
-        " without waiting to be typed at — a background watch on" +
-        ` GET /mail/${justConfirmed}/events, sending this room's password as the` +
-        " x-gyredeck-token header, filtering to messages that name you or answer" +
-        " something you asked rather than every message in the room. The stream is" +
-        " closed after five minutes and says so before it goes; re-arm it then if you" +
-        " are still waiting on something. Start one at a time, never two.",
+      `The password you were just given has been accepted: you may now read and post in room ${justConfirmed}.`,
     );
   }
   // A member that has not been given the room's password can read what is addressed to
@@ -371,6 +364,22 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
         " you have it, send it as the x-gyredeck-token header instead of the machine" +
         " token on any call about this room. Do not retry without it and do not look" +
         " for another way in.",
+    );
+  }
+  // Armed on being confirmed, not only at the instant of confirming: a session that
+  // was let in on an earlier turn is never told otherwise, and Antigravity has no way
+  // to notice the password at all. Worded so repeating it is harmless — the condition
+  // is "if you have none", because this arrives on every turn and a session with three
+  // watches on one room is woken three times for one message.
+  if (room_ && mine && mine.confirmed === true) {
+    standing.push(
+      `If you have no watch on room ${room_} yet, start one now so a message reaches` +
+        " you without waiting to be typed at: one background call to" +
+        ` GET /mail/${room_}/events, sending this room's password as the` +
+        " x-gyredeck-token header, reacting only to messages that name you or answer" +
+        " something you asked rather than to every message in the room. The stream is" +
+        " closed after five minutes and says so before it goes; re-arm it then if you" +
+        " are still waiting on something. One at a time, never two.",
     );
   }
   if (room_ && mine) {
@@ -525,7 +534,7 @@ const main = async () => {
         // prompt is held until this hook answers.
         if (conversationId) {
           respondingEvent = eventType;
-          // A password in the prompt is consent, and it has to be spent before the
+          // A password in the prompt is consent, and it has to be presented before the
           // drain: confirming first means the same turn can be told it may now speak,
           // and the notice the confirmation puts in the room arrives with everything
           // else rather than a turn later.

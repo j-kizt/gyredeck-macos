@@ -820,6 +820,12 @@
   font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
 }
 
+/* Worth noticing rather than blending in: the point of the marker is to stop a local
+   run being mistaken for the installed app. */
+.footer-version[data-local="true"] {
+  color: var(--accent-text);
+}
+
 .footer-done-close {
   margin-left: auto;
 }
@@ -849,4 +855,196 @@
   padding: 2px 3px;
   color: var(--text-3);
   background: rgba(255, 255, 255, 0.055);
+}
+
+/* Connecting one session to another. Wiring, not a conversation: the room code, who
+   is in it, and what each is for — the exchange itself happens in the agents' own
+   terminals, which is why there is nothing here to type a message into. */
+.session-sync {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.session-sync-head {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--text-3);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.session-sync-room {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.session-sync-code {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 5px;
+  color: var(--accent-text);
+  background: rgba(var(--accent-rgb), 0.14);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.session-sync-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  color: var(--text-2);
+  background: var(--fill);
+  cursor: pointer;
+}
+
+.session-sync-icon:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--fill-2);
+}
+
+/* Leaving a room is the one destructive thing here, so it reads as one. */
+.session-sync-icon.danger {
+  color: var(--danger);
+}
+
+.session-sync-icon.danger:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: rgba(255, 107, 102, 0.14);
+}
+
+.session-sync-icon:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.session-sync-members {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.session-sync-member {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 4px 7px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.session-sync-member[data-you="true"] {
+  background: rgba(var(--accent-rgb), 0.1);
+}
+
+.session-sync-provider {
+  flex: 1 1 auto;
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.session-sync-pending {
+  flex: none;
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--accent-text);
+  background: rgba(var(--accent-rgb), 0.2);
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.session-sync-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* Two equal halves across the full width. The pair is one choice — create a room or
+   join one — so neither should look like the main one by being wider. */
+.session-sync-row[data-split="true"] {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+.session-sync-input {
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.2);
+  font: inherit;
+  font-size: 11px;
+}
+
+.session-sync-input:focus-visible {
+  border-color: rgba(var(--accent-rgb), 0.65);
+  outline: none;
+}
+
+.session-sync-btn {
+  display: inline-flex;
+  flex: none;
+  gap: 4px;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  padding: 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text-2);
+  background: var(--fill);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.session-sync-btn:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--fill-2);
+}
+
+.session-sync-btn.primary {
+  color: var(--accent-text);
+  background: rgba(var(--accent-rgb), 0.16);
+}
+
+.session-sync-btn:disabled {
+  color: var(--text-3);
+  cursor: default;
+}
+
+.session-sync-note {
+  margin: 0;
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.session-sync-note[data-error="true"] {
+  color: var(--warn-text, #e0a458);
 }

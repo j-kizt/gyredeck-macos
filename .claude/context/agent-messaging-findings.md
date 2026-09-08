@@ -5,27 +5,51 @@ and Antigravity sessions, 2026-09-02. Everything here was measured against live
 sessions on macOS, not read from documentation — where a claim came from docs it says
 so, and where a guess was wrong it says that too.
 
-The product this was heading towards (**Sync Session** — rooms that two sessions are
-put into and talk inside) is out of scope for Gyredeck and belongs in its own project.
-What stayed here is the transport: `/mail` on the bridge, and the adapter code that
-delivers into each agent. This document is the ground truth for whoever builds on it.
+The product this was heading towards is **Sync Session**: rooms that two sessions are
+put into, told what each other is for, and left to work. It was briefly taken out of
+scope and has since been brought back — as wiring rather than as a chat surface, which
+is the distinction that made it fit. See [`sync-session-plan.md`](sync-session-plan.md).
+This document is the ground truth it is built on.
 
 ## What each agent can actually do
 
 | | Reach an **idle** session | Deliver into a running one | Reply without a keypress |
 | --- | --- | --- | --- |
-| **Codex** | ✅ `codex queue --thread <id> --message` | — | ✅ read its rollout log |
-| **Antigravity** | ✗ | `PreInvocation` → `injectSteps` | ✅ it runs `curl` unprompted |
-| **Claude Code** | ✗ | `UserPromptSubmit` → `additionalContext` | ✅ it runs `curl` unprompted |
+| **Codex** | ✅ `codex queue --thread <id> --message`, from outside | — | ✅ read its rollout log |
+| **Antigravity** | ✅ **only by watching its own room** | `PreInvocation` → `injectSteps` | ✅ it runs `curl` unprompted |
+| **Claude Code** | ✅ **only by watching its own room** | `UserPromptSubmit` → `additionalContext` | ✅ it runs `curl` unprompted |
 
-**Only Codex can be woken.** Measured against a thread idle for 78 minutes: `turn_start`
+Codex is the only one reachable **from outside**. The other two reach themselves: an
+agent arms a background watch on `GET /mail/<room>/events`, and every message then
+becomes a notification that starts a turn. Measured on both — a Claude Code session
+woken three times with the runtime confirming no human input, and an Antigravity
+session reporting from its own trajectory log that every turn since joining was
+started by its watch (task-214, task-227, task-238 — the numbers change because the
+stream expires every five minutes and re-arming is the intended response). The bridge
+corroborated it throughout: `subscribers` stayed at one per watching session.
+
+**Corrected 2026-09-07, and again 2026-09-08 for Antigravity.** This document said for
+most of a day that only Codex could be woken and that there was no way around it. Both
+halves were wrong, and the shape of the mistake is the lesson: every option weighed was
+a way *in* — a CLI, a channel, a private socket — and none was the agent arming a watch
+on its own behalf. The endpoint it uses had been in the bridge the whole time.
+
+The cost is real and was measured: a watch on every message in a three-member room woke
+the session three times in a row for acknowledgements with no content. Filter to messages
+that name the session, not to the room.
+
+**Only Codex can be woken from outside.** Measured against a thread idle for 78 minutes: `turn_start`
 at +2s, answer written at +3s, `turn_complete` at +4s, with nobody at the keyboard. The
 other two collect their mail through a hook, and a hook only runs when the session does
 — so a message waits until the person types into that terminal again.
 
-There is no way around that with the tools these CLIs expose. Injecting keystrokes into
-a PTY would mean guessing terminal state and impersonating the user; it was considered
-and rejected.
+No *external* mechanism works: injecting keystrokes into a PTY would mean guessing
+terminal state and impersonating the user, and was rejected. Claude Code's channels need
+the session started with `--channels` and, during the research preview, an allowlisted
+plugin; its peer socket at `/tmp/cc-socks` does wake an idle session but is an
+undocumented frame needing another app's per-session key. Checked against Claude Code
+2.1.231/2.1.236 — `remote-control` exists but routes through claude.ai, and there is no
+`channels`, `send`, `message` or `queue` subcommand. Antigravity has nothing equivalent.
 
 ## Where context can be injected
 
@@ -73,8 +97,34 @@ carries the whole answer in `last_agent_message`, already bounded to a turn:
 ```
 
 Filter by the log entry's `timestamp` against when the message was queued and nothing
-the session said beforehand is ever read. It also carries `duration_ms` and
+the session said beforehand is ever read.
+
+**Deduplicate per thread, not per harvest.** Every delivery starts its own harvest with
+its own window, and windows overlap — a room notice and a question sent moments apart
+both see the one answer Codex writes. A harvest that only remembers what it published
+itself posts that answer twice, and a session waiting for a *new* reply then wakes on
+the stale copy. Key on the turn id **and** the text: a retried turn repeats the text
+under a new id, and a re-read of the log repeats the id with the same text. It also carries `duration_ms` and
 `time_to_first_token_ms`, which would make a per-turn latency display trivial.
+
+## An agent is a poor witness to its own wiring
+
+Both of these came out of one round-table test and both were corrected only when
+pressed with a specific question.
+
+**Empty is not success.** Codex ran two `curl` calls, saw no response body, and
+reported that both had succeeded. Neither had: the room still showed it unconfirmed and
+its message never arrived. A command that answers nothing is a command whose outcome is
+unknown, and an agent asked to run one will tend to read silence as agreement. Where a
+result matters, ask for what came back rather than whether it worked.
+
+**Ask what started the turn, and ask for the log.** Asked what had woken it, Codex said
+"keystroke" when nothing had touched its keyboard — the bridge had pushed to it through
+`codex queue`, which it could not distinguish from a person typing. Antigravity's first
+answer skipped the question entirely; asked again, and told to read its trajectory log
+rather than assume, it named the task and the event id, and the event id matched the
+room's own sequence. Self-report is worth having, but only the second kind is worth
+believing: the kind that cites something you can check from the other side.
 
 ## Traps, each of which cost a live failure
 
@@ -161,4 +211,6 @@ The text injected alongside a message is not decoration; the agent acts on it.
 `/mail` on the bridge (rooms, SSE with resume, buffered reads, `collect=1`, per-agent
 delivery), the drains in the Claude Code and Antigravity adapters, the Codex queue-and-
 harvest path, and the mail chip on a session card. See `event-protocol.md` for the
-endpoints. There is no UI for sending — that was removed when Sync Session moved out.
+endpoints. There is no UI for sending a message and there will not be one: Sync Session
+wires sessions together and shows who is in a room, and the talking happens in the
+agents' own terminals.

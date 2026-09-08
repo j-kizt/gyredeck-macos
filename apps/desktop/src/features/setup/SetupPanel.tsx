@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, Trash2 } from "lucide-react";
+import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, Link2, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import type { IGyredeckBridgeCapabilities } from "@gyredeck/protocol";
 import { shortenPath } from "../session/activity";
 import type { IUseUpdater } from "../updater/useUpdater";
@@ -7,8 +7,10 @@ import { ProviderIcon } from "../github/components";
 import type { GitProvider, IGhAccount } from "../github/types";
 import { useGitCredentialHelper } from "./useGitCredentialHelper";
 
-type SetupCategory = "connection" | "plugins" | "display" | "git" | "update";
-const SETUP_CATEGORIES: SetupCategory[] = ["connection", "display", "git", "plugins", "update"];
+type SetupCategory = "connection" | "permission" | "plugins" | "display" | "git" | "update";
+// Alphabetical. Arrow-key order and the visible order are the same list, because a
+// roving tabstop that jumps somewhere else is a bug.
+const SETUP_CATEGORIES: SetupCategory[] = ["connection", "display", "git", "permission", "plugins", "update"];
 
 // Terminals Focus can jump to. Add a row here (plus its AppleScript in the native
 // focus_terminal handler) to support another terminal.
@@ -29,6 +31,12 @@ export interface ISetupPanelProps {
   keepAwakeEnabled: boolean;
   keepAwakeError: string | null;
   hookStatus: { path: string | null; installed: boolean | null };
+  /** Rooms the bridge currently holds, keyed by code. Only ones with members are shown. */
+  mailRooms: Record<string, { room: string; members: string[]; pending: number }>;
+  /** Null while unknown, so the switch does not claim "off" before it has looked. */
+  syncRepliesAllowed: boolean | null;
+  syncRepliesBusy: boolean;
+  onSyncRepliesChange: (next: boolean) => Promise<void>;
   agyStatus: { path: string | null; installed: boolean | null };
   codexStatus: { path: string | null; installed: boolean | null };
   nativeAction: { bridgeOnline: boolean | null; message: string | null };
@@ -142,6 +150,56 @@ const GitAccountList = ({ accounts, canUseNativeControls, onSetActive, onRemove 
   );
 };
 
+/**
+ * The sync rooms the bridge is holding, laid out like the account list.
+ *
+ * Only rooms with members: a plain mailbox exists for every session that has ever been
+ * sent anything, and listing those would bury the two or three that mean something.
+ * Read-only on purpose — a room is joined and left from a session's own detail panel,
+ * where the person can see which session they are acting on.
+ */
+const SyncRoomList = ({
+  rooms,
+  canUseNativeControls,
+}: {
+  rooms: Record<string, { room: string; members: string[]; pending: number }>;
+  canUseNativeControls: boolean;
+}) => {
+  if (!canUseNativeControls) return null;
+  const open = Object.values(rooms).filter((entry) => entry.members.length > 0);
+  if (open.length === 0) {
+    return (
+      <div className="setup-row passive">
+        <span className="status-slot"><Link2 className="setup-icon" size={14} strokeWidth={2.3} /></span>
+        <span className="setup-copy">
+          <span className="setup-title">Sync rooms</span>
+          <span className="setup-detail">None open — connect two sessions from a session's detail panel</span>
+        </span>
+      </div>
+    );
+  }
+  return (
+    <div className="setup-account-list">
+      {open.map((entry) => (
+        <div className="setup-account-row" key={entry.room}>
+          <span className="setup-account-icon"><Link2 size={15} strokeWidth={2.3} /></span>
+          <span className="setup-account-main">
+            <span className="setup-account-login">{entry.room}</span>
+            <span className="setup-account-tags">
+              <span className="setup-detail">{entry.members.join(" · ")}</span>
+            </span>
+          </span>
+          {entry.pending > 0 ? (
+            <span className="setup-account-active" title={`${entry.pending} waiting to be collected`}>
+              {entry.pending} waiting
+            </span>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+};
+
 const UPDATER_DETAIL: Record<IUseUpdater["status"], string> = {
   idle: "Check for the latest release",
   checking: "Checking for updates…",
@@ -154,7 +212,7 @@ const UPDATER_DETAIL: Record<IUseUpdater["status"], string> = {
 const MIN_BRIDGE_PORT = 1024;
 const MAX_BRIDGE_PORT = 65535;
 
-export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
+export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, mailRooms, syncRepliesAllowed, syncRepliesBusy, onSyncRepliesChange, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
   const [activeCategory, setActiveCategory] = useState<SetupCategory>("connection");
   const [compactNavigation, setCompactNavigation] = useState(() => window.matchMedia("(max-width: 380px)").matches);
   const credentialHelper = useGitCredentialHelper(canUseNativeControls);
@@ -229,6 +287,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
           <button className="setup-side-tab" id="setup-tab-connection" type="button" role="tab" aria-selected={activeCategory === "connection"} aria-controls="setup-panel-connection" tabIndex={activeCategory === "connection" ? 0 : -1} data-active={activeCategory === "connection"} onClick={() => selectCategory("connection")} onKeyDown={(event) => handleCategoryKeyDown(event, "connection")}><PlugZap size={12} strokeWidth={2.2} /><span>Connection</span></button>
           <button className="setup-side-tab" id="setup-tab-display" type="button" role="tab" aria-selected={activeCategory === "display"} aria-controls="setup-panel-display" tabIndex={activeCategory === "display" ? 0 : -1} data-active={activeCategory === "display"} onClick={() => selectCategory("display")} onKeyDown={(event) => handleCategoryKeyDown(event, "display")}><MonitorIcon size={12} strokeWidth={2.2} /><span>Display</span></button>
           <button className="setup-side-tab" id="setup-tab-git" type="button" role="tab" aria-selected={activeCategory === "git"} aria-controls="setup-panel-git" tabIndex={activeCategory === "git" ? 0 : -1} data-active={activeCategory === "git"} onClick={() => selectCategory("git")} onKeyDown={(event) => handleCategoryKeyDown(event, "git")}><KeyRound size={12} strokeWidth={2.2} /><span>Git</span></button>
+          <button className="setup-side-tab" id="setup-tab-permission" type="button" role="tab" aria-selected={activeCategory === "permission"} aria-controls="setup-panel-permission" tabIndex={activeCategory === "permission" ? 0 : -1} data-active={activeCategory === "permission"} onClick={() => selectCategory("permission")} onKeyDown={(event) => handleCategoryKeyDown(event, "permission")}><ShieldCheck size={12} strokeWidth={2.2} /><span>Permission</span></button>
           <button className="setup-side-tab" id="setup-tab-plugins" type="button" role="tab" aria-selected={activeCategory === "plugins"} aria-controls="setup-panel-plugins" tabIndex={activeCategory === "plugins" ? 0 : -1} data-active={activeCategory === "plugins"} onClick={() => selectCategory("plugins")} onKeyDown={(event) => handleCategoryKeyDown(event, "plugins")}><Puzzle size={12} strokeWidth={2.2} /><span>Plugins</span></button>
           <button className="setup-side-tab" id="setup-tab-update" type="button" role="tab" aria-selected={activeCategory === "update"} aria-controls="setup-panel-update" tabIndex={activeCategory === "update" ? 0 : -1} data-active={activeCategory === "update"} onClick={() => selectCategory("update")} onKeyDown={(event) => handleCategoryKeyDown(event, "update")}><Download size={12} strokeWidth={2.2} /><span>Update</span></button>
         </div>
@@ -240,7 +299,22 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
               <div className="setup-row"><span className="bridge-dot" data-connected={isConnected} title={connectionTitle} /><span className="setup-copy"><span className="setup-title">Bridge</span><span className="setup-detail">{connectionTitle}</span></span>{!isConnected ? <button className="pill-btn" type="button" disabled={pendingAction === "bridge"} onClick={() => void runAction("bridge", onCheckBridge)} data-tauri-drag-region="false" aria-label="Reconnect bridge">{pendingAction === "bridge" ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : <PlugZap size={12} strokeWidth={2.3} />}{pendingAction === "bridge" ? "Reconnecting…" : "Reconnect"}</button> : null}</div>
               <div className="setup-row setup-row-stack"><div className="setup-row-main"><span className="status-slot"><PlugZap className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Bridge port</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : portStatus ?? `Local bridge port · ${bridgePort}`}</span></span>{canUseNativeControls ? <button className="pill-btn" type="button" onClick={toggleEditPort} data-tauri-drag-region="false" aria-expanded={editingPort} aria-label="Edit bridge port"><Pencil size={12} strokeWidth={2.3} />Edit</button> : null}</div>{editingPort ? <span className="setup-row-actions full"><input className="setup-input" type="number" min={MIN_BRIDGE_PORT} max={MAX_BRIDGE_PORT} value={portField} onChange={(event) => setPortField(event.target.value)} disabled={portBusy} data-tauri-drag-region="false" aria-label="Bridge port" autoFocus /><button className="pill-btn accent" type="button" onClick={() => void applyPort()} disabled={!canApplyPort} data-tauri-drag-region="false"><Check size={12} strokeWidth={2.3} />Apply</button></span> : null}</div>
               <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{guidance.title}</span><span className="setup-detail">{guidance.detail}</span></span></div>
+              <SyncRoomList rooms={mailRooms} canUseNativeControls={canUseNativeControls} />
               {nativeAction.message ? <div className="notice-row" data-online={nativeAction.bridgeOnline === true} role="status" aria-live="polite">{nativeAction.message}</div> : null}
+            </>
+          ) : null}
+
+          {activeCategory === "permission" ? (
+            <>
+              <div className="setup-section-heading"><span>Permission</span><small>What an agent may do unprompted</small></div>
+              <div className="setup-row"><span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Allow sync replies without asking</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : !hookStatus.installed ? "Needs the Claude Code hook — install it under Plugins" : syncRepliesAllowed === null ? "Checking…" : syncRepliesAllowed ? "On · a session answers its room without a prompt each time" : "Off · Claude Code asks before every reply and every wait"}</span></span>{!hookStatus.installed ? (
+                // Shown but locked rather than hidden: the setting exists and its state
+                // is worth seeing. A padlock says why it cannot be moved, where a greyed
+                // switch would only say that it cannot.
+                <span className="setup-locked" title="Install the Claude Code hook first"><Lock size={12} strokeWidth={2.4} /></span>
+              ) : (
+                <button className="switch-toggle" type="button" role="switch" aria-checked={syncRepliesAllowed === true} data-on={syncRepliesAllowed === true} disabled={!canUseNativeControls || syncRepliesBusy || syncRepliesAllowed === null} onClick={() => void onSyncRepliesChange(!syncRepliesAllowed)} data-tauri-drag-region="false" aria-label={`${syncRepliesAllowed ? "Stop allowing" : "Allow"} sync replies without asking`}><span className="switch-thumb" /></button>
+              )}</div>
             </>
           ) : null}
 

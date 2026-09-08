@@ -347,6 +347,17 @@
   cursor: default;
 }
 
+/* Occupies the switch's slot so a locked row lines up with the ones above it. */
+.setup-locked {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 20px;
+  color: var(--text-3);
+}
+
 .switch-toggle {
   position: relative;
   flex: none;

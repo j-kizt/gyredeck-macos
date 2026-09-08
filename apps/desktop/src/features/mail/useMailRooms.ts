@@ -4,6 +4,8 @@ import { useEffect, useState } from "react";
 export interface IMailRoom {
   room: string;
   seq: number;
+  /** Provider names of the sessions put into this room; empty for a plain mailbox. */
+  members: string[];
   pending: number;
   subscribers: number;
   lastMessageAt: string | null;

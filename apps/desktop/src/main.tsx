@@ -3,6 +3,7 @@ import { BarChart3, Check, ChevronLeft, Copy, Focus, GitBranch, List, Server, Se
 import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState, type ErrorInfo, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import type { GyredeckPresenceStatus } from "@gyredeck/protocol";
+import { SessionSyncPanel } from "./features/mail/SessionSyncPanel";
 import { useMailRooms } from "./features/mail/useMailRooms";
 import { SessionContextMeter, SessionContextSummary, StatusGlyph, WorkspaceSessionGroupItem } from "./features/session/components";
 import {
@@ -115,6 +116,10 @@ const App = () => {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
   const [hookStatus, setHookStatus] = useState<IHookStatus>({ path: null, installed: null });
+  // Whether a session may answer its room without being approved each time. Null until
+  // read, so the switch does not flicker through "off" on the way to its real state.
+  const [syncRepliesAllowed, setSyncRepliesAllowed] = useState<boolean | null>(null);
+  const [syncRepliesBusy, setSyncRepliesBusy] = useState(false);
   const [agyStatus, setAgyStatus] = useState<IHookStatus>({ path: null, installed: null });
   const [codexStatus, setCodexStatus] = useState<IHookStatus>({ path: null, installed: null });
   const [dismissedSessionIds, setDismissedSessionIds] = useState<DismissedSessionRegistry>(readDismissedSessionIds);
@@ -190,7 +195,9 @@ const App = () => {
   // Mail waiting per session. Gated like the other pollers: the chip only exists on
   // the session list, so there is nothing to keep fresh when that is not on screen.
   const mailRooms = useMailRooms({
-    active: activeMainTab === "sessions" && !setupOpen && !selectedSessionId,
+    // The session list needs this for the mail chip, and Settings → Connection lists
+    // the open rooms — so Settings being open is a reason to poll, not to stop.
+    active: setupOpen || (activeMainTab === "sessions" && !selectedSessionId),
     canUseNativeControls,
   });
 
@@ -674,6 +681,31 @@ const App = () => {
     }
   };
 
+  const loadSyncReplies = async () => {
+    if (!canUseNativeControls) {
+      setSyncRepliesAllowed(null);
+      return;
+    }
+    try {
+      setSyncRepliesAllowed(await invoke<boolean>("sync_replies_allowed"));
+    } catch {
+      setSyncRepliesAllowed(null);
+    }
+  };
+
+  const changeSyncReplies = async (next: boolean) => {
+    setSyncRepliesBusy(true);
+    try {
+      await invoke("set_sync_replies_allowed", { enabled: next });
+      setSyncRepliesAllowed(next);
+    } catch {
+      // The switch stays where it was; a failed write has not changed anything.
+      await loadSyncReplies();
+    } finally {
+      setSyncRepliesBusy(false);
+    }
+  };
+
   const loadAgyStatus = async () => {
     if (!canUseNativeControls) {
       clearHookStatus(setAgyStatus);
@@ -809,9 +841,20 @@ const App = () => {
       void loadHookStatus();
       void loadAgyStatus();
       void loadCodexStatus();
+      void loadSyncReplies();
       void checkBridge();
     }
   }, [setupOpen]);
+
+  // Also on mount, because the session detail decides whether to offer Sync session by
+  // whether that agent's hook is installed. Loading these only when Settings opens hid
+  // the panel until someone had been there once.
+  useEffect(() => {
+    if (!canUseNativeControls) return;
+    void loadHookStatus();
+    void loadAgyStatus();
+    void loadCodexStatus();
+  }, [canUseNativeControls]);
 
   return (
     <main className="overlay-root" data-live={hasAgentLiveActivity ? "true" : "false"} data-running={isWorkingActivity ? "true" : "false"} data-status={activityViewStatus}>
@@ -889,6 +932,10 @@ const App = () => {
                   keepAwakeEnabled={keepAwakeEnabled}
                   keepAwakeError={keepAwakeError}
                   hookStatus={hookStatus}
+                  mailRooms={mailRooms}
+                  syncRepliesAllowed={syncRepliesAllowed}
+                  syncRepliesBusy={syncRepliesBusy}
+                  onSyncRepliesChange={changeSyncReplies}
                   agyStatus={agyStatus}
                   codexStatus={codexStatus}
                   nativeAction={nativeAction}
@@ -921,6 +968,19 @@ const App = () => {
                   {sessionAction.message ? (
                     <div className="notice-row compact" data-online={sessionAction.ok === true} role="status" aria-live="polite">{sessionAction.message}</div>
                   ) : null}
+                  <SessionSyncPanel
+                    session={selectedSession}
+                    canUseNativeControls={canUseNativeControls}
+                    hookInstalled={
+                      selectedSession.provider === "Claude Code"
+                        ? hookStatus.installed
+                        : selectedSession.provider === "Antigravity"
+                          ? agyStatus.installed
+                          : selectedSession.provider === "Codex"
+                            ? codexStatus.installed
+                            : false
+                    }
+                  />
                   <div className="detail-section-label">Recent activity</div>
                   {selectedSessionActivityEvents.length === 0 ? (
                     <div className="empty-text small">No events captured yet</div>
@@ -1090,7 +1150,17 @@ const App = () => {
                 ) : (
                   <>
                     <span className="footer-copyright">© 2026 Gyredeck · J-Kitz</span>
-                    <span className="footer-version">{updater.currentVersion ? `v${updater.currentVersion}` : ""}</span>
+                    {/* A local run reports the same version as the installed app, since
+                        both read it from tauri.conf.json — so the version cannot say
+                        which one is on screen. Vite's dev flag can: `desktop:dev`
+                        serves the frontend, `desktop:install` builds it. */}
+                    <span className="footer-version" data-local={import.meta.env.DEV}>
+                      {import.meta.env.DEV
+                        ? "local"
+                        : updater.currentVersion
+                          ? `v${updater.currentVersion}`
+                          : ""}
+                    </span>
                   </>
                 )}
               </div>

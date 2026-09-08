@@ -422,6 +422,154 @@ fn claude_settings_path() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".claude").join("settings.json"))
 }
 
+/// Read `~/.claude/settings.json` as an object, or an empty one if it is missing.
+///
+/// A file that will not parse is an error rather than something to replace: it holds
+/// the person's own hooks and permissions.
+fn read_claude_settings() -> Result<serde_json::Value, String> {
+    let path = claude_settings_path()?;
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read settings.json: {error}"))?;
+    if content.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(&content)
+        .map_err(|error| format!("Failed to parse settings.json: {error}"))
+}
+
+fn write_claude_settings(settings: &serde_json::Value) -> Result<(), String> {
+    let path = claude_settings_path()?;
+    let Some(parent) = path.parent() else {
+        return Err("Failed to resolve Claude settings directory".to_string());
+    };
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Failed to create Claude settings directory: {error}"))?;
+    let json = serde_json::to_string_pretty(settings)
+        .map_err(|error| format!("Failed to stringify settings.json: {error}"))?;
+    fs::write(&path, format!("{json}\n"))
+        .map_err(|error| format!("Failed to write settings.json: {error}"))
+}
+
+/// The permission rules that let a session answer its room without being asked.
+///
+/// Every reply and every wait is a `curl` whose text differs each time, so a session in
+/// a mode that asks is asked again for each one — and a feature whose point is that
+/// nobody relays messages by hand cannot also need a keypress per message.
+///
+/// Prefix rules are safe here: Claude Code splits a command on `&&`, `||`, `;`, `|`,
+/// `|&`, `&` and newlines and requires every subcommand to match a rule of its own, so
+/// an allowed prefix cannot carry something else in after it.
+///
+/// The endpoint is baked in, which means these go stale if the bridge port changes —
+/// so they are rewritten whenever the port is set, not only at install.
+fn sync_reply_rules(host: &str, port: u16) -> Vec<String> {
+    let token = "TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token);";
+    vec![
+        format!("Bash({token} curl -s -X POST http://{host}:{port}/mail/:*)"),
+        format!("Bash({token} curl -s \"http://{host}:{port}/mail/:*)"),
+        // The compound form is what the adapters emit, but a matcher that judges the
+        // subcommands separately sees only the curl. Both shapes are listed rather than
+        // guessed between.
+        format!("Bash(curl -s -X POST http://{host}:{port}/mail/:*)"),
+        format!("Bash(curl -s \"http://{host}:{port}/mail/:*)"),
+    ]
+}
+
+/// Rules we have ever written, so turning the switch off removes them even after the
+/// port changed underneath.
+fn is_sync_reply_rule(rule: &str) -> bool {
+    rule.starts_with("Bash(TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); curl ")
+        || (rule.starts_with("Bash(curl -s") && rule.contains("/mail/:*)"))
+}
+
+/// Add or remove the rules in a parsed settings document. Other entries are untouched:
+/// this is somebody else's file and only our own lines are ours to move.
+fn apply_sync_reply_rules(settings: &mut serde_json::Value, enabled: bool, host: &str, port: u16) {
+    if !settings.is_object() {
+        *settings = serde_json::json!({});
+    }
+    let root = settings.as_object_mut().expect("settings is object");
+    let permissions = root
+        .entry("permissions".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !permissions.is_object() {
+        *permissions = serde_json::json!({});
+    }
+    let permissions = permissions.as_object_mut().expect("permissions is object");
+    let allow = permissions
+        .entry("allow".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if !allow.is_array() {
+        *allow = serde_json::json!([]);
+    }
+    let list = allow.as_array_mut().expect("allow is array");
+
+    list.retain(|entry| !entry.as_str().is_some_and(is_sync_reply_rule));
+    if enabled {
+        for rule in sync_reply_rules(host, port) {
+            list.push(serde_json::Value::String(rule));
+        }
+    }
+}
+
+const SYNC_REPLIES_FLAG: &str = "allowSyncReplies";
+
+fn rules_present(settings: &serde_json::Value) -> bool {
+    settings
+        .get("permissions")
+        .and_then(|value| value.get("allow"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|list| {
+            list.iter()
+                .any(|entry| entry.as_str().is_some_and(is_sync_reply_rule))
+        })
+}
+
+fn write_sync_reply_rules(enabled: bool) -> Result<(), String> {
+    let mut settings = read_claude_settings()?;
+    apply_sync_reply_rules(
+        &mut settings,
+        enabled,
+        standalone_bridge::BRIDGE_HOST,
+        standalone_bridge::configured_bridge_port(),
+    );
+    write_claude_settings(&settings)
+}
+
+/// The switch's state, reconciling the preference with what is actually in the file.
+///
+/// The preference is the intent and defaults to on, so an install that predates this
+/// setting is opted in rather than silently left out. The rules are the effect, and
+/// they can be missing for reasons the preference knows nothing about — an older
+/// install, a hand-edited settings file, a port that moved. When intent and effect
+/// disagree and the hook is installed, the effect is brought back into line.
+#[tauri::command]
+fn sync_replies_allowed() -> Result<bool, String> {
+    let wanted = standalone_bridge::config_flag(SYNC_REPLIES_FLAG, true);
+    let settings = read_claude_settings()?;
+    if wanted && !rules_present(&settings) {
+        // Only once the hook is in: without it nothing sends a reply to permit, and
+        // writing permissions for a integration the person has not set up would be
+        // reaching further than they asked.
+        if claude_hook_status().is_ok_and(|(_, installed)| installed) {
+            write_sync_reply_rules(true)?;
+        }
+        return Ok(wanted);
+    }
+    Ok(wanted && rules_present(&settings))
+}
+
+#[tauri::command]
+fn set_sync_replies_allowed(enabled: bool) -> Result<(), String> {
+    // Intent is recorded before the effect, so a failed write leaves a switch that
+    // reports what the person chose and retries on the next read.
+    standalone_bridge::write_config_flag(SYNC_REPLIES_FLAG, enabled)?;
+    write_sync_reply_rules(enabled)
+}
+
 fn agy_hook_install_path() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     Ok(PathBuf::from(home)
@@ -559,6 +707,33 @@ fn mail_rooms() -> Result<Vec<standalone_bridge::MailRoom>, String> {
     standalone_bridge::mail_rooms()
 }
 
+/// Which sync room a session is in, so its panel can show the room instead of the
+/// buttons that would put it in one.
+#[tauri::command]
+fn sync_room(conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
+    standalone_bridge::sync_room(&conversation_id)
+}
+
+#[tauri::command]
+fn sync_create(conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
+    standalone_bridge::sync_create(&conversation_id)
+}
+
+#[tauri::command]
+fn sync_issue_password(code: String, conversation_id: String) -> Result<String, String> {
+    standalone_bridge::sync_issue_password(&code, &conversation_id)
+}
+
+#[tauri::command]
+fn sync_join(code: String, conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
+    standalone_bridge::sync_join(&code, &conversation_id)
+}
+
+#[tauri::command]
+fn sync_leave(code: String, conversation_id: String) -> Result<(), String> {
+    standalone_bridge::sync_leave(&code, &conversation_id)
+}
+
 #[tauri::command]
 fn get_bridge_port() -> u16 {
     standalone_bridge::configured_bridge_port()
@@ -576,6 +751,10 @@ fn set_bridge_port(
         return Err(format!("Port {port} is already in use by another process"));
     }
     standalone_bridge::write_configured_port(port)?;
+    // The rules name the endpoint, so leaving them behind would silently stop matching.
+    if standalone_bridge::config_flag(SYNC_REPLIES_FLAG, true) {
+        let _ = write_sync_reply_rules(true);
+    }
     state.restart()
 }
 
@@ -3773,6 +3952,16 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
     fs::create_dir_all(settings_parent)
         .map_err(|error| format!("Failed to create Claude settings directory: {error}"))?;
 
+    // On by default, because a session that has to be approved for every reply defeats
+    // the point of connecting two of them. The switch in Settings turns it back off,
+    // and that choice is respected here rather than overwritten by reinstalling.
+    apply_sync_reply_rules(
+        &mut settings,
+        standalone_bridge::config_flag(SYNC_REPLIES_FLAG, true),
+        standalone_bridge::BRIDGE_HOST,
+        standalone_bridge::configured_bridge_port(),
+    );
+
     let json_string = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("Failed to stringify settings.json: {e}"))?;
     fs::write(&settings_path, format!("{json_string}\n"))
@@ -5059,6 +5248,11 @@ pub fn run() {
             bridge_health,
             get_bridge_port,
             mail_rooms,
+            sync_room,
+            sync_create,
+            sync_join,
+            sync_issue_password,
+            sync_leave,
             set_bridge_port,
             claude_usage,
             codex_usage,
@@ -5066,6 +5260,8 @@ pub fn run() {
             focus_terminal,
             install_claude_hook,
             claude_hook_status,
+            sync_replies_allowed,
+            set_sync_replies_allowed,
             install_agy_hook,
             agy_hook_status,
             install_codex_hook,

@@ -882,18 +882,34 @@ function startBridge(config) {
     let unavailable = false;
     for (const recipient of recipients) {
       const provider = providerByConversation.get(recipient);
-      // A member that has not been confirmed can read the room but not answer it. Say
-      // so in the same breath as the message, or it tries to reply, is refused, and has
-      // no idea why — Codex especially, which has no hook that could tell it separately
-      // and only ever learns about a room from what is pushed to it.
-      const muted =
-        room.members.size > 0 && room.members.get(recipient)?.confirmed !== true
-          ? "[Gyredeck: you are in this room but not yet allowed to answer in it. Ask the" +
-            " person at this terminal for the room's password and wait for it —" +
-            " do not retry and do not work around it.]\n\n"
-          : "";
+      // A member that has not been confirmed gets none of the room's content. Reading is
+      // what the password buys — the others cannot open the stream without it, and
+      // pushing the conversation to Codex regardless would make it the one way in that
+      // needs no permission at all. It is told once why it is quiet, and then nothing
+      // reaches it until a person hands over the password.
+      const member = room.members.size > 0 ? room.members.get(recipient) : null;
+      if (member && member.confirmed !== true) {
+        if (member.toldUnconfirmed) continue;
+        member.toldUnconfirmed = true;
+        const notice =
+          "[Gyredeck: you have been put in a room here, but until someone gives you its" +
+          " password you can neither read what is said in it nor answer. Ask the person at" +
+          " this terminal for the room's password. When they give it to you, use it" +
+          " yourself: send it as the x-gyredeck-token header on every call about this" +
+          ` room, starting with POST http://127.0.0.1:${config.port}/sync/rooms/${roomName}/confirm` +
+          ` with {\"conversationId\":\"${recipient}\",\"password\":\"THE PASSWORD\"}. Nobody` +
+          " will confirm you; presenting it is what lets you in. Until then, do not retry" +
+          " and do not look for another way in — nothing further will reach you.]";
+        if (provider === "codexCliHook") {
+          if (deliverToCodex(recipient, room, notice) === "queued") queued = true;
+          else unavailable = true;
+        } else if (provider === "agyHost" || provider === "claudeCodeHook") {
+          waiting = true;
+        }
+        continue;
+      }
       if (provider === "codexCliHook") {
-        const outcome = deliverToCodex(recipient, room, `${muted}${text}`);
+        const outcome = deliverToCodex(recipient, room, text);
         if (outcome === "queued") queued = true;
         else unavailable = true;
       } else if (provider === "agyHost" || provider === "claudeCodeHook") {
@@ -1090,6 +1106,7 @@ function startBridge(config) {
           return;
         }
         member.confirmed = true;
+        member.toldUnconfirmed = false;
         room.touchedAt = Date.now();
         announceMembership(
           code,
@@ -1258,7 +1275,16 @@ function startBridge(config) {
         const collectInbox = () => {
           const at = new Date().toISOString();
           const sync = syncRoomFor(as);
-          const sources = [[as, mailRoomFor(as, false)], ...(sync ? [[sync.name, sync.room]] : [])];
+          // A session's own mailbox is always its own to read. Its room is not: reading
+          // is what the password buys, and a merge that handed the room over anyway
+          // would be the same leak as pushing it — one door closed, another open. The
+          // room is still *named* in the answer, so an unconfirmed session can be told
+          // where it is and what it lacks.
+          const mayReadRoom = sync ? sync.room.members.get(as)?.confirmed === true : false;
+          const sources = [
+            [as, mailRoomFor(as, false)],
+            ...(sync && mayReadRoom ? [[sync.name, sync.room]] : []),
+          ];
           const fresh = [];
           for (const [roomName, room] of sources) {
             if (!room) continue;

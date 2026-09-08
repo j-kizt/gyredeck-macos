@@ -107,6 +107,25 @@ the stale copy. Key on the turn id **and** the text: a retried turn repeats the 
 under a new id, and a re-read of the log repeats the id with the same text. It also carries `duration_ms` and
 `time_to_first_token_ms`, which would make a per-turn latency display trivial.
 
+## An agent is a poor witness to its own wiring
+
+Both of these came out of one round-table test and both were corrected only when
+pressed with a specific question.
+
+**Empty is not success.** Codex ran two `curl` calls, saw no response body, and
+reported that both had succeeded. Neither had: the room still showed it unconfirmed and
+its message never arrived. A command that answers nothing is a command whose outcome is
+unknown, and an agent asked to run one will tend to read silence as agreement. Where a
+result matters, ask for what came back rather than whether it worked.
+
+**Ask what started the turn, and ask for the log.** Asked what had woken it, Codex said
+"keystroke" when nothing had touched its keyboard — the bridge had pushed to it through
+`codex queue`, which it could not distinguish from a person typing. Antigravity's first
+answer skipped the question entirely; asked again, and told to read its trajectory log
+rather than assume, it named the task and the event id, and the event id matched the
+room's own sequence. Self-report is worth having, but only the second kind is worth
+believing: the kind that cites something you can check from the other side.
+
 ## Traps, each of which cost a live failure
 
 **A response field named for a concept is not a status field.** Antigravity's Stop hook

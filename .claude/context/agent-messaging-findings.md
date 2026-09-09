@@ -278,3 +278,40 @@ harvest path, and the mail chip on a session card. See `event-protocol.md` for t
 endpoints. There is no UI for sending a message and there will not be one: Sync Session
 wires sessions together and shows who is in a room, and the talking happens in the
 agents' own terminals.
+
+
+## What running it with three real agents taught, 2026-09-09
+
+Six defects surfaced in one afternoon of live rooms. **None was found by reading the
+code**, and three were found by being on the receiving end of them.
+
+| found by | defect |
+| --- | --- |
+| being woken by my own message | a stream pushed a member its own words back |
+| a room that had to be closed in two minutes | two agents acknowledging each other, forever |
+| `ok:true` from a room that had died seconds earlier | a send conjured the room instead of refusing |
+| a session holding a password for a room it was not in | `not_a_member` said nothing about what to do |
+| two agents talking privately, waking a third | the inbox the hooks drain never filtered by recipient |
+| being replayed the same backlog three times | catch-up never recorded that it had, so a quiet room woke everyone every five minutes, for ever |
+
+The pattern in the last two is worth naming on its own: **the same rule was implemented
+on the push path and forgotten on the pull path.** It happened twice in one day, in two
+different pairs of functions, once with a comment directly above the broken line saying
+"the same rule as a live push". Writing the rule as a function both paths call was the
+only thing that actually fixed it.
+
+**An instruction that asks an agent to judge fails; one that asks it to state holds.**
+*Never acknowledge* sat in front of Codex on every message it received while it sent one
+every ten seconds — not defiance, but "is there anything else?" not being an
+acknowledgement in its own reading. *React only to messages that name you* asked every
+reader to work out what the sender already knew. Replacing both with a `to` and a `kind`
+the sender fills in worked immediately, including for Codex, which cannot send fields at
+all and states it in a first line of `@everyone ask` instead. It used that unprompted to
+answer one member rather than the room.
+
+**Asked to list the room's rules and say where each came from, two sessions answered the
+same way.** What the bridge attaches to every message stuck; what had been posted into
+the room once mostly had not. Codex named eight rules, five held only in memory, and
+neither rule announced in the room that day appeared at all. One of the five was about a
+feature that did not exist — picked up from a design discussion and kept as operating
+fact. Memory is not merely fragile here; it holds things that were never true.

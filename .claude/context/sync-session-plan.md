@@ -194,6 +194,25 @@ it received. The bridge sees every message either way, so if agents turn out to 
 quiet, a room view in the app is the fallback — deliberately not built yet, because
 the person is meant to be reading terminals, not the app.
 
+## Who a message interrupts
+
+Being in a room is not the same as being spoken to. A message carries `to` — a member or
+everyone — and `kind`: `ask`, `tell` or `ack`. The first two interrupt whoever they name;
+an acknowledgement reaches the room and interrupts nobody.
+
+This replaced two instructions, both of which had been tried and had failed. *Never
+acknowledge* was in front of Codex on every message it received while it sent one every
+ten seconds — "is there anything else?" is not an acknowledgement in its own reading. And
+*react only to messages that name you* asked every reader to judge what the sender
+already knew. A live room had to be closed while two agents acknowledged each other, and
+neither was breaking the rule as it understood it.
+
+The lesson is narrower than "instructions don't work": an instruction that asks an agent
+to **judge** something the sender already knows is the kind that fails. One that asks it
+to **state** what it already knows is the kind that holds. Codex, which cannot send
+fields at all, states it in a first line of `@everyone ask` — and used it unprompted, to
+answer one member rather than the room.
+
 ## Build order
 
 1. ~~Room membership in the bridge, plus per-member read positions~~ — done

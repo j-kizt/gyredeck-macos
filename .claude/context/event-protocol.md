@@ -106,10 +106,28 @@ Agents running on this machine have no shared channel: Claude Code sessions can 
 A room is just a name matching `[A-Za-z0-9_-]{1,64}`, created by whoever sends to it first. Each message gets a monotonic `seq` within its room:
 
 ```json
-{ "seq": 3, "from": "codex", "text": "…", "replyTo": "some-room", "ts": "2026-09-02T07:25:51.512Z" }
+{ "seq": 3, "from": "codex", "to": "everyone", "kind": "ask", "text": "…", "replyTo": "some-room", "ts": "2026-09-02T07:25:51.512Z" }
 ```
 
 `replyTo` is optional and is the sender naming where it is listening. Without it a recipient can be reached but has nowhere to answer, which is how the first version of this needed a person to carry every reply by hand.
+
+### Who a message is for, and what it is for
+
+`to` is a member's name, a conversation id, or `"everyone"`. `kind` is `ask`, `tell` or `ack`; the room itself sends `notice`, which nobody else may claim.
+
+| kind | reaches | interrupts |
+| --- | --- | --- |
+| `ask` / `tell` | whoever `to` names | the same |
+| `ack` | the room | **nobody** |
+| `notice` | the room | **nobody** |
+
+An acknowledgement is published, takes a `seq` and is readable like anything else. It simply costs no one a turn, which is what makes it harmless — the point was never that acknowledgements should not exist. There is accordingly **no rule against them**, and none asking a reader to filter for its own name: both were tried as instructions and both failed, in a live room that had to be closed while two agents acknowledged each other. The room routes instead.
+
+Both fields are optional, and both default to the loud answer — an unaddressed `tell` to everyone. A sender who omits them, or spells one wrong, is over-heard rather than silently dropped: silence is the failure nobody notices.
+
+**Reaching and interrupting are different questions**, and the channels ask different ones. A stream and a push into Codex cost the recipient a turn, so they ask whether the message should interrupt. A collection — `GET /mail/inbox`, which the hooks drain — does not, because the session is already running; it asks only whether the message was addressed to this session. That is why a notice saying somebody *left* the room still arrives there, which matters to a member told an hour ago that they were present.
+
+Codex sends no fields, because the bridge posts on its behalf and there is no request of its own to put them in. It says the same thing in the only place it has: a first line of `@everyone ask` or `@Claude Code ack`, which the bridge lifts off before the room sees the text. No line means the same loud default as an omitted field.
 
 Two ways to receive, because the participants differ in kind:
 
@@ -138,6 +156,10 @@ Two credentials reach `/mail` and they mean different things:
 Password and token are one thing said two ways: a password to the person copying it out of the panel, a token to the `x-gyredeck-token` header carrying it. The machine's ingest token is deliberately **not** accepted for a room's messages or its stream. Every agent reads that file to make any call at all, so accepting it would let anything speak in, or watch, a conversation it was never let into — and the framing tells an agent that a request from a member is what it is there for.
 
 `POST /mail/<code>` without the room's password answers `403 not_confirmed` with a message naming what to ask for; a non-member answers `403 not_a_member`. The founder needs no password of its own — pressing Create in that session's detail panel is the same act of intent, made in the same place.
+
+A code with no room behind it answers `404 no_such_room`, on the stream and on a send alike. It is never created by being written to — a room is issued, and a code with nothing behind it means the room ended, most often with the bridge that held it. (A private mailbox *is* created on first write: it is named after one session, and writing to it before that session has read anything is ordinary.) Every refusal on `/mail/<code>/events` answers in SSE frames rather than plain JSON, because a watcher reads the body for `data:` lines and a plain error is dropped by its own filter — leaving a failed watch that looks exactly like a quiet room.
+
+`GET /mail/wait` answers a timeout with `yourLastMessage`: the seq, the addressing, and why nothing came back — an `ack` woke nobody, the recipient is not in the room, everyone addressed is still unconfirmed, or the message was correct and delivered and the silence is theirs. The last is as important as the rest: an asker that "fixes" a message that was already right and sends it again is the start of the next loop.
 
 `turn_complete.usage` may carry a `contextWindow`, and where it does it wins over the
 model-name lookup in the desktop app. Codex is the case: its hook payload has no token

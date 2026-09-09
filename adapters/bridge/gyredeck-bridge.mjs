@@ -1235,6 +1235,10 @@ function startBridge(config) {
       try {
         res.write(frame);
         pushed = true;
+        // How far this member's stream has been written, which is what `since=resume`
+        // hands back. Deliberately not the same as readSeq below: a push is not a read.
+        const member = res.gyredeckWatcher ? room.members.get(res.gyredeckWatcher) : null;
+        if (member) member.streamSeq = Math.max(member.streamSeq ?? 0, message.seq);
       } catch {
         room.clients.delete(res);
       }
@@ -2113,15 +2117,23 @@ function startBridge(config) {
         // way to tell — the same shape as the cursor that outlived its room and
         // reported success while discarding everything. A mailbox is different: it is
         // named after one session and watching it before anything is sent is normal.
+        // Every refusal on this route answers in frames, because a watcher reads the
+        // body for `data:` lines — that is what a stream is made of — and a plain JSON
+        // error is printed and then dropped by the reader's own filter, leaving a watch
+        // that looks like a quiet room. The status is kept for anything checking it,
+        // and 404 matters most of the three: it is the one a watcher meets when the
+        // room it is trying to rejoin no longer exists.
+        const refuseStream = (status, error, message) => {
+          res.writeHead(status, { "content-type": "text/event-stream; charset=utf-8", ...corsHeaders });
+          res.end(`event: error\ndata: ${JSON.stringify({ ok: false, error, message, fatal: status === 404 })}\n\n`);
+        };
         const room = SYNC_CODE.test(name) ? mailRooms.get(name) : mailRoomFor(name, true);
         if (!room) {
-          sendJson(SYNC_CODE.test(name) ? 404 : 429, {
-            ok: false,
-            error: SYNC_CODE.test(name) ? "no_such_room" : "too_many_rooms",
-            ...(SYNC_CODE.test(name)
-              ? { message: "Nothing by that code is open. A room ends with its last member." }
-              : {}),
-          });
+          if (SYNC_CODE.test(name)) {
+            refuseStream(404, "no_such_room", "Nothing by that code is open. A room ends with its last member, and with the bridge that held it. Stop watching; re-opening will be refused again.");
+          } else {
+            refuseStream(429, "too_many_rooms", "No room can be opened for this name right now.");
+          }
           return;
         }
         // Reading a room people were put into needs that room's password — not the
@@ -2129,20 +2141,11 @@ function startBridge(config) {
         // in the room. The password alone is not enough: a session that has been
         // disconnected still remembers it, and without this its watch would keep
         // running on a room it was removed from.
-        // A refusal here has to be shaped like the stream it is refusing. A watcher
-        // filters the body for `data:` lines, because that is what a stream is made of,
-        // and a plain JSON error does not match — so the refusal is printed and then
-        // dropped by the reader's own filter, leaving a watch that looks like a quiet
-        // room. A session in a live room hit exactly this and had to work out `?as=`
-        // for itself. The status stays 403 for anything that checks it.
-        const refuseStream = (error, message) => {
-          res.writeHead(403, { "content-type": "text/event-stream; charset=utf-8", ...corsHeaders });
-          res.end(`event: error\ndata: ${JSON.stringify({ ok: false, error, message })}\n\n`);
-        };
         const watcher = url.searchParams.get("as") ?? null;
         if (room.members.size > 0) {
           if (!holdsRoomPassword(room, headerToken)) {
             refuseStream(
+              403,
               "not_confirmed",
               "This room needs its own password. Ask the person at this terminal for it, then send it as the x-gyredeck-token header.",
             );
@@ -2150,6 +2153,7 @@ function startBridge(config) {
           }
           if (!watcher || room.members.get(watcher)?.confirmed !== true) {
             refuseStream(
+              403,
               "not_a_member",
               "Name yourself with ?as=<conversationId>; only a confirmed member of this room may watch it.",
             );
@@ -2183,10 +2187,18 @@ function startBridge(config) {
         // Hand back what was missed while disconnected. Without this a subscriber
         // that drops has no way to close the gap except to fall back to the
         // read endpoint, and a push-only reader would simply lose those messages.
-        const resumeFrom = Number.parseInt(
-          req.headers["last-event-id"] ?? url.searchParams.get("since") ?? "",
-          10,
-        );
+        // `since=resume` asks the room where this watcher had got to, instead of the
+        // watcher telling it. Tracking a seq client-side is the part of a watch that
+        // keeps going wrong: it takes a second command per frame, and the obvious way
+        // to write that captures the stream into a variable, at which point nothing
+        // reaches the notifier and the room looks silent. Two sessions wrote that same
+        // bug on the same day, one of them the author of the instruction.
+        const asked = url.searchParams.get("since");
+        const streamed = watcher ? room.members.get(watcher)?.streamSeq : null;
+        const resumeFrom =
+          asked === "resume"
+            ? (typeof streamed === "number" ? streamed : 0)
+            : Number.parseInt(req.headers["last-event-id"] ?? asked ?? "", 10);
         if (Number.isInteger(resumeFrom) && resumeFrom > 0) {
           for (const message of room.messages) {
             if (message.seq > resumeFrom) res.write(mailFrame(message));

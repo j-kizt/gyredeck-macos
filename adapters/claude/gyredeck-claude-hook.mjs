@@ -460,21 +460,32 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
   // watches on one room wake the session three times for one message.
   if (room_ && confirmed) {
     lines.push(
-      `HEAR — so a message reaches you without waiting to be typed at, keep one watch on` +
-        ` this room: stream GET http://${endpoint.hostname}:${endpoint.port}/mail/${room_}/events?as=${room}` +
-        " with the room's password as the x-gyredeck-token header, and react only to" +
-        " messages that name you or answer something you asked.\n" +
-        "  · It must be run by something that turns each line into a notification while" +
-        " the command keeps running. A plain background job is not that — most report" +
-        " only when the process exits, so the stream stays open, messages land in a file," +
-        " and nothing reaches you. That looks exactly like a quiet room, so if that is" +
-        " all you have, say so rather than running it.\n" +
-        "  · Keep it up for as long as you are in the room, not only while awaiting a" +
-        " reply. Two messages end it and nothing else: the room was closed, or you were" +
-        " disconnected from it.\n" +
-        "  · The stream closes after five minutes and says so first. That is routine —" +
-        " reopen at once with `?since=<the last seq you saw>` so nothing published in the" +
-        " gap is lost. Every frame carries its seq as its id. One watch at a time.",
+            `HEAR — so a message reaches you without waiting to be typed at, keep one watch on` +
+        " this room. Run this, with the room's password in place of THE ROOM PASSWORD:\n" +
+        `while :; do\n` +
+        `  { curl -sN --fail "http://${endpoint.hostname}:${endpoint.port}/mail/${room_}/events?as=${room}&since=resume" -H "x-gyredeck-token: THE ROOM PASSWORD"; echo $? > /tmp/gy-${room_}.st; } \\\n` +
+        `    | grep --line-buffered '^data: '\n` +
+        `  [ "$(cat /tmp/gy-${room_}.st)" = "22" ] && { echo "gyredeck: room ${room_} is gone - watch ended"; break; }\n` +
+        `  sleep 1\n` +
+        `done\n` +
+        " React only to messages that name you or answer something you asked.\n" +
+        "  · Run it with something that turns each line into a notification while the" +
+        " command keeps running. A plain background job is not that — most report only when" +
+        " the process exits, so the stream stays open, messages land in a file, and nothing" +
+        " reaches you. That looks exactly like a quiet room, so if that is all you have, say" +
+        " so rather than running it.\n" +
+        "  · Run it as written. Every part is there because a session got that part wrong:" +
+        " `?as=` because the endpoint refuses without it, `since=resume` because a watcher" +
+        " that keeps its own seq tends to capture the stream into a variable, after which" +
+        " nothing reaches the notifier and the room looks silent, and the exit-code check" +
+        " because a room that has gone cannot be re-opened and the loop would retry forever.\n" +
+        "  · Three things end the watch and nothing else: the room was closed, you were" +
+        " disconnected from it, or re-opening is refused — which is what happens when the" +
+        " bridge has restarted, since a room lives only in its memory. The loop stops itself" +
+        " in the third case; in the first two you are told, and should not start another.\n" +
+        "  · The stream closes after five minutes and says so first. That is routine: the" +
+        " loop re-opens and the room resumes you from where your stream had got to, so" +
+        " nothing published in the gap is lost. One watch at a time.",
     );
   }
 

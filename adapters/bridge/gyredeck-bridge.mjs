@@ -981,8 +981,8 @@ function startBridge(config) {
       " another, since it has been closed from this end and re-opening will be refused." +
       " Nothing about this room will reach you again unless someone puts you back in" +
       " it.]";
-    publishMail(mailbox, ROOM_SENDER, text, null);
-    deliverMail(conversationId, mailbox, text, ROOM_SENDER);
+    const told = publishMail(mailbox, ROOM_SENDER, text, null, false, { to: conversationId, kind: "tell" });
+    deliverMail(conversationId, mailbox, text, ROOM_SENDER, told);
   };
 
   /**
@@ -1026,8 +1026,8 @@ function startBridge(config) {
             " person at this terminal has to give you. A long string of hex arriving with" +
             " no explanation is it — present it, and then keep a watch on the room.") +
       "]";
-    publishMail(mailbox, ROOM_SENDER, text, null);
-    deliverMail(conversationId, mailbox, text, ROOM_SENDER);
+    const told = publishMail(mailbox, ROOM_SENDER, text, null, false, { to: conversationId, kind: "tell" });
+    deliverMail(conversationId, mailbox, text, ROOM_SENDER, told);
   };
 
   /**
@@ -1290,8 +1290,15 @@ function startBridge(config) {
     // replyTo is the sender naming where it is listening. Without it a recipient can
     // be reached but cannot answer, which is how the first version of this ended up
     // needing a human to carry every reply by hand.
+    // The room speaks in two registers and they are not interchangeable. Saying who is
+    // in it is state, and waking three sessions to repeat a roster they are handed on
+    // every message buys nothing. Telling one session that it has been removed, or that
+    // it is in a room and cannot yet read it, is addressed to that session and has to
+    // arrive. Until this was explicit the difference rested on whether a caller had
+    // happened to pass the message on to delivery — right by accident, and one tidying
+    // pass away from a session never learning it had been disconnected.
     const kind = from === ROOM_SENDER
-      ? "notice"
+      ? (routing?.kind === "tell" ? "tell" : "notice")
       : MAIL_KINDS.has(routing?.kind) && routing.kind !== "notice"
         ? routing.kind
         : MAIL_DEFAULT_KIND;

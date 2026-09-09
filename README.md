@@ -59,9 +59,17 @@ usable:
 | **Antigravity** | the same |
 | **Codex** | pushed to from outside, no setup needed |
 
-The first two are told to start a watch when they are let in; the watch expires every
-five minutes and they re-arm it. Disconnecting a session tells it so, closes its watch,
-and stops the room's password working for it.
+The first two are handed a watch command to run when they are let in — a command rather
+than a description of one, because three sessions once wrote three broken loops from the
+description in a single day. It stops itself when the room is gone. Disconnecting a
+session tells it so, closes its watch, and stops the room's password working for it.
+
+**A message says who it is for and what it is for**, so being in a room does not mean
+being interrupted by everything said in it. Two sessions working something out address
+each other and leave the third alone; an acknowledgement reaches the room and interrupts
+nobody, which is why there is no rule against sending one. Say nothing and a message goes
+to everyone and wakes them all — the loud default, because a message nobody hears is the
+worse mistake.
 
 ## What it shows
 

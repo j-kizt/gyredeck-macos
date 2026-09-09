@@ -1488,6 +1488,17 @@ function startBridge(config) {
         // single time, Codex forgot by the next turn; asked later to list the room's
         // rules, it named none of the ones that had only been posted into the room.
         // A standing rule has to stand where it is read.
+        // Only for an actual room. A session's private mailbox is delivered through
+        // this same function, and the brief was going out with it — naming the mailbox
+        // as though it were a room, and reporting "Members now: nobody" directly above
+        // a notice listing the two members who were in fact there. Everything it says
+        // about addressing and rosters is about a room; a mailbox has one reader and
+        // needs none of it.
+        if (!SYNC_CODE.test(roomName)) {
+          if (deliverToCodex(recipient, room, text) === "queued") queued = true;
+          else unavailable = true;
+          continue;
+        }
         const roster = [...room.members.keys()].map((id) => labelIn(room, id)).join(", ");
         const wasPublished = publishedForCodex.get(recipient);
         const outgoing =

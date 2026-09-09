@@ -137,17 +137,25 @@ dropped every message — worth building carefully rather than discovering later
 
 ## Known limits
 
-**Work flows one way freely.** Only Codex can be reached while idle, so:
+**Every member can be reached while idle, by two different routes.** This section said
+the opposite for most of a day, and `agent-messaging-findings.md` had already corrected it
+while this file still claimed work flowed one way — two files in one folder disagreeing,
+which is worse than either being wrong alone.
 
 ```
-Claude implements  →  hands to Codex     delivered in ~2s, nobody types anything
-Codex reports back →  to Claude          waits until someone types in Claude's terminal
+bridge → Codex        pushed in, ~2s, nothing to set up
+bridge → Claude, AGY  not pushable — they hold a watch on the room and wake themselves
 ```
 
-The round trip used to need one keystroke on the non-Codex side. `GET /mail/wait` closes
-it: the sender waits for the answer inside its own turn, so the reply comes back as the
-result of the call it is blocked on rather than needing a new turn. Measured at 1.5s from
-publish to wake — the message wakes the waiter rather than being found by the next poll.
+Codex is reached from outside because the bridge runs `codex queue` and is not inside its
+sandbox. The other two cannot be reached from outside at all, and do not need to be: each
+runs the watch command it is handed when it is let in, and every message addressed to it
+starts a turn. Verified on Claude Code with the runtime confirming no human input, and on
+Antigravity from its own trajectory log.
+
+`GET /mail/wait` remains, for a different case: an asker that needs the answer before it
+can carry on waits inside its own turn rather than ending it. Measured at 1.5s from
+publish to wake. A timed-out wait now also says whether the message was the problem.
 
 What this is not is a way to wake an idle session. The asker chooses to wait; nothing
 reaches a session that has already finished its turn. `claude-code-session-bridge` solves
@@ -228,5 +236,6 @@ answer one member rather than the room.
 4. ~~The panel: create, join, connected, disconnect~~ — done
 5. ~~Auto-remove on `conversation_close`~~ — done
 
-What is left is not on this list: nothing tells the person a reply arrived, and only
-Codex can be reached while idle. Both are recorded under Known limits above.
+What is left is not on this list: nothing tells the person a reply arrived. Reaching an
+idle session is no longer on it either — every member can be, by one route or the other.
+Both are covered under Known limits above.

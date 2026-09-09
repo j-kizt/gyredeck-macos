@@ -343,23 +343,41 @@ The trailing clause carries the limit. Whether a request fits is judged against 
 
 Every tier asks the agent to say what came in **and** what it sent back. With ordinary mail a person had typed something and was waiting; inside a room they may have started nothing at all, and the terminal is their only window onto an exchange they set up and stepped away from.
 
-Members are named in three tiers, each added only when the one before it is ambiguous:
+**A member's name is chosen once, when it arrives, and never changes.** Each candidate is
+tried in turn and the first one free in that room is taken:
 
-| room holds | name |
+```
+Codex  →  Codex · J-Kitz  →  Codex · J-Kitz #01a07f
+```
+
+| arriving into a room that already holds | takes |
 | --- | --- |
-| one Codex | `Codex` |
-| two Codex, different checkouts | `Codex · J-Kitz`, `Codex · AD1` |
-| two Codex, same checkout | `Codex · J-Kitz #01a07f`, `Codex · J-Kitz #4b12c9` |
+| nobody | `Codex` |
+| `Codex` (a different checkout) | `Codex · AD1` |
+| `Codex` (the same checkout) | `Codex · J-Kitz` |
+| `Codex` and `Codex · J-Kitz` | `Codex · J-Kitz #01a07f` |
 
-An unqualified duplicate names nobody — a request addressed to "Codex" in a room
-holding two of them is a request to neither, and the framing tells an agent that a
-request from a member is what it is there for. Qualifying every mention regardless
-would lengthen them all to fix a collision that usually is not there.
+So whoever arrived first keeps the short name, and the asymmetry is the point. The name
+used to be worked out afresh from whoever happened to be present, which made it a
+different name at different moments: a session collected several across one transcript
+with nothing linking them, and a question about what "Codex" said an hour ago had no
+answer. A live session reported it from its own log — `seq 3` called it `Claude Code`,
+`seq 35` called it `Claude Code · Workspace`, because a second Claude Code had joined in
+between.
 
-The workspace is the last segment of the session's `cwd`, which is what a person
-already calls that session. The id comes last and short because it means nothing to a
-person; two sessions in one checkout is an ordinary thing to be doing, and the case
-where telling them apart matters most.
+Deciding at the door also retires the argument that kept being got wrong. There is no
+member set to pass any more, only a field to read, so no call site can name a member from
+the wrong moment — which three of ten were doing, including the departure notices, which
+computed the label *after* removing the member and so announced that "Codex" had left
+while naming the Codex that was still there.
+
+A name outlives the membership, in `room.formerLabels`: a session that leaves and is put
+back is the same session, and a stable name that changes on return is not stable.
+
+The workspace is the last segment of the session's `cwd`, which is what a person already
+calls that session. The id comes last and short because it means nothing to a person; two
+sessions in one checkout is an ordinary thing to be doing, and the case where telling them
+apart matters most.
 
 A reply goes to the room when there is one, so every member sees it and the exchange stays in one place instead of splitting into private mailboxes. Members are introduced by provider name and nothing else — a conversation id reads as nothing — which is why the bridge attaches a label drawn from the `runtime.sourceKind` it has already seen on that session's events.
 

@@ -1233,6 +1233,12 @@ function startBridge(config) {
     let pushed = false;
     for (const res of room.clients) {
       try {
+        // Nobody is woken by their own message. Filtering this in the watcher would mean
+        // parsing each frame there, which is the second command per frame that keeps
+        // tempting the capture-into-a-variable bug — and the room already knows who is
+        // reading, so it is the cheaper place to know it. Without this every agent wakes
+        // itself the moment it speaks, which is the same wasted turn as an acknowledgement.
+        if (res.gyredeckWatcher && res.gyredeckWatcher === message.from) continue;
         res.write(frame);
         pushed = true;
         // How far this member's stream has been written, which is what `since=resume`
@@ -2201,7 +2207,9 @@ function startBridge(config) {
             : Number.parseInt(req.headers["last-event-id"] ?? asked ?? "", 10);
         if (Number.isInteger(resumeFrom) && resumeFrom > 0) {
           for (const message of room.messages) {
-            if (message.seq > resumeFrom) res.write(mailFrame(message));
+            // Same rule as a live push: catching up is not a reason to be handed back
+            // your own words.
+            if (message.seq > resumeFrom && message.from !== watcher) res.write(mailFrame(message));
           }
         }
 

@@ -401,6 +401,19 @@ function startBridge(config) {
    * replies is the cheapest thing that can tell those two apart.
    */
   const codexHarvest = { turns: 0, published: 0, warned: false };
+  /**
+   * The seq the bridge last gave a Codex session's own words, so it can be told.
+   *
+   * Codex never sees a reply to anything: the bridge posts for it, and the response
+   * goes nowhere it can read. The brief nevertheless told it not to claim a message was
+   * sent without seeing ok:true and a seq — a rule it could never satisfy even once,
+   * while its messages were in fact being published every time. Handing the seq back on
+   * the next push is the only confirmation that can reach it, and its absence is the
+   * only way it can learn a harvest failed. Codex itself pointed out the gap that
+   * remains: with no next push, the last message stays unconfirmed. That is accepted —
+   * closing it would mean waking a session to tell it a number.
+   */
+  const publishedForCodex = new Map();
   // Several turns is enough to be past a slow flush and not enough to be a whole
   // working session lost before anyone hears about it.
   const CODEX_HARVEST_SUSPECT_AFTER = 5;
@@ -437,7 +450,8 @@ function startBridge(config) {
     for (const reply of replies) {
       if (!claimCodexReply(conversationId, reply)) continue;
       if (refuseToPublish(found.room, conversationId)) continue;
-      publishMail(found.room, conversationId, reply.text, null, true);
+      const published = publishMail(found.room, conversationId, reply.text, null, true);
+      if (published?.seq) publishedForCodex.set(conversationId, published.seq);
       deliverMail(found.name, found.room, reply.text, conversationId);
     }
   };
@@ -1284,7 +1298,8 @@ function startBridge(config) {
         // confirmed does not get to speak just because the bridge is the one holding
         // the pen.
         if (refuseToPublish(room, threadId)) continue;
-        publishMail(room, threadId, reply.text, null, true);
+        const published = publishMail(room, threadId, reply.text, null, true);
+        if (published?.seq) publishedForCodex.set(threadId, published.seq);
       }
       if (seen.size === 0 && Date.now() < deadline) setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
     };
@@ -1368,6 +1383,12 @@ function startBridge(config) {
         // next turn and went back to curl — which its sandbox refuses at connect, so
         // the POST failed silently and it reported "sent" for messages the room never
         // received. A standing rule has to stand where it is read.
+        // Everything here is repeated on every message rather than said once. Told a
+        // single time, Codex forgot by the next turn; asked later to list the room's
+        // rules, it named none of the ones that had only been posted into the room.
+        // A standing rule has to stand where it is read.
+        const roster = [...room.members.keys()].map((id) => labelIn(room, id)).join(", ");
+        const wasPublished = publishedForCodex.get(recipient);
         const outgoing =
           `[Gyredeck · room ${roomName} — how to answer: write your reply as ordinary` +
           " text in this turn. Do not call Gyredeck: your sandbox refuses the network" +
@@ -1378,8 +1399,24 @@ function startBridge(config) {
           " write in a turn is taken, so say everything the room needs in one closing" +
           " message rather than several. You also need no watch:" +
           " messages are pushed into your session whether or not you are doing anything." +
-          " Never say you have sent something unless you saw a reply carrying ok:true" +
-          " and a seq; if you did not see one, you did not send it.]\n\n" +
+          // Answering an acknowledgement wakes every session watching the room for
+          // nothing. Measured at three content-free wakes in a row in this very room,
+          // by which point two of them were acknowledging acknowledgements.
+          " Reply only when you have something to add, an answer, a question or a" +
+          " disagreement — never to acknowledge. The sender already knows the message" +
+          " arrived; the bridge tells them so." +
+          // Its roster is memory of announcements it happened to receive: it cannot
+          // read the room's state, so a push that failed once would leave it wrong
+          // forever. Restating who is here on every message costs a line and closes it.
+          ` Members now: ${roster || "nobody"}.` +
+          // Never "wait for ok:true" — Codex cannot see a response to anything, so that
+          // rule was unsatisfiable while its messages were in fact being published.
+          (wasPublished
+            ? ` Your previous message reached the room as seq ${wasPublished}.`
+            : " Nothing of yours has been published in this room yet.") +
+          " You will not see a response to what you write — the bridge posts for you and" +
+          " tells you the seq here, on the next message you get. If a seq never follows," +
+          " what you wrote did not arrive.]\n\n" +
           text;
         const outcome = deliverToCodex(recipient, room, outgoing);
         if (outcome === "queued") queued = true;
@@ -2092,22 +2129,30 @@ function startBridge(config) {
         // in the room. The password alone is not enough: a session that has been
         // disconnected still remembers it, and without this its watch would keep
         // running on a room it was removed from.
+        // A refusal here has to be shaped like the stream it is refusing. A watcher
+        // filters the body for `data:` lines, because that is what a stream is made of,
+        // and a plain JSON error does not match — so the refusal is printed and then
+        // dropped by the reader's own filter, leaving a watch that looks like a quiet
+        // room. A session in a live room hit exactly this and had to work out `?as=`
+        // for itself. The status stays 403 for anything that checks it.
+        const refuseStream = (error, message) => {
+          res.writeHead(403, { "content-type": "text/event-stream; charset=utf-8", ...corsHeaders });
+          res.end(`event: error\ndata: ${JSON.stringify({ ok: false, error, message })}\n\n`);
+        };
         const watcher = url.searchParams.get("as") ?? null;
         if (room.members.size > 0) {
           if (!holdsRoomPassword(room, headerToken)) {
-            sendJson(403, {
-              ok: false,
-              error: "not_confirmed",
-              message: "This room needs its own password. Ask the person at this terminal for it, then send it as the x-gyredeck-token header.",
-            });
+            refuseStream(
+              "not_confirmed",
+              "This room needs its own password. Ask the person at this terminal for it, then send it as the x-gyredeck-token header.",
+            );
             return;
           }
           if (!watcher || room.members.get(watcher)?.confirmed !== true) {
-            sendJson(403, {
-              ok: false,
-              error: "not_a_member",
-              message: "Name yourself with ?as=<conversationId>; only a confirmed member of this room may watch it.",
-            });
+            refuseStream(
+              "not_a_member",
+              "Name yourself with ?as=<conversationId>; only a confirmed member of this room may watch it.",
+            );
             return;
           }
         }

@@ -1132,7 +1132,14 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
       headers: { "x-gyredeck-token": minted.body.password },
     });
     assert.equal(anonymous.status, 403);
-    assert.equal((await anonymous.json()).error, "not_a_member");
+    // Shaped like the stream it refuses, not like an ordinary error. A watcher reads
+    // the body for `data:` lines because that is what a stream is made of, so a plain
+    // JSON refusal is printed and then dropped by the reader's own filter — leaving a
+    // watch that looks exactly like a quiet room. A live session hit this and had to
+    // work out the missing `?as=` for itself.
+    const refusal = await anonymous.text();
+    assert.match(refusal, /^event: error\ndata: /, "a refused watch answers in frames");
+    assert.equal(JSON.parse(refusal.split("data: ")[1]).error, "not_a_member");
 
     const allowed = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${joiner}`, {
       headers: { "x-gyredeck-token": minted.body.password },
@@ -1544,7 +1551,9 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     // Every tier asks for both directions, because the person may not have started
     // the exchange and the terminal is their only window onto it.
     for (const injected of [fromRoomMate, fromUser, fromStranger]) {
-      assert.match(injected, /say what you sent back/);
+      // The words sent, not the fact of sending: "I answered Codex" reads as openness
+      // while telling the person nothing about what was said for them.
+      assert.match(injected, /show what you sent — the words themselves/);
     }
   } finally {
     bridge.stdin.end();

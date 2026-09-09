@@ -412,9 +412,12 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
   }
 
   standing.push(
-    "NARRATE: begin by saying what came in and who sent it, and after you answer, say" +
-      " what you sent back. The person watching this terminal did not necessarily start" +
-      " this exchange and can only follow it through what you say.",
+    "NARRATE: begin by saying what came in and who sent it, and after you answer, show" +
+      " what you sent — the words themselves, not that you replied. The person watching" +
+      " this terminal did not necessarily start this exchange and can only follow it" +
+      " through what you say; \"I answered Codex\" tells them something happened without" +
+      " telling them what you said on their behalf, which reads as openness and is not." +
+      " Give the seq from the reply too, so it can be traced back.",
   );
 
   const lines = [
@@ -458,7 +461,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
   if (room_ && confirmed) {
     lines.push(
       `HEAR — so a message reaches you without waiting to be typed at, keep one watch on` +
-        ` this room: stream GET http://${endpoint.hostname}:${endpoint.port}/mail/${room_}/events` +
+        ` this room: stream GET http://${endpoint.hostname}:${endpoint.port}/mail/${room_}/events?as=${room}` +
         " with the room's password as the x-gyredeck-token header, and react only to" +
         " messages that name you or answer something you asked.\n" +
         "  · It must be run by something that turns each line into a notification while" +

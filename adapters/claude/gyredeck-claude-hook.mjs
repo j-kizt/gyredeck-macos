@@ -448,19 +448,29 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
         prelude +
         `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${replyTo} ` +
         `-H 'content-type: application/json' ${header} ` +
-        `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}"}'\n` +
+        `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}","to":"everyone","kind":"tell"}'\n` +
         "A successful send answers with ok:true and a seq. Do not report having sent" +
         " anything unless you saw that: a refused POST prints nothing useful, and saying" +
-        " you replied when the room never received it is worse than saying nothing.",
+        " you replied when the room never received it is worse than saying nothing.\n" +
+        'A message carries who it is for and what it is for: "to" is a member\'s name or "everyone", and "kind" is "ask", "tell" or "ack". ask and tell interrupt whoever they name; ack reaches the room and interrupts nobody, so an acknowledgement costs no one a turn and you may send one freely. Leave them out and the message goes to everyone as tell, waking every session in the room — so say what you mean.',
     );
   }
   // Watching sits with the other things to do rather than at the top, where five
   // paragraphs of it arrived before the session had been told what the room was. The
   // condition is "if you have none", because this text arrives every turn and three
   // watches on one room wake the session three times for one message.
+  //
+  // Every part of the command below is there because a session got that part wrong, and
+  // the reasons live here rather than in the text: telling a reader why each flag exists
+  // costs them the words on every turn and buys nothing, since the ask is only to run it
+  // unmodified. `?as=` because the endpoint refuses a nameless watcher. `since=resume`
+  // because a watcher keeping its own seq needs a second command per frame, and the
+  // obvious way to write that captures the stream into a variable — after which nothing
+  // reaches the notifier and the room looks silent. The exit-code check because a room
+  // that has gone cannot be re-opened, and a loop told only to reopen retries forever.
   if (room_ && confirmed) {
     lines.push(
-            `HEAR — so a message reaches you without waiting to be typed at, keep one watch on` +
+      `HEAR — so a message reaches you without waiting to be typed at, keep one watch on` +
         " this room. Run this, with the room's password in place of THE ROOM PASSWORD:\n" +
         `while :; do\n` +
         `  { curl -sN --fail "http://${endpoint.hostname}:${endpoint.port}/mail/${room_}/events?as=${room}&since=resume" -H "x-gyredeck-token: THE ROOM PASSWORD"; echo $? > /tmp/gy-${room_}.st; } \\\n` +
@@ -468,21 +478,20 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
         `  [ "$(cat /tmp/gy-${room_}.st)" = "22" ] && { echo "gyredeck: room ${room_} is gone - watch ended"; break; }\n` +
         `  sleep 1\n` +
         `done\n` +
-        " React only to messages that name you or answer something you asked.\n" +
+        "Anything arriving on it is meant to interrupt you: the room sends only what was" +
+        " addressed to you or to everyone, never an acknowledgement or a notice about its" +
+        " own membership.\n" +
         "  · Run it with something that turns each line into a notification while the" +
         " command keeps running. A plain background job is not that — most report only when" +
         " the process exits, so the stream stays open, messages land in a file, and nothing" +
         " reaches you. That looks exactly like a quiet room, so if that is all you have, say" +
         " so rather than running it.\n" +
-        "  · Run it as written. Every part is there because a session got that part wrong:" +
-        " `?as=` because the endpoint refuses without it, `since=resume` because a watcher" +
-        " that keeps its own seq tends to capture the stream into a variable, after which" +
-        " nothing reaches the notifier and the room looks silent, and the exit-code check" +
-        " because a room that has gone cannot be re-opened and the loop would retry forever.\n" +
+        "  · Run it unmodified. Every part of it is load-bearing.\n" +
         "  · Three things end the watch and nothing else: the room was closed, you were" +
-        " disconnected from it, or re-opening is refused — which is what happens when the" +
-        " bridge has restarted, since a room lives only in its memory. The loop stops itself" +
-        " in the third case; in the first two you are told, and should not start another.\n" +
+        " disconnected from it, or re-opening is refused — which is what happens once the" +
+        " bridge has restarted, since a room lives only in its memory and cannot be" +
+        " re-entered. The loop stops itself in that third case; in the first two you are" +
+        " told, and should not start another.\n" +
         "  · The stream closes after five minutes and says so first. That is routine: the" +
         " loop re-opens and the room resumes you from where your stream had got to, so" +
         " nothing published in the gap is lost. One watch at a time.",
@@ -501,7 +510,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
         `curl -s "http://${endpoint.hostname}:${endpoint.port}/mail/wait?as=${room}&timeout=60&collect=1" ` +
         "-H \"x-gyredeck-token: THE ROOM PASSWORD\"\n" +
         "It returns as soon as something arrives, or after the timeout with" +
-        " \"timedOut\": true — if that happens, say so and stop rather than waiting again.",
+        " \"timedOut\": true. A timed-out answer also carries yourLastMessage, saying who your last message went to, what kind it was, and whether that is why nothing came back — read it before deciding anything. If it says the message was addressed correctly and delivered, the silence is theirs: say so and stop, and do not send it again.",
     );
   }
 

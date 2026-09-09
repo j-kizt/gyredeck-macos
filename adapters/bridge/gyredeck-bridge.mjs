@@ -389,6 +389,31 @@ function startBridge(config) {
    * Nothing is published twice: the same per-thread claim guards this and the harvest
    * that follows a push.
    */
+  /**
+   * The routing Codex asked for, taken off the front of what it wrote.
+   *
+   * Every other member sends `to` and `kind` as fields. Codex sends nothing — the
+   * bridge posts on its behalf — so the one place it can say who a message is for is
+   * the message. A first line of `@everyone ask` or `@Claude Code ack` is lifted off
+   * and becomes the fields; anything else leaves the text alone and takes the loud
+   * default, because a Codex turn that was never taught this must still be heard.
+   */
+  const CODEX_ROUTING_LINE = /^@(.+?)[ \t]+(ask|tell|ack)[ \t]*$/i;
+  const routeCodexReply = (room, text) => {
+    const [first, ...rest] = text.split("\n");
+    const match = CODEX_ROUTING_LINE.exec(first.trim());
+    if (!match) return { text, routing: { to: MAIL_EVERYONE, kind: MAIL_DEFAULT_KIND } };
+    const target = match[1].trim();
+    const to = /^everyone$/i.test(target)
+      ? MAIL_EVERYONE
+      : room.members.has(target)
+        ? target
+        : [...room.members.keys()].find(
+            (id) => labelIn(room, id).toLowerCase() === target.toLowerCase(),
+          ) ?? MAIL_EVERYONE;
+    return { text: rest.join("\n").trim() || text, routing: { to, kind: match[2].toLowerCase() } };
+  };
+
   /** Where the last harvest of each Codex log stopped, as a byte offset into it. */
   const harvestAt = new Map();
   /**
@@ -450,9 +475,10 @@ function startBridge(config) {
     for (const reply of replies) {
       if (!claimCodexReply(conversationId, reply)) continue;
       if (refuseToPublish(found.room, conversationId)) continue;
-      const published = publishMail(found.room, conversationId, reply.text, null, true);
+      const { text, routing } = routeCodexReply(found.room, reply.text);
+      const published = publishMail(found.room, conversationId, text, null, true, routing);
       if (published?.seq) publishedForCodex.set(conversationId, published.seq);
-      deliverMail(found.name, found.room, reply.text, conversationId);
+      deliverMail(found.name, found.room, text, conversationId, published);
     }
   };
 
@@ -1105,10 +1131,12 @@ function startBridge(config) {
   const announceMembership = (name, room, note) => {
     const present = [...room.members.keys()].map((id) => labelIn(room, id));
     const text = `${note} Members now: ${present.join(", ") || "nobody"}.`;
-    publishMail(room, ROOM_SENDER, text, null);
-    // News about the room travels the same way anything else does, or a Codex member
-    // would never hear it: it does not read an inbox, it is pushed to.
-    deliverMail(name, room, text, ROOM_SENDER);
+    const notice = publishMail(room, ROOM_SENDER, text, null);
+    // A room notice is published and readable but wakes nobody: the roster it carries
+    // already rides on every message Codex is handed, so interrupting three sessions to
+    // repeat it is pure cost. This was measured — a join and a confirmation woke every
+    // member twice inside six seconds, and one of them answered each time.
+    deliverMail(name, room, text, ROOM_SENDER, notice);
   };
 
 
@@ -1211,17 +1239,71 @@ function startBridge(config) {
     return null;
   };
 
-  const publishMail = (room, from, text, replyTo, fromSession = false) => {
+  /**
+   * What a message is for, declared by whoever sends it.
+   *
+   * The room cannot judge whether a message deserves to interrupt anyone — only the
+   * sender knows that — and asking every reader to judge it instead was tried and
+   * failed: told never to acknowledge, two agents acknowledged each other until the
+   * room had to be closed. Neither was breaking the rule as it understood it. Saying it
+   * once, in a field, is something a sender can actually do.
+   *
+   * `ask` and `tell` reach whoever they are addressed to. `ack` reaches the room and
+   * nobody's attention, which is what makes it harmless — the point was never that
+   * acknowledgements should not exist, only that they should not cost a turn. `notice`
+   * is the room speaking about itself; the roster it carries already rides on every
+   * message Codex is handed, so waking anyone for it buys nothing.
+   */
+  const MAIL_KINDS = new Set(["ask", "tell", "ack", "notice"]);
+  /** Unaddressed and attention-worthy: what a sender who says nothing must get. */
+  const MAIL_DEFAULT_KIND = "tell";
+  const MAIL_EVERYONE = "everyone";
+
+  /**
+   * Whether this message is this member's to see at all.
+   *
+   * Addressing only. Two sessions working something out between them are not writing to
+   * a third, and handing it to them anyway is the noise the `to` field exists to stop.
+   */
+  const reachesMember = (message, conversationId) =>
+    message.from !== conversationId &&
+    (message.to === MAIL_EVERYONE || message.to === conversationId);
+
+  /**
+   * Whether it should interrupt them, which is a stricter question than reaching them.
+   *
+   * Asked of the channels that cost a turn — a stream, and a push into Codex. Not of a
+   * collection, where the session is already awake and running: there an acknowledgement
+   * costs nothing to include, and a notice that someone has left the room is worth
+   * having, since a member told an hour ago that somebody was here may be about to ask
+   * them for something.
+   */
+  const wakesMember = (message, conversationId) => {
+    if (message.kind === "ack" || message.kind === "notice") return false;
+    return reachesMember(message, conversationId);
+  };
+
+  const publishMail = (room, from, text, replyTo, fromSession = false, routing = null) => {
     room.seq += 1;
     mailOrdinal += 1;
     room.touchedAt = Date.now();
     // replyTo is the sender naming where it is listening. Without it a recipient can
     // be reached but cannot answer, which is how the first version of this ended up
     // needing a human to carry every reply by hand.
+    const kind = from === ROOM_SENDER
+      ? "notice"
+      : MAIL_KINDS.has(routing?.kind) && routing.kind !== "notice"
+        ? routing.kind
+        : MAIL_DEFAULT_KIND;
     const message = {
       seq: room.seq,
       ord: mailOrdinal,
       from,
+      // Addressed, so the room can route rather than broadcast. Anything unrecognised
+      // becomes everyone: a sender who gets this wrong must be heard too loudly rather
+      // than not at all, since silence is the failure nobody notices.
+      to: typeof routing?.to === "string" && routing.to.length > 0 ? routing.to : MAIL_EVERYONE,
+      kind,
       text,
       replyTo: replyTo ?? null,
       ts: new Date().toISOString(),
@@ -1233,12 +1315,13 @@ function startBridge(config) {
     let pushed = false;
     for (const res of room.clients) {
       try {
-        // Nobody is woken by their own message. Filtering this in the watcher would mean
-        // parsing each frame there, which is the second command per frame that keeps
-        // tempting the capture-into-a-variable bug — and the room already knows who is
-        // reading, so it is the cheaper place to know it. Without this every agent wakes
-        // itself the moment it speaks, which is the same wasted turn as an acknowledgement.
-        if (res.gyredeckWatcher && res.gyredeckWatcher === message.from) continue;
+        // A stream exists to interrupt, so only what should interrupt goes down it.
+        // Filtering in the watcher would mean parsing every frame there, which is the
+        // second command per frame that keeps tempting the capture-into-a-variable bug
+        // — and the room already knows who is reading, from the `?as=` it insists on.
+        // An acknowledgement or a room notice is still published and still readable; it
+        // simply does not cost anyone a turn.
+        if (res.gyredeckWatcher && !wakesMember(message, res.gyredeckWatcher)) continue;
         res.write(frame);
         pushed = true;
         // How far this member's stream has been written, which is what `since=resume`
@@ -1308,7 +1391,8 @@ function startBridge(config) {
         // confirmed does not get to speak just because the bridge is the one holding
         // the pen.
         if (refuseToPublish(room, threadId)) continue;
-        const published = publishMail(room, threadId, reply.text, null, true);
+        const routed = routeCodexReply(room, reply.text);
+        const published = publishMail(room, threadId, routed.text, null, true, routed.routing);
         if (published?.seq) publishedForCodex.set(threadId, published.seq);
       }
       if (seen.size === 0 && Date.now() < deadline) setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
@@ -1326,13 +1410,20 @@ function startBridge(config) {
    * that runs when their session next does, so there is nothing to send and nothing
    * to wait for.
    */
-  const deliverMail = (roomName, room, text, from) => {
+  const deliverMail = (roomName, room, text, from, routing = null) => {
+    // A message that should not interrupt is still in the room to be read; it just is
+    // not carried to anyone. Codex is the reason this has to be decided here: it holds
+    // no stream to filter and cannot choose whether to be woken, so the room chooses
+    // for it — the same choice every other member makes for itself at its watch.
+    const carries = (recipient) =>
+      !routing ||
+      wakesMember({ from, to: routing.to ?? MAIL_EVERYONE, kind: routing.kind ?? MAIL_DEFAULT_KIND }, recipient);
     const recipients = room.members.size > 0
       // Nobody is delivered their own message, and a notice from the room itself goes
       // to everyone.
-      ? [...room.members.keys()].filter((id) => id !== from)
+      ? [...room.members.keys()].filter((id) => id !== from && carries(id))
       : [roomName];
-    if (recipients.length === 0) return "no_recipients";
+    if (recipients.length === 0) return routing && routing.kind === "ack" ? "not_notified" : "no_recipients";
 
     let queued = false;
     let waiting = false;
@@ -1409,12 +1500,17 @@ function startBridge(config) {
           " write in a turn is taken, so say everything the room needs in one closing" +
           " message rather than several. You also need no watch:" +
           " messages are pushed into your session whether or not you are doing anything." +
-          // Answering an acknowledgement wakes every session watching the room for
-          // nothing. Measured at three content-free wakes in a row in this very room,
-          // by which point two of them were acknowledging acknowledgements.
-          " Reply only when you have something to add, an answer, a question or a" +
-          " disagreement — never to acknowledge. The sender already knows the message" +
-          " arrived; the bridge tells them so." +
+          // Say who it is for and what it is for, in the one place Codex can say
+          // anything. Telling it never to acknowledge was tried and did not hold: the
+          // rule was in front of it on every message while it offered its help every
+          // ten seconds, because "is there anything else?" is not an acknowledgement in
+          // its own reading. A label it writes is something it can get right.
+          " Open your message with one line saying who it is for and what it is:" +
+          " @everyone ask, @everyone tell, @everyone ack, or a member's name in place of" +
+          " everyone. The line is removed before the room sees it. ask and tell reach" +
+          " the people named; ack reaches the room and interrupts nobody, so courtesy" +
+          " costs no one a turn and you may send it freely. Leave the line out and it" +
+          " goes to everyone as tell, which interrupts them all — so say it." +
           // Its roster is memory of announcements it happened to receive: it cannot
           // read the room's state, so a push that failed once would leave it wrong
           // forever. Restating who is here on every message costs a line and closes it.
@@ -1687,8 +1783,25 @@ function startBridge(config) {
         const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
         const password = typeof body.password === "string" ? body.password.trim() : "";
         const room = mailRooms.get(code);
-        if (!room || !room.members.has(conversationId)) {
-          sendJson(404, { ok: false, error: "not_a_member" });
+        // Two very different situations answered by the same bare word, and a live
+        // session met both: holding a password for a room it had never been added to,
+        // and holding one for a room that had ended. Neither is something the session
+        // can fix, and both are one sentence to explain — the password is the right to
+        // speak in a room, not the way into one.
+        if (!room) {
+          sendJson(404, {
+            ok: false,
+            error: "no_such_room",
+            message: `No room is open under the code ${code}. A room ends with its last member, and with the bridge that held it. Ask the person at this terminal to make a new one.`,
+          });
+          return;
+        }
+        if (!room.members.has(conversationId)) {
+          sendJson(404, {
+            ok: false,
+            error: "not_a_member",
+            message: "You are not in this room yet, and the password does not put you in one — it is the right to speak once you are. Ask the person at this terminal to add this session to the room from Gyredeck, then present the password again.",
+          });
           return;
         }
         const member = room.members.get(conversationId);
@@ -1706,7 +1819,11 @@ function startBridge(config) {
           return;
         }
         if (!holdsRoomPassword(room, password)) {
-          sendJson(403, { ok: false, error: "bad_password" });
+          sendJson(403, {
+            ok: false,
+            error: "bad_password",
+            message: "That is not this room's password. It is 32 hex characters, copied from Gyredeck by the person who made the room — a room code is not it, and neither is the machine's ingest token.",
+          });
           return;
         }
         member.confirmed = true;
@@ -1918,11 +2035,26 @@ function startBridge(config) {
             ...(sync && mayReadRoom ? [[sync.name, sync.room]] : []),
           ];
           const fresh = [];
+          // How far each source was examined, which is not the same as what was taken:
+          // a message deliberately not carried to this session must still stop counting
+          // as waiting to be picked up, or its pending total climbs forever.
+          const examined = new Map();
           for (const [roomName, room] of sources) {
             if (!room) continue;
             const reader = readerFor(room, as);
+            // A private mailbox is addressed to this session by being its mailbox, so
+            // everything in it is for it — the notice that says which room it has been
+            // put in arrives that way. A sync room is shared, and collecting from it is
+            // as much an interruption as a push: the hook drops what it finds straight
+            // into the session's next turn. So the same rule applies, and it has to be
+            // applied here too — two agents addressing each other directly still woke a
+            // third, because the stream had learnt this and the inbox had not.
+            const shared = room !== mailRoomFor(as, false);
             for (const message of room.messages) {
-              if (message.seq > reader.readSeq) fresh.push({ room: roomName, ...message });
+              if (message.seq <= reader.readSeq) continue;
+              examined.set(roomName, Math.max(examined.get(roomName) ?? 0, message.seq));
+              if (shared && !reachesMember(message, as)) continue;
+              fresh.push({ room: roomName, ...message });
             }
             room.touchedAt = Date.now();
           }
@@ -1938,7 +2070,12 @@ function startBridge(config) {
             for (const [roomName, room] of sources) {
               if (!room) continue;
               const taken = collected.filter((message) => message.room === roomName);
-              if (taken.length > 0) markRead(room, as, taken.at(-1).seq, at);
+              // Past everything looked at, not merely everything handed over — but never
+              // past what the cap left behind, which is still owed to this session.
+              const upTo = collected.length < fresh.length
+                ? taken.at(-1)?.seq
+                : Math.max(taken.at(-1)?.seq ?? 0, examined.get(roomName) ?? 0);
+              if (upTo) markRead(room, as, upTo, at);
             }
           }
           return { collected, sync };
@@ -1954,8 +2091,49 @@ function startBridge(config) {
             ? Math.min(requestedWait * 1_000, MAIL_WAIT_MAX_MS)
             : MAIL_WAIT_DEFAULT_MS;
 
+          /**
+           * Why nothing came back, when the bridge can actually tell.
+           *
+           * An asker that waits a minute and hears nothing has two very different
+           * problems — it addressed the message wrongly, or it addressed it right and
+           * the other session is busy — and no way to tell them apart. The room knows:
+           * it routed the message. Saying so here costs nothing and lands in the reply
+           * to the call the asker is already blocked on, which is the one place it is
+           * certain to be read. Distinguishing the two matters as much as spotting the
+           * first: an asker that "fixes" a message that was already correct and sends
+           * it again is the start of the next loop.
+           */
+          const diagnoseSilence = (sync) => {
+            if (!sync) return null;
+            const mine = [...sync.room.messages].reverse().find((message) => message.from === as);
+            if (!mine) return { sent: false, reason: "You have not said anything in this room yet." };
+            const base = { seq: mine.seq, to: mine.to, kind: mine.kind };
+            if (mine.kind === "ack") {
+              return { ...base, reason: "kind \"ack\" reaches the room but wakes nobody. Nothing was notified of this. Send it as \"ask\" if you need an answer." };
+            }
+            if (mine.to !== MAIL_EVERYONE && !sync.room.members.has(mine.to)) {
+              return { ...base, reason: `Addressed to "${mine.to}", who is not in this room. Nobody received it. Address it to everyone, or to a name from the members list.` };
+            }
+            const target = mine.to === MAIL_EVERYONE
+              ? [...sync.room.members.keys()].filter((id) => id !== as)
+              : [mine.to];
+            const unconfirmed = target.filter((id) => sync.room.members.get(id)?.confirmed !== true);
+            if (target.length > 0 && unconfirmed.length === target.length) {
+              return { ...base, reason: "Everyone it was addressed to is still waiting for the room's password, so none of them can read it yet." };
+            }
+            if (target.length === 0) {
+              return { ...base, reason: "There is nobody else in this room to answer." };
+            }
+            return { ...base, reason: "Addressed correctly and delivered. The silence is theirs, not a mistake in what you sent — do not send it again on account of this." };
+          };
+
           const answer = (collected, sync, timedOut) =>
-            sendJson(200, { ok: true, timedOut, ...describeInbox(collected, sync, as) });
+            sendJson(200, {
+              ok: true,
+              timedOut,
+              ...(timedOut ? { yourLastMessage: diagnoseSilence(sync) } : {}),
+              ...describeInbox(collected, sync, as),
+            });
 
           const first = collectInbox();
           if (first.collected.length > 0) {
@@ -2043,6 +2221,11 @@ function startBridge(config) {
           sendJson(400, { ok: false, error: "invalid_reply_to" });
           return;
         }
+        // Who this is for and what it is for. Both are optional and both default to the
+        // loud answer — an unaddressed `tell` to everyone — because a sender who omits
+        // them or spells them wrong has to be over-heard rather than silently dropped.
+        const routedKind = MAIL_KINDS.has(body.kind) && body.kind !== "notice" ? body.kind : MAIL_DEFAULT_KIND;
+        const routedTo = typeof body.to === "string" && body.to.length > 0 ? body.to : MAIL_EVERYONE;
         // A sync room is never conjured by posting to it. A private mailbox is: it is
         // named after one session and writing to it before that session has read
         // anything is ordinary. A room code is not — it is issued, and a code with no
@@ -2091,10 +2274,19 @@ function startBridge(config) {
           });
           return;
         }
-        const message = publishMail(room, from, text, replyTo);
+        // Addressing by the name the room uses, not only by id: those names exist so
+        // that agents can refer to each other, and an address nobody can write is an
+        // address nobody will use.
+        const addressed = routedTo === MAIL_EVERYONE || room.members.has(routedTo)
+          ? routedTo
+          : [...room.members.keys()].find(
+              (id) => labelIn(room, id).toLowerCase() === routedTo.toLowerCase(),
+            ) ?? routedTo;
+        const message = publishMail(room, from, text, replyTo, false, { to: addressed, kind: routedKind });
         // Delivery is per-agent and reported back so a caller can say what will happen
-        // rather than guess: "queued" reaches an idle session, "on_next_turn" waits.
-        const delivery = deliverMail(name, room, text, from);
+        // rather than guess: "queued" reaches an idle session, "on_next_turn" waits,
+        // "not_notified" means it was published and deliberately woke nobody.
+        const delivery = deliverMail(name, room, text, from, message);
         // A queued message is in the session's hands whether or not it answers, so it
         // is not still waiting to be collected. Leaving it pending would light the
         // chip on a session that had already been handed the message.
@@ -2225,10 +2417,20 @@ function startBridge(config) {
             ? (typeof streamed === "number" ? streamed : 0)
             : Number.parseInt(req.headers["last-event-id"] ?? asked ?? "", 10);
         if (Number.isInteger(resumeFrom) && resumeFrom > 0) {
+          const member = watcher ? room.members.get(watcher) : null;
           for (const message of room.messages) {
-            // Same rule as a live push: catching up is not a reason to be handed back
-            // your own words.
-            if (message.seq > resumeFrom && message.from !== watcher) res.write(mailFrame(message));
+            if (message.seq <= resumeFrom) continue;
+            // The same rule as a live push, applied by the same function rather than
+            // restated — the two paths were written apart and drifted apart, so a watch
+            // that reconnected was handed the acknowledgements and room notices it had
+            // just been spared. Every five minutes, for every member.
+            if (wakesMember(message, watcher)) res.write(mailFrame(message));
+            // Moved past whether it was written or not, and moved here rather than only
+            // where frames are pushed. Catching up used to hand messages over without
+            // recording that it had, so `since=resume` answered with the same cursor
+            // next time and replayed the same backlog — every reconnect, for as long as
+            // the room stayed open. A quiet room woke everyone in it every five minutes.
+            if (member) member.streamSeq = Math.max(member.streamSeq ?? 0, message.seq);
           }
         }
 

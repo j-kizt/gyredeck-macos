@@ -1980,6 +1980,14 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     assert.ok(acked, "an acknowledgement is still published");
     assert.equal(acked.kind, "ack");
 
+    // The room brief belongs to a room. It was going out with mailbox deliveries too,
+    // naming the mailbox as though it were one and reporting "Members now: nobody"
+    // above a notice that listed the members who were there.
+    const codexInbox = await call("GET", `/mail/${thread}`);
+    const joinNotice = (codexInbox.body.messages || []).map((message) => message.text).join("\n");
+    assert.doesNotMatch(joinNotice, /Members now: nobody/, "a mailbox has no roster to report");
+    assert.doesNotMatch(joinNotice, new RegExp(`Gyredeck · room ${thread}`), "a mailbox is not a room");
+
     // A turn that never learned the convention must still be heard, loudly.
     await writeFile(rollout, turn("no routing line here"));
     await endTurn();

@@ -398,11 +398,20 @@ function startBridge(config) {
    * and becomes the fields; anything else leaves the text alone and takes the loud
    * default, because a Codex turn that was never taught this must still be heard.
    */
-  const CODEX_ROUTING_LINE = /^@(.+?)[ \t]+(ask|tell|ack)[ \t]*$/i;
+  // Either the line is only the routing, or it carries the message after a separator.
+  // Codex wrote `@Antigravity reaction — รับทราบครับ` every time, which is the natural
+  // way to write it and which the first version of this refused: the line did not match,
+  // so the message fell through to the loud default and went to the whole room as a
+  // tell. Silently, and with an ok and a seq, so nothing looked wrong from either end.
+  // A separator is required rather than plain space, or `@Antigravity tell me about X`
+  // would lose three words to the parser.
+  const CODEX_ROUTING_LINE =
+    /^@(.+?)[ \t]+(ask|tell|reaction|ack)[ \t]*(?:[—–\-:|][ \t]*(.*))?$/i;
   const routeCodexReply = (room, text) => {
     const [first, ...rest] = text.split("\n");
     const match = CODEX_ROUTING_LINE.exec(first.trim());
     if (!match) return { text, routing: { to: MAIL_EVERYONE, kind: MAIL_DEFAULT_KIND } };
+    const inline = (match[3] ?? "").trim();
     const target = match[1].trim();
     const to = /^everyone$/i.test(target)
       ? MAIL_EVERYONE
@@ -411,7 +420,11 @@ function startBridge(config) {
         : [...room.members.keys()].find(
             (id) => labelIn(room, id).toLowerCase() === target.toLowerCase(),
           ) ?? MAIL_EVERYONE;
-    return { text: rest.join("\n").trim() || text, routing: { to, kind: match[2].toLowerCase() } };
+    // A line with nothing under it said everything it meant in the line. Falling back
+    // to the whole text published `@everyone ack` as the message body, which is the
+    // instruction wearing the costume of a reply.
+    const body = [inline, rest.join("\n").trim()].filter(Boolean).join("\n");
+    return { text: body || "ok", routing: { to, kind: asKind(match[2].toLowerCase()) } };
   };
 
   /** Where the last harvest of each Codex log stopped, as a byte offset into it. */
@@ -476,6 +489,10 @@ function startBridge(config) {
       if (!claimCodexReply(conversationId, reply)) continue;
       if (refuseToPublish(found.room, conversationId)) continue;
       const { text, routing } = routeCodexReply(found.room, reply.text);
+      // Codex never sees a refusal, so the run is broken by not publishing rather than
+      // by answering — the next brief tells it no seq followed, which is the signal it
+      // has for anything that did not arrive.
+      if (routing.kind === "reaction" && reactionRunExhausted(found.room)) continue;
       const published = publishMail(found.room, conversationId, text, null, true, routing);
       if (published?.seq) publishedForCodex.set(conversationId, published.seq);
       deliverMail(found.name, found.room, text, conversationId, published);
@@ -628,6 +645,26 @@ function startBridge(config) {
     if (member?.label) room.formerLabels.set(conversationId, member.label);
     room.members.delete(conversationId);
     harvestAt.delete(codexRolloutFor(conversationId) ?? "");
+  };
+
+  /**
+   * Tell the session that was just let in, not only the room it was let into.
+   *
+   * The roster announcement is state and wakes nobody, which is right — and left the
+   * one session that most needed to know entirely uninformed. Codex sat asking for a
+   * password it had already been given and could not have used, because being confirmed
+   * had been announced to everyone except it.
+   */
+  const tellConfirmed = (name, room, conversationId) => {
+    const mailbox = mailRoomFor(conversationId, true);
+    if (!mailbox) return;
+    const text =
+      `[Gyredeck: you are confirmed in room ${name} and may speak here now. Reply to this` +
+      " with a reaction so the person at this terminal can see that it took: a reaction" +
+      " is a short line saying where this leaves you, it interrupts nobody, and nothing" +
+      " answers it.]";
+    const told = publishMail(mailbox, ROOM_SENDER, text, null, false, { to: conversationId, kind: "tell" });
+    deliverMail(conversationId, mailbox, text, ROOM_SENDER, told);
   };
 
   /**
@@ -1254,7 +1291,47 @@ function startBridge(config) {
    * is the room speaking about itself; the roster it carries already rides on every
    * message Codex is handed, so waking anyone for it buys nothing.
    */
-  const MAIL_KINDS = new Set(["ask", "tell", "ack", "notice"]);
+  const MAIL_KINDS = new Set(["ask", "tell", "reaction", "notice"]);
+  /**
+   * What may be said back, which is as much of the design as what may be sent.
+   *
+   * An `ask` is answered. A `tell` may be answered with a `reaction` and nothing more,
+   * and so may a `notice` — a member told that somebody joined or left may want to say
+   * what that means for it, and the person watching wants to see that it noticed. A
+   * `reaction` ends there. Without that last clause the pair is a conversation again:
+   * the loop that closed a room was two agents each answering what the other had merely
+   * said.
+   *
+   * There was briefly an `ack` beside `reaction` and it earned nothing: same routing,
+   * same terminal position, differing only in that one was defined to carry no content.
+   * A reaction says the same thing and says it usefully, because the person watching a
+   * terminal is the audience and the framing already asks a session to show what it
+   * sent. `ack` is still accepted on the wire and read as a reaction — dropping it would
+   * turn every acknowledgement already in flight into the loud default, which is the one
+   * direction this must never fail in.
+   */
+  const MAIL_TERMINAL_KINDS = new Set(["reaction"]);
+  const asKind = (value) => (value === "ack" ? "reaction" : value);
+  /**
+   * How many reactions may follow one another before the room stops taking them.
+   *
+   * A reaction is where an exchange is supposed to stop, and saying so is an
+   * instruction — the kind that failed twice today. This is the same rule with something
+   * behind it. Ordinary use never comes near: a tell answered by a reaction is one in a
+   * row, and three sessions each reacting to the same notice is three. A fourth means
+   * reactions are being answered with reactions, which is the shape of the loop that
+   * closed a room, and it is refused with the reason rather than absorbed.
+   */
+  const MAIL_MAX_REACTION_RUN = 3;
+  const reactionRunExhausted = (room) => {
+    let run = 0;
+    for (let index = room.messages.length - 1; index >= 0; index -= 1) {
+      if (room.messages[index].kind !== "reaction") break;
+      run += 1;
+      if (run >= MAIL_MAX_REACTION_RUN) return true;
+    }
+    return false;
+  };
   /** Unaddressed and attention-worthy: what a sender who says nothing must get. */
   const MAIL_DEFAULT_KIND = "tell";
   const MAIL_EVERYONE = "everyone";
@@ -1278,10 +1355,23 @@ function startBridge(config) {
    * having, since a member told an hour ago that somebody was here may be about to ask
    * them for something.
    */
-  const wakesMember = (message, conversationId) => {
-    if (message.kind === "ack" || message.kind === "notice") return false;
-    return reachesMember(message, conversationId);
-  };
+  /**
+   * Whether it interrupts them, which — since every kind now does — is the same question.
+   *
+   * It was not always. `ack` and `notice` were silent for a while, and silence turned out
+   * to be the wrong tool: a confirmation nobody is woken for is a confirmation nobody
+   * gets, and somebody joining or leaving is exactly the thing a member needs promptly,
+   * since it decides who there is left to ask. So addressing is the only thing that
+   * routes, and `kind` says what to do about a message rather than who hears it.
+   *
+   * What bounds an exchange is now the reply rules alone: an ask is answered, a tell or a
+   * notice may draw a reaction, and a reaction is never answered. The loop that closed a
+   * room was not caused by replies waking people — it was caused by every reply going to
+   * everyone, which addressing fixes and which the briefs now say outright. The two
+   * functions are kept apart because the distinction is real and may be wanted again;
+   * today they agree.
+   */
+  const wakesMember = (message, conversationId) => reachesMember(message, conversationId);
 
   const publishMail = (room, from, text, replyTo, fromSession = false, routing = null) => {
     room.seq += 1;
@@ -1297,10 +1387,11 @@ function startBridge(config) {
     // arrive. Until this was explicit the difference rested on whether a caller had
     // happened to pass the message on to delivery — right by accident, and one tidying
     // pass away from a session never learning it had been disconnected.
+    const asked = asKind(routing?.kind);
     const kind = from === ROOM_SENDER
-      ? (routing?.kind === "tell" ? "tell" : "notice")
-      : MAIL_KINDS.has(routing?.kind) && routing.kind !== "notice"
-        ? routing.kind
+      ? (asked === "tell" ? "tell" : "notice")
+      : MAIL_KINDS.has(asked) && asked !== "notice"
+        ? asked
         : MAIL_DEFAULT_KIND;
     const message = {
       seq: room.seq,
@@ -1524,11 +1615,14 @@ function startBridge(config) {
           // ten seconds, because "is there anything else?" is not an acknowledgement in
           // its own reading. A label it writes is something it can get right.
           " Open your message with one line saying who it is for and what it is:" +
-          " @everyone ask, @everyone tell, @everyone ack, or a member's name in place of" +
-          " everyone. The line is removed before the room sees it. ask and tell reach" +
-          " the people named; ack reaches the room and interrupts nobody, so courtesy" +
-          " costs no one a turn and you may send it freely. Leave the line out and it" +
-          " goes to everyone as tell, which interrupts them all — so say it." +
+          " @everyone ask, @Antigravity tell, @everyone reaction, or any member's name" +
+          " in place of everyone. The line is removed before the room sees it. ask wants" +
+          " an answer; tell does not but may draw a reaction; a reaction is a short line" +
+          " saying it landed and where that leaves you — send one for a tell or for a" +
+          " notice that somebody joined or left, and never answer one, which is where an" +
+          " exchange stops. Leave the line out and it goes to everyone as tell, which" +
+          " interrupts them all. When you answer someone, name them: that is what keeps" +
+          " one exchange costing one wake instead of waking the room." +
           // Its roster is memory of announcements it happened to receive: it cannot
           // read the room's state, so a push that failed once would leave it wrong
           // forever. Restating who is here on every message costs a line and closes it.
@@ -1789,6 +1883,7 @@ function startBridge(config) {
             room,
             `${labelIn(room, conversationId)} was confirmed by the room's owner and can now speak here.`,
           );
+          tellConfirmed(code, room, conversationId);
         }
         sendJson(200, { ok: true, room: code, password: room.password });
         return;
@@ -1852,6 +1947,7 @@ function startBridge(config) {
           room,
           `${labelIn(room, conversationId)} was confirmed by the room's owner and can now speak here.`,
         );
+        tellConfirmed(code, room, conversationId);
         sendJson(200, {
           ok: true,
           ...describeRoom(code, room, conversationId),
@@ -2071,6 +2167,10 @@ function startBridge(config) {
             for (const message of room.messages) {
               if (message.seq <= reader.readSeq) continue;
               examined.set(roomName, Math.max(examined.get(roomName) ?? 0, message.seq));
+              // Everything addressed here, whatever its kind. A collection costs no
+              // turn, and both of the quiet kinds have something to give a reader: a
+              // notice says who arrived or left, and a reaction says how somebody took
+              // what was said to them.
               if (shared && !reachesMember(message, as)) continue;
               fresh.push({ room: roomName, ...message });
             }
@@ -2242,7 +2342,9 @@ function startBridge(config) {
         // Who this is for and what it is for. Both are optional and both default to the
         // loud answer — an unaddressed `tell` to everyone — because a sender who omits
         // them or spells them wrong has to be over-heard rather than silently dropped.
-        const routedKind = MAIL_KINDS.has(body.kind) && body.kind !== "notice" ? body.kind : MAIL_DEFAULT_KIND;
+        const routedKind = MAIL_KINDS.has(asKind(body.kind)) && asKind(body.kind) !== "notice"
+          ? asKind(body.kind)
+          : MAIL_DEFAULT_KIND;
         const routedTo = typeof body.to === "string" && body.to.length > 0 ? body.to : MAIL_EVERYONE;
         // A sync room is never conjured by posting to it. A private mailbox is: it is
         // named after one session and writing to it before that session has read
@@ -2300,6 +2402,14 @@ function startBridge(config) {
           : [...room.members.keys()].find(
               (id) => labelIn(room, id).toLowerCase() === routedTo.toLowerCase(),
             ) ?? routedTo;
+        if (routedKind === "reaction" && reactionRunExhausted(room)) {
+          sendJson(409, {
+            ok: false,
+            error: "reaction_run",
+            message: `The last ${MAIL_MAX_REACTION_RUN} messages in this room are reactions, so this one was not published. A reaction is where an exchange stops — nothing answers one. If you have something to add, send it as a tell or an ask.`,
+          });
+          return;
+        }
         const message = publishMail(room, from, text, replyTo, false, { to: addressed, kind: routedKind });
         // Delivery is per-agent and reported back so a caller can say what will happen
         // rather than guess: "queued" reaches an idle session, "on_next_turn" waits,

@@ -2043,9 +2043,28 @@ function startBridge(config) {
           sendJson(400, { ok: false, error: "invalid_reply_to" });
           return;
         }
-        const room = mailRoomFor(name, true);
+        // A sync room is never conjured by posting to it. A private mailbox is: it is
+        // named after one session and writing to it before that session has read
+        // anything is ordinary. A room code is not — it is issued, and a code with no
+        // room behind it means the room ended, most often because the bridge restarted
+        // and took its memory with it.
+        //
+        // Creating one here answered ok:true with a seq for a message nobody would ever
+        // read: the new room has no members, so the guard below — which only applies to
+        // rooms that have any — waved it through. The sender was told the one thing it
+        // is supposed to be able to trust. Watchers already stop themselves when a room
+        // goes; until now senders were the half still being lied to.
+        const room = SYNC_CODE.test(name) ? mailRooms.get(name) ?? null : mailRoomFor(name, true);
         if (!room) {
-          sendJson(429, { ok: false, error: "too_many_rooms" });
+          if (SYNC_CODE.test(name)) {
+            sendJson(404, {
+              ok: false,
+              error: "no_such_room",
+              message: "Nothing by that code is open. A room ends with its last member, and with the bridge that held it — this message was not delivered to anyone.",
+            });
+          } else {
+            sendJson(429, { ok: false, error: "too_many_rooms" });
+          }
           return;
         }
         // This is where the password earns its place. A room with members is one people

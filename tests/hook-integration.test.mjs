@@ -1085,7 +1085,7 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
 
     const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
     assert.equal(minted.status, 200);
-    assert.match(minted.body.password, /^gk-[a-z2-9]{10}$/);
+    assert.match(minted.body.password, /^[0-9a-f]{32}$/, "the length and shape of an MD5 digest");
 
     // The room's token is what authorises, and it travels in the header — the same
     // place a credential already goes, so "attach it to every message" costs nothing.
@@ -1132,7 +1132,14 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
       headers: { "x-gyredeck-token": minted.body.password },
     });
     assert.equal(anonymous.status, 403);
-    assert.equal((await anonymous.json()).error, "not_a_member");
+    // Shaped like the stream it refuses, not like an ordinary error. A watcher reads
+    // the body for `data:` lines because that is what a stream is made of, so a plain
+    // JSON refusal is printed and then dropped by the reader's own filter — leaving a
+    // watch that looks exactly like a quiet room. A live session hit this and had to
+    // work out the missing `?as=` for itself.
+    const refusal = await anonymous.text();
+    assert.match(refusal, /^event: error\ndata: /, "a refused watch answers in frames");
+    assert.equal(JSON.parse(refusal.split("data: ")[1]).error, "not_a_member");
 
     const allowed = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${joiner}`, {
       headers: { "x-gyredeck-token": minted.body.password },
@@ -1150,8 +1157,30 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
     const told = await call("GET", `/mail/inbox?as=${joiner}`);
     assert.match(
       told.body.messages.at(-1).text,
-      /no longer in room .*stop it: it has been closed from this end/s,
+      /no longer in room .*stop yours and do not open another/s,
     );
+
+    // Closing is the room's end, not one member's exit: everyone is told, every stream
+    // is cut, and only then does the room go. Doing it in the other order would leave
+    // nobody to tell and no stream to find.
+    // `joiner` was disconnected earlier in this test, so bring someone back in to be
+    // the member who gets told — closing an empty-but-for-the-founder room proves
+    // nothing about telling anyone.
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: stranger });
+    const outsiderClose = await fetch(`http://127.0.0.1:${port}/sync/rooms/${code}?as=${stranger}`, {
+      method: "DELETE",
+      headers,
+    });
+    assert.equal(outsiderClose.status, 403, "only the founder ends a room others are in");
+
+    const closed = await fetch(`http://127.0.0.1:${port}/sync/rooms/${code}?as=${founder}`, {
+      method: "DELETE",
+      headers,
+    });
+    assert.equal(closed.status, 200);
+    const closeNotice = await call("GET", `/mail/inbox?as=${stranger}`);
+    assert.match(closeNotice.body.messages.at(-1).text, /no longer in room .*the room was closed/s);
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, null);
 
     // A code nobody is in cannot be watched into existence: a watcher on a dead room
     // would see nothing forever and have no way to tell that from silence.
@@ -1302,14 +1331,18 @@ test("an inbox merges a session's mailbox with its sync room, and the cap cannot
     // speaks first and twice: the peer arrived, then the peer was confirmed. News about
     // the room travels the same way anything else does, or a member that cannot read an
     // inbox never hears it.
+    // The first is this session's own mailbox telling it that it is in a room — the
+    // room cannot carry that, since an unconfirmed member cannot read the room.
     assert.deepEqual(merged.messages.map((message) => [message.room, message.from]), [
+      [me, "gyredeck-room"],
       [code, "gyredeck-room"],
       [code, "gyredeck-room"],
       [me, "gyredeck"],
       [code, peer],
     ]);
-    assert.match(merged.messages[0].text, /joined this room\. Members now: /);
-    assert.match(merged.messages[1].text, /was confirmed by the room's owner/);
+    assert.match(merged.messages[0].text, /you are now in sync room .*you created it/s);
+    assert.match(merged.messages[1].text, /joined this room\. Members now: /);
+    assert.match(merged.messages[2].text, /was confirmed by the room's owner/);
     // The same call names the room and who is in it, so a hook with a sub-second
     // budget does not need a second request to know who it is talking to.
     assert.equal(merged.room, code);
@@ -1489,7 +1522,10 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     assert.match(fromRoomMate, new RegExp(`sync room ${code}`));
     // What each session is for came from its own user in its own terminal, so the room
     // introduces members by provider and says nothing about their jobs.
-    assert.match(fromRoomMate, /because the user connected you to it/);
+    // The briefing leads with where the session is and who is with it, before anything
+    // about what to do — a session reading this first should be able to act on it
+    // without having read anything else.
+    assert.match(fromRoomMate, /WHERE: the person at this terminal put you in this room/);
     assert.match(fromRoomMate, /Also here: Codex\./);
     assert.match(fromRoomMate, /what you are here for/);
     assert.doesNotMatch(fromRoomMate, /information only/);
@@ -1515,7 +1551,9 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     // Every tier asks for both directions, because the person may not have started
     // the exchange and the terminal is their only window onto it.
     for (const injected of [fromRoomMate, fromUser, fromStranger]) {
-      assert.match(injected, /say what you sent back/);
+      // The words sent, not the fact of sending: "I answered Codex" reads as openness
+      // while telling the person nothing about what was said for them.
+      assert.match(injected, /show what you sent — the words themselves/);
     }
   } finally {
     bridge.stdin.end();

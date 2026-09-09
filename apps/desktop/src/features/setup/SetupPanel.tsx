@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, Link2, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, Link2, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, ShieldCheck, Trash2, X } from "lucide-react";
 import type { IGyredeckBridgeCapabilities } from "@gyredeck/protocol";
 import { shortenPath } from "../session/activity";
 import type { IUseUpdater } from "../updater/useUpdater";
@@ -32,7 +32,8 @@ export interface ISetupPanelProps {
   keepAwakeError: string | null;
   hookStatus: { path: string | null; installed: boolean | null };
   /** Rooms the bridge currently holds, keyed by code. Only ones with members are shown. */
-  mailRooms: Record<string, { room: string; members: string[]; pending: number }>;
+  mailRooms: Record<string, { room: string; members: string[]; pending: number; founder: string | null }>;
+  onCloseRoom: (room: string, founder: string) => Promise<void>;
   /** Null while unknown, so the switch does not claim "off" before it has looked. */
   syncRepliesAllowed: boolean | null;
   syncRepliesBusy: boolean;
@@ -151,7 +152,8 @@ const GitAccountList = ({ accounts, canUseNativeControls, onSetActive, onRemove 
 };
 
 /**
- * The sync rooms the bridge is holding, laid out like the account list.
+ * The sync rooms the bridge is holding, laid out like the account list, and shown only
+ * while there are any.
  *
  * Only rooms with members: a plain mailbox exists for every session that has ever been
  * sent anything, and listing those would bury the two or three that mean something.
@@ -161,32 +163,35 @@ const GitAccountList = ({ accounts, canUseNativeControls, onSetActive, onRemove 
 const SyncRoomList = ({
   rooms,
   canUseNativeControls,
+  onCloseRoom,
 }: {
-  rooms: Record<string, { room: string; members: string[]; pending: number }>;
+  rooms: Record<string, { room: string; members: string[]; pending: number; founder: string | null }>;
   canUseNativeControls: boolean;
+  onCloseRoom: (room: string, founder: string) => Promise<void>;
 }) => {
+  const [closing, setClosing] = useState<string | null>(null);
   if (!canUseNativeControls) return null;
   const open = Object.values(rooms).filter((entry) => entry.members.length > 0);
-  if (open.length === 0) {
-    return (
-      <div className="setup-row passive">
-        <span className="status-slot"><Link2 className="setup-icon" size={14} strokeWidth={2.3} /></span>
-        <span className="setup-copy">
-          <span className="setup-title">Sync rooms</span>
-          <span className="setup-detail">None open — connect two sessions from a session's detail panel</span>
-        </span>
-      </div>
-    );
-  }
+  // Absent rather than empty. A room exists only while people are using one, so "none
+  // open" is the ordinary state and a row saying so would sit under Connection
+  // permanently, describing nothing.
+  if (open.length === 0) return null;
   return (
-    <div className="setup-account-list">
+    <>
+      <div className="setup-subheading">Sync rooms</div>
+      <div className="setup-account-list">
       {open.map((entry) => (
-        <div className="setup-account-row" key={entry.room}>
+        <div className="setup-account-row" key={entry.room} data-closing={closing === entry.room}>
           <span className="setup-account-icon"><Link2 size={15} strokeWidth={2.3} /></span>
           <span className="setup-account-main">
             <span className="setup-account-login">{entry.room}</span>
             <span className="setup-account-tags">
-              <span className="setup-detail">{entry.members.join(" · ")}</span>
+              {/* A count, not a roster: which sessions are in a room is answered in
+                  their own detail panels, and naming them here made every row as tall
+                  as the number of members. */}
+              <span className="setup-detail">
+                {entry.members.length === 1 ? "1 session" : `${entry.members.length} sessions`}
+              </span>
             </span>
           </span>
           {entry.pending > 0 ? (
@@ -194,9 +199,34 @@ const SyncRoomList = ({
               {entry.pending} waiting
             </span>
           ) : null}
+          {entry.founder ? (
+            // Closing ends the room for everyone in it, so it belongs to whoever opened
+            // it — the same hand that gave out the password. It is not instant either:
+            // every member is told and every stream is cut before the room goes, so the
+            // button says it is working rather than sitting dead until the row leaves.
+            <button
+              className="gh-icon-btn danger"
+              type="button"
+              disabled={closing === entry.room}
+              onClick={() => {
+                setClosing(entry.room);
+                void onCloseRoom(entry.room, entry.founder ?? "").finally(() => setClosing(null));
+              }}
+              data-tauri-drag-region="false"
+              title={closing === entry.room ? "Closing…" : "Close this room for everyone in it"}
+              aria-label={closing === entry.room ? `Closing room ${entry.room}` : `Close room ${entry.room}`}
+            >
+              {closing === entry.room ? (
+                <RefreshCw className="setup-spin" size={13} strokeWidth={2.4} />
+              ) : (
+                <Trash2 size={13} strokeWidth={2.3} />
+              )}
+            </button>
+          ) : null}
         </div>
-      ))}
-    </div>
+        ))}
+      </div>
+    </>
   );
 };
 
@@ -212,7 +242,7 @@ const UPDATER_DETAIL: Record<IUseUpdater["status"], string> = {
 const MIN_BRIDGE_PORT = 1024;
 const MAX_BRIDGE_PORT = 65535;
 
-export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, mailRooms, syncRepliesAllowed, syncRepliesBusy, onSyncRepliesChange, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
+export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, mailRooms, onCloseRoom, syncRepliesAllowed, syncRepliesBusy, onSyncRepliesChange, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
   const [activeCategory, setActiveCategory] = useState<SetupCategory>("connection");
   const [compactNavigation, setCompactNavigation] = useState(() => window.matchMedia("(max-width: 380px)").matches);
   const credentialHelper = useGitCredentialHelper(canUseNativeControls);
@@ -299,8 +329,8 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
               <div className="setup-row"><span className="bridge-dot" data-connected={isConnected} title={connectionTitle} /><span className="setup-copy"><span className="setup-title">Bridge</span><span className="setup-detail">{connectionTitle}</span></span>{!isConnected ? <button className="pill-btn" type="button" disabled={pendingAction === "bridge"} onClick={() => void runAction("bridge", onCheckBridge)} data-tauri-drag-region="false" aria-label="Reconnect bridge">{pendingAction === "bridge" ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : <PlugZap size={12} strokeWidth={2.3} />}{pendingAction === "bridge" ? "Reconnecting…" : "Reconnect"}</button> : null}</div>
               <div className="setup-row setup-row-stack"><div className="setup-row-main"><span className="status-slot"><PlugZap className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Bridge port</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : portStatus ?? `Local bridge port · ${bridgePort}`}</span></span>{canUseNativeControls ? <button className="pill-btn" type="button" onClick={toggleEditPort} data-tauri-drag-region="false" aria-expanded={editingPort} aria-label="Edit bridge port"><Pencil size={12} strokeWidth={2.3} />Edit</button> : null}</div>{editingPort ? <span className="setup-row-actions full"><input className="setup-input" type="number" min={MIN_BRIDGE_PORT} max={MAX_BRIDGE_PORT} value={portField} onChange={(event) => setPortField(event.target.value)} disabled={portBusy} data-tauri-drag-region="false" aria-label="Bridge port" autoFocus /><button className="pill-btn accent" type="button" onClick={() => void applyPort()} disabled={!canApplyPort} data-tauri-drag-region="false"><Check size={12} strokeWidth={2.3} />Apply</button></span> : null}</div>
               <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{guidance.title}</span><span className="setup-detail">{guidance.detail}</span></span></div>
-              <SyncRoomList rooms={mailRooms} canUseNativeControls={canUseNativeControls} />
               {nativeAction.message ? <div className="notice-row" data-online={nativeAction.bridgeOnline === true} role="status" aria-live="polite">{nativeAction.message}</div> : null}
+              <SyncRoomList rooms={mailRooms} canUseNativeControls={canUseNativeControls} onCloseRoom={onCloseRoom} />
             </>
           ) : null}
 

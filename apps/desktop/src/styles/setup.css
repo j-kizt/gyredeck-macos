@@ -111,6 +111,12 @@
   background: rgba(255, 255, 255, 0.04);
 }
 
+/* A room on its way out reads as leaving rather than simply present, so the wait is
+   visible in the row and not only in the button. */
+.setup-account-row[data-closing="true"] {
+  opacity: 0.55;
+}
+
 .setup-account-icon {
   display: inline-flex;
   flex: none;

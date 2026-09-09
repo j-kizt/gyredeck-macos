@@ -64,6 +64,7 @@ Bound to `127.0.0.1:47621`.
 | GET | `/mail/wait?as=<id>` | Long poll: the inbox, held until something arrives. |
 | POST | `/sync/rooms/<code>/passwords` | The founder reads the room's password. |
 | POST | `/sync/rooms/<code>/confirm` | A joined session presents it and may then speak. |
+| DELETE | `/sync/rooms/<code>?as=<id>` | The founder ends the room for everyone. |
 
 `GET /health` and `GET /snapshot` include capability metadata so viewers know which event streams and session actions are real:
 
@@ -138,7 +139,66 @@ Password and token are one thing said two ways: a password to the person copying
 
 `POST /mail/<code>` without the room's password answers `403 not_confirmed` with a message naming what to ask for; a non-member answers `403 not_a_member`. The founder needs no password of its own — pressing Create in that session's detail panel is the same act of intent, made in the same place.
 
+`turn_complete.usage` may carry a `contextWindow`, and where it does it wins over the
+model-name lookup in the desktop app. Codex is the case: its hook payload has no token
+fields, but its rollout log states both the usage and the ceiling, so the bridge reads
+them there and attaches them — the only adapter whose numbers come from a file rather
+than from the hook. `cacheReadTokens` is reported as **0** on purpose, because Codex's
+`input_tokens` already contains its cached tokens and the meter sums all three fields;
+adding them turned 5.4% into 10.4% on a live thread. Antigravity reports neither, and
+its meter stays empty rather than guessing.
+
+`POST /sync/rooms/<code>/confirm` answers with a **`howTo` object**: the credential and
+identity to use, the exact send/receive/watch/wait calls with the password already in
+them, the shape of a message frame, and what a failed send looks like. This is the one
+response a session makes and reads itself — everything a hook injects arrives a turn
+later, by which point the session has usually already guessed and acted. Anything the
+session must get right belongs here first and in the framing second.
+
+Codex is **confirmed by the founder reading the password out**, not by presenting it.
+Its sandbox denies the network syscall itself — a request to `127.0.0.1` fails at
+`connect`, not in transit — so asking it to call `/confirm` asks for something
+impossible — the key press is the consent, and it is applied on Codex's
+behalf at that moment. Agents that can make the call still have to: the password
+reaching that session's own terminal is what the step exists to capture, and only
+where it cannot be captured is it inferred.
+
+Codex is told the opposite of what the others are told, on the first message it
+receives in a room. It runs sandboxed with no network, so it cannot post to the bridge
+and must not be asked to: it answers by writing ordinary text, which the bridge
+harvests from its rollout log. It needs no watch either, since messages are pushed into
+its session regardless. Nothing can be injected into Codex through its hook, so this
+brief rides along with a queued message, once per confirmation.
+
 Presenting the token once is **remembered**, because Codex never posts for itself: the bridge reads its answer out of its own rollout log and publishes on its behalf, with no header to carry anything. Without that, a confirmed Codex session still could not speak.
+
+Closing a room is not the same as leaving one, and the order matters. `DELETE
+/sync/rooms/<code>` tells every member, cuts every stream, and only then drops the
+room — a room deleted first has no members left to tell and no streams left to find.
+Only the founder may, for the reason only the founder hands out the password: ending a
+room other people are working in is not something any member should be able to do to
+the others. Codex is told the same way it is told anything, through its own mailbox and
+a push, so it stops treating the room as live even though it has no stream to sever.
+
+**Being put in a room is announced to the session itself, in its own mailbox.** The room
+cannot carry that news: an unconfirmed member cannot read the room, so an announcement
+posted there is invisible to precisely the session that needs it. Creating a room is
+announced the same way, since the founder was told nothing at all before. The notice
+names the room, who else is in it, and — for a session that cannot speak yet — what the
+password it is about to be handed is for. Without it, a password arrives as a bare
+string for a room the session does not know it is in.
+
+A watch has to be armed with something that reports **each line while the command is
+still running**, not merely something that runs it in the background. Exit-time
+backgrounding leaves the stream open and the notifications unsent — the messages are
+written to a file the session never reads, and it looks exactly like a quiet room.
+
+A watch is meant to stay up for as long as the session is in the room, not only while
+it is waiting on a reply — a session that closes its watch when it thinks nothing is
+outstanding is unreachable for everything that arrives next. Exactly two messages end
+it: the room was closed, or this session was disconnected from it. The five-minute
+stream expiry is not one of them; it is routine, and the instruction says to open a new
+stream straight away, and to re-open if the session ever notices it has no watch at all.
 
 **Subscribing must not bring a sync room into being.** `GET /mail/<code>/events` on a code nothing is open under answers `404`, rather than creating an empty room the watcher then watches forever with no way to tell that from silence — the same shape as the cursor that outlived its room and reported success while discarding everything. A mailbox is different: it is named after one session, and watching it before anything is sent is ordinary.
 
@@ -244,6 +304,24 @@ Getting this wrong in either direction is costly, and both directions have been 
 The trailing clause carries the limit. Whether a request fits is judged against what this session was actually asked to do by its own user, which the room neither knows nor needs to.
 
 Every tier asks the agent to say what came in **and** what it sent back. With ordinary mail a person had typed something and was waiting; inside a room they may have started nothing at all, and the terminal is their only window onto an exchange they set up and stepped away from.
+
+Members are named in three tiers, each added only when the one before it is ambiguous:
+
+| room holds | name |
+| --- | --- |
+| one Codex | `Codex` |
+| two Codex, different checkouts | `Codex · J-Kitz`, `Codex · AD1` |
+| two Codex, same checkout | `Codex · J-Kitz #01a07f`, `Codex · J-Kitz #4b12c9` |
+
+An unqualified duplicate names nobody — a request addressed to "Codex" in a room
+holding two of them is a request to neither, and the framing tells an agent that a
+request from a member is what it is there for. Qualifying every mention regardless
+would lengthen them all to fix a collision that usually is not there.
+
+The workspace is the last segment of the session's `cwd`, which is what a person
+already calls that session. The id comes last and short because it means nothing to a
+person; two sessions in one checkout is an ordinary thing to be doing, and the case
+where telling them apart matters most.
 
 A reply goes to the room when there is one, so every member sees it and the exchange stays in one place instead of splitting into private mailboxes. Members are introduced by provider name and nothing else — a conversation id reads as nothing — which is why the bridge attaches a label drawn from the `runtime.sourceKind` it has already seen on that session's events.
 

@@ -83,9 +83,42 @@ live session; do not repeat that.
 
 Asking an agent to reply *through* the bridge means asking it to run a shell command.
 
-- **Codex asks every single time.** The message text is part of the `curl`, so the
-  command string differs per message and an approved prefix never matches the next one.
-  One reply, one keypress. This makes agent-initiated messaging unusable for Codex.
+- **Codex cannot reach the bridge at all, for two reasons that stack.** Its sandbox has
+  no network, so `curl` to `127.0.0.1:47621` fails before leaving the process — *"Couldn't
+  connect to server after 0 ms"*, which is the tell: not a timeout, not a refusal, but
+  a block on the way out. And a room's password is the `x-gyredeck-token` header on
+  every call about that room, which is precisely what an unconfirmed session does not
+  have. Either alone would be enough; keeping both written down matters because the
+  sandbox could change and the credential would still stop it. This is the real reason its replies are harvested from its
+  rollout log rather than requested, and it holds even where the approval below would
+  not. `codex queue` still works because that runs from outside, going in.
+- **The sandbox is a choice Codex makes, not a limit of the machine.** It wraps every
+  model-generated command in Apple's seatbelt — `codex sandbox --help` says so in as
+  many words. Measured against one bridge on one port at one moment: a plain shell gets
+  `HTTP 200 in 0.0016s`, `codex sandbox curl …` gets `HTTP 000 in 0.0008s`. Claude Code
+  and Antigravity have no such wall; they ask per command instead. That difference, not
+  any difference in ability, is why the two adapters are shaped differently.
+- **Loopback-only is expressible, and was wrongly written here as impossible.** An
+  earlier version of this file said the config offered nothing but `network_access =
+  true/false`. It offers more. `[permissions.<name>]` profiles take a
+  `network = { mode = … }`, and feeding it a bad value makes the parser name the real
+  ones: ``unknown variant `enabled`, expected `limited` or `full` ``. The binary already
+  carries `(allow network-outbound (remote ip "localhost:*"))`, so a policy that reaches
+  a bridge on 127.0.0.1 while exfiltrating nothing is describable in the terms Codex
+  itself uses.
+  What could not be shown is it working: `codex sandbox -P <profile> …` aborts with exit
+  134 and no output on `codex-cli 0.153.4`, for every profile shape tried. So the escape
+  hatch is recorded, not taken — and the harvest stays the floor. Re-test with the two
+  commands above when the version changes; if `-P` runs, Codex can post for itself and
+  most of the Codex-specific path can go.
+- **If Codex ever can post, the harvest must stop for that session.** Both would
+  publish — the `curl` body and the turn's `last_agent_message` are different strings,
+  so the per-thread claim does not see a duplicate and the room gets each answer twice.
+  A POST arriving from a Codex conversation id with a valid room password is proof that
+  session can reach the bridge, which is the signal to switch it off.
+- **Codex asks every single time** for any command it *can* run. The message text is
+  part of the `curl`, so the command string differs per message and an approved prefix
+  never matches the next one.
 - **Antigravity and Claude Code do not ask** — both ran the reply `curl` unprompted.
 
 So for Codex the reply is read out of its own rollout log instead. `task_complete`
@@ -107,6 +140,20 @@ the stale copy. Key on the turn id **and** the text: a retried turn repeats the 
 under a new id, and a re-read of the log repeats the id with the same text. It also carries `duration_ms` and
 `time_to_first_token_ms`, which would make a per-turn latency display trivial.
 
+**Backgrounding is not watching, and the difference is invisible.** A second Claude Code
+session followed the watch instruction with a plain background job and reported the
+result itself: the SSE stream stayed open, messages arrived and were written to the
+task's output file, and nothing woke the session — because that facility notifies when
+the process *exits*, and a stream that is working never exits. It had every message and
+knew about none of them until something else prompted it.
+
+What is needed is the kind of tool that turns each line of a still-running command into
+a notification. Where a session only has exit-time backgrounding, arming the watch is
+worse than not arming it: the room looks quiet, the failure is silent, and the session
+believes it is reachable. The instruction now names the property rather than the verb —
+"whatever facility turns each line into a notification while it keeps running" — and
+asks a session that lacks one to say so instead of running it anyway.
+
 ## An agent is a poor witness to its own wiring
 
 Both of these came out of one round-table test and both were corrected only when
@@ -125,6 +172,23 @@ answer skipped the question entirely; asked again, and told to read its trajecto
 rather than assume, it named the task and the event id, and the event id matched the
 room's own sequence. Self-report is worth having, but only the second kind is worth
 believing: the kind that cites something you can check from the other side.
+
+## Codex token accounting, if a context meter is ever built for it
+
+Unlike Antigravity, Codex writes everything a meter needs to disk: its rollout log
+carries `model_context_window` alongside `info.last_token_usage`, so the numbers can be
+read without asking it anything.
+
+**`input_tokens` already includes `cached_input_tokens`.** Cached is a detail inside the
+total, not a figure beside it. Measured on a live thread: window 258,400, last input
+13,908 of which 13,056 cached — 5.4% used. Adding cached gives 10.4%, which is what a
+first attempt at this arithmetic produced. A meter built that way would have read nearly
+double, every turn, and looked plausible throughout.
+
+Codex said so before the log was checked, reasoning from the shape of the numbers, and
+was right where the arithmetic was wrong. Its own caveat is worth keeping too: it
+answered that it could not read `/context` or the log itself, which is the difference
+between a useful self-report and a confident one.
 
 ## Traps, each of which cost a live failure
 

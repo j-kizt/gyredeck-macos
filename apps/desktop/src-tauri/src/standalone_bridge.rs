@@ -346,6 +346,8 @@ pub(crate) struct MailRoom {
     pub seq: u32,
     /// Provider names of the sessions put into this room, empty for a plain mailbox.
     pub members: Vec<String>,
+    /// The session that created the room, and the only one that may close it.
+    pub founder: Option<String>,
     pub pending: u32,
     pub subscribers: u32,
     #[serde(rename = "lastMessageAt")]
@@ -598,6 +600,31 @@ pub(crate) fn sync_issue_password(code: &str, conversation_id: &str) -> Result<S
         .ok_or_else(|| "Bridge returned no password".to_string())
 }
 
+/// Close a room for everyone in it.
+///
+/// Different from leaving: every member is told, every stream is cut, and the room is
+/// gone. Only the founder may, for the same reason only the founder hands out the
+/// password — ending a room other people are working in is not a thing any member
+/// should be able to do to the others.
+pub(crate) fn sync_close(code: &str, conversation_id: &str) -> Result<(), String> {
+    if !valid_room(code) || !valid_room(conversation_id) {
+        return Err("Not a valid room".to_string());
+    }
+    let (status, value) = bridge_request(
+        "DELETE",
+        &format!("/sync/rooms/{code}?as={conversation_id}"),
+        None,
+    )?;
+    if !(200..300).contains(&status) {
+        return Err(match value.get("error").and_then(serde_json::Value::as_str) {
+            Some("not_the_founder") => "Only the session that created this room can close it".to_string(),
+            Some("no_such_room") => "That room is already closed".to_string(),
+            _ => sync_error(status, &value),
+        });
+    }
+    Ok(())
+}
+
 /// Join a room by code. Idempotent, so pressing Connect twice is not an error.
 pub(crate) fn sync_join(code: &str, conversation_id: &str) -> Result<SyncRoom, String> {
     if !valid_room(conversation_id) {
@@ -654,6 +681,10 @@ pub(crate) fn mail_rooms() -> Result<Vec<MailRoom>, String> {
                     .map(|value| value.to_string())
             };
             Some(MailRoom {
+                founder: room
+                    .get("founder")
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned),
                 members: room
                     .get("members")
                     .and_then(serde_json::Value::as_array)

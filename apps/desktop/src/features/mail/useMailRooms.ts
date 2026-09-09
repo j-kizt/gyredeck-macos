@@ -6,6 +6,8 @@ export interface IMailRoom {
   seq: number;
   /** Provider names of the sessions put into this room; empty for a plain mailbox. */
   members: string[];
+  /** The session that created the room, and the only one that may close it. */
+  founder: string | null;
   pending: number;
   subscribers: number;
   lastMessageAt: string | null;

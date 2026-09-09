@@ -22,7 +22,7 @@
  *   POST /ingest    - Multi-provider event fan-in
  */
 
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
@@ -307,8 +307,8 @@ function startBridge(config) {
   const releaseClosedSession = (conversationId) => {
     const found = syncRoomFor(conversationId);
     if (!found) return;
-    const label = providerLabelFor(conversationId);
-    found.room.members.delete(conversationId);
+    const label = labelIn(found.room, conversationId);
+    retireLabel(found.room, conversationId);
     found.room.touchedAt = Date.now();
     // A session that has ended cannot read the notice, but its stream is still open
     // until something closes it, and this is that something.
@@ -338,6 +338,124 @@ function startBridge(config) {
     }
   };
 
+  /**
+   * What a Codex thread has in its context window, read from its own rollout log.
+   *
+   * Codex's hook payload carries no token counts, but the log it writes anyway does —
+   * so the numbers arrive without asking the session for anything. `input_tokens`
+   * already contains `cached_input_tokens`; adding them double-counts, which on a live
+   * thread turned 5.4% into 10.4%. Reported here in the shape the meter reads, with the
+   * cache fields zeroed rather than omitted, because the meter sums all three.
+   */
+  const codexUsageFor = (threadId) => {
+    const path = codexRolloutFor(threadId);
+    if (!path) return null;
+    let window = null;
+    let last = null;
+    try {
+      for (const line of readFileSync(path, "utf8").split("\n")) {
+        if (!line.trim()) continue;
+        let entry;
+        try { entry = JSON.parse(line); } catch { continue; }
+        const payload = entry?.payload;
+        if (!payload) continue;
+        const seen = payload.model_context_window ?? payload.info?.model_context_window;
+        if (Number.isFinite(seen)) window = seen;
+        const usage = payload.info?.last_token_usage;
+        if (usage && Number.isFinite(usage.input_tokens)) last = usage;
+      }
+    } catch {
+      return null;
+    }
+    if (!last) return null;
+    return {
+      inputTokens: last.input_tokens,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      outputTokens: Number.isFinite(last.output_tokens) ? last.output_tokens : null,
+      contextWindow: window,
+    };
+  };
+
+  /**
+   * Put whatever a Codex session just said into the room it is in.
+   *
+   * Codex cannot post for itself, so the bridge speaks on its behalf — but it used to do
+   * that only while a harvest was running, and a harvest only started when somebody
+   * pushed a message in. A Codex session told by its own user to say something wrote the
+   * message and it reached nobody. Reading its log whenever it finishes a turn covers
+   * both cases with one path.
+   *
+   * Nothing is published twice: the same per-thread claim guards this and the harvest
+   * that follows a push.
+   */
+  /** Where the last harvest of each Codex log stopped, as a byte offset into it. */
+  const harvestAt = new Map();
+  /**
+   * How the harvest is doing, because its failure mode is indistinguishable from quiet.
+   *
+   * Reading another program's log is not a contract: `event_msg` / `task_complete` /
+   * `last_agent_message` are Codex's own shapes and can change under us. If they do,
+   * every read parses nothing, no message is ever published, and a room where an agent
+   * is talking looks exactly like a room where nobody is. Counting turns against
+   * replies is the cheapest thing that can tell those two apart.
+   */
+  const codexHarvest = { turns: 0, published: 0, warned: false };
+  /**
+   * The seq the bridge last gave a Codex session's own words, so it can be told.
+   *
+   * Codex never sees a reply to anything: the bridge posts for it, and the response
+   * goes nowhere it can read. The brief nevertheless told it not to claim a message was
+   * sent without seeing ok:true and a seq — a rule it could never satisfy even once,
+   * while its messages were in fact being published every time. Handing the seq back on
+   * the next push is the only confirmation that can reach it, and its absence is the
+   * only way it can learn a harvest failed. Codex itself pointed out the gap that
+   * remains: with no next push, the last message stays unconfirmed. That is accepted —
+   * closing it would mean waking a session to tell it a number.
+   */
+  const publishedForCodex = new Map();
+  // Several turns is enough to be past a slow flush and not enough to be a whole
+  // working session lost before anyone hears about it.
+  const CODEX_HARVEST_SUSPECT_AFTER = 5;
+  const harvestCodexTurn = (conversationId) => {
+    const found = syncRoomFor(conversationId);
+    const member = found?.room.members.get(conversationId);
+    if (!member || member.confirmed !== true) return;
+    const path = codexRolloutFor(conversationId);
+    if (!path) return;
+    // A log nobody has read yet starts at the moment this session joined the room, so a
+    // conversation that was already long does not arrive in the room all at once. Every
+    // read after that resumes from a byte offset, which cannot step over a line.
+    const resuming = harvestAt.get(path);
+    const { replies, offset } = readCodexLog(
+      path,
+      resuming ?? 0,
+      resuming === undefined ? Date.parse(member.joinedAt) || 0 : 0,
+    );
+    harvestAt.set(path, offset);
+    codexHarvest.turns += 1;
+    codexHarvest.published += replies.length;
+    if (
+      !codexHarvest.warned &&
+      codexHarvest.published === 0 &&
+      codexHarvest.turns >= CODEX_HARVEST_SUSPECT_AFTER
+    ) {
+      codexHarvest.warned = true;
+      console.error(
+        `⚠ codex harvest has read ${codexHarvest.turns} finished turns in a room and found` +
+          " nothing to publish — its rollout format may have changed. Messages from Codex" +
+          " are being lost silently.",
+      );
+    }
+    for (const reply of replies) {
+      if (!claimCodexReply(conversationId, reply)) continue;
+      if (refuseToPublish(found.room, conversationId)) continue;
+      const published = publishMail(found.room, conversationId, reply.text, null, true);
+      if (published?.seq) publishedForCodex.set(conversationId, published.seq);
+      deliverMail(found.name, found.room, reply.text, conversationId);
+    }
+  };
+
   const emitHookStop = (data = {}) => {
     const now = Date.now();
     const scope = tracker.hookScope(data, now);
@@ -349,9 +467,24 @@ function startBridge(config) {
         hookEventName: typeof data.hookEventName === "string" ? data.hookEventName : "Stop",
         source: typeof data.source === "string" ? data.source : "hook",
         message: typeof data.message === "string" ? data.message : null,
-        usage: data.usage && typeof data.usage === "object" ? data.usage : null,
+        // A hook that reports its own usage is believed; Codex reports none, so its log
+        // is read instead. Only for Codex — the others put real numbers in the payload.
+        usage: data.usage && typeof data.usage === "object"
+          ? data.usage
+          : providerByConversation.get(scope.conversationId) === "codexCliHook"
+            ? codexUsageFor(scope.conversationId)
+            : null,
       },
     });
+
+    // A Codex turn ending is the only signal that it has said something, and until now
+    // its words were only collected while a harvest happened to be running — which
+    // started only when somebody pushed a message to it. Told to speak by its own user,
+    // it wrote a perfectly good reply that reached nobody. Its log is read on every turn
+    // it completes, so what it says in a room arrives whoever prompted it.
+    if (providerByConversation.get(scope.conversationId) === "codexCliHook") {
+      harvestCodexTurn(scope.conversationId);
+    }
   };
 
   const emitHookAttention = (data = {}) => {
@@ -408,6 +541,81 @@ function startBridge(config) {
     codex: "Codex",
     agyHost: "Antigravity",
   };
+  /**
+   * The workspace a session is working in, which is what tells two of the same agent
+   * apart. "Codex" and "Codex" in one room name nobody; "Codex · J-Kitz" and
+   * "Codex · AD1" name two particular sessions, and they are the names the person
+   * already uses for them.
+   */
+  const workspaceByConversation = new Map();
+
+  const workspaceFor = (conversationId) => {
+    const cwd = workspaceByConversation.get(conversationId);
+    if (typeof cwd !== "string" || cwd.length === 0) return null;
+    const leaf = cwd.split("/").filter(Boolean).pop();
+    return leaf && leaf.length > 0 ? leaf : null;
+  };
+
+  /**
+   * The name a member goes by in one room, chosen once when it arrives.
+   *
+   * Chosen rather than derived. A name computed from whoever happens to be present is
+   * a different name at different moments: one session picks up several across a
+   * transcript with nothing linking them, and a question about what "Codex" said an
+   * hour ago has no answer. Deciding at the door costs an asymmetry — whoever arrived
+   * first keeps the short name — and buys a name that still means the same session
+   * later, which is the property that cannot be repaired after the fact.
+   *
+   * It also retires the argument that kept being got wrong. There is no member set to
+   * pass any more, only a field to read, so a call site cannot name a member from the
+   * wrong moment — which is what three of them were doing.
+   */
+  const allocateLabel = (room, conversationId) => {
+    const taken = new Set();
+    for (const member of room.members.values()) if (member.label) taken.add(member.label);
+    const former = room.formerLabels.get(conversationId);
+    if (former && !taken.has(former)) return former;
+    const provider = providerLabelFor(conversationId);
+    const workspace = workspaceFor(conversationId);
+    // Shortest first: a lone Codex is "Codex", the second one to arrive in another
+    // checkout is "Codex · AD1", and a second one in the same checkout takes an id.
+    const candidates = workspace ? [provider, `${provider} · ${workspace}`] : [provider];
+    for (const candidate of candidates) if (!taken.has(candidate)) return candidate;
+    // An id means nothing to a person, which is why it is last. It still beats a name
+    // that points at two sessions at once: a request to one would read as a request to
+    // the other.
+    const longest = candidates[candidates.length - 1];
+    const short = `${longest} #${conversationId.slice(0, 6)}`;
+    return taken.has(short) ? `${longest} #${conversationId}` : short;
+  };
+
+  /**
+   * Take a member out of a room, keeping the name it was known by.
+   *
+   * The name outlives the membership on purpose: the notices that announce a departure
+   * are written after it, and a resumed session put back in the room should not come
+   * back under a different name. What does not outlive it is the harvest cursor —
+   * that belongs to a membership, and a rejoin should read from where the room is now.
+   */
+  const retireLabel = (room, conversationId) => {
+    const member = room.members.get(conversationId);
+    if (member?.label) room.formerLabels.set(conversationId, member.label);
+    room.members.delete(conversationId);
+    harvestAt.delete(codexRolloutFor(conversationId) ?? "");
+  };
+
+  /**
+   * What to call a session in this room, whether or not it is still in it.
+   *
+   * Falling back through the names the room has retired is what makes the departure
+   * notices safe: they used to name the leaver from the membership it had just been
+   * removed from, and so named whoever was left instead.
+   */
+  const labelIn = (room, conversationId) =>
+    room.members.get(conversationId)?.label ??
+    room.formerLabels.get(conversationId) ??
+    providerLabelFor(conversationId);
+
   const providerLabelFor = (conversationId) =>
     PROVIDER_LABELS[providerByConversation.get(conversationId)] ?? "Agent";
   const rememberProvider = (payload) => {
@@ -415,6 +623,9 @@ function startBridge(config) {
     const sourceKind = payload?.runtime?.sourceKind;
     if (typeof conversationId === "string" && typeof sourceKind === "string") {
       providerByConversation.set(conversationId, sourceKind);
+    }
+    if (typeof conversationId === "string" && typeof payload?.cwd === "string") {
+      workspaceByConversation.set(conversationId, payload.cwd);
     }
   };
 
@@ -510,22 +721,71 @@ function startBridge(config) {
     return true;
   };
 
+  /** One line of a Codex rollout as a reply, or null when the line is anything else. */
+  const codexReplyFromLine = (line, sinceMs) => {
+    if (!line.trim()) return null;
+    let entry;
+    try { entry = JSON.parse(line); } catch { return null; }
+    if (entry.type !== "event_msg" || entry.payload?.type !== "task_complete") return null;
+    const text = entry.payload.last_agent_message;
+    if (typeof text !== "string" || !text.trim()) return null;
+    const at = Date.parse(entry.timestamp ?? "");
+    if (Number.isFinite(at) && at < sinceMs) return null;
+    return { turnId: entry.payload.turn_id ?? null, text: text.trim() };
+  };
+
   const readCodexReplies = (rolloutPath, sinceMs) => {
     const replies = [];
     let content = "";
     try { content = readFileSync(rolloutPath, "utf8"); } catch { return replies; }
     for (const line of content.split("\n")) {
-      if (!line.trim()) continue;
-      let entry;
-      try { entry = JSON.parse(line); } catch { continue; }
-      if (entry.type !== "event_msg" || entry.payload?.type !== "task_complete") continue;
-      const text = entry.payload.last_agent_message;
-      if (typeof text !== "string" || !text.trim()) continue;
-      const at = Date.parse(entry.timestamp ?? "");
-      if (Number.isFinite(at) && at < sinceMs) continue;
-      replies.push({ turnId: entry.payload.turn_id ?? null, text: text.trim() });
+      const reply = codexReplyFromLine(line, sinceMs);
+      if (reply) replies.push(reply);
     }
     return replies;
+  };
+
+  /**
+   * Everything Codex has said past `offset`, and the offset to resume from next time.
+   *
+   * A byte cursor rather than a clock, because this one advances and a clock cannot
+   * advance safely: the old cursor moved to "now" before the file was read, so a line
+   * flushed a moment late fell below the next read's floor and was never published. The
+   * per-thread claim stops a reply being said twice; nothing stopped one being skipped.
+   *
+   * Only whole lines are consumed. A log caught mid-write ends in a partial line, and
+   * the returned offset stops in front of it so the next read sees it complete.
+   */
+  const readCodexLog = (rolloutPath, offset, sinceMs) => {
+    let size = 0;
+    try { size = statSync(rolloutPath).size; } catch { return { replies: [], offset }; }
+    // A file smaller than its cursor was rotated or rewritten, and the cursor now points
+    // into a log that no longer exists.
+    const from = offset > size ? 0 : offset;
+    if (from >= size) return { replies: [], offset: size };
+    let chunk = "";
+    let fd = null;
+    try {
+      fd = openSync(rolloutPath, "r");
+      const buffer = Buffer.allocUnsafe(size - from);
+      const read = readSync(fd, buffer, 0, buffer.length, from);
+      // Safe to decode from here: an offset only ever lands just past a newline, so it
+      // never cuts a multi-byte character in half.
+      chunk = buffer.subarray(0, read).toString("utf8");
+    } catch {
+      return { replies: [], offset };
+    } finally {
+      if (fd !== null) { try { closeSync(fd); } catch {} }
+    }
+    const lastBreak = chunk.lastIndexOf("\n");
+    if (lastBreak < 0) return { replies: [], offset: from };
+    const whole = chunk.slice(0, lastBreak);
+    const replies = [];
+    for (const line of whole.split("\n")) {
+      const reply = codexReplyFromLine(line, sinceMs);
+      if (reply) replies.push(reply);
+    }
+    return { replies, offset: from + Buffer.byteLength(whole, "utf8") + 1 };
   };
 
   // Mail rooms: a named channel for agents on this machine to talk to each other,
@@ -594,6 +854,10 @@ function startBridge(config) {
       messages: [],
       clients: new Set(),
       members: new Map(),
+      // Names already handed out in this room, kept past the member that held them.
+      // A session is resumable and keeps its id, so one that leaves and is put back
+      // is the same session — and a stable name that changes on return is not stable.
+      formerLabels: new Map(),
       touchedAt: Date.now(),
     };
     mailRooms.set(name, room);
@@ -636,14 +900,16 @@ function startBridge(config) {
   const describeRoom = (name, room, as) => ({
     room: name,
     seq: room.seq,
-    members: [...room.members].map(([conversationId, member]) => ({
-      conversationId,
-      provider: providerLabelFor(conversationId),
-      confirmed: member.confirmed === true,
-      joinedAt: member.joinedAt,
-      pending: Math.max(0, room.seq - member.readSeq),
-      lastReadAt: member.lastReadAt ?? null,
-    })),
+    members: (() => {
+      return [...room.members].map(([conversationId, member]) => ({
+        conversationId,
+        provider: labelIn(room, conversationId),
+        confirmed: member.confirmed === true,
+        joinedAt: member.joinedAt,
+        pending: Math.max(0, room.seq - member.readSeq),
+        lastReadAt: member.lastReadAt ?? null,
+      }));
+    })(),
     you: as && room.members.has(as) ? as : null,
     // Named rather than inferred: a confirmed joiner looks identical to a founder from
     // the outside, and only the founder may hand out the right to speak.
@@ -684,16 +950,160 @@ function startBridge(config) {
     if (!mailbox) return;
     const text =
       `[Gyredeck: you are no longer in room ${name} — ${why}. You can neither read it` +
-      " nor post to it now, and its password will not let you back in. If you have a" +
-      " watch running on that room, stop it: it has been closed from this end and" +
-      " re-arming it will be refused. Nothing about this room will reach you again" +
-      " unless someone puts you back in it.]";
+      " nor post to it now, and its password will not let you back in. This is one of" +
+      " the two messages that end a watch on that room: stop yours and do not open" +
+      " another, since it has been closed from this end and re-opening will be refused." +
+      " Nothing about this room will reach you again unless someone puts you back in" +
+      " it.]";
     publishMail(mailbox, ROOM_SENDER, text, null);
     deliverMail(conversationId, mailbox, text, ROOM_SENDER);
   };
 
+  /**
+   * Tell a session, in its own mailbox, that it has been put in a room.
+   *
+   * The room itself cannot carry this: a member that has not been confirmed cannot read
+   * the room, so an announcement posted there is invisible to exactly the session that
+   * needs it. Without this a session first learns of a room when a password arrives
+   * with no explanation of what it is for — which is what happened to Codex, told a
+   * secret for a room it did not know it was in.
+   */
+  const tellJoined = (name, room, conversationId, how) => {
+    const mailbox = mailRoomFor(conversationId, true);
+    if (!mailbox) return;
+    const confirmed = room.members.get(conversationId)?.confirmed === true;
+    const others = [...room.members.keys()].filter((id) => id !== conversationId);
+    const company = others.length > 0
+      ? ` Also here: ${others.map((id) => labelIn(room, id)).join(", ")}.`
+      : " Nobody else is in it yet.";
+    const text =
+      `[Gyredeck: you are now in sync room ${name} — ${how}.${company}` +
+      // What the password is for differs by what this session can do with it. Codex
+      // cannot open a stream and cannot call the bridge at all, so for it the password
+      // really is somebody else's business. Everyone else needs it in hand: it is the
+      // header on every call about this room, the watch included.
+      (providerByConversation.get(conversationId) === "codexCliHook"
+        ? confirmed
+          ? " You can read it and post to it already, and messages are pushed into your" +
+            " session, so there is nothing to set up. The room's password is what the" +
+            " person hands to another session so that one can join; a long string of hex" +
+            " arriving here is that, and there is nothing for you to do with it."
+          : " You cannot read or post there yet. The person at this terminal will be" +
+            " given the room's password, and you are let in the moment they read it out" +
+            " — you do not present it yourself and there is nothing to run."
+        : confirmed
+          ? " You can read it and post to it, but you need the room's password in hand to" +
+            " do either: it is the x-gyredeck-token header on every call about this room," +
+            " including the watch you should be running on it. A long string of hex" +
+            " arriving in this terminal is that password."
+          : " You cannot read or post there yet: that needs the room's password, which the" +
+            " person at this terminal has to give you. A long string of hex arriving with" +
+            " no explanation is it — present it, and then keep a watch on the room.") +
+      "]";
+    publishMail(mailbox, ROOM_SENDER, text, null);
+    deliverMail(conversationId, mailbox, text, ROOM_SENDER);
+  };
+
+  /**
+   * What a session can do in a room, written where it will actually be read.
+   *
+   * A confirm is a call the session makes itself and reads the answer to, so it is the
+   * one place an instruction is certain to land — anything a hook injects arrives a turn
+   * later, by which point the session has usually guessed. The commands come with the
+   * password already in them: a session that just presented it plainly has it.
+   */
+  const howToUseRoom = (name, password, conversationId, host, port) => ({
+    credential: {
+      header: "x-gyredeck-token",
+      value: password,
+      note:
+        "This room's own password, on every call below. The machine's ingest token is" +
+        " not accepted for a room, and neither is another room's password.",
+    },
+    identity: {
+      as: conversationId,
+      note:
+        "Name yourself with this wherever a call takes `as` or `from`. A stream without" +
+        " it is refused; a message without it is not attributed to you.",
+    },
+    send: {
+      what: "Post a message everyone in the room sees.",
+      method: "POST",
+      url: `http://${host}:${port}/mail/${name}`,
+      body: {
+        from: conversationId,
+        text: "<your message, plain text>",
+        replyTo: conversationId,
+      },
+      command:
+        `curl -s -X POST http://${host}:${port}/mail/${name}` +
+        ` -H 'content-type: application/json' -H 'x-gyredeck-token: ${password}'` +
+        ` -d '{"from":"${conversationId}","text":"YOUR TEXT","replyTo":"${conversationId}"}'`,
+      success: '{"ok":true,"seq":<number>} — the seq is the room-wide sequence of your message.',
+      failure: {
+        403: "not_a_member or not_confirmed — you are out of the room, or have not presented its password.",
+        400: "invalid_message — from or text missing.",
+      },
+      rule:
+        "Treat a send as failed unless you saw ok:true and a seq. A refused POST prints" +
+        " little or nothing, and reporting a message you did not send is worse than" +
+        " reporting nothing.",
+    },
+    receive: {
+      what: "Each message arrives as one Server-Sent Event on the stream below.",
+      frame: "id: <seq>\\nevent: mail\\ndata: <json>\\n\\n",
+      dataShape: {
+        seq: "<number> — room-wide, increasing; the resume point",
+        from: "<conversationId of the sender, or gyredeck-room for the room itself, or gyredeck for the person>",
+        text: "<the message>",
+        replyTo: "<where to answer, usually the sender>",
+        ts: "<ISO timestamp>",
+      },
+      note:
+        "Ignore frames whose from is your own id — your posts come back on your own" +
+        " stream. Frames from gyredeck-room are facts about membership, not requests.",
+    },
+    watch: {
+      what: "Be woken when a message arrives, rather than waiting to be typed at.",
+      method: "GET",
+      url: `http://${host}:${port}/mail/${name}/events?as=${conversationId}`,
+      command:
+        `curl -sN "http://${host}:${port}/mail/${name}/events?as=${conversationId}"` +
+        ` -H 'x-gyredeck-token: ${password}'`,
+      runner:
+        "Run it with a facility that turns each line into a notification while the" +
+        " command is still running. A plain background job will not do: most report only" +
+        " when the process exits, and a working stream never exits — the messages land" +
+        " in a file and nothing reaches you. If that is all you have, say so rather than" +
+        " arming it, because the failure is silent and looks like a quiet room.",
+      lifetime:
+        "Keep exactly one running for as long as you are in the room, not only while" +
+        " awaiting a reply. The stream closes after five minutes and says so first;" +
+        " that is routine — reopen at once.",
+      resume:
+        `Reopen with &since=<the last seq you saw>, e.g.` +
+        ` .../mail/${name}/events?as=${conversationId}&since=12 . Without it the new` +
+        " stream starts from now and anything published in the gap is lost silently.",
+      stop:
+        "Stop for good on either of two messages, and only those: the room was closed," +
+        " or you were disconnected from it.",
+    },
+    wait: {
+      what: "Block inside this turn for an answer you need before you can carry on.",
+      method: "GET",
+      url: `http://${host}:${port}/mail/wait?as=${conversationId}&timeout=60&collect=1`,
+      command:
+        `curl -s "http://${host}:${port}/mail/wait?as=${conversationId}&timeout=60&collect=1"` +
+        ` -H 'x-gyredeck-token: ${password}'`,
+      success: '{"ok":true,"timedOut":false,"messages":[...]} — same message shape as the stream.',
+      rule:
+        "Only while an answer is genuinely outstanding. It answers timedOut:true if" +
+        " none arrives; one wait at a time per session, a second is refused.",
+    },
+  });
+
   const announceMembership = (name, room, note) => {
-    const present = [...room.members.keys()].map(providerLabelFor);
+    const present = [...room.members.keys()].map((id) => labelIn(room, id));
     const text = `${note} Members now: ${present.join(", ") || "nobody"}.`;
     publishMail(room, ROOM_SENDER, text, null);
     // News about the room travels the same way anything else does, or a Codex member
@@ -702,13 +1112,12 @@ function startBridge(config) {
   };
 
 
-  // Longer than a room code and from the same alphabet. A code is a name people say to
-  // each other; this is the thing that grants the right to speak, so it is not meant to
-  // be guessable or memorable.
-  const newRoomPassword = () =>
-    `gk-${Array.from(randomBytes(10))
-      .map((byte) => SYNC_CODE_ALPHABET[byte % SYNC_CODE_ALPHABET.length])
-      .join("")}`;
+  // Thirty-two hex characters, the length and shape of an MD5 digest. A room code is a
+  // name people say to each other and is kept short for that; this is the thing that
+  // grants the right to speak, and nobody types it — it is copied from the panel and
+  // pasted into a terminal — so length costs nothing and buys the difference between
+  // fifty bits and a hundred and twenty-eight.
+  const newRoomPassword = () => randomBytes(16).toString("hex");
 
   const newSyncCode = () => {
     for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -744,12 +1153,14 @@ function startBridge(config) {
     ...(sync
       ? {
           room: sync.name,
-          members: [...sync.room.members].map(([conversationId, member]) => ({
-            conversationId,
-            provider: providerLabelFor(conversationId),
-            confirmed: member.confirmed === true,
-            you: conversationId === as,
-          })),
+          members: (() => {
+            return [...sync.room.members].map(([conversationId, member]) => ({
+              conversationId,
+              provider: labelIn(sync.room, conversationId),
+              confirmed: member.confirmed === true,
+              you: conversationId === as,
+            }));
+          })(),
         }
       : { room: null, members: [] }),
   });
@@ -824,6 +1235,10 @@ function startBridge(config) {
       try {
         res.write(frame);
         pushed = true;
+        // How far this member's stream has been written, which is what `since=resume`
+        // hands back. Deliberately not the same as readSeq below: a push is not a read.
+        const member = res.gyredeckWatcher ? room.members.get(res.gyredeckWatcher) : null;
+        if (member) member.streamSeq = Math.max(member.streamSeq ?? 0, message.seq);
       } catch {
         room.clients.delete(res);
       }
@@ -887,7 +1302,8 @@ function startBridge(config) {
         // confirmed does not get to speak just because the bridge is the one holding
         // the pen.
         if (refuseToPublish(room, threadId)) continue;
-        publishMail(room, threadId, reply.text, null, true);
+        const published = publishMail(room, threadId, reply.text, null, true);
+        if (published?.seq) publishedForCodex.set(threadId, published.seq);
       }
       if (seen.size === 0 && Date.now() < deadline) setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
     };
@@ -926,15 +1342,31 @@ function startBridge(config) {
       if (member && member.confirmed !== true) {
         if (member.toldUnconfirmed) continue;
         member.toldUnconfirmed = true;
+        // What to do with the password differs by agent, and telling everyone the same
+        // thing is how Codex ended up being asked to run a call its sandbox forbids.
+        // It cannot reach the bridge at all; the person types the password and Gyredeck
+        // does the rest, so its instruction is to ask and then wait.
         const notice =
-          "[Gyredeck: you have been put in a room here, but until someone gives you its" +
-          " password you can neither read what is said in it nor answer. Ask the person at" +
-          " this terminal for the room's password. When they give it to you, use it" +
-          " yourself: send it as the x-gyredeck-token header on every call about this" +
-          ` room, starting with POST http://127.0.0.1:${config.port}/sync/rooms/${roomName}/confirm` +
-          ` with {\"conversationId\":\"${recipient}\",\"password\":\"THE PASSWORD\"}. Nobody` +
-          " will confirm you; presenting it is what lets you in. Until then, do not retry" +
-          " and do not look for another way in — nothing further will reach you.]";
+          provider === "codexCliHook"
+            ? "[Gyredeck: you have been put in a room here, but until someone gives you" +
+              " its password you can neither read what is said in it nor answer. Two" +
+              " things stop you calling Gyredeck about it, and both hold: the room's" +
+              " password is the x-gyredeck-token header on every such call and you do" +
+              " not have it, and your sandbox denies network syscalls outright, so even" +
+              " a request to 127.0.0.1 fails at connect rather than in transit. Ask the person at this" +
+              " terminal for the password and then wait — asking is the whole of your" +
+              " part. When they read it out of Gyredeck you are let in there and then," +
+              " and the room simply starts arriving. Nothing further will reach you" +
+              " until that happens.]"
+            : "[Gyredeck: you have been put in a room here, but until someone gives you" +
+              " its password you can neither read what is said in it nor answer. Ask the" +
+              " person at this terminal for the room's password. When they give it to" +
+              " you, use it yourself: send it as the x-gyredeck-token header on every" +
+              ` call about this room, starting with POST http://127.0.0.1:${config.port}` +
+              `/sync/rooms/${roomName}/confirm with {\"conversationId\":\"${recipient}\",` +
+              ' \"password\":\"THE PASSWORD\"}. Nobody will confirm you; presenting it is' +
+              " what lets you in. Until then, do not retry and do not look for another" +
+              " way in — nothing further will reach you.]";
         if (provider === "codexCliHook") {
           if (deliverToCodex(recipient, room, notice) === "queued") queued = true;
           else unavailable = true;
@@ -944,7 +1376,53 @@ function startBridge(config) {
         continue;
       }
       if (provider === "codexCliHook") {
-        const outcome = deliverToCodex(recipient, room, text);
+        // Codex is the one agent nothing can be injected into — its hook fires but the
+        // text never reaches the model — so a queued message is the only channel there
+        // is, and the standing instructions ride along with the first one it gets in a
+        // room. What they say is the opposite of what the others are told: Codex's
+        // sandbox denies the network syscall itself, so `curl` fails at connect even
+        // for loopback ("Couldn't connect ... after 0 ms" — the timing is the tell). It answers by writing its
+        // answer as ordinary text, which the bridge harvests from its own rollout log.
+        // Repeated on every message, not once. Told a single time, Codex forgot by the
+        // next turn and went back to curl — which its sandbox refuses at connect, so
+        // the POST failed silently and it reported "sent" for messages the room never
+        // received. A standing rule has to stand where it is read.
+        // Everything here is repeated on every message rather than said once. Told a
+        // single time, Codex forgot by the next turn; asked later to list the room's
+        // rules, it named none of the ones that had only been posted into the room.
+        // A standing rule has to stand where it is read.
+        const roster = [...room.members.keys()].map((id) => labelIn(room, id)).join(", ");
+        const wasPublished = publishedForCodex.get(recipient);
+        const outgoing =
+          `[Gyredeck · room ${roomName} — how to answer: write your reply as ordinary` +
+          " text in this turn. Do not call Gyredeck: your sandbox refuses the network" +
+          " syscall, so curl fails at connect even for 127.0.0.1, and a failed POST" +
+          " looks like nothing at all. The bridge reads what you write from your own" +
+          " session log and puts it in the room for you — that is the only path that" +
+          " works, and it needs nothing from you but the words. Only the last thing you" +
+          " write in a turn is taken, so say everything the room needs in one closing" +
+          " message rather than several. You also need no watch:" +
+          " messages are pushed into your session whether or not you are doing anything." +
+          // Answering an acknowledgement wakes every session watching the room for
+          // nothing. Measured at three content-free wakes in a row in this very room,
+          // by which point two of them were acknowledging acknowledgements.
+          " Reply only when you have something to add, an answer, a question or a" +
+          " disagreement — never to acknowledge. The sender already knows the message" +
+          " arrived; the bridge tells them so." +
+          // Its roster is memory of announcements it happened to receive: it cannot
+          // read the room's state, so a push that failed once would leave it wrong
+          // forever. Restating who is here on every message costs a line and closes it.
+          ` Members now: ${roster || "nobody"}.` +
+          // Never "wait for ok:true" — Codex cannot see a response to anything, so that
+          // rule was unsatisfiable while its messages were in fact being published.
+          (wasPublished
+            ? ` Your previous message reached the room as seq ${wasPublished}.`
+            : " Nothing of yours has been published in this room yet.") +
+          " You will not see a response to what you write — the bridge posts for you and" +
+          " tells you the seq here, on the next message you get. If a seq never follows," +
+          " what you wrote did not arrive.]\n\n" +
+          text;
+        const outcome = deliverToCodex(recipient, room, outgoing);
         if (outcome === "queued") queued = true;
         else unavailable = true;
       } else if (provider === "agyHost" || provider === "claudeCodeHook") {
@@ -999,7 +1477,23 @@ function startBridge(config) {
 
     if (req.url === "/health") {
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
-      res.end(JSON.stringify({ ok: true, name: "gyredeck", version: PROTOCOL_VERSION, mode: "standalone", clients: clients.size, capabilities }));
+      res.end(
+        JSON.stringify({
+          ok: true,
+          name: "gyredeck",
+          version: PROTOCOL_VERSION,
+          mode: "standalone",
+          clients: clients.size,
+          capabilities,
+          // Surfaced rather than only logged: a log line scrolls away, and this is the
+          // one fault in the room that nothing else can show.
+          codexHarvest: {
+            turns: codexHarvest.turns,
+            published: codexHarvest.published,
+            suspect: codexHarvest.published === 0 && codexHarvest.turns >= CODEX_HARVEST_SUSPECT_AFTER,
+          },
+        }),
+      );
       return;
     }
 
@@ -1083,6 +1577,7 @@ function startBridge(config) {
         room.createdBy = conversationId;
         room.password = newRoomPassword();
         room.members.set(conversationId, {
+          label: allocateLabel(room, conversationId),
           // Pressing Create in this session's own detail panel is the same act of
           // intent the password exists to capture, so the founder needs no password.
           confirmed: true,
@@ -1093,9 +1588,52 @@ function startBridge(config) {
           lastReadAt: null,
         });
         room.touchedAt = Date.now();
+        // Told after the room exists, so the notice can name it and say who is there.
+        tellJoined(name, room, conversationId, "you created it");
         // The founder is handed the room's token once, here; everyone else gets it
         // from them, by hand, into the terminal of the session being let in.
         sendJson(201, { ok: true, password: room.password, ...describeRoom(name, room, conversationId) });
+        return;
+      }
+
+      // DELETE /sync/rooms/<code> — close the room for everyone.
+      //
+      // Leaving is one member's business; closing is the room's end, and the difference
+      // matters to what is still running. Every member is told, every stream is cut,
+      // and only then is the room dropped — in that order, because a room deleted first
+      // has no members left to tell and no streams left to find.
+      if (req.method === "DELETE" && segments.length === 3) {
+        const room = mailRooms.get(code);
+        if (!room || room.members.size === 0) {
+          sendJson(404, { ok: false, error: "no_such_room" });
+          return;
+        }
+        const closer = url.searchParams.get("as");
+        if (closer && room.createdBy !== closer) {
+          sendJson(403, {
+            ok: false,
+            error: "not_the_founder",
+            message: "Only the session that created this room can close it.",
+          });
+          return;
+        }
+        for (const conversationId of [...room.members.keys()]) {
+          retireLabel(room, conversationId);
+          partWithMember(code, room, conversationId, "the room was closed");
+        }
+        // Anything still holding the stream that was not a member — nothing should be,
+        // but a socket outliving its membership is exactly the bug this guards.
+        for (const res of [...room.clients]) {
+          try {
+            res.write(`: gyredeck room ${code} closed\n\n`);
+            res.end();
+          } catch {
+            // Already gone.
+          }
+        }
+        room.clients.clear();
+        mailRooms.delete(code);
+        sendJson(200, { ok: true, room: code, closed: true });
         return;
       }
 
@@ -1116,6 +1654,22 @@ function startBridge(config) {
           return;
         }
         room.touchedAt = Date.now();
+        // Reading the password out is the founder's act of letting people in, and for
+        // an agent that cannot present it there is nothing further to wait for. Codex
+        // cannot open a socket from inside its sandbox, so asking it to confirm itself asks
+        // for something impossible; the key press is the consent, and it is applied
+        // here on its behalf.
+        for (const [conversationId, member] of room.members) {
+          if (member.confirmed === true) continue;
+          if (providerByConversation.get(conversationId) !== "codexCliHook") continue;
+          member.confirmed = true;
+          member.toldUnconfirmed = false;
+          announceMembership(
+            code,
+            room,
+            `${labelIn(room, conversationId)} was confirmed by the room's owner and can now speak here.`,
+          );
+        }
         sendJson(200, { ok: true, room: code, password: room.password });
         return;
       }
@@ -1133,7 +1687,16 @@ function startBridge(config) {
         }
         const member = room.members.get(conversationId);
         if (member.confirmed === true) {
-          sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
+          sendJson(200, {
+            ok: true,
+            ...describeRoom(code, room, conversationId),
+            // The answer to a call the session made itself, and so the one place an
+            // instruction is certain to be read — everything a hook injects lands a turn
+            // later, by which point the session has usually guessed.
+            ...(room.members.get(conversationId)?.confirmed === true
+              ? { howTo: howToUseRoom(code, room.password, conversationId, BRIDGE_HOST, config.port) }
+              : {}),
+          });
           return;
         }
         if (!holdsRoomPassword(room, password)) {
@@ -1146,9 +1709,18 @@ function startBridge(config) {
         announceMembership(
           code,
           room,
-          `${providerLabelFor(conversationId)} was confirmed by the room's owner and can now speak here.`,
+          `${labelIn(room, conversationId)} was confirmed by the room's owner and can now speak here.`,
         );
-        sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
+        sendJson(200, {
+          ok: true,
+          ...describeRoom(code, room, conversationId),
+          // The answer to a call the session made itself, and so the one place an
+          // instruction is certain to be read — everything a hook injects lands a turn
+          // later, by which point the session has usually guessed.
+          ...(room.members.get(conversationId)?.confirmed === true
+            ? { howTo: howToUseRoom(code, room.password, conversationId, BRIDGE_HOST, config.port) }
+            : {}),
+        });
         return;
       }
 
@@ -1180,6 +1752,7 @@ function startBridge(config) {
             return;
           }
           room.members.set(conversationId, {
+            label: allocateLabel(room, conversationId),
             // Joining puts a session in the room; it does not yet let it speak. The
             // person confirms that separately, by typing the room's password into this
             // session's own terminal — an act performed where the session lives rather
@@ -1191,10 +1764,22 @@ function startBridge(config) {
             readSeq: room.seq,
             lastReadAt: null,
           });
-          announceMembership(code, room, `${providerLabelFor(conversationId)} joined this room.`);
+          announceMembership(code, room, `${labelIn(room, conversationId)} joined this room.`);
+          // The room's own announcement reaches everyone who can already read it; the
+          // one being added usually cannot, and hears about it here instead.
+          tellJoined(code, room, conversationId, "someone put you in it from the app");
         }
         room.touchedAt = Date.now();
-        sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
+        sendJson(200, {
+          ok: true,
+          ...describeRoom(code, room, conversationId),
+          // The answer to a call the session made itself, and so the one place an
+          // instruction is certain to be read — everything a hook injects lands a turn
+          // later, by which point the session has usually guessed.
+          ...(room.members.get(conversationId)?.confirmed === true
+            ? { howTo: howToUseRoom(code, room.password, conversationId, BRIDGE_HOST, config.port) }
+            : {}),
+        });
         return;
       }
 
@@ -1211,8 +1796,8 @@ function startBridge(config) {
           sendJson(404, { ok: false, error: "not_a_member" });
           return;
         }
-        const label = providerLabelFor(conversationId);
-        room.members.delete(conversationId);
+        const label = labelIn(room, conversationId);
+        retireLabel(room, conversationId);
         room.touchedAt = Date.now();
         // The one leaving is told first, while the room object is still here to name.
         partWithMember(code, room, conversationId, "someone disconnected it from the app");
@@ -1271,7 +1856,11 @@ function startBridge(config) {
               subscribers: room.clients.size,
               // Named, not raw ids: this list is read by a person in Settings, and a
       // conversation id tells them nothing.
-      members: [...room.members.keys()].map(providerLabelFor),
+      members: (() => {
+        return [...room.members.keys()].map((id) => labelIn(room, id));
+      })(),
+      // Named so a listing can tell which rooms the person may close from here.
+      founder: room.createdBy ?? null,
               lastMessageAt: room.messages.at(-1)?.ts ?? null,
               lastReadAt: reader.lastReadAt ?? null,
             };
@@ -1528,15 +2117,23 @@ function startBridge(config) {
         // way to tell — the same shape as the cursor that outlived its room and
         // reported success while discarding everything. A mailbox is different: it is
         // named after one session and watching it before anything is sent is normal.
+        // Every refusal on this route answers in frames, because a watcher reads the
+        // body for `data:` lines — that is what a stream is made of — and a plain JSON
+        // error is printed and then dropped by the reader's own filter, leaving a watch
+        // that looks like a quiet room. The status is kept for anything checking it,
+        // and 404 matters most of the three: it is the one a watcher meets when the
+        // room it is trying to rejoin no longer exists.
+        const refuseStream = (status, error, message) => {
+          res.writeHead(status, { "content-type": "text/event-stream; charset=utf-8", ...corsHeaders });
+          res.end(`event: error\ndata: ${JSON.stringify({ ok: false, error, message, fatal: status === 404 })}\n\n`);
+        };
         const room = SYNC_CODE.test(name) ? mailRooms.get(name) : mailRoomFor(name, true);
         if (!room) {
-          sendJson(SYNC_CODE.test(name) ? 404 : 429, {
-            ok: false,
-            error: SYNC_CODE.test(name) ? "no_such_room" : "too_many_rooms",
-            ...(SYNC_CODE.test(name)
-              ? { message: "Nothing by that code is open. A room ends with its last member." }
-              : {}),
-          });
+          if (SYNC_CODE.test(name)) {
+            refuseStream(404, "no_such_room", "Nothing by that code is open. A room ends with its last member, and with the bridge that held it. Stop watching; re-opening will be refused again.");
+          } else {
+            refuseStream(429, "too_many_rooms", "No room can be opened for this name right now.");
+          }
           return;
         }
         // Reading a room people were put into needs that room's password — not the
@@ -1547,19 +2144,19 @@ function startBridge(config) {
         const watcher = url.searchParams.get("as") ?? null;
         if (room.members.size > 0) {
           if (!holdsRoomPassword(room, headerToken)) {
-            sendJson(403, {
-              ok: false,
-              error: "not_confirmed",
-              message: "This room needs its own password. Ask the person at this terminal for it, then send it as the x-gyredeck-token header.",
-            });
+            refuseStream(
+              403,
+              "not_confirmed",
+              "This room needs its own password. Ask the person at this terminal for it, then send it as the x-gyredeck-token header.",
+            );
             return;
           }
           if (!watcher || room.members.get(watcher)?.confirmed !== true) {
-            sendJson(403, {
-              ok: false,
-              error: "not_a_member",
-              message: "Name yourself with ?as=<conversationId>; only a confirmed member of this room may watch it.",
-            });
+            refuseStream(
+              403,
+              "not_a_member",
+              "Name yourself with ?as=<conversationId>; only a confirmed member of this room may watch it.",
+            );
             return;
           }
         }
@@ -1590,10 +2187,18 @@ function startBridge(config) {
         // Hand back what was missed while disconnected. Without this a subscriber
         // that drops has no way to close the gap except to fall back to the
         // read endpoint, and a push-only reader would simply lose those messages.
-        const resumeFrom = Number.parseInt(
-          req.headers["last-event-id"] ?? url.searchParams.get("since") ?? "",
-          10,
-        );
+        // `since=resume` asks the room where this watcher had got to, instead of the
+        // watcher telling it. Tracking a seq client-side is the part of a watch that
+        // keeps going wrong: it takes a second command per frame, and the obvious way
+        // to write that captures the stream into a variable, at which point nothing
+        // reaches the notifier and the room looks silent. Two sessions wrote that same
+        // bug on the same day, one of them the author of the instruction.
+        const asked = url.searchParams.get("since");
+        const streamed = watcher ? room.members.get(watcher)?.streamSeq : null;
+        const resumeFrom =
+          asked === "resume"
+            ? (typeof streamed === "number" ? streamed : 0)
+            : Number.parseInt(req.headers["last-event-id"] ?? asked ?? "", 10);
         if (Number.isInteger(resumeFrom) && resumeFrom > 0) {
           for (const message of room.messages) {
             if (message.seq > resumeFrom) res.write(mailFrame(message));

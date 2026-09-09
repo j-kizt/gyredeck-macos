@@ -6,12 +6,15 @@ import type { GyredeckEvent } from "@gyredeck/protocol";
  * (claude-sonnet-4-5-20250929 → claude-sonnet-4-5) resolve to their family; no key here
  * is a prefix of another, so match order does not matter.
  *
- * Only Claude Code's adapter reports token usage — Antigravity's hook payload carries no
- * token fields at all and Codex sends a single notify — so in practice this map is the
- * whole feature's reach. A model absent from it renders the token count without a bar
- * rather than against a guessed ceiling: assuming 200k for a 1M-window model reported a
- * 302k conversation as 151% full. Claude Opus 4.5 and earlier are deliberately absent
- * rather than estimated.
+ * This map covers Claude Code, whose adapter reports usage but not a window. Codex needs
+ * none of it: it states its own ceiling in the rollout log the bridge reads, which is
+ * just as well, since it names models no static map will have heard of. Antigravity
+ * reports neither — its counts never leave the CLI's memory, confirmed by asking it.
+ *
+ * A model absent from here and reporting no window of its own renders the token count
+ * without a bar rather than against a guessed ceiling: assuming 200k for a 1M-window
+ * model reported a 302k conversation as 151% full. Claude Opus 4.5 and earlier are
+ * deliberately absent rather than estimated.
  */
 const CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   ["claude-fable-5", 1_000_000],
@@ -37,6 +40,14 @@ interface IPromptTokens {
   inputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  /**
+   * The window the session itself reported, where it does.
+   *
+   * Codex names models this map has never heard of and states its own ceiling in the
+   * log the bridge reads, so a reported window beats a guessed one — and beats no bar
+   * at all, which is what an unknown model gets.
+   */
+  contextWindow?: number | null;
 }
 
 export interface IContextUsageSnapshot {
@@ -103,10 +114,12 @@ export const collectContextUsage = (
     }
 
     if (event.type !== "turn_complete" || !event.data.usage) continue;
+    const reportedWindow = event.data.usage.contextWindow;
     const usage: IPromptTokens = {
       inputTokens: positive(event.data.usage.inputTokens),
       cacheReadTokens: positive(event.data.usage.cacheReadTokens),
       cacheCreationTokens: positive(event.data.usage.cacheCreationTokens),
+      contextWindow: typeof reportedWindow === "number" && reportedWindow > 0 ? reportedWindow : null,
     };
     if (usage.inputTokens + usage.cacheReadTokens + usage.cacheCreationTokens === 0) continue;
     patch(key, (entry) =>
@@ -144,7 +157,10 @@ export const buildContextMeter = (
   const { inputTokens, cacheReadTokens, cacheCreationTokens } = snapshot.usage;
   const used = inputTokens + cacheReadTokens + cacheCreationTokens;
   if (used === 0) return null;
-  const window = resolveContextWindow(snapshot.model ?? fallbackModel);
+  // What the session says about itself wins over what this file knows about models:
+  // the map cannot list every model, and a session that states its own ceiling is not
+  // guessing.
+  const window = snapshot.usage.contextWindow ?? resolveContextWindow(snapshot.model ?? fallbackModel);
   return {
     used,
     inputTokens,

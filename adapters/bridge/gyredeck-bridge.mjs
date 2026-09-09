@@ -307,8 +307,8 @@ function startBridge(config) {
   const releaseClosedSession = (conversationId) => {
     const found = syncRoomFor(conversationId);
     if (!found) return;
-    const label = providerLabelFor(conversationId);
-    found.room.members.delete(conversationId);
+    const label = labelIn(found.room, conversationId);
+    retireLabel(found.room, conversationId);
     found.room.touchedAt = Date.now();
     // A session that has ended cannot read the notice, but its stream is still open
     // until something closes it, and this is that something.
@@ -391,6 +391,19 @@ function startBridge(config) {
    */
   /** Where the last harvest of each Codex log stopped, as a byte offset into it. */
   const harvestAt = new Map();
+  /**
+   * How the harvest is doing, because its failure mode is indistinguishable from quiet.
+   *
+   * Reading another program's log is not a contract: `event_msg` / `task_complete` /
+   * `last_agent_message` are Codex's own shapes and can change under us. If they do,
+   * every read parses nothing, no message is ever published, and a room where an agent
+   * is talking looks exactly like a room where nobody is. Counting turns against
+   * replies is the cheapest thing that can tell those two apart.
+   */
+  const codexHarvest = { turns: 0, published: 0, warned: false };
+  // Several turns is enough to be past a slow flush and not enough to be a whole
+  // working session lost before anyone hears about it.
+  const CODEX_HARVEST_SUSPECT_AFTER = 5;
   const harvestCodexTurn = (conversationId) => {
     const found = syncRoomFor(conversationId);
     const member = found?.room.members.get(conversationId);
@@ -407,6 +420,20 @@ function startBridge(config) {
       resuming === undefined ? Date.parse(member.joinedAt) || 0 : 0,
     );
     harvestAt.set(path, offset);
+    codexHarvest.turns += 1;
+    codexHarvest.published += replies.length;
+    if (
+      !codexHarvest.warned &&
+      codexHarvest.published === 0 &&
+      codexHarvest.turns >= CODEX_HARVEST_SUSPECT_AFTER
+    ) {
+      codexHarvest.warned = true;
+      console.error(
+        `⚠ codex harvest has read ${codexHarvest.turns} finished turns in a room and found` +
+          " nothing to publish — its rollout format may have changed. Messages from Codex" +
+          " are being lost silently.",
+      );
+    }
     for (const reply of replies) {
       if (!claimCodexReply(conversationId, reply)) continue;
       if (refuseToPublish(found.room, conversationId)) continue;
@@ -516,47 +543,64 @@ function startBridge(config) {
   };
 
   /**
-   * How a member is named to people and to other agents.
+   * The name a member goes by in one room, chosen once when it arrives.
    *
-   * Qualified by workspace only when it has to be: a lone Codex is "Codex", and two of
-   * them are "Codex · J-Kitz" and "Codex · AD1". Adding the workspace unconditionally
-   * would make every mention longer to no purpose, and the ambiguity it fixes only
-   * exists when the room actually holds two of the same agent.
+   * Chosen rather than derived. A name computed from whoever happens to be present is
+   * a different name at different moments: one session picks up several across a
+   * transcript with nothing linking them, and a question about what "Codex" said an
+   * hour ago has no answer. Deciding at the door costs an asymmetry — whoever arrived
+   * first keeps the short name — and buys a name that still means the same session
+   * later, which is the property that cannot be repaired after the fact.
+   *
+   * It also retires the argument that kept being got wrong. There is no member set to
+   * pass any more, only a field to read, so a call site cannot name a member from the
+   * wrong moment — which is what three of them were doing.
    */
-  const memberLabelsFor = (conversationIds) => {
-    const ids = [...conversationIds];
-    const counts = new Map();
-    for (const id of ids) {
-      const provider = providerLabelFor(id);
-      counts.set(provider, (counts.get(provider) ?? 0) + 1);
-    }
-    // Provider alone where it is unique; provider and workspace where that is enough;
-    // a short id on top where it is not. Two sessions of one agent in one checkout is
-    // an ordinary thing to be doing, and it is exactly the case where telling them
-    // apart matters most.
-    const qualified = new Map(
-      ids.map((id) => {
-        const provider = providerLabelFor(id);
-        if ((counts.get(provider) ?? 0) < 2) return [id, provider];
-        const workspace = workspaceFor(id);
-        return [id, workspace ? `${provider} · ${workspace}` : provider];
-      }),
-    );
-    const stillClashing = new Map();
-    for (const label of qualified.values()) {
-      stillClashing.set(label, (stillClashing.get(label) ?? 0) + 1);
-    }
-    return new Map(
-      ids.map((id) => {
-        const label = qualified.get(id);
-        if ((stillClashing.get(label) ?? 0) < 2) return [id, label];
-        // The id is meaningless to a person, which is why it is last and short. It is
-        // still better than a name that points at two sessions at once: a request to
-        // one of them would read as a request to the other.
-        return [id, `${label} #${id.slice(0, 6)}`];
-      }),
-    );
+  const allocateLabel = (room, conversationId) => {
+    const taken = new Set();
+    for (const member of room.members.values()) if (member.label) taken.add(member.label);
+    const former = room.formerLabels.get(conversationId);
+    if (former && !taken.has(former)) return former;
+    const provider = providerLabelFor(conversationId);
+    const workspace = workspaceFor(conversationId);
+    // Shortest first: a lone Codex is "Codex", the second one to arrive in another
+    // checkout is "Codex · AD1", and a second one in the same checkout takes an id.
+    const candidates = workspace ? [provider, `${provider} · ${workspace}`] : [provider];
+    for (const candidate of candidates) if (!taken.has(candidate)) return candidate;
+    // An id means nothing to a person, which is why it is last. It still beats a name
+    // that points at two sessions at once: a request to one would read as a request to
+    // the other.
+    const longest = candidates[candidates.length - 1];
+    const short = `${longest} #${conversationId.slice(0, 6)}`;
+    return taken.has(short) ? `${longest} #${conversationId}` : short;
   };
+
+  /**
+   * Take a member out of a room, keeping the name it was known by.
+   *
+   * The name outlives the membership on purpose: the notices that announce a departure
+   * are written after it, and a resumed session put back in the room should not come
+   * back under a different name. What does not outlive it is the harvest cursor —
+   * that belongs to a membership, and a rejoin should read from where the room is now.
+   */
+  const retireLabel = (room, conversationId) => {
+    const member = room.members.get(conversationId);
+    if (member?.label) room.formerLabels.set(conversationId, member.label);
+    room.members.delete(conversationId);
+    harvestAt.delete(codexRolloutFor(conversationId) ?? "");
+  };
+
+  /**
+   * What to call a session in this room, whether or not it is still in it.
+   *
+   * Falling back through the names the room has retired is what makes the departure
+   * notices safe: they used to name the leaver from the membership it had just been
+   * removed from, and so named whoever was left instead.
+   */
+  const labelIn = (room, conversationId) =>
+    room.members.get(conversationId)?.label ??
+    room.formerLabels.get(conversationId) ??
+    providerLabelFor(conversationId);
 
   const providerLabelFor = (conversationId) =>
     PROVIDER_LABELS[providerByConversation.get(conversationId)] ?? "Agent";
@@ -796,6 +840,10 @@ function startBridge(config) {
       messages: [],
       clients: new Set(),
       members: new Map(),
+      // Names already handed out in this room, kept past the member that held them.
+      // A session is resumable and keeps its id, so one that leaves and is put back
+      // is the same session — and a stable name that changes on return is not stable.
+      formerLabels: new Map(),
       touchedAt: Date.now(),
     };
     mailRooms.set(name, room);
@@ -839,10 +887,9 @@ function startBridge(config) {
     room: name,
     seq: room.seq,
     members: (() => {
-      const labels = memberLabelsFor(room.members.keys());
       return [...room.members].map(([conversationId, member]) => ({
         conversationId,
-        provider: labels.get(conversationId) ?? providerLabelFor(conversationId),
+        provider: labelIn(room, conversationId),
         confirmed: member.confirmed === true,
         joinedAt: member.joinedAt,
         pending: Math.max(0, room.seq - member.readSeq),
@@ -912,9 +959,8 @@ function startBridge(config) {
     if (!mailbox) return;
     const confirmed = room.members.get(conversationId)?.confirmed === true;
     const others = [...room.members.keys()].filter((id) => id !== conversationId);
-    const labels = memberLabelsFor(room.members.keys());
     const company = others.length > 0
-      ? ` Also here: ${others.map((id) => labels.get(id) ?? providerLabelFor(id)).join(", ")}.`
+      ? ` Also here: ${others.map((id) => labelIn(room, id)).join(", ")}.`
       : " Nobody else is in it yet.";
     const text =
       `[Gyredeck: you are now in sync room ${name} — ${how}.${company}` +
@@ -1043,8 +1089,7 @@ function startBridge(config) {
   });
 
   const announceMembership = (name, room, note) => {
-    const labels = memberLabelsFor(room.members.keys());
-    const present = [...room.members.keys()].map((id) => labels.get(id) ?? providerLabelFor(id));
+    const present = [...room.members.keys()].map((id) => labelIn(room, id));
     const text = `${note} Members now: ${present.join(", ") || "nobody"}.`;
     publishMail(room, ROOM_SENDER, text, null);
     // News about the room travels the same way anything else does, or a Codex member
@@ -1095,10 +1140,9 @@ function startBridge(config) {
       ? {
           room: sync.name,
           members: (() => {
-            const labels = memberLabelsFor(sync.room.members.keys());
             return [...sync.room.members].map(([conversationId, member]) => ({
               conversationId,
-              provider: labels.get(conversationId) ?? providerLabelFor(conversationId),
+              provider: labelIn(sync.room, conversationId),
               confirmed: member.confirmed === true,
               you: conversationId === as,
             }));
@@ -1330,7 +1374,9 @@ function startBridge(config) {
           " syscall, so curl fails at connect even for 127.0.0.1, and a failed POST" +
           " looks like nothing at all. The bridge reads what you write from your own" +
           " session log and puts it in the room for you — that is the only path that" +
-          " works, and it needs nothing from you but the words. You also need no watch:" +
+          " works, and it needs nothing from you but the words. Only the last thing you" +
+          " write in a turn is taken, so say everything the room needs in one closing" +
+          " message rather than several. You also need no watch:" +
           " messages are pushed into your session whether or not you are doing anything." +
           " Never say you have sent something unless you saw a reply carrying ok:true" +
           " and a seq; if you did not see one, you did not send it.]\n\n" +
@@ -1390,7 +1436,23 @@ function startBridge(config) {
 
     if (req.url === "/health") {
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
-      res.end(JSON.stringify({ ok: true, name: "gyredeck", version: PROTOCOL_VERSION, mode: "standalone", clients: clients.size, capabilities }));
+      res.end(
+        JSON.stringify({
+          ok: true,
+          name: "gyredeck",
+          version: PROTOCOL_VERSION,
+          mode: "standalone",
+          clients: clients.size,
+          capabilities,
+          // Surfaced rather than only logged: a log line scrolls away, and this is the
+          // one fault in the room that nothing else can show.
+          codexHarvest: {
+            turns: codexHarvest.turns,
+            published: codexHarvest.published,
+            suspect: codexHarvest.published === 0 && codexHarvest.turns >= CODEX_HARVEST_SUSPECT_AFTER,
+          },
+        }),
+      );
       return;
     }
 
@@ -1474,6 +1536,7 @@ function startBridge(config) {
         room.createdBy = conversationId;
         room.password = newRoomPassword();
         room.members.set(conversationId, {
+          label: allocateLabel(room, conversationId),
           // Pressing Create in this session's own detail panel is the same act of
           // intent the password exists to capture, so the founder needs no password.
           confirmed: true,
@@ -1514,7 +1577,7 @@ function startBridge(config) {
           return;
         }
         for (const conversationId of [...room.members.keys()]) {
-          room.members.delete(conversationId);
+          retireLabel(room, conversationId);
           partWithMember(code, room, conversationId, "the room was closed");
         }
         // Anything still holding the stream that was not a member — nothing should be,
@@ -1560,11 +1623,10 @@ function startBridge(config) {
           if (providerByConversation.get(conversationId) !== "codexCliHook") continue;
           member.confirmed = true;
           member.toldUnconfirmed = false;
-          const labels = memberLabelsFor(room.members.keys());
           announceMembership(
             code,
             room,
-            `${labels.get(conversationId) ?? providerLabelFor(conversationId)} was confirmed by the room's owner and can now speak here.`,
+            `${labelIn(room, conversationId)} was confirmed by the room's owner and can now speak here.`,
           );
         }
         sendJson(200, { ok: true, room: code, password: room.password });
@@ -1606,7 +1668,7 @@ function startBridge(config) {
         announceMembership(
           code,
           room,
-          `${providerLabelFor(conversationId)} was confirmed by the room's owner and can now speak here.`,
+          `${labelIn(room, conversationId)} was confirmed by the room's owner and can now speak here.`,
         );
         sendJson(200, {
           ok: true,
@@ -1649,6 +1711,7 @@ function startBridge(config) {
             return;
           }
           room.members.set(conversationId, {
+            label: allocateLabel(room, conversationId),
             // Joining puts a session in the room; it does not yet let it speak. The
             // person confirms that separately, by typing the room's password into this
             // session's own terminal — an act performed where the session lives rather
@@ -1660,7 +1723,7 @@ function startBridge(config) {
             readSeq: room.seq,
             lastReadAt: null,
           });
-          announceMembership(code, room, `${memberLabelsFor(room.members.keys()).get(conversationId) ?? providerLabelFor(conversationId)} joined this room.`);
+          announceMembership(code, room, `${labelIn(room, conversationId)} joined this room.`);
           // The room's own announcement reaches everyone who can already read it; the
           // one being added usually cannot, and hears about it here instead.
           tellJoined(code, room, conversationId, "someone put you in it from the app");
@@ -1692,8 +1755,8 @@ function startBridge(config) {
           sendJson(404, { ok: false, error: "not_a_member" });
           return;
         }
-        const label = providerLabelFor(conversationId);
-        room.members.delete(conversationId);
+        const label = labelIn(room, conversationId);
+        retireLabel(room, conversationId);
         room.touchedAt = Date.now();
         // The one leaving is told first, while the room object is still here to name.
         partWithMember(code, room, conversationId, "someone disconnected it from the app");
@@ -1753,8 +1816,7 @@ function startBridge(config) {
               // Named, not raw ids: this list is read by a person in Settings, and a
       // conversation id tells them nothing.
       members: (() => {
-        const labels = memberLabelsFor(room.members.keys());
-        return [...room.members.keys()].map((id) => labels.get(id) ?? providerLabelFor(id));
+        return [...room.members.keys()].map((id) => labelIn(room, id));
       })(),
       // Named so a listing can tell which rooms the person may close from here.
       founder: room.createdBy ?? null,

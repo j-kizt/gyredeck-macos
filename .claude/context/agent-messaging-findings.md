@@ -92,6 +92,30 @@ Asking an agent to reply *through* the bridge means asking it to run a shell com
   sandbox could change and the credential would still stop it. This is the real reason its replies are harvested from its
   rollout log rather than requested, and it holds even where the approval below would
   not. `codex queue` still works because that runs from outside, going in.
+- **The sandbox is a choice Codex makes, not a limit of the machine.** It wraps every
+  model-generated command in Apple's seatbelt — `codex sandbox --help` says so in as
+  many words. Measured against one bridge on one port at one moment: a plain shell gets
+  `HTTP 200 in 0.0016s`, `codex sandbox curl …` gets `HTTP 000 in 0.0008s`. Claude Code
+  and Antigravity have no such wall; they ask per command instead. That difference, not
+  any difference in ability, is why the two adapters are shaped differently.
+- **Loopback-only is expressible, and was wrongly written here as impossible.** An
+  earlier version of this file said the config offered nothing but `network_access =
+  true/false`. It offers more. `[permissions.<name>]` profiles take a
+  `network = { mode = … }`, and feeding it a bad value makes the parser name the real
+  ones: ``unknown variant `enabled`, expected `limited` or `full` ``. The binary already
+  carries `(allow network-outbound (remote ip "localhost:*"))`, so a policy that reaches
+  a bridge on 127.0.0.1 while exfiltrating nothing is describable in the terms Codex
+  itself uses.
+  What could not be shown is it working: `codex sandbox -P <profile> …` aborts with exit
+  134 and no output on `codex-cli 0.153.4`, for every profile shape tried. So the escape
+  hatch is recorded, not taken — and the harvest stays the floor. Re-test with the two
+  commands above when the version changes; if `-P` runs, Codex can post for itself and
+  most of the Codex-specific path can go.
+- **If Codex ever can post, the harvest must stop for that session.** Both would
+  publish — the `curl` body and the turn's `last_agent_message` are different strings,
+  so the per-thread claim does not see a duplicate and the room gets each answer twice.
+  A POST arriving from a Codex conversation id with a valid room password is proof that
+  session can reach the bridge, which is the signal to switch it off.
 - **Codex asks every single time** for any command it *can* run. The message text is
   part of the `curl`, so the command string differs per message and an approved prefix
   never matches the next one.

@@ -452,7 +452,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
         "A successful send answers with ok:true and a seq. Do not report having sent" +
         " anything unless you saw that: a refused POST prints nothing useful, and saying" +
         " you replied when the room never received it is worse than saying nothing.\n" +
-        'A message carries who it is for and what it is for: "to" is a member\'s name or "everyone", and "kind" is "ask", "tell" or "ack". ask and tell interrupt whoever they name; ack reaches the room and interrupts nobody, so an acknowledgement costs no one a turn and you may send one freely. Leave them out and the message goes to everyone as tell, waking every session in the room — so say what you mean.',
+        'A message says who it is for and what it is for. "to" is a member\'s name or "everyone"; "kind" is one of four. **ask** wants an answer. **tell** does not, but may draw a reaction. **reaction** is a short line saying it landed and where that leaves you — send one for a tell or for a notice about somebody joining or leaving, address it wherever you like since it asks for nothing back, and never answer one: that is where an exchange stops. **notice** is the room speaking about itself and interrupts nobody. Leave the fields out and the message goes to everyone as tell, waking every session in the room. When you answer someone, address it to them — that is what keeps one exchange costing one wake instead of waking the room.',
     );
   }
   // Watching sits with the other things to do rather than at the top, where five

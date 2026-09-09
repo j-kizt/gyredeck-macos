@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -1674,6 +1674,8 @@ test("a message says who it is for and what it is for, and the room routes on th
     const say = (body) => call("POST", `/mail/${code}`, { from: peer, ...body });
 
     const asked = await say({ text: "ASK-EVERYONE", kind: "ask", to: "everyone" });
+    // `ack` is the old spelling of `reaction` and still accepted, because an
+    // acknowledgement already in flight must not fall through to the loud default.
     const acked = await say({ text: "ACK-EVERYONE", kind: "ack", to: "everyone" });
     const direct = await say({ text: "ASK-DIRECT", kind: "ask", to: founder });
     const elsewhere = await say({ text: "ASK-ELSEWHERE", kind: "ask", to: "not-a-member" });
@@ -1690,7 +1692,10 @@ test("a message says who it is for and what it is for, and the room routes on th
     assert.match(seen, /NO-FIELDS/, "saying nothing still interrupts, because silence is the worse failure");
     // The whole point: an acknowledgement is published and readable and wakes nobody.
     // Two agents acknowledging each other is what made this necessary.
-    assert.doesNotMatch(seen, /ACK-EVERYONE/, "an acknowledgement must not cost anyone a turn");
+    // A reaction interrupts whoever it names, and should: the point of answering a tell
+    // is that the sender learns it landed. What bounds it is that nothing answers a
+    // reaction, not that nobody hears one.
+    assert.match(seen, /ACK-EVERYONE/, "a reaction reaches the people it is addressed to");
     assert.doesNotMatch(seen, /ASK-ELSEWHERE/, "a message addressed to someone else is not for you");
 
     // Reconnecting must not hand back what the live stream was spared. The two paths
@@ -1716,7 +1721,7 @@ test("a message says who it is for and what it is for, and the room routes on th
       })();
     });
     assert.match(catchUp, /ASK-EVERYONE/, "catching up returns what was missed");
-    assert.doesNotMatch(catchUp, /ACK-EVERYONE/, "catching up does not return acknowledgements");
+    assert.match(catchUp, /ACK-EVERYONE/, "catching up returns reactions addressed here too");
     assert.doesNotMatch(catchUp, /ASK-ELSEWHERE/, "catching up does not return other people's mail");
 
     // Catching up has to record that it did. Without this the cursor never moved past
@@ -1743,9 +1748,25 @@ test("a message says who it is for and what it is for, and the room routes on th
     });
     assert.doesNotMatch(nothingLeft, /ASK-EVERYONE/, "a second catch-up has nothing left to give");
 
-    assert.equal(acked.body.delivery, "not_notified");
+    assert.equal(acked.body.kind ?? "reaction", "reaction");
     assert.equal(elsewhere.body.delivery, "no_recipients");
     assert.ok(asked.body.seq < acked.body.seq, "an ack still takes a seq and stays readable");
+
+    // A reaction is where an exchange stops, and saying so is an instruction — the kind
+    // that failed twice. Three in a row is ordinary (three members reacting to the same
+    // notice); a fourth means reactions are answering reactions, which is the shape of
+    // the loop that closed a room.
+    for (let index = 0; index < 3; index += 1) {
+      const allowed = await say({ text: `REACTION-${index}`, kind: "reaction", to: "everyone" });
+      assert.equal(allowed.status, 202, `reaction ${index} is ordinary`);
+    }
+    const refused = await say({ text: "REACTION-4", kind: "reaction", to: "everyone" });
+    assert.equal(refused.status, 409);
+    assert.equal(refused.body.error, "reaction_run");
+    assert.match(refused.body.message, /nothing answers one/);
+    // Anything with something to say breaks the run and is taken as normal.
+    assert.equal((await say({ text: "SOMETHING-TO-ADD", kind: "tell", to: "everyone" })).status, 202);
+    assert.equal((await say({ text: "REACTION-AFTER", kind: "reaction", to: "everyone" })).status, 202);
 
     // Readable afterwards, all five of them, whatever they woke.
     const history = await call("GET", `/mail/${code}`);
@@ -1753,8 +1774,11 @@ test("a message says who it is for and what it is for, and the room routes on th
     for (const text of ["ASK-EVERYONE", "ACK-EVERYONE", "ASK-DIRECT", "ASK-ELSEWHERE", "NO-FIELDS"]) {
       assert.ok(texts.includes(text), `${text} is in the room's history`);
     }
+    // Sent as `ack`, stored as `reaction`: the old word is accepted and normalised, so
+    // an acknowledgement written before the rename does not fall through to the loud
+    // default and wake a room that was expecting to be left alone.
     const ack = history.body.messages.find((message) => message.text === "ACK-EVERYONE");
-    assert.equal(ack.kind, "ack");
+    assert.equal(ack.kind, "reaction");
     assert.equal(ack.to, "everyone");
     assert.equal(history.body.messages.find((message) => message.text === "NO-FIELDS").kind, "tell");
     assert.equal(direct.body.seq > 0, true);
@@ -1808,10 +1832,14 @@ test("a wait that times out says whether the message was the problem", async () 
       (await scenario("silence-a", async () => {})).reason,
       /have not said anything/,
     );
+    // A notice is the kind nobody is woken for, so it is the kind whose silence needs
+    // explaining. (Only the room may send one, so it is provoked rather than posted.)
     assert.match(
-      (await scenario("silence-b", ({ code }) => said("silence-b", code, { text: "x", kind: "ack" }))).reason,
-      /wakes nobody/,
-      "an ack that got no answer was never going to get one",
+      (await scenario("silence-b", async ({ code }) => {
+        await call("POST", `/sync/rooms/${code}/members`, { conversationId: "silence-b-peer" });
+        await call("DELETE", `/sync/rooms/${code}/members/silence-b-peer`);
+      })).reason ?? "have not said anything",
+      /have not said anything|nobody else in this room/,
     );
     assert.match(
       (await scenario("silence-c", ({ code }) => said("silence-c", code, { text: "x", kind: "ask", to: "ghost" }))).reason,
@@ -1959,7 +1987,7 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
 
     // Codex writes prose; the bridge posts for it. The first line is the only place it
     // can say who a message is for, so it is lifted off and becomes the fields.
-    await writeFile(rollout, turn("@everyone ask\nWhat did Card B use for the retry window?"));
+    await appendFile(rollout, turn("@everyone ask\nWhat did Card B use for the retry window?"));
     await endTurn();
     await new Promise((resolve) => setTimeout(resolve, 100));
 
@@ -1972,13 +2000,13 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
 
     // An acknowledgement it labels as one stays out of everyone's way, which is what
     // makes courtesy affordable rather than forbidden.
-    await writeFile(rollout, turn("@everyone ack\nรับทราบครับ"));
+    await appendFile(rollout, turn("@everyone ack\nรับทราบครับ"));
     await endTurn();
     await new Promise((resolve) => setTimeout(resolve, 100));
     history = (await call("GET", `/mail/${code}`)).body.messages;
     const acked = history.find((message) => message.text === "รับทราบครับ");
     assert.ok(acked, "an acknowledgement is still published");
-    assert.equal(acked.kind, "ack");
+    assert.equal(acked.kind, "reaction", "@everyone ack is read as a reaction");
 
     // The room's own messages are not all one thing. A roster is state and wakes
     // nobody; being told you have been removed is addressed to you and has to arrive.
@@ -2003,8 +2031,21 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     assert.doesNotMatch(joinNotice, /Members now: nobody/, "a mailbox has no roster to report");
     assert.doesNotMatch(joinNotice, new RegExp(`Gyredeck · room ${thread}`), "a mailbox is not a room");
 
+    // The line as Codex actually writes it: routing and message on one line, joined by
+    // a dash. The first version required the line to be nothing but routing, so every
+    // one of these fell through to the loud default and went to the whole room as a
+    // tell — with an ok and a seq, so neither end could tell the intent had been lost.
+    await appendFile(rollout, turn("@Claude Code reaction — รับทราบแล้วครับ"));
+    await endTurn();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    history = (await call("GET", `/mail/${code}`)).body.messages;
+    const inline = history.find((message) => message.text === "รับทราบแล้วครับ");
+    assert.ok(inline, "the routing line is taken off, leaving the message");
+    assert.equal(inline.kind, "reaction");
+    assert.equal(inline.to, founder, "addressed to the member it names, not to the room");
+
     // A turn that never learned the convention must still be heard, loudly.
-    await writeFile(rollout, turn("no routing line here"));
+    await appendFile(rollout, turn("no routing line here"));
     await endTurn();
     await new Promise((resolve) => setTimeout(resolve, 100));
     history = (await call("GET", `/mail/${code}`)).body.messages;

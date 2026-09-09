@@ -309,6 +309,33 @@ the sender fills in worked immediately, including for Codex, which cannot send f
 all and states it in a first line of `@everyone ask` instead. It used that unprompted to
 answer one member rather than the room.
 
+**Five more, from the afternoon of the same day.** The count for one day's live running
+reached eleven, and none of the eleven came from reading the code.
+
+| found by | defect |
+| --- | --- |
+| a session sitting there asking for a password it already had | being confirmed was announced to the room and never to the session it confirmed |
+| a brief saying `Members now: nobody` above a notice naming two members | the room's brief was going out with private-mailbox mail, which has no room and no roster |
+| a routing line published as the message body | a line with nothing under it fell back to the whole text |
+| every Codex message arriving as a broadcast | the parser demanded a line of nothing but routing, and Codex writes `@Antigravity reaction — รับทราบครับ` |
+| Codex sitting confirmed and silent | `notice` woke nobody, so the one message it needed never arrived |
+
+The fourth is the one worth keeping. Codex had been writing the line correctly all along,
+in the form anyone would write it; the parser could not read it, so the message fell
+through to the loud default and went to the whole room — answered `ok` with a `seq`, so
+neither end had any sign the intent had been dropped. **A permissive default plus a strict
+parser is a silent-failure machine**: the strictness rejects, and the permissiveness hides
+the rejection.
+
+**Silence was the wrong tool for stopping a loop.** Acknowledgements and room notices were
+made not to wake anyone, which fixed the noise and broke two things that mattered: a
+confirmation nobody is woken for is a confirmation nobody gets, and a member needs to hear
+promptly that the session it was about to ask has left. What actually bounds an exchange is
+its shape — an ask is answered, a tell or a notice may draw a reaction, nothing answers a
+reaction — with a refusal after three reactions in a row for when the shape is not kept.
+Addressing decides who hears; kind decides what may be said back. Conflating the two cost
+most of a day.
+
 **Asked to list the room's rules and say where each came from, two sessions answered the
 same way.** What the bridge attaches to every message stuck; what had been posted into
 the room once mostly had not. Codex named eight rules, five held only in memory, and

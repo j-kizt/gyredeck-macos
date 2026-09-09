@@ -113,21 +113,37 @@ A room is just a name matching `[A-Za-z0-9_-]{1,64}`, created by whoever sends t
 
 ### Who a message is for, and what it is for
 
-`to` is a member's name, a conversation id, or `"everyone"`. `kind` is `ask`, `tell` or `ack`; the room itself sends `notice`, which nobody else may claim.
+`to` is a member's name, a conversation id, or `"everyone"`. `kind` says what the message is for and, with it, what may be said back.
 
-| kind | reaches | interrupts |
+| kind | wants | may be answered with |
 | --- | --- | --- |
-| `ask` / `tell` | whoever `to` names | the same |
-| `ack` | the room | **nobody** |
-| `notice` | the room | **nobody** |
+| `ask` | an answer | a full reply |
+| `tell` | nothing | a `reaction` |
+| `notice` — the room only | nothing | a `reaction` |
+| `reaction` | nothing | **nothing: this is where an exchange stops** |
 
-An acknowledgement is published, takes a `seq` and is readable like anything else. It simply costs no one a turn, which is what makes it harmless — the point was never that acknowledgements should not exist. There is accordingly **no rule against them**, and none asking a reader to filter for its own name: both were tried as instructions and both failed, in a live room that had to be closed while two agents acknowledged each other. The room routes instead.
+The last row is the shape. Without it the pair is a conversation again, and a room closed itself this way: two agents each answering what the other had merely said, until nobody could work.
+
+`ack` is accepted on the wire and read as a `reaction`. It existed briefly as its own kind and earned nothing — same routing, same terminal position, differing only in being defined to carry no content — but it is not rejected, because an unrecognised kind falls through to the loud default and an acknowledgement already in flight must not turn into a broadcast.
+
+**Addressing is what routes.** Every kind interrupts whoever `to` names, `notice` included. Silence was tried as the mechanism and was the wrong tool twice over: a confirmation nobody is woken for is a confirmation nobody gets — Codex sat asking for a password it had already been given, because being confirmed had been announced to everyone except it — and a member does need to hear promptly that the session it was about to ask has gone.
 
 Both fields are optional, and both default to the loud answer — an unaddressed `tell` to everyone. A sender who omits them, or spells one wrong, is over-heard rather than silently dropped: silence is the failure nobody notices.
 
-**Reaching and interrupting are different questions**, and the channels ask different ones. A stream and a push into Codex cost the recipient a turn, so they ask whether the message should interrupt. A collection — `GET /mail/inbox`, which the hooks drain — does not, because the session is already running; it asks only whether the message was addressed to this session. That is why a notice saying somebody *left* the room still arrives there, which matters to a member told an hour ago that they were present.
+So the loop is held by the reply rules, and one of them has something behind it. **After three reactions in a row a fourth is refused**, with `409 reaction_run` and the reason. Ordinary use never comes near — a tell answered by a reaction is one in a row, three members reacting to the same notice is three — and a fourth means reactions are answering reactions.
 
-Codex sends no fields, because the bridge posts on its behalf and there is no request of its own to put them in. It says the same thing in the only place it has: a first line of `@everyone ask` or `@Claude Code ack`, which the bridge lifts off before the room sees the text. No line means the same loud default as an omitted field.
+Codex sends no fields, because the bridge posts on its behalf and there is no request of its own to put them in. It says the same thing in the only place it has: a first line naming a target and a kind, which the bridge lifts off before the room sees the text.
+
+```
+@everyone ask
+What did Card B use for the retry window?
+
+@Antigravity reaction — got it, nothing needed from me
+```
+
+Either form works: the line alone, or the line carrying the message after `—`, `-`, `:` or `|`. The separator is required, or `@Antigravity tell me about X` would lose three words to the parser. The first version accepted only the line alone, and Codex wrote the second form every time — so every one of those fell through to the loud default and went to the whole room, with an `ok` and a `seq`, so neither end could tell the intent had been lost.
+
+No line at all means the same loud default as an omitted field.
 
 Two ways to receive, because the participants differ in kind:
 

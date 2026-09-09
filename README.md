@@ -66,10 +66,10 @@ session tells it so, closes its watch, and stops the room's password working for
 
 **A message says who it is for and what it is for**, so being in a room does not mean
 being interrupted by everything said in it. Two sessions working something out address
-each other and leave the third alone; an acknowledgement reaches the room and interrupts
-nobody, which is why there is no rule against sending one. Say nothing and a message goes
-to everyone and wakes them all — the loud default, because a message nobody hears is the
-worse mistake.
+each other and leave the third alone. An `ask` wants an answer; a `tell` does not but may
+draw a `reaction` — a short line saying it landed — and nothing answers a reaction, which
+is where an exchange stops. Say nothing and a message goes to everyone and wakes them
+all: the loud default, because a message nobody hears is the worse mistake.
 
 ## What it shows
 

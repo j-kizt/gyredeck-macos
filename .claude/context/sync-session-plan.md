@@ -197,8 +197,15 @@ the person is meant to be reading terminals, not the app.
 ## Who a message interrupts
 
 Being in a room is not the same as being spoken to. A message carries `to` — a member or
-everyone — and `kind`: `ask`, `tell` or `ack`. The first two interrupt whoever they name;
-an acknowledgement reaches the room and interrupts nobody.
+everyone — and `kind`, which says what may be said back: an `ask` is answered, a `tell` or
+a `notice` may draw a `reaction`, and **nothing answers a reaction**. That last clause is
+what makes an exchange finite; the rest is addressing.
+
+Silence was tried as the mechanism first — acknowledgements and notices that woke nobody —
+and it was the wrong tool. A confirmation nobody is woken for is a confirmation nobody
+gets, and a member needs to hear promptly that the session it was about to ask has left.
+So everything interrupts whoever it names, and the bound moved to the replies: after three
+reactions in a row, a fourth is refused.
 
 This replaced two instructions, both of which had been tried and had failed. *Never
 acknowledge* was in front of Codex on every message it received while it sent one every

@@ -644,10 +644,34 @@ fn node_hook_command(installed_path: &str, event: &str) -> String {
     format!("{node} {installed_path} --event {event}")
 }
 
+/// Whether a command line runs `--event <event>`, and not `--event <event>Something`.
+fn runs_event(command: &str, event: &str) -> bool {
+    let needle = format!("--event {event}");
+    let mut from = 0;
+    while let Some(at) = command[from..].find(&needle) {
+        let end = from + at + needle.len();
+        match command[end..].chars().next() {
+            None => return true,
+            Some(next) if next.is_whitespace() => return true,
+            Some(_) => from = end,
+        }
+    }
+    false
+}
+
+/// Whether one of our hooks for this event is already registered.
+///
+/// Matched on the script and the event rather than on the whole command line, because
+/// the rest of that line is not stable. The installer writes an absolute path to the
+/// node binary it found; `pnpm hooks:install` writes a bare `node` and lets the shell
+/// resolve it; and either becomes wrong the moment the person switches nvm version.
+/// Comparing the strings whole made all three of those look like "not installed", which
+/// is worse than it sounds: the hook goes on working and delivering events, while the
+/// app reports the agent unhooked and hides the sync panel entirely.
 fn hook_entry_present(
     hooks: &serde_json::Map<String, serde_json::Value>,
     event: &str,
-    command: &str,
+    installed_path: &str,
 ) -> bool {
     hooks
         .get(event)
@@ -659,7 +683,11 @@ fn hook_entry_present(
                     .and_then(serde_json::Value::as_array)
                     .map(|inner| {
                         inner.iter().any(|hook| {
-                            hook.get("command").and_then(serde_json::Value::as_str) == Some(command)
+                            hook.get("command")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|command| {
+                                    command.contains(installed_path) && runs_event(command, event)
+                                })
                         })
                     })
                     .unwrap_or(false)
@@ -3923,8 +3951,7 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
     prune_hook_entries(hooks, &installed_path);
 
     let mut register = |event: &str, entry: serde_json::Value| {
-        let command = node_hook_command(&installed_path, event);
-        if hook_entry_present(hooks, event, &command) {
+        if hook_entry_present(hooks, event, &installed_path) {
             return;
         }
         let list = hooks
@@ -3986,8 +4013,7 @@ fn claude_hook_status() -> Result<(String, bool), String> {
         if let Ok(content) = fs::read_to_string(&settings_path) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(hooks) = json.get("hooks").and_then(serde_json::Value::as_object) {
-                    let command = node_hook_command(&installed_path, "Stop");
-                    in_settings = hook_entry_present(hooks, "Stop", &command);
+                    in_settings = hook_entry_present(hooks, "Stop", &installed_path);
                 }
             }
         }
@@ -4141,8 +4167,7 @@ fn install_codex_hook(app: tauri::AppHandle) -> Result<String, String> {
     prune_hook_entries(hooks, &installed_path);
 
     let mut register = |event: &str, entry: serde_json::Value| {
-        let command = node_hook_command(&installed_path, event);
-        if hook_entry_present(hooks, event, &command) {
+        if hook_entry_present(hooks, event, &installed_path) {
             return;
         }
         let list = hooks
@@ -4209,11 +4234,7 @@ fn codex_hook_status() -> Result<(String, bool), String> {
         if let Ok(content) = fs::read_to_string(&hooks_json_path) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(hooks) = json.get("hooks").and_then(|v| v.as_object()) {
-                    in_hooks = hook_entry_present(
-                        hooks,
-                        "Stop",
-                        &node_hook_command(&installed_path, "Stop"),
-                    );
+                    in_hooks = hook_entry_present(hooks, "Stop", &installed_path);
                 }
             }
         }
@@ -5786,5 +5807,51 @@ mod display_selection_tests {
             Some(CodexMetricLine::Progress { label, used, .. })
                 if label == "Gemini 5h" && *used == 25.0
         ));
+    }
+}
+
+#[cfg(test)]
+mod hook_registration_tests {
+    use super::{hook_entry_present, runs_event};
+
+    const SCRIPT: &str = "/Users/someone/.config/gyredeck/gyredeck-claude-hook.mjs";
+
+    fn settings(command: &str) -> serde_json::Map<String, serde_json::Value> {
+        let json = serde_json::json!({
+            "Stop": [{"hooks": [{"type": "command", "command": command}]}]
+        });
+        json.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn an_event_is_not_matched_by_one_that_ends_with_it() {
+        assert!(runs_event("node x.mjs --event Stop", "Stop"));
+        assert!(runs_event("node x.mjs --event Stop --quiet", "Stop"));
+        assert!(!runs_event("node x.mjs --event SubagentStop", "Stop"));
+        assert!(!runs_event("node x.mjs --event Stopping", "Stop"));
+    }
+
+    #[test]
+    fn the_node_binary_is_not_part_of_the_match() {
+        // The installer writes the absolute path it resolved; `pnpm hooks:install`
+        // writes a bare `node`. Both run the same hook, and comparing whole command
+        // lines called one of them uninstalled — which hid the sync panel while the
+        // hook went on delivering events.
+        for prefix in ["node", "/Users/someone/.nvm/versions/node/v22.16.0/bin/node"] {
+            let hooks = settings(&format!("{prefix} {SCRIPT} --event Stop"));
+            assert!(hook_entry_present(&hooks, "Stop", SCRIPT), "prefix {prefix}");
+        }
+    }
+
+    #[test]
+    fn someone_elses_hook_is_not_ours() {
+        let hooks = settings("node /Users/someone/other-tool/hook.mjs --event Stop");
+        assert!(!hook_entry_present(&hooks, "Stop", SCRIPT));
+    }
+
+    #[test]
+    fn our_script_registered_for_a_different_event_does_not_count() {
+        let hooks = settings(&format!("node {SCRIPT} --event SessionStart"));
+        assert!(!hook_entry_present(&hooks, "Stop", SCRIPT));
     }
 }

@@ -1980,6 +1980,21 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     assert.ok(acked, "an acknowledgement is still published");
     assert.equal(acked.kind, "ack");
 
+    // The room's own messages are not all one thing. A roster is state and wakes
+    // nobody; being told you have been removed is addressed to you and has to arrive.
+    // That difference used to rest on whether a caller passed the message on to
+    // delivery — right by accident, and one tidying pass away from a session never
+    // learning it had been disconnected.
+    const codexMail = (await call("GET", `/mail/${thread}`)).body.messages || [];
+    const joined = codexMail.find((message) => /you are now in sync room/.test(message.text));
+    assert.ok(joined, "a session is told which room it is in");
+    assert.equal(joined.kind, "tell", "being put in a room is addressed to you, not room state");
+    assert.equal(joined.to, thread);
+    const roomHistory = (await call("GET", `/mail/${code}`)).body.messages || [];
+    const roster = roomHistory.find((message) => /joined this room/.test(message.text));
+    assert.ok(roster, "the room announces who is in it");
+    assert.equal(roster.kind, "notice", "a roster is state and interrupts nobody");
+
     // The room brief belongs to a room. It was going out with mailbox deliveries too,
     // naming the mailbox as though it were one and reporting "Members now: nobody"
     // above a notice that listed the members who were there.

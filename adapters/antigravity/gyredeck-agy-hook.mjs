@@ -207,7 +207,7 @@ const replyInstruction = (endpoint, room, replyRooms) => {
     `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${target} ` +
     "-H 'content-type: application/json' " +
     (isRoom ? '-H "x-gyredeck-token: THE ROOM PASSWORD" ' : '-H "x-gyredeck-token: $TOKEN" ') +
-    `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}"}'`;
+    `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}","to":"everyone","kind":"tell"}'`;
   return {
     ephemeralMessage:
       "The mail above asked you something, and answering is expected — this is a " +
@@ -218,6 +218,7 @@ const replyInstruction = (endpoint, room, replyRooms) => {
       "A successful send answers with ok:true and a seq. Do not report having sent " +
       "anything unless you saw that: a refused POST prints nothing useful, and saying " +
       "you replied when the room never received it is worse than saying nothing.\n" +
+      'A message carries who it is for and what it is for: "to" is a member\'s name or "everyone", and "kind" is "ask", "tell" or "ack". ask and tell interrupt whoever they name; ack reaches the room and interrupts nobody, so an acknowledgement costs no one a turn and you may send one freely. Leave them out and the message goes to everyone as tell, waking every session in the room — so say what you mean.' + "\n" +
       (replyRooms.length > 1 ? `Other senders are listening on: ${replyRooms.slice(1).join(", ")}.\n` : "") +
       "Skip it only if nothing was actually asked.",
   };
@@ -364,21 +365,20 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
         `  [ "$(cat /tmp/gy-${syncRoom}.st)" = "22" ] && { echo "gyredeck: room ${syncRoom} is gone - watch ended"; break; }\n` +
         `  sleep 1\n` +
         `done\n` +
-        " React only to messages that name you or answer something you asked.\n" +
+        "Anything arriving on it is meant to interrupt you: the room sends only what was" +
+        " addressed to you or to everyone, never an acknowledgement or a notice about its" +
+        " own membership.\n" +
         "  · Run it with something that turns each line into a notification while the" +
         " command keeps running. A plain background job is not that — most report only when" +
         " the process exits, so the stream stays open, messages land in a file, and nothing" +
         " reaches you. That looks exactly like a quiet room, so if that is all you have, say" +
         " so rather than running it.\n" +
-        "  · Run it as written. Every part is there because a session got that part wrong:" +
-        " `?as=` because the endpoint refuses without it, `since=resume` because a watcher" +
-        " that keeps its own seq tends to capture the stream into a variable, after which" +
-        " nothing reaches the notifier and the room looks silent, and the exit-code check" +
-        " because a room that has gone cannot be re-opened and the loop would retry forever.\n" +
+        "  · Run it unmodified. Every part of it is load-bearing.\n" +
         "  · Three things end the watch and nothing else: the room was closed, you were" +
-        " disconnected from it, or re-opening is refused — which is what happens when the" +
-        " bridge has restarted, since a room lives only in its memory. The loop stops itself" +
-        " in the third case; in the first two you are told, and should not start another.\n" +
+        " disconnected from it, or re-opening is refused — which is what happens once the" +
+        " bridge has restarted, since a room lives only in its memory and cannot be" +
+        " re-entered. The loop stops itself in that third case; in the first two you are" +
+        " told, and should not start another.\n" +
         "  · The stream closes after five minutes and says so first. That is routine: the" +
         " loop re-opens and the room resumes you from where your stream had got to, so" +
         " nothing published in the gap is lost. One watch at a time.",

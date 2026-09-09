@@ -1621,3 +1621,376 @@ test("a session that ends is taken out of its sync room", async () => {
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("a message says who it is for and what it is for, and the room routes on that", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-route-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "route-founder";
+  const peer = "route-peer";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    const password = created.body.password;
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: peer });
+    await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password });
+
+    // The founder watches; everything below is about what does and does not reach it.
+    const stream = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${founder}&since=resume`, {
+      headers: { "x-gyredeck-token": password },
+    });
+    const reader = stream.body.getReader();
+    let seen = "";
+    const pump = (async () => {
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) return;
+          seen += new TextDecoder().decode(value);
+        }
+      } catch {}
+    })();
+
+    const say = (body) => call("POST", `/mail/${code}`, { from: peer, ...body });
+
+    const asked = await say({ text: "ASK-EVERYONE", kind: "ask", to: "everyone" });
+    const acked = await say({ text: "ACK-EVERYONE", kind: "ack", to: "everyone" });
+    const direct = await say({ text: "ASK-DIRECT", kind: "ask", to: founder });
+    const elsewhere = await say({ text: "ASK-ELSEWHERE", kind: "ask", to: "not-a-member" });
+    // Nothing said at all: the shape every existing caller uses, which has to keep
+    // behaving the way it always did.
+    const bare = await say({ text: "NO-FIELDS" });
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    reader.cancel().catch(() => {});
+    await pump;
+
+    assert.match(seen, /ASK-EVERYONE/, "an ask to everyone interrupts everyone");
+    assert.match(seen, /ASK-DIRECT/, "an ask to one member interrupts that member");
+    assert.match(seen, /NO-FIELDS/, "saying nothing still interrupts, because silence is the worse failure");
+    // The whole point: an acknowledgement is published and readable and wakes nobody.
+    // Two agents acknowledging each other is what made this necessary.
+    assert.doesNotMatch(seen, /ACK-EVERYONE/, "an acknowledgement must not cost anyone a turn");
+    assert.doesNotMatch(seen, /ASK-ELSEWHERE/, "a message addressed to someone else is not for you");
+
+    // Reconnecting must not hand back what the live stream was spared. The two paths
+    // were written apart and drifted: a watch reopened every five minutes was given
+    // every acknowledgement and room notice it had already been kept from.
+    const again = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${founder}&since=1`, {
+      headers: { "x-gyredeck-token": password },
+    });
+    const catchUp = await new Promise((resolve) => {
+      const reader2 = again.body.getReader();
+      let text = "";
+      const stop = setTimeout(() => { reader2.cancel().catch(() => {}); resolve(text); }, 250);
+      (async () => {
+        try {
+          for (;;) {
+            const { value, done } = await reader2.read();
+            if (done) break;
+            text += new TextDecoder().decode(value);
+          }
+        } catch {}
+        clearTimeout(stop);
+        resolve(text);
+      })();
+    });
+    assert.match(catchUp, /ASK-EVERYONE/, "catching up returns what was missed");
+    assert.doesNotMatch(catchUp, /ACK-EVERYONE/, "catching up does not return acknowledgements");
+    assert.doesNotMatch(catchUp, /ASK-ELSEWHERE/, "catching up does not return other people's mail");
+
+    // Catching up has to record that it did. Without this the cursor never moved past
+    // what it handed over, so every reconnect replayed the same backlog — which in a
+    // quiet room means waking everyone in it every five minutes, for ever.
+    const third = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${founder}&since=resume`, {
+      headers: { "x-gyredeck-token": password },
+    });
+    const nothingLeft = await new Promise((resolve) => {
+      const reader3 = third.body.getReader();
+      let text = "";
+      const stop = setTimeout(() => { reader3.cancel().catch(() => {}); resolve(text); }, 250);
+      (async () => {
+        try {
+          for (;;) {
+            const { value, done } = await reader3.read();
+            if (done) break;
+            text += new TextDecoder().decode(value);
+          }
+        } catch {}
+        clearTimeout(stop);
+        resolve(text);
+      })();
+    });
+    assert.doesNotMatch(nothingLeft, /ASK-EVERYONE/, "a second catch-up has nothing left to give");
+
+    assert.equal(acked.body.delivery, "not_notified");
+    assert.equal(elsewhere.body.delivery, "no_recipients");
+    assert.ok(asked.body.seq < acked.body.seq, "an ack still takes a seq and stays readable");
+
+    // Readable afterwards, all five of them, whatever they woke.
+    const history = await call("GET", `/mail/${code}`);
+    const texts = history.body.messages.map((message) => message.text);
+    for (const text of ["ASK-EVERYONE", "ACK-EVERYONE", "ASK-DIRECT", "ASK-ELSEWHERE", "NO-FIELDS"]) {
+      assert.ok(texts.includes(text), `${text} is in the room's history`);
+    }
+    const ack = history.body.messages.find((message) => message.text === "ACK-EVERYONE");
+    assert.equal(ack.kind, "ack");
+    assert.equal(ack.to, "everyone");
+    assert.equal(history.body.messages.find((message) => message.text === "NO-FIELDS").kind, "tell");
+    assert.equal(direct.body.seq > 0, true);
+  } finally {
+    bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a wait that times out says whether the message was the problem", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-silence-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    // A session may only be in one room, so each case gets its own asker.
+    const scenario = async (who, prepare) => {
+      const created = await call("POST", "/sync/rooms", { conversationId: who });
+      const context = { code: created.body.room, password: created.body.password };
+      // The join notice is waiting in the asker's own mailbox; a wait would return it
+      // instead of timing out, so it is collected first.
+      await call("GET", `/mail/inbox?as=${who}&collect=1`);
+      await prepare(context);
+      await call("GET", `/mail/inbox?as=${who}&collect=1`);
+      const waited = await call("GET", `/mail/wait?as=${who}&timeout=1`);
+      assert.equal(waited.body.timedOut, true);
+      return waited.body.yourLastMessage;
+    };
+
+    const said = (who, code, body) => call("POST", `/mail/${code}`, { from: who, ...body });
+
+    assert.match(
+      (await scenario("silence-a", async () => {})).reason,
+      /have not said anything/,
+    );
+    assert.match(
+      (await scenario("silence-b", ({ code }) => said("silence-b", code, { text: "x", kind: "ack" }))).reason,
+      /wakes nobody/,
+      "an ack that got no answer was never going to get one",
+    );
+    assert.match(
+      (await scenario("silence-c", ({ code }) => said("silence-c", code, { text: "x", kind: "ask", to: "ghost" }))).reason,
+      /not in this room/,
+    );
+    assert.match(
+      (await scenario("silence-d", ({ code }) => said("silence-d", code, { text: "x", kind: "ask" }))).reason,
+      /nobody else in this room/,
+    );
+    assert.match(
+      (await scenario("silence-e", async ({ code }) => {
+        await call("POST", `/sync/rooms/${code}/members`, { conversationId: "silence-e-peer" });
+        await said("silence-e", code, { text: "x", kind: "ask" });
+      })).reason,
+      /waiting for the room's password/,
+    );
+    // The case that keeps an asker from "fixing" a message that was already right and
+    // sending it again, which is how the next loop would start.
+    assert.match(
+      (await scenario("silence-f", async ({ code, password }) => {
+        await call("POST", `/sync/rooms/${code}/members`, { conversationId: "silence-f-peer" });
+        await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: "silence-f-peer", password });
+        await said("silence-f", code, { text: "x", kind: "ask" });
+      })).reason,
+      /silence is theirs/,
+    );
+  } finally {
+    bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a message to a room that is not there is refused, not delivered to a new one", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-ghost-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    // A code with no room behind it is what a sender meets after a bridge restart.
+    // Conjuring the room answered ok:true with a seq for a message nobody would read.
+    const ghost = await call("POST", "/mail/sync-abcd", { from: "ghost-sender", text: "hi" });
+    assert.equal(ghost.status, 404);
+    assert.equal(ghost.body.error, "no_such_room");
+
+    // A private mailbox is different: it is named after one session, and writing to it
+    // before that session has read anything is ordinary.
+    assert.equal((await call("POST", "/mail/some-conversation", { from: "x", text: "hi" })).status, 202);
+
+    const created = await call("POST", "/sync/rooms", { conversationId: "ghost-founder" });
+    const code = created.body.room;
+    assert.equal((await call("POST", `/mail/${code}`, { from: "ghost-founder", text: "hi" })).status, 202);
+
+    await call("DELETE", `/sync/rooms/${code}?as=ghost-founder`);
+    const afterClosing = await call("POST", `/mail/${code}`, { from: "ghost-founder", text: "hi again" });
+    assert.equal(afterClosing.status, 404, "a closed room does not quietly come back");
+    // The watcher side of the same truth, so the two halves cannot drift apart again.
+    const stream = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=ghost-founder`, {
+      headers: { "x-gyredeck-token": token },
+    });
+    assert.equal(stream.status, 404);
+    assert.match(await stream.text(), /^event: error\ndata: /, "a refused watch answers in frames");
+  } finally {
+    bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a Codex turn is lifted out of its log, routed by the line it opens with", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-harvest-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const thread = "01a0845e-eb31-76d3-a20e-dbebd733f9f5";
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "09", "09");
+  await mkdir(rolloutDir, { recursive: true });
+  const rollout = join(rolloutDir, `rollout-2026-09-09T11-13-28-${thread}.jsonl`);
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "harvest-founder";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    // The bridge only knows an agent by the runtime kind on its events, and only reads
+    // a rollout log for a session it believes is Codex.
+    for (const [conversationId, sourceKind] of [[founder, "claudeCodeHook"], [thread, "codexCliHook"]]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: thread });
+    // Codex cannot present a password, so the founder reading it out is what lets it in.
+    await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+
+    const turn = (text) => JSON.stringify({
+      type: "event_msg",
+      timestamp: new Date().toISOString(),
+      payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: text },
+    }) + "\n";
+    const endTurn = () => call("POST", "/hook/stop", {
+      hookId: randomUUID(),
+      hookEventName: "Stop",
+      source: "hook",
+      workingDirectory: "/tmp/project",
+      conversationId: thread,
+    });
+
+    // Codex writes prose; the bridge posts for it. The first line is the only place it
+    // can say who a message is for, so it is lifted off and becomes the fields.
+    await writeFile(rollout, turn("@everyone ask\nWhat did Card B use for the retry window?"));
+    await endTurn();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    let history = (await call("GET", `/mail/${code}`)).body.messages;
+    const asked = history.find((message) => message.from === thread);
+    assert.ok(asked, "a finished Codex turn reaches the room whoever prompted it");
+    assert.equal(asked.text, "What did Card B use for the retry window?");
+    assert.equal(asked.kind, "ask");
+    assert.equal(asked.to, "everyone");
+
+    // An acknowledgement it labels as one stays out of everyone's way, which is what
+    // makes courtesy affordable rather than forbidden.
+    await writeFile(rollout, turn("@everyone ack\nรับทราบครับ"));
+    await endTurn();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    history = (await call("GET", `/mail/${code}`)).body.messages;
+    const acked = history.find((message) => message.text === "รับทราบครับ");
+    assert.ok(acked, "an acknowledgement is still published");
+    assert.equal(acked.kind, "ack");
+
+    // A turn that never learned the convention must still be heard, loudly.
+    await writeFile(rollout, turn("no routing line here"));
+    await endTurn();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    history = (await call("GET", `/mail/${code}`)).body.messages;
+    const bare = history.find((message) => message.text === "no routing line here");
+    assert.ok(bare, "an unlabelled Codex turn is published rather than dropped");
+    assert.equal(bare.kind, "tell");
+    assert.equal(bare.to, "everyone");
+  } finally {
+    bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

@@ -2058,3 +2058,62 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("the AGY adapter reports token usage when there is any, and never invents it", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-agyusage-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const adapter = join(repoRoot, "adapters", "antigravity", "gyredeck-agy-hook.mjs");
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const usageAfter = async (payload) => {
+      await runAdapter(adapter, ["--event", "Stop"], home, { conversationId: randomUUID(), ...payload });
+      const snapshot = await (await fetch(`http://127.0.0.1:${port}/snapshot`, {
+        headers: { "x-gyredeck-token": token },
+      })).json();
+      const last = [...(snapshot.recent || [])].reverse().find((event) => event.type === "turn_complete");
+      return last?.data?.usage ?? null;
+    };
+
+    // Exactly what Antigravity sends today, taken from recorded payload shapes. Its three
+    // numeric fields are step counters; reading them as tokens would produce a meter that
+    // is confidently wrong, which is worse than none.
+    assert.equal(
+      await usageAfter({
+        modelName: "gemini-3.1-pro-low",
+        invocationNum: 0,
+        initialNumSteps: 3,
+        executionNum: 0,
+        transcriptPath: "/somewhere/transcript.jsonl",
+        workspacePaths: ["/tmp/project"],
+        terminationReason: "NO_TOOL_CALL",
+      }),
+      null,
+      "no counts means null, not zero — a meter reading 0% is a claim",
+    );
+
+    // Gemini's own spelling, the likeliest thing to appear if Antigravity ever reports.
+    // Nothing has to be changed here for the meter to start working on that day.
+    assert.deepEqual(
+      await usageAfter({
+        modelName: "gemini-3.1-pro-low",
+        usageMetadata: { promptTokenCount: 12000, candidatesTokenCount: 800, cachedContentTokenCount: 400 },
+      }),
+      { inputTokens: 12000, outputTokens: 800, cacheReadTokens: 400, cacheCreationTokens: 0 },
+    );
+  } finally {
+    bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

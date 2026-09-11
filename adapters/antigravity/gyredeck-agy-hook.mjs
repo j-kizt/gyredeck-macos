@@ -1,4 +1,5 @@
 import { request } from "node:http";
+import { appendFileSync, existsSync, statSync, unlinkSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -53,6 +54,125 @@ const readIngestToken = async () => {
 };
 
 /** Read JSON payload from stdin. */
+/**
+ * Write down the shape of a hook payload, when asked to and only then.
+ *
+ * Antigravity reports no token usage anywhere: not in its brain directory, not in the
+ * 992 events already collected from it, and the adapter has never set `usage` because
+ * there was nothing to set it from. Whether a context meter is even possible turns on
+ * one unanswered question — does the payload carry counts this adapter simply never
+ * reads? — and answering it by running the agent costs the quota it is short of.
+ *
+ * So it answers itself, the next time the agent is used for its own reasons. Create
+ * ~/.config/gyredeck/agy-payload-shape.on and the next few payloads are described here;
+ * delete it and nothing is written. Off unless switched on, and it deletes its own
+ * switch when it has enough.
+ *
+ * Shapes, not contents: key paths with types, numbers kept whole because numbers are the
+ * point, strings cut to forty characters. A prompt is not needed to answer the question
+ * and should not be sitting in a file because of it.
+ */
+const SHAPE_SWITCH = join(CONFIG_DIR, "agy-payload-shape.on");
+const SHAPE_LOG = join(CONFIG_DIR, "agy-payload-shape.ndjson");
+const SHAPE_MAX_BYTES = 256 * 1024;
+
+const describeShape = (value, path = "", into = {}) => {
+  if (value === null || value === undefined) into[path || "."] = String(value);
+  else if (Array.isArray(value)) {
+    into[path || "."] = `array(${value.length})`;
+    if (value.length > 0) describeShape(value[0], `${path}[0]`, into);
+  } else if (typeof value === "object") {
+    if (path) into[path] = "object";
+    for (const [key, inner] of Object.entries(value)) {
+      describeShape(inner, path ? `${path}.${key}` : key, into);
+    }
+  } else if (typeof value === "number") into[path || "."] = value;
+  else if (typeof value === "string") {
+    into[path || "."] = value.length > 40 ? `string(${value.length})` : value;
+  } else into[path || "."] = typeof value;
+  return into;
+};
+
+const recordShape = (eventType, input) => {
+  try {
+    if (!existsSync(SHAPE_SWITCH)) return;
+    // Enough is enough: the switch removes itself rather than waiting to be noticed.
+    if (existsSync(SHAPE_LOG) && statSync(SHAPE_LOG).size > SHAPE_MAX_BYTES) {
+      try { unlinkSync(SHAPE_SWITCH); } catch {}
+      return;
+    }
+    appendFileSync(
+      SHAPE_LOG,
+      JSON.stringify({ at: new Date().toISOString(), eventType, shape: describeShape(input) }) + "\n",
+      { mode: 0o600 },
+    );
+  } catch {
+    // A hook must never fail because a diagnostic did.
+  }
+};
+
+/**
+ * Take token counts out of a hook payload, if it ever carries any.
+ *
+ * Today it does not. Antigravity reports no usage anywhere it can be reached: not in the
+ * brain directory, not in the transcript `transcriptPath` points at, not in any of the
+ * five hook payloads, not in 992 collected events — and asked directly, the agent said it
+ * does not know its own context use either, so there is nothing being withheld, only
+ * nothing counted.
+ *
+ * This reads whatever appears rather than the field names of the day, because the shape
+ * of a field that does not exist cannot be known in advance. Anything numeric under a
+ * name that means input, output, cached or window is taken; everything else is left
+ * alone. The moment Antigravity starts reporting, the meter lights up on its own and
+ * nobody has to come back and check — which is the only useful thing that can be built
+ * against an absence.
+ *
+ * Deliberately no estimate from transcript length. A meter showing a number people
+ * believe is worse than no meter, and a guess dressed as a measurement is exactly that.
+ */
+const TOKEN_FIELDS = [
+  ["inputTokens", /^(input|prompt)_?tokens?(count)?$/i],
+  ["outputTokens", /^(output|completion|candidates)_?tokens?(count)?$/i],
+  // `cachedContentTokenCount` is Gemini's own spelling and the likeliest to turn up.
+  ["cacheReadTokens", /^cache(d)?_?(read|hit|content)?_?(input_?)?tokens?(count)?$/i],
+  ["cacheCreationTokens", /^cache_?(creation|write)_?(input_?)?tokens?(count)?$/i],
+  ["contextWindow", /^(model_?)?context_?(window|length|limit)$/i],
+];
+
+const findUsage = (value, found = {}, depth = 0) => {
+  if (depth > 4 || value === null || typeof value !== "object") return found;
+  for (const [key, inner] of Object.entries(value)) {
+    if (typeof inner === "number" && Number.isFinite(inner)) {
+      for (const [field, pattern] of TOKEN_FIELDS) {
+        if (found[field] === undefined && pattern.test(key)) found[field] = inner;
+      }
+    } else if (inner && typeof inner === "object") {
+      findUsage(inner, found, depth + 1);
+    }
+  }
+  return found;
+};
+
+/**
+ * The usage to report for a finished turn, or null when there is nothing to report.
+ *
+ * Null rather than zeroes: a meter reading 0% is a claim, and "no numbers" is not that
+ * claim. The bridge already treats null as nothing to show.
+ */
+const usageFrom = (input) => {
+  const found = findUsage(input);
+  // A window with no usage under it measures nothing, and usage with no window is still
+  // worth having — the desktop app knows windows by model name.
+  if (found.inputTokens === undefined && found.outputTokens === undefined) return null;
+  return {
+    inputTokens: found.inputTokens ?? 0,
+    outputTokens: found.outputTokens ?? null,
+    cacheReadTokens: found.cacheReadTokens ?? 0,
+    cacheCreationTokens: found.cacheCreationTokens ?? 0,
+    ...(found.contextWindow !== undefined ? { contextWindow: found.contextWindow } : {}),
+  };
+};
+
 const readInput = async () => {
   let body = "";
   for await (const chunk of process.stdin) body += chunk;
@@ -443,6 +563,7 @@ const main = async () => {
     if (!eventType) return respond();
 
     const input = await readInput();
+    recordShape(eventType, input);
     const endpoint = await readEndpoint();
     const token = await readIngestToken();
 
@@ -547,6 +668,7 @@ const main = async () => {
         conversationId,
         toolName: null,
         message: typeof input.terminationReason === "string" ? input.terminationReason : null,
+        usage: usageFrom(input),
       }));
     }
 

@@ -57,6 +57,7 @@ export type GyredeckEventType =
   | "turn_stop"
   | "turn_complete"
   | "attention_requested"
+  | "room_message"
   | "tool_start"
   | "tool_end"
   | "compact_start"
@@ -167,6 +168,35 @@ export interface IGyredeckAttentionRequestedEvent extends IGyredeckBaseEvent {
   };
 }
 
+/**
+ * Something was said in a sync room to a session that is a member of it.
+ *
+ * Mail and presence were separate streams, and that was fine while the only reader was
+ * an agent's own hook. It stopped being fine once the app wanted to say "a reply you
+ * have not read arrived": the room poller only runs while the session list is on screen,
+ * which is exactly not the moment a person needs telling. This puts the fact on the one
+ * stream the window keeps subscribed to whether it is visible or not.
+ *
+ * Only what was addressed to the member and asks something of them: an `ask` or a
+ * `tell`. A `reaction` is where an exchange stops and a `notice` is the room describing
+ * itself — neither leaves anything to do, and a notification with nothing behind it is
+ * how notifications get switched off.
+ *
+ * `conversationId` is the member this concerns, not the sender, because the app shows
+ * this against the session the person would go to.
+ */
+export interface IGyredeckRoomMessageEvent extends IGyredeckBaseEvent {
+  type: "room_message";
+  data: {
+    room: string;
+    seq: number;
+    from: string;
+    fromLabel: string;
+    kind: "ask" | "tell" | string;
+    preview: string;
+  };
+}
+
 export interface IGyredeckToolStartEvent extends IGyredeckBaseEvent {
   type: "tool_start";
   data: {
@@ -250,6 +280,7 @@ export type GyredeckEvent =
   | IGyredeckTurnStopEvent
   | IGyredeckTurnCompleteEvent
   | IGyredeckAttentionRequestedEvent
+  | IGyredeckRoomMessageEvent
   | IGyredeckToolStartEvent
   | IGyredeckToolEndEvent
   | IGyredeckCompactStartEvent

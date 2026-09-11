@@ -904,6 +904,10 @@ function startBridge(config) {
     // rates would otherwise share a single position and the slower one would lose
     // whatever the faster one collected.
     const room = {
+      // Its own name, because everything that publishes into a room is handed the room
+      // and not the key it is filed under, and a reverse lookup to recover the one from
+      // the other is a scan that can disagree with itself.
+      name,
       seq: 0,
       // Who pressed Create. Only they are offered the key, because handing out the
       // right to speak is the founder's act, not something any member can pass on.
@@ -1446,6 +1450,36 @@ function startBridge(config) {
     if (author) {
       author.readSeq = Math.max(author.readSeq, message.seq);
       author.lastReadAt = message.ts;
+    }
+    // Mail and presence are separate streams, and the app only polls rooms while the
+    // session list is on screen — which is not when a person needs telling that a reply
+    // landed. One line on the stream the window is always subscribed to closes that.
+    // Only what was addressed to a member and asks something of them: a reaction is
+    // where an exchange stops and a notice is the room describing itself, and a
+    // notification with nothing behind it is how notifications get switched off.
+    if (room.members.size > 0 && (message.kind === "ask" || message.kind === "tell")) {
+      for (const member of room.members.keys()) {
+        if (!wakesMember(message, member)) continue;
+        emitLocal({
+          version: PROTOCOL_VERSION,
+          id: randomUUID(),
+          type: "room_message",
+          timestamp: message.ts,
+          // The member this concerns, not the sender: the app shows it against the
+          // session a person would go to.
+          conversationId: member,
+          cwd: workspaceByConversation.get(member) ?? null,
+          runtime: null,
+          data: {
+            room: room.name ?? "",
+            seq: message.seq,
+            from: message.from,
+            fromLabel: labelIn(room, message.from),
+            kind: message.kind,
+            preview: String(message.text).replace(/\s+/g, " ").slice(0, 160),
+          },
+        });
+      }
     }
     wakeMailWaiters();
     return message;

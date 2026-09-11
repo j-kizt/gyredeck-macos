@@ -2117,3 +2117,85 @@ test("the AGY adapter reports token usage when there is any, and never invents i
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("a room message reaches the presence stream, but only when it asks something of a member", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-roomevent-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "roomevent-founder";
+  const peer = "roomevent-peer";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    const password = created.body.password;
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: peer });
+    await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password });
+
+    // Mail and presence were separate streams, and the app only polls rooms while the
+    // session list is on screen — never when a person most needs telling.
+    const stream = await fetch(`http://127.0.0.1:${port}/events`, { headers: { "x-gyredeck-token": token } });
+    const reader = stream.body.getReader();
+    let seen = "";
+    const pump = (async () => {
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) return;
+          seen += new TextDecoder().decode(value);
+        }
+      } catch {}
+    })();
+
+    const say = (body) => call("POST", `/mail/${code}`, { from: peer, ...body });
+    await say({ text: "AN-ASK", kind: "ask", to: "everyone" });
+    await say({ text: "A-REACTION", kind: "reaction", to: "everyone" });
+    await say({ text: "FOR-SOMEONE-ELSE", kind: "tell", to: "not-a-member" });
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    reader.cancel().catch(() => {});
+    await pump;
+
+    const events = seen
+      .split("\n")
+      .map((line) => line.startsWith("data: ") ? line.slice(6) : null)
+      .filter(Boolean)
+      .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .filter((event) => event?.type === "room_message");
+
+    assert.equal(events.length, 1, "one event, for the one message that asked something of a member");
+    const [event] = events;
+    assert.equal(event.conversationId, founder, "addressed to the member it concerns, not the sender");
+    assert.equal(event.data.from, peer);
+    assert.equal(event.data.kind, "ask");
+    assert.equal(event.data.preview, "AN-ASK");
+    assert.equal(event.data.room, code);
+    // A reaction is where an exchange stops and a notice is the room describing itself:
+    // neither leaves anything to do, and a notification with nothing behind it is how
+    // notifications get switched off.
+    assert.doesNotMatch(seen, /A-REACTION/, "a reaction is not worth interrupting anyone for");
+    assert.doesNotMatch(seen, /FOR-SOMEONE-ELSE/, "somebody else's mail is not yours to be told about");
+  } finally {
+    bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

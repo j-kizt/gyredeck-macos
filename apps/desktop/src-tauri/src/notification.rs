@@ -19,11 +19,11 @@ mod platform {
     use objc2::{
         define_class, extern_methods, rc::Retained, runtime::NSObject, runtime::ProtocolObject,
     };
-    use objc2_foundation::{NSError, NSObjectProtocol};
+    use objc2_foundation::{NSError, NSObjectProtocol, NSString};
     use objc2_user_notifications::{
-        UNAuthorizationOptions, UNAuthorizationStatus, UNNotification,
-        UNNotificationPresentationOptions, UNNotificationSettings, UNUserNotificationCenter,
-        UNUserNotificationCenterDelegate,
+        UNAuthorizationOptions, UNAuthorizationStatus, UNMutableNotificationContent,
+        UNNotification, UNNotificationPresentationOptions, UNNotificationRequest,
+        UNNotificationSettings, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
     };
 
     use super::NotificationPermissionState;
@@ -120,6 +120,42 @@ mod platform {
         permission_state()
     }
 
+    /// Post one notification, replacing any earlier one carrying the same identifier.
+    ///
+    /// Replacing rather than stacking is the whole reason the caller supplies an id. A
+    /// session that asks twice in ten seconds should occupy one slot in Notification
+    /// Centre, not two: the second question is the one worth answering, and a column of
+    /// near-identical banners is how a useful notification becomes one people switch off.
+    ///
+    /// The identifier carries which session it belongs to, so it does double duty —
+    /// replacement now, and a route back to that session when acting on a banner is
+    /// wired up. `userInfo` would be the conventional place, but its dictionary wants
+    /// key and value types that do not line up with what the bindings accept here, and
+    /// a second field holding the same fact is a second field to keep in step.
+    pub fn deliver(identifier: &str, title: &str, body: &str) -> Result<(), String> {
+        if !is_bundled() {
+            return Err("Notifications require the installed app bundle (unavailable in dev)".to_string());
+        }
+        let content = UNMutableNotificationContent::new();
+        content.setTitle(&NSString::from_str(title));
+        content.setBody(&NSString::from_str(body));
+        // No trigger: `None` means deliver immediately.
+        let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+            &NSString::from_str(identifier),
+            &content,
+            None,
+        );
+        let center = UNUserNotificationCenter::currentNotificationCenter();
+        let (sender, receiver) = mpsc::channel();
+        let completion = RcBlock::new(move |error: *mut NSError| {
+            let _ = sender.send(if error.is_null() { Ok(()) } else { Err(ns_error_message(error)) });
+        });
+        center.addNotificationRequest_withCompletionHandler(&request, Some(&completion));
+        receiver
+            .recv_timeout(CALLBACK_TIMEOUT)
+            .map_err(|_| "Timed out while posting a macOS notification".to_string())?
+    }
+
     fn notification_settings() -> Result<Retained<UNNotificationSettings>, String> {
         let center = UNUserNotificationCenter::currentNotificationCenter();
         let (sender, receiver) = mpsc::channel();
@@ -171,6 +207,10 @@ mod platform {
     pub fn request_permission() -> Result<NotificationPermissionState, String> {
         Err("Native macOS notifications are unavailable on this platform".to_string())
     }
+
+    pub fn deliver(_identifier: &str, _title: &str, _body: &str) -> Result<(), String> {
+        Err("Native macOS notifications are unavailable on this platform".to_string())
+    }
 }
 
 pub fn initialize() {
@@ -195,5 +235,21 @@ pub async fn notification_permission_state() -> Result<NotificationPermissionSta
 #[tauri::command]
 pub async fn request_notification_permission() -> Result<NotificationPermissionState, String> {
     run_blocking(platform::request_permission).await
+}
+
+/// Post a notification the renderer has decided is worth interrupting for.
+///
+/// The decision stays in the renderer because that is where the event stream already
+/// arrives — the window is hidden rather than destroyed when it is closed, so the
+/// webview keeps running and keeps its subscription. Reaching for the events a second
+/// time here would mean the same rule implemented in two places, which is how the room
+/// routing drifted apart twice in one day.
+#[tauri::command]
+pub async fn deliver_notification(
+    identifier: String,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    run_blocking(move || platform::deliver(&identifier, &title, &body)).await
 }
 

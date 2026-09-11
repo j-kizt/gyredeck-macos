@@ -1,16 +1,17 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowRight, Check, Coffee, Download, Focus, KeyRound, Link2, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, ShieldCheck, Trash2, X } from "lucide-react";
+import { ArrowRight, Bell, Check, Coffee, Download, Focus, KeyRound, Link2, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, ShieldCheck, Trash2, X } from "lucide-react";
 import type { IGyredeckBridgeCapabilities } from "@gyredeck/protocol";
+import type { INotificationsState, NotificationPermission } from "../notifications/useNotifications";
 import { shortenPath } from "../session/activity";
 import type { IUseUpdater } from "../updater/useUpdater";
 import { ProviderIcon } from "../github/components";
 import type { GitProvider, IGhAccount } from "../github/types";
 import { useGitCredentialHelper } from "./useGitCredentialHelper";
 
-type SetupCategory = "connection" | "permission" | "plugins" | "display" | "git" | "update";
+type SetupCategory = "connection" | "display" | "git" | "notification" | "permission" | "plugins" | "update";
 // Alphabetical. Arrow-key order and the visible order are the same list, because a
 // roving tabstop that jumps somewhere else is a bug.
-const SETUP_CATEGORIES: SetupCategory[] = ["connection", "display", "git", "permission", "plugins", "update"];
+const SETUP_CATEGORIES: SetupCategory[] = ["connection", "display", "git", "notification", "permission", "plugins", "update"];
 
 // Terminals Focus can jump to. Add a row here (plus its AppleScript in the native
 // focus_terminal handler) to support another terminal.
@@ -33,6 +34,7 @@ export interface ISetupPanelProps {
   hookStatus: { path: string | null; installed: boolean | null };
   /** Rooms the bridge currently holds, keyed by code. Only ones with members are shown. */
   mailRooms: Record<string, { room: string; members: string[]; pending: number; founder: string | null }>;
+  notifications: INotificationsState;
   onCloseRoom: (room: string, founder: string) => Promise<void>;
   /** Null while unknown, so the switch does not claim "off" before it has looked. */
   syncRepliesAllowed: boolean | null;
@@ -242,7 +244,29 @@ const UPDATER_DETAIL: Record<IUseUpdater["status"], string> = {
 const MIN_BRIDGE_PORT = 1024;
 const MAX_BRIDGE_PORT = 65535;
 
-export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, mailRooms, onCloseRoom, syncRepliesAllowed, syncRepliesBusy, onSyncRepliesChange, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
+/** What macOS currently allows, said plainly enough to act on. */
+const notificationPermissionDetail = (
+  permission: NotificationPermission,
+  canUseNativeControls: boolean,
+): string => {
+  if (!canUseNativeControls) return "Desktop runtime required";
+  switch (permission) {
+    case "authorized":
+    case "provisional":
+    case "ephemeral":
+      return "Allowed · banners will appear while the window is closed";
+    // Not a state this can change: macOS only asks once, and after a refusal the answer
+    // lives in System Settings. Saying so beats a button that silently does nothing.
+    case "denied":
+      return "Refused · turn Gyredeck back on in System Settings › Notifications";
+    case "unsupported":
+      return "Unavailable · notifications need the installed app, not a dev build";
+    default:
+      return "Not asked yet";
+  }
+};
+
+export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, mailRooms, notifications, onCloseRoom, syncRepliesAllowed, syncRepliesBusy, onSyncRepliesChange, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
   const [activeCategory, setActiveCategory] = useState<SetupCategory>("connection");
   const [compactNavigation, setCompactNavigation] = useState(() => window.matchMedia("(max-width: 380px)").matches);
   const credentialHelper = useGitCredentialHelper(canUseNativeControls);
@@ -317,6 +341,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
           <button className="setup-side-tab" id="setup-tab-connection" type="button" role="tab" aria-selected={activeCategory === "connection"} aria-controls="setup-panel-connection" tabIndex={activeCategory === "connection" ? 0 : -1} data-active={activeCategory === "connection"} onClick={() => selectCategory("connection")} onKeyDown={(event) => handleCategoryKeyDown(event, "connection")}><PlugZap size={12} strokeWidth={2.2} /><span>Connection</span></button>
           <button className="setup-side-tab" id="setup-tab-display" type="button" role="tab" aria-selected={activeCategory === "display"} aria-controls="setup-panel-display" tabIndex={activeCategory === "display" ? 0 : -1} data-active={activeCategory === "display"} onClick={() => selectCategory("display")} onKeyDown={(event) => handleCategoryKeyDown(event, "display")}><MonitorIcon size={12} strokeWidth={2.2} /><span>Display</span></button>
           <button className="setup-side-tab" id="setup-tab-git" type="button" role="tab" aria-selected={activeCategory === "git"} aria-controls="setup-panel-git" tabIndex={activeCategory === "git" ? 0 : -1} data-active={activeCategory === "git"} onClick={() => selectCategory("git")} onKeyDown={(event) => handleCategoryKeyDown(event, "git")}><KeyRound size={12} strokeWidth={2.2} /><span>Git</span></button>
+          <button className="setup-side-tab" id="setup-tab-notification" type="button" role="tab" aria-selected={activeCategory === "notification"} aria-controls="setup-panel-notification" tabIndex={activeCategory === "notification" ? 0 : -1} data-active={activeCategory === "notification"} onClick={() => selectCategory("notification")} onKeyDown={(event) => handleCategoryKeyDown(event, "notification")}><Bell size={12} strokeWidth={2.2} /><span>Notification</span></button>
           <button className="setup-side-tab" id="setup-tab-permission" type="button" role="tab" aria-selected={activeCategory === "permission"} aria-controls="setup-panel-permission" tabIndex={activeCategory === "permission" ? 0 : -1} data-active={activeCategory === "permission"} onClick={() => selectCategory("permission")} onKeyDown={(event) => handleCategoryKeyDown(event, "permission")}><ShieldCheck size={12} strokeWidth={2.2} /><span>Permission</span></button>
           <button className="setup-side-tab" id="setup-tab-plugins" type="button" role="tab" aria-selected={activeCategory === "plugins"} aria-controls="setup-panel-plugins" tabIndex={activeCategory === "plugins" ? 0 : -1} data-active={activeCategory === "plugins"} onClick={() => selectCategory("plugins")} onKeyDown={(event) => handleCategoryKeyDown(event, "plugins")}><Puzzle size={12} strokeWidth={2.2} /><span>Plugins</span></button>
           <button className="setup-side-tab" id="setup-tab-update" type="button" role="tab" aria-selected={activeCategory === "update"} aria-controls="setup-panel-update" tabIndex={activeCategory === "update" ? 0 : -1} data-active={activeCategory === "update"} onClick={() => selectCategory("update")} onKeyDown={(event) => handleCategoryKeyDown(event, "update")}><Download size={12} strokeWidth={2.2} /><span>Update</span></button>
@@ -331,6 +356,17 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
               <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{guidance.title}</span><span className="setup-detail">{guidance.detail}</span></span></div>
               {nativeAction.message ? <div className="notice-row" data-online={nativeAction.bridgeOnline === true} role="status" aria-live="polite">{nativeAction.message}</div> : null}
               <SyncRoomList rooms={mailRooms} canUseNativeControls={canUseNativeControls} onCloseRoom={onCloseRoom} />
+            </>
+          ) : null}
+
+          {activeCategory === "notification" ? (
+            <>
+              <div className="setup-section-heading"><span>Notification</span><small>What is worth interrupting you for</small></div>
+              <div className="setup-row passive"><span className="status-slot"><Bell className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">macOS permission</span><span className="setup-detail">{notificationPermissionDetail(notifications.permission, canUseNativeControls)}</span></span>{canUseNativeControls && notifications.permission === "notDetermined" ? <button className="pill-btn" type="button" onClick={() => void notifications.requestPermission()} data-tauri-drag-region="false">Allow</button> : null}</div>
+              <div className="setup-row"><span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">When an agent needs an answer</span><span className="setup-detail">A question or an approval it cannot carry on without</span></span><button className="switch" type="button" role="switch" aria-checked={notifications.attention} data-on={notifications.attention} onClick={() => notifications.setAttention(!notifications.attention)} data-tauri-drag-region="false" aria-label="Notify when an agent needs an answer"><span className="switch-thumb" /></button></div>
+              <div className="setup-row"><span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">When a sync room reply arrives</span><span className="setup-detail">Only what was addressed to one of your sessions</span></span><button className="switch" type="button" role="switch" aria-checked={notifications.roomMessage} data-on={notifications.roomMessage} onClick={() => notifications.setRoomMessage(!notifications.roomMessage)} data-tauri-drag-region="false" aria-label="Notify when a sync room reply arrives"><span className="switch-thumb" /></button></div>
+              <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Only while the window is closed</span><span className="setup-detail">A banner for something already on screen is how notifications get switched off</span></span></div>
+              {notifications.error ? <div className="notice-row" role="status" aria-live="polite">{notifications.error}</div> : null}
             </>
           ) : null}
 

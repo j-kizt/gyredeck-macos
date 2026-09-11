@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import type { GyredeckPresenceStatus } from "@gyredeck/protocol";
 import { SessionSyncPanel } from "./features/mail/SessionSyncPanel";
 import { useMailRooms } from "./features/mail/useMailRooms";
+import { useNotifications } from "./features/notifications/useNotifications";
 import { SessionContextMeter, SessionContextSummary, StatusGlyph, WorkspaceSessionGroupItem } from "./features/session/components";
 import {
   formatTime,
@@ -200,6 +201,10 @@ const App = () => {
     active: setupOpen || (activeMainTab === "sessions" && !selectedSessionId),
     canUseNativeControls,
   });
+
+  // Not gated on what is on screen, unlike every other poller here: this one exists
+  // for the times when nothing is.
+  const notifications = useNotifications({ lastLiveEvent, canUseNativeControls });
 
   const githubMonitor = useGithubMonitor({
     active: activeMainTab === "git" && !setupOpen && !selectedSessionId,
@@ -933,6 +938,7 @@ const App = () => {
                   keepAwakeError={keepAwakeError}
                   hookStatus={hookStatus}
                   mailRooms={mailRooms}
+                  notifications={notifications}
                   onCloseRoom={async (room, founder) => {
                     try {
                       await invoke("sync_close", { code: room, conversationId: founder });

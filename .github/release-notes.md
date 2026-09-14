@@ -1,5 +1,25 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## v1.12.0 — Put the repo you actually watch at the top
+
+Tracked repos sat in the order they were added, which is rarely the order they matter in.
+The one checked every hour ends up under three added once and never looked at again.
+
+### Added
+
+- **Drag repo cards into any order you like.** Each card has a grip down its left side;
+  dragging it opens an outlined gap where the card will land, so the result is on screen
+  before the mouse is released. The list scrolls when you reach either edge, faster the
+  further in you go. Only the grip starts a drag — the repo name and the delete button
+  keep working as they did. The order is kept per account and survives a restart.
+
+### Fixes
+
+- **Drag and drop could not work at all inside the window.** Tauri turns on a
+  window-level handler for files dropped onto the app from outside, and it swallows the
+  page's own drop event — a drag would run and end in silence. The app does not accept
+  dropped files, so that handler is off.
+
 ## v1.11.2 — Notifications, now shown to work
 
 v1.11.1 shipped notifications that had never been seen to fire, and guessed at why: that

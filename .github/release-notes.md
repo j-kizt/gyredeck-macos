@@ -1,5 +1,27 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## v1.13.0 — Follow the CI line to the run
+
+### Added
+
+- **The CI line on a repo card opens the run.** It was the only line on the card that
+  could not be followed — the repo name, the pull request count and the commit all went
+  somewhere, while the one worth chasing when something breaks sat there as text. The
+  link is whatever the provider returned, so it works for a GitHub workflow run and a
+  GitLab pipeline alike. A run the provider gave no link for stays plain text rather
+  than becoming a button that does nothing.
+
+### Fixes
+
+- **The notification permission is read each time it can be looked at, not once at
+  startup.** It lives in System Settings and can be switched off there without telling
+  the app, and closing the window hides it rather than closing it — so the first answer
+  outlived every chance to notice, and the panel went on saying *Allowed* for a
+  permission macOS had already revoked. That also sealed off the refusal notice added in
+  v1.11.2: the state never became refused in the app's view, so the sentence explaining
+  where to switch it back on, and the button that opens that pane, could not be reached
+  by the one person who needed them.
+
 ## v1.12.0 — Put the repo you actually watch at the top
 
 Tracked repos sat in the order they were added, which is rarely the order they matter in.

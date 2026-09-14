@@ -49,22 +49,36 @@ export const createDefaultBridgeCapabilities = (): IGyredeckBridgeCapabilities =
   },
 });
 
-export type GyredeckEventType =
-  | "bridge_ready"
-  | "conversation_open"
-  | "conversation_close"
-  | "turn_start"
-  | "turn_stop"
-  | "turn_complete"
-  | "attention_requested"
-  | "room_message"
-  | "tool_start"
-  | "tool_end"
-  | "compact_start"
-  | "compact_end"
-  | "llm_start"
-  | "llm_end"
-  | "bridge_error";
+/**
+ * Every event the bridge emits, as a value rather than only a type.
+ *
+ * A subscriber has to name each one it wants: `EventSource` delivers by event name, and
+ * anything unnamed is dropped without a sound. That list used to be typed out again in
+ * the renderer, and `room_message` was added here and forgotten there — the events were
+ * emitted, logged, and never heard, which looked exactly like a notification fault.
+ *
+ * Keeping the array as the source and deriving the union from it means the two cannot
+ * disagree: a new event is one edit, and every place that walks the list picks it up.
+ */
+export const GYREDECK_EVENT_TYPES = [
+  "bridge_ready",
+  "conversation_open",
+  "conversation_close",
+  "turn_start",
+  "turn_stop",
+  "turn_complete",
+  "attention_requested",
+  "room_message",
+  "tool_start",
+  "tool_end",
+  "compact_start",
+  "compact_end",
+  "llm_start",
+  "llm_end",
+  "bridge_error",
+] as const;
+
+export type GyredeckEventType = (typeof GYREDECK_EVENT_TYPES)[number];
 
 export interface IGyredeckEventRuntime {
   sourcePid: number;

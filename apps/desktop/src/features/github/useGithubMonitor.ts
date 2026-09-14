@@ -55,6 +55,8 @@ interface IUseGithubMonitorOptions {
 
 export interface IGithubMonitor {
   trackedRepos: string[];
+  /** Put `repo` where `before` currently sits, or at the end when `before` is null. */
+  moveRepo: (repo: string, before: string | null) => void;
   statuses: Record<string, GithubRepoState>;
   accounts: IGhAccount[];
   activeAccount: string | null;
@@ -193,6 +195,25 @@ export const useGithubMonitor = ({ active, canUseNativeControls }: IUseGithubMon
     void refreshRepo(trimmed);
   }, [refreshRepo]);
 
+  // Order is the reading order the person chose, so it is theirs to set. The list was
+  // already an array persisted per account — what was missing was any way to say what
+  // belongs at the top, not anywhere to keep the answer.
+  const moveRepo = useCallback((repo: string, before: string | null) => {
+    setTrackedRepos((current) => {
+      const from = current.indexOf(repo);
+      if (from === -1) return current;
+      const without = current.filter((name) => name !== repo);
+      // Resolved after the removal rather than before: an item dragged downwards would
+      // otherwise land one place short of where it was dropped.
+      const at = before === null ? without.length : without.indexOf(before);
+      if (at === -1) return current;
+      const next = [...without.slice(0, at), repo, ...without.slice(at)];
+      if (next.every((name, index) => name === current[index])) return current;
+      writeTrackedRepos(viewingKeyRef.current, next);
+      return next;
+    });
+  }, []);
+
   const removeRepo = useCallback((repo: string) => {
     setTrackedRepos((current) => {
       const next = current.filter((r) => r !== repo);
@@ -329,6 +350,7 @@ export const useGithubMonitor = ({ active, canUseNativeControls }: IUseGithubMon
 
   return {
     trackedRepos,
+    moveRepo,
     statuses,
     accounts,
     activeAccount,

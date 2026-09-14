@@ -101,18 +101,42 @@ export const useNotifications = ({
     settingsRef.current = settings;
   }, [settings]);
 
+  /**
+   * Re-read rather than remember. The permission lives in System Settings, where it can
+   * be switched off at any time and without telling this app — and closing the window
+   * hides it rather than destroying it, so a value read once at startup outlives every
+   * chance to notice. Held state would keep claiming "Allowed" for a permission macOS
+   * had already revoked, and the refusal notice that explains how to undo it would never
+   * be reached.
+   */
   useEffect(() => {
     if (!canUseNativeControls) return;
     let cancelled = false;
-    void (async () => {
+    let unlisten: (() => void) | null = null;
+
+    const read = async () => {
       try {
         const state = await invoke<NotificationPermission>("notification_permission_state");
         if (!cancelled) setPermission(state);
       } catch {
         if (!cancelled) setPermission("unsupported");
       }
-    })();
-    return () => { cancelled = true; };
+    };
+
+    void read();
+    // Focus is the moment the answer is about to be looked at, and the moment a person
+    // returns from having changed it.
+    void getCurrentWindow()
+      .onFocusChanged(({ payload: focused }) => { if (focused) void read(); })
+      .then((stop) => {
+        if (cancelled) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {
+        // Without the subscription the state is merely as stale as it was before.
+      });
+
+    return () => { cancelled = true; unlisten?.(); };
   }, [canUseNativeControls]);
 
   const requestPermission = useCallback(async () => {

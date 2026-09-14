@@ -402,6 +402,9 @@ pub struct GithubRun {
     pub conclusion: Option<String>,
     pub branch: String,
     pub created_at: String,
+    /// Where to read the run in full. Taken from whatever each provider returns rather
+    /// than assembled from parts, so no second copy of their URL layouts can drift.
+    pub url: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -513,6 +516,11 @@ fn recent_runs(
                                 .map(str::to_string),
                             branch: run.get("head_branch").and_then(Value::as_str).unwrap_or("").to_string(),
                             created_at: run.get("created_at").and_then(Value::as_str).unwrap_or("").to_string(),
+                            url: run
+                                .get("html_url")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string),
                         })
                         .collect()
                 })
@@ -545,6 +553,11 @@ fn recent_runs(
                                 conclusion,
                                 branch,
                                 created_at: run.get("created_at").and_then(Value::as_str).unwrap_or("").to_string(),
+                                url: run
+                                    .get("web_url")
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string),
                             }
                         })
                         .collect()

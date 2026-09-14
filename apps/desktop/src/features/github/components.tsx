@@ -123,11 +123,22 @@ const RepoCard = ({ repo, provider, state, onRemove, dragging, onDragStart, onDr
         ) : (
           <>
             {run ? (
-              <Tooltip label={`CI ${run.label}${latestRun?.name ? ` · ${latestRun.name}` : ""}`}>
-                <div className="gh-card-line">
-                  <span className={`gh-dot ${run.tone}`}>{run.symbol}</span> CI {run.label}
-                  {latestRun?.name ? <span className="muted"> · {latestRun.name}</span> : null}
-                </div>
+              <Tooltip label={latestRun?.url ? `Open the run · CI ${run.label}${latestRun.name ? ` · ${latestRun.name}` : ""}` : `CI ${run.label}${latestRun?.name ? ` · ${latestRun.name}` : ""}`}>
+                {/* A failing run is the line most worth leaving the app for, and it was
+                    the only one on the card that could not be followed. A link only when
+                    the provider supplied one — the alternative is rebuilding their URL
+                    layouts here and being wrong somewhere nobody checks. */}
+                {latestRun?.url ? (
+                  <button className="gh-card-line gh-link" type="button" onClick={() => latestRun.url && openExternal(latestRun.url)}>
+                    <span className={`gh-dot ${run.tone}`}>{run.symbol}</span> CI {run.label}
+                    {latestRun.name ? <span className="muted"> · {latestRun.name}</span> : null}
+                  </button>
+                ) : (
+                  <div className="gh-card-line">
+                    <span className={`gh-dot ${run.tone}`}>{run.symbol}</span> CI {run.label}
+                    {latestRun?.name ? <span className="muted"> · {latestRun.name}</span> : null}
+                  </div>
+                )}
               </Tooltip>
             ) : data ? (
               <div className="gh-card-line muted">No workflow runs</div>

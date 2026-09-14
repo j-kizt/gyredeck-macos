@@ -11,6 +11,8 @@ export interface IGithubRun {
   conclusion: string | null;
   branch: string;
   created_at: string;
+  /** Where the run can be read in full, as the provider reported it. Null when it did not. */
+  url: string | null;
 }
 
 export interface IGithubPull {

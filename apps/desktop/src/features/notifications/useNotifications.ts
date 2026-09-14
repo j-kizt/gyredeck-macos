@@ -27,6 +27,8 @@ export interface INotificationsState extends INotificationSettings {
   /** Why the last attempt failed, or null. Shown rather than swallowed. */
   error: string | null;
   requestPermission: () => Promise<void>;
+  /** Open System Settings › Notifications — the only place a refusal can be undone. */
+  openSettings: () => Promise<void>;
   setAttention: (enabled: boolean) => void;
   setRoomMessage: (enabled: boolean) => void;
   setGit: (enabled: boolean) => void;
@@ -117,6 +119,24 @@ export const useNotifications = ({
     setError(null);
     try {
       setPermission(await invoke<NotificationPermission>("request_notification_permission"));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      // A failed ask still changes what is true: macOS refuses outright once an app has
+      // been switched off, so the state it leaves behind is `denied` — which the panel
+      // can explain and act on. Holding the old `notDetermined` instead leaves a button
+      // that keeps failing and a message that never arrives.
+      try {
+        setPermission(await invoke<NotificationPermission>("notification_permission_state"));
+      } catch {
+        // Both calls failed; the error already on screen is the honest answer.
+      }
+    }
+  }, []);
+
+  const openSettings = useCallback(async () => {
+    setError(null);
+    try {
+      await invoke("open_notification_settings");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -220,6 +240,7 @@ export const useNotifications = ({
     permission,
     error,
     requestPermission,
+    openSettings,
     setAttention: (enabled: boolean) => update({ attention: enabled }),
     setRoomMessage: (enabled: boolean) => update({ roomMessage: enabled }),
     setGit: (enabled: boolean) => update({ git: enabled }),

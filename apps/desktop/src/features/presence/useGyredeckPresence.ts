@@ -3,6 +3,7 @@ import {
   createInitialPresence,
   getPresenceView,
   reducePresence,
+  GYREDECK_EVENT_TYPES,
   type GyredeckEvent,
   type IGyredeckBridgeCapabilities,
   type IGyredeckPresence,
@@ -702,22 +703,9 @@ export const useGyredeckPresence = ({
         setConnection({ status: "error", message: "Received malformed bridge event" });
       }
     };
-    for (const type of [
-      "bridge_ready",
-      "conversation_open",
-      "conversation_close",
-      "turn_start",
-      "turn_stop",
-      "turn_complete",
-      "attention_requested",
-      "tool_start",
-      "tool_end",
-      "compact_start",
-      "compact_end",
-      "llm_start",
-      "llm_end",
-      "bridge_error",
-    ]) {
+    // Walked rather than listed: an event named here and nowhere else arrives and is
+    // dropped without a sound, which reads as whatever consumes it being broken.
+    for (const type of GYREDECK_EVENT_TYPES) {
       source.addEventListener(type, handle as EventListener);
     }
 

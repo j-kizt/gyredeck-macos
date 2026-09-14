@@ -4,6 +4,7 @@ import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState, type E
 import { createRoot } from "react-dom/client";
 import type { GyredeckPresenceStatus } from "@gyredeck/protocol";
 import { SessionSyncPanel } from "./features/mail/SessionSyncPanel";
+import { unreadIn, useRoomInbox } from "./features/mail/useRoomInbox";
 import { useMailRooms } from "./features/mail/useMailRooms";
 import { useNotifications } from "./features/notifications/useNotifications";
 import type { IGithubRepoStatus } from "./features/github/types";
@@ -202,6 +203,38 @@ const App = () => {
     active: setupOpen || (activeMainTab === "sessions" && !selectedSessionId),
     canUseNativeControls,
   });
+
+  // Kept from the event stream, not from the poller above: that poller stops while a
+  // session detail or another tab is open, which is exactly when a reply nobody has seen
+  // arrives.
+  const roomInbox = useRoomInbox({ lastLiveEvent });
+  const sessionMessages = selectedSessionId
+    ? roomInbox.inbox[selectedSessionId]?.messages ?? []
+    : [];
+  const unreadByConversation = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const [conversationId, inbox] of Object.entries(roomInbox.inbox)) {
+      const unread = unreadIn(inbox);
+      if (unread > 0) counts[conversationId] = unread;
+    }
+    return counts;
+  }, [roomInbox.inbox]);
+
+  // Opening a session is reading it. Anything narrower — a button on the chip, a
+  // separate gesture — leaves a count that outlives the thing it was counting.
+  //
+  // Whether there was anything unread has to be read before marking it read, and only
+  // on the open itself: depending on the registry too would re-run after the mark and
+  // always see zero.
+  const [detailTab, setDetailTab] = useState<"activity" | "messages">("activity");
+  useEffect(() => {
+    if (!selectedSessionId) return;
+    // Land on whichever answers the question that was just asked: a session opened
+    // because something was unread is being opened to read it.
+    setDetailTab(unreadIn(roomInbox.inbox[selectedSessionId]) > 0 ? "messages" : "activity");
+    roomInbox.markRead(selectedSessionId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSessionId]);
 
   const githubMonitor = useGithubMonitor({
     active: activeMainTab === "git" && !setupOpen && !selectedSessionId,
@@ -554,6 +587,7 @@ const App = () => {
     });
     if (conversationId === presence.conversationId) setAcknowledgedConversationId(conversationId);
     if (selectedSessionId === conversationId) setSelectedSessionId(null);
+    roomInbox.forget(conversationId);
   };
 
   const clearCompletedSessionGroup = (group: IWorkspaceSessionGroup) => {
@@ -933,7 +967,7 @@ const App = () => {
 
             <div
               className="sheet-body"
-              data-view={activeMainTab === "usage" && !setupOpen && !selectedSession ? "usage" : "default"}
+              data-view={setupOpen ? "setup" : activeMainTab === "usage" && !selectedSession ? "usage" : "default"}
               id={!setupOpen && !selectedSession ? `main-panel-${activeMainTab}` : undefined}
               role={!setupOpen && !selectedSession ? "tabpanel" : undefined}
               aria-labelledby={!setupOpen && !selectedSession ? `main-tab-${activeMainTab}` : undefined}
@@ -986,11 +1020,6 @@ const App = () => {
                   <SessionContextSummary session={selectedSession} />
                   <SessionContextMeter session={selectedSession} usage={contextUsage[selectedSession.conversationId]} />
                   <div className="detail-path" title={selectedSession.cwd}>{shortenPath(selectedSession.cwd)}</div>
-                  {canUseNativeControls ? (
-                    <div className="capability-note">Focus matches iTerm terminal cwd/title and selects its session</div>
-                  ) : (
-                    <div className="capability-note">Focus needs the desktop runtime</div>
-                  )}
                   {sessionAction.message ? (
                     <div className="notice-row compact" data-online={sessionAction.ok === true} role="status" aria-live="polite">{sessionAction.message}</div>
                   ) : null}
@@ -1007,8 +1036,35 @@ const App = () => {
                             : false
                     }
                   />
-                  <div className="detail-section-label">Recent activity</div>
-                  {selectedSessionActivityEvents.length === 0 ? (
+                  {/* Two readings of the same session: what it did, and what was said to
+                      it. Tabs rather than two stacked lists because the second is usually
+                      empty, and an empty section above a full one is a scroll past
+                      nothing. Opening on an unread reply lands on Messages. */}
+                  <div className="detail-tabs" role="tablist" aria-label="Session detail view">
+                    <button className="detail-tab" type="button" role="tab" data-active={detailTab === "activity"} aria-selected={detailTab === "activity"} onClick={() => setDetailTab("activity")} data-tauri-drag-region="false">Recent activity</button>
+                    <button className="detail-tab" type="button" role="tab" data-active={detailTab === "messages"} aria-selected={detailTab === "messages"} onClick={() => setDetailTab("messages")} data-tauri-drag-region="false">
+                      Messages
+                      {sessionMessages.length > 0 ? <span className="detail-tab-count">{sessionMessages.length}</span> : null}
+                    </button>
+                  </div>
+                  {detailTab === "messages" ? (
+                    sessionMessages.length === 0 ? (
+                      <div className="empty-text small">Nothing has been said to this session in a sync room</div>
+                    ) : (
+                      <ul className="session-sync-log">
+                        {[...sessionMessages].reverse().map((message) => (
+                          <li className="session-sync-message" key={`${message.room}:${message.seq}`}>
+                            <span className="session-sync-message-head">
+                              <span className="session-sync-message-from">{message.fromLabel}</span>
+                              <span className="session-sync-message-meta">{message.kind} · {message.room} · {formatTime(message.at)}</span>
+                            </span>
+                            <span className="session-sync-message-text">{message.preview}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    )
+                  ) : (
+                    selectedSessionActivityEvents.length === 0 ? (
                     <div className="empty-text small">No events captured yet</div>
                   ) : (
                     <div className="action-list">
@@ -1025,6 +1081,7 @@ const App = () => {
                         );
                       })}
                     </div>
+                  )
                   )}
                 </div>
               ) : activeMainTab === "usage" ? (
@@ -1065,6 +1122,7 @@ const App = () => {
                                 group={group}
                                 groupKey={groupKey}
                                 mailRooms={mailRooms}
+                                unread={unreadByConversation}
                                 removeGroupArmed={pendingGroupHistoryRemoval === getGroupRemovalId(groupKey, group)}
                                 onClear={dismissSession}
                                 onFocus={(session) => void focusSelectedSession(session)}
@@ -1103,6 +1161,7 @@ const App = () => {
                                 group={group}
                                 groupKey={groupKey}
                                 mailRooms={mailRooms}
+                                unread={unreadByConversation}
                                 removeGroupArmed={pendingGroupHistoryRemoval === getGroupRemovalId(groupKey, group)}
                                 onClear={dismissSession}
                                 onFocus={(session) => void focusSelectedSession(session)}

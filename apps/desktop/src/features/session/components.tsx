@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Focus, Mail, Trash2, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Focus, Mail, MessageSquare, Trash2, X } from "lucide-react";
 import { compactNumber, formatRelativeAge, formatTime, shortModelName } from "./activity";
 import { buildContextMeter, type IContextUsageSnapshot } from "./contextWindow";
 import type { ISessionDetail, ISessionSummary, IWorkspaceSessionGroup } from "./types";
@@ -117,12 +117,32 @@ const SessionMailChip = ({ mail }: { mail: IMailRoom | undefined }) => {
   );
 };
 
-export interface ISessionListRowProps { child?: boolean; mail?: IMailRoom; onClear: (id: string) => void; onFocus: (session: ISessionSummary) => void; onOpen: (id: string) => void; session: ISessionSummary; }
-export const SessionListRow = ({ child = false, mail, onClear, onFocus, onOpen, session }: ISessionListRowProps) => (
+/**
+ * Replies addressed to this session that nobody has looked at.
+ *
+ * Separate from the mail chip beside it because they answer different questions. Mail
+ * pending is about the agent — something is queued and reaches it when it next runs.
+ * This is about the person: something was already said, and it has not been read. Until
+ * now the only way to find that out was to open the agent's terminal and ask it.
+ */
+const SessionUnreadChip = ({ unread }: { unread: number }) => {
+  if (unread < 1) return null;
+  return (
+    <Tooltip label={`${unread} unread repl${unread === 1 ? "y" : "ies"} in a sync room · open this session to read`}>
+      <span className="session-unread" data-state="unread">
+        <MessageSquare size={9} strokeWidth={2.6} aria-hidden="true" />
+        {unread}
+      </span>
+    </Tooltip>
+  );
+};
+
+export interface ISessionListRowProps { child?: boolean; mail?: IMailRoom; unread?: number; onClear: (id: string) => void; onFocus: (session: ISessionSummary) => void; onOpen: (id: string) => void; session: ISessionSummary; }
+export const SessionListRow = ({ child = false, mail, unread = 0, onClear, onFocus, onOpen, session }: ISessionListRowProps) => (
   <li className={`session-row ${child ? "session-child-row" : ""} ${session.status === "done" ? "ended" : ""}`} data-status={session.status}>
     <button className="session-row-main" type="button" onClick={() => onOpen(session.conversationId)} data-session-id={session.conversationId} data-tauri-drag-region="false" aria-label={`Open ${session.project} session details`}>
       <StatusGlyph status={session.status} />
-      <span className="session-label"><span className="session-title-line"><Tooltip label={child ? shortSessionId(session.conversationId) : session.project}><span className="session-project">{child ? shortSessionId(session.conversationId) : session.project}</span></Tooltip><span className={`session-inline-status status-text-${session.status}`}>{statusLabel(session.status)}</span><SessionMailChip mail={mail} /></span><Tooltip label={session.detail}><span className="session-activity">{session.detail}</span></Tooltip><Tooltip label={child ? session.project : session.workspace}><span className="session-folder">{child ? session.project : session.workspace}</span></Tooltip></span>
+      <span className="session-label"><span className="session-title-line"><Tooltip label={child ? shortSessionId(session.conversationId) : session.project}><span className="session-project">{child ? shortSessionId(session.conversationId) : session.project}</span></Tooltip><span className={`session-inline-status status-text-${session.status}`}>{statusLabel(session.status)}</span><SessionMailChip mail={mail} /><SessionUnreadChip unread={unread} /></span><Tooltip label={session.detail}><span className="session-activity">{session.detail}</span></Tooltip><Tooltip label={child ? session.project : session.workspace}><span className="session-folder">{child ? session.project : session.workspace}</span></Tooltip></span>
       <span className="session-row-metadata" title={formatTime(session.lastActivityAt)}><span className="session-provider">{session.provider}</span>{session.model ? <Tooltip label={session.model}><span className="session-model">{shortModelName(session.model)}</span></Tooltip> : null}<span className="session-age">{formatRelativeAge(session.lastActivityAt)}</span></span>
     </button>
     <div className="session-row-actions"><button className="row-btn row-focus" type="button" onClick={() => onFocus(session)} data-tauri-drag-region="false" aria-label={`Focus ${session.project} session in terminal`} title="Focus matching terminal (iTerm2/Ghostty)"><Focus size={11} strokeWidth={2.4} /></button>{session.status === "done" ? <button className="row-btn row-clear" type="button" onClick={() => onClear(session.conversationId)} data-tauri-drag-region="false" aria-label={`Clear completed ${session.project} session`} title="Hide this completed session until it has fresh activity"><X size={12} strokeWidth={2.5} /></button> : null}</div>
@@ -149,15 +169,15 @@ const groupMail = (
   return { ...rooms[0], pending, lastReadAt };
 };
 
-export interface IWorkspaceSessionGroupItemProps { expanded: boolean; group: IWorkspaceSessionGroup; mailRooms?: Record<string, IMailRoom>; groupKey: string; removeGroupArmed: boolean; onClear: (id: string) => void; onFocus: (session: ISessionSummary) => void; onGroupAction: (groupKey: string, group: IWorkspaceSessionGroup) => void; onOpen: (id: string) => void; onToggle: (key: string) => void; }
-export const WorkspaceSessionGroupItem = ({ expanded, group, groupKey, mailRooms, removeGroupArmed, onClear, onFocus, onGroupAction, onOpen, onToggle }: IWorkspaceSessionGroupItemProps) => {
-  if (group.sessions.length === 1) return <SessionListRow session={group.sessions[0]} mail={mailRooms?.[group.sessions[0].conversationId]} onClear={onClear} onFocus={onFocus} onOpen={onOpen} />;
+export interface IWorkspaceSessionGroupItemProps { expanded: boolean; group: IWorkspaceSessionGroup; mailRooms?: Record<string, IMailRoom>; unread?: Record<string, number>; groupKey: string; removeGroupArmed: boolean; onClear: (id: string) => void; onFocus: (session: ISessionSummary) => void; onGroupAction: (groupKey: string, group: IWorkspaceSessionGroup) => void; onOpen: (id: string) => void; onToggle: (key: string) => void; }
+export const WorkspaceSessionGroupItem = ({ expanded, group, groupKey, mailRooms, unread, removeGroupArmed, onClear, onFocus, onGroupAction, onOpen, onToggle }: IWorkspaceSessionGroupItemProps) => {
+  if (group.sessions.length === 1) return <SessionListRow session={group.sessions[0]} mail={mailRooms?.[group.sessions[0].conversationId]} unread={unread?.[group.sessions[0].conversationId] ?? 0} onClear={onClear} onFocus={onFocus} onOpen={onOpen} />;
   const canRemoveInactiveGroup = group.sessions.every((session) => session.status === "inactive");
   return (
     <li className="session-group-block" data-status={group.status}><div className="session-row session-group" data-status={group.status}>
       <button className="session-row-main session-group-main" type="button" onClick={() => onToggle(groupKey)} data-tauri-drag-region="false" aria-expanded={expanded} aria-label={`${expanded ? "Collapse" : "Expand"} ${group.project}, ${group.sessions.length} sessions`}>
         <span className="session-disclosure" aria-hidden="true">{expanded ? <ChevronDown size={12} strokeWidth={2.4} /> : <ChevronRight size={12} strokeWidth={2.4} />}</span><StatusGlyph status={group.status} />
-        <span className="session-label"><span className="session-title-line"><Tooltip label={group.project}><span className="session-project">{group.project}</span></Tooltip><span className="session-group-count">×{group.sessions.length}</span><span className={`session-inline-status status-text-${group.status}`}>{statusLabel(group.status)}</span><SessionMailChip mail={groupMail(group, mailRooms)} /></span><Tooltip label={group.detail}><span className="session-activity">{group.detail}</span></Tooltip><Tooltip label={group.workspace}><span className="session-folder">{group.workspace}</span></Tooltip></span>
+        <span className="session-label"><span className="session-title-line"><Tooltip label={group.project}><span className="session-project">{group.project}</span></Tooltip><span className="session-group-count">×{group.sessions.length}</span><span className={`session-inline-status status-text-${group.status}`}>{statusLabel(group.status)}</span><SessionMailChip mail={groupMail(group, mailRooms)} /><SessionUnreadChip unread={group.sessions.reduce((total, item) => total + (unread?.[item.conversationId] ?? 0), 0)} /></span><Tooltip label={group.detail}><span className="session-activity">{group.detail}</span></Tooltip><Tooltip label={group.workspace}><span className="session-folder">{group.workspace}</span></Tooltip></span>
         <span className="session-row-metadata" title={formatTime(group.lastActivityAt)}><span className="session-provider">{group.primarySession.provider}</span>{group.primarySession.model ? <Tooltip label={group.primarySession.model}><span className="session-model">{shortModelName(group.primarySession.model)}</span></Tooltip> : null}<span className="session-age">{formatRelativeAge(group.lastActivityAt)}</span></span>
       </button>
       {group.sessions.every((session) => session.status === "done") ? <div className="session-row-actions"><button className="row-btn row-clear" type="button" onClick={() => onGroupAction(groupKey, group)} data-tauri-drag-region="false" aria-label={`Clear completed ${group.project} group`} title="Hide every completed session in this group until it has fresh activity"><X size={12} strokeWidth={2.5} /></button></div> : null}

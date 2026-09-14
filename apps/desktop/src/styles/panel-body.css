@@ -8,13 +8,19 @@
      of floating over the content, while keeping content symmetric and aligned with the
      header in .sheet-inner. */
   margin-inline: calc(-1 * var(--sheet-inline-padding));
-  padding: 0 var(--sheet-inline-padding) 18px;
+  padding: 0 var(--sheet-inline-padding) 12px;
 }
 
 .sheet-body[data-view="usage"] {
   margin-inline: 0;
   overflow: hidden;
   padding: 0;
+}
+
+/* Settings scrolls its two columns separately, so the page must not scroll as well —
+   an outer scrollbar here would move the pair together and undo the point of it. */
+.sheet-body[data-view="setup"] {
+  overflow: hidden;
 }
 
 .footer-actions {

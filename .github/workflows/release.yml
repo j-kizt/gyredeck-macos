@@ -17,6 +17,19 @@ jobs:
         with:
           fetch-depth: 0
 
+      # A tag is the only thing that starts a release, and nothing stopped one being cut
+      # from a branch that never merged. The result would be a published, signed build
+      # that main does not contain and nobody can reproduce from it — the kind of mistake
+      # that is only found later, by someone reading code that was never released.
+      - name: Refuse a tag that is not on main
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+            echo "::error::${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main. Merge the release PR first, then tag the merge commit."
+            exit 1
+          fi
+          echo "${GITHUB_REF_NAME} is on main."
+
       - name: Build changelog
         id: changelog
         run: |

@@ -14,9 +14,9 @@
       {
         "label": "main",
         "title": "Gyredeck",
-        "width": 420,
+        "width": 444,
         "height": 560,
-        "minWidth": 420,
+        "minWidth": 444,
         "minHeight": 560,
         "resizable": true,
         "fullscreen": false,

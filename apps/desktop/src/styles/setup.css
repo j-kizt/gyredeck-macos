@@ -9,7 +9,12 @@
 
 .setup-layout {
   display: grid;
-  grid-template-columns: 104px minmax(0, 1fr);
+  /* Sized to the longest tab rather than to a number. 104px fitted the names that
+     existed when it was written and clipped "Notification" the day one was added.
+     max-content means the next name added is not a re-tune — and the window grew by
+     what the column did, so the panel beside it keeps the room it had rather than
+     paying for the fix. */
+  grid-template-columns: max-content minmax(0, 1fr);
   gap: 12px;
   min-width: 0;
   min-height: 0;
@@ -41,6 +46,8 @@
 }
 
 .setup-side-tab span {
+  /* Kept even though the wide layout now sizes itself to fit: below 380px the tabs
+     become three equal columns, where a long name still has to give way gracefully. */
   overflow: hidden;
   font-size: 10px;
   font-weight: 650;

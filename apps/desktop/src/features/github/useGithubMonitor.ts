@@ -26,6 +26,19 @@ interface IAccountRef {
 }
 
 const POLL_INTERVAL_MS = 45_000;
+/**
+ * How often to look when nobody is looking with you.
+ *
+ * The monitor used to stop entirely the moment the Git tab was left, which meant the one
+ * situation worth being told about — a run failing while you are somewhere else — was
+ * the one situation nothing was watching. Polling on regardless is what makes a
+ * notification possible at all.
+ *
+ * A minute rather than the 45 seconds used on screen: a run takes minutes, so nothing is
+ * missed by looking less often, and the rate limit is a shared budget that a window
+ * nobody has open should not be spending at full speed.
+ */
+const BACKGROUND_POLL_INTERVAL_MS = 60_000;
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => window.setTimeout(resolve, ms));
 
@@ -306,9 +319,11 @@ export const useGithubMonitor = ({ active, canUseNativeControls }: IUseGithubMon
   }, [canUseNativeControls, refreshAccounts]);
 
   useEffect(() => {
-    if (!active || !canUseNativeControls) return undefined;
-    void refreshAccounts();
-    const timer = window.setInterval(refresh, POLL_INTERVAL_MS);
+    if (!canUseNativeControls) return undefined;
+    // `active` now decides the pace rather than whether to look at all. Stopping was
+    // what made a failed run go unnoticed until somebody happened to open the tab.
+    if (active) void refreshAccounts();
+    const timer = window.setInterval(refresh, active ? POLL_INTERVAL_MS : BACKGROUND_POLL_INTERVAL_MS);
     return () => window.clearInterval(timer);
   }, [active, canUseNativeControls, refresh, refreshAccounts]);
 

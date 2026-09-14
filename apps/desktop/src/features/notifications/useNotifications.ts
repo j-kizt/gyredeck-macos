@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { GyredeckEvent } from "@gyredeck/protocol";
+import type { IGithubRepoStatus } from "../github/types";
+import { gitChangesBetween, markOf, type IGitMark } from "./gitChanges";
 
 export type NotificationPermission =
   | "notDetermined"
@@ -16,6 +18,8 @@ export interface INotificationSettings {
   attention: boolean;
   /** Somebody addressed this session in a sync room. */
   roomMessage: boolean;
+  /** A watched repo moved: CI finished, a pull request opened, a commit landed. */
+  git: boolean;
 }
 
 export interface INotificationsState extends INotificationSettings {
@@ -25,6 +29,7 @@ export interface INotificationsState extends INotificationSettings {
   requestPermission: () => Promise<void>;
   setAttention: (enabled: boolean) => void;
   setRoomMessage: (enabled: boolean) => void;
+  setGit: (enabled: boolean) => void;
 }
 
 const STORAGE_KEY = "gyredeck.notifications";
@@ -32,14 +37,15 @@ const STORAGE_KEY = "gyredeck.notifications";
 const readSettings = (): INotificationSettings => {
   try {
     const stored = window.localStorage.getItem(STORAGE_KEY);
-    if (!stored) return { attention: true, roomMessage: true };
+    if (!stored) return { attention: true, roomMessage: true, git: true };
     const parsed = JSON.parse(stored) as Partial<INotificationSettings>;
     return {
       attention: parsed.attention !== false,
       roomMessage: parsed.roomMessage !== false,
+      git: parsed.git !== false,
     };
   } catch {
-    return { attention: true, roomMessage: true };
+    return { attention: true, roomMessage: true, git: true };
   }
 };
 
@@ -72,9 +78,12 @@ const trim = (text: string | null | undefined, limit = 140): string => {
  */
 export const useNotifications = ({
   lastLiveEvent,
+  repoStatuses,
   canUseNativeControls,
 }: {
   lastLiveEvent: GyredeckEvent | null;
+  /** Current state of every watched repo, keyed by name. Compared against the last look. */
+  repoStatuses: Record<string, IGithubRepoStatus>;
   canUseNativeControls: boolean;
 }): INotificationsState => {
   const [settings, setSettings] = useState<INotificationSettings>(readSettings);
@@ -84,6 +93,7 @@ export const useNotifications = ({
   // would replay the event that happens to be current and post it twice.
   const settingsRef = useRef(settings);
   const deliveredRef = useRef<string | null>(null);
+  const gitMarksRef = useRef<Map<string, IGitMark>>(new Map());
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -160,6 +170,43 @@ export const useNotifications = ({
     })();
   }, [canUseNativeControls, lastLiveEvent]);
 
+  useEffect(() => {
+    if (!canUseNativeControls) return;
+    const marks = gitMarksRef.current;
+    const changes = Object.values(repoStatuses).flatMap((status) => {
+      if (!status?.repo || status.error) return [];
+      const found = gitChangesBetween(marks.get(status.repo), status);
+      // Recorded whether or not it was reported: the first look has nothing to compare
+      // against, and leaving it unrecorded would make the second look announce
+      // everything as though it had just happened.
+      marks.set(status.repo, markOf(status));
+      return settingsRef.current.git ? found : [];
+    });
+    if (changes.length === 0) return;
+
+    void (async () => {
+      try {
+        if (await getCurrentWindow().isVisible()) return;
+      } catch {
+        // Unable to tell — err towards notifying.
+      }
+      for (const change of changes) {
+        try {
+          await invoke("deliver_notification", {
+            // One slot per repo per kind of news: a repo whose CI fails twice replaces
+            // its own banner, while a failure and a new pull request stay separate
+            // because they ask for different things.
+            identifier: `gyredeck.git.${change.kind}.${change.repo}`,
+            title: change.title,
+            body: trim(change.body) || change.repo,
+          });
+        } catch (cause) {
+          setError(cause instanceof Error ? cause.message : String(cause));
+        }
+      }
+    })();
+  }, [canUseNativeControls, repoStatuses]);
+
   const update = useCallback((patch: Partial<INotificationSettings>) => {
     setSettings((previous) => {
       const next = { ...previous, ...patch };
@@ -175,5 +222,6 @@ export const useNotifications = ({
     requestPermission,
     setAttention: (enabled: boolean) => update({ attention: enabled }),
     setRoomMessage: (enabled: boolean) => update({ roomMessage: enabled }),
+    setGit: (enabled: boolean) => update({ git: enabled }),
   };
 };

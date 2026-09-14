@@ -1,5 +1,47 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## v1.11.1 — Notifications, landed but unproven
+
+A patch rather than a minor, on purpose. It carries the first notification work, and that
+work has never been shown to function: every build it could be tested on locally is
+ad-hoc signed, and macOS ties notification permission to a signed bundle id, so the
+request fails before any of it is reached. This release exists partly to find out.
+
+If notifications do work for you, Settings → Notification is where they live and the next
+release will say so properly.
+
+### Added
+
+- **Settings → Notification.** Two groups: *Sessions* for an agent that needs an answer
+  and for a sync room reply addressed to one of your sessions, and *Git* for a watched
+  repo moving — CI finishing, a pull request opening, a commit landing. Banners appear
+  only while the window is closed; one for something already on screen is how
+  notifications become the kind people switch off.
+- **The Git monitor keeps watching after you leave its tab**, once a minute instead of
+  stopping. The one moment worth being told about — a run failing while you are elsewhere
+  — was the one moment nothing was looking.
+
+### Fixes
+
+- The Settings sidebar was a fixed-width column and clipped "Notification" the day that
+  category was added. It fits its longest label now, and the window grew by the same
+  amount so the panel beside it keeps the room it had.
+- Notification switches rendered as bare circles, having been given a class the
+  stylesheet does not define.
+- Notifications asked macOS to present them with an option deprecated since macOS 11,
+  which for an app that never quits meant every one of them was delivered and then shown
+  as nothing.
+
+### Notes
+
+- Antigravity still reports no token usage anywhere it can be read — checked in its brain
+  directory, its transcript, all five hook payloads, the whole of `~/.gemini`, 992
+  collected events, and by asking the agent itself. The adapter now takes counts from
+  whatever a payload carries, so a context meter appears by itself on the day one is
+  reported. Nothing is estimated from transcript length: a number people believe is worse
+  than no number.
+
+
 ## v1.11.0 — Sync Session, after meeting three real agents
 
 Mostly repair. v1.10.0 shipped Sync Session and it did not survive contact with three

@@ -1,5 +1,28 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## v1.11.2 — Notifications, now shown to work
+
+v1.11.1 shipped notifications that had never been seen to fire, and guessed at why: that
+macOS ties the permission to a certificate this project does not have. That was wrong.
+An ad-hoc signed build is granted the permission perfectly well. Two ordinary bugs were
+doing the work, and both are fixed here. All four banners have now been watched arriving.
+
+### Fixes
+
+- **The permission row said "Not asked yet" while macOS held the app as refused.** Once
+  refused, every later request returns the same error, so the Allow button could not work
+  and the sentence explaining where to undo it could never appear. The request now reports
+  the status the system holds rather than whether asking succeeded, and a refusal offers a
+  button that opens the pane holding the switch.
+- **Sync-room banners had never fired once.** The renderer subscribes to events by name
+  and `room_message` was missing from its list, so the events were sent, written to the
+  log, and heard by nobody. The list now lives in the protocol package alongside the type,
+  with no second copy to fall behind.
+- **Every build presented itself to macOS as a different app.** Nothing ran `codesign` on
+  the bundle, so the identifier came from the binary name rather than from
+  `Info.plist` — meaning a permission granted to one version would not have survived an
+  update to the next.
+
 ## v1.11.1 — Notifications, landed but unproven
 
 A patch rather than a minor, on purpose. It carries the first notification work, and that

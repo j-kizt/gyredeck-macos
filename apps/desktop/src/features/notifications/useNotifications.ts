@@ -101,18 +101,41 @@ export const useNotifications = ({
     settingsRef.current = settings;
   }, [settings]);
 
+  /**
+   * Re-read rather than remember. The permission lives in System Settings, where it can
+   * be switched off at any time and without telling this app — and closing the window
+   * hides it rather than destroying it, so a value read once at startup outlives every
+   * chance to notice. Held state would keep claiming "Allowed" for a permission macOS
+   * had already revoked, and the refusal notice that explains how to undo it would never
+   * be reached.
+   */
   useEffect(() => {
     if (!canUseNativeControls) return;
     let cancelled = false;
-    void (async () => {
+
+    const read = async () => {
       try {
         const state = await invoke<NotificationPermission>("notification_permission_state");
         if (!cancelled) setPermission(state);
       } catch {
         if (!cancelled) setPermission("unsupported");
       }
-    })();
-    return () => { cancelled = true; };
+    };
+
+    void read();
+    // Focus is the moment the answer is about to be looked at, and the moment a person
+    // returns from having changed it. Taken from the DOM rather than from Tauri's window
+    // events: the same code then runs in the browser demo, where a Tauri-only call threw
+    // inside this effect and took the whole app down with it.
+    const onWake = () => { if (document.visibilityState !== "hidden") void read(); };
+    window.addEventListener("focus", onWake);
+    document.addEventListener("visibilitychange", onWake);
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", onWake);
+      document.removeEventListener("visibilitychange", onWake);
+    };
   }, [canUseNativeControls]);
 
   const requestPermission = useCallback(async () => {

@@ -39,7 +39,7 @@ use github::{
 
 use keep_awake::KeepAwakeState;
 use local_services::{control_local_service, local_services, LocalServicesControlState};
-use notification::{deliver_notification, notification_permission_state, request_notification_permission};
+use notification::{deliver_notification, notification_permission_state, open_notification_settings, request_notification_permission};
 use standalone_bridge::StandaloneBridgeState;
 
 #[cfg(target_os = "macos")]
@@ -5314,6 +5314,7 @@ pub fn run() {
             open_external_url,
             reconcile_display,
             request_notification_permission,
+            open_notification_settings,
             set_keep_awake,
             set_tray_attention,
             select_display

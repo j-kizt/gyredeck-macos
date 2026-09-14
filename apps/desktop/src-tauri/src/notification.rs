@@ -121,13 +121,26 @@ mod platform {
             UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
             &completion,
         );
-        receiver
+        let refusal = receiver
             .recv_timeout(PERMISSION_CALLBACK_TIMEOUT)
-            .map_err(|_| {
-                "Timed out while waiting for macOS notification permission".to_string()
-            })??;
+            .map_err(|_| "Timed out while waiting for macOS notification permission".to_string())?
+            .err();
 
-        permission_state()
+        // Settled by what the system now holds, not by whether asking succeeded. macOS
+        // refuses the request outright once an app has been turned off — the error says
+        // "not allowed", which reads like a broken app and sent a whole morning into
+        // chasing code signatures. The status says `denied`, which is the truth and the
+        // one state the panel knows how to explain.
+        let state = permission_state()?;
+        match state {
+            NotificationPermissionState::NotDetermined => match refusal {
+                // Asking failed and left no trace: nothing was learnt, so say so rather
+                // than reporting a state that was never reached.
+                Some(message) => Err(message),
+                None => Ok(state),
+            },
+            settled => Ok(settled),
+        }
     }
 
     /// Post one notification, replacing any earlier one carrying the same identifier.
@@ -182,6 +195,25 @@ mod platform {
             .map_err(|_| "Timed out while reading macOS notification settings".to_string())
     }
 
+    /// Open the pane that holds the one switch a refused app cannot flip for itself.
+    ///
+    /// Once macOS has recorded a refusal it stops presenting the prompt, so the only
+    /// route back is this list. Offering the trip is the difference between a dead end
+    /// and a two-click fix.
+    pub fn open_settings() -> Result<(), String> {
+        std::process::Command::new("/usr/bin/open")
+            .arg("x-apple.systempreferences:com.apple.Notifications-Settings.extension")
+            .status()
+            .map_err(|error| format!("Could not open System Settings: {error}"))
+            .and_then(|status| {
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err("System Settings refused to open".to_string())
+                }
+            })
+    }
+
     fn permission_state_from_status(status: UNAuthorizationStatus) -> NotificationPermissionState {
         if status == UNAuthorizationStatus::NotDetermined {
             NotificationPermissionState::NotDetermined
@@ -221,6 +253,10 @@ mod platform {
     pub fn deliver(_identifier: &str, _title: &str, _body: &str) -> Result<(), String> {
         Err("Native macOS notifications are unavailable on this platform".to_string())
     }
+
+    pub fn open_settings() -> Result<(), String> {
+        Err("Native macOS notifications are unavailable on this platform".to_string())
+    }
 }
 
 pub fn initialize() {
@@ -254,6 +290,11 @@ pub async fn request_notification_permission() -> Result<NotificationPermissionS
 /// webview keeps running and keeps its subscription. Reaching for the events a second
 /// time here would mean the same rule implemented in two places, which is how the room
 /// routing drifted apart twice in one day.
+#[tauri::command]
+pub async fn open_notification_settings() -> Result<(), String> {
+    run_blocking(platform::open_settings).await
+}
+
 #[tauri::command]
 pub async fn deliver_notification(
     identifier: String,

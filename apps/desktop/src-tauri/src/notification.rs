@@ -56,8 +56,16 @@ mod platform {
                 _notification: &UNNotification,
                 completion_handler: &DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
             ) {
-                #[allow(deprecated)]
-                completion_handler.call((UNNotificationPresentationOptions::Alert,));
+                // Banner and List, not the deprecated Alert. This delegate decides what
+                // happens to a notification posted *while the app is running*, which for
+                // a menu-bar app is every notification it will ever send — and asking
+                // for an option macOS stopped honouring in 11 means the notification is
+                // delivered and then presented as nothing at all. Silent, with no error
+                // anywhere: the post succeeds, the banner never appears.
+                completion_handler.call((
+                    UNNotificationPresentationOptions::Banner
+                        | UNNotificationPresentationOptions::List,
+                ));
             }
         }
     );
@@ -107,8 +115,10 @@ mod platform {
             let _ = sender.send(result);
         });
 
+        // Alert here is the authorisation option, not the presentation one, and is not
+        // deprecated — it is what grants the right to show anything at all.
         center.requestAuthorizationWithOptions_completionHandler(
-            UNAuthorizationOptions::Alert,
+            UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
             &completion,
         );
         receiver

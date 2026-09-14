@@ -112,7 +112,6 @@ export const useNotifications = ({
   useEffect(() => {
     if (!canUseNativeControls) return;
     let cancelled = false;
-    let unlisten: (() => void) | null = null;
 
     const read = async () => {
       try {
@@ -125,18 +124,18 @@ export const useNotifications = ({
 
     void read();
     // Focus is the moment the answer is about to be looked at, and the moment a person
-    // returns from having changed it.
-    void getCurrentWindow()
-      .onFocusChanged(({ payload: focused }) => { if (focused) void read(); })
-      .then((stop) => {
-        if (cancelled) stop();
-        else unlisten = stop;
-      })
-      .catch(() => {
-        // Without the subscription the state is merely as stale as it was before.
-      });
+    // returns from having changed it. Taken from the DOM rather than from Tauri's window
+    // events: the same code then runs in the browser demo, where a Tauri-only call threw
+    // inside this effect and took the whole app down with it.
+    const onWake = () => { if (document.visibilityState !== "hidden") void read(); };
+    window.addEventListener("focus", onWake);
+    document.addEventListener("visibilitychange", onWake);
 
-    return () => { cancelled = true; unlisten?.(); };
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", onWake);
+      document.removeEventListener("visibilitychange", onWake);
+    };
   }, [canUseNativeControls]);
 
   const requestPermission = useCallback(async () => {

@@ -6,6 +6,7 @@ import type { GyredeckPresenceStatus } from "@gyredeck/protocol";
 import { SessionSyncPanel } from "./features/mail/SessionSyncPanel";
 import { useMailRooms } from "./features/mail/useMailRooms";
 import { useNotifications } from "./features/notifications/useNotifications";
+import type { IGithubRepoStatus } from "./features/github/types";
 import { SessionContextMeter, SessionContextSummary, StatusGlyph, WorkspaceSessionGroupItem } from "./features/session/components";
 import {
   formatTime,
@@ -202,14 +203,25 @@ const App = () => {
     canUseNativeControls,
   });
 
-  // Not gated on what is on screen, unlike every other poller here: this one exists
-  // for the times when nothing is.
-  const notifications = useNotifications({ lastLiveEvent, canUseNativeControls });
-
   const githubMonitor = useGithubMonitor({
     active: activeMainTab === "git" && !setupOpen && !selectedSessionId,
     canUseNativeControls,
   });
+
+  // Only settled snapshots: a repo still loading, or one whose last fetch failed, has
+  // nothing trustworthy to compare against and would read as movement the moment it
+  // recovered.
+  const repoStatuses = useMemo(() => {
+    const ready: Record<string, IGithubRepoStatus> = {};
+    for (const [repo, state] of Object.entries(githubMonitor.statuses)) {
+      if (state.status === "ready") ready[repo] = state.data;
+    }
+    return ready;
+  }, [githubMonitor.statuses]);
+
+  // Not gated on what is on screen, unlike every other poller here: this one exists for
+  // the times when nothing is.
+  const notifications = useNotifications({ lastLiveEvent, repoStatuses, canUseNativeControls });
 
   useEffect(() => {
     if (!clearCompletedArmed) return undefined;

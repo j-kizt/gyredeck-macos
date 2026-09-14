@@ -173,14 +173,23 @@
   gap: 8px;
 }
 
+/* Two columns: the grip owns the first for the whole height of the card, so what can be
+   dragged is a place rather than a spot inside one row. */
 .gh-card {
   border: 1px solid var(--hair);
   border-radius: 10px;
   background: var(--fill);
   padding: 9px 10px;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: 7px;
+}
+
+.gh-card-body {
   display: flex;
   flex-direction: column;
   gap: 5px;
+  min-width: 0;
 }
 
 .gh-card-head {
@@ -188,6 +197,63 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+
+/* The grip is the whole of what can be dragged. Cards carry a link and a delete button,
+   and a card draggable by its whole surface turns a misjudged press on either into a
+   reorder nobody asked for. */
+/* Always visible. A control that appears only under the pointer is one a person has to
+   already know about to find. */
+.gh-grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  color: var(--text-2);
+  cursor: grab;
+  transition: color 120ms ease;
+  margin-left: -3px;
+}
+
+.gh-card:hover .gh-grip {
+  color: var(--text);
+}
+
+.gh-grip:active {
+  cursor: grabbing;
+  color: var(--text);
+}
+
+.gh-card.dragging {
+  opacity: 0.4;
+}
+
+/* An outline holding open the space the card will occupy. A hairline between two cards
+   has to be read and interpreted; a gap the size of the card is the answer already in
+   the shape of the result. */
+.gh-drop-slot {
+  height: 38px;
+  border: 1.5px dashed var(--accent);
+  border-radius: 10px;
+  background: rgba(var(--accent-rgb), 0.1);
+}
+
+/* Past the last card: a strip tall enough to aim at. Only the outline inside it is
+   drawn, so nothing shows until the pointer is actually here. */
+.gh-drop-end {
+  min-height: 38px;
+  display: flex;
+  align-items: stretch;
+}
+
+.gh-drop-end > .gh-drop-slot {
+  flex: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gh-grip {
+    transition: none;
+  }
 }
 
 .gh-repo-name {

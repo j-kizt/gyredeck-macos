@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Check, ChevronsUpDown, Copy, Download, GitBranch, GitCommit, GitPullRequest, LogIn, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Check, ChevronsUpDown, Copy, Download, GitBranch, GitCommit, GitPullRequest, GripVertical, LogIn, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import type { GitProvider, GithubRepoState, IGithubRun } from "./types";
 import type { IGithubMonitor } from "./useGithubMonitor";
 import { Tooltip } from "../../Tooltip";
@@ -73,58 +73,87 @@ interface IRepoCardProps {
   provider: GitProvider;
   state: GithubRepoState | undefined;
   onRemove: (repo: string) => void;
+  dragging: boolean;
+  onDragStart: () => void;
+  onDragEnd: () => void;
+  onDragOver: () => void;
 }
 
-const RepoCard = ({ repo, provider, state, onRemove }: IRepoCardProps) => {
+const RepoCard = ({ repo, provider, state, onRemove, dragging, onDragStart, onDragEnd, onDragOver }: IRepoCardProps) => {
   const data = state && (state.status === "ready" || state.status === "error") ? state.data : undefined;
   const latestRun = data?.runs[0];
   const run = latestRun ? runState(latestRun) : null;
   const noun = requestNoun(provider);
+  // Draggable only while the grip is held. The card carries a link and a delete button,
+  // and a card that is draggable everywhere turns every stray press on them into a drag.
+  const [grabbed, setGrabbed] = useState(false);
   return (
-    <div className="gh-card">
-      <div className="gh-card-head">
-        <button className="gh-repo-name" type="button" onClick={() => openExternal(repoUrl(provider, repo))} title={`Open ${repo}`}>
-          {repo}
-        </button>
-        <button className="gh-icon-btn gh-remove" type="button" aria-label={`Stop tracking ${repo}`} onClick={() => onRemove(repo)}>
-          <Trash2 size={12} strokeWidth={2.3} />
-        </button>
+    <div
+      className={`gh-card${dragging ? " dragging" : ""}`}
+      draggable={grabbed}
+      onDragStart={(event) => {
+        // Firefox refuses to start a drag without payload; the value is unused.
+        event.dataTransfer.setData("text/plain", repo);
+        event.dataTransfer.effectAllowed = "move";
+        onDragStart();
+      }}
+      onDragEnd={() => { setGrabbed(false); onDragEnd(); }}
+      onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; onDragOver(); }}
+      onDrop={(event) => event.preventDefault()}
+    >
+      <span
+        className="gh-grip"
+        aria-hidden="true"
+        onMouseDown={() => setGrabbed(true)}
+        onMouseUp={() => setGrabbed(false)}
+      >
+        <GripVertical size={12} strokeWidth={2.3} />
+      </span>
+      <div className="gh-card-body">
+        <div className="gh-card-head">
+          <button className="gh-repo-name" type="button" onClick={() => openExternal(repoUrl(provider, repo))} title={`Open ${repo}`}>
+            {repo}
+          </button>
+          <button className="gh-icon-btn gh-remove" type="button" aria-label={`Stop tracking ${repo}`} onClick={() => onRemove(repo)}>
+            <Trash2 size={12} strokeWidth={2.3} />
+          </button>
+        </div>
+        {state?.status === "loading" && !data ? (
+          <div className="gh-card-line muted">Loading…</div>
+        ) : (
+          <>
+            {run ? (
+              <Tooltip label={`CI ${run.label}${latestRun?.name ? ` · ${latestRun.name}` : ""}`}>
+                <div className="gh-card-line">
+                  <span className={`gh-dot ${run.tone}`}>{run.symbol}</span> CI {run.label}
+                  {latestRun?.name ? <span className="muted"> · {latestRun.name}</span> : null}
+                </div>
+              </Tooltip>
+            ) : data ? (
+              <div className="gh-card-line muted">No workflow runs</div>
+            ) : null}
+            {data ? (
+              <Tooltip label={data.pulls[0]?.title ?? `${data.open_pr_count} open ${noun}${data.open_pr_count === 1 ? "" : "s"}`}>
+                <button className="gh-card-line gh-link" type="button" onClick={() => openExternal(requestsUrl(provider, repo))}>
+                  <GitPullRequest size={12} strokeWidth={2.3} /> {data.open_pr_count} open {noun}{data.open_pr_count === 1 ? "" : "s"}
+                  {data.pulls[0] ? <span className="muted"> · {data.pulls[0].title}</span> : null}
+                </button>
+              </Tooltip>
+            ) : null}
+            {data?.commit ? (
+              <Tooltip label={data.commit.message}>
+                <button className="gh-card-line gh-link" type="button" onClick={() => data.commit && openExternal(commitUrl(provider, repo, data.commit.sha))}>
+                  <GitCommit size={12} strokeWidth={2.3} /> {data.commit.sha} {data.commit.message}
+                  <span className="muted"> · {relativeTime(data.commit.committed_at)}</span>
+                </button>
+              </Tooltip>
+            ) : data ? (
+              <div className="gh-card-line muted">No commits yet</div>
+            ) : null}
+            {state?.status === "error" ? <div className="gh-card-line error">{state.message}</div> : null}
+          </>
+        )}
       </div>
-      {state?.status === "loading" && !data ? (
-        <div className="gh-card-line muted">Loading…</div>
-      ) : (
-        <>
-          {run ? (
-            <Tooltip label={`CI ${run.label}${latestRun?.name ? ` · ${latestRun.name}` : ""}`}>
-              <div className="gh-card-line">
-                <span className={`gh-dot ${run.tone}`}>{run.symbol}</span> CI {run.label}
-                {latestRun?.name ? <span className="muted"> · {latestRun.name}</span> : null}
-              </div>
-            </Tooltip>
-          ) : data ? (
-            <div className="gh-card-line muted">No workflow runs</div>
-          ) : null}
-          {data ? (
-            <Tooltip label={data.pulls[0]?.title ?? `${data.open_pr_count} open ${noun}${data.open_pr_count === 1 ? "" : "s"}`}>
-              <button className="gh-card-line gh-link" type="button" onClick={() => openExternal(requestsUrl(provider, repo))}>
-                <GitPullRequest size={12} strokeWidth={2.3} /> {data.open_pr_count} open {noun}{data.open_pr_count === 1 ? "" : "s"}
-                {data.pulls[0] ? <span className="muted"> · {data.pulls[0].title}</span> : null}
-              </button>
-            </Tooltip>
-          ) : null}
-          {data?.commit ? (
-            <Tooltip label={data.commit.message}>
-              <button className="gh-card-line gh-link" type="button" onClick={() => data.commit && openExternal(commitUrl(provider, repo, data.commit.sha))}>
-                <GitCommit size={12} strokeWidth={2.3} /> {data.commit.sha} {data.commit.message}
-                <span className="muted"> · {relativeTime(data.commit.committed_at)}</span>
-              </button>
-            </Tooltip>
-          ) : data ? (
-            <div className="gh-card-line muted">No commits yet</div>
-          ) : null}
-          {state?.status === "error" ? <div className="gh-card-line error">{state.message}</div> : null}
-        </>
-      )}
     </div>
   );
 };
@@ -423,11 +452,64 @@ const AccountSelect = ({ monitor }: { monitor: IGithubMonitor }) => {
   );
 };
 
+/** The nearest ancestor that actually scrolls, which is not the list itself. */
+const scrollParentOf = (node: HTMLElement | null): HTMLElement | null => {
+  for (let element = node?.parentElement ?? null; element; element = element.parentElement) {
+    const overflow = window.getComputedStyle(element).overflowY;
+    if ((overflow === "auto" || overflow === "scroll") && element.scrollHeight > element.clientHeight) {
+      return element;
+    }
+  }
+  return null;
+};
+
 export const GithubPanel = ({ monitor, canUseNativeControls }: IGithubPanelProps) => {
   const signingIn = monitor.deviceFlow.status === "starting" || monitor.deviceFlow.status === "awaiting";
   const [addingAccount, setAddingAccount] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  // Which card is in the air, and which card it currently sits in front of. Held by the
+  // list rather than by either card, because a drag is a fact about the order.
+  const [dragging, setDragging] = useState<string | null>(null);
+  const [dropBefore, setDropBefore] = useState<string | null>(null);
   const viewingProvider: GitProvider = monitor.viewingProvider ?? monitor.activeProvider ?? "github";
+
+  const cardsRef = useRef<HTMLDivElement | null>(null);
+
+  // Drag and drop scrolls nothing on its own, so a card could not be moved past what was
+  // already on screen — the reachable list ended at the window edge.
+  useEffect(() => {
+    if (dragging === null) return;
+    const scroller = scrollParentOf(cardsRef.current);
+    if (!scroller) return;
+    const EDGE = 52;
+    const MAX_STEP = 14;
+    let pointerY: number | null = null;
+    let frame = 0;
+    const track = (event: DragEvent) => { pointerY = event.clientY; };
+    const step = () => {
+      frame = window.requestAnimationFrame(step);
+      if (pointerY === null) return;
+      const box = scroller.getBoundingClientRect();
+      // Proportional to how far into the edge the pointer has gone: one fixed speed
+      // either crawls when crossing a long list or overshoots when nudging one row.
+      const above = box.top + EDGE - pointerY;
+      const below = pointerY - (box.bottom - EDGE);
+      if (above > 0) scroller.scrollTop -= MAX_STEP * Math.min(1, above / EDGE);
+      else if (below > 0) scroller.scrollTop += MAX_STEP * Math.min(1, below / EDGE);
+    };
+    document.addEventListener("dragover", track);
+    frame = window.requestAnimationFrame(step);
+    return () => {
+      document.removeEventListener("dragover", track);
+      window.cancelAnimationFrame(frame);
+    };
+  }, [dragging]);
+
+  const endDrag = useCallback(() => {
+    if (dragging) monitor.moveRepo(dragging, dropBefore);
+    setDragging(null);
+    setDropBefore(null);
+  }, [dragging, dropBefore, monitor]);
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -485,14 +567,49 @@ export const GithubPanel = ({ monitor, canUseNativeControls }: IGithubPanelProps
 
           <AddRepo key={monitor.viewingAccount ?? "none"} tracked={monitor.trackedRepos} onAdd={monitor.addRepo} loadRepos={monitor.listAvailableRepos} />
 
-          <div className="gh-cards">
+          <div
+            ref={cardsRef}
+            className="gh-cards"
+            // The gap between cards belongs to the list, and a pointer crossing it
+            // mid-drag would otherwise clear the target and drop the card back where it
+            // started. Past the last card means the end of the list.
+            onDragOver={(event) => { if (dragging) event.preventDefault(); }}
+            onDrop={(event) => { event.preventDefault(); endDrag(); }}
+          >
             {monitor.trackedRepos.length === 0 ? (
               <div className="gh-empty">No repositories tracked yet. Add one accessible to the current account.</div>
             ) : (
               monitor.trackedRepos.map((repo) => (
-                <RepoCard key={repo} repo={repo} provider={viewingProvider} state={monitor.statuses[repo]} onRemove={monitor.removeRepo} />
+                <Fragment key={repo}>
+                  {/* A gap opened where the card would land says where it goes in the
+                      terms the list is already read in — the cards below have moved
+                      down, exactly as they will once it is dropped. */}
+                  {dragging !== null && dragging !== repo && dropBefore === repo ? (
+                    <div className="gh-drop-slot" aria-hidden="true" />
+                  ) : null}
+                  <RepoCard
+                    repo={repo}
+                    provider={viewingProvider}
+                    state={monitor.statuses[repo]}
+                    onRemove={monitor.removeRepo}
+                    dragging={dragging === repo}
+                    onDragStart={() => { setDragging(repo); setDropBefore(repo); }}
+                    onDragEnd={endDrag}
+                    onDragOver={() => { if (dragging && dragging !== repo) setDropBefore(repo); }}
+                  />
+                </Fragment>
               ))
             )}
+            {/* Past the last card. Tall enough to be aimed at rather than hit by luck. */}
+            {dragging !== null ? (
+              <div
+                className="gh-drop-end"
+                onDragOver={(event) => { event.preventDefault(); setDropBefore(null); }}
+                aria-hidden="true"
+              >
+                {dropBefore === null ? <div className="gh-drop-slot" /> : null}
+              </div>
+            ) : null}
           </div>
         </>
       ) : null}

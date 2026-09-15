@@ -791,6 +791,42 @@ fn set_bridge_port(
     state.restart()
 }
 
+/// Whether the app is set to start when the machine is unlocked.
+///
+/// Read from the launch agent rather than remembered: it is a fact about the system,
+/// and a person can change it in System Settings without telling the app. A value cached
+/// here would go on claiming whatever it was told last — the same way the notification
+/// permission did until it stopped being remembered.
+#[tauri::command]
+fn launch_at_login_enabled(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|error| format!("Could not read the login item: {error}"))
+}
+
+#[tauri::command]
+fn set_launch_at_login(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let outcome = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    outcome.map_err(|error| {
+        format!(
+            "Could not {} launching at login: {error}",
+            if enabled { "enable" } else { "disable" }
+        )
+    })?;
+    // Answered from the system again rather than echoing the request, so the switch
+    // shows what is true rather than what was asked for.
+    manager
+        .is_enabled()
+        .map_err(|error| format!("Could not confirm the login item: {error}"))
+}
+
 #[tauri::command]
 fn set_keep_awake(state: tauri::State<'_, KeepAwakeState>, active: bool) -> Result<bool, String> {
     state.set_active(active)
@@ -5332,12 +5368,20 @@ pub fn run() {
             request_notification_permission,
             open_notification_settings,
             set_keep_awake,
+            launch_at_login_enabled,
+            set_launch_at_login,
             set_tray_attention,
             select_display
         ]);
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // Registered for its Rust side only. The matching JS package would be the
+        // ordinary way to reach it, and the bundle budget has a hundred bytes spare.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(KeepAwakeState::default())
         .manage(TrayAttentionState::default())
         .manage(DisplayPreferenceState::default())

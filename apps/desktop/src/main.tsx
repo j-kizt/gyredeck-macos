@@ -36,6 +36,7 @@ import {
 import type { DeletedSessionRegistry, DismissedSessionRegistry, ISessionDetail, ISessionSummary, IWorkspaceSessionGroup } from "./features/session/types";
 import { DEFAULT_BRIDGE_PORT, useGyredeckPresence } from "./features/presence/useGyredeckPresence";
 import { SetupPanel } from "./features/setup/SetupPanel";
+import { useLaunchAtLogin } from "./features/setup/useLaunchAtLogin";
 import { useUpdater } from "./features/updater/useUpdater";
 import { readUsageSettings, writeUsageSettings } from "./features/usage/adapters";
 import { AgentUsageList } from "./features/usage/components";
@@ -254,6 +255,7 @@ const App = () => {
 
   // Not gated on what is on screen, unlike every other poller here: this one exists for
   // the times when nothing is.
+  const launchAtLogin = useLaunchAtLogin(canUseNativeControls);
   const notifications = useNotifications({ lastLiveEvent, repoStatuses, usages: agentUsages, canUseNativeControls });
 
   useEffect(() => {
@@ -983,6 +985,7 @@ const App = () => {
                   keepAwakeEnabled={keepAwakeEnabled}
                   keepAwakeError={keepAwakeError}
                   hookStatus={hookStatus}
+                  launchAtLogin={launchAtLogin}
                   mailRooms={mailRooms}
                   notifications={notifications}
                   onCloseRoom={async (room, founder) => {

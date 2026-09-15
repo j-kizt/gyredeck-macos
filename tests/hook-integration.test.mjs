@@ -2238,6 +2238,20 @@ for (const [label, adapter, args, payload, expectedPaths] of [
     ["/hook/stop"],
   ],
   [
+    "codex",
+    "adapters/codex/gyredeck-codex-hook.mjs",
+    ["--event", "PermissionRequest"],
+    {
+      hook_event_name: "PermissionRequest",
+      session_id: "x1",
+      cwd: "/tmp/p",
+      tool_name: "Bash",
+      tool_use_id: "exec-1",
+      transcript_path: "/tmp/rollout.jsonl",
+    },
+    ["/hook/attention"],
+  ],
+  [
     // Codex passes this one its event as a single JSON argument, not on stdin.
     "codex-notify",
     "adapters/codex/gyredeck-codex-notify.mjs",

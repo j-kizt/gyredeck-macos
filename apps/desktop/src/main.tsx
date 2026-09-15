@@ -71,6 +71,8 @@ interface ISessionActionState {
 interface IHookStatus {
   path: string | null;
   installed: boolean | null;
+  /** Installed, but not the copy this build ships — it needs installing again. */
+  stale: boolean | null;
 }
 
 type MainPanelTab = "sessions" | "usage" | "ports" | "git";
@@ -120,13 +122,13 @@ const App = () => {
   const [activeMainTab, setActiveMainTab] = useState<MainPanelTab>("sessions");
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
-  const [hookStatus, setHookStatus] = useState<IHookStatus>({ path: null, installed: null });
+  const [hookStatus, setHookStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
   // Whether a session may answer its room without being approved each time. Null until
   // read, so the switch does not flicker through "off" on the way to its real state.
   const [syncRepliesAllowed, setSyncRepliesAllowed] = useState<boolean | null>(null);
   const [syncRepliesBusy, setSyncRepliesBusy] = useState(false);
-  const [agyStatus, setAgyStatus] = useState<IHookStatus>({ path: null, installed: null });
-  const [codexStatus, setCodexStatus] = useState<IHookStatus>({ path: null, installed: null });
+  const [agyStatus, setAgyStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
+  const [codexStatus, setCodexStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
   const [dismissedSessionIds, setDismissedSessionIds] = useState<DismissedSessionRegistry>(readDismissedSessionIds);
   const [deletedSessionIds, setDeletedSessionIds] = useState<DeletedSessionRegistry>(readDeletedSessionIds);
   const [keepAwakeEnabled, setKeepAwakeEnabled] = useState(readKeepAwakeEnabled);
@@ -737,7 +739,7 @@ const App = () => {
   // path) doesn't re-render the panel once per adapter for no change — a stray
   // re-render there can land between a focus() and a keypress and drop focus.
   const clearHookStatus = (set: React.Dispatch<React.SetStateAction<IHookStatus>>) =>
-    set((current) => (current.path === null && current.installed === null ? current : { path: null, installed: null }));
+    set((current) => (current.path === null && current.installed === null ? current : { path: null, installed: null, stale: null }));
 
   const loadHookStatus = async () => {
     if (!canUseNativeControls) {
@@ -746,8 +748,8 @@ const App = () => {
     }
 
     try {
-      const [path, installed] = await invoke<[string, boolean]>("claude_hook_status");
-      setHookStatus({ path, installed });
+      const [path, installed, stale] = await invoke<[string, boolean, boolean | null]>("claude_hook_status");
+      setHookStatus({ path, installed, stale });
     } catch {
       clearHookStatus(setHookStatus);
     }
@@ -785,8 +787,8 @@ const App = () => {
     }
 
     try {
-      const [path, installed] = await invoke<[string, boolean]>("agy_hook_status");
-      setAgyStatus({ path, installed });
+      const [path, installed, stale] = await invoke<[string, boolean, boolean | null]>("agy_hook_status");
+      setAgyStatus({ path, installed, stale });
     } catch {
       clearHookStatus(setAgyStatus);
     }
@@ -827,9 +829,15 @@ const App = () => {
     }
 
     try {
+      // Already registered means the agent reads the file afresh on its next event, so
+      // nothing needs restarting — telling someone to restart anyway adds a step to a
+      // migration that is meant to be one click.
+      const wasInstalled = hookStatus.installed === true;
       const path = await invoke<string>("install_claude_hook");
-      setHookStatus({ path, installed: true });
-      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: `Installed → ${shortenPath(path)} · restart Claude Code` });
+      setHookStatus({ path, installed: true, stale: false });
+      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: wasInstalled
+          ? `Reinstalled → ${shortenPath(path)} · in effect from the next event`
+          : `Installed → ${shortenPath(path)} · restart Claude Code` });
     } catch (error) {
       setNativeAction({
         bridgeOnline: nativeAction.bridgeOnline,
@@ -845,8 +853,8 @@ const App = () => {
     }
 
     try {
-      const [path, installed] = await invoke<[string, boolean]>("codex_hook_status");
-      setCodexStatus({ path, installed });
+      const [path, installed, stale] = await invoke<[string, boolean, boolean | null]>("codex_hook_status");
+      setCodexStatus({ path, installed, stale });
     } catch {
       clearHookStatus(setCodexStatus);
     }
@@ -859,9 +867,15 @@ const App = () => {
     }
 
     try {
+      // Already registered means the agent reads the file afresh on its next event, so
+      // nothing needs restarting — telling someone to restart anyway adds a step to a
+      // migration that is meant to be one click.
+      const wasInstalled = agyStatus.installed === true;
       const path = await invoke<string>("install_agy_hook");
-      setAgyStatus({ path, installed: true });
-      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: `Installed → ${shortenPath(path)} · restart Antigravity` });
+      setAgyStatus({ path, installed: true, stale: false });
+      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: wasInstalled
+          ? `Reinstalled → ${shortenPath(path)} · in effect from the next event`
+          : `Installed → ${shortenPath(path)} · restart Antigravity` });
     } catch (error) {
       setNativeAction({
         bridgeOnline: nativeAction.bridgeOnline,
@@ -877,9 +891,15 @@ const App = () => {
     }
 
     try {
+      // Already registered means the agent reads the file afresh on its next event, so
+      // nothing needs restarting — telling someone to restart anyway adds a step to a
+      // migration that is meant to be one click.
+      const wasInstalled = codexStatus.installed === true;
       const path = await invoke<string>("install_codex_hook");
-      setCodexStatus({ path, installed: true });
-      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: `Installed → ${shortenPath(path)} · restart Codex` });
+      setCodexStatus({ path, installed: true, stale: false });
+      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: wasInstalled
+          ? `Reinstalled → ${shortenPath(path)} · in effect from the next event`
+          : `Installed → ${shortenPath(path)} · restart Codex` });
     } catch (error) {
       setNativeAction({
         bridgeOnline: nativeAction.bridgeOnline,

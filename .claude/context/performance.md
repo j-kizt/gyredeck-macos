@@ -2,6 +2,14 @@
 
 Gyredeck treats performance claims as local regression evidence, not universal guarantees. Measure on the same machine, with the same deterministic workloads, and compare medians/p95 rather than one run.
 
+`pnpm test:budget` — the bundle-size layer alone — runs in CI on every pull request, in
+the `check` job. Nothing ran it until 2026-09-15, and the ceiling had been exceeded for
+four merges by then without anything saying so.
+
+The other two layers stay local. They start a server to measure against and it does not
+come up on the runner; until that is fixed, running the layer that works beats running
+none of them.
+
 `pnpm test:performance` builds the desktop web bundle and then runs three evidence layers:
 
 ```
@@ -44,8 +52,6 @@ Starts the bridge under a temporary `HOME`, publishes N deterministic events (5,
 | Startup | ≤ 100ms |
 | Throughput | ≥ 20,000 events/s |
 | Persisted log | > 0 bytes |
-
-> Note: this script currently imports the bridge under the path `mods/gyredeck.js`, which does not exist in this tree — the standalone bridge lives at `adapters/bridge/gyredeck-bridge.mjs`. The `--ref`/`--mod` plumbing (comparing against a Git ref) still points at the old Letta mod path. Until the script is updated to target the standalone bridge, treat the bridge layer of `pnpm test:performance` as needing a fix rather than a working budget.
 
 ## Commands
 

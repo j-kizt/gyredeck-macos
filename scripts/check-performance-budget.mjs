@@ -6,10 +6,27 @@ const repoRoot = resolve(import.meta.dirname, "..");
 const distRoot = join(repoRoot, "apps/desktop/dist");
 const assetRoot = join(distRoot, "assets");
 
+/**
+ * Ceilings, not measurements.
+ *
+ * The JavaScript one was raised on 2026-09-15 from 105,500, which it had been quietly
+ * over since the unread-messages work four merges earlier. Nothing noticed, because this
+ * script was not wired into CI — a guard nobody runs is not a guard, and the number it
+ * held had two bytes of headroom, which makes it a line that happened not to have been
+ * crossed rather than a limit anyone chose.
+ *
+ * 112,000 is chosen to leave room for ordinary work while still stopping the thing this
+ * is actually for: a library arriving. The drag-and-drop library considered for the repo
+ * card reordering would have added roughly thirty thousand bytes gzipped and would hit
+ * this immediately, which is the behaviour worth keeping.
+ *
+ * Raising it again should mean the same thing it meant this time: a deliberate decision
+ * with the reason written down, never a number edited to match whatever was measured.
+ */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 105_500,
+  jsGzipBytes: 112_000,
 };
 
 const walk = async (directory) => {

@@ -28,8 +28,9 @@
 - Browser demo regression: `pnpm test:demo`
 - Hook integration tests: `pnpm test:hooks`
 - Baseline-grounded bundle/session/bridge budgets: `pnpm test:performance`
+- Bundle size ceiling alone, the layer CI enforces: `pnpm test:budget`
 - Desktop web build: `pnpm desktop:web:build`
 - Native desktop build/install: `pnpm desktop:build` or `pnpm desktop:install`
 - Rust-only native check: run `cargo check` from `apps/desktop/src-tauri/`
-- `.github/workflows/ci.yml` runs `pnpm check`, `cargo check`, `pnpm test:hooks` (job `check`) and `pnpm test:demo` (job `test`) on every PR. Both are required checks on `main`, so a red PR cannot merge.
+- `.github/workflows/ci.yml` runs `pnpm check`, `cargo check`, `pnpm test:hooks`, `pnpm test:budget` (job `check`) and `pnpm test:demo` (job `test`) on every PR. Both are required checks on `main`, so a red PR cannot merge. `test:budget` (the bundle-size layer of `test:performance`) was added on 2026-09-15 after the ceiling sat broken for four merges unnoticed. The other two layers of `test:performance` start a local server that does not come up on the runner, so they stay a local-only check until that is fixed.
 - Do not leave `pnpm desktop:dev` running while `pnpm test:demo` runs locally: Playwright reuses that vite server and its workers then hang at teardown, exiting non-zero even when every test passed.

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 export interface ISyncMember {
   conversationId: string;
@@ -19,6 +19,16 @@ export interface ISyncRoomState {
   error: string | null;
   /** False when the room could not be read at all, so acting on it would guess. */
   canAct: boolean;
+  /**
+   * Which conversation the room above was actually read for, or null before any read
+   * has landed.
+   *
+   * `canAct` cannot answer this: it is true from the first render, because it means
+   * "nothing has failed" and nothing has been attempted yet either. Anything that acts
+   * on `room` being null — rather than merely offering a button — has to wait for a
+   * reading, and has to know the reading belongs to the session in front of it.
+   */
+  loadedFor: string | null;
   /** True when this session created the room, which is who may invite. */
   isFounder: boolean;
   /** Read the room's password, to hand to a session being let in. */
@@ -51,6 +61,12 @@ export const useSyncRoom = ({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [readFailure, setReadFailure] = useState<string | null>(null);
+  const [loadedFor, setLoadedFor] = useState<string | null>(null);
+  // Which session is selected *now*, readable from inside a reply that started before it
+  // changed. A local copy of the prop cannot do this: it and the prop come from the same
+  // closure, so they are equal after the await no matter what has happened since.
+  const wantedRef = useRef(conversationId);
+  wantedRef.current = conversationId;
   const [founder, setFounder] = useState<string | null>(null);
 
   const apply = (next: { room: string | null; founder?: string | null; members: ISyncMember[] }) => {
@@ -61,21 +77,28 @@ export const useSyncRoom = ({
 
   const read = useCallback(async () => {
     if (!conversationId || !canUseNativeControls) return;
+    // Captured before the await, and compared afterwards against the ref rather than the
+    // prop, which has not moved inside this closure.
+    const askedFor = conversationId;
     try {
       const next = await invoke<{ room: string | null; founder: string | null; members: ISyncMember[] }>("sync_room", {
         conversationId,
       });
+      if (askedFor !== wantedRef.current) return;
       apply(next);
+      setLoadedFor(askedFor);
       setReadFailure(null);
       // A read that succeeds is the newer truth about the room, so a refusal from an
       // earlier action stops applying. Without this a 409 from Create stayed on screen
       // beside the very state it was complaining about.
       if (next.room) setError(null);
     } catch (cause) {
+      if (askedFor !== wantedRef.current) return;
       // "No room" and "could not ask" have to stay distinguishable. Treating a failed
       // read as an empty room offers Create on a session that is already in one, and
       // the refusal that follows contradicts the buttons that invited it.
       apply({ room: null, members: [] });
+      setLoadedFor(null);
       setReadFailure(cause instanceof Error ? cause.message : String(cause));
     }
   }, [canUseNativeControls, conversationId]);
@@ -84,6 +107,9 @@ export const useSyncRoom = ({
     setRoom(null);
     setMembers([]);
     setError(null);
+    // The previous session's reading does not describe this one. Clearing it here is
+    // what stops a room from one session being used to judge another for a render.
+    setLoadedFor(null);
     if (!conversationId || !canUseNativeControls) return;
     void read();
     const timer = window.setInterval(() => void read(), POLL_INTERVAL_MS);
@@ -140,5 +166,6 @@ export const useSyncRoom = ({
     leave: () => act("sync_leave", { code: room }),
     clearError: () => setError(null),
     canAct: readFailure === null,
+    loadedFor,
   };
 };

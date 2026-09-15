@@ -13,6 +13,8 @@ export interface IRoomMessage {
 }
 
 export interface IRoomInbox {
+  /** The room these messages belong to. Leaving it ends them. */
+  room: string;
   messages: IRoomMessage[];
   /** When this session's messages were last looked at. Null means never. */
   readAt: string | null;
@@ -51,6 +53,46 @@ export const unreadIn = (inbox: IRoomInbox | undefined): number => {
 };
 
 /**
+ * Record a message against the session it was addressed to.
+ *
+ * A different room is a different conversation: carrying the old list forward would mix
+ * two rooms into one and count replies nobody in this room ever sent. Returns the
+ * registry unchanged when the message is already held, which a backfill replays.
+ */
+export const recordMessage = (
+  registry: RoomInboxRegistry,
+  conversationId: string,
+  message: IRoomMessage,
+): RoomInboxRegistry => {
+  const held = registry[conversationId];
+  const inbox: IRoomInbox =
+    held && held.room === message.room ? held : { room: message.room, messages: [], readAt: null };
+  if (inbox.messages.some((held) => held.seq === message.seq)) return registry;
+  return {
+    ...registry,
+    [conversationId]: { ...inbox, messages: [...inbox.messages, message].slice(-MAX_MESSAGES) },
+  };
+};
+
+/**
+ * Keep only what belongs to the room this session is in now.
+ *
+ * Messages outlive rooms otherwise: leaving one left its replies sitting under the
+ * session, counted as unread and shown in a tab, for a conversation that had ended.
+ * `null` means the session is in no room at all, and then there is nothing to keep.
+ */
+export const retainedRegistry = (
+  registry: RoomInboxRegistry,
+  conversationId: string,
+  room: string | null,
+): RoomInboxRegistry => {
+  const held = registry[conversationId];
+  if (!held || held.room === room) return registry;
+  const { [conversationId]: _left, ...rest } = registry;
+  return rest;
+};
+
+/**
  * What was said to each session in a sync room, and whether it has been looked at.
  *
  * Kept from the event stream rather than from the room poller: that poller only runs
@@ -77,13 +119,7 @@ export const useRoomInbox = ({ lastLiveEvent }: { lastLiveEvent: GyredeckEvent |
     const data = lastLiveEvent.data;
 
     setRegistry((current) => {
-      const inbox = current[conversationId] ?? { messages: [], readAt: null };
-      // Seq is unique within a room, and a room is what this event is about — so a
-      // replayed backfill lands on the message it already recorded rather than beside it.
-      if (inbox.messages.some((message) => message.seq === data.seq && message.room === data.room)) {
-        return current;
-      }
-      const message: IRoomMessage = {
+      const next = recordMessage(current, conversationId, {
         seq: data.seq,
         room: data.room,
         from: data.from,
@@ -91,15 +127,8 @@ export const useRoomInbox = ({ lastLiveEvent }: { lastLiveEvent: GyredeckEvent |
         kind: data.kind,
         preview: data.preview,
         at: lastLiveEvent.timestamp,
-      };
-      const next: RoomInboxRegistry = {
-        ...current,
-        [conversationId]: {
-          ...inbox,
-          messages: [...inbox.messages, message].slice(-MAX_MESSAGES),
-        },
-      };
-      write(next);
+      });
+      if (next !== current) write(next);
       return next;
     });
   }, [lastLiveEvent]);
@@ -117,6 +146,21 @@ export const useRoomInbox = ({ lastLiveEvent }: { lastLiveEvent: GyredeckEvent |
     });
   }, []);
 
+  /**
+   * Keep only what belongs to the room this session is in now.
+   *
+   * Messages outlive rooms otherwise: leaving one left its replies sitting under the
+   * session, counted as unread and shown in a tab, for a conversation that had ended.
+   * `null` means the session is in no room at all, and then there is nothing to keep.
+   */
+  const retain = useCallback((conversationId: string, room: string | null) => {
+    setRegistry((current) => {
+      const next = retainedRegistry(current, conversationId, room);
+      if (next !== current) write(next);
+      return next;
+    });
+  }, []);
+
   const forget = useCallback((conversationId: string) => {
     setRegistry((current) => {
       if (!current[conversationId]) return current;
@@ -126,5 +170,5 @@ export const useRoomInbox = ({ lastLiveEvent }: { lastLiveEvent: GyredeckEvent |
     });
   }, []);
 
-  return { inbox: registry, markRead, forget };
+  return { inbox: registry, markRead, retain, forget };
 };

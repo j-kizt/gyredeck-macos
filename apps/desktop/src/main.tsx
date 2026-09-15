@@ -4,6 +4,7 @@ import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState, type E
 import { createRoot } from "react-dom/client";
 import type { GyredeckPresenceStatus } from "@gyredeck/protocol";
 import { SessionSyncPanel } from "./features/mail/SessionSyncPanel";
+import { useSyncRoom } from "./features/mail/useSyncRoom";
 import { unreadIn, useRoomInbox } from "./features/mail/useRoomInbox";
 import { useMailRooms } from "./features/mail/useMailRooms";
 import { useNotifications } from "./features/notifications/useNotifications";
@@ -227,7 +228,25 @@ const App = () => {
   // Whether there was anything unread has to be read before marking it read, and only
   // on the open itself: depending on the registry too would re-run after the mark and
   // always see zero.
+  // Lifted out of the sync panel so the tabs and the panel read one answer rather than
+  // polling for two that can disagree.
+  const selectedSyncRoom = useSyncRoom({ conversationId: selectedSessionId, canUseNativeControls });
+
+  // Messages belong to the room they were said in. Leaving one ends them, rather than
+  // leaving replies to a finished conversation sitting under the session as unread.
+  useEffect(() => {
+    // Only once a reading has landed *for this session*. `canAct` is true from the first
+    // render — it means nothing has failed, and nothing has been attempted either — so
+    // guarding on it read the initial `room: null` as "in no room" and deleted the inbox
+    // of every session the moment it was opened.
+    if (!selectedSessionId || selectedSyncRoom.loadedFor !== selectedSessionId) return;
+    roomInbox.retain(selectedSessionId, selectedSyncRoom.room);
+  }, [roomInbox, selectedSessionId, selectedSyncRoom.loadedFor, selectedSyncRoom.room]);
+
   const [detailTab, setDetailTab] = useState<"activity" | "messages">("activity");
+  useEffect(() => {
+    if (!selectedSyncRoom.room) setDetailTab("activity");
+  }, [selectedSyncRoom.room]);
   useEffect(() => {
     if (!selectedSessionId) return;
     // Land on whichever answers the question that was just asked: a session opened
@@ -1028,6 +1047,7 @@ const App = () => {
                   ) : null}
                   <SessionSyncPanel
                     session={selectedSession}
+                    sync={selectedSyncRoom}
                     canUseNativeControls={canUseNativeControls}
                     hookInstalled={
                       selectedSession.provider === "Claude Code"
@@ -1045,12 +1065,17 @@ const App = () => {
                       nothing. Opening on an unread reply lands on Messages. */}
                   <div className="detail-tabs" role="tablist" aria-label="Session detail view">
                     <button className="detail-tab" type="button" role="tab" data-active={detailTab === "activity"} aria-selected={detailTab === "activity"} onClick={() => setDetailTab("activity")} data-tauri-drag-region="false">Recent activity</button>
-                    <button className="detail-tab" type="button" role="tab" data-active={detailTab === "messages"} aria-selected={detailTab === "messages"} onClick={() => setDetailTab("messages")} data-tauri-drag-region="false">
-                      Messages
-                      {sessionMessages.length > 0 ? <span className="detail-tab-count">{sessionMessages.length}</span> : null}
-                    </button>
+                    {/* Only while there is a room to have messages in. Out of one, there is
+                        nothing left to read and the tab would offer an empty list for a
+                        conversation that has ended. */}
+                    {selectedSyncRoom.loadedFor === selectedSession.conversationId && selectedSyncRoom.room ? (
+                      <button className="detail-tab" type="button" role="tab" data-active={detailTab === "messages"} aria-selected={detailTab === "messages"} onClick={() => setDetailTab("messages")} data-tauri-drag-region="false">
+                        Messages
+                        {sessionMessages.length > 0 ? <span className="detail-tab-count">{sessionMessages.length}</span> : null}
+                      </button>
+                    ) : null}
                   </div>
-                  {detailTab === "messages" ? (
+                  {detailTab === "messages" && selectedSyncRoom.loadedFor === selectedSession.conversationId && selectedSyncRoom.room ? (
                     sessionMessages.length === 0 ? (
                       <div className="empty-text small">Nothing has been said to this session in a sync room</div>
                     ) : (

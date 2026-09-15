@@ -1,5 +1,29 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## v1.14.0 — Told before you run out, and there when you log in
+
+### Added
+
+- **A banner when a quota is running out.** Once when a provider's remaining quota
+  crosses 20%, again at 10%, and again when it reaches zero — which says *Quota
+  exhausted*, because running out is a different fact from running low rather than a
+  sharper warning. Only the crossing is announced: usage is polled every fifteen minutes,
+  and "currently low" would interrupt four times an hour for one quota that is simply
+  low. Finding quota already spent when the app opens says nothing at all — that is a
+  state, not an event. Switched off under Settings → Notification → Usage, where the
+  groups are now in alphabetical order.
+- **Start when you log in**, under Settings → Display. Read from the system rather than
+  remembered, so removing the login item in System Settings is reflected here rather than
+  contradicted.
+
+### Fixes
+
+- **A plain `agy` was not recognised as the Antigravity CLI.** Process discovery asked
+  for a slash, and `ps` reports a bare invocation as just `agy` — which is how the CLI is
+  normally started. The failure was invisible, because the cloud endpoint answered
+  instead; the local probe exists for when that one cannot, and it could not have taken
+  over.
+
 ## v1.13.0 — Follow the CI line to the run
 
 ### Added

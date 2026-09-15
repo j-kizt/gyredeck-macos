@@ -236,6 +236,11 @@ const main = async () => {
           hookId: randomUUID(),
           hookEventName: eventType,
           source: "hook",
+          // Named on the stop itself, not left for the bridge to infer from earlier
+          // ingest events: a bridge restarted mid-turn hears this stop first, and what
+          // kind of hook sent it decides whether the notify echo that follows is a
+          // duplicate to swallow.
+          sourceKind: "codexCliHook",
           workingDirectory: cwd,
           conversationId,
           toolName: null,

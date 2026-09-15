@@ -37,6 +37,7 @@ import {
 import type { DeletedSessionRegistry, DismissedSessionRegistry, ISessionDetail, ISessionSummary, IWorkspaceSessionGroup } from "./features/session/types";
 import { DEFAULT_BRIDGE_PORT, useGyredeckPresence } from "./features/presence/useGyredeckPresence";
 import { SetupPanel } from "./features/setup/SetupPanel";
+import { hookNeedsAttention, type IHookStatus } from "./features/setup/hookStatus";
 import { useLaunchAtLogin } from "./features/setup/useLaunchAtLogin";
 import { useUpdater } from "./features/updater/useUpdater";
 import { readUsageSettings, writeUsageSettings } from "./features/usage/adapters";
@@ -66,13 +67,6 @@ interface INativeActionState {
 interface ISessionActionState {
   ok: boolean | null;
   message: string | null;
-}
-
-interface IHookStatus {
-  path: string | null;
-  installed: boolean | null;
-  /** Installed, but not the copy this build ships — it needs installing again. */
-  stale: boolean | null;
 }
 
 type MainPanelTab = "sessions" | "usage" | "ports" | "git";
@@ -129,6 +123,7 @@ const App = () => {
   const [syncRepliesBusy, setSyncRepliesBusy] = useState(false);
   const [agyStatus, setAgyStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
   const [codexStatus, setCodexStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
+  const [codexNotifyStatus, setCodexNotifyStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
   const [dismissedSessionIds, setDismissedSessionIds] = useState<DismissedSessionRegistry>(readDismissedSessionIds);
   const [deletedSessionIds, setDeletedSessionIds] = useState<DeletedSessionRegistry>(readDeletedSessionIds);
   const [keepAwakeEnabled, setKeepAwakeEnabled] = useState(readKeepAwakeEnabled);
@@ -276,6 +271,11 @@ const App = () => {
 
   // Not gated on what is on screen, unlike every other poller here: this one exists for
   // the times when nothing is.
+  // Any adapter older than the app that ships it. Settings is where it gets fixed, so
+  // the gear is where it has to be visible from — a warning only reachable by going
+  // looking is one nobody goes looking for.
+  const hooksNeedAttention = [hookStatus, agyStatus, codexStatus, codexNotifyStatus].some(hookNeedsAttention);
+
   const launchAtLogin = useLaunchAtLogin(canUseNativeControls);
   const notifications = useNotifications({ lastLiveEvent, repoStatuses, usages: agentUsages, canUseNativeControls });
 
@@ -884,6 +884,43 @@ const App = () => {
     }
   };
 
+  const loadCodexNotifyStatus = async () => {
+    if (!canUseNativeControls) {
+      clearHookStatus(setCodexNotifyStatus);
+      return;
+    }
+
+    try {
+      const [path, installed, stale] = await invoke<[string, boolean, boolean | null]>("codex_notify_status");
+      setCodexNotifyStatus({ path, installed, stale });
+    } catch {
+      clearHookStatus(setCodexNotifyStatus);
+    }
+  };
+
+  const installCodexNotify = async () => {
+    if (!canUseNativeControls) {
+      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: "Open with pnpm desktop:dev" });
+      return;
+    }
+
+    try {
+      const wasInstalled = codexNotifyStatus.installed === true;
+      const path = await invoke<string>("install_codex_notify");
+      setCodexNotifyStatus({ path, installed: true, stale: false });
+      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: wasInstalled
+          ? `Reinstalled → ${shortenPath(path)} · in effect from the next turn`
+          : `Installed → ${shortenPath(path)} · restart Codex` });
+    } catch (error) {
+      // A refusal here is usually "notify already points somewhere else", which is a
+      // sentence worth reading rather than a generic failure.
+      setNativeAction({
+        bridgeOnline: nativeAction.bridgeOnline,
+        message: error instanceof Error ? error.message : "Codex notify install failed",
+      });
+    }
+  };
+
   const installCodex = async () => {
     if (!canUseNativeControls) {
       setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: "Open with pnpm desktop:dev" });
@@ -933,6 +970,7 @@ const App = () => {
       void loadHookStatus();
       void loadAgyStatus();
       void loadCodexStatus();
+      void loadCodexNotifyStatus();
       void loadSyncReplies();
       void checkBridge();
     }
@@ -946,6 +984,7 @@ const App = () => {
     void loadHookStatus();
     void loadAgyStatus();
     void loadCodexStatus();
+    void loadCodexNotifyStatus();
   }, [canUseNativeControls]);
 
   return (
@@ -998,7 +1037,7 @@ const App = () => {
                       <GitBranch size={13} strokeWidth={2.3} />
                     </button>
                   </div>
-                  <button className="header-tab" type="button" aria-label="Settings" onClick={(event) => { event.stopPropagation(); openSetup(); }} data-tauri-drag-region="false" title="Settings">
+                  <button className="header-tab" type="button" aria-label={hooksNeedAttention ? "Settings · an agent hook needs reinstalling" : "Settings"} data-flag={hooksNeedAttention} onClick={(event) => { event.stopPropagation(); openSetup(); }} data-tauri-drag-region="false" title={hooksNeedAttention ? "Settings · an agent hook needs reinstalling" : "Settings"}>
                     <Settings size={13} strokeWidth={2.3} />
                   </button>
                 </div>
@@ -1045,6 +1084,8 @@ const App = () => {
                   onInstallHook={installHook}
                   onInstallAgy={installAgy}
                   onInstallCodex={installCodex}
+                  codexNotifyStatus={codexNotifyStatus}
+                  onInstallCodexNotify={installCodexNotify}
                   onKeepAwakeChange={updateKeepAwakeEnabled}
                   bridgePort={bridgePort}
                   onApplyBridgePort={applyBridgePort}

@@ -4201,6 +4201,154 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
     Ok(installed_path)
 }
 
+fn codex_notify_install_path() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("gyredeck")
+        .join("gyredeck-codex-notify.mjs"))
+}
+
+fn codex_config_toml_path() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    Ok(PathBuf::from(home).join(".codex").join("config.toml"))
+}
+
+/// The `notify` line Codex needs, as this machine would write it.
+fn codex_notify_command(installed_path: &str) -> toml_edit::Item {
+    let mut array = toml_edit::Array::new();
+    array.push("node");
+    array.push(installed_path);
+    toml_edit::value(array)
+}
+
+/// What `notify` currently holds, from the installer's point of view.
+#[derive(PartialEq, Debug)]
+enum CodexNotify {
+    /// No `notify` key at all.
+    Absent,
+    /// Exactly the two-element command this installer writes.
+    Ours,
+    /// Anything else — another program, a wrapper, extra arguments, or a value that is
+    /// not even an array. All of it is somebody's deliberate configuration.
+    Theirs(String),
+}
+
+/// Read `notify` as one of three things, rather than asking a yes/no question.
+///
+/// Matching our path *anywhere* in the array was the first attempt, and it was wrong in
+/// both directions: a wrapper like `["sh", "-c", "… our-path …"]` counted as ours and
+/// would have been flattened to two elements, losing the wrapper; and a value that was
+/// not an array at all failed the check and so slipped past the guard entirely, straight
+/// to being overwritten.
+fn codex_notify_state(document: &toml_edit::DocumentMut, installed_path: &str) -> CodexNotify {
+    let Some(item) = document.get("notify") else {
+        return CodexNotify::Absent;
+    };
+    let Some(array) = item.as_array() else {
+        return CodexNotify::Theirs(item.to_string().trim().to_string());
+    };
+    let parts: Vec<Option<&str>> = array.iter().map(|value| value.as_str()).collect();
+    if parts.len() == 2 && parts[0] == Some("node") && parts[1] == Some(installed_path) {
+        return CodexNotify::Ours;
+    }
+    let shown: Vec<String> = array
+        .iter()
+        .map(|value| value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string()))
+        .collect();
+    CodexNotify::Theirs(shown.join(" "))
+}
+
+/// Put the notify adapter in place and point Codex at it.
+///
+/// `config.toml` is the user's own file — this one had two hand-written comment lines
+/// explaining an unrelated setting — so it is edited with `toml_edit`, which preserves
+/// everything it does not touch. A plain parse-and-rewrite would silently drop comments
+/// and reorder keys, which is not a thing to do to somebody's configuration for the sake
+/// of adding one line.
+///
+/// `notify` holds a single program rather than a list of them, so an existing value that
+/// is not ours is a refusal rather than something to append to: overwriting it would
+/// disconnect whatever they had wired up, and silently.
+#[tauri::command]
+fn install_codex_notify(app: tauri::AppHandle) -> Result<String, String> {
+    let install_path = codex_notify_install_path()?;
+    let config_path = codex_config_toml_path()?;
+    let installed_path = install_path.to_string_lossy().to_string();
+
+    // Everything that can refuse, before anything that can change. The first version
+    // copied the script and only then read the config, so a refusal still left a file
+    // behind — "I did not do this" while having done half of it.
+    let resource_path = app
+        .path()
+        .resolve(
+            "gyredeck-codex-notify.mjs",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|e| format!("Failed to resolve resource: {e}"))?;
+
+    let mut document = if config_path.exists() {
+        let content = fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read config.toml: {e}"))?;
+        content.parse::<toml_edit::DocumentMut>().map_err(|error| {
+            format!("Refusing to overwrite unparsable ~/.codex/config.toml: {error}")
+        })?
+    } else {
+        toml_edit::DocumentMut::new()
+    };
+
+    let state = codex_notify_state(&document, &installed_path);
+    if let CodexNotify::Theirs(current) = &state {
+        return Err(format!(
+            "~/.codex/config.toml already sets notify to {current}. Codex runs one notify              program, so leaving it alone is the only safe answer — point it at              {installed_path} by hand if you want Gyredeck to have it."
+        ));
+    }
+
+    let Some(parent) = install_path.parent() else {
+        return Err("Failed to resolve config directory".to_string());
+    };
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Failed to create config directory: {error}"))?;
+    fs::copy(&resource_path, &install_path)
+        .map_err(|error| format!("Failed to copy notify script: {error}"))?;
+
+    // Already ours means the line is already right, and rewriting it would only risk
+    // reformatting something the person may have laid out deliberately.
+    if state == CodexNotify::Absent {
+        document["notify"] = codex_notify_command(&installed_path);
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("Failed to create .codex directory: {error}"))?;
+        }
+        fs::write(&config_path, document.to_string())
+            .map_err(|error| format!("Failed to write config.toml: {error}"))?;
+    }
+
+    Ok(installed_path)
+}
+
+#[tauri::command]
+fn codex_notify_status(app: tauri::AppHandle) -> Result<(String, bool, Option<bool>), String> {
+    let install_path = codex_notify_install_path()?;
+    let config_path = codex_config_toml_path()?;
+    let installed_path = install_path.to_string_lossy().to_string();
+
+    let wired = config_path
+        .exists()
+        .then(|| fs::read_to_string(&config_path).ok())
+        .flatten()
+        .and_then(|content| content.parse::<toml_edit::DocumentMut>().ok())
+        .is_some_and(|document| codex_notify_state(&document, &installed_path) == CodexNotify::Ours);
+
+    let installed = install_path.exists() && wired;
+    let stale = if installed {
+        hook_is_stale(&app, "gyredeck-codex-notify.mjs", &install_path)
+    } else {
+        Some(false)
+    };
+    Ok((installed_path, installed, stale))
+}
+
 #[tauri::command]
 fn install_codex_hook(app: tauri::AppHandle) -> Result<String, String> {
     let install_path = codex_hook_install_path()?;
@@ -5421,6 +5569,8 @@ pub fn run() {
             set_keep_awake,
             launch_at_login_enabled,
             set_launch_at_login,
+            install_codex_notify,
+            codex_notify_status,
             set_tray_attention,
             select_display
         ]);
@@ -5920,6 +6070,87 @@ mod display_selection_tests {
             Some(CodexMetricLine::Progress { label, used, .. })
                 if label == "Gemini 5h" && *used == 25.0
         ));
+    }
+}
+
+#[cfg(test)]
+mod codex_notify_config_tests {
+    use super::{codex_notify_command, codex_notify_state, CodexNotify};
+
+    const OURS: &str = "/Users/someone/.config/gyredeck/gyredeck-codex-notify.mjs";
+
+    fn parse(text: &str) -> toml_edit::DocumentMut {
+        text.parse().expect("valid toml")
+    }
+
+    #[test]
+    fn comments_and_order_survive_the_edit() {
+        // config.toml belongs to the person, not to us. The file this was written against
+        // carried two hand-written lines explaining an unrelated setting, and a
+        // parse-and-rewrite would have dropped them for the sake of adding one key.
+        let original = "model = \"gpt-5\"\n\n# Required for lifecycle hooks to run at all.\n[features]\nhooks = true\n";
+        let mut document = parse(original);
+        document["notify"] = codex_notify_command(OURS);
+        let written = document.to_string();
+
+        assert!(written.contains("# Required for lifecycle hooks to run at all."));
+        assert!(written.contains("model = \"gpt-5\""));
+        assert!(written.contains(OURS));
+        assert!(written.find("model =").unwrap() < written.find("[features]").unwrap());
+    }
+
+    #[test]
+    fn our_own_entry_is_recognised_so_reinstalling_is_not_a_refusal() {
+        let mut document = parse("");
+        document["notify"] = codex_notify_command(OURS);
+        assert_eq!(codex_notify_state(&document, OURS), CodexNotify::Ours);
+    }
+
+    #[test]
+    fn no_notify_at_all_is_absent_rather_than_somebody_elses() {
+        assert_eq!(codex_notify_state(&parse("model = \"gpt-5\"\n"), OURS), CodexNotify::Absent);
+    }
+
+    #[test]
+    fn another_program_is_theirs() {
+        let document = parse("notify = [\"node\", \"/opt/their-own-notifier.mjs\"]\n");
+        assert!(matches!(codex_notify_state(&document, OURS), CodexNotify::Theirs(_)));
+    }
+
+    #[test]
+    fn a_wrapper_that_merely_mentions_our_path_is_theirs() {
+        // The first version matched our path anywhere in the array, so this counted as
+        // ours — and the installer would have flattened it to two elements, throwing the
+        // wrapper and its flags away.
+        let document = parse(&format!("notify = [\"sh\", \"-c\", \"node {OURS} --verbose\"]\n"));
+        assert!(matches!(codex_notify_state(&document, OURS), CodexNotify::Theirs(_)));
+    }
+
+    #[test]
+    fn our_path_with_extra_arguments_is_theirs() {
+        let document = parse(&format!("notify = [\"node\", \"{OURS}\", \"--quiet\"]\n"));
+        assert!(matches!(codex_notify_state(&document, OURS), CodexNotify::Theirs(_)));
+    }
+
+    #[test]
+    fn a_notify_that_is_not_an_array_is_theirs_rather_than_invisible() {
+        // Asking `as_array()` first meant a string answered "not ours" by being unreadable,
+        // and the guard that should have refused was skipped entirely.
+        let document = parse("notify = \"/opt/notifier\"\n");
+        assert!(matches!(codex_notify_state(&document, OURS), CodexNotify::Theirs(_)));
+
+        let table = parse("[notify]\ncommand = \"x\"\n");
+        assert!(matches!(codex_notify_state(&table, OURS), CodexNotify::Theirs(_)));
+    }
+
+    #[test]
+    fn a_refusal_changes_nothing_in_the_document() {
+        let original = "notify = [\"node\", \"/opt/theirs.mjs\"]\n";
+        let document = parse(original);
+        assert!(matches!(codex_notify_state(&document, OURS), CodexNotify::Theirs(_)));
+        // Reading must not mutate: the installer refuses on this and the file has to be
+        // exactly as it was found.
+        assert_eq!(document.to_string(), original);
     }
 }
 

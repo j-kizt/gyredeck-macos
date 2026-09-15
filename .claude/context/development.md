@@ -15,7 +15,14 @@ Connect an agent (or use the in-app **Settings → Plugins → Claude Code hooks
 pnpm hooks:install            # install the Claude Code hook into ~/.claude/settings.json
 ```
 
-Codex (optional, coarse turn-level presence): copy `adapters/codex/gyredeck-codex-notify.mjs` to `~/.config/gyredeck/` and add to `~/.codex/config.toml`:
+Codex notify (optional, coarse turn-level presence) is installed from Settings →
+Plugins → **Codex notify**, alongside the other adapters. It copies the script and writes
+`notify` into `~/.codex/config.toml` with `toml_edit`, which leaves comments and key order
+untouched.
+
+It refuses rather than overwriting if `notify` already points somewhere else: Codex runs
+one notify program, so replacing it would silently disconnect whatever was there. Wiring
+it by hand still works and is what the installer writes:
 
 ```toml
 notify = ["node", "/Users/<you>/.config/gyredeck/gyredeck-codex-notify.mjs"]

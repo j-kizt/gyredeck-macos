@@ -70,7 +70,14 @@ Tauri v2 shell. Native responsibilities:
 - **Services scan** (`local_services.rs`) — enumerates listening TCP sockets via `lsof`, probes HTTP roots, and exposes a guarded stop/force-kill control for eligible current-user listeners. See `services.md`.
 - **Git Monitor** (`github.rs`) — per-repo latest commit, CI status (GitHub Actions / GitLab pipelines), and open PRs/MRs for **GitHub and GitLab** via their REST APIs, using an own provider-tagged token store (`~/.config/gyredeck/github-accounts.json`, `0600`). Accounts are added via OAuth 2.0 device flow (GitLab tokens carry a refresh token + expiry and auto-refresh) or imported from the optional `gh`/`glab` CLIs. A built-in git credential helper (`gyredeck-desktop git-credential`) serves `git push`/`pull` without those CLIs, per-host (A1: fills only hosts with no existing gh/glab helper); GitLab uses username `oauth2`. An optional "Sync git identity" toggle writes the global `user.name`/`user.email` (+ `gh auth switch`) on account switch; with it off, switching is view-only.
 - **Display / keep-awake** — persisted display selection and a keep-display-awake toggle.
-- **Hook installers** — `install_claude_hook` / `install_agy_hook` copy the adapter and register it, reporting install status back to Settings → Plugins.
+- **Hook installers** — `install_claude_hook`, `install_agy_hook`, `install_codex_hook` and
+  `install_codex_notify` copy the adapter and register it, reporting install status back to
+  Settings → Plugins. Status also reports **stale**: the installed copy is compared byte for
+  byte against the one in the app bundle, so an adapter left behind by an update is named as
+  out of date rather than left to go quiet. A red dot appears on the Settings control and the
+  Plugins tab while any is stale. `install_codex_notify` edits `~/.codex/config.toml` with
+  `toml_edit` to preserve comments and ordering, and refuses if `notify` already points
+  elsewhere — Codex runs only one.
 
 ### Renderer (`apps/desktop/src`)
 

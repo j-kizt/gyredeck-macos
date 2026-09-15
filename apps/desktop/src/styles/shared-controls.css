@@ -26,6 +26,29 @@
   transition: background 120ms ease, color 120ms ease, transform 120ms ease;
 }
 
+/* A dot on the control that leads to the fix, rather than a banner that has to be
+   dismissed. Drawn with ::after so nothing is added to the markup for a state that is
+   usually absent. */
+.header-tab[data-flag="true"],
+.setup-side-tab[data-flag="true"] {
+  position: relative;
+}
+
+.header-tab[data-flag="true"]::after,
+.setup-side-tab[data-flag="true"]::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--danger);
+  /* Ringed in the window's own background so the dot reads as a mark on the control
+     rather than a smudge where the two colours meet. */
+  box-shadow: 0 0 0 1.5px var(--surface);
+}
+
 .header-tab:hover,
 .header-tab[data-active="true"] {
   color: rgba(255, 255, 255, 0.9);

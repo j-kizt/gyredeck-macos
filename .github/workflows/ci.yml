@@ -65,6 +65,11 @@ jobs:
       - name: Hook integration tests
         run: pnpm test:hooks
 
+      # The budgets in scripts/check-performance-budget.mjs went quietly over four merges
+      # running because nothing ran them. A ceiling nobody checks is not a ceiling.
+      - name: Bundle and runtime budgets
+        run: pnpm test:performance
+
   test:
     name: test
     runs-on: macos-latest

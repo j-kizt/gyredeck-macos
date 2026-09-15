@@ -1,5 +1,30 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## v1.15.0 — Codex notify installed from the app, and hooks that admit their age
+
+### Added
+
+- **Settings → Plugins installs Codex notify.** It was the one adapter still wired by
+  hand-editing `~/.codex/config.toml`. The installer edits that file without disturbing
+  its comments or ordering, and refuses — before touching anything — if `notify` already
+  points somewhere else: Codex runs one notify program, and replacing it would silently
+  disconnect whatever was there.
+- **An out-of-date hook says so.** Each installed adapter is compared against the copy
+  this build ships; one left behind by an update shows *Out of date* with a Reinstall
+  button instead of quietly going stale. A red dot on the Settings control and on the
+  Plugins tab points there while any needs the visit. An install whose currency cannot
+  be checked is flagged too — unknown is not the same as fine.
+
+### Fixes
+
+- **One Codex turn no longer arrives twice.** With both the full Codex hooks and Codex
+  notify installed, a finished turn was reported by each under a different identity, so
+  the session list grew a phantom and one ending interrupted twice. The bridge now pairs
+  the two stops, whichever order they arrive in, and keeps the one that knows the real
+  session — while a Codex with no hooks at all still reports through notify, which is
+  what it is for. Naming a runtime on a stop is believed only with the machine token,
+  so nothing unauthenticated can claim to be a hook and silence the real one.
+
 ## v1.14.1 — Messages that end with their room
 
 ### Fixes

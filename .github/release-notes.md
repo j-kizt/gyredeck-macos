@@ -1,5 +1,23 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## v1.14.1 — Messages that end with their room
+
+### Fixes
+
+- **A sync room's replies no longer outlive the room.** They were filed under the session
+  alone, so leaving a room left them there — counted as unread, shown in a tab, for a
+  conversation that had ended — and mixed in with the next room's if one was joined. The
+  Messages tab now appears only while there is a room to have messages in.
+- **Opening a session no longer deletes what it was opened to read.** The check for "is
+  this session in a room" ran before the answer had arrived and read the blank as "no
+  room", clearing the session's messages every time its detail was opened.
+- **One session's room no longer appears on another.** An answer arriving after the
+  selection moved on was applied to whichever session was on screen by then, briefly
+  showing the wrong room code — and offering a Disconnect that would have acted on it.
+- **The bundle size ceiling is enforced in CI**, which it never was. It had been exceeded
+  for four merges without anything saying so, v1.14.0 among them. The limit is now a
+  number chosen with a reason rather than one that happened not to have been crossed.
+
 ## v1.14.0 — Told before you run out, and there when you log in
 
 ### Added

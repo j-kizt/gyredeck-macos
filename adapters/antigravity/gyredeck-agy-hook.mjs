@@ -207,7 +207,11 @@ const post = (endpoint, token, path, payload) =>
       "content-type": "application/json",
       "content-length": Buffer.byteLength(body),
     };
-    if (token && path === "/ingest") {
+    // Every path, not just /ingest. The bridge does not require it on the hook relays
+    // yet and ignores what it does not check, so this changes nothing on its own — which
+    // is the point: it has to be true of every adapter in the wild before the bridge can
+    // start refusing, or enforcing would cut off all three at once.
+    if (token) {
       headers["x-gyredeck-token"] = token;
     }
 

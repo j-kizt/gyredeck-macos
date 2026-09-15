@@ -2199,3 +2199,125 @@ test("a room message reaches the presence stream, but only when it asks somethin
     await rm(home, { recursive: true, force: true });
   }
 });
+
+/**
+ * Every adapter sends the machine token on every POST, not only on `/ingest`.
+ *
+ * The bridge does not require it on the hook relays yet, so nothing observable changes —
+ * which is exactly why this needs a test. It is the half of the change that has to be
+ * true everywhere before the bridge can start refusing, and an adapter that quietly
+ * stopped sending it would only be discovered by the hooks going dead.
+ */
+for (const [label, adapter, args, payload, expectedPaths] of [
+  [
+    "claude",
+    "adapters/claude/gyredeck-claude-hook.mjs",
+    ["--event", "Notification"],
+    { hook_event_name: "Notification", cwd: "/tmp/p", session_id: "c1", message: "hi" },
+    ["/hook/attention"],
+  ],
+  [
+    "claude",
+    "adapters/claude/gyredeck-claude-hook.mjs",
+    ["--event", "Stop"],
+    { hook_event_name: "Stop", cwd: "/tmp/p", session_id: "c1" },
+    ["/hook/stop"],
+  ],
+  [
+    "codex",
+    "adapters/codex/gyredeck-codex-hook.mjs",
+    ["--event", "Stop"],
+    {
+      hook_event_name: "Stop",
+      session_id: "x1",
+      cwd: "/tmp/p",
+      model: "gpt-5",
+      permission_mode: "default",
+      transcript_path: "/tmp/rollout.jsonl",
+    },
+    ["/hook/stop"],
+  ],
+  [
+    "codex",
+    "adapters/codex/gyredeck-codex-hook.mjs",
+    ["--event", "PermissionRequest"],
+    {
+      hook_event_name: "PermissionRequest",
+      session_id: "x1",
+      cwd: "/tmp/p",
+      tool_name: "Bash",
+      tool_use_id: "exec-1",
+      transcript_path: "/tmp/rollout.jsonl",
+    },
+    ["/hook/attention"],
+  ],
+  [
+    // Codex passes this one its event as a single JSON argument, not on stdin.
+    "codex-notify",
+    "adapters/codex/gyredeck-codex-notify.mjs",
+    [JSON.stringify({ type: "agent-turn-complete", "conversation-id": "x1", cwd: "/tmp/p" })],
+    {},
+    ["/hook/stop"],
+  ],
+  [
+    "antigravity",
+    "adapters/antigravity/gyredeck-agy-hook.mjs",
+    ["--event", "Stop"],
+    { hook_event_name: "Stop", conversationId: "a1", workspacePaths: ["/tmp/p"] },
+    ["/hook/stop"],
+  ],
+  [
+    "antigravity",
+    "adapters/antigravity/gyredeck-agy-hook.mjs",
+    // Antigravity has no Notification event; attention comes from an ask_question tool.
+    ["--event", "PreToolUse"],
+    {
+      conversationId: "a1",
+      workspacePaths: ["/tmp/p"],
+      toolCall: {
+        name: "ask_question",
+        args: {
+          questions: [{ question: "Which one?", options: ["A", "B"], is_multi_select: false }],
+          toolAction: "Asking user for next steps",
+          toolSummary: "Ask a question",
+        },
+      },
+    },
+    ["/hook/attention"],
+  ],
+]) {
+  test(`${label} adapter sends the machine token to ${expectedPaths.join(", ")}`, async () => {
+    const home = await mkdtemp(join(tmpdir(), `gyredeck-token-${label}-`));
+    await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+    const port = await freePort();
+    await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+    // Adapters accept a token only in the shape the bridge mints — 64 hex characters —
+    // and treat anything else as absent, so a readable-looking placeholder tests nothing.
+    const machineToken = "a".repeat(64);
+    await writeFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), `${machineToken}\n`);
+
+    // A recorder rather than the bridge: what is being asserted is what left the adapter.
+    const seen = [];
+    const { createServer } = await import("node:http");
+    const recorder = createServer((request, response) => {
+      seen.push({ path: request.url, token: request.headers["x-gyredeck-token"] ?? null });
+      response.writeHead(202, { "content-type": "application/json" });
+      response.end("{}");
+    });
+    await new Promise((resolve) => recorder.listen(port, "127.0.0.1", resolve));
+
+    try {
+      const result = await runAdapter(adapter, args, home, payload);
+      assert.equal(result.code, 0, result.stderr);
+
+      for (const path of expectedPaths) {
+        const request = seen.find((entry) => entry.path === path);
+        assert.ok(request, `${label} posted to ${path} (saw ${JSON.stringify(seen.map((e) => e.path))})`);
+        assert.equal(request.token, machineToken, `${label} sent the token to ${path}`);
+      }
+    } finally {
+      await new Promise((resolve) => recorder.close(resolve));
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+}

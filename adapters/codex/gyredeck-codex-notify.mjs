@@ -34,16 +34,31 @@ const readEndpoint = async () => {
   }
 };
 
-const post = (endpoint, path, payload) =>
+/**
+ * The machine token, in the one shape the bridge mints. Anything else is treated as
+ * absent rather than sent, so a half-written file cannot become a credential.
+ */
+const readIngestToken = async () => {
+  try {
+    const value = (await readFile(join(CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    return /^[a-f0-9]{64}$/i.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+};
+
+const post = (endpoint, token, path, payload) =>
   new Promise((resolve) => {
     const body = JSON.stringify(payload);
+    const headers = { "content-type": "application/json", "content-length": Buffer.byteLength(body) };
+    if (token) headers["x-gyredeck-token"] = token;
     const req = request(
       {
         hostname: endpoint.hostname,
         port: endpoint.port,
         path,
         method: "POST",
-        headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        headers,
         timeout: 750,
       },
       (res) => {
@@ -74,7 +89,7 @@ const main = async () => {
     const endpoint = await readEndpoint();
     const cwd = process.cwd();
 
-    await post(endpoint, "/hook/stop", {
+    await post(endpoint, await readIngestToken(), "/hook/stop", {
       hookId: randomUUID(),
       hookEventName: "Stop",
       source: "codex-notify",

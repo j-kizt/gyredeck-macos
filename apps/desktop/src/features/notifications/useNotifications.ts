@@ -4,6 +4,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { GyredeckEvent } from "@gyredeck/protocol";
 import type { IGithubRepoStatus } from "../github/types";
 import { gitChangesBetween, markOf, type IGitMark } from "./gitChanges";
+import { markOf as quotaMarkOf, quotaAlertsBetween, type QuotaMark } from "./usageAlerts";
+import { USAGE_PROVIDERS } from "../usage/providers";
+import type { IAgentUsageState, UsageProviderId } from "../usage/types";
 
 export type NotificationPermission =
   | "notDetermined"
@@ -20,6 +23,8 @@ export interface INotificationSettings {
   roomMessage: boolean;
   /** A watched repo moved: CI finished, a pull request opened, a commit landed. */
   git: boolean;
+  /** A provider's remaining quota crossed a threshold worth knowing about. */
+  quota: boolean;
 }
 
 export interface INotificationsState extends INotificationSettings {
@@ -32,6 +37,7 @@ export interface INotificationsState extends INotificationSettings {
   setAttention: (enabled: boolean) => void;
   setRoomMessage: (enabled: boolean) => void;
   setGit: (enabled: boolean) => void;
+  setQuota: (enabled: boolean) => void;
 }
 
 const STORAGE_KEY = "gyredeck.notifications";
@@ -39,15 +45,16 @@ const STORAGE_KEY = "gyredeck.notifications";
 const readSettings = (): INotificationSettings => {
   try {
     const stored = window.localStorage.getItem(STORAGE_KEY);
-    if (!stored) return { attention: true, roomMessage: true, git: true };
+    if (!stored) return { attention: true, roomMessage: true, git: true, quota: true };
     const parsed = JSON.parse(stored) as Partial<INotificationSettings>;
     return {
       attention: parsed.attention !== false,
       roomMessage: parsed.roomMessage !== false,
       git: parsed.git !== false,
+      quota: parsed.quota !== false,
     };
   } catch {
-    return { attention: true, roomMessage: true, git: true };
+    return { attention: true, roomMessage: true, git: true, quota: true };
   }
 };
 
@@ -81,11 +88,14 @@ const trim = (text: string | null | undefined, limit = 140): string => {
 export const useNotifications = ({
   lastLiveEvent,
   repoStatuses,
+  usages,
   canUseNativeControls,
 }: {
   lastLiveEvent: GyredeckEvent | null;
   /** Current state of every watched repo, keyed by name. Compared against the last look. */
   repoStatuses: Record<string, IGithubRepoStatus>;
+  /** Current usage for every provider. Polled whether or not its tab is on screen. */
+  usages: Record<UsageProviderId, IAgentUsageState>;
   canUseNativeControls: boolean;
 }): INotificationsState => {
   const [settings, setSettings] = useState<INotificationSettings>(readSettings);
@@ -96,6 +106,7 @@ export const useNotifications = ({
   const settingsRef = useRef(settings);
   const deliveredRef = useRef<string | null>(null);
   const gitMarksRef = useRef<Map<string, IGitMark>>(new Map());
+  const quotaMarksRef = useRef<Map<string, QuotaMark>>(new Map());
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -250,6 +261,49 @@ export const useNotifications = ({
     })();
   }, [canUseNativeControls, repoStatuses]);
 
+  useEffect(() => {
+    if (!canUseNativeControls) return;
+    const marks = quotaMarksRef.current;
+    const alerts = Object.values(usages).flatMap((usage) => {
+      if (!usage?.providerId) return [];
+      // Named from the registry the tabs are drawn from, so a banner and the tab it
+      // refers to cannot end up calling the same provider different things.
+      const label = USAGE_PROVIDERS.find((provider) => provider.id === usage.providerId)?.label ?? usage.providerId;
+      const found = quotaAlertsBetween(marks.get(usage.providerId), usage, label);
+      // Recorded whether or not it was reported, and whether or not the toggle is on: a
+      // mark skipped while switched off would make switching back on announce a backlog
+      // of crossings that happened while nobody had asked to hear about them.
+      if (usage.status === "online" && !usage.stale) marks.set(usage.providerId, quotaMarkOf(usage));
+      return settingsRef.current.quota ? found : [];
+    });
+    if (alerts.length === 0) return;
+
+    void (async () => {
+      try {
+        if (await getCurrentWindow().isVisible()) return;
+      } catch {
+        // Unable to tell — err towards notifying.
+      }
+      for (const alert of alerts) {
+        try {
+          await invoke("deliver_notification", {
+            // One slot per metric *and* per threshold. Crossing 20 and then 10 are
+            // separate things that happened, and sharing a slot let the second erase the
+            // first — watched happening with a test ladder, where 7% was replaced before
+            // it could be read. Real crossings are hours or days apart, so three entries
+            // is a history rather than a pile; crossing the same line twice still
+            // replaces its own banner.
+            identifier: `gyredeck.quota.${alert.providerId}.${alert.metricLabel}.${alert.threshold}`,
+            title: alert.threshold === 0 ? `Quota exhausted · ${alert.providerLabel}` : `${alert.leftPercent}% left · ${alert.providerLabel}`,
+            body: trim([alert.metricLabel, alert.resetLabel].filter(Boolean).join(" · ")) || alert.providerLabel,
+          });
+        } catch (cause) {
+          setError(cause instanceof Error ? cause.message : String(cause));
+        }
+      }
+    })();
+  }, [canUseNativeControls, usages]);
+
   const update = useCallback((patch: Partial<INotificationSettings>) => {
     setSettings((previous) => {
       const next = { ...previous, ...patch };
@@ -267,5 +321,6 @@ export const useNotifications = ({
     setAttention: (enabled: boolean) => update({ attention: enabled }),
     setRoomMessage: (enabled: boolean) => update({ roomMessage: enabled }),
     setGit: (enabled: boolean) => update({ git: enabled }),
+    setQuota: (enabled: boolean) => update({ quota: enabled }),
   };
 };

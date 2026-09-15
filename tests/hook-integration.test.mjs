@@ -2224,6 +2224,35 @@ for (const [label, adapter, args, payload, expectedPaths] of [
     ["/hook/stop"],
   ],
   [
+    "codex",
+    "adapters/codex/gyredeck-codex-hook.mjs",
+    ["--event", "Stop"],
+    {
+      hook_event_name: "Stop",
+      session_id: "x1",
+      cwd: "/tmp/p",
+      model: "gpt-5",
+      permission_mode: "default",
+      transcript_path: "/tmp/rollout.jsonl",
+    },
+    ["/hook/stop"],
+  ],
+  [
+    // Codex passes this one its event as a single JSON argument, not on stdin.
+    "codex-notify",
+    "adapters/codex/gyredeck-codex-notify.mjs",
+    [JSON.stringify({ type: "agent-turn-complete", "conversation-id": "x1", cwd: "/tmp/p" })],
+    {},
+    ["/hook/stop"],
+  ],
+  [
+    "antigravity",
+    "adapters/antigravity/gyredeck-agy-hook.mjs",
+    ["--event", "Stop"],
+    { hook_event_name: "Stop", conversationId: "a1", workspacePaths: ["/tmp/p"] },
+    ["/hook/stop"],
+  ],
+  [
     "antigravity",
     "adapters/antigravity/gyredeck-agy-hook.mjs",
     // Antigravity has no Notification event; attention comes from an ask_question tool.

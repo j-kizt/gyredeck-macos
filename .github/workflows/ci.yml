@@ -65,10 +65,14 @@ jobs:
       - name: Hook integration tests
         run: pnpm test:hooks
 
-      # The budgets in scripts/check-performance-budget.mjs went quietly over four merges
-      # running because nothing ran them. A ceiling nobody checks is not a ceiling.
-      - name: Bundle and runtime budgets
-        run: pnpm test:performance
+      # The bundle ceiling in scripts/check-performance-budget.mjs went quietly over four
+      # merges running because nothing ran it. A ceiling nobody checks is not a ceiling.
+      #
+      # Only the size layer. The other two layers of `pnpm test:performance` start a
+      # local server to measure with, and it does not come up on the runner — that is
+      # worth fixing, but not by leaving the part that does work switched off until it is.
+      - name: Bundle size budget
+        run: pnpm test:budget
 
   test:
     name: test

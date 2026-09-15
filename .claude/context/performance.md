@@ -2,9 +2,13 @@
 
 Gyredeck treats performance claims as local regression evidence, not universal guarantees. Measure on the same machine, with the same deterministic workloads, and compare medians/p95 rather than one run.
 
-`pnpm test:performance` runs in CI on every pull request, in the `check` job. It was not
-wired in until 2026-09-15, and the bundle ceiling it holds had been exceeded for four
-merges by then without anything saying so.
+`pnpm test:budget` — the bundle-size layer alone — runs in CI on every pull request, in
+the `check` job. Nothing ran it until 2026-09-15, and the ceiling had been exceeded for
+four merges by then without anything saying so.
+
+The other two layers stay local. They start a server to measure against and it does not
+come up on the runner; until that is fixed, running the layer that works beats running
+none of them.
 
 `pnpm test:performance` builds the desktop web bundle and then runs three evidence layers:
 

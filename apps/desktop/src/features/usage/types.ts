@@ -58,6 +58,8 @@ export interface IUsageMetric {
   groupModels: string[];
   limitLabel: string | null;
   value: number | null;
+  /** How much is left, always — unlike `value`, which follows the used/left toggle. */
+  leftPercent: number | null;
   statusLevel: "ok" | "warning" | "danger" | "unavailable";
   statusLabel:
     | "Available"

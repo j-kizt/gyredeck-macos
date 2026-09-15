@@ -117,6 +117,10 @@ const normalizeMetric = (
     groupModels: getUsageMetricGroupModels(groupLabel),
     limitLabel,
     value,
+    // Kept rather than discarded: `value` follows the used/left toggle, so anything
+    // downstream asking "how much is left" would otherwise have to recompute it and
+    // could disagree with the meter beside it.
+    leftPercent: left,
     statusLevel: getStatusLevel(left),
     statusLabel: getStatusLabel(left),
     remainingLabel: hasAvailableQuota
@@ -327,6 +331,8 @@ export const createDemoAgentUsage = (
       groupModels: getUsageMetricGroupModels(groupLabel),
       limitLabel: groupLabel ? "Weekly Limit" : null,
       value,
+      // The demo builds its metrics already expressed as what is left.
+      leftPercent: value,
       statusLevel,
       statusLabel: getStatusLabel(value),
       remainingLabel,

@@ -3456,6 +3456,23 @@ fn home_dir() -> Option<PathBuf> {
         .filter(|path| path.is_dir())
 }
 
+/// Whether a `ps` command line is the `agy` CLI.
+///
+/// Matched on the basename of the executable rather than by substring. The previous
+/// rule asked for a slash — `/agy`, or a name ending in it — and so missed a plain
+/// `agy`, which is how the CLI is normally started: the process was running and
+/// answering, and the app looked straight past it. Substring matching also claimed
+/// neighbours like `/usr/bin/agyx`, which this does not.
+fn is_agy_command(lower_command: &str) -> bool {
+    let Some(executable) = lower_command.split_whitespace().next() else {
+        return false;
+    };
+    executable
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == "agy")
+}
+
 fn discover_antigravity_ls_processes() -> Vec<AntigravityLsDiscovery> {
     let output = Command::new("ps")
         .args(["-ax", "-o", "pid=,command="])
@@ -3473,8 +3490,7 @@ fn discover_antigravity_ls_processes() -> Vec<AntigravityLsDiscovery> {
             let lower = command.to_lowercase();
             let is_antigravity_ls = lower.contains("language_server")
                 && (lower.contains("antigravity") || lower.contains("antigravity-ide"));
-            let is_agy_ls =
-                lower.contains("/agy") || lower.starts_with("agy ") || lower.ends_with("/agy");
+            let is_agy_ls = is_agy_command(&lower);
             if !is_antigravity_ls && !is_agy_ls {
                 return None;
             }
@@ -5853,6 +5869,34 @@ mod display_selection_tests {
             Some(CodexMetricLine::Progress { label, used, .. })
                 if label == "Gemini 5h" && *used == 25.0
         ));
+    }
+}
+
+#[cfg(test)]
+mod agy_discovery_tests {
+    use super::is_agy_command;
+
+    #[test]
+    fn a_bare_agy_is_the_cli() {
+        // How the CLI is normally started. The rule it replaced asked for a slash and
+        // missed this, so a running, answering session was looked straight past.
+        assert!(is_agy_command("agy"));
+        assert!(is_agy_command("agy --conversation=9dc7f968"));
+    }
+
+    #[test]
+    fn a_full_path_is_the_cli() {
+        assert!(is_agy_command("/users/jkpiaro/.local/bin/agy"));
+        assert!(is_agy_command("/users/jkpiaro/.local/bin/agy --flag value"));
+    }
+
+    #[test]
+    fn a_neighbour_that_merely_contains_agy_is_not() {
+        // Substring matching claimed all of these.
+        assert!(!is_agy_command("/usr/bin/agyx"));
+        assert!(!is_agy_command("/opt/agy-helper --serve"));
+        assert!(!is_agy_command("legacy --agy"));
+        assert!(!is_agy_command(""));
     }
 }
 

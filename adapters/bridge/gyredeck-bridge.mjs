@@ -499,9 +499,61 @@ function startBridge(config) {
     }
   };
 
-  const emitHookStop = (data = {}) => {
+  // One Codex turn ending can arrive twice: once from the full hooks under the real
+  // session id, and once from notify under `codex:<cwd>`, which it invents because it is
+  // told nothing else. Random hookIds mean shouldEmitHookSignal cannot pair them, so they
+  // are correlated stop-to-stop here: a notify stop waits briefly, and a full-hook stop
+  // for the same directory inside that wait replaces it — whichever order they arrive in,
+  // since Codex promises neither. The wait is the whole cost, and only notify pays it.
+  //
+  // Correlated on stops rather than on the hook having reported anything lately, because
+  // "it sent an event" is not "its stop works" — a hook whose stop path is broken (an old
+  // copy the bridge has started refusing, say) must not silence the notify that still
+  // covers for it. And refused here rather than prevented in Settings: which adapters are
+  // installed can be changed from outside the app entirely, so the only place the
+  // duplicate can be ruled out is where both signals arrive.
+  const NOTIFY_STOP_HOLD_MS = 1_500;
+  const CODEX_STOP_ECHO_MS = 5_000;
+  const codexStopAtByCwd = new Map();
+  const heldNotifyStopByCwd = new Map();
+
+  const emitHookStop = (data = {}, runtimeTrusted = false) => {
     const now = Date.now();
     const scope = tracker.hookScope(data, now);
+    if (data.source === "codex-notify" && scope.cwd) {
+      if (now - (codexStopAtByCwd.get(scope.cwd) ?? 0) <= CODEX_STOP_ECHO_MS) return;
+      // A second notify inside the hold is the same turn again; the held one covers it.
+      if (heldNotifyStopByCwd.has(scope.cwd)) return;
+      const timer = setTimeout(() => {
+        heldNotifyStopByCwd.delete(scope.cwd);
+        finishHookStop(data, scope, Date.now());
+      }, NOTIFY_STOP_HOLD_MS);
+      timer.unref?.();
+      heldNotifyStopByCwd.set(scope.cwd, timer);
+      return;
+    }
+    // A stop can be the first thing the bridge ever hears from a session — a restart
+    // mid-turn loses the ingest events the provider map is normally learned from — so a
+    // stop that names its own runtime is believed, under the same condition /ingest
+    // applies to runtime.sourceKind: only with the machine token. Naming a runtime is
+    // what opens the Codex harvest and dedupe paths, so an unauthenticated caller does
+    // not get to claim one. This is also what lets finishHookStop harvest a Codex turn
+    // the bridge has no history for.
+    if (runtimeTrusted && data.sourceKind === "codexCliHook" && typeof scope.conversationId === "string" && scope.conversationId.length > 0) {
+      providerByConversation.set(scope.conversationId, "codexCliHook");
+    }
+    if (scope.cwd && providerByConversation.get(scope.conversationId) === "codexCliHook") {
+      codexStopAtByCwd.set(scope.cwd, now);
+      const held = heldNotifyStopByCwd.get(scope.cwd);
+      if (held) { clearTimeout(held); heldNotifyStopByCwd.delete(scope.cwd); }
+      for (const [cwd, at] of codexStopAtByCwd) {
+        if (now - at > CODEX_STOP_ECHO_MS) codexStopAtByCwd.delete(cwd);
+      }
+    }
+    finishHookStop(data, scope, now);
+  };
+
+  const finishHookStop = (data, scope, now) => {
     if (!tracker.shouldEmitHookSignal("turn_complete", scope, data, now)) return;
     emitLocal({
       version: PROTOCOL_VERSION, id: randomUUID(), type: "turn_complete",
@@ -1709,7 +1761,7 @@ function startBridge(config) {
 
     if (req.method === "POST" && req.url === "/hook/stop") {
       const body = await readJsonBody(req);
-      emitHookStop(body);
+      emitHookStop(body, matchesIngestToken(config.ingestToken, req.headers["x-gyredeck-token"]));
       res.writeHead(202, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
       res.end(JSON.stringify({ ok: true, type: "turn_complete" }));
       return;

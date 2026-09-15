@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -2321,3 +2321,152 @@ for (const [label, adapter, args, payload, expectedPaths] of [
     }
   });
 }
+
+test("one Codex turn ending is reported once, whichever of hook and notify speaks first", async () => {
+  // Both adapters installed is a state the app permits, so the bridge has to make it
+  // benign: the hook knows the real session id, notify only knows the directory, and a
+  // turn ending fires both with no promised order. Correlated stop-to-stop — a notify
+  // stop is held briefly and a full-hook stop for the same directory replaces it — rather
+  // than on the hook having reported anything lately, because "it sent an event" is not
+  // "its stop works", and a hook whose stop path is broken must not silence the notify
+  // that still covers for it.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-codex-both-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  // Resolved, because a hook reports the directory Codex is in and notify reports
+  // `process.cwd()` — and on macOS the temp path is a symlink, so the two would
+  // otherwise spell the same directory differently and never line up.
+  const hooked = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-hooked-")));
+  // Its own directory, not `hooked` again: the stop echo from the first scenario lasts
+  // longer than the settle between them, so reusing the directory would drop this
+  // scenario's notify for the previous scenario's reason and never exercise the hold.
+  const hooked2 = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-hooked2-")));
+  const lame = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-lame-")));
+  const bare = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-bare-")));
+  const cold = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-cold-")));
+  const forged = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-forged-")));
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const runHook = (event, sessionId, cwd, extra = {}) =>
+    runAdapter("adapters/codex/gyredeck-codex-hook.mjs", ["--event", event], home, {
+      session_id: sessionId, cwd, model: "gpt-5.6-luna", hook_event_name: event, ...extra,
+    });
+
+  /** Codex calls notify with one JSON argument, in whatever directory it is running in. */
+  const runNotify = (workingDirectory) =>
+    new Promise((resolve) => {
+      const child = spawn(
+        process.execPath,
+        [join(repoRoot, "adapters/codex/gyredeck-codex-notify.mjs"), JSON.stringify({
+          type: "agent-turn-complete",
+          "last-assistant-message": "done",
+        })],
+        { cwd: workingDirectory, env: { ...process.env, HOME: home }, stdio: ["ignore", "ignore", "pipe"] },
+      );
+      child.on("close", resolve);
+    });
+
+  // Past the notify hold (1.5s in the bridge), so anything still pending has fired.
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 2_200));
+  const completions = async () => {
+    const snapshot = await (await fetch(`http://127.0.0.1:${port}/snapshot`)).json();
+    return snapshot.recent.filter((event) => event.type === "turn_complete");
+  };
+
+  const hookFirst = "01a06082-8ef6-7900-ae39-44fe2e46aaaa";
+  const notifyFirst = "01a06082-8ef6-7900-ae39-44fe2e46bbbb";
+
+  try {
+    await waitForHealth(port, stderrRef);
+
+    // Hook stop first, notify echo after: the echo is dropped on arrival.
+    await runHook("UserPromptSubmit", hookFirst, hooked);
+    await runHook("Stop", hookFirst, hooked);
+    await runNotify(hooked);
+    await settle();
+    let seen = await completions();
+    assert.equal(seen.length, 1, "hook-then-notify reports once");
+    assert.equal(seen[0].conversationId, hookFirst, "under the session the hook knows, not the directory");
+
+    // Notify first, hook stop inside the hold: the held notify is replaced by the real one.
+    await runNotify(hooked2);
+    await runHook("UserPromptSubmit", notifyFirst, hooked2);
+    await runHook("Stop", notifyFirst, hooked2);
+    await settle();
+    seen = await completions();
+    assert.equal(seen.length, 2, "notify-then-hook still reports once");
+    assert.equal(seen[1].conversationId, notifyFirst);
+
+    // A hook that reports activity but whose stop never arrives must not silence notify —
+    // this is the case that rules out keying on "the hook sent something lately".
+    await runHook("PreToolUse", "01a06082-8ef6-7900-ae39-44fe2e46cccc", lame, {
+      tool_name: "Bash", tool_use_id: "exec-1", tool_input: { command: "ls" },
+    });
+    await runNotify(lame);
+    await settle();
+    seen = await completions();
+    assert.equal(seen.length, 3, "a hook that never stops does not silence notify");
+    assert.equal(seen[2].conversationId, `codex:${lame}`);
+
+    // No hooks at all is the case notify exists for, and without this half the test
+    // would pass just as well against a notify that had stopped working altogether.
+    await runNotify(bare);
+    await settle();
+    seen = await completions();
+    assert.equal(seen.length, 4, "an unhooked directory still reports its turn");
+    assert.equal(seen[3].conversationId, `codex:${bare}`);
+
+    // A stop the bridge has no history for: a restart mid-turn loses the ingest events
+    // the provider map is learned from, so the stop names its own runtime. Without that,
+    // this stop would be emitted but not recorded, and the notify echo would follow it
+    // as a second completion under the directory's invented id.
+    const coldId = "01a06082-8ef6-7900-ae39-44fe2e46dddd";
+    await runHook("Stop", coldId, cold);
+    await runNotify(cold);
+    await settle();
+    seen = await completions();
+    assert.equal(seen.length, 5, "a stop with no prior ingest still swallows its notify echo");
+    assert.equal(seen[4].conversationId, coldId);
+
+    // Naming a runtime is a claim with consequences — it opens the Codex harvest path
+    // and lets a stop swallow the notify behind it — so it is believed only with the
+    // machine token, the same condition /ingest puts on runtime.sourceKind. A caller
+    // without the token can still report a stop (that door closes in PR2), but cannot
+    // make the bridge treat it as the full Codex hook and silence the real fallback.
+    await fetch(`http://127.0.0.1:${port}/hook/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        hookId: randomUUID(),
+        hookEventName: "Stop",
+        source: "hook",
+        sourceKind: "codexCliHook",
+        workingDirectory: forged,
+        conversationId: "01a06082-8ef6-7900-ae39-44fe2e46eeee",
+      }),
+    });
+    await runNotify(forged);
+    await settle();
+    seen = await completions();
+    assert.equal(seen.length, 7, "an unauthenticated stop cannot claim a runtime and silence notify");
+    assert.equal(seen[6].conversationId, `codex:${forged}`);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+    await rm(hooked, { recursive: true, force: true });
+    await rm(hooked2, { recursive: true, force: true });
+    await rm(lame, { recursive: true, force: true });
+    await rm(bare, { recursive: true, force: true });
+    await rm(cold, { recursive: true, force: true });
+    await rm(forged, { recursive: true, force: true });
+  }
+});

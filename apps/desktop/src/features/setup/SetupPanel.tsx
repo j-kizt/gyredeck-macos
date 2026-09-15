@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowRight, Bell, Check, Coffee, Download, Focus, KeyRound, Link2, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Puzzle, RefreshCw, ShieldCheck, Trash2, X } from "lucide-react";
+import { ArrowRight, Bell, Check, Coffee, Download, Focus, KeyRound, Link2, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Power, Puzzle, RefreshCw, ShieldCheck, Trash2, X } from "lucide-react";
 import type { IGyredeckBridgeCapabilities } from "@gyredeck/protocol";
 import type { INotificationsState, NotificationPermission } from "../notifications/useNotifications";
 import { shortenPath } from "../session/activity";
@@ -28,6 +28,7 @@ export interface ISetupPanelProps {
   connectionTitle: string;
   guidance: { title: string; detail: string };
   isConnected: boolean;
+  launchAtLogin: { enabled: boolean; busy: boolean; error: string | null; set: (enabled: boolean) => Promise<void> };
   keepAwakeActive: boolean;
   keepAwakeEnabled: boolean;
   keepAwakeError: string | null;
@@ -266,7 +267,7 @@ const notificationPermissionDetail = (
   }
 };
 
-export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, mailRooms, notifications, onCloseRoom, syncRepliesAllowed, syncRepliesBusy, onSyncRepliesChange, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
+export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, launchAtLogin, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, mailRooms, notifications, onCloseRoom, syncRepliesAllowed, syncRepliesBusy, onSyncRepliesChange, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
   const [activeCategory, setActiveCategory] = useState<SetupCategory>("connection");
   // Provisional and ephemeral deliver too; only these three mean a banner can appear.
   const notificationsAllowed =
@@ -416,6 +417,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
               <div className="setup-section-heading"><span>Display</span><small>Screen and focus behavior</small></div>
               <div className="setup-row"><span className="status-slot"><Coffee className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Keep awake while working</span><span className="setup-detail">{!keepAwakeEnabled ? "Off · display follows macOS idle settings" : !canUseNativeControls ? "Desktop runtime required" : keepAwakeError ? `Unavailable · ${keepAwakeError}` : keepAwakeActive ? "Active · agent working — display won't sleep" : "On · will stay awake only while an agent is working"}</span></span><button className="switch-toggle" type="button" role="switch" aria-checked={keepAwakeEnabled} data-on={keepAwakeEnabled} disabled={!canUseNativeControls} onClick={() => onKeepAwakeChange(!keepAwakeEnabled)} data-tauri-drag-region="false" aria-label={`${keepAwakeEnabled ? "Disable" : "Enable"} keep display awake`}><span className="switch-thumb" /></button></div>
               <div className="setup-row"><span className="status-slot"><Focus className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Terminal</span><span className="setup-detail">Focus jumps to this terminal at the session cwd</span></span><select className="setup-select" value={terminal} onChange={(event) => onTerminalChange(event.target.value as TerminalChoice)} data-tauri-drag-region="false" aria-label="Focus terminal">{TERMINAL_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></div>
+              <div className="setup-row"><span className="status-slot"><Power className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Start when you log in</span><span className="setup-detail">{launchAtLogin.error ?? (canUseNativeControls ? "Opens hidden in the menu bar, not on screen" : "Needs the desktop runtime")}</span></span><button className="switch-toggle" type="button" role="switch" aria-checked={launchAtLogin.enabled} data-on={launchAtLogin.enabled} disabled={!canUseNativeControls || launchAtLogin.busy} onClick={() => void launchAtLogin.set(!launchAtLogin.enabled)} data-tauri-drag-region="false" aria-label="Start Gyredeck when you log in"><span className="switch-thumb" /></button></div>
             </>
           ) : null}
 

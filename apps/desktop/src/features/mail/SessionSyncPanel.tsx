@@ -1,7 +1,7 @@
 import { Check, Copy, KeyRound, Link2, Link2Off } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { ISessionSummary } from "../session/types";
-import { useSyncRoom } from "./useSyncRoom";
+import type { ISyncRoomState } from "./useSyncRoom";
 
 /**
  * Connecting one session to another, and nothing else.
@@ -14,18 +14,18 @@ import { useSyncRoom } from "./useSyncRoom";
  */
 export const SessionSyncPanel = ({
   session,
+  sync,
   canUseNativeControls,
   hookInstalled,
 }: {
   session: ISessionSummary;
+  /** Read by whoever owns the detail view, so the tabs beside this cannot disagree with it. */
+  sync: ISyncRoomState;
   canUseNativeControls: boolean;
   /** Whether this session's own agent has the Gyredeck hook. Null while unknown. */
   hookInstalled: boolean | null;
 }) => {
-  const { room, busy, error, canAct, isFounder, issuePassword, create, join, leave, clearError } = useSyncRoom({
-    conversationId: session.conversationId,
-    canUseNativeControls,
-  });
+  const { room, busy, error, canAct, isFounder, issuePassword, create, join, leave, clearError } = sync;
   const [mode, setMode] = useState<"idle" | "joining">("idle");
   const [code, setCode] = useState("");
   const [copied, setCopied] = useState(false);

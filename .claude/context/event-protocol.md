@@ -36,7 +36,7 @@ Events are newline-delimited JSON in `~/.config/gyredeck/gyredeck.events.ndjson`
 | Antigravity (AGY) hook | `agyHost` | hook payload `modelName` |
 | Codex notify | `codex-notify` (via the `/hook/stop` relay `source` field) | not available |
 
-Forwarded `runtime` identity is trusted only when the `POST /ingest` request carries the machine-local `x-gyredeck-token` (a `0600` file at `~/.config/gyredeck/gyredeck.ingest-token`). Untrusted or older senders stay event-compatible, but their `runtime` field is stripped before storage. Hook-derived signals (`/hook/stop`, `/hook/attention`) reuse a recently correlated scope only when it is unambiguous and inside the bounded active-scope window; an unscoped hook event leaves `runtime` null. Runtime metadata never grants process control and does not expose command arguments.
+Every mutation carries the machine-local `x-gyredeck-token` (a `0600` file at `~/.config/gyredeck/gyredeck.ingest-token`) or is refused with `401`: `POST /ingest`, `/hook/stop` and `/hook/attention` alike. The token used to be advisory on those routes — an untrusted sender's event was still accepted, with its `runtime` field stripped before storage — which left any local process able to write into the presence stream and the audit log. The refusal names the fix, because the way it is met in practice is an adapter left behind by an update. Hook-derived signals (`/hook/stop`, `/hook/attention`) reuse a recently correlated scope only when it is unambiguous and inside the bounded active-scope window; an unscoped hook event leaves `runtime` null. Runtime metadata never grants process control and does not expose command arguments.
 
 The bridge keeps carry-forward scope **per conversation** (falling back to cwd), so scoped fields such as `model` never bleed from one agent/source into another — an Antigravity turn cannot stamp its model onto a Claude conversation.
 
@@ -150,7 +150,7 @@ Two ways to receive, because the participants differ in kind:
 - **Subscribe** — `GET /mail/<room>/events` holds an SSE connection and is pushed to as messages arrive. Suited to anything long-lived: the desktop app, a session watching its counterpart. Each frame carries `id: <seq>`, so a dropped subscriber resumes rather than skipping the gap — `EventSource` replays the last id it saw as `Last-Event-ID` on its own, and a client that is not `EventSource` can pass `?since=<seq>` for the same effect.
 - **Read the backlog** — `GET /mail/<room>?since=<seq>` returns what came after `seq`. A hook process lives for milliseconds and cannot hold a connection, so without a buffer it would miss everything sent while its agent was idle. `since` is the highest `seq` already handled, which makes repeat reads idempotent.
 
-Unlike `/ingest`, which downgrades an untrusted sender's `runtime` to null but still accepts the event, mail **requires** `x-gyredeck-token` and returns `401` without it. Mail is read and acted on by agents, so an untrusted local process must not be able to put words into another agent's input.
+Mail **requires** `x-gyredeck-token` and returns `401` without one, as every mutation now does. What is particular to mail is which credential counts: the door admits anything shaped like one, and each route decides which of the two it will take. Mail is read and acted on by agents, so an untrusted local process must not be able to put words into another agent's input — nor read them, which is the same leak in the other direction.
 
 ## Sync rooms
 
@@ -166,8 +166,20 @@ Two credentials reach `/mail` and they mean different things:
 
 | | proves | opens |
 | --- | --- | --- |
-| the machine's ingest token | this call is local | `GET /mail` (the app's own listing) |
-| a room's password | a person let this session into this room | that room's reads and sends |
+| the machine's ingest token | this call is local | `GET /mail` (the app's own listing), and a session's own mailbox: `GET /mail/inbox`, `GET /mail/wait`, `GET|POST /mail/<session>` |
+| a room's password | a person let this session into this room | that room's reads and sends: `POST /mail/<code>`, `GET /mail/<code>?since=`, `GET /mail/<code>/events` |
+
+A session already in a room may use that room's password for its own mailbox too — it is the credential it was handed, and asking it to hold a second one buys nothing.
+
+`GET /mail` — the whole table, every room and its roster — takes the machine token alone: it is the app's view, not a member's. Issuing a room's password, closing a room, and taking a member out take it too; those three change who may do what, and were authorised on `?as=` alone, which is a name a caller writes rather than something it holds. Creating and joining stay open, because being in a room grants nothing by itself.
+
+### What a mailbox credential does not prove
+
+`GET /mail/inbox`, `GET /mail/wait` and a private mailbox's own stream take the machine token **or** the password of the room that session is in. Both shut out a process holding neither, and `collect=1` is why that matters — it takes the mail rather than reading it, moving the cursor so the session it was addressed to never sees it.
+
+Neither credential is per-session, so neither says *which* session is asking. The machine token is read by every agent on this machine to make any call at all; a room's password is shared by everyone in that room, including a member who has been removed and still remembers it. A peer can therefore still open a peer's mailbox. Closing that needs a per-session credential, which does not exist yet — it is a design change, not a missing check, and it is deliberately not in this pass.
+
+Reading a room takes both halves: its password **and** `?as=` naming a confirmed member. The password alone is not enough, because a session that has been disconnected still remembers it. This was written twice and the copies had drifted — the stream applied it and the backlog read beside it applied nothing, so a whole room could be read by anything that sent the header non-empty. It is one rule now.
 
 Password and token are one thing said two ways: a password to the person copying it out of the panel, a token to the `x-gyredeck-token` header carrying it. The machine's ingest token is deliberately **not** accepted for a room's messages or its stream. Every agent reads that file to make any call at all, so accepting it would let anything speak in, or watch, a conversation it was never let into — and the framing tells an agent that a request from a member is what it is there for.
 

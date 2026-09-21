@@ -93,6 +93,52 @@ export const retainedRegistry = (
 };
 
 /**
+ * A room code rather than a session's own mailbox name.
+ *
+ * Deliberately looser than the alphabet the bridge mints from (which leaves out the
+ * characters that read alike): all this has to do is tell a four-character room code
+ * apart from a conversation id, which is a UUID. Tying it to the exact alphabet would
+ * make a change there silently stop this from recognising rooms at all.
+ */
+const SYNC_CODE = /^sync-[a-z0-9]{4}$/i;
+
+/**
+ * Drop what belongs to rooms that no longer exist.
+ *
+ * `retainedRegistry` above is the same idea for one session, and it only ever runs for
+ * the session whose detail is open — which is not where the unread chip is. A room
+ * closing while its session sat unopened in the list left the chip claiming messages for
+ * a conversation that had ended, and nothing would clear it until somebody happened to
+ * click that session.
+ *
+ * `openRooms` must come from a listing that actually answered: an empty one means every
+ * room ended, and a failed read looks exactly the same from here. Only sync rooms are
+ * judged — a private mailbox is named after its session and is not in the room listing to
+ * be missing from.
+ */
+export const retainOpenRooms = (
+  registry: RoomInboxRegistry,
+  openRooms: ReadonlySet<string>,
+  takenAt: number,
+): RoomInboxRegistry => {
+  const dead = Object.keys(registry).filter((conversationId) => {
+    const held = registry[conversationId];
+    const room = held?.room;
+    if (typeof room !== "string" || !SYNC_CODE.test(room) || openRooms.has(room)) return false;
+    // A listing speaks only for when it was taken. A room made after it is missing from
+    // it because it did not exist yet, not because it ended — and deleting on that reads
+    // a brand-new room's first message as the last word of a room that is over. So the
+    // listing has to be newer than everything it is about to throw away.
+    const newest = held.messages.reduce((latest, message) => Math.max(latest, Date.parse(message.at) || 0), 0);
+    return takenAt > newest;
+  });
+  if (dead.length === 0) return registry;
+  const next = { ...registry };
+  for (const conversationId of dead) delete next[conversationId];
+  return next;
+};
+
+/**
  * What was said to each session in a sync room, and whether it has been looked at.
  *
  * Kept from the event stream rather than from the room poller: that poller only runs
@@ -161,6 +207,15 @@ export const useRoomInbox = ({ lastLiveEvent }: { lastLiveEvent: GyredeckEvent |
     });
   }, []);
 
+  /** Clear every session whose room has ended, not only the one on screen. */
+  const pruneClosedRooms = useCallback((openRooms: ReadonlySet<string>, takenAt: number) => {
+    setRegistry((current) => {
+      const next = retainOpenRooms(current, openRooms, takenAt);
+      if (next !== current) write(next);
+      return next;
+    });
+  }, []);
+
   const forget = useCallback((conversationId: string) => {
     setRegistry((current) => {
       if (!current[conversationId]) return current;
@@ -170,5 +225,5 @@ export const useRoomInbox = ({ lastLiveEvent }: { lastLiveEvent: GyredeckEvent |
     });
   }, []);
 
-  return { inbox: registry, markRead, retain, forget };
+  return { inbox: registry, markRead, retain, pruneClosedRooms, forget };
 };

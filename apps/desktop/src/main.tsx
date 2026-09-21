@@ -240,6 +240,21 @@ const App = () => {
     roomInbox.retain(selectedSessionId, selectedSyncRoom.room);
   }, [roomInbox, selectedSessionId, selectedSyncRoom.loadedFor, selectedSyncRoom.room]);
 
+  // The same rule for every session, not only the one whose detail is open — which is
+  // where the unread chip actually is. A room closing while its session sat unopened in
+  // the list left the chip counting messages for a conversation that had ended.
+  // `loaded` is load-bearing: an empty listing means every room ended, and a failed read
+  // is indistinguishable from it here. `takenAt` is the other half — a listing cannot end
+  // a room that was made after it was taken.
+  //
+  // Depends on the prune function rather than the whole `roomInbox`, which is a fresh
+  // object every render: this must run on poll results, not on unrelated re-renders.
+  const { pruneClosedRooms } = roomInbox;
+  useEffect(() => {
+    if (!mailRooms.loaded) return;
+    pruneClosedRooms(new Set(Object.keys(mailRooms.rooms)), mailRooms.takenAt);
+  }, [mailRooms.loaded, mailRooms.rooms, mailRooms.takenAt, pruneClosedRooms]);
+
   const [detailTab, setDetailTab] = useState<"activity" | "messages">("activity");
   useEffect(() => {
     if (!selectedSyncRoom.room) setDetailTab("activity");
@@ -1064,7 +1079,7 @@ const App = () => {
                   keepAwakeError={keepAwakeError}
                   hookStatus={hookStatus}
                   launchAtLogin={launchAtLogin}
-                  mailRooms={mailRooms}
+                  mailRooms={mailRooms.rooms}
                   notifications={notifications}
                   onCloseRoom={async (room, founder) => {
                     try {
@@ -1210,7 +1225,7 @@ const App = () => {
                                 expanded={expandedSessionGroupKeys.has(groupKey)}
                                 group={group}
                                 groupKey={groupKey}
-                                mailRooms={mailRooms}
+                                mailRooms={mailRooms.rooms}
                                 unread={unreadByConversation}
                                 removeGroupArmed={pendingGroupHistoryRemoval === getGroupRemovalId(groupKey, group)}
                                 onClear={dismissSession}
@@ -1249,7 +1264,7 @@ const App = () => {
                                 expanded={expandedSessionGroupKeys.has(groupKey)}
                                 group={group}
                                 groupKey={groupKey}
-                                mailRooms={mailRooms}
+                                mailRooms={mailRooms.rooms}
                                 unread={unreadByConversation}
                                 removeGroupArmed={pendingGroupHistoryRemoval === getGroupRemovalId(groupKey, group)}
                                 onClear={dismissSession}

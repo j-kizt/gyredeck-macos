@@ -38,7 +38,7 @@ after Join                     connected
 
 Create already puts the session in the room, so there is nothing left to confirm: the
 code appears with the things worth doing to it — copy, disconnect, and for the founder
-alone a key that mints a one-time password to hand to one joining session. **One room per session** — no
+alone a key that reveals the room's password to hand to one joining session — the same string every time, not a one-time one. **One room per session** — no
 switcher, and Disconnect is unambiguous. The count beside another member is what is
 waiting for it, which is how a stalled handover becomes visible.
 
@@ -57,9 +57,16 @@ message:
 *Confirmed* is what makes the middle row safe to state so strongly. Joining is what the
 app can do; being allowed to speak is what a person does, by copying the room's token
 from the founder's key and typing it into the joining session's own terminal. From then
-on the session presents it in the header of every read and send. Without that step any
-local process holding the machine token could issue instructions to everything in the
-room — and the row above tells an agent to act on them.
+on the session presents it in the header of every read and send. It is what lets that
+session *read* the room at all — the machine token is not accepted there, and without
+this step a session put into a room can see nothing said in it.
+
+It does **not** keep a machine-token holder from posting into the room: sending accepts
+either credential, because a founder is confirmed by pressing Create and holds no
+password until somebody reads one out. So a local process with the machine token can
+still put words in front of an agent that was told to act on them. Every agent can read
+that file, so the gap is real; closing it needs a credential the app has and a hook does
+not, which does not exist yet.
 
 The middle row is the reverse of what plain mail says, and has to be: being put in a
 room together *is* the permission, so a request that arrives through one has to be
@@ -113,11 +120,16 @@ GET    /sync/rooms?as=<conversationId>   → room, members   (the panel reads th
 ```
 
 Codes are short and typeable (`sync-4f2a`), not UUIDs, and they are **names rather
-than secrets** — every call already requires the ingest token, so knowing a code
-grants nothing on its own. Keeping it that way avoids inventing key management.
+than secrets**: knowing a code grants nothing on its own. **Reading** a room takes the
+room's own password, handed over by a person, and nothing else. **Sending** takes that
+or the machine token, because a founder is confirmed by pressing Create and holds no
+password until somebody reads one out. Creating and joining are deliberately open —
+being put in a room grants nothing.
 
-Rooms are evicted when the last member leaves, and a member is removed automatically
-on `conversation_close` so dead sessions do not linger.
+Rooms end when the last member leaves, and also when the **founder** leaves: everything
+a room is for afterwards runs through the founder, so what was left behind was a code
+nobody could be let into and nobody could close. A member is removed automatically on
+`conversation_close` so dead sessions do not linger.
 
 ## Adapters
 

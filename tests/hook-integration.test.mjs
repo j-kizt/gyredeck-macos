@@ -2744,3 +2744,143 @@ test("every mutation and every room read needs a credential that verifies", asyn
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("only the app's own pages may reach the bridge from a browser", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-cors-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const recent = async () => (await (await fetch(`${base}/snapshot`)).json()).recent.length;
+    const ingest = (origin) => fetch(`${base}/ingest`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-gyredeck-token": token,
+        ...(origin ? { origin } : {}),
+      },
+      body: JSON.stringify({
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId: randomUUID(), cwd: "/tmp/cors", data: { inputCount: 1 },
+      }),
+    });
+
+    // Every adapter, every hook and the whole native side reach the bridge from a process
+    // and send no Origin at all. They are not what CORS defends against, and refusing them
+    // would take the bridge off the air.
+    const headless = await ingest(null);
+    assert.equal(headless.status, 202, "a caller with no Origin is not a browser and is served");
+    assert.equal(headless.headers.get("access-control-allow-origin"), null, "and needs no CORS headers");
+
+    // The two pages that legitimately exist: the packaged macOS webview, and the dev
+    // server the same renderer runs from.
+    for (const origin of ["tauri://localhost", `http://127.0.0.1:47622`, "http://localhost:47622"]) {
+      const allowed = await fetch(`${base}/health`, { headers: { origin } });
+      assert.equal(allowed.status, 200, `${origin} is allowed`);
+      assert.equal(allowed.headers.get("access-control-allow-origin"), origin, "reflected, not starred");
+      assert.equal(allowed.headers.get("vary"), "origin", "so a cache cannot serve one origin's answer to the other");
+      assert.match(
+        allowed.headers.get("access-control-allow-methods") ?? "",
+        /DELETE/,
+        "DELETE is advertised: two sync-room routes use it",
+      );
+    }
+
+    // The whole point. `*` let any page a person had open reach a server on their own
+    // loopback, which is the one thing a same-origin policy exists to stop.
+    const before = await recent();
+    const foreign = await ingest("https://evil.example");
+    assert.equal(foreign.status, 403, "a page from anywhere else is refused");
+    assert.equal((await foreign.json()).error, "forbidden_origin");
+    assert.equal(
+      await recent(),
+      before,
+      "and refused before the event was taken — a CORS header alone would have let the bridge act and only then had the answer blocked in the browser",
+    );
+
+    // The preflight is where a browser asks whether the real call is worth making. An
+    // allowed origin gets its answer; a stranger is turned away here rather than being
+    // told to come back with the real one.
+    const preflight = await fetch(`${base}/ingest`, {
+      method: "OPTIONS",
+      headers: { origin: "tauri://localhost", "access-control-request-method": "POST" },
+    });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get("access-control-allow-origin"), "tauri://localhost");
+    const refusedPreflight = await fetch(`${base}/ingest`, {
+      method: "OPTIONS",
+      headers: { origin: "https://evil.example", "access-control-request-method": "POST" },
+    });
+    assert.equal(refusedPreflight.status, 403, "the preflight is refused too");
+
+    // The allowed page doing the real thing, not just reading /health: the reflected
+    // header has to survive the route it was asked of.
+    const fromApp = await ingest("tauri://localhost");
+    assert.equal(fromApp.status, 202, "the app's own page may still post");
+    assert.equal(fromApp.headers.get("access-control-allow-origin"), "tauri://localhost");
+
+    // A route that takes no token at all is where a foreign page would get the most for
+    // free, so it is the one worth pinning: the refusal has to come from the origin gate,
+    // which sits in front of every route rather than inside the ones that ask for a
+    // credential.
+    const rooms = async () => (await (await fetch(`${base}/mail`, { headers: { "x-gyredeck-token": token } })).json()).rooms.length;
+    const roomsBefore = await rooms();
+    const forgedRoom = await fetch(`${base}/sync/rooms`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://evil.example" },
+      body: JSON.stringify({ conversationId: "session-from-a-web-page" }),
+    });
+    assert.equal(forgedRoom.status, 403, "an open route is still behind the origin gate");
+    assert.equal(await rooms(), roomsBefore, "and no room was created on the way past");
+
+    // Two edges a page can reach for. `null` is what a sandboxed iframe sends, and is not
+    // any of the origins we allow. The right port on the wrong host, or the right host on
+    // the wrong port, is a different page.
+    const edges = [
+      "null",
+      "http://127.0.0.1:47623",
+      "http://127.0.0.1",
+      "https://127.0.0.1:47622",
+      "tauri://localhost.evil.example",
+      "http://localhost:47623",
+      "http://evil.127.0.0.1:47622",
+      "file://",
+      "http://[::1]:47622",
+      "tauri://localhost:47622",
+    ];
+    for (const origin of edges) {
+      const edge = await fetch(`${base}/health`, { headers: { origin } });
+      assert.equal(edge.status, 403, `${origin} is not one of ours`);
+    }
+
+    // Named in the log, because an allowlist that is ever wrong takes the renderer off the
+    // air and otherwise says nothing anywhere about why.
+    assert.match(stderrRef.value, /refused a browser request from origin "https:\/\/evil\.example"/);
+    // And bounded, so a stranger cannot make the bridge shout by varying the origin. This
+    // only says anything if more distinct origins were refused than the cap allows: eleven
+    // above, against a cap of eight. An assertion of "at most eight" over six origins would
+    // have passed with no cap at all.
+    assert.ok(edges.length + 1 > 8, "the test must out-number the cap or it proves nothing");
+    assert.equal(
+      (stderrRef.value.match(/refused a browser request/g) ?? []).length,
+      8,
+      "exactly the cap, not one line per stranger",
+    );
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

@@ -1252,8 +1252,13 @@ test("a sync room gives each member its own read position", async () => {
     // Two notices are in the room before anyone says anything: one for the join, one
     // for the confirmation that followed it.
     assert.deepEqual(await pendingByMember(), { [first]: 2, [second]: 2 });
+    // Reading a room needs the room's own password and a confirmed member to read as.
+    // The machine token is deliberately not accepted for a room's messages: every agent
+    // can read that file, so it can never carry the person's decision to let one
+    // particular session in.
+    const roomHeaders = { "x-gyredeck-token": created.body.password };
     for (const who of [first, second]) {
-      await fetch(`${base}/mail/${code}?since=0&collect=1&as=${who}`, { headers });
+      await fetch(`${base}/mail/${code}?since=0&collect=1&as=${who}`, { headers: roomHeaders });
     }
 
     // The point of the whole change: two members read at their own pace. Sharing one
@@ -1263,7 +1268,7 @@ test("a sync room gives each member its own read position", async () => {
     await send(first, "second");
     assert.deepEqual(await pendingByMember(), { [first]: 0, [second]: 2 }, "nobody waits for what they wrote");
 
-    await fetch(`${base}/mail/${code}?since=0&collect=1&as=${second}`, { headers });
+    await fetch(`${base}/mail/${code}?since=0&collect=1&as=${second}`, { headers: roomHeaders });
     assert.deepEqual(await pendingByMember(), { [first]: 0, [second]: 0 });
 
     await send(second, "reply");
@@ -1769,7 +1774,17 @@ test("a message says who it is for and what it is for, and the room routes on th
     assert.equal((await say({ text: "REACTION-AFTER", kind: "reaction", to: "everyone" })).status, 202);
 
     // Readable afterwards, all five of them, whatever they woke.
-    const history = await call("GET", `/mail/${code}`);
+    // Reading a room needs the room's own password and a confirmed member to read as.
+    // The machine token is deliberately not accepted for a room's messages: every agent
+    // can read that file, so it can never carry the person's decision to let one
+    // particular session in.
+    const readRoom = async (as) => {
+      const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${as}`, {
+        headers: { "x-gyredeck-token": password },
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const history = await readRoom(founder);
     const texts = history.body.messages.map((message) => message.text);
     for (const text of ["ASK-EVERYONE", "ACK-EVERYONE", "ASK-DIRECT", "ASK-ELSEWHERE", "NO-FIELDS"]) {
       assert.ok(texts.includes(text), `${text} is in the room's history`);
@@ -1971,6 +1986,16 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     await call("POST", `/sync/rooms/${code}/members`, { conversationId: thread });
     // Codex cannot present a password, so the founder reading it out is what lets it in.
     await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+    // Reading a room needs the room's own password and a confirmed member to read as.
+    // The machine token is deliberately not accepted for a room's messages: every agent
+    // can read that file, so it can never carry the person's decision to let one
+    // particular session in.
+    const readRoom = async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${founder}`, {
+        headers: { "x-gyredeck-token": created.body.password },
+      });
+      return (await response.json()).messages;
+    };
 
     const turn = (text) => JSON.stringify({
       type: "event_msg",
@@ -1991,7 +2016,7 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     await endTurn();
     await new Promise((resolve) => setTimeout(resolve, 100));
 
-    let history = (await call("GET", `/mail/${code}`)).body.messages;
+    let history = await readRoom();
     const asked = history.find((message) => message.from === thread);
     assert.ok(asked, "a finished Codex turn reaches the room whoever prompted it");
     assert.equal(asked.text, "What did Card B use for the retry window?");
@@ -2003,7 +2028,7 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     await appendFile(rollout, turn("@everyone ack\nรับทราบครับ"));
     await endTurn();
     await new Promise((resolve) => setTimeout(resolve, 100));
-    history = (await call("GET", `/mail/${code}`)).body.messages;
+    history = await readRoom();
     const acked = history.find((message) => message.text === "รับทราบครับ");
     assert.ok(acked, "an acknowledgement is still published");
     assert.equal(acked.kind, "reaction", "@everyone ack is read as a reaction");
@@ -2018,7 +2043,7 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     assert.ok(joined, "a session is told which room it is in");
     assert.equal(joined.kind, "tell", "being put in a room is addressed to you, not room state");
     assert.equal(joined.to, thread);
-    const roomHistory = (await call("GET", `/mail/${code}`)).body.messages || [];
+    const roomHistory = await readRoom();
     const roster = roomHistory.find((message) => /joined this room/.test(message.text));
     assert.ok(roster, "the room announces who is in it");
     assert.equal(roster.kind, "notice", "a roster is state and interrupts nobody");
@@ -2038,7 +2063,7 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     await appendFile(rollout, turn("@Claude Code reaction — รับทราบแล้วครับ"));
     await endTurn();
     await new Promise((resolve) => setTimeout(resolve, 100));
-    history = (await call("GET", `/mail/${code}`)).body.messages;
+    history = await readRoom();
     const inline = history.find((message) => message.text === "รับทราบแล้วครับ");
     assert.ok(inline, "the routing line is taken off, leaving the message");
     assert.equal(inline.kind, "reaction");
@@ -2048,7 +2073,7 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     await appendFile(rollout, turn("no routing line here"));
     await endTurn();
     await new Promise((resolve) => setTimeout(resolve, 100));
-    history = (await call("GET", `/mail/${code}`)).body.messages;
+    history = await readRoom();
     const bare = history.find((message) => message.text === "no routing line here");
     assert.ok(bare, "an unlabelled Codex turn is published rather than dropped");
     assert.equal(bare.kind, "tell");
@@ -2436,12 +2461,12 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
     assert.equal(seen.length, 5, "a stop with no prior ingest still swallows its notify echo");
     assert.equal(seen[4].conversationId, coldId);
 
-    // Naming a runtime is a claim with consequences — it opens the Codex harvest path
-    // and lets a stop swallow the notify behind it — so it is believed only with the
-    // machine token, the same condition /ingest puts on runtime.sourceKind. A caller
-    // without the token can still report a stop (that door closes in PR2), but cannot
-    // make the bridge treat it as the full Codex hook and silence the real fallback.
-    await fetch(`http://127.0.0.1:${port}/hook/stop`, {
+    // A stop is a mutation like any other and the door is shut: without the machine
+    // token the call is refused outright, so it cannot report a turn at all — and in
+    // particular cannot name a runtime, which is what opens the Codex harvest path and
+    // lets a stop swallow the notify behind it. The refusal says how to fix it, because
+    // the way this is met in practice is a hook left behind by an update.
+    const forgedStop = await fetch(`http://127.0.0.1:${port}/hook/stop`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -2453,11 +2478,15 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
         conversationId: "01a06082-8ef6-7900-ae39-44fe2e46eeee",
       }),
     });
+    assert.equal(forgedStop.status, 401, "a stop without the machine token is refused");
+    const forgedBody = await forgedStop.json();
+    assert.equal(forgedBody.error, "unauthorized");
+    assert.match(forgedBody.message, /reinstall it from Settings/);
     await runNotify(forged);
     await settle();
     seen = await completions();
-    assert.equal(seen.length, 7, "an unauthenticated stop cannot claim a runtime and silence notify");
-    assert.equal(seen[6].conversationId, `codex:${forged}`);
+    assert.equal(seen.length, 6, "the refused stop reported nothing, and notify still covers the turn");
+    assert.equal(seen[5].conversationId, `codex:${forged}`);
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
@@ -2468,5 +2497,250 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
     await rm(bare, { recursive: true, force: true });
     await rm(cold, { recursive: true, force: true });
     await rm(forged, { recursive: true, force: true });
+  }
+});
+
+// A room's password is shared by everyone in that room, so it says which room is asking
+// and never which session. Until a per-session credential exists, a peer can still open a
+// peer's mailbox — see event-protocol.md, "What a mailbox credential does not prove".
+// Left as a todo rather than a passing assertion on purpose: writing down what the hole
+// currently does would make it the contract and stand in the way of closing it.
+test("a room credential cannot collect another member's private mailbox", {
+  todo: "needs a per-session credential; agreed with the user to be its own PR after PR2",
+}, () => {});
+
+test("every mutation and every room read needs a credential that verifies", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-auth-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const founder = "session-founder";
+  const peer = "session-peer";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(base + path, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const snapshotCount = async () => (await (await fetch(`${base}/snapshot`)).json()).recent.length;
+
+    // ── Hook mutations ──
+    // Well-formed but wrong is the case that matters: a shape check would pass it, and
+    // the point of this door is that it verifies rather than notices.
+    const WRONG = "b".repeat(64);
+    const bodies = {
+      "/ingest": {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId: "01a06082-8ef6-7900-ae39-44fe2e46ffff", cwd: "/tmp/forged",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" },
+        data: { inputCount: 1 },
+      },
+      "/hook/stop": {
+        hookId: randomUUID(), hookEventName: "Stop", source: "hook",
+        workingDirectory: "/tmp/forged", conversationId: "01a06082-8ef6-7900-ae39-44fe2e460001",
+      },
+      "/hook/attention": {
+        hookId: randomUUID(), hookEventName: "Notification", source: "hook",
+        workingDirectory: "/tmp/forged", conversationId: "01a06082-8ef6-7900-ae39-44fe2e460002",
+        message: "needs you",
+      },
+    };
+    const before = await snapshotCount();
+    for (const [path, body] of Object.entries(bodies)) {
+      for (const [label, sent] of [["no token", {}], ["a wrong token", { "x-gyredeck-token": WRONG }]]) {
+        const response = await fetch(base + path, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...sent },
+          body: JSON.stringify(body),
+        });
+        assert.equal(response.status, 401, `${path} with ${label} is refused`);
+        const refused = await response.json();
+        assert.equal(refused.error, "unauthorized");
+        assert.match(refused.message, /reinstall it from Settings/, `${path} says how to fix it`);
+      }
+    }
+    assert.equal(await snapshotCount(), before, "nothing a refused mutation carried reached the stream");
+    assert.equal((await call("POST", "/ingest", bodies["/ingest"])).status, 202, "the token still opens it");
+
+    // ── A room people were put into ──
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    const password = created.body.password;
+    assert.equal((await joinConfirmed(call, code, founder, peer)).status, 200);
+    assert.equal((await call("POST", `/mail/${code}`, { from: peer, text: "IN-THE-ROOM" })).status, 202);
+
+    const readRoom = async (credential, as) => {
+      const query = as ? `?since=0&as=${as}` : "?since=0";
+      const response = await fetch(`${base}/mail/${code}${query}`, {
+        headers: credential ? { "x-gyredeck-token": credential } : {},
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    // The door used to admit any string at all, which is what made every check behind
+    // it decorative.
+    assert.equal((await readRoom("x", founder)).status, 401, "junk is not a credential");
+    assert.equal((await readRoom(null, founder)).status, 401, "nor is nothing");
+    // Shaped like a credential and not one: the door passes it on shape alone, and the
+    // room refuses it on the only thing that decides — whether it is this room's
+    // password. Shape is a filter, never the check.
+    const wrongShape = await readRoom(WRONG, founder);
+    assert.equal(wrongShape.status, 403, "a wrong token of the right shape opens nothing");
+    assert.equal(wrongShape.body.error, "not_confirmed");
+
+    // The machine's token proves the call is local and nothing more. Every agent can
+    // read that file, so it can never carry the person's decision to let one session in.
+    const asMachine = await readRoom(token, founder);
+    assert.equal(asMachine.status, 403, "the machine's token does not open a room's messages");
+    assert.equal(asMachine.body.error, "not_confirmed");
+
+    // The password alone is not enough either: a session that was disconnected still
+    // remembers it, which is the same rule the stream beside this one applies.
+    const unnamed = await readRoom(password, null);
+    assert.equal(unnamed.status, 403, "a reader still has to say who it is");
+    assert.equal(unnamed.body.error, "not_a_member");
+    const stranger = await readRoom(password, "session-nobody");
+    assert.equal(stranger.status, 403, "and be in the room");
+    assert.equal(stranger.body.error, "not_a_member");
+
+    const member = await readRoom(password, founder);
+    assert.equal(member.status, 200, "a confirmed member holding the password reads it");
+    assert.ok(member.body.messages.some((message) => message.text === "IN-THE-ROOM"));
+
+    // Speaking in a room is refused before `from` is read, because `from` is a name the
+    // caller writes: a member the room remembers as confirmed must not be speakable for
+    // by something that only sent the header non-empty.
+    const forgedPost = await fetch(`${base}/mail/${code}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": WRONG },
+      body: JSON.stringify({ from: peer, text: "SHOULD-NOT-LAND" }),
+    });
+    assert.equal(forgedPost.status, 403, "a wrong token cannot speak as a confirmed member");
+    assert.equal((await forgedPost.json()).error, "not_confirmed");
+    const after = await readRoom(password, founder);
+    assert.ok(
+      !after.body.messages.some((message) => message.text === "SHOULD-NOT-LAND"),
+      "and nothing it tried to say was written down",
+    );
+
+    // ── A session's own mailbox ──
+    // `as` says which mailbox to open and nothing about who is asking. With collect=1 a
+    // refused reader that was let through would not merely read the mail, it would take
+    // it: the cursor moves and the session it was addressed to never sees it.
+    const drain = async (credential, route = "inbox") => {
+      const response = await fetch(`${base}/mail/${route}?as=${peer}&collect=1&timeout=1`, {
+        headers: credential ? { "x-gyredeck-token": credential } : {},
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    // Read without collecting, which is what the cursor check needs on both sides of the
+    // refusals: the position must be exactly where it was.
+    const peek = async () => {
+      const response = await fetch(`${base}/mail/inbox?as=${peer}`, {
+        headers: { "x-gyredeck-token": token },
+      });
+      return (await response.json()).messages.length;
+    };
+
+    const waiting = await peek();
+    assert.ok(waiting > 0, "the peer has mail waiting for it to begin with");
+    // Both doors into a mailbox, refused the same way — `wait` is the one that blocks
+    // inside a turn, so a refusal there is the one a session would feel.
+    for (const route of ["inbox", "wait"]) {
+      assert.equal((await drain("x", route)).status, 401, `junk cannot open /mail/${route}`);
+      assert.equal((await drain(WRONG, route)).status, 401, `nor can a wrong token of the right shape`);
+    }
+    // A refused collect must not have counted as a read. This is the half that does not
+    // announce itself: the caller is turned away, but if the cursor had moved the mail
+    // would be gone and the session it was for would simply never hear of it.
+    assert.equal(await peek(), waiting, "a refused collect left the cursor where it was");
+
+    const collected = await drain(token);
+    assert.equal(collected.status, 200, "the hook's own credential still opens it");
+    assert.ok(
+      collected.body.messages.some((message) => /you are now in sync room/.test(message.text)),
+      "what the refused readers were reaching for is still there for the session it was sent to",
+    );
+
+    // The room's password is what `howToUseRoom` hands a session for its own wait and
+    // inbox, so it has to keep opening them — the machine token is not the only caller.
+    const byRoomPassword = await fetch(`${base}/mail/inbox?as=${peer}`, {
+      headers: { "x-gyredeck-token": password },
+    });
+    assert.equal(byRoomPassword.status, 200, "a member's own room password opens its own inbox");
+
+    // ── The app's own listing ──
+    // Every room and every roster, which is the app's view rather than a member's. The
+    // door admits a room's password too, so this route has to say which of the two it
+    // takes: passing the shape check is not being the app.
+    const listing = async (credential) =>
+      (await fetch(`${base}/mail`, { headers: { "x-gyredeck-token": credential } })).status;
+    assert.equal(await listing(WRONG), 401, "a wrong token of the right shape sees no rooms");
+    assert.equal(await listing(password), 401, "nor does a room's own password: it is not the app");
+    assert.equal(await listing(token), 200, "the app's token does");
+
+    // ── The three calls that change who may do what ──
+    // Each was authorised on `?as=` alone, which is a name a caller writes rather than
+    // something it holds.
+    for (const [method, path, body] of [
+      ["POST", `/sync/rooms/${code}/passwords`, { conversationId: founder }],
+      ["DELETE", `/sync/rooms/${code}/members/${peer}`, null],
+      ["DELETE", `/sync/rooms/${code}?as=${founder}`, null],
+    ]) {
+      const response = await fetch(base + path, {
+        method,
+        headers: { "content-type": "application/json", "x-gyredeck-token": WRONG },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      assert.equal(response.status, 401, `${method} ${path} is the app's to make`);
+      assert.equal((await response.json()).error, "unauthorized");
+    }
+    // And the room is still whole: a refused call changed nothing.
+    const intact = await call("GET", `/sync/rooms?as=${founder}`);
+    assert.equal(intact.body.room, code, "the room survived the refused calls");
+    assert.equal(intact.body.members.length, 2, "and so did both its members");
+
+    // ── Watching a mailbox ──
+    const watched = await fetch(`${base}/mail/${peer}/events?as=${peer}`, {
+      headers: { "x-gyredeck-token": WRONG },
+    });
+    assert.equal(watched.status, 401, "a wrong token cannot watch somebody's mailbox either");
+    await watched.text();
+
+    // Nor may a refused caller leave anything behind. Resolving a mailbox name is what
+    // creates it, so a check made after resolution would still let an uncredentialed
+    // caller fill the room table with mailboxes nobody will ever read.
+    const invented = "session-never-existed";
+    const refusedWatch = await fetch(`${base}/mail/${invented}/events?as=${invented}`, {
+      headers: { "x-gyredeck-token": WRONG },
+    });
+    assert.equal(refusedWatch.status, 401, "a wrong token cannot open a stream on a new name");
+    await refusedWatch.text();
+    const refusedPost = await fetch(`${base}/mail/${invented}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": WRONG },
+      body: JSON.stringify({ from: peer, text: "SHOULD-NOT-LAND" }),
+    });
+    assert.equal(refusedPost.status, 401, "nor can it post into one");
+    const rooms = (await (await fetch(`${base}/mail`, { headers: { "x-gyredeck-token": token } })).json()).rooms;
+    assert.ok(!rooms.some((room) => room.room === invented), "and neither call brought the name into being");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
   }
 });

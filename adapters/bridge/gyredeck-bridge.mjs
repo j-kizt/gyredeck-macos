@@ -60,6 +60,11 @@ function readOrCreateIngestToken() {
   }
 }
 
+// The two credentials that reach /mail: the machine's token (32 bytes) and a room's
+// password (16). Kept as one expression so the door and the things that mint them cannot
+// drift — `readOrCreateIngestToken` and `newRoomPassword` are the other two ends of it.
+const CREDENTIAL_SHAPE = /^(?:[a-f0-9]{32}|[a-f0-9]{64})$/i;
+
 function matchesIngestToken(expected, value) {
   if (typeof value !== "string") return false;
   const provided = Buffer.from(value);
@@ -517,7 +522,7 @@ function startBridge(config) {
   const codexStopAtByCwd = new Map();
   const heldNotifyStopByCwd = new Map();
 
-  const emitHookStop = (data = {}, runtimeTrusted = false) => {
+  const emitHookStop = (data = {}) => {
     const now = Date.now();
     const scope = tracker.hookScope(data, now);
     if (data.source === "codex-notify" && scope.cwd) {
@@ -534,12 +539,12 @@ function startBridge(config) {
     }
     // A stop can be the first thing the bridge ever hears from a session — a restart
     // mid-turn loses the ingest events the provider map is normally learned from — so a
-    // stop that names its own runtime is believed, under the same condition /ingest
-    // applies to runtime.sourceKind: only with the machine token. Naming a runtime is
-    // what opens the Codex harvest and dedupe paths, so an unauthenticated caller does
-    // not get to claim one. This is also what lets finishHookStop harvest a Codex turn
-    // the bridge has no history for.
-    if (runtimeTrusted && data.sourceKind === "codexCliHook" && typeof scope.conversationId === "string" && scope.conversationId.length > 0) {
+    // stop that names its own runtime is believed. Naming a runtime is what opens the
+    // Codex harvest and dedupe paths; the machine token is what makes the claim
+    // believable, and the route now refuses the call outright without it, so there is no
+    // longer an untrusted stop to guard against here. This is also what lets
+    // finishHookStop harvest a Codex turn the bridge has no history for.
+    if (data.sourceKind === "codexCliHook" && typeof scope.conversationId === "string" && scope.conversationId.length > 0) {
       providerByConversation.set(scope.conversationId, "codexCliHook");
     }
     if (scope.cwd && providerByConversation.get(scope.conversationId) === "codexCliHook") {
@@ -605,6 +610,33 @@ function startBridge(config) {
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET, POST, OPTIONS",
     "access-control-allow-headers": "content-type, accept, x-gyredeck-token",
+  };
+
+  // Said to a person, not to a program: a hook that stops working is noticed by whoever
+  // is at the terminal, and the one thing they need to know is that reinstalling it fixes
+  // this. Adapters have carried the token since v1.15.0; older copies left behind by an
+  // update are exactly what the staleness check already names in Settings.
+  const ROOM_PASSWORD_HINT =
+    "This room needs its own password. Ask the person at this terminal for it, then send it as the x-gyredeck-token header.";
+
+  const TOKEN_HINT =
+    "This call must carry the machine token from ~/.config/gyredeck/gyredeck.ingest-token" +
+    " in the x-gyredeck-token header. If this is an agent hook, reinstall it from" +
+    " Settings → Plugins (or run `pnpm hooks:install`) — older copies do not send it.";
+
+  /**
+   * Refuse a hook mutation that does not carry the machine token, and say so.
+   *
+   * Every mutation shares one gate rather than each route testing for itself, because
+   * the route that forgot was the whole hole: /hook/attention never read the header at
+   * all, and the two beside it read it only to decide how much of the payload to
+   * believe. Returns true when the request has been answered and the caller must stop.
+   */
+  const refuseHookCall = (res, req) => {
+    if (holdsMachineToken(req.headers["x-gyredeck-token"])) return false;
+    res.writeHead(401, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+    res.end(JSON.stringify({ ok: false, error: "unauthorized", message: TOKEN_HINT }));
+    return true;
   };
 
   const readJsonBody = (req) =>
@@ -1323,6 +1355,60 @@ function startBridge(config) {
   const holdsRoomPassword = (room, headerValue) =>
     typeof room.password === "string" && matchesIngestToken(room.password, headerValue);
 
+  /**
+   * Whether a request carries the machine's own token.
+   *
+   * Verified, not noticed. The gate this replaced accepted any string at all, which made
+   * every route behind it look guarded while proving nothing about the caller.
+   */
+  const holdsMachineToken = (headerValue) => matchesIngestToken(config.ingestToken, headerValue);
+
+  /**
+   * Whether a caller holds *a* credential that reaches a mailbox nobody was put into.
+   *
+   * Two callers are legitimate and they hold different things. A hook holds the machine
+   * token, because that file is how it reaches the bridge at all. A session that has been
+   * let into a room holds that room's password, which is what `howToUseRoom` puts in every
+   * call it hands out. Either shuts out a process holding neither — and `collect=1` is
+   * why that matters: it does not merely read the mail, it takes it, moving the cursor so
+   * the session it was addressed to never sees it.
+   *
+   * What this cannot do is say *which* session is asking, so it is not yet the rule the
+   * name `as` implies. Neither credential is per-session: the machine token is read by
+   * every agent on this machine to make any call at all, and a room's password is shared
+   * by everyone in that room, an ex-member who still remembers it included. So a peer can
+   * still open a peer's mailbox. Closing that needs a per-session credential, which does
+   * not exist yet — see `event-protocol.md`, "What a mailbox credential does not prove".
+   */
+  const holdsMailboxCredential = (mailboxName, headerValue) => {
+    if (holdsMachineToken(headerValue)) return true;
+    const sync = syncRoomFor(mailboxName);
+    return sync ? holdsRoomPassword(sync.room, headerValue) : false;
+  };
+
+  /**
+   * Why a room people were put into may not be read: its own password, and still being in
+   * it. The password alone is not enough — a session that has been disconnected still
+   * remembers it.
+   *
+   * One rule, because it was written twice and the two copies had already drifted: the
+   * stream applied it and the backlog read beside it applied nothing, so a whole room
+   * could be read by a caller that only had to send the header non-empty.
+   */
+  const refuseRoomRead = (room, headerValue, as, verb) => {
+    if (room.members.size === 0) return null;
+    if (!holdsRoomPassword(room, headerValue)) {
+      return { error: "not_confirmed", message: ROOM_PASSWORD_HINT };
+    }
+    if (!as || room.members.get(as)?.confirmed !== true) {
+      return {
+        error: "not_a_member",
+        message: `Name yourself with ?as=<conversationId>; only a confirmed member of this room may ${verb} it.`,
+      };
+    }
+    return null;
+  };
+
   const refuseToPublish = (room, from) => {
     if (room.members.size === 0) return null;
     if (from === ROOM_SENDER) return null;
@@ -1745,13 +1831,12 @@ function startBridge(config) {
     }
 
     if (req.method === "POST" && req.url === "/ingest") {
+      if (refuseHookCall(res, req)) return;
       const body = await readJsonBody(req);
       if (body && typeof body === "object" && typeof body.type === "string" && typeof body.id === "string") {
-        const runtimeTrusted = matchesIngestToken(config.ingestToken, req.headers["x-gyredeck-token"]);
-        const payload = runtimeTrusted ? body : { ...body, runtime: null };
-        emitLocal(payload);
+        emitLocal(body);
         res.writeHead(202, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
-        res.end(JSON.stringify({ ok: true, type: body.type, runtimeTrusted }));
+        res.end(JSON.stringify({ ok: true, type: body.type }));
         return;
       }
       res.writeHead(400, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
@@ -1760,14 +1845,16 @@ function startBridge(config) {
     }
 
     if (req.method === "POST" && req.url === "/hook/stop") {
+      if (refuseHookCall(res, req)) return;
       const body = await readJsonBody(req);
-      emitHookStop(body, matchesIngestToken(config.ingestToken, req.headers["x-gyredeck-token"]));
+      emitHookStop(body);
       res.writeHead(202, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
       res.end(JSON.stringify({ ok: true, type: "turn_complete" }));
       return;
     }
 
     if (req.method === "POST" && req.url === "/hook/attention") {
+      if (refuseHookCall(res, req)) return;
       const body = await readJsonBody(req);
       emitHookAttention(body);
       res.writeHead(202, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
@@ -1835,6 +1922,20 @@ function startBridge(config) {
       const url = new URL(req.url, "http://127.0.0.1");
       const segments = url.pathname.split("/").filter(Boolean);
       const code = segments[2];
+
+      // The three that change who may do what are not like create and join: issuing the
+      // password, closing the room, and taking a member out. Each is pressed in the app
+      // and only ever called by it, and each was authorised on `?as=` alone — a session
+      // id, which is a name a caller writes, not something it holds. The machine token
+      // does not prove which session is asking, but it does keep the act inside the app
+      // that has the button, which `?as=` never did.
+      const changesAuthority =
+        (req.method === "POST" && segments.length === 4 && segments[3] === "passwords") ||
+        (req.method === "DELETE" && segments.length >= 3);
+      if (changesAuthority && !holdsMachineToken(req.headers["x-gyredeck-token"])) {
+        sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+        return;
+      }
 
       // GET /sync/rooms?as=<id> — which room this session is in, if any.
       if (req.method === "GET" && segments.length === 2) {
@@ -2149,11 +2250,14 @@ function startBridge(config) {
       // what the app itself holds; it lists rooms and draws the UI. A room's own token
       // is what a session is given by hand, and it is the only thing that says a person
       // let this session into this room. Either opens the door; which one came in
-      // decides what is allowed once inside.
+      // decides what is allowed once inside, and that is decided per route below.
+      // Both are hex of a known length, so the door turns away anything not even shaped
+      // like a credential without having to know which of the two this caller should be
+      // holding. It used to admit any non-empty string, which left every route behind it
+      // looking guarded while proving nothing at all about the caller.
       const headerToken = req.headers["x-gyredeck-token"];
-      const machineToken = matchesIngestToken(config.ingestToken, headerToken);
-      if (!machineToken && typeof headerToken !== "string") {
-        sendJson(401, { ok: false, error: "unauthorized" });
+      if (typeof headerToken !== "string" || !CREDENTIAL_SHAPE.test(headerToken)) {
+        sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
         return;
       }
       sweepMailRooms();
@@ -2162,7 +2266,15 @@ function startBridge(config) {
       const segments = url.pathname.split("/").filter(Boolean);
 
       // GET /mail — which rooms exist, so a peer can find its counterpart.
+      //
+      // The whole table, every room and its roster, which is the app's view and not a
+      // member's. The door above admits a room's password too, so this one route has to
+      // say which of the two it takes: passing the shape check is not being the app.
       if (req.method === "GET" && segments.length === 1) {
+        if (!holdsMachineToken(headerToken)) {
+          sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+          return;
+        }
         sendJson(200, {
           ok: true,
           rooms: [...mailRooms].map(([name, room]) => {
@@ -2210,6 +2322,14 @@ function startBridge(config) {
         const as = url.searchParams.get("as") ?? "";
         if (!MAIL_ROOM_NAME.test(as)) {
           sendJson(400, { ok: false, error: "invalid_session" });
+          return;
+        }
+        // `as` is a claim, not a credential: it says which mailbox to open and nothing
+        // about who is asking. Without this, any local process could name another
+        // session and, with collect=1, empty its mailbox — leaving a session that was
+        // written to and never told.
+        if (!holdsMailboxCredential(as, headerToken)) {
+          sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
           return;
         }
         const collect = url.searchParams.get("collect") === "1";
@@ -2432,6 +2552,31 @@ function startBridge(config) {
           ? asKind(body.kind)
           : MAIL_DEFAULT_KIND;
         const routedTo = typeof body.to === "string" && body.to.length > 0 ? body.to : MAIL_EVERYONE;
+        // Asked before the name is resolved, because resolving a mailbox name creates it:
+        // an uncredentialed caller must otherwise be able to fill the room table with
+        // mailboxes nobody will ever read.
+        //
+        // A room people were put into takes a credential that verifies before `from` is
+        // looked at, because `from` is a name the caller writes. Without this, a member
+        // the room already remembers as confirmed could be spoken for by anything that
+        // sent the header non-empty — the one thing mail must not allow.
+        //
+        // Either credential: the room's own password, or the machine token. Not the
+        // password alone, because the founder is confirmed by pressing Create and has no
+        // password in hand until a person reads one out — that exemption is the design,
+        // not an oversight. The machine token is read by every agent on this machine, so
+        // this does not isolate one local agent from another; that needs a per-session
+        // credential and is written up in event-protocol.md.
+        const standing = SYNC_CODE.test(name) ? mailRooms.get(name) ?? null : null;
+        if (standing && standing.members.size > 0) {
+          if (!holdsMachineToken(headerToken) && !holdsRoomPassword(standing, headerToken)) {
+            sendJson(403, { ok: false, error: "not_confirmed", message: ROOM_PASSWORD_HINT });
+            return;
+          }
+        } else if (!holdsMailboxCredential(name, headerToken)) {
+          sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+          return;
+        }
         // A sync room is never conjured by posting to it. A private mailbox is: it is
         // named after one session and writing to it before that session has read
         // anything is ordinary. A room code is not — it is issued, and a code with no
@@ -2528,6 +2673,21 @@ function startBridge(config) {
       // its mail delivered while the agent had never seen it.
       if (req.method === "GET" && tail === undefined) {
         const room = mailRoomFor(name, false);
+        // The same rule the stream beside this one applies, and for the same reason: this
+        // hands over the room's messages, and `collect=1` takes them — the cursor moves
+        // and the session they were addressed to never sees them. It was the stream alone
+        // that checked, so a backlog read was the way around it.
+        if (room) {
+          const refusal = refuseRoomRead(room, headerToken, url.searchParams.get("as"), "read");
+          if (refusal) {
+            sendJson(403, { ok: false, ...refusal });
+            return;
+          }
+          if (room.members.size === 0 && !holdsMailboxCredential(name, headerToken)) {
+            sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+            return;
+          }
+        }
         const parsed = Number.parseInt(url.searchParams.get("since") ?? "", 10);
         const since = Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
         const messages = room ? room.messages.filter((message) => message.seq > since) : [];
@@ -2558,6 +2718,15 @@ function startBridge(config) {
           res.writeHead(status, { "content-type": "text/event-stream; charset=utf-8", ...corsHeaders });
           res.end(`event: error\ndata: ${JSON.stringify({ ok: false, error, message, fatal: status === 404 })}\n\n`);
         };
+        // Asked before the name is resolved, because resolving a mailbox name creates it:
+        // an uncredentialed caller must otherwise be able to fill the room table with
+        // mailboxes nobody will ever read. A room that has members is not covered here —
+        // its own password is what stands in front of it, further down.
+        const standing = SYNC_CODE.test(name) ? mailRooms.get(name) ?? null : null;
+        if ((standing?.members.size ?? 0) === 0 && !holdsMailboxCredential(name, headerToken)) {
+          refuseStream(401, "unauthorized", TOKEN_HINT);
+          return;
+        }
         const room = SYNC_CODE.test(name) ? mailRooms.get(name) : mailRoomFor(name, true);
         if (!room) {
           if (SYNC_CODE.test(name)) {
@@ -2573,23 +2742,10 @@ function startBridge(config) {
         // disconnected still remembers it, and without this its watch would keep
         // running on a room it was removed from.
         const watcher = url.searchParams.get("as") ?? null;
-        if (room.members.size > 0) {
-          if (!holdsRoomPassword(room, headerToken)) {
-            refuseStream(
-              403,
-              "not_confirmed",
-              "This room needs its own password. Ask the person at this terminal for it, then send it as the x-gyredeck-token header.",
-            );
-            return;
-          }
-          if (!watcher || room.members.get(watcher)?.confirmed !== true) {
-            refuseStream(
-              403,
-              "not_a_member",
-              "Name yourself with ?as=<conversationId>; only a confirmed member of this room may watch it.",
-            );
-            return;
-          }
+        const refusal = refuseRoomRead(room, headerToken, watcher, "watch");
+        if (refusal) {
+          refuseStream(403, refusal.error, refusal.message);
+          return;
         }
         res.writeHead(200, {
           "content-type": "text/event-stream; charset=utf-8",

@@ -2172,25 +2172,29 @@ function startBridge(config) {
           });
           return;
         }
-        const member = room.members.get(conversationId);
-        if (member.confirmed === true) {
-          sendJson(200, {
-            ok: true,
-            ...describeRoom(code, room, conversationId),
-            // The answer to a call the session made itself, and so the one place an
-            // instruction is certain to be read — everything a hook injects lands a turn
-            // later, by which point the session has usually guessed.
-            ...(room.members.get(conversationId)?.confirmed === true
-              ? { howTo: howToUseRoom(code, room.password, conversationId, BRIDGE_HOST, config.port) }
-              : {}),
-          });
-          return;
-        }
+        // The password is checked before anything else about this member, so there is no
+        // longer a case where being already confirmed answers a question about the
+        // password without looking at it. That case used to hand the room's password back
+        // to anyone who could name a confirmed member, and answering `ok:true` to a wrong
+        // one is its own fault: `confirmRoomPassword` in the Claude hook reads `ok` as
+        // "the password I just gave was accepted", so the person at the terminal was told
+        // a wrong password had worked.
         if (!holdsRoomPassword(room, password)) {
           sendJson(403, {
             ok: false,
             error: "bad_password",
             message: "That is not this room's password. It is 32 hex characters, copied from Gyredeck by the person who made the room — a room code is not it, and neither is the machine's ingest token.",
+          });
+          return;
+        }
+        const member = room.members.get(conversationId);
+        if (member.confirmed === true) {
+          // Presenting it again is not an error: a session that restarts and is handed the
+          // password a second time is asking the same question and gets the same answer.
+          sendJson(200, {
+            ok: true,
+            ...describeRoom(code, room, conversationId),
+            howTo: howToUseRoom(code, room.password, conversationId, BRIDGE_HOST, config.port),
           });
           return;
         }
@@ -2206,12 +2210,12 @@ function startBridge(config) {
         sendJson(200, {
           ok: true,
           ...describeRoom(code, room, conversationId),
-          // The answer to a call the session made itself, and so the one place an
-          // instruction is certain to be read — everything a hook injects lands a turn
-          // later, by which point the session has usually guessed.
-          ...(room.members.get(conversationId)?.confirmed === true
-            ? { howTo: howToUseRoom(code, room.password, conversationId, BRIDGE_HOST, config.port) }
-            : {}),
+          // Reached only past the password check above, so this caller has already proved
+          // it holds what it is being handed back. The answer to a call the session made
+          // itself, and so the one place an instruction is certain to be read —
+          // everything a hook injects lands a turn later, by which point the session has
+          // usually guessed.
+          howTo: howToUseRoom(code, room.password, conversationId, BRIDGE_HOST, config.port),
         });
         return;
       }
@@ -2262,16 +2266,14 @@ function startBridge(config) {
           tellJoined(code, room, conversationId, "someone put you in it from the app");
         }
         room.touchedAt = Date.now();
-        sendJson(200, {
-          ok: true,
-          ...describeRoom(code, room, conversationId),
-          // The answer to a call the session made itself, and so the one place an
-          // instruction is certain to be read — everything a hook injects lands a turn
-          // later, by which point the session has usually guessed.
-          ...(room.members.get(conversationId)?.confirmed === true
-            ? { howTo: howToUseRoom(code, room.password, conversationId, BRIDGE_HOST, config.port) }
-            : {}),
-        });
+        // No `howTo`, and so no password. Joining is deliberately open — putting a session
+        // in a room grants it nothing — but the answer used to carry the room's password
+        // whenever the *named* session was already confirmed, without ever asking who was
+        // calling. Anything on this machine could name a member and be handed the one
+        // thing a person is supposed to read out by hand. Nothing on the desktop side
+        // reads `howTo`; the session that needs it gets it from `/confirm`, where it has
+        // just presented the password.
+        sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
         return;
       }
 

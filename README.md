@@ -85,7 +85,7 @@ all: the loud default, because a message nobody hears is the worse mistake.
 ## Privacy
 
 - Everything runs locally on `127.0.0.1`; nothing is uploaded.
-- A sync room's password is held in memory only and dies with the room. It gates reading and speaking in that room — the machine's own token is not accepted there, because every agent can read it and it says nothing about who you let in.
+- A sync room's password is held in memory only and dies with the room. **Reading** that room takes it and nothing else: the machine's own token is not accepted, because every agent can read that file and it says nothing about who you let in. **Speaking** takes the password or the machine token — a founder is confirmed by pressing Create and holds no password until somebody reads one out, so requiring it would silence the session that made the room.
 - The bridge stores tool status and output length, not raw tool output; user-text previews are off by default.
 - Git accounts are stored locally under `~/.config/gyredeck` (OAuth device-flow tokens, or imported from `gh`/`glab`); the optional built-in credential helper serves `git push`/`pull` without needing those CLIs. Switching accounts can optionally sync your global git identity (toggle in **Settings → Git**).
 

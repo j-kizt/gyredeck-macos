@@ -312,6 +312,14 @@ function startBridge(config) {
   const releaseClosedSession = (conversationId) => {
     const found = syncRoomFor(conversationId);
     if (!found) return;
+    // A founder leaving by ending its session is a founder leaving. There are two doors
+    // out of a room — the app's Disconnect and a session simply stopping — and fixing
+    // only the one being looked at is how the room outlived its founder in the first
+    // place.
+    if (found.room.createdBy === conversationId) {
+      closeRoom(found.name, found.room, "the session that created it ended, and a room does not outlive its founder");
+      return;
+    }
     const label = labelIn(found.room, conversationId);
     retireLabel(found.room, conversationId);
     found.room.touchedAt = Date.now();
@@ -1138,6 +1146,35 @@ function startBridge(config) {
    * than left to fail quietly on the next message: a watch that outlives its membership
    * looks exactly like a quiet room.
    */
+  /**
+   * End a room: tell every member, cut every stream, then drop it — in that order.
+   *
+   * A room deleted first has no members left to tell and no streams left to find. Called
+   * both by the close button and by the founder leaving, because a room without its
+   * founder is not a room anybody can go on using: nobody can be let into it (`/passwords`
+   * answers `not_the_founder` to everyone left) and nobody can close it either, since the
+   * app asks as itself and gets the same refusal. It became a code that could only be
+   * abandoned.
+   */
+  const closeRoom = (name, room, why) => {
+    for (const conversationId of [...room.members.keys()]) {
+      retireLabel(room, conversationId);
+      partWithMember(name, room, conversationId, why);
+    }
+    // Anything still holding the stream that was not a member — nothing should be, but a
+    // socket outliving its membership is exactly the bug this guards.
+    for (const res of [...room.clients]) {
+      try {
+        res.write(`: gyredeck room ${name} closed\n\n`);
+        res.end();
+      } catch {
+        // Already gone.
+      }
+    }
+    room.clients.clear();
+    mailRooms.delete(name);
+  };
+
   const partWithMember = (name, room, conversationId, why) => {
     for (const res of [...room.clients]) {
       if (res.gyredeckWatcher !== conversationId) continue;
@@ -2086,22 +2123,7 @@ function startBridge(config) {
           });
           return;
         }
-        for (const conversationId of [...room.members.keys()]) {
-          retireLabel(room, conversationId);
-          partWithMember(code, room, conversationId, "the room was closed");
-        }
-        // Anything still holding the stream that was not a member — nothing should be,
-        // but a socket outliving its membership is exactly the bug this guards.
-        for (const res of [...room.clients]) {
-          try {
-            res.write(`: gyredeck room ${code} closed\n\n`);
-            res.end();
-          } catch {
-            // Already gone.
-          }
-        }
-        room.clients.clear();
-        mailRooms.delete(code);
+        closeRoom(code, room, "the room was closed");
         sendJson(200, { ok: true, room: code, closed: true });
         return;
       }
@@ -2288,6 +2310,17 @@ function startBridge(config) {
         const room = mailRoomFor(code, false);
         if (!room || !room.members.has(conversationId)) {
           sendJson(404, { ok: false, error: "not_a_member" });
+          return;
+        }
+        // The founder leaving ends the room rather than shrinking it. Everything a room
+        // is for afterwards runs through the founder — letting the next session in, and
+        // closing the room at all — so what was left behind was a code nobody could use
+        // and nobody could get rid of. Everyone in it is told, which is the whole reason
+        // this goes through the same close as the button rather than dropping the room
+        // here.
+        if (room.createdBy === conversationId) {
+          closeRoom(code, room, "the session that created it left, and a room does not outlive its founder");
+          sendJson(200, { ok: true, room: code, closed: true, members: [] });
           return;
         }
         const label = labelIn(room, conversationId);

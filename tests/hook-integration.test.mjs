@@ -2885,6 +2885,116 @@ test("only the app's own pages may reach the bridge from a browser", async () =>
   }
 });
 
+test("a room does not outlive the founder that made it", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-founder-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const founder = "session-founder";
+  const peer = "session-peer";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(base + path, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    assert.equal((await joinConfirmed(call, code, founder, peer)).status, 200);
+
+    // The peer is watching, the way a session in a room is meant to be.
+    const stream = await fetch(`${base}/mail/${code}/events?as=${peer}`, {
+      headers: { "x-gyredeck-token": created.body.password },
+    });
+    assert.equal(stream.status, 200);
+    const reader = stream.body.getReader();
+    const closed = (async () => {
+      try {
+        for (;;) {
+          const { done } = await reader.read();
+          if (done) return true;
+        }
+      } catch {
+        return true;
+      }
+    })();
+
+    // Take the mailbox notices already waiting, so what is checked afterwards is what
+    // the founder's leaving produced and not what joining did.
+    await call("GET", `/mail/inbox?as=${peer}&collect=1`);
+
+    const left = await call("DELETE", `/sync/rooms/${code}/members/${founder}`);
+    assert.equal(left.status, 200);
+    assert.equal(left.body.closed, true, "the founder leaving ends the room, it does not shrink it");
+
+    // Gone for everyone, not merely for the one who left. What was left behind before
+    // was a code nobody could be let into — `/passwords` answers `not_the_founder` to
+    // everyone remaining — and nobody could close either, since the app asks as itself
+    // and gets the same refusal.
+    assert.equal((await call("GET", `/sync/rooms?as=${peer}`)).body.room, null, "the peer is out of it too");
+    assert.equal((await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: peer })).status, 404);
+    assert.equal((await call("DELETE", `/sync/rooms/${code}?as=${peer}`)).status, 404);
+    const listed = await (await fetch(`${base}/mail`, { headers })).json();
+    assert.ok(!listed.rooms.some((room) => room.room === code), "and the room itself is gone");
+
+    // Told, not just dropped: the whole reason this goes through the same close as the
+    // button rather than deleting the room where the member was removed.
+    const inbox = await call("GET", `/mail/inbox?as=${peer}&collect=1`);
+    const parted = inbox.body.messages.find((message) => /no longer in room/.test(message.text));
+    assert.ok(parted, "the peer is told the room ended");
+    assert.match(parted.text, /a room does not outlive its founder/);
+    assert.equal(await closed, true, "and its watch is cut rather than left hanging on a room that is gone");
+
+    // The other door out of a room, and the one the first fix missed: a session simply
+    // ending. `conversation_close` takes the founder out the same way Disconnect does, so
+    // it has to end the room the same way — with a peer still in it, which is the case
+    // that tells the two apart.
+    const third = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code3 = third.body.room;
+    assert.equal((await joinConfirmed(call, code3, founder, peer)).status, 200);
+    await call("GET", `/mail/inbox?as=${peer}&collect=1`);
+    assert.equal((await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "conversation_close", timestamp: new Date().toISOString(),
+      conversationId: founder, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+      data: { reason: "quit" },
+    })).status, 202);
+    assert.equal((await call("GET", `/sync/rooms?as=${peer}`)).body.room, null, "the peer is out of it too");
+    const afterClose = await call("GET", `/mail/inbox?as=${peer}&collect=1`);
+    const toldOfEnd = afterClose.body.messages.find((message) => /no longer in room/.test(message.text));
+    assert.ok(toldOfEnd, "and was told, rather than left holding a code that does nothing");
+    assert.match(toldOfEnd.text, /a room does not outlive its founder/);
+
+    // A member who is not the founder still just leaves.
+    const second = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code2 = second.body.room;
+    assert.equal((await joinConfirmed(call, code2, founder, peer)).status, 200);
+    const peerLeft = await call("DELETE", `/sync/rooms/${code2}/members/${peer}`);
+    assert.equal(peerLeft.status, 200);
+    assert.notEqual(peerLeft.body.closed, true, "an ordinary member leaving is not the room's end");
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, code2, "the founder is still in it");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("a room's password is not handed to whoever asks for it", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-leak-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });

@@ -668,6 +668,63 @@ fn runs_event(command: &str, event: &str) -> bool {
 /// Comparing the strings whole made all three of those look like "not installed", which
 /// is worse than it sounds: the hook goes on working and delivering events, while the
 /// app reports the agent unhooked and hides the sync panel entirely.
+/// Whether a command line runs the file at `installed_path`, and not one whose name merely
+/// contains it.
+///
+/// `contains` alone accepted `…/gyredeck-agy-hook.mjs.bak` and a path that happened to end
+/// with ours, both of which are a different file. The installer writes
+/// `{node} {path} --event {event}` with no quoting, so whitespace or the edge of the string
+/// on each side is exactly the boundary it produces. A registration written by hand in some
+/// other shape is reported as not installed, which is the safe way round: the button then
+/// says Install, and pressing it writes the form the app can vouch for.
+fn runs_installed_path(command: &str, installed_path: &str) -> bool {
+    let bounded = |index: usize| {
+        let before = command[..index].chars().next_back();
+        let after = command[index + installed_path.len()..].chars().next();
+        before.is_none_or(char::is_whitespace) && after.is_none_or(char::is_whitespace)
+    };
+    let mut from = 0;
+    while let Some(at) = command[from..].find(installed_path) {
+        let index = from + at;
+        if bounded(index) {
+            return true;
+        }
+        from = index + installed_path.len();
+    }
+    false
+}
+
+fn commands_installed_hook(entry: &serde_json::Value, event: &str, installed_path: &str) -> bool {
+    entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|command| runs_installed_path(command, installed_path) && runs_event(command, event))
+}
+
+/// Whether an agent's own config will run *this* installation's adapter for `event`.
+///
+/// The file existing says nothing about what the agent calls: a copy left behind by an
+/// older version, registered at its own path, is what the agent still runs, and reporting
+/// that as installed leaves a person with no way to find out they need to reinstall.
+///
+/// Two shapes, because the agents disagree. Claude and Codex nest the commands under a
+/// matcher group (`[{matcher, hooks: [{type, command}]}]`); Antigravity writes some events
+/// as the commands themselves (`[{type, command}]`). Handled in one place rather than one
+/// probe per agent, because the probe Antigravity had instead — "is there a key named
+/// gyredeck" — is exactly the check that cannot tell the two installations apart.
+/// Whether `~/.gemini/config/hooks.json` will run *this* installation's adapter.
+///
+/// A whole file rather than a flag, because the thing that goes wrong is the file
+/// disagreeing with itself: a `gyredeck` namespace left by an older version, whose
+/// commands name that version's path. Asking only whether the namespace exists answers
+/// yes to that, and it is the answer nobody can act on.
+fn agy_registration_present(hooks_json: &serde_json::Value, installed_path: &str) -> bool {
+    hooks_json
+        .get("gyredeck")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|hooks| hook_entry_present(hooks, "Stop", installed_path))
+}
+
 fn hook_entry_present(
     hooks: &serde_json::Map<String, serde_json::Value>,
     event: &str,
@@ -676,24 +733,22 @@ fn hook_entry_present(
     hooks
         .get(event)
         .and_then(serde_json::Value::as_array)
-        .map(|entries| {
-            entries.iter().any(|entry| {
-                entry
-                    .get("hooks")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|inner| {
-                        inner.iter().any(|hook| {
-                            hook.get("command")
-                                .and_then(serde_json::Value::as_str)
-                                .is_some_and(|command| {
-                                    command.contains(installed_path) && runs_event(command, event)
-                                })
-                        })
-                    })
-                    .unwrap_or(false)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| match entry.get("hooks") {
+                // The nested shape: the commands are inside, and an outer `command`
+                // beside them is not one of them.
+                Some(serde_json::Value::Array(inner)) => inner
+                    .iter()
+                    .any(|hook| commands_installed_hook(hook, event, installed_path)),
+                // Declared `hooks` and got something else. Reading the entry as the flat
+                // shape here would let a malformed group hand its outer `command` to the
+                // fallback, which is a registration we cannot vouch for being counted as
+                // one we can.
+                Some(_) => false,
+                // The flat shape Antigravity writes for some events.
+                None => commands_installed_hook(entry, event, installed_path),
             })
         })
-        .unwrap_or(false)
 }
 
 /// Remove any hook entries whose command contains `needle` (e.g. an old brand's
@@ -4497,11 +4552,15 @@ fn agy_hook_status(app: tauri::AppHandle) -> Result<(String, bool, Option<bool>)
     let hooks_json_path = agy_hooks_json_path()?;
     let installed_path = install_path.to_string_lossy().to_string();
 
+    // Not "is there a key named gyredeck": that is true of an install from an older
+    // version too, whose commands point at its own path. Antigravity would keep running
+    // that one while this panel called it installed and the staleness check compared the
+    // copy nothing runs — so the red dot could never appear.
     let mut in_hooks = false;
     if hooks_json_path.exists() {
         if let Ok(content) = fs::read_to_string(&hooks_json_path) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                in_hooks = json.get("gyredeck").is_some();
+                in_hooks = agy_registration_present(&json, &installed_path);
             }
         }
     }
@@ -5834,7 +5893,12 @@ mod display_selection_tests {
 
     #[test]
     fn claude_rate_limit_keeps_the_last_good_timestamp() {
-        let auth = claude_auth("first-access", "first-refresh");
+        // Its own credentials, because the last-good cache is one map for the whole
+        // process and keyed on these. Sharing a key with the scoping test above made the
+        // two race: whichever stored last decided what this one read, and the other
+        // stores `now_iso()`. It passed for as long as the scheduler happened to run
+        // them in the order that hid it.
+        let auth = claude_auth("rate-limited-access", "rate-limited-refresh");
         let snapshot = CodexUsageSnapshot {
             provider_id: "claude".to_string(),
             display_name: "Claude Code".to_string(),
@@ -6232,7 +6296,8 @@ mod agy_discovery_tests {
 
 #[cfg(test)]
 mod hook_registration_tests {
-    use super::{hook_entry_present, runs_event};
+    use super::{agy_registration_present, hook_entry_present, runs_event};
+
 
     const SCRIPT: &str = "/Users/someone/.config/gyredeck/gyredeck-claude-hook.mjs";
 
@@ -6273,5 +6338,107 @@ mod hook_registration_tests {
     fn our_script_registered_for_a_different_event_does_not_count() {
         let hooks = settings(&format!("node {SCRIPT} --event SessionStart"));
         assert!(!hook_entry_present(&hooks, "Stop", SCRIPT));
+    }
+
+    // Antigravity writes some events as the commands themselves rather than under a
+    // matcher group, and its status used to ask only whether a key named `gyredeck`
+    // existed. An install from an older version answers yes to that while Antigravity
+    // goes on running its adapter, at its own path — so the panel said Installed, the
+    // staleness check compared a copy nothing runs, and a person had no way to learn
+    // they needed to reinstall.
+    const AGY_SCRIPT: &str = "/Users/someone/.config/gyredeck/gyredeck-agy-hook.mjs";
+
+    fn agy_hooks_json(command: &str) -> serde_json::Value {
+        serde_json::json!({
+            "gyredeck": {
+                "PreToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": command}]}],
+                "Stop": [{"type": "command", "command": command}]
+            }
+        })
+    }
+
+    #[test]
+    fn a_flat_command_entry_counts_as_registered() {
+        let json = agy_hooks_json(&format!("node {AGY_SCRIPT} --event Stop"));
+        assert!(agy_registration_present(&json, AGY_SCRIPT));
+    }
+
+    #[test]
+    fn an_older_install_at_its_own_path_does_not_count() {
+        let json = agy_hooks_json("node /Users/someone/.gemini/hooks/gyredeck-agy-hook.mjs --event Stop");
+        assert!(
+            !agy_registration_present(&json, AGY_SCRIPT),
+            "the namespace is there, but what Antigravity runs is the other copy",
+        );
+    }
+
+    #[test]
+    fn no_namespace_at_all_is_not_registered() {
+        assert!(!agy_registration_present(&serde_json::json!({}), AGY_SCRIPT));
+    }
+
+    // `contains` said yes to both of these. A backup beside the adapter and a path that
+    // merely ends with ours are different files, and calling either one "installed" is the
+    // same mistake in a smaller place.
+    #[test]
+    fn a_file_whose_name_only_starts_with_ours_is_not_ours() {
+        let hooks = settings(&format!("node {SCRIPT}.bak --event Stop"));
+        assert!(!hook_entry_present(&hooks, "Stop", SCRIPT));
+    }
+
+    #[test]
+    fn a_longer_path_that_ends_with_ours_is_not_ours() {
+        let hooks = settings(&format!("node /Users/someone/backups{SCRIPT} --event Stop"));
+        assert!(!hook_entry_present(&hooks, "Stop", SCRIPT));
+    }
+
+    // The shape Claude and Codex write, kept pinned now that a second shape is accepted
+    // beside it: the fallback must not start answering for entries that have a `hooks`
+    // array of their own.
+    #[test]
+    fn a_nested_entry_whose_inner_hooks_are_someone_elses_does_not_count() {
+        let hooks = settings("node /Users/someone/other-tool/hook.mjs --event Stop");
+        assert!(!hook_entry_present(&hooks, "Stop", SCRIPT));
+    }
+
+    // Each of these carries OUR path in the outer command on purpose. With a foreign path
+    // they would be refused for having the wrong path and prove nothing about the shape —
+    // passing for a reason the test was not written to check.
+    #[test]
+    fn an_entry_declaring_hooks_as_something_else_is_not_registered() {
+        for malformed in [
+            serde_json::json!({"Stop": [{"hooks": "not-an-array", "command": format!("node {SCRIPT} --event Stop")}]}),
+            serde_json::json!({"Stop": [{"hooks": {}, "command": format!("node {SCRIPT} --event Stop")}]}),
+            serde_json::json!({"Stop": [{"hooks": 7, "command": format!("node {SCRIPT} --event Stop")}]}),
+            serde_json::json!({"Stop": [{"hooks": serde_json::Value::Null, "command": format!("node {SCRIPT} --event Stop")}]}),
+        ] {
+            let hooks = malformed.as_object().unwrap().clone();
+            assert!(!hook_entry_present(&hooks, "Stop", SCRIPT), "{malformed}");
+        }
+    }
+
+    // An entry with a real `hooks` array must be read from the inside only: an outer
+    // `command` sitting beside it is not a registration.
+    #[test]
+    fn an_outer_command_beside_a_hooks_array_is_not_read() {
+        let hooks = serde_json::json!({
+            "Stop": [{
+                "hooks": [{"type": "command", "command": "node /Users/someone/other-tool/hook.mjs --event Stop"}],
+                "command": format!("node {SCRIPT} --event Stop")
+            }]
+        });
+        assert!(!hook_entry_present(&hooks.as_object().unwrap().clone(), "Stop", SCRIPT));
+    }
+
+    #[test]
+    fn a_malformed_event_list_is_not_registered() {
+        for malformed in [
+            serde_json::json!({"Stop": "not-an-array"}),
+            serde_json::json!({"Stop": [{"type": "command"}]}),
+            serde_json::json!({"Stop": []}),
+        ] {
+            let hooks = malformed.as_object().unwrap().clone();
+            assert!(!hook_entry_present(&hooks, "Stop", SCRIPT), "{malformed}");
+        }
     }
 }

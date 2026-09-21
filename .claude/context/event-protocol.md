@@ -167,11 +167,15 @@ Two credentials reach `/mail` and they mean different things:
 | | proves | opens |
 | --- | --- | --- |
 | the machine's ingest token | this call is local | `GET /mail` (the app's own listing), and a session's own mailbox: `GET /mail/inbox`, `GET /mail/wait`, `GET|POST /mail/<session>` |
-| a room's password | a person let this session into this room | that room's reads and sends: `POST /mail/<code>`, `GET /mail/<code>?since=`, `GET /mail/<code>/events` |
+| a room's password | a person let this session into this room | that room's **reads**, which take nothing else: `GET /mail/<code>?since=`, `GET /mail/<code>/events`. Also its sends, `POST /mail/<code>` — but see below, sends take the machine token too |
 
 A session already in a room may use that room's password for its own mailbox too — it is the credential it was handed, and asking it to hold a second one buys nothing.
 
 `GET /mail` — the whole table, every room and its roster — takes the machine token alone: it is the app's view, not a member's. Issuing a room's password, closing a room, and taking a member out take it too; those three change who may do what, and were authorised on `?as=` alone, which is a name a caller writes rather than something it holds. Creating and joining stay open, because being in a room grants nothing by itself.
+
+### Which pages may call the bridge at all
+
+Separate from any credential, and checked first. `access-control-allow-origin` was `*`, which let any page a person happened to have open reach a server on their own loopback — the one thing a same-origin policy exists to stop. A request carrying an `Origin` is now answered only for `tauri://localhost` (the packaged macOS webview) or `http://127.0.0.1:47622` / `http://localhost:47622` (the dev server); anything else is refused `403 forbidden_origin` **before the route runs**, because a CORS header alone would let the bridge act and only then have the answer blocked in the browser. The allowed origin is reflected rather than starred, with `vary: origin`. A request with no `Origin` header is a process rather than a page — every adapter, every hook, the whole native side — and is served as it always was.
 
 ### What a mailbox credential does not prove
 
@@ -181,9 +185,13 @@ Neither credential is per-session, so neither says *which* session is asking. Th
 
 Reading a room takes both halves: its password **and** `?as=` naming a confirmed member. The password alone is not enough, because a session that has been disconnected still remembers it. This was written twice and the copies had drifted — the stream applied it and the backlog read beside it applied nothing, so a whole room could be read by anything that sent the header non-empty. It is one rule now.
 
-Password and token are one thing said two ways: a password to the person copying it out of the panel, a token to the `x-gyredeck-token` header carrying it. The machine's ingest token is deliberately **not** accepted for a room's messages or its stream. Every agent reads that file to make any call at all, so accepting it would let anything speak in, or watch, a conversation it was never let into — and the framing tells an agent that a request from a member is what it is there for.
+Password and token are one thing said two ways: a password to the person copying it out of the panel, a token to the `x-gyredeck-token` header carrying it.
 
-`POST /mail/<code>` without the room's password answers `403 not_confirmed` with a message naming what to ask for; a non-member answers `403 not_a_member`. The founder needs no password of its own — pressing Create in that session's detail panel is the same act of intent, made in the same place.
+**Reading a room takes its password and nothing else.** Not the machine's ingest token: every agent reads that file to make any call at all, so accepting it would let anything watch a conversation it was never let into.
+
+**Sending into a room takes its password *or* the machine token**, and the asymmetry is the founder. A founder is confirmed by pressing Create and holds no password until a person reads one out, so requiring the password to speak would silence the one session that made the room. `from` is then checked as before — the credential says the caller may speak here at all, `from` says who is speaking. The cost is that any local process holding the machine token can post as a member it can name, which is the same limit as everything else on this bridge: see [What a mailbox credential does not prove](#what-a-mailbox-credential-does-not-prove). Reads do not pay that cost and so do not take the shortcut.
+
+`POST /mail/<code>` carrying neither the room's password nor the machine token answers `403 not_confirmed` with a message naming what to ask for; a non-member answers `403 not_a_member`. The founder needs no password of its own — pressing Create in that session's detail panel is the same act of intent, made in the same place, and the machine token is what its session actually presents until somebody reads a password out.
 
 A code with no room behind it answers `404 no_such_room`, on the stream and on a send alike. It is never created by being written to — a room is issued, and a code with nothing behind it means the room ended, most often with the bridge that held it. (A private mailbox *is* created on first write: it is named after one session, and writing to it before that session has read anything is ordinary.) Every refusal on `/mail/<code>/events` answers in SSE frames rather than plain JSON, because a watcher reads the body for `data:` lines and a plain error is dropped by its own filter — leaving a failed watch that looks exactly like a quiet room.
 

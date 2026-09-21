@@ -606,10 +606,62 @@ function startBridge(config) {
     });
   };
 
-  const corsHeaders = {
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, POST, OPTIONS",
-    "access-control-allow-headers": "content-type, accept, x-gyredeck-token",
+  /**
+   * The pages allowed to call this bridge from a browser.
+   *
+   * `*` let any page a person had open reach a server on their own loopback — the one
+   * thing a same-origin policy exists to stop. Only two pages ever legitimately do:
+   * the packaged app's webview, and the dev server the same renderer runs from.
+   *
+   * `tauri://localhost` is what Tauri gives a macOS webview whose content is bundled
+   * (`tauri_protocol_url`, tauri 2.11.2 — Windows and Android get `http://tauri.localhost`
+   * instead, and this app is macOS only). The dev port is `vite.config.ts`'s, which sets
+   * `strictPort: true`, so it is this number or the dev server does not come up at all;
+   * both spellings of loopback are listed because the browser sends whichever the URL bar
+   * holds.
+   */
+  const VITE_DEV_PORT = 47622;
+  const ALLOWED_ORIGINS = new Set([
+    "tauri://localhost",
+    `http://127.0.0.1:${VITE_DEV_PORT}`,
+    `http://localhost:${VITE_DEV_PORT}`,
+  ]);
+
+  /**
+   * What a caller with no `Origin` at all is: not a browser.
+   *
+   * Every adapter, every hook and the whole native side reach the bridge over plain
+   * HTTP from a process, and send no Origin. Refusing those would take the bridge off
+   * the air; they are also not the thing CORS defends against, which is a page acting
+   * with a person's browser behind it.
+   */
+  const corsHeadersFor = (req) => {
+    const origin = req.headers.origin;
+    if (typeof origin !== "string" || origin.length === 0) return {};
+    if (!ALLOWED_ORIGINS.has(origin)) return null;
+    return {
+      "access-control-allow-origin": origin,
+      // Reflected rather than fixed, so anything that caches a response cannot serve it
+      // to a page from the other allowed origin.
+      vary: "origin",
+      "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+      "access-control-allow-headers": "content-type, accept, x-gyredeck-token",
+    };
+  };
+
+  /**
+   * Say a refused origin once, and only ever a few of them.
+   *
+   * Silence here is the expensive failure: if the allowlist is ever wrong, the renderer
+   * stops working and looks like a dead bridge with nothing anywhere saying why. One line
+   * naming the origin turns that into a five-second diagnosis. Bounded because the trigger
+   * is a stranger's to pull.
+   */
+  const refusedOrigins = new Set();
+  const noteRefusedOrigin = (origin) => {
+    if (refusedOrigins.has(origin) || refusedOrigins.size >= 8) return;
+    refusedOrigins.add(origin);
+    console.error(`gyredeck: refused a browser request from origin ${JSON.stringify(origin)}`);
   };
 
   // Said to a person, not to a program: a hook that stops working is noticed by whoever
@@ -634,7 +686,7 @@ function startBridge(config) {
    */
   const refuseHookCall = (res, req) => {
     if (holdsMachineToken(req.headers["x-gyredeck-token"])) return false;
-    res.writeHead(401, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+    res.writeHead(401, { "content-type": "application/json; charset=utf-8", ...(corsHeadersFor(req) ?? {}) });
     res.end(JSON.stringify({ ok: false, error: "unauthorized", message: TOKEN_HINT }));
     return true;
   };
@@ -1168,8 +1220,8 @@ function startBridge(config) {
       header: "x-gyredeck-token",
       value: password,
       note:
-        "This room's own password, on every call below. The machine's ingest token is" +
-        " not accepted for a room, and neither is another room's password.",
+        "This room's own password, on every call below. Another room's password will not" +
+        " open this one, and reading this room takes this password and nothing else.",
     },
     identity: {
       as: conversationId,
@@ -1824,6 +1876,22 @@ function startBridge(config) {
   };
 
   const server = createServer(async (req, res) => {
+    // Answered before anything is read or written, preflight included: a page that is not
+    // allowed to be here must not get as far as the route, and a 403 on the preflight is
+    // what tells it so rather than leaving the real call to be made and then blocked in
+    // the browser after the bridge has already acted on it.
+    const corsHeaders = corsHeadersFor(req);
+    if (corsHeaders === null) {
+      res.writeHead(403, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({
+        ok: false,
+        error: "forbidden_origin",
+        message: "This bridge answers the Gyredeck app and its dev server, and nothing else in a browser.",
+      }));
+      noteRefusedOrigin(req.headers.origin);
+      return;
+    }
+
     if (req.method === "OPTIONS") {
       res.writeHead(204, corsHeaders);
       res.end();

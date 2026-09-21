@@ -2884,3 +2884,88 @@ test("only the app's own pages may reach the bridge from a browser", async () =>
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("a room's password is not handed to whoever asks for it", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-leak-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const founder = "session-founder";
+  const peer = "session-peer";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(base + path, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    const password = created.body.password;
+    assert.equal((await joinConfirmed(call, code, founder, peer)).status, 200);
+
+    // Everything a stranger needs is public: `GET /events` carries conversation ids and
+    // needs no credential at all. So the id of a confirmed member is not a secret, and
+    // nothing may be handed over for knowing one.
+    const asStranger = (path, body) => fetch(base + path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    // Joining is idempotent and deliberately open — being put in a room grants nothing.
+    // It used to answer with the room's password whenever the *named* session was already
+    // confirmed, without once asking who was calling.
+    const rejoined = await asStranger(`/sync/rooms/${code}/members`, { conversationId: peer });
+    assert.equal(rejoined.status, 200, "joining is still open");
+    const rejoinedBody = await rejoined.json();
+    assert.equal(rejoinedBody.howTo, undefined, "and hands over nothing");
+    assert.ok(!JSON.stringify(rejoinedBody).includes(password), "the password is not in the answer at all");
+
+    // The same for confirm's already-confirmed answer, which never looked at the password
+    // it was given: presenting the wrong one got the right one back.
+    const guessed = await asStranger(`/sync/rooms/${code}/confirm`, {
+      conversationId: peer,
+      password: "f".repeat(32),
+    });
+    const guessedBody = await guessed.json();
+    // Refused outright, not answered `ok:true` without the instructions. The Claude hook
+    // reads `ok` as "the password I just gave was accepted", so a soft answer here tells
+    // the person at the terminal that a wrong password worked.
+    assert.equal(guessed.status, 403, "a wrong password is refused, whoever it names");
+    assert.equal(guessedBody.ok, false);
+    assert.equal(guessedBody.error, "bad_password");
+    assert.equal(guessedBody.howTo, undefined, "a wrong password earns nothing back");
+    assert.ok(!JSON.stringify(guessedBody).includes(password), "and does not leak it another way");
+
+    // What still works: a session that presents the password gets the instructions, which
+    // is the whole point of them. The Claude and Antigravity hooks tell their agent to
+    // read this answer, so it has to keep carrying the commands.
+    const presented = await asStranger(`/sync/rooms/${code}/confirm`, {
+      conversationId: peer,
+      password,
+    });
+    const presentedBody = await presented.json();
+    assert.ok(presentedBody.howTo, "presenting it is what earns it");
+    assert.equal(presentedBody.howTo.credential.value, password);
+    assert.match(presentedBody.howTo.send.command, new RegExp(code));
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

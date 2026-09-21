@@ -1,5 +1,48 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## v1.16.0 — The local bridge stops taking everybody's word for it
+
+The bridge listens on `127.0.0.1` and, until now, believed most of what reached it. The
+machine token it has always handed out was advisory: the routes that mattered read it only
+to decide how much of a payload to trust, and one of them never read it at all. Past the
+door, a page you happened to have open in a browser could talk to it. This release closes
+all of that.
+
+**If an agent hook stops reporting after this update, reinstall it** from Settings →
+Plugins. Hooks shipped before v1.15.0 do not send the token, and the bridge now refuses
+them rather than half-believing them — the refusal says so in as many words.
+
+### Changed
+
+- **Every mutation now needs the machine token.** `POST /ingest`, the stop relay and the
+  attention relay are refused with `401` without it, and the refusal names the fix rather
+  than leaving a person to find it. Before this, any process on the machine could write
+  into your session list and your event log; the token only decided whether the `runtime`
+  field beside the event was believed, and the attention relay did not look at it at all.
+- **Reading a sync room needs that room's password and a confirmed member to read as** —
+  the rule its live stream always applied, and which the read beside it applied not at
+  all. A whole room's history could be fetched by anything that sent the header
+  non-empty, and asking for it with `collect=1` also moved the read position, so the
+  member it was addressed to never saw the mail. Speaking in a room is checked before
+  `from` is read, so a confirmed member can no longer be spoken for.
+- **The bridge answers the app's own pages and nothing else in a browser.** The origin
+  policy was `*`: any page open in any tab could reach a server on your own loopback,
+  which is the one thing a same-origin policy exists to stop. A foreign origin is now
+  turned away before the route runs — not merely blocked in the browser afterwards, which
+  for anything that changes state is too late. Requests that carry no origin at all are
+  unaffected: those are the adapters and the app itself, which are processes, not pages.
+
+### Fixes
+
+- **A hook installed somewhere else no longer reports itself as installed.** The
+  Antigravity status asked only whether a registration existed, not whether it named the
+  adapter this build manages — so an install left by an older version read as *Installed*
+  while Antigravity went on running the older copy, and the out-of-date check compared a
+  file nothing was using. It now compares the registered command against the installed
+  path, as the Claude Code and Codex statuses already did. Two smaller versions of the
+  same mistake are fixed with it: a backup file sitting beside the adapter counted as the
+  adapter, and a malformed registration was read as a valid one.
+
 ## v1.15.0 — Codex notify installed from the app, and hooks that admit their age
 
 ### Added

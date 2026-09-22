@@ -3212,6 +3212,443 @@ test("a bridge that starts on a world-readable event log narrows it before writi
   }
 });
 
+test("a room full of unread mail refuses the next message instead of eating the oldest", async () => {
+  // The bridge used to `shift()` the oldest message off whenever a room passed its cap,
+  // read or not, and tell nobody. A long review is exactly the shape that hits it: two
+  // agents talking while one of them is busy thinking.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-capacity-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const founder = "capacity-founder";
+  const quiet = "capacity-quiet";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(base + path, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    assert.equal((await joinConfirmed(call, code, founder, quiet)).status, 200);
+
+    // `quiet` never collects, so everything addressed to it stays owed. Fill the room by
+    // bytes rather than by count — far fewer requests, same cap.
+    const fat = "x".repeat(4_000);
+    let refusal = null;
+    for (let i = 0; i < 400 && refusal === null; i += 1) {
+      const said = await call("POST", `/mail/${code}`, {
+        from: founder, to: quiet, kind: "tell", text: `${i} ${fat}`,
+      });
+      if (said.status !== 202) refusal = said;
+    }
+
+    assert.ok(refusal, "the room has to fill, or this test proves nothing");
+    assert.equal(refusal.status, 409);
+    assert.equal(refusal.body.error, "room_full");
+    assert.match(refusal.body.message, /not published/);
+    assert.match(refusal.body.message, /Waiting on/, "and it names who has not read");
+
+    // Nothing was taken from the session that had not read: the first message it was ever
+    // sent is still there to collect.
+    const inbox = await fetch(`${base}/mail/inbox?as=${quiet}&limit=1`, { headers });
+    const seen = await inbox.json();
+    assert.equal(inbox.status, 200);
+    assert.equal(seen.messages[0]?.seq, 1, "the oldest message is intact");
+    assert.equal(seen.missed, undefined, "and the session is not told it lost anything, because it did not");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a message the bridge accepted is a message that arrives", async () => {
+  // The invariant the refusal exists to buy, and the one the old `shift()` broke: a `202`
+  // means the room took responsibility for that message. It used to mean "filed, and
+  // possibly thrown away before its reader woke up".
+  //
+  // The reader deliberately lags far behind, so the room reaches its cap with mail nobody
+  // has collected. With the fix, some sends come back `409` and every `202` is delivered.
+  // Without it, every send is accepted and the difference goes missing.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-accepted-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const founder = "accepted-founder";
+  const reader = "accepted-reader";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(base + path, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    assert.equal((await joinConfirmed(call, code, founder, reader)).status, 200);
+
+    const fat = "x".repeat(4_000);
+    const accepted = new Set();
+    let refused = 0;
+    for (let i = 0; i < 600; i += 1) {
+      const said = await call("POST", `/mail/${code}`, {
+        from: founder, to: reader, kind: "tell", text: `msg-${i} ${fat}`,
+      });
+      if (said.status === 202) accepted.add(`msg-${i}`);
+      else {
+        refused += 1;
+        assert.equal(said.status, 409);
+        assert.equal(said.body.error, "room_full");
+        // Let the reader drain, which is what the refusal tells the sender to wait for.
+        for (let drain = 0; drain < 20; drain += 1) {
+          const seen = await (await fetch(`${base}/mail/inbox?as=${reader}&collect=1&limit=100`, { headers })).json();
+          for (const message of seen.messages) {
+            if (typeof message.text === "string") accepted.delete(message.text.split(" ")[0]) || null;
+          }
+          if (seen.messages.length === 0) break;
+        }
+      }
+    }
+
+    // Drain whatever is left.
+    for (let drain = 0; drain < 40; drain += 1) {
+      const seen = await (await fetch(`${base}/mail/inbox?as=${reader}&collect=1&limit=100`, { headers })).json();
+      for (const message of seen.messages) {
+        if (typeof message.text === "string") accepted.delete(message.text.split(" ")[0]);
+      }
+      if (seen.messages.length === 0) break;
+    }
+
+    assert.ok(refused > 0, "the room has to reach its cap, or this proves nothing");
+    assert.deepEqual([...accepted], [], "every message the bridge answered 202 to reached its reader");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("speaking does not count as reading: a busy session keeps the mail it has not collected", async () => {
+  // The fault that defeated the whole guarantee, found by Codex. Publishing used to mark
+  // the author as having read everything below its own message — so a session that
+  // answered without collecting looked caught up, the room felt free to drop what had
+  // been addressed to it, and the sender was told 202.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-author-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const founder = "author-founder";
+  const busy = "author-busy";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(base + path, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    assert.equal((await joinConfirmed(call, code, founder, busy)).status, 200);
+
+    // Addressed to the busy session, which never collects it.
+    const owed = await call("POST", `/mail/${code}`, {
+      from: founder, to: busy, kind: "ask", text: "THE-ONE-THAT-MATTERS",
+    });
+    assert.equal(owed.status, 202);
+
+    // It answers without collecting — which is exactly what a session mid-turn does.
+    assert.equal((await call("POST", `/mail/${code}`, {
+      from: busy, to: founder, kind: "tell", text: "working on it",
+    })).status, 202);
+
+    // Now push the room at its budget. Under the fault the busy session looked caught up,
+    // so the room would spend its mail and keep answering 202.
+    const fat = "x".repeat(4_000);
+    for (let i = 0; i < 400; i += 1) {
+      const said = await call("POST", `/mail/${code}`, {
+        from: founder, to: founder, kind: "notice-ish", text: `filler-${i} ${fat}`,
+      });
+      if (said.status === 409) break;
+      assert.equal(said.status, 202);
+    }
+
+    // The message it was owed is still there to collect.
+    const seen = await (await fetch(`${base}/mail/inbox?as=${busy}&collect=1&limit=500`, { headers })).json();
+    const texts = seen.messages.map((message) => message.text);
+    assert.ok(
+      texts.includes("THE-ONE-THAT-MATTERS"),
+      "the message addressed to a session that never collected must survive; it did not",
+    );
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a Codex answer the room has no space for is kept, not stepped over", async () => {
+  // Codex found this twice. Moving the capacity check in front of `claimCodexReply` was
+  // not enough: `harvestAt` had already advanced past the reply, so the next pass read
+  // from beyond it and the answer was gone with nothing anywhere saying so. The cursor
+  // must stay where it was until the room actually takes the message.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-harvest-full-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const thread = "01a0845e-eb31-76d3-a20e-dbebd733f9f6";
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "09", "22");
+  await mkdir(rolloutDir, { recursive: true });
+  const rollout = join(rolloutDir, `rollout-2026-09-22T11-13-28-${thread}.jsonl`);
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "harvest-full-founder";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    for (const [conversationId, sourceKind] of [[founder, "claudeCodeHook"], [thread, "codexCliHook"]]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    // Confirmed, because an unconfirmed session cannot read the room either — and the
+    // drain below is what frees the space this test is about.
+    assert.equal((await joinConfirmed(call, code, founder, thread)).status, 200);
+
+    const readRoom = async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${founder}`, {
+        headers: { "x-gyredeck-token": created.body.password },
+      });
+      return (await response.json()).messages;
+    };
+
+    // Fill the room with mail the Codex session is owed and never collects, so it is full
+    // of messages that may not be spent.
+    const fat = "x".repeat(4_000);
+    let full = false;
+    for (let i = 0; i < 400 && !full; i += 1) {
+      const said = await call("POST", `/mail/${code}`, {
+        from: founder, to: thread, kind: "tell", text: `filler-${i} ${fat}`,
+      });
+      full = said.status === 409;
+    }
+    assert.ok(full, "the room has to be full, or this proves nothing");
+
+    const turn = (text, at = new Date()) => JSON.stringify({
+      type: "event_msg",
+      timestamp: at.toISOString(),
+      payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: text },
+    }) + "\n";
+    const endTurn = () => call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook",
+      workingDirectory: "/tmp/project", conversationId: thread,
+    });
+
+    // Codex answers while there is no room for it. It has to be a big answer: a room that
+    // cannot take another 4,000 bytes may still have space for a short line, and "full"
+    // is a question about a particular message, not a state of the room.
+    // Written before this session was ever put in a room, and it must never be published:
+    // the join time is the filter, and the filter only applies while the cursor is unset.
+    // Setting the cursor to zero on a first read that handled nothing threw it away.
+    await appendFile(rollout, turn("@everyone tell\nFROM-BEFORE-THE-ROOM", new Date(Date.now() - 86_400_000)));
+
+    const answer = `THE-ANSWER-THAT-MUST-SURVIVE ${"y".repeat(4_000)}`;
+    await appendFile(rollout, turn(`@everyone tell\n${answer}`));
+    await endTurn();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    let history = await readRoom();
+    assert.ok(
+      !history.some((message) => message.text.startsWith("THE-ANSWER-THAT-MUST-SURVIVE")),
+      "a full room does not take it — that is the premise, not the fault",
+    );
+
+    // The session collects, which is what the refusal told the sender to wait for.
+    for (let drain = 0; drain < 30; drain += 1) {
+      const seen = await (await fetch(`http://127.0.0.1:${port}/mail/inbox?as=${thread}&collect=1&limit=100`, { headers })).json();
+      if (seen.messages.length === 0) break;
+    }
+
+    // A second answer lands while the room is still full. Both are now behind the cursor,
+    // and the fault Codex found second was that keeping the whole batch re-reads the part
+    // that was already published — `claimCodexReply` remembers only the last 64, so a long
+    // enough batch republishes its own beginning.
+    await appendFile(rollout, turn("@everyone tell\nTHE-THIRD-ANSWER"));
+    await endTurn();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    // Codex says something else, and that turn is harvested with room to spare. If the
+    // cursor had stepped over the first answer, only this one would arrive — which is
+    // exactly what the fault looked like: an answer that was never published and never
+    // read again.
+    await appendFile(rollout, turn("@everyone tell\nTHE-SECOND-ANSWER"));
+    await endTurn();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    history = await readRoom();
+    const fromCodex = history.filter((message) => message.from === thread).map((message) => message.text);
+    assert.ok(
+      fromCodex.some((text) => text.startsWith("THE-ANSWER-THAT-MUST-SURVIVE")),
+      `the refused answer was read again once there was room; instead the room holds: ${JSON.stringify(fromCodex.map((t) => t.slice(0, 32)))}`,
+    );
+    assert.ok(fromCodex.some((text) => text === "THE-SECOND-ANSWER"), "and the newer one too");
+    assert.ok(fromCodex.some((text) => text === "THE-THIRD-ANSWER"), "and the one refused behind it");
+    assert.ok(
+      !fromCodex.some((text) => text === "FROM-BEFORE-THE-ROOM"),
+      "and what Codex said before it was in the room stays out of it",
+    );
+
+    // Each answer exactly once. A cursor kept at the head of a refused batch re-reads what
+    // it already published, and past `CODEX_PUBLISHED_MEMORY` those claims are forgotten.
+    const counted = fromCodex.reduce((tally, text) => tally.set(text, (tally.get(text) ?? 0) + 1), new Map());
+    for (const [text, times] of counted) {
+      assert.equal(times, 1, `"${text.slice(0, 32)}" was published ${times} times`);
+    }
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("trimming the room's notices never carries a reader past mail it has not seen", async () => {
+  // A fault I introduced bounding notices, and Codex reproduced against the real function:
+  // a notice removed from the *middle* of the history raised `droppedThroughSeq`, which is
+  // a watermark meaning "everything at or below this is gone". The inbox carries a
+  // reader's cursor up to it, so a reader that had collected the first message was moved
+  // past the second and never handed it. The number is only ever true of a prefix.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-notices-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const founder = "notices-founder";
+  const quiet = "notices-quiet";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(base + path, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    assert.equal((await joinConfirmed(call, code, founder, quiet)).status, 200);
+
+    // Its private mailbox already holds the note saying which room it was put in, and
+    // that sorts ahead of everything below. Clear it, so what is measured is the room.
+    for (let drain = 0; drain < 5; drain += 1) {
+      const seen = await (await fetch(`${base}/mail/inbox?as=${quiet}&collect=1&limit=50`, { headers })).json();
+      if (seen.messages.length === 0) break;
+    }
+
+    // Two messages the quiet session is owed and has not collected.
+    for (const text of ["OWED-FIRST", "OWED-SECOND"]) {
+      assert.equal((await call("POST", `/mail/${code}`, {
+        from: founder, to: quiet, kind: "tell", text,
+      })).status, 202);
+    }
+
+    // Far more notices than the room keeps, made the way the room makes them: somebody
+    // joining and leaving, over and over.
+    for (let i = 0; i < 40; i += 1) {
+      const passer = `notices-passer-${i}`;
+      await call("POST", `/sync/rooms/${code}/members`, { conversationId: passer });
+      await call("DELETE", `/sync/rooms/${code}/members/${passer}`, { conversationId: passer });
+    }
+
+    // Collect one message, which is where the cursor gets moved.
+    const first = await (await fetch(`${base}/mail/inbox?as=${quiet}&collect=1&limit=1`, { headers })).json();
+    assert.deepEqual(first.messages.map((message) => message.text), ["OWED-FIRST"]);
+
+    // And the second is still there to be handed over.
+    const second = await (await fetch(`${base}/mail/inbox?as=${quiet}&collect=1&limit=10`, { headers })).json();
+    assert.ok(
+      second.messages.some((message) => message.text === "OWED-SECOND"),
+      `the second message was skipped; the room handed back ${JSON.stringify(second.messages.map((m) => m.text))}`,
+    );
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("a room code that is not open reads as gone, not as quiet", async () => {
   // Found by the person at the terminal after an app update ended their room: a dead code
   // and a code nobody ever minted both answered `200 {"messages":[]}`, which is what an

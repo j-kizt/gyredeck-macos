@@ -85,6 +85,152 @@ export const roomHasLostItsFounder = (room) =>
   room.createdBy !== null && room.createdBy !== undefined && !room.members.has(room.createdBy);
 
 /** Why an orphaned room was closed, told to whoever is still in it. */
+/**
+ * How much a room may hold, in two units, because one of them was lying.
+ *
+ * The cap used to be a count alone, and the count is in UTF-16 code units — Thai runs
+ * about 2.14× that in UTF-8, so "100 messages of 4096" was not 13 MB of anything. Bytes
+ * are what the machine spends, so bytes are what is budgeted; the count stays as a second
+ * ceiling so one room cannot hold a hundred thousand one-character messages.
+ *
+ * 500 and 1 MiB are chosen against the work these rooms actually do: a single code review
+ * between two agents ran to 26 messages and 76 KB, so this is roughly a dozen of those.
+ */
+export const MAIL_MAX_MESSAGES = 500;
+export const MAIL_MAX_ROOM_BYTES = 1_048_576;
+
+/**
+ * How many of the room's own notices it keeps.
+ *
+ * A notice cannot be refused — it is how a session learns it was removed from a room, and
+ * refusing one is the silent failure this work exists to end. So it must be bounded some
+ * other way, or a room joined and left repeatedly while somebody is not reading grows past
+ * both caps with nothing able to stop it. Codex found that hole in the exemption.
+ *
+ * Bounded by dropping the *oldest notice*, never correspondence: a notice says what the
+ * room looks like now, and the newest is the one that is true. Thirty-two is well past any
+ * real join and leave history and still nothing against the budget.
+ *
+ * This deliberately does not move `droppedThroughSeq`. That number is a watermark — "every
+ * seq at or below this is gone" — and it is only true of a prefix. A notice removed from
+ * the middle of the history would raise it over mail still sitting there, and the inbox
+ * carries the reader's cursor up to it: the first version of this did exactly that, and
+ * Codex reproduced a reader collecting seq 1 and never being handed seq 2. Nobody is owed
+ * an old roster, so nothing needs reporting when one goes.
+ */
+export const MAIL_MAX_NOTICES = 32;
+
+/** What a message costs the room. The envelope is small and fixed; the text is not. */
+export const messageBytes = (message) => Buffer.byteLength(message.text ?? "", "utf8");
+
+export const roomBytes = (room) => room.messages.reduce((total, m) => total + messageBytes(m), 0);
+
+/**
+ * The furthest point every reader of this room has passed.
+ *
+ * Anything at or below it has been handed to everyone who was waiting for it, so dropping
+ * it loses nothing. A member who has read nothing holds this at zero, which is the point:
+ * their mail is not something the room may quietly spend to make space.
+ *
+ * A private mailbox has no members and uses the room-level position, which is the one its
+ * single reader advances.
+ */
+export const slowestReaderSeq = (room) => {
+  if (room.members.size === 0) return room.readSeq;
+  let slowest = Infinity;
+  for (const member of room.members.values()) slowest = Math.min(slowest, member.readSeq ?? 0);
+  return slowest === Infinity ? room.readSeq : slowest;
+};
+
+/**
+ * Drop what everyone has already read, oldest first, until the room is inside both caps.
+ *
+ * Records how far it got on the room, so a reader can be told that something it never saw
+ * is gone rather than being handed a shorter list and left to assume that was all there
+ * was. Returns how many messages went.
+ */
+/**
+ * Keep the room's own notices to their own allowance, oldest first.
+ *
+ * Run before the ordinary trim so a notice never costs a message somebody is still owed.
+ * Read or unread does not enter into it — a notice is a statement about the room, not
+ * correspondence addressed to anyone, and nobody is owed an old roster.
+ */
+/**
+ * Who the room speaks as. Not a session: nothing answers it and nothing is addressed to it.
+ */
+export const ROOM_SENDER = "gyredeck-room";
+
+/** Whether the room itself said this, whatever kind it chose to say it as. */
+const isRoomsOwnVoice = (message) => message.from === ROOM_SENDER || message.kind === "notice";
+
+export const trimRoomNotices = (room) => {
+  let notices = room.messages.reduce((count, m) => count + (isRoomsOwnVoice(m) ? 1 : 0), 0);
+  let dropped = 0;
+  while (notices > MAIL_MAX_NOTICES) {
+    const index = room.messages.findIndex((m) => isRoomsOwnVoice(m));
+    if (index < 0) break;
+    room.messages.splice(index, 1);
+    notices -= 1;
+    dropped += 1;
+  }
+  return dropped;
+};
+
+export const trimRoomMessages = (room) => {
+  const safeUpTo = slowestReaderSeq(room);
+  let bytes = roomBytes(room);
+  let dropped = 0;
+  while (
+    room.messages.length > 0 &&
+    room.messages[0].seq <= safeUpTo &&
+    (room.messages.length > MAIL_MAX_MESSAGES || bytes > MAIL_MAX_ROOM_BYTES)
+  ) {
+    const [gone] = room.messages.splice(0, 1);
+    bytes -= messageBytes(gone);
+    room.droppedThroughSeq = Math.max(room.droppedThroughSeq ?? 0, gone.seq);
+    dropped += 1;
+  }
+  return dropped;
+};
+
+/**
+ * Whether one more message would have to push out one nobody has read.
+ *
+ * Asked before a send rather than after, because the answer decides whether the sender is
+ * told. The old code pushed and then `shift()`ed the oldest unconditionally: a room busy
+ * enough to hit the cap silently ate whatever its slowest reader had not collected, and
+ * nothing anywhere said so. Refusing is worse for the sender and better for everyone,
+ * since a refusal can be read and acted on.
+ */
+export const roomIsFull = (room, incomingBytes = 0) => {
+  // Spend what is spendable on paper first, and spend as much of it as the incoming
+  // message needs. An earlier version asked only whether the *oldest* message could go,
+  // which is the right question for the count — one over means one out — and the wrong
+  // one for bytes: a megabyte arriving behind a one-byte read message freed one byte and
+  // reported room. Codex reproduced it against this function; the room ended 3,425 bytes
+  // over its budget having answered 202.
+  const safeUpTo = slowestReaderSeq(room);
+  let messages = room.messages.length;
+  let bytes = roomBytes(room);
+  for (const message of room.messages) {
+    if (messages + 1 <= MAIL_MAX_MESSAGES && bytes + incomingBytes <= MAIL_MAX_ROOM_BYTES) break;
+    // Past here is owed to somebody, and no amount of need makes it spendable.
+    if (message.seq > safeUpTo) break;
+    messages -= 1;
+    bytes -= messageBytes(message);
+  }
+  return messages + 1 > MAIL_MAX_MESSAGES || bytes + incomingBytes > MAIL_MAX_ROOM_BYTES;
+};
+
+/** Who is holding the room up, for the sentence the refusal hands back. */
+export const slowestReaders = (room) => {
+  const slowest = slowestReaderSeq(room);
+  return [...room.members.entries()]
+    .filter(([, member]) => (member.readSeq ?? 0) <= slowest)
+    .map(([id]) => id);
+};
+
 export const ORPHANED_ROOM_REASON =
   "the session that created it is no longer in it, and a room does not outlive its founder";
 
@@ -657,12 +803,11 @@ function startBridge(config) {
     // conversation that was already long does not arrive in the room all at once. Every
     // read after that resumes from a byte offset, which cannot step over a line.
     const resuming = harvestAt.get(path);
-    const { replies, offset } = readCodexLog(
+    const { replies, offset, from } = readCodexLog(
       path,
       resuming ?? 0,
       resuming === undefined ? Date.parse(member.joinedAt) || 0 : 0,
     );
-    harvestAt.set(path, offset);
     codexHarvest.turns += 1;
     codexHarvest.published += replies.length;
     if (
@@ -677,17 +822,43 @@ function startBridge(config) {
           " are being lost silently.",
       );
     }
+    // How far the batch was actually taken. A reply the room has no space for must be read
+    // again later, and the byte cursor is what decides that: advancing it past a refusal
+    // loses the answer for good, whether or not it was claimed. Per reply rather than per
+    // batch, because keeping the whole batch for the sake of its tail re-reads the head —
+    // and `claimCodexReply` only remembers the last CODEX_PUBLISHED_MEMORY, so a long
+    // enough batch would publish its own beginning twice. Codex found both halves of this.
+    // Seeded from where the read actually began, not from the old cursor: a rotated or
+    // truncated log restarts at zero, and clamping to the previous offset would make the
+    // bridge read the new file from the top over and over until it outgrew the old one.
+    let handledThrough = from;
     for (const reply of replies) {
-      if (!claimCodexReply(conversationId, reply)) continue;
-      if (refuseToPublish(found.room, conversationId)) continue;
+      // Capacity first, and a refusal stops the batch rather than skipping one of it:
+      // publishing what came after would put Codex's answers in the room out of order.
+      if (roomIsFull(found.room, Buffer.byteLength(reply.text ?? "", "utf8"))) break;
+      if (!claimCodexReply(conversationId, reply)) { handledThrough = reply.endsAt; continue; }
+      if (refuseToPublish(found.room, conversationId)) { handledThrough = reply.endsAt; continue; }
       const { text, routing } = routeCodexReply(found.room, reply.text);
       // Codex never sees a refusal, so the run is broken by not publishing rather than
       // by answering — the next brief tells it no seq followed, which is the signal it
       // has for anything that did not arrive.
-      if (routing.kind === "reaction" && reactionRunExhausted(found.room)) continue;
+      if (routing.kind === "reaction" && reactionRunExhausted(found.room)) { handledThrough = reply.endsAt; continue; }
       const published = publishMail(found.room, conversationId, text, null, true, routing);
       if (published?.seq) publishedForCodex.set(conversationId, published.seq);
       deliverMail(found.name, found.room, text, conversationId, published);
+      handledThrough = reply.endsAt;
+    }
+    // Everything the room took, and not one byte more.
+    //
+    // With no replies at all the whole read is consumed — there was nothing to come back
+    // for. With replies but none handled, the cursor is left exactly as it was found, and
+    // on a first read that means leaving it *unset*: setting it to zero would turn the
+    // next read from "everything since this session joined the room" into "everything in
+    // the log", and publish answers Codex gave before it was ever in the room.
+    if (replies.length === 0) {
+      harvestAt.set(path, offset);
+    } else if (handledThrough > from || resuming !== undefined) {
+      harvestAt.set(path, handledThrough);
     }
   };
 
@@ -1163,11 +1334,11 @@ function startBridge(config) {
    */
   const readCodexLog = (rolloutPath, offset, sinceMs) => {
     let size = 0;
-    try { size = statSync(rolloutPath).size; } catch { return { replies: [], offset }; }
+    try { size = statSync(rolloutPath).size; } catch { return { replies: [], offset, from: offset }; }
     // A file smaller than its cursor was rotated or rewritten, and the cursor now points
     // into a log that no longer exists.
     const from = offset > size ? 0 : offset;
-    if (from >= size) return { replies: [], offset: size };
+    if (from >= size) return { replies: [], offset: size, from };
     let chunk = "";
     let fd = null;
     try {
@@ -1178,19 +1349,26 @@ function startBridge(config) {
       // never cuts a multi-byte character in half.
       chunk = buffer.subarray(0, read).toString("utf8");
     } catch {
-      return { replies: [], offset };
+      return { replies: [], offset, from };
     } finally {
       if (fd !== null) { try { closeSync(fd); } catch {} }
     }
     const lastBreak = chunk.lastIndexOf("\n");
-    if (lastBreak < 0) return { replies: [], offset: from };
+    if (lastBreak < 0) return { replies: [], offset: from, from };
     const whole = chunk.slice(0, lastBreak);
     const replies = [];
+    // Where each reply ends, so the caller can stop the cursor between two of them. A
+    // batch can be taken in part — the room may have space for the first answer and not
+    // the second — and one offset for the whole read cannot say that. Rereading the ones
+    // already published is not free either: `claimCodexReply` remembers only the last
+    // CODEX_PUBLISHED_MEMORY of them, so a long enough batch would republish its own head.
+    let at = from;
     for (const line of whole.split("\n")) {
+      at += Buffer.byteLength(line, "utf8") + 1;
       const reply = codexReplyFromLine(line, sinceMs);
-      if (reply) replies.push(reply);
+      if (reply) replies.push({ ...reply, endsAt: at });
     }
-    return { replies, offset: from + Buffer.byteLength(whole, "utf8") + 1 };
+    return { replies, offset: from + Buffer.byteLength(whole, "utf8") + 1, from };
   };
 
   // Mail rooms: a named channel for agents on this machine to talk to each other,
@@ -1201,7 +1379,6 @@ function startBridge(config) {
   // otherwise miss anything sent while its agent was idle.
   const MAIL_ROOM_NAME = /^[A-Za-z0-9_-]{1,64}$/;
   const MAIL_MAX_ROOMS = 32;
-  const MAIL_MAX_MESSAGES = 100;
   const MAIL_MAX_TEXT = 4_096;
   const MAIL_MAX_FROM = 64;
   const MAIL_ROOM_IDLE_MS = 3_600_000;
@@ -1256,6 +1433,10 @@ function startBridge(config) {
       password: null,
       readSeq: 0,
       messages: [],
+      // The highest seq this room has dropped to stay inside its caps. A reader whose
+      // cursor is below it has missed something, and is told so rather than handed a
+      // short list it would read as "that was all".
+      droppedThroughSeq: 0,
       clients: new Set(),
       members: new Map(),
       // Names already handed out in this room, kept past the member that held them.
@@ -1328,7 +1509,7 @@ function startBridge(config) {
    * apart. It reuses the message path so the news travels the way everything else does
    * — instantly for Codex, on the next turn for the others.
    */
-  const ROOM_SENDER = "gyredeck-room";
+
 
   /**
    * Tell a session it is out, and cut anything it left running.
@@ -1581,8 +1762,18 @@ function startBridge(config) {
    * sub-second budget and would otherwise need a second request to know who it is
    * talking to.
    */
-  const describeInbox = (messages, sync, as) => ({
+  const describeInbox = (messages, sync, as, missed = []) => ({
     messages,
+    // Only when something was actually lost. An empty field on every answer is noise
+    // that teaches readers to skip the one time it matters.
+    ...(missed.length > 0
+      ? {
+          missed,
+          missedNote:
+            "Messages addressed to you were dropped before you collected them: the room filled up. " +
+            "They cannot be recovered. Ask whoever was speaking to repeat anything you needed.",
+        }
+      : {}),
     ...(sync
       ? {
           room: sync.name,
@@ -1796,6 +1987,15 @@ function startBridge(config) {
   const wakesMember = (message, conversationId) => reachesMember(message, conversationId);
 
   const publishMail = (room, from, text, replyTo, fromSession = false, routing = null) => {
+    // Capacity is decided here, not at one caller. The HTTP route checks first so it can
+    // answer with a sentence naming who has not read; every other way into a room — a
+    // harvested Codex reply, a relayed hook message — arrives through this line, and
+    // without it they could push a room past a budget the route was busy enforcing.
+    //
+    // The room's own voice is exempt. A notice is how a session learns it was removed or
+    // that somebody joined, and refusing one would be the same silent failure in a
+    // different place; they are small, and the budget bounds what senders add.
+    if (from !== ROOM_SENDER && roomIsFull(room, Buffer.byteLength(text, "utf8"))) return null;
     room.seq += 1;
     mailOrdinal += 1;
     room.touchedAt = Date.now();
@@ -1829,7 +2029,13 @@ function startBridge(config) {
       ts: new Date().toISOString(),
     };
     room.messages.push(message);
-    if (room.messages.length > MAIL_MAX_MESSAGES) room.messages.shift();
+    // Notices first, against their own allowance, so the room's own voice can never cost
+    // a message addressed to somebody. Then what every reader has already been handed. A
+    // room that cannot make space this way is refused at the door — see `roomIsFull` — so
+    // reaching here and still being over the cap means it is full of mail somebody is
+    // still owed, and the only thing that was let past that door is a notice.
+    trimRoomNotices(room);
+    trimRoomMessages(room);
 
     const frame = mailFrame(message);
     let pushed = false;
@@ -1865,9 +2071,28 @@ function startBridge(config) {
     // different things, and a member reads on its own schedule. The author is the
     // exception — nobody waits to be handed what they just wrote.
     const author = room.members.get(from);
+    // Nobody waits to be handed what they just wrote — but writing is not reading, and
+    // this used to say otherwise: the author's cursor jumped to its own message, so a
+    // session that answered without collecting looked caught up, the room felt free to
+    // drop mail addressed to it, and the sender was told 202. Codex caught that.
+    //
+    // The question is not "was the author exactly up to date" — a single room notice in
+    // between would then strand the cursor for good, and the room would never free space
+    // again. It is whether anything the author is actually owed sits in the gap: mail
+    // addressed to them, by somebody else. A notice is the room describing itself, kept
+    // to its own allowance and owed to nobody, so it does not hold a cursor.
     if (author) {
-      author.readSeq = Math.max(author.readSeq, message.seq);
-      author.lastReadAt = message.ts;
+      const owed = room.messages.some(
+        (earlier) =>
+          earlier.seq > author.readSeq &&
+          earlier.seq < message.seq &&
+          earlier.kind !== "notice" &&
+          reachesMember(earlier, from),
+      );
+      if (!owed) {
+        author.readSeq = message.seq;
+        author.lastReadAt = message.ts;
+      }
     }
     // Mail and presence are separate streams, and the app only polls rooms while the
     // session list is on screen — which is not when a person needs telling that a reply
@@ -1934,7 +2159,18 @@ function startBridge(config) {
     // not this harvest's call to make — an overlapping one may already have posted it.
     const seen = new Set();
     const poll = () => {
+      // Whether this pass stopped because the room was full rather than because it ran
+      // out of replies. Per pass, so an earlier success cannot end the polling that the
+      // refused reply still needs.
+      let waitingForRoom = false;
       for (const reply of readCodexReplies(rolloutPath, since)) {
+        // A reply the room has no space for is not "seen": marking it so would stop the
+        // polling that is the only thing that will ever look at it again. Nor may an
+        // earlier success in the same pass end it — that was the second half of the fault.
+        if (roomIsFull(room, Buffer.byteLength(reply.text ?? "", "utf8"))) {
+          waitingForRoom = true;
+          break;
+        }
         seen.add(reply.turnId ?? reply.text);
         if (!claimCodexReply(threadId, reply)) continue;
         // A harvested answer is still that session speaking, and a session nobody
@@ -1945,7 +2181,9 @@ function startBridge(config) {
         const published = publishMail(room, threadId, routed.text, null, true, routed.routing);
         if (published?.seq) publishedForCodex.set(threadId, published.seq);
       }
-      if (seen.size === 0 && Date.now() < deadline) setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
+      if ((seen.size === 0 || waitingForRoom) && Date.now() < deadline) {
+        setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
+      }
     };
     setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
     return "queued";
@@ -2653,9 +2891,15 @@ function startBridge(config) {
           // a message deliberately not carried to this session must still stop counting
           // as waiting to be picked up, or its pending total climbs forever.
           const examined = new Map();
+          // Mail this session is owed and can never be handed: the room hit its cap and
+          // dropped messages it had already given to everyone else. Saying nothing here
+          // hands back a short list that reads exactly like "that was all there was".
+          const missed = [];
           for (const [roomName, room] of sources) {
             if (!room) continue;
             const reader = readerFor(room, as);
+            const gap = (room.droppedThroughSeq ?? 0) - reader.readSeq;
+            if (gap > 0) missed.push({ room: roomName, count: gap, throughSeq: room.droppedThroughSeq });
             // A private mailbox is addressed to this session by being its mailbox, so
             // everything in it is for it — the notice that says which room it has been
             // put in arrives that way. A sync room is shared, and collecting from it is
@@ -2694,9 +2938,12 @@ function startBridge(config) {
                 ? taken.at(-1)?.seq
                 : Math.max(taken.at(-1)?.seq ?? 0, examined.get(roomName) ?? 0);
               if (upTo) markRead(room, as, upTo, at);
+              // Past the gap as well, or the same loss is reported on every collection
+              // for the rest of the session. It is told once, and once is the point.
+              if ((room.droppedThroughSeq ?? 0) > 0) markRead(room, as, room.droppedThroughSeq, at);
             }
           }
-          return { collected, sync };
+          return { collected, sync, missed };
         };
 
         // GET /mail/wait?as=<id> — the same answer as the inbox, except that an empty
@@ -2745,17 +2992,17 @@ function startBridge(config) {
             return { ...base, reason: "Addressed correctly and delivered. The silence is theirs, not a mistake in what you sent — do not send it again on account of this." };
           };
 
-          const answer = (collected, sync, timedOut) =>
+          const answer = (collected, sync, timedOut, missed = []) =>
             sendJson(200, {
               ok: true,
               timedOut,
               ...(timedOut ? { yourLastMessage: diagnoseSilence(sync) } : {}),
-              ...describeInbox(collected, sync, as),
+              ...describeInbox(collected, sync, as, missed),
             });
 
           const first = collectInbox();
           if (first.collected.length > 0) {
-            answer(first.collected, first.sync, false);
+            answer(first.collected, first.sync, false, first.missed);
             return;
           }
           // One wait per session, enforced rather than asked for. The instruction says
@@ -2777,12 +3024,12 @@ function startBridge(config) {
 
           const waiter = { as, check: null };
           let done = false;
-          const finish = (collected, sync, timedOut) => {
+          const finish = (collected, sync, timedOut, missed = []) => {
             if (done) return;
             done = true;
             mailWaiters.delete(waiter);
             clearTimeout(timer);
-            answer(collected, sync, timedOut);
+            answer(collected, sync, timedOut, missed);
           };
           const timer = setTimeout(() => finish([], syncRoomFor(as), true), waitMs);
           timer.unref?.();
@@ -2791,7 +3038,7 @@ function startBridge(config) {
             // would mark messages delivered into a socket nobody is reading.
             if (done || req.destroyed) return;
             const next = collectInbox();
-            if (next.collected.length > 0) finish(next.collected, next.sync, false);
+            if (next.collected.length > 0) finish(next.collected, next.sync, false, next.missed);
           };
           // A client that hangs up must not leave a timer and a closure behind, and
           // must not have its read position advanced on the way out.
@@ -2805,8 +3052,8 @@ function startBridge(config) {
           return;
         }
 
-        const { collected, sync } = collectInbox();
-        sendJson(200, { ok: true, ...describeInbox(collected, sync, as) });
+        const { collected, sync, missed } = collectInbox();
+        sendJson(200, { ok: true, ...describeInbox(collected, sync, as, missed) });
         return;
       }
 
@@ -2927,6 +3174,22 @@ function startBridge(config) {
           : [...room.members.keys()].find(
               (id) => labelIn(room, id).toLowerCase() === routedTo.toLowerCase(),
             ) ?? routedTo;
+        if (roomIsFull(room, Buffer.byteLength(text, "utf8"))) {
+          // Everything left in the room is owed to somebody, so making space would mean
+          // taking a message from the session it was addressed to — which is what used to
+          // happen, without a word to anyone. The sender is told instead, and told who to
+          // wait for.
+          const waiting = slowestReaders(room).map((id) => labelIn(room, id));
+          sendJson(409, {
+            ok: false,
+            error: "room_full",
+            message:
+              `This room is holding all it can (${MAIL_MAX_MESSAGES} messages or ${Math.round(MAIL_MAX_ROOM_BYTES / 1024)} KB) and nothing in it has been read by everyone yet, so this message was not published — publishing it would have taken somebody else's.` +
+              (waiting.length > 0 ? ` Waiting on: ${waiting.join(", ")}.` : "") +
+              " Once they collect their mail there will be room again.",
+          });
+          return;
+        }
         if (routedKind === "reaction" && reactionRunExhausted(room)) {
           sendJson(409, {
             ok: false,

@@ -2462,6 +2462,11 @@ fn value_to_u64(value: Option<&Value>) -> Option<u64> {
 fn usage_client(provider: &str) -> Result<reqwest::blocking::Client, String> {
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(12))
+        // Every URL this client is given has been checked before it is sent. A redirect is
+        // a URL nobody checked, and reqwest follows them by default — so the one decision
+        // about where a credential may travel would be made about the first hop only. 307
+        // and 308 also keep the body, which on the refresh call is the refresh token.
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("Gyredeck");
 
     if let Some(proxy_url) = openusage_proxy_url() {
@@ -2756,6 +2761,7 @@ fn claude_oauth_config() -> ClaudeOauthConfig {
     let is_ant_user = env_text("USER_TYPE").as_deref() == Some("ant");
     if is_ant_user && env_flag("USE_LOCAL_OAUTH") {
         base_api = env_text("CLAUDE_LOCAL_OAUTH_API_BASE")
+            .filter(|url| is_confidential_oauth_url(url))
             .unwrap_or_else(|| "http://localhost:8000".to_string())
             .trim_end_matches('/')
             .to_string();
@@ -3481,6 +3487,12 @@ fn probe_antigravity_ls_usage() -> Option<CodexUsageSnapshot> {
     // LOOPBACK_HOST), and the two functions below assert that before sending.
     let loopback_client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
+        // The asserts below pin every URL this client is *given* to the loopback address,
+        // which is what makes skipping certificate checks survivable. A redirect would
+        // undo that in one hop: this client would follow it to another host and skip the
+        // check there too, carrying the CSRF header, which is not one of the headers
+        // reqwest strips when a redirect crosses hosts.
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("Gyredeck")
         .danger_accept_invalid_certs(true)
         .build()
@@ -3605,19 +3617,21 @@ fn discover_listening_ports(discovery: &AntigravityLsDiscovery) -> Vec<u16> {
 /// True when an OAuth base URL is safe to send credentials to: TLS, or loopback where
 /// the request never reaches a network.
 fn is_confidential_oauth_url(url: &str) -> bool {
-    if url.starts_with("https://") {
-        return true;
-    }
-    let Some(rest) = url.strip_prefix("http://") else {
+    // Parsed rather than split. Reading the authority by hand took the userinfo for the
+    // host, so `http://localhost:8000@evil.example` passed as loopback while the request
+    // went to `evil.example` carrying a bearer token in the clear. Anything that decides
+    // where a credential may travel has to see the URL the way the client that sends it
+    // will.
+    let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
-    let authority = rest.split('/').next().unwrap_or("");
-    // IPv6 authorities bracket the host, so the port cannot simply be split on ':'.
-    let host = match authority.strip_prefix('[') {
-        Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
-        None => authority.split(':').next().unwrap_or(""),
-    };
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    match parsed.scheme() {
+        "https" => true,
+        // A parsed IPv6 host keeps its brackets, where splitting the string by hand took
+        // them off — so both spellings are named rather than one.
+        "http" => matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1" | "[::1]")),
+        _ => false,
+    }
 }
 
 /// The only host the certificate-skipping client above may ever be pointed at.
@@ -5761,6 +5775,15 @@ mod transport_safety_tests {
         // A refresh token would cross the network in the clear.
         assert!(!is_confidential_oauth_url("http://api.anthropic.com"));
         assert!(!is_confidential_oauth_url("http://localhost.evil.test:8000"));
+        // Userinfo is not the host. Splitting the authority by hand read `localhost` here
+        // and let the request go to `evil.example` with a bearer token on it; a parser
+        // sees what the client sending the request will see.
+        assert!(!is_confidential_oauth_url("http://localhost:8000@evil.example"));
+        assert!(!is_confidential_oauth_url("http://127.0.0.1@evil.example/"));
+        assert!(!is_confidential_oauth_url("http://user:127.0.0.1@evil.example"));
+        assert!(!is_confidential_oauth_url("ftp://localhost"));
+        assert!(!is_confidential_oauth_url("not a url"));
+        assert!(!is_confidential_oauth_url(""));
         assert!(!is_confidential_oauth_url("ftp://api.anthropic.com"));
         assert!(!is_confidential_oauth_url("api.anthropic.com"));
     }

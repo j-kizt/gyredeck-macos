@@ -27,6 +27,7 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 
 const PROTOCOL_VERSION = 2;
@@ -64,6 +65,30 @@ function readOrCreateIngestToken() {
 // password (16). Kept as one expression so the door and the things that mint them cannot
 // drift — `readOrCreateIngestToken` and `newRoomPassword` are the other two ends of it.
 const CREDENTIAL_SHAPE = /^(?:[a-f0-9]{32}|[a-f0-9]{64})$/i;
+
+/** Characters a room code is drawn from: no `0/O`, no `1/l/I`, nothing that reads alike. */
+export const SYNC_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+
+/**
+ * One character of a room code, drawn evenly from the alphabet.
+ *
+ * `byte % 31` is not even: 256 is not a multiple of 31, so the first eight letters come up
+ * on nine of the 256 byte values and the other twenty-three on eight — a 12.5% edge. Small,
+ * and a code is a name people read to each other rather than a secret, so nothing depends
+ * on it; it is simply free to do properly. Bytes at or above the largest whole multiple of
+ * the alphabet are thrown away and another drawn, which is what makes the remainder even.
+ *
+ * Module scope, and exported, so the test can draw from the generator the bridge itself
+ * uses. A copy of this rule living in the test would go on passing if this one went back
+ * to a plain modulo.
+ */
+const SYNC_CODE_LIMIT = 256 - (256 % SYNC_CODE_ALPHABET.length);
+export const syncCodeChar = () => {
+  for (;;) {
+    const [byte] = randomBytes(1);
+    if (byte < SYNC_CODE_LIMIT) return SYNC_CODE_ALPHABET[byte % SYNC_CODE_ALPHABET.length];
+  }
+};
 
 function matchesIngestToken(expected, value) {
   if (typeof value !== "string") return false;
@@ -836,11 +861,30 @@ function startBridge(config) {
     }
   };
 
+  /**
+   * Whether this bridge is allowed to start an agent CLI at all.
+   *
+   * A test suite must not launch the user's real agents. The hook tests point `HOME` at a
+   * `mkdtemp` directory and spawn this bridge against it; `deliverToCodex` then ran the
+   * real `codex`, which inherited that fake `HOME` and scaffolded `~/.codex/skills/…` into
+   * it while the test's own cleanup was deleting the directory — `ENOTEMPTY`, about one run
+   * in eight. The flake was the smaller half: running somebody's agent as a side effect of
+   * `pnpm test:hooks` is the part that should never have been possible.
+   *
+   * Read once, because a switch that can change under a running bridge is a second state to
+   * reason about for no gain.
+   */
+  const agentSpawnAllowed = process.env.GYREDECK_NO_AGENT_SPAWN !== "1";
+
   // Locate an agent CLI the way the desktop app locates node: a process launched from
   // Finder or Spotlight does not inherit the shell's PATH, so the usual install
   // directories have to be searched explicitly.
+  //
+  // This is the only door to spawning one, and every caller already handles "not found" —
+  // so refusing here covers any agent added later, rather than this one command.
   const agentBinaryCache = new Map();
   const findAgentBinary = (name) => {
+    if (!agentSpawnAllowed) return null;
     if (agentBinaryCache.has(name)) return agentBinaryCache.get(name);
     const directories = [
       join(homedir(), ".bun", "bin"),
@@ -1018,7 +1062,7 @@ function startBridge(config) {
   const MAIL_MAX_WAITERS = 16;
   // Codes are read off one screen and typed into another, so the alphabet leaves out
   // characters that get confused by eye: 0/O, 1/l/I.
-  const SYNC_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+
   /** A room code, as opposed to a conversation id used as a mailbox name. */
   const SYNC_CODE = /^sync-[a-z2-9]{4}$/;
   const mailRooms = new Map();
@@ -1363,9 +1407,7 @@ function startBridge(config) {
 
   const newSyncCode = () => {
     for (let attempt = 0; attempt < 20; attempt += 1) {
-      const suffix = Array.from(randomBytes(4))
-        .map((byte) => SYNC_CODE_ALPHABET[byte % SYNC_CODE_ALPHABET.length])
-        .join("");
+      const suffix = Array.from({ length: 4 }, syncCodeChar).join("");
       const code = `sync-${suffix}`;
       if (!mailRooms.has(code)) return code;
     }
@@ -2953,62 +2995,75 @@ const hostArg = args.includes("--host") ? args[args.indexOf("--host") + 1] : nul
 const daemon = args.includes("--daemon");
 const parentStdio = args.includes("--parent-stdio");
 
-const config = readConfig();
-if (portArg && Number.isInteger(portArg)) config.port = portArg;
-if (hostArg === BRIDGE_HOST) config.host = hostArg;
+/**
+ * Everything below starts a bridge, so it runs only when this file is the program.
+ *
+ * Importing it — which the tests do, to draw from the very generator the bridge uses
+ * rather than a copy of it that could silently stop matching — used to bind the port and
+ * collide with whatever bridge was already running.
+ */
+const isEntryPoint = process.argv[1] !== undefined
+  && import.meta.url === pathToFileURL(process.argv[1]).href;
 
-const { server, emitLocal } = startBridge(config);
+if (isEntryPoint) {
+  const config = readConfig();
+  if (portArg && Number.isInteger(portArg)) config.port = portArg;
+  if (hostArg === BRIDGE_HOST) config.host = hostArg;
 
-server.on("error", (error) => {
-  if (error.code === "EADDRINUSE") {
-    console.error(`✗ Port ${config.port} already in use (Letta mod or another bridge is running)`);
+  const { server, emitLocal } = startBridge(config);
+
+  server.on("error", (error) => {
+    if (error.code === "EADDRINUSE") {
+      console.error(`✗ Port ${config.port} already in use (Letta mod or another bridge is running)`);
+      process.exit(1);
+    }
+    console.error(`✗ Bridge error: ${error.message}`);
     process.exit(1);
-  }
-  console.error(`✗ Bridge error: ${error.message}`);
-  process.exit(1);
-});
+  });
 
-server.listen(config.port, config.host, () => {
-  const bridgeReadyEvent = {
-    version: PROTOCOL_VERSION,
-    id: randomUUID(),
-    type: "bridge_ready",
-    timestamp: new Date().toISOString(),
-    agentId: null, agentName: null, conversationId: null,
-    cwd: null, model: null, permissionMode: null, runtime: null,
-    data: {
-      port: config.port,
-      logFile: config.logFile,
-      ssePath: "/events",
-      healthPath: "/health",
-    },
+  server.listen(config.port, config.host, () => {
+    const bridgeReadyEvent = {
+      version: PROTOCOL_VERSION,
+      id: randomUUID(),
+      type: "bridge_ready",
+      timestamp: new Date().toISOString(),
+      agentId: null, agentName: null, conversationId: null,
+      cwd: null, model: null, permissionMode: null, runtime: null,
+      data: {
+        port: config.port,
+        logFile: config.logFile,
+        ssePath: "/events",
+        healthPath: "/health",
+      },
+    };
+    emitLocal(bridgeReadyEvent);
+
+    console.log(`✓ Gyredeck standalone bridge running on ${config.host}:${config.port}`);
+    console.log(`  Log: ${config.logFile}`);
+    console.log(`  SSE: http://${config.host}:${config.port}/events`);
+    console.log(`  Health: http://${config.host}:${config.port}/health`);
+    console.log(`  Mode: standalone (accepts Letta /ingest + AGY /ingest + hooks)`);
+
+    if (daemon) {
+      // Detach from terminal
+      process.stdin.unref();
+      process.stdout.write("");
+      if (typeof process.disconnect === "function") process.disconnect();
+    }
+  });
+
+  // Graceful shutdown
+  const shutdown = () => {
+    console.log("\n⏹ Bridge shutting down...");
+    server.close();
+    process.exit(0);
   };
-  emitLocal(bridgeReadyEvent);
-
-  console.log(`✓ Gyredeck standalone bridge running on ${config.host}:${config.port}`);
-  console.log(`  Log: ${config.logFile}`);
-  console.log(`  SSE: http://${config.host}:${config.port}/events`);
-  console.log(`  Health: http://${config.host}:${config.port}/health`);
-  console.log(`  Mode: standalone (accepts Letta /ingest + AGY /ingest + hooks)`);
-
-  if (daemon) {
-    // Detach from terminal
-    process.stdin.unref();
-    process.stdout.write("");
-    if (typeof process.disconnect === "function") process.disconnect();
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+  if (parentStdio) {
+    process.stdin.resume();
+    process.stdin.once("end", shutdown);
+    process.stdin.once("error", shutdown);
   }
-});
 
-// Graceful shutdown
-const shutdown = () => {
-  console.log("\n⏹ Bridge shutting down...");
-  server.close();
-  process.exit(0);
-};
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-if (parentStdio) {
-  process.stdin.resume();
-  process.stdin.once("end", shutdown);
-  process.stdin.once("error", shutdown);
 }

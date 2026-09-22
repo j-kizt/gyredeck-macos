@@ -10,6 +10,20 @@ import test from "node:test";
 const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const CONFIG_DIR = [".config", "gyredeck"];
 
+/**
+ * No bridge started by these tests may launch a real agent CLI.
+ *
+ * Every bridge below is spawned with `HOME` pointed at a `mkdtemp` directory, and
+ * `deliverToCodex` used to run the real `codex` against it: the child inherited the fake
+ * `HOME`, scaffolded `~/.codex/skills/…` into it, and was still writing when the test's
+ * cleanup deleted the directory — `ENOTEMPTY`, about one run in eight. Running somebody's
+ * agent as a side effect of the test suite is the larger fault of the two.
+ *
+ * Set here rather than in `package.json` so it holds however this file is invoked; every
+ * spawn below spreads `process.env`, so one line covers all of them.
+ */
+process.env.GYREDECK_NO_AGENT_SPAWN = "1";
+
 /** Wait until the standalone bridge answers /health, or throw with captured stderr. */
 const waitForHealth = async (port, stderrRef) => {
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -3073,6 +3087,72 @@ test("a room's password is not handed to whoever asks for it", async () => {
     assert.ok(presentedBody.howTo, "presenting it is what earns it");
     assert.equal(presentedBody.howTo.credential.value, password);
     assert.match(presentedBody.howTo.send.command, new RegExp(code));
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a bridge told not to launch agents does not go looking for one", async () => {
+  // The switch itself, proven rather than assumed: every other test in this file relies on
+  // it, and a switch that quietly stopped working would take the flake back without a
+  // single assertion changing. A bridge that cannot find an agent answers `unavailable`
+  // and says so in the delivery report, which is the observable end of the same decision.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-nospawn-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const founder = "session-founder";
+  const codex = "01a0c318-e19d-7482-b265-3c4796c7afaf";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(base + path, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    // The bridge only reaches for `codex queue` on behalf of a session it believes is
+    // Codex, which it learns from the runtime on that session's events.
+    assert.equal((await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: codex, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" },
+      data: { inputCount: 1 },
+    })).status, 202);
+
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    assert.equal((await joinConfirmed(call, code, founder, codex)).status, 200);
+
+    // Addressed to the Codex session, which is the case that would have launched it.
+    const said = await call("POST", `/mail/${code}`, {
+      from: founder, to: codex, kind: "ask", text: "anything at all",
+    });
+    assert.equal(said.status, 202);
+    assert.equal(
+      said.body.delivery,
+      "unavailable",
+      "no agent was started, and the sender is told so rather than left believing it was reached",
+    );
+
+    // And nothing was written into the temp HOME on the way past, which is the fault the
+    // switch exists for: the scaffolding raced this test's own cleanup.
+    assert.equal(existsSync(join(home, ".codex", "skills")), false, "the fake HOME is untouched");
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();

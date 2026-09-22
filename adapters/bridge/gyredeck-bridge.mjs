@@ -22,7 +22,7 @@
  *   POST /ingest    - Multi-provider event fan-in
  */
 
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
@@ -360,8 +360,109 @@ function createScopeTracker() {
 
 // ── Bridge server ──
 
+/**
+ * The mode the event log is kept at.
+ *
+ * Every line of it carries a `conversationId`, a `cwd`, a `model` and a `permissionMode`,
+ * which is a record of what every agent on this machine was doing and where. The ingest
+ * token sits in the same directory at `0600`; the log had no mode of its own and was
+ * created by whatever appended to it first, under the process umask — `0644`.
+ */
+const LOG_FILE_MODE = 0o600;
+
+/**
+ * Open the event log for appending, or refuse to write to disk and say why.
+ *
+ * Everything happens through one file descriptor, deliberately. Checking a path and then
+ * writing to that path are two different files if anything moves in between, and the mode
+ * is exactly what an attacker would want to change in that gap; a descriptor is the file
+ * itself. `O_NOFOLLOW` refuses a symlink outright, so the log cannot be pointed at
+ * something else that then inherits `0600` and our writes.
+ *
+ * A log that cannot be confirmed as a regular file at `0600` is **not written to**. The
+ * earlier version of this swallowed a failed `chmod` and appended anyway, which left the
+ * file exactly as wide as it had been while the docs claimed otherwise — Codex caught that
+ * in review. Presence is still not worth a leak, so the bridge says one line on stderr and
+ * runs on: the log is local diagnostics, and `GET /events` and `/snapshot` are unaffected.
+ *
+ * Note what that does *not* promise. Disk logging narrows the file before writing to it, or
+ * it is off. It does not narrow a file it has given up on — a log that was already `0644`
+ * and could not be chmodded stays `0644`, holding whatever it already held. The guarantee
+ * is about what this bridge adds, not about what it finds.
+ *
+ * Exported, and returns a writer rather than a descriptor, so no caller can hold the fd
+ * and skip the check that earned it.
+ */
+export function openEventLog(logFile) {
+  const refuse = (why) => ({
+    enabled: false,
+    why,
+    append() {},
+    close() {},
+  });
+
+  try {
+    mkdirSync(dirname(logFile), { recursive: true, mode: 0o700 });
+  } catch (error) {
+    return refuse(`cannot create the directory for ${logFile}: ${error.code ?? error.message}`);
+  }
+
+  let fd;
+  try {
+    const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW;
+    fd = openSync(logFile, flags, LOG_FILE_MODE);
+  } catch (error) {
+    // ELOOP is the interesting one: the path is a symlink, and following it is the whole
+    // thing `O_NOFOLLOW` exists to refuse.
+    return refuse(`cannot open ${logFile} for appending: ${error.code ?? error.message}`);
+  }
+
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile()) throw new Error("not a regular file");
+    if ((opened.mode & 0o777) !== LOG_FILE_MODE) {
+      // Every machine that ran an older bridge has a log at 0644, and nothing else would
+      // ever narrow it. Through the descriptor, so it is this file and not whatever the
+      // path names by now.
+      fchmodSync(fd, LOG_FILE_MODE);
+      if ((fstatSync(fd).mode & 0o777) !== LOG_FILE_MODE) throw new Error("the mode did not change");
+    }
+  } catch (error) {
+    closeSync(fd);
+    return refuse(`will not write ${logFile}: ${error.code ?? error.message}`);
+  }
+
+  let open = true;
+  return {
+    enabled: true,
+    why: null,
+    append(line) {
+      if (!open) return;
+      try {
+        // Through the descriptor that was checked, but by `appendFileSync` rather than
+        // `writeSync`: a raw write may take only part of the line and report how much,
+        // which would leave half a JSON object in an NDJSON file and call it a success.
+        // Codex caught that. This writes all of it or throws.
+        appendFileSync(fd, line);
+      } catch (error) {
+        // A descriptor that has stopped accepting writes is not going to start again, and
+        // an event every turn would be a line of stderr every turn.
+        open = false;
+        console.error(`gyredeck: stopped writing the event log — ${error.code ?? error.message}`);
+        try { closeSync(fd); } catch { /* already gone */ }
+      }
+    },
+    close() {
+      if (!open) return;
+      open = false;
+      try { closeSync(fd); } catch { /* already gone */ }
+    },
+  };
+}
+
 function startBridge(config) {
-  mkdirSync(dirname(config.logFile), { recursive: true });
+  const eventLog = openEventLog(config.logFile);
+  if (!eventLog.enabled) console.error(`gyredeck: event log disabled — ${eventLog.why}`);
 
   const capabilities = {
     events: { lifecycle: true, turns: true, tools: true, compact: true, llm: true },
@@ -421,7 +522,7 @@ function startBridge(config) {
     if (recent.length > maxRecent) recent.shift();
 
     const serialized = JSON.stringify(payload);
-    appendFileSync(config.logFile, `${serialized}\n`);
+    eventLog.append(`${serialized}\n`);
 
     const frame = `event: ${payload.type}\ndata: ${serialized}\n\n`;
     for (const res of clients) {
@@ -3018,7 +3119,7 @@ function startBridge(config) {
     res.end(JSON.stringify({ ok: false, error: "not_found" }));
   });
 
-  return { server, emitLocal, capabilities };
+  return { server, emitLocal, capabilities, eventLog };
 }
 
 function readRecentEvents(logFile, maxRecent) {
@@ -3058,7 +3159,7 @@ if (isEntryPoint) {
   if (portArg && Number.isInteger(portArg)) config.port = portArg;
   if (hostArg === BRIDGE_HOST) config.host = hostArg;
 
-  const { server, emitLocal } = startBridge(config);
+  const { server, emitLocal, eventLog } = startBridge(config);
 
   server.on("error", (error) => {
     if (error.code === "EADDRINUSE") {
@@ -3104,6 +3205,7 @@ if (isEntryPoint) {
   const shutdown = () => {
     console.log("\n⏹ Bridge shutting down...");
     server.close();
+    eventLog.close();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

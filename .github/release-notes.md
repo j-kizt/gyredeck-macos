@@ -1,5 +1,29 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Nothing said in a sync room goes missing without saying so — (v1.16.3)
+
+Two ways a room could lose your messages quietly, and one way it could pretend to still
+be there after it had ended.
+
+### Fixes
+
+- **A room refuses a message rather than eating one nobody has read.** Rooms have always
+  had a limit, and past it the oldest message was simply dropped — whether or not the
+  session it was addressed to had collected it, and with nothing anywhere saying so. The
+  reader was handed a shorter list, which looks exactly like nothing more having been
+  said. A room now spends its space in one direction only: a message may go once everyone
+  has read it, and when everything left is still owed to somebody the sender is told the
+  room is full and who it is waiting on. The limit is also counted in bytes now as well as
+  messages, which the old one was not — it counted characters of a kind that do not
+  correspond to space, so for Thai it was out by more than double.
+- **Answering is no longer treated as reading.** A session that replied without collecting
+  its mail looked caught up, so the room felt free to spend what had been addressed to it.
+  This is the one that bites during a long review, where one side is busy thinking.
+- **A sync room code that is no longer open says so.** Reading a room that had ended
+  answered like an open room with nothing in it, so a session kept watching a code that no
+  longer existed and saw only quiet. Worth knowing: updating the app restarts the bridge,
+  and every open room ends with it.
+
 ## Two files that were wider open than they should have been — (v1.16.2)
 
 Both of these are about something outliving what it belonged to: a room without the

@@ -66,6 +66,59 @@ function readOrCreateIngestToken() {
 // drift — `readOrCreateIngestToken` and `newRoomPassword` are the other two ends of it.
 const CREDENTIAL_SHAPE = /^(?:[a-f0-9]{32}|[a-f0-9]{64})$/i;
 
+/**
+ * Whether a room still holds the session that created it.
+ *
+ * A room without its founder is over, whoever else is still in it: nobody left can be let
+ * in (`/passwords` answers `not_the_founder` to them) and nobody can close it either,
+ * since the app asks as itself and gets the same refusal. What remains is a code nobody
+ * can use for anything.
+ *
+ * A mailbox has no founder — `createdBy` is null — and is not judged by this.
+ *
+ * Its own function, at module scope, so the sweep and the test ask the same question. The
+ * three paths that remove a member each close the room when it is the founder; this is the
+ * net under them, for the one that forgets. One of them did forget, which is how a room
+ * came to outlive its founder to begin with.
+ */
+export const roomHasLostItsFounder = (room) =>
+  room.createdBy !== null && room.createdBy !== undefined && !room.members.has(room.createdBy);
+
+/** Why an orphaned room was closed, told to whoever is still in it. */
+export const ORPHANED_ROOM_REASON =
+  "the session that created it is no longer in it, and a room does not outlive its founder";
+
+/**
+ * One pass over the room table: close what is orphaned, forget what has gone cold.
+ *
+ * **This runs on a request, not on a clock.** There is no timer; the two callers are a
+ * `/sync/rooms` listing and a `/mail` call, so a room nobody asks about sits as it is.
+ * That is why the three paths that remove a member each close the room themselves — they
+ * are what makes it immediate. This is the repair for a path that forgets to, taking
+ * effect at the next request, and one of them did forget, which is how a room came to
+ * outlive its founder. Do not read it as an invariant held at the moment of mutation.
+ *
+ * Lifted out of `startBridge` and given the map and the close as arguments so a test can
+ * run the real pass. Behind the closure the only reachable question was the predicate, and
+ * a test that asks only that goes on passing with the pass itself deleted.
+ */
+export const sweepRooms = (rooms, now, { close, idleMs }) => {
+  for (const [name, room] of rooms) {
+    // A room without the session that made it is over, whoever else is still in it:
+    // nobody left can be let in (`/passwords` answers `not_the_founder` to them) and
+    // nobody can close it either. Checked before the members test below, or the case
+    // that matters — the founder gone, a peer still there — would never be reached.
+    if (roomHasLostItsFounder(room)) {
+      close(name, room, ORPHANED_ROOM_REASON);
+      continue;
+    }
+    // A room with members was set up deliberately and stays until its last member
+    // leaves; only unattended mailboxes age out.
+    if (room.members.size > 0) continue;
+    if (room.clients.size === 0 && now - room.touchedAt > idleMs) rooms.delete(name);
+  }
+};
+
 /** Characters a room code is drawn from: no `0/O`, no `1/l/I`, nothing that reads alike. */
 export const SYNC_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 
@@ -1069,15 +1122,10 @@ function startBridge(config) {
 
   // Rooms are created by whoever speaks first, so they need an upper bound and a way
   // to go away again; without both, any local process could grow this map forever.
-  const sweepMailRooms = () => {
-    const now = Date.now();
-    for (const [name, room] of mailRooms) {
-      // A room with members was set up deliberately and stays until its last member
-      // leaves; only unattended mailboxes age out.
-      if (room.members.size > 0) continue;
-      if (room.clients.size === 0 && now - room.touchedAt > MAIL_ROOM_IDLE_MS) mailRooms.delete(name);
-    }
-  };
+  // The pass lives at module scope — see `sweepRooms`, including when it does and does
+  // not run.
+  const sweepMailRooms = () =>
+    sweepRooms(mailRooms, Date.now(), { close: closeRoom, idleMs: MAIL_ROOM_IDLE_MS });
 
   const mailRoomFor = (name, create) => {
     const existing = mailRooms.get(name);

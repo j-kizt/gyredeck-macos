@@ -131,6 +131,15 @@ a room is for afterwards runs through the founder, so what was left behind was a
 nobody could be let into and nobody could close. A member is removed automatically on
 `conversation_close` so dead sessions do not linger.
 
+Each of those three exits closes the room itself, and that is what makes it immediate.
+Behind them the room sweep asks the same question of the whole table — is `createdBy` still
+a member — and closes what is not, whatever removed it. Three call sites each remembering
+one rule is a rule that gets forgotten, and one of them had, which is how a room came to
+outlive its founder. The sweep is the repair for that, not a guarantee: **it runs on a
+request, not on a clock** — a `/sync/rooms` listing or a `/mail` call — so an orphaned room
+nobody asks about sits as it is until somebody does. A mailbox has no founder (`createdBy`
+is null) and is not judged by this.
+
 ## Adapters
 
 One line each: drain `/mail/inbox?as=<conversationId>` instead of

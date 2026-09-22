@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
 import test from "node:test";
 
 import { SYNC_CODE_ALPHABET, syncCodeChar } from "../adapters/bridge/gyredeck-bridge.mjs";
@@ -15,9 +14,6 @@ import { SYNC_CODE_ALPHABET, syncCodeChar } from "../adapters/bridge/gyredeck-br
  */
 const ALPHABET = SYNC_CODE_ALPHABET;
 const LIMIT = 256 - (256 % ALPHABET.length);
-
-/** The rejected shape, kept only so the two can be compared in the same run. */
-const drawByModulo = () => ALPHABET[randomBytes(1)[0] % ALPHABET.length];
 
 /**
  * The share of draws landing on the eight characters the modulo favours.
@@ -69,21 +65,23 @@ test("throwing away the bytes past the last whole multiple evens it out", () => 
 });
 
 test("the generator the bridge actually uses draws evenly", () => {
-  // `syncCodeChar` imported from the bridge, so this fails if the bridge goes back to a
-  // plain modulo — which a local copy of the rule would not. Both are drawn in the same
-  // run against the same generator, so the comparison says which is flatter rather than
-  // resting on a threshold guessed in advance.
+  // `syncCodeChar` imported from the bridge, so this goes red if the bridge returns to a
+  // plain modulo — which a copy of the rule living in this file would not.
   //
-  // 300k draws puts each share about fourteen standard errors from the midpoint between
-  // the two expected values, so a run failing by chance is not a thing that happens.
-  const rounds = 300_000;
-  const even = favouredShare(syncCodeChar, rounds);
-  const modulo = favouredShare(drawByModulo, rounds);
+  // Measured against a fixed midpoint rather than against a modulo drawn here for
+  // comparison. The two arithmetic tests above already pin where a modulo lands, so
+  // drawing one would add nothing — and a second generator in this file that is biased on
+  // purpose is still biased random code, which is what CodeQL says when it flags it.
+  //
+  // 300k draws puts either share about fourteen standard errors from the midpoint, so a
+  // run failing by chance is not a thing that happens.
   const evenExpected = 8 / ALPHABET.length;
   const moduloExpected = (8 * 9) / 256;
   const midpoint = (evenExpected + moduloExpected) / 2;
+  const share = favouredShare(syncCodeChar, 300_000);
 
-  assert.ok(even < midpoint, `the bridge stays near ${evenExpected.toFixed(4)}: got ${even.toFixed(4)}`);
-  assert.ok(modulo > midpoint, `the modulo keeps its edge near ${moduloExpected.toFixed(4)}: got ${modulo.toFixed(4)}`);
-  assert.ok(even < modulo, "and the bridge is the flatter of the two");
+  assert.ok(
+    share < midpoint,
+    `an even draw sits near ${evenExpected.toFixed(4)} and a modulo near ${moduloExpected.toFixed(4)}; got ${share.toFixed(4)}`,
+  );
 });

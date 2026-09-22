@@ -1,5 +1,29 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Two files that were wider open than they should have been — (v1.16.2)
+
+Both of these are about something outliving what it belonged to: a room without the
+person who made it, and a log file keeping the permissions of whichever process happened
+to create it first.
+
+### Fixes
+
+- **A sync room cannot outlive the session that created it.** A founder could leave
+  through a path that forgot to close the room — and what was left could not be joined,
+  because only the founder can let anyone in, and could not be closed either, because the
+  app asks as itself and gets the same refusal. It was a code that could only be
+  abandoned. The bridge now asks the question of the whole room table instead of relying
+  on each way out to remember: a room whose founder is no longer in it is over, whoever
+  else is still there, and everyone in it is told.
+- **The event log is no longer readable by anything on the machine.**
+  `~/.config/gyredeck/gyredeck.events.ndjson` records what each agent was doing and
+  where — a conversation id, a working directory, a model — and it was created by
+  whichever process appended to it first, which left it world-readable while the token
+  beside it was not. Gyredeck now opens it itself, refuses to follow a symlink standing
+  in its place, narrows a log an older version left open, and **stops writing to disk
+  entirely** rather than append to a file it could not make private, saying so once
+  instead of going quiet about it.
+
 ## A room ends when the person who made it leaves — (v1.16.1)
 
 Three faults in sync rooms, two of them found by using the thing. A room outlived the

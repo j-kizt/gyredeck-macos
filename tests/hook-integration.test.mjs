@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -3153,6 +3153,58 @@ test("a bridge told not to launch agents does not go looking for one", async () 
     // And nothing was written into the temp HOME on the way past, which is the fault the
     // switch exists for: the scaffolding raced this test's own cleanup.
     assert.equal(existsSync(join(home, ".codex", "skills")), false, "the fake HOME is untouched");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a bridge that starts on a world-readable event log narrows it before writing", async () => {
+  // The unit tests around `openEventLog` all call it directly, so they would go on passing
+  // if `startBridge` stopped calling it. This pins the call site: a log already at 0644,
+  // which is what every machine that ran an earlier bridge has, and a real bridge started
+  // over it. Codex asked for this in review.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-logmode-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const logFile = join(home, ...CONFIG_DIR, "gyredeck.events.ndjson");
+  const alreadyThere = `${JSON.stringify({ version: 2, id: randomUUID(), type: "turn_start" })}\n`;
+  await writeFile(logFile, alreadyThere);
+  await chmod(logFile, 0o644);
+  assert.equal((await stat(logFile)).mode & 0o777, 0o644, "the fixture has to start wide");
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  try {
+    await waitForHealth(port, stderrRef);
+    assert.equal((await stat(logFile)).mode & 0o777, 0o600, "starting the bridge narrows the log it found");
+
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const conversationId = `log-mode-${randomUUID()}`;
+    const posted = await fetch(`http://127.0.0.1:${port}/ingest`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      body: JSON.stringify({
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project", data: { inputCount: 1 },
+      }),
+    });
+    assert.equal(posted.status, 202);
+
+    // Still writing, and still private: narrowing the mode must not have cost the log.
+    const written = await readFile(logFile, "utf8");
+    assert.ok(written.startsWith(alreadyThere), "what the log already held is still there");
+    assert.ok(written.includes(conversationId), "and the new event was appended to it");
+    assert.equal((await stat(logFile)).mode & 0o777, 0o600);
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();

@@ -3211,3 +3211,58 @@ test("a bridge that starts on a world-readable event log narrows it before writi
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("a room code that is not open reads as gone, not as quiet", async () => {
+  // Found by the person at the terminal after an app update ended their room: a dead code
+  // and a code nobody ever minted both answered `200 {"messages":[]}`, which is what an
+  // open room with nothing in it says. The send path and the stream already refused; the
+  // backlog read had been left out, so a session could watch a room that no longer
+  // existed and conclude the others had simply gone quiet.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-gone-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const founder = "gone-founder";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+
+    // A code that was never minted.
+    const never = await fetch(`${base}/mail/sync-zzzz?since=0&as=${founder}`, { headers });
+    assert.equal(never.status, 404);
+    assert.equal((await never.json()).error, "no_such_room");
+
+    // And one that was real and has ended, which is the case that bit.
+    const created = await fetch(`${base}/sync/rooms`, {
+      method: "POST", headers, body: JSON.stringify({ conversationId: founder }),
+    });
+    const code = (await created.json()).room;
+    const closed = await fetch(`${base}/sync/rooms/${code}`, {
+      method: "DELETE", headers, body: JSON.stringify({ conversationId: founder }),
+    });
+    assert.equal(closed.status, 200);
+
+    const gone = await fetch(`${base}/mail/${code}?since=0&as=${founder}`, { headers });
+    assert.equal(gone.status, 404, "a room that has ended must not read as an empty room");
+    assert.match((await gone.json()).message, /nothing here to read/);
+
+    // A private mailbox is not a room code and is still created on demand.
+    const mailbox = await fetch(`${base}/mail/${founder}?since=0`, { headers });
+    assert.equal(mailbox.status, 200);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

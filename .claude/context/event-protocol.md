@@ -181,7 +181,18 @@ Separate from any credential, and checked first. `access-control-allow-origin` w
 
 `GET /mail/inbox`, `GET /mail/wait` and a private mailbox's own stream take the machine token **or** the password of the room that session is in. Both shut out a process holding neither, and `collect=1` is why that matters — it takes the mail rather than reading it, moving the cursor so the session it was addressed to never sees it.
 
-Neither credential is per-session, so neither says *which* session is asking. The machine token is read by every agent on this machine to make any call at all; a room's password is shared by everyone in that room, including a member who has been removed and still remembers it. A peer can therefore still open a peer's mailbox. Closing that needs a per-session credential, which does not exist yet — it is a design change, not a missing check, and it is deliberately not in this pass.
+Neither credential is per-session, so neither says *which* session is asking. The machine token is read by every agent on this machine to make any call at all; a room's password is shared by everyone in that room, including a member who has been removed and still remembers it. A peer can therefore still open a peer's mailbox with `/mail/inbox?as=<the other session>&collect=1`.
+
+**This is not a missing check, and a per-session secret does not fix it on its own.** The threat model is worth stating plainly, because it has been proposed as a small change more than once:
+
+- Every hook and every agent runs as the same Unix user, so each can read anything the others can — the machine token included, which the app itself teaches them to read.
+- A hook is a process that lives for milliseconds. It cannot remember a secret between invocations, so a per-session secret would have to be written where the next invocation can find it — which is to say where every other agent can find it too.
+- `?as=` is a name the caller writes. Nothing in an HTTP request over loopback tells the bridge which process sent it: Node exposes no peer credentials for a TCP socket, and none for a Unix socket either.
+- `GET /snapshot` and `GET /events` are open by design, so the conversation ids to name are not secret in the first place.
+
+So a secret held in a file, or handed over through the hooks as they work today, is not a security boundary — it only looks like one, which is worse than this paragraph. What would close it is a change of trust boundary rather than another credential: a native broker that attests the calling process through the OS and maps it to a conversation id, or agents separated by sandbox or account so that each session's secret lands somewhere the others cannot read. Either is real work with a real design, and until one exists this is a documented limit, not an oversight.
+
+Requiring the machine token on `/snapshot` and `/events` would keep conversation ids away from a process that has no token at all. That is worth doing for its own sake, and it is **not** a fix for this: an attacker who can read the token reads the ids too.
 
 Reading a room takes both halves: its password **and** `?as=` naming a confirmed member. The password alone is not enough, because a session that has been disconnected still remembers it. This was written twice and the copies had drifted — the stream applied it and the backlog read beside it applied nothing, so a whole room could be read by anything that sent the header non-empty. It is one rule now.
 

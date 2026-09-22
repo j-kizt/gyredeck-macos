@@ -6,12 +6,19 @@ Pre-1.0, we use `0.MINOR.PATCH`:
 
 | Change | Bump | Example |
 | --- | --- | --- |
-| New feature or user-visible behavior change | **minor** (`0.X.0`) | new adapter/plugin, popover→window, new tab |
-| Bug fix, perf, docs, internal refactor | **patch** (`0.x.Y`) | crash fix, scope fix |
+| Something the app could not do before | **minor** (`0.X.0`) | new adapter/plugin, popover→window, new tab |
+| Bug fix, perf, docs, internal refactor | **patch** (`0.x.Y`) | crash fix, scope fix, a repair a user plainly notices |
 
 Adopted from **v0.2.0** onward. Earlier tags (`v0.1.1`–`v0.1.9`) predate this rule and used patch bumps for everything (including the v0.1.7 Antigravity feature) — treat them as history, don't refactor.
 
-When unsure whether a change is "feature" or "fix": if a user would notice the app behaves differently, it's minor.
+**A fix is a patch, however visible it is.** Repairing something broken changes what a
+user sees — that is what repairing means — so "would they notice?" cannot be the test, and
+reading it as one empties the patch row: every release becomes minor. Minor is for
+something the app could not do before.
+
+When genuinely unsure, ask what the release *adds*. Nothing added, however much behaviour
+moved, is a patch. v1.16.0 was cut as a minor carrying only fixes, on the strength of the
+sentence this replaces; that one is history, don't refactor.
 
 ## Release flow
 

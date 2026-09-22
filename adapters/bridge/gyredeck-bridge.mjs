@@ -2967,6 +2967,20 @@ function startBridge(config) {
       // its mail delivered while the agent had never seen it.
       if (req.method === "GET" && tail === undefined) {
         const room = mailRoomFor(name, false);
+        // A room code that is not open answers like a room that is, but empty — which
+        // reads as "nothing was said here" rather than "this room is gone". The person at
+        // the terminal found it: a dead code and a code nobody ever minted were
+        // indistinguishable, so a session could keep watching a room that had ended and
+        // see only quiet. The send path and the stream beside this one already say so;
+        // this one had been left out.
+        if (!room && SYNC_CODE.test(name)) {
+          sendJson(404, {
+            ok: false,
+            error: "no_such_room",
+            message: "Nothing by that code is open. A room ends with its last member, and with the bridge that held it — there is nothing here to read, and there never will be again.",
+          });
+          return;
+        }
         // The same rule the stream beside this one applies, and for the same reason: this
         // hands over the room's messages, and `collect=1` takes them — the cursor moves
         // and the session they were addressed to never sees them. It was the stream alone

@@ -30,6 +30,7 @@ these steps only when the user asks to release.
 
 1. Branch off `main` (e.g. `release/vX.Y.Z`) and bump `"version"` in all three: `apps/desktop/src-tauri/tauri.conf.json`, `package.json`, `apps/desktop/package.json`.
 2. Rewrite `.github/release-notes.md` — CI reads it **verbatim** as the GitHub Release body. Keep the style: 1-line preamble + `### Changed` / `### Fixes` sections.
+   - Heading: `## <what it is about> — (vX.Y.Z)`, from v1.16.1 on. The version used to come first, which read as a second title directly under the release's own — GitHub already shows the tag above it. Earlier entries keep the old shape; they are history.
 3. Commit (conventional-commit message, `Co-Authored-By` trailer), push the branch, and open a PR into `main` with `gh pr create`.
 4. Merge the PR, then `git checkout main && git pull`.
 5. Tag the merge commit: `git tag -a vX.Y.Z -m "Gyredeck vX.Y.Z" && git push origin vX.Y.Z`. The tag must point at a commit already on `main` — tagging the branch before it merges publishes a build that `main` does not contain.

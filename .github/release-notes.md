@@ -1,5 +1,51 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A room ends when the person who made it leaves — (v1.16.1)
+
+Three faults in sync rooms, two of them found by using the thing. A room outlived the
+session that created it, the unread count outlived its room, and the room's password —
+the one thing you hand over by reading it out loud — was given to anything that asked.
+
+### Fixes
+
+- **Leaving a room you created ends it.** It used to remove you and leave the room
+  standing, which sounds harmless and is not: everything a room is for afterwards runs
+  through its founder, so what was left behind was a code nobody could be let into and
+  nobody could close. Now everyone in it is told, every watch is cut, and the room is
+  gone — the same as pressing Close, because leaving as the founder is the same act. A
+  session simply ending counts as leaving, which is the half that was missed the first
+  time. An ordinary member leaving is still just leaving.
+- **The message count on a session card goes when its room goes.** It was only ever
+  cleared for the session whose detail was open, which is not where the count is shown —
+  so a room closing while its session sat unopened in the list left a badge claiming
+  messages for a conversation that had ended, until you happened to click that session.
+- **A room's password is no longer handed to whoever asks for it.** Two calls returned
+  it — one on joining, one on confirming a session that was already confirmed — without
+  asking who was calling, and neither needed a credential to reach. Anything running on
+  this machine could name a session and be given the password a person is supposed to
+  read out by hand. Presenting the password is what earns it back now, and presenting a
+  wrong one is refused: it used to answer as though it had worked, so the terminal was
+  told a wrong password had been accepted.
+- **An access token could be sent unencrypted to another machine.** The check that
+  decided whether a URL was safe read the address by splitting the text, which takes a
+  username for a hostname — so a URL shaped like `http://localhost@elsewhere` passed as
+  local while the request went elsewhere. It reads the address properly now. Redirects
+  are refused as well, on both the usage and the local-service paths: a redirect is a
+  destination nobody checked, and the one that carries a refresh token keeps it across
+  the hop.
+- **Room codes are drawn evenly.** The first eight letters of the alphabet came up about
+  an eighth more often than the rest. Nothing depended on it — a code is a name, not a
+  secret — but it is free to do properly.
+
+### Notes
+
+- Running the test suite no longer starts your agents. It launched the real `codex` to
+  deliver a test message, against a temporary home directory it was also deleting.
+- A patch, not a minor: none of this is something the app could not do before. The
+  versioning note that made v1.16.0 a minor on the strength of "would a user notice?" has
+  been corrected — repairing something broken always changes what a user sees, so that
+  question cannot be what separates the two.
+
 ## v1.16.0 — The local bridge stops taking everybody's word for it
 
 The bridge listens on `127.0.0.1` and, until now, believed most of what reached it. The

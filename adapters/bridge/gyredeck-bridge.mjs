@@ -157,6 +157,97 @@ export const slowestReaderSeq = (room) => {
  * correspondence addressed to anyone, and nobody is owed an old roster.
  */
 /**
+ * Reading Codex's own log, at module scope so it can be tested.
+ *
+ * Nothing in here needs anything from the bridge — it is `node:fs` and these three
+ * functions — and the byte arithmetic is where two faults hid: a cursor that stepped over a
+ * reply the room had refused, and a rotated log that left the cursor above the new file's
+ * end. Neither was reachable from a test while this lived inside `startBridge`, so both had
+ * to be accepted on the strength of reading the code. That is the debt this repays.
+ */
+/** One line of a Codex rollout as a reply, or null when the line is anything else. */
+export const codexReplyFromLine = (line, sinceMs) => {
+  if (!line.trim()) return null;
+  let entry;
+  try { entry = JSON.parse(line); } catch { return null; }
+  if (entry.type !== "event_msg" || entry.payload?.type !== "task_complete") return null;
+  const text = entry.payload.last_agent_message;
+  if (typeof text !== "string" || !text.trim()) return null;
+  const at = Date.parse(entry.timestamp ?? "");
+  if (Number.isFinite(at) && at < sinceMs) return null;
+  return { turnId: entry.payload.turn_id ?? null, text: text.trim() };
+};
+
+export const readCodexReplies = (rolloutPath, sinceMs) => {
+  const replies = [];
+  let content = "";
+  try { content = readFileSync(rolloutPath, "utf8"); } catch { return replies; }
+  for (const line of content.split("\n")) {
+    const reply = codexReplyFromLine(line, sinceMs);
+    if (reply) replies.push(reply);
+  }
+  return replies;
+};
+
+/**
+ * Everything Codex has said past `offset`, and the offset to resume from next time.
+ *
+ * A byte cursor rather than a clock, because this one advances and a clock cannot
+ * advance safely: the old cursor moved to "now" before the file was read, so a line
+ * flushed a moment late fell below the next read's floor and was never published. The
+ * per-thread claim stops a reply being said twice; nothing stopped one being skipped.
+ *
+ * Only whole lines are consumed. A log caught mid-write ends in a partial line, and
+ * the returned offset stops in front of it so the next read sees it complete.
+ */
+export const readCodexLog = (rolloutPath, offset, sinceMs) => {
+  let size = 0;
+  try { size = statSync(rolloutPath).size; } catch { return { replies: [], offset, from: offset }; }
+  // A file **smaller** than its cursor was truncated or rewritten shorter, and the cursor
+  // now points past the end of a log that no longer holds what it was counting.
+  //
+  // This is the whole of what an offset can detect, and it is worth being exact about:
+  // a log replaced by a different file of the same size or larger is read from the middle
+  // of the new one, and an identical size reads as "nothing new". Catching that needs the
+  // file's identity — `dev` and `ino` kept beside the cursor and compared — which is a
+  // change in what this stores, not a change in this line. Codex CLI writes one rollout per
+  // session and never reuses a path, so it has not come up; if it ever does, that is the
+  // fix, not a wider comparison here.
+  const from = offset > size ? 0 : offset;
+  if (from >= size) return { replies: [], offset: size, from };
+  let chunk = "";
+  let fd = null;
+  try {
+    fd = openSync(rolloutPath, "r");
+    const buffer = Buffer.allocUnsafe(size - from);
+    const read = readSync(fd, buffer, 0, buffer.length, from);
+    // Safe to decode from here: an offset only ever lands just past a newline, so it
+    // never cuts a multi-byte character in half.
+    chunk = buffer.subarray(0, read).toString("utf8");
+  } catch {
+    return { replies: [], offset, from };
+  } finally {
+    if (fd !== null) { try { closeSync(fd); } catch {} }
+  }
+  const lastBreak = chunk.lastIndexOf("\n");
+  if (lastBreak < 0) return { replies: [], offset: from, from };
+  const whole = chunk.slice(0, lastBreak);
+  const replies = [];
+  // Where each reply ends, so the caller can stop the cursor between two of them. A
+  // batch can be taken in part — the room may have space for the first answer and not
+  // the second — and one offset for the whole read cannot say that. Rereading the ones
+  // already published is not free either: `claimCodexReply` remembers only the last
+  // CODEX_PUBLISHED_MEMORY of them, so a long enough batch would republish its own head.
+  let at = from;
+  for (const line of whole.split("\n")) {
+    at += Buffer.byteLength(line, "utf8") + 1;
+    const reply = codexReplyFromLine(line, sinceMs);
+    if (reply) replies.push({ ...reply, endsAt: at });
+  }
+  return { replies, offset: from + Buffer.byteLength(whole, "utf8") + 1, from };
+};
+
+/**
  * Who the room speaks as. Not a session: nothing answers it and nothing is addressed to it.
  */
 export const ROOM_SENDER = "gyredeck-room";
@@ -1295,80 +1386,6 @@ function startBridge(config) {
       }
     }
     return true;
-  };
-
-  /** One line of a Codex rollout as a reply, or null when the line is anything else. */
-  const codexReplyFromLine = (line, sinceMs) => {
-    if (!line.trim()) return null;
-    let entry;
-    try { entry = JSON.parse(line); } catch { return null; }
-    if (entry.type !== "event_msg" || entry.payload?.type !== "task_complete") return null;
-    const text = entry.payload.last_agent_message;
-    if (typeof text !== "string" || !text.trim()) return null;
-    const at = Date.parse(entry.timestamp ?? "");
-    if (Number.isFinite(at) && at < sinceMs) return null;
-    return { turnId: entry.payload.turn_id ?? null, text: text.trim() };
-  };
-
-  const readCodexReplies = (rolloutPath, sinceMs) => {
-    const replies = [];
-    let content = "";
-    try { content = readFileSync(rolloutPath, "utf8"); } catch { return replies; }
-    for (const line of content.split("\n")) {
-      const reply = codexReplyFromLine(line, sinceMs);
-      if (reply) replies.push(reply);
-    }
-    return replies;
-  };
-
-  /**
-   * Everything Codex has said past `offset`, and the offset to resume from next time.
-   *
-   * A byte cursor rather than a clock, because this one advances and a clock cannot
-   * advance safely: the old cursor moved to "now" before the file was read, so a line
-   * flushed a moment late fell below the next read's floor and was never published. The
-   * per-thread claim stops a reply being said twice; nothing stopped one being skipped.
-   *
-   * Only whole lines are consumed. A log caught mid-write ends in a partial line, and
-   * the returned offset stops in front of it so the next read sees it complete.
-   */
-  const readCodexLog = (rolloutPath, offset, sinceMs) => {
-    let size = 0;
-    try { size = statSync(rolloutPath).size; } catch { return { replies: [], offset, from: offset }; }
-    // A file smaller than its cursor was rotated or rewritten, and the cursor now points
-    // into a log that no longer exists.
-    const from = offset > size ? 0 : offset;
-    if (from >= size) return { replies: [], offset: size, from };
-    let chunk = "";
-    let fd = null;
-    try {
-      fd = openSync(rolloutPath, "r");
-      const buffer = Buffer.allocUnsafe(size - from);
-      const read = readSync(fd, buffer, 0, buffer.length, from);
-      // Safe to decode from here: an offset only ever lands just past a newline, so it
-      // never cuts a multi-byte character in half.
-      chunk = buffer.subarray(0, read).toString("utf8");
-    } catch {
-      return { replies: [], offset, from };
-    } finally {
-      if (fd !== null) { try { closeSync(fd); } catch {} }
-    }
-    const lastBreak = chunk.lastIndexOf("\n");
-    if (lastBreak < 0) return { replies: [], offset: from, from };
-    const whole = chunk.slice(0, lastBreak);
-    const replies = [];
-    // Where each reply ends, so the caller can stop the cursor between two of them. A
-    // batch can be taken in part — the room may have space for the first answer and not
-    // the second — and one offset for the whole read cannot say that. Rereading the ones
-    // already published is not free either: `claimCodexReply` remembers only the last
-    // CODEX_PUBLISHED_MEMORY of them, so a long enough batch would republish its own head.
-    let at = from;
-    for (const line of whole.split("\n")) {
-      at += Buffer.byteLength(line, "utf8") + 1;
-      const reply = codexReplyFromLine(line, sinceMs);
-      if (reply) replies.push({ ...reply, endsAt: at });
-    }
-    return { replies, offset: from + Buffer.byteLength(whole, "utf8") + 1, from };
   };
 
   // Mail rooms: a named channel for agents on this machine to talk to each other,

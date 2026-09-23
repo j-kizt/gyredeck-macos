@@ -3703,3 +3703,103 @@ test("a room code that is not open reads as gone, not as quiet", async () => {
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("a batch re-read after the dedup window overflows still publishes each answer once", async () => {
+  // `claimCodexReply` remembers the last 64 replies per thread. A batch that is re-read
+  // — because its tail was refused for space — loses the claims on its head once it is
+  // longer than that window, and publishes those answers a second time.
+  //
+  // Forcing it without running sixty-six turns, which is Codex's construction: leave the
+  // room space for sixty-five short replies but not the sixty-sixth, write sixty-six
+  // `task_complete` lines in one rollout, and harvest. The tail is refused, the batch is
+  // read again after the room drains, and the head has fallen out of the window.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-dedup-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const thread = "01a0845e-eb31-76d3-a20e-dbebd733f9f7";
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "09", "23");
+  await mkdir(rolloutDir, { recursive: true });
+  const rollout = join(rolloutDir, `rollout-2026-09-23T09-00-00-${thread}.jsonl`);
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "dedup-founder";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    for (const [conversationId, sourceKind] of [[founder, "claudeCodeHook"], [thread, "codexCliHook"]]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    assert.equal((await joinConfirmed(call, code, founder, thread)).status, 200);
+
+    // The founder fills the room to just under its message cap, addressed to the Codex
+    // session so nothing may be spent while it is not collecting. 500 is the cap; leaving
+    // 65 free means the 66th Codex reply is the one refused.
+    const roomState = await (await fetch(`http://127.0.0.1:${port}/mail`, { headers })).json();
+    const already = roomState.rooms.find((entry) => entry.room === code).buffered;
+    for (let i = already; i < 500 - 65; i += 1) {
+      const said = await call("POST", `/mail/${code}`, { from: founder, to: thread, kind: "tell", text: `filler-${i}` });
+      assert.equal(said.status, 202, `filling the room stopped early at ${i}`);
+    }
+
+    const said = Array.from({ length: 66 }, (_, i) => `answer-${i}`);
+    await writeFile(rollout, said.map((text) => `${JSON.stringify({
+      type: "event_msg",
+      timestamp: new Date().toISOString(),
+      payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: `@everyone tell\n${text}` },
+    })}\n`).join(""));
+
+    const stop = () => call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook",
+      workingDirectory: "/tmp/project", conversationId: thread,
+    });
+
+    await stop();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // Drain as the Codex session, which is what frees the space the tail needs.
+    for (let drain = 0; drain < 40; drain += 1) {
+      const seen = await (await fetch(`http://127.0.0.1:${port}/mail/inbox?as=${thread}&collect=1&limit=200`, { headers })).json();
+      if (seen.messages.length === 0) break;
+    }
+
+    await stop();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const history = await (await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${founder}`, {
+      headers: { "x-gyredeck-token": created.body.password },
+    })).json();
+    const fromCodex = history.messages.filter((message) => message.from === thread).map((message) => message.text);
+
+    const counted = fromCodex.reduce((tally, text) => tally.set(text, (tally.get(text) ?? 0) + 1), new Map());
+    const twice = [...counted].filter(([, times]) => times > 1);
+    assert.deepEqual(twice, [], `published more than once: ${JSON.stringify(twice)}`);
+    assert.ok(counted.size > 64, `the batch has to outrun the dedup window, and only ${counted.size} answers arrived`);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

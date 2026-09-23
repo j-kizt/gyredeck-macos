@@ -22,7 +22,7 @@
     "test:budget": "pnpm desktop:web:build && node scripts/check-performance-budget.mjs",
     "test:performance": "pnpm desktop:web:build && node scripts/check-performance-budget.mjs && node scripts/benchmark-session-model.mjs --assert && node scripts/benchmark-bridge.mjs --events=5000 --assert",
     "test:demo": "playwright test",
-    "test:hooks": "node --test tests/hook-integration.test.mjs && node --experimental-strip-types --test tests/git-changes.test.mjs && node --experimental-strip-types --test tests/usage-alerts.test.mjs && node --experimental-strip-types --test tests/room-inbox.test.mjs && node --experimental-strip-types --test tests/hook-status.test.mjs && node --test tests/sync-code.test.mjs && node --test tests/room-founder.test.mjs && node --test tests/event-log-mode.test.mjs && node --test tests/room-capacity.test.mjs"
+    "test:hooks": "node --test tests/hook-integration.test.mjs && node --experimental-strip-types --test tests/git-changes.test.mjs && node --experimental-strip-types --test tests/usage-alerts.test.mjs && node --experimental-strip-types --test tests/room-inbox.test.mjs && node --experimental-strip-types --test tests/hook-status.test.mjs && node --test tests/sync-code.test.mjs && node --test tests/room-founder.test.mjs && node --test tests/event-log-mode.test.mjs && node --test tests/room-capacity.test.mjs && node --test tests/codex-log.test.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.61.0",

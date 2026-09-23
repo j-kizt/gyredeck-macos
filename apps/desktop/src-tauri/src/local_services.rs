@@ -1478,17 +1478,65 @@ mod macos {
                 port,
                 mode: LocalServiceControlMode::Stop,
             };
-            let listening = (0..40).any(|_| {
-                let listening =
-                    endpoint_is_listening(&request, Instant::now() + Duration::from_millis(250))
-                        .unwrap_or(false);
-                if !listening {
-                    thread::sleep(Duration::from_millis(25));
+            // Wait by the clock, not by a count of attempts, and give each probe room.
+            //
+            // `endpoint_is_listening` returns `Err` when its `lsof` does not finish in the
+            // budget it was given, and `unwrap_or(false)` read that as "not listening yet" —
+            // so a loaded machine spent its forty attempts on probes that never got to look,
+            // and the fixture declared a listener missing that was there all along. Same
+            // mistake as the one `with_control_fixture` exists for: a probe that could not
+            // run is not an answer. Thirty seconds is far past anything a local python
+            // needs, and is only ever waited out when something is genuinely wrong.
+            let waiting_until = Instant::now() + Duration::from_secs(30);
+            let mut listening = false;
+            while Instant::now() < waiting_until {
+                if endpoint_is_listening(&request, Instant::now() + Duration::from_secs(1))
+                    .unwrap_or(false)
+                {
+                    listening = true;
+                    break;
                 }
-                listening
-            });
+                thread::sleep(Duration::from_millis(25));
+            }
             assert!(listening, "test-owned listener did not become visible");
             (ChildGuard(child), request)
+        }
+
+        /// Run a control scenario, and if the machine could not answer, run it again from
+        /// a brand new fixture.
+        ///
+        /// `revalidationUnavailable` is what comes back when the `lsof` behind revalidation
+        /// does not finish inside its budget. It is not a wrong answer about the listener —
+        /// it is the absence of one, and the product is right to fail closed there. A test
+        /// that asserts a real outcome is therefore asserting that a probe finished in time,
+        /// which on a machine running the whole suite at once it does not always do:
+        /// measured at 4 failures in 24 full-suite runs before this.
+        ///
+        /// Asking the same process again is not the answer, and that was the first thing I
+        /// tried. The status also appears *after* a signal has gone out, when the
+        /// confirmation that follows it cannot run — retrying there sends a second SIGTERM
+        /// on the theory that nothing has happened yet. Codex caught that, and narrowing the
+        /// retry to the pre-signal case simply put the flake back, because the post-signal
+        /// case is the one that fails.
+        ///
+        /// So the unit of retry is the whole scenario. Each attempt gets its own process and
+        /// its own state, and an attempt that could not be confirmed is discarded rather
+        /// than patched up — no control request is ever repeated against a fixture that has
+        /// already been signalled. A scenario may still signal its process more than once by
+        /// design, as the concurrent one does with SIGTERM and then SIGKILL; what never
+        /// happens is a retry replaying a stage the fixture has already been through. A probe that could not run is not an answer, and the way
+        /// to get an answer is to ask again from the beginning.
+        fn with_control_fixture<T>(
+            signal_handler: &str,
+            attempt: impl Fn(&ChildGuard, &LocalServiceControlRequest) -> Option<T>,
+        ) -> T {
+            for _ in 0..5 {
+                let (child, request) = spawn_control_fixture(signal_handler);
+                if let Some(value) = attempt(&child, &request) {
+                    return value;
+                }
+            }
+            panic!("every attempt ended with a revalidation that could not run");
         }
 
         fn grant_control(state: &LocalServicesControlState, request: &LocalServiceControlRequest) {
@@ -1894,54 +1942,78 @@ mod macos {
 
         #[test]
         fn closing_only_the_listener_never_unlocks_force_kill() {
-            let (mut child, request) = spawn_control_fixture(
+            with_control_fixture(
                 "def handle_term(*_):\n    s.close()\nsignal.signal(signal.SIGTERM,handle_term)",
-            );
-            let state = LocalServicesControlState::default();
-            grant_control(&state, &request);
+                |child, request| {
+                    let state = LocalServicesControlState::default();
+                    grant_control(&state, request);
 
-            let result = control(request.clone(), &state);
-            assert_eq!(result.status, "listenerStopped");
-            assert!(child
-                .0
-                .try_wait()
-                .expect("inspect fixture process")
-                .is_none());
-            let force = control(
-                LocalServiceControlRequest {
-                    mode: LocalServiceControlMode::ForceKill,
-                    ..request
+                    let result = control(request.clone(), &state);
+                    if result.status == "revalidationUnavailable" {
+                        return None;
+                    }
+                    assert_eq!(result.status, "listenerStopped");
+                    // Still the same live process: closing its listener must not have
+                    // ended it. Asked of the system rather than of the `Child` handle,
+                    // which needs `&mut` and would make this scenario unrepeatable.
+                    let still_there = super::basic_process(request.process_id)
+                        .is_some_and(|process| {
+                            process.start_time_ms == request.process_start_time_ms
+                        });
+                    assert!(still_there, "closing the listener ended the process");
+                    let _ = child;
+                    let force = control(
+                        LocalServiceControlRequest {
+                            mode: LocalServiceControlMode::ForceKill,
+                            ..request.clone()
+                        },
+                        &state,
+                    );
+                    if force.status == "revalidationUnavailable" {
+                        return None;
+                    }
+                    assert_eq!(force.status, "notAllowed");
+                    Some(())
                 },
-                &state,
             );
-            assert_eq!(force.status, "notAllowed");
         }
 
         #[test]
         fn concurrent_force_requests_share_no_progression_proof() {
-            let (_child, request) =
-                spawn_control_fixture("signal.signal(signal.SIGTERM,signal.SIG_IGN)");
-            let state = Arc::new(LocalServicesControlState::default());
-            grant_control(&state, &request);
-            assert_eq!(control(request.clone(), &state).status, "stillRunning");
+            with_control_fixture(
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN)",
+                |_child, request| {
+                    let state = Arc::new(LocalServicesControlState::default());
+                    grant_control(&state, request);
+                    let opened = control(request.clone(), &state).status;
+                    if opened == "revalidationUnavailable" {
+                        return None;
+                    }
+                    assert_eq!(opened, "stillRunning");
 
-            let force_request = LocalServiceControlRequest {
-                mode: LocalServiceControlMode::ForceKill,
-                ..request
-            };
-            let first_state = Arc::clone(&state);
-            let first_request = force_request.clone();
-            let first = thread::spawn(move || control(first_request, &first_state).status);
-            let second_state = Arc::clone(&state);
-            let second = thread::spawn(move || control(force_request, &second_state).status);
-            let mut statuses = vec![
-                first.join().expect("join first force request"),
-                second.join().expect("join second force request"),
-            ];
-            statuses.sort();
-            assert_eq!(
-                statuses,
-                vec!["killed".to_string(), "notAllowed".to_string()]
+                    let force_request = LocalServiceControlRequest {
+                        mode: LocalServiceControlMode::ForceKill,
+                        ..request.clone()
+                    };
+                    let first_state = Arc::clone(&state);
+                    let first_request = force_request.clone();
+                    let first = thread::spawn(move || control(first_request, &first_state).status);
+                    let second_state = Arc::clone(&state);
+                    let second = thread::spawn(move || control(force_request, &second_state).status);
+                    let mut statuses = vec![
+                        first.join().expect("join first force request"),
+                        second.join().expect("join second force request"),
+                    ];
+                    if statuses.iter().any(|status| status == "revalidationUnavailable") {
+                        return None;
+                    }
+                    statuses.sort();
+                    assert_eq!(
+                        statuses,
+                        vec!["killed".to_string(), "notAllowed".to_string()]
+                    );
+                    Some(())
+                },
             );
         }
 

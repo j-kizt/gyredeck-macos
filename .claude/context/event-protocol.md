@@ -2,7 +2,7 @@
 
 Protocol version: `2` (`"protocol-v2"`)
 
-Events are newline-delimited JSON in `~/.config/gyredeck/gyredeck.events.ndjson` (set to `0600` before anything is written to it, or disk logging is off and the bridge says why) and Server-Sent Events from `GET /events`. Every adapter emits the same envelope regardless of which agent runtime produced the event.
+Events are newline-delimited JSON in `~/.config/gyredeck/gyredeck.events.ndjson` (set to `0600` before anything is written to it, or disk logging is off and the bridge says why; rotated to `.1` past 8 MiB, one generation kept and read back before the live log) and Server-Sent Events from `GET /events`. Every adapter emits the same envelope regardless of which agent runtime produced the event.
 
 ## Base fields
 

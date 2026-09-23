@@ -1,5 +1,29 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## The log stops growing, and the key that signs updates is replaced — (v1.17.0)
+
+**Install this one before the next release comes out.** It is what hands your copy the new
+key updates are signed with from here on. Take it and everything afterwards works as normal;
+still be on an older version when the next release lands and that one will refuse to install,
+leaving a manual download as the only way forward — Update has no way to offer you an earlier
+version instead.
+
+### Changed
+
+- **The event log no longer grows without limit.** `gyredeck.events.ndjson` records what each
+  agent was doing and where, and nothing had ever shortened it — it had reached 21 MB here,
+  and every start read the whole of it. It is now moved aside past 8 MiB, one previous copy
+  is kept, and startup reads only the end of it. If it ever cannot be moved aside, Gyredeck
+  stops writing to disk and says so rather than growing anyway.
+- **The key that signs updates has been replaced.** The old one had no passphrase and, until
+  this week, was readable by anything on the machine — which means anyone who had been on
+  your Mac could have signed an update Gyredeck would have accepted. There is no sign that
+  anybody did; it is being replaced because it could not be ruled out. The new one is
+  passphrase-protected and the passphrase is kept in the macOS Keychain.
+
+This release is still signed with the old key, which is what lets your current copy accept
+it. The switch happens in a later release, once everyone has this one.
+
 ## Nothing you can see, and that is the point — (v1.16.4)
 
 Housekeeping only. Nothing this release changes is visible while using the app, and it is

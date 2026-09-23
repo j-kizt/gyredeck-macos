@@ -1,5 +1,23 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Nothing you can see, and that is the point — (v1.16.4)
+
+Housekeeping only. Nothing this release changes is visible while using the app, and it is
+published so the work is not left sitting unreleased rather than because there is anything
+to go and look at.
+
+### Changed
+
+- **Three pieces of the bridge that could not be tested now can be.** The part that lifts
+  Codex's answers out of its own log lived somewhere no test could reach it, which is why
+  two faults in it last release had to be accepted on the strength of reading the code
+  rather than proving them. It is exactly the same code in the same order, in a place tests
+  can call.
+- **Two tests that failed occasionally now fail only for real reasons.** One depended on
+  where a twenty-four second demo cycle happened to be when it clicked; the other asserted
+  an outcome that a busy machine sometimes cannot produce an answer for at all. Neither was
+  ever a fault in the app, and no behaviour was changed to settle them.
+
 ## Nothing said in a sync room goes missing without saying so — (v1.16.3)
 
 Two ways a room could lose your messages quietly, and one way it could pretend to still

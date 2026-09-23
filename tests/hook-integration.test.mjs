@@ -3803,3 +3803,63 @@ test("a batch re-read after the dedup window overflows still publishes each answ
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("a running bridge rotates its event log rather than growing forever", async () => {
+  // Rotating only at startup would bound nothing: this process runs for days. The
+  // descriptor follows the file rather than the path, so a rename leaves it writing into
+  // the generation that was moved aside — it has to be reopened on the near side of the
+  // new name, and that is what this watches for.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-rotate-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const logFile = join(home, ...CONFIG_DIR, "gyredeck.events.ndjson");
+  // Just under the 8 MiB cap, so a handful of events carries it over.
+  await writeFile(logFile, `${"x".repeat(8 * 1024 * 1024 - 4_096)}\n`);
+  await chmod(logFile, 0o600);
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+
+    // Enough events to cross what the fixture left free.
+    const conversationId = `rotate-${randomUUID()}`;
+    for (let i = 0; i < 40; i += 1) {
+      const posted = await fetch(`http://127.0.0.1:${port}/ingest`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-gyredeck-token": token },
+        body: JSON.stringify({
+          version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+          conversationId, cwd: "/tmp/project", data: { inputCount: 1, filler: "y".repeat(200) },
+        }),
+      });
+      assert.equal(posted.status, 202);
+    }
+
+    const rotated = `${logFile}.1`;
+    assert.ok(existsSync(rotated), "the log it found was moved aside");
+    assert.equal((await stat(rotated)).mode & 0o777, 0o600, "and stayed private on the way");
+
+    // The live log is the small one, and it is still being written — which is the half a
+    // rename alone would break.
+    const live = await stat(logFile);
+    assert.ok(live.size < 1024 * 1024, `the live log restarted small, is ${live.size}`);
+    assert.ok(
+      (await readFile(logFile, "utf8")).includes(conversationId),
+      "and events still land in it after the rotation",
+    );
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

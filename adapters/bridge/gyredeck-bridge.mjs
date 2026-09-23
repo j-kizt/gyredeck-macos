@@ -22,7 +22,7 @@
  *   POST /ingest    - Multi-provider event fan-in
  */
 
-import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
@@ -608,35 +608,100 @@ function createScopeTracker() {
 const LOG_FILE_MODE = 0o600;
 
 /**
+ * How large the event log may get, and how much of it is read back at startup.
+ *
+ * It had no bound at all: on this machine it had reached 21 MB and 42,000 lines, and the
+ * only thing that ever shortened it was somebody deleting it. One previous generation is
+ * kept, so the pair is about twice this — about, not exactly: `/ingest` puts no ceiling on
+ * a single event, so one oversized record can carry a generation past the cap on its own.
+ *
+ * Eight megabytes is roughly a fortnight of ordinary use here. The tail read is what the
+ * bridge hydrates `/snapshot` from, and 1 MiB is far more than the 500 events it keeps —
+ * reading the whole file for them cost 42 ms at 20 MB and grew with the file.
+ */
+const LOG_MAX_BYTES = 8 * 1024 * 1024;
+const LOG_TAIL_BYTES = 1024 * 1024;
+
+/** Where a log goes when it is rotated. One generation is kept; the older one is lost. */
+export const rotatedLogPath = (logFile) => `${logFile}.1`;
+
+/**
+ * Open the log and prove it is ours before a byte goes near it.
+ *
+ * Every way into the file goes through here — the first open and every reopen after a
+ * rotation — because the checks are the point and a second door without them is a second
+ * door without them. `O_NOFOLLOW` refuses a symlink outright; `fstat` on the descriptor
+ * says it is a regular file; `fchmod` through that same descriptor makes it private and is
+ * verified. Path and descriptor are never mixed: nothing here works by name after the open.
+ *
+ * Throws rather than returning a reason, so a caller cannot carry on with a descriptor it
+ * did not earn.
+ */
+const openPrivateLog = (logFile) => {
+  const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW;
+  const fd = openSync(logFile, flags, LOG_FILE_MODE);
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile()) throw new Error("not a regular file");
+    if ((opened.mode & 0o777) !== LOG_FILE_MODE) {
+      // Every machine that ran an older bridge has a log at 0644, and nothing else would
+      // ever narrow it.
+      fchmodSync(fd, LOG_FILE_MODE);
+      if ((fstatSync(fd).mode & 0o777) !== LOG_FILE_MODE) throw new Error("the mode did not change");
+    }
+    return { fd, size: opened.size };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+};
+
+/**
+ * Move the log aside so the next open starts an empty one.
+ *
+ * Called only once the path has been proved a regular private file by `openPrivateLog`,
+ * and only with that descriptor already closed. The order matters and the first version of
+ * this had it backwards: rotating first meant `statSync` followed a symlink, `renameSync`
+ * moved the symlink, and `chmodSync` reached through it to change something else's mode —
+ * the exact thing `O_NOFOLLOW` is there to refuse, undone by the housekeeping in front of
+ * it. Codex reproduced that against a symlink pointing at an 8 MiB file and watched the
+ * target get chmodded.
+ *
+ * What this does and does not establish: the path held a regular private file a moment ago,
+ * which is what kills the static symlink. It is not proof of identity across the gap between
+ * closing the descriptor and renaming — another process of this user could swap the path in
+ * between. Agents on this machine all run as the same user and can reach these files
+ * directly anyway, so that is outside what this defends against; it is said here rather than
+ * implied by a comment claiming more.
+ *
+ * The file is already `0600` by the time it is renamed, so the generation moved aside is
+ * private without anything having to touch it by path afterwards. Throws when the rename
+ * fails, because the caller has just closed its descriptor and must not carry on writing to
+ * a log it could not rotate — a directory that allows writes but not renames would otherwise
+ * grow forever, one event at a time. Codex reproduced that too.
+ */
+export const rotateEventLog = (logFile) => {
+  renameSync(logFile, rotatedLogPath(logFile));
+};
+
+/**
  * Open the event log for appending, or refuse to write to disk and say why.
  *
- * Everything happens through one file descriptor, deliberately. Checking a path and then
- * writing to that path are two different files if anything moves in between, and the mode
- * is exactly what an attacker would want to change in that gap; a descriptor is the file
- * itself. `O_NOFOLLOW` refuses a symlink outright, so the log cannot be pointed at
- * something else that then inherits `0600` and our writes.
- *
- * A log that cannot be confirmed as a regular file at `0600` is **not written to**. The
- * earlier version of this swallowed a failed `chmod` and appended anyway, which left the
- * file exactly as wide as it had been while the docs claimed otherwise — Codex caught that
- * in review. Presence is still not worth a leak, so the bridge says one line on stderr and
- * runs on: the log is local diagnostics, and `GET /events` and `/snapshot` are unaffected.
+ * A log that cannot be confirmed as a private regular file is **not written to**. An earlier
+ * version swallowed a failed `chmod` and appended anyway, which left the file exactly as
+ * wide as it had been while the docs claimed otherwise. Presence is not worth a leak, so the
+ * bridge says one line on stderr and runs on: the log is local diagnostics, and `GET /events`
+ * and `/snapshot` are unaffected.
  *
  * Note what that does *not* promise. Disk logging narrows the file before writing to it, or
- * it is off. It does not narrow a file it has given up on — a log that was already `0644`
- * and could not be chmodded stays `0644`, holding whatever it already held. The guarantee
- * is about what this bridge adds, not about what it finds.
+ * it is off. It does not narrow a file it has given up on. The guarantee is about what this
+ * bridge adds, not about what it finds.
  *
- * Exported, and returns a writer rather than a descriptor, so no caller can hold the fd
- * and skip the check that earned it.
+ * Exported, and returns a writer rather than a descriptor, so no caller can hold the fd and
+ * skip the checks that earned it.
  */
 export function openEventLog(logFile) {
-  const refuse = (why) => ({
-    enabled: false,
-    why,
-    append() {},
-    close() {},
-  });
+  const refuse = (why) => ({ enabled: false, why, append() {}, close() {} });
 
   try {
     mkdirSync(dirname(logFile), { recursive: true, mode: 0o700 });
@@ -645,27 +710,20 @@ export function openEventLog(logFile) {
   }
 
   let fd;
+  let written;
   try {
-    const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW;
-    fd = openSync(logFile, flags, LOG_FILE_MODE);
+    // Opened and vouched for *before* anything is rotated: the size that decides a rotation
+    // is this descriptor's own, and rotation is considered only once it has passed
+    // validation. What that does and does not establish is set out on `rotateEventLog`.
+    ({ fd, size: written } = openPrivateLog(logFile));
+    if (written >= LOG_MAX_BYTES) {
+      closeSync(fd);
+      rotateEventLog(logFile);
+      ({ fd, size: written } = openPrivateLog(logFile));
+    }
   } catch (error) {
     // ELOOP is the interesting one: the path is a symlink, and following it is the whole
     // thing `O_NOFOLLOW` exists to refuse.
-    return refuse(`cannot open ${logFile} for appending: ${error.code ?? error.message}`);
-  }
-
-  try {
-    const opened = fstatSync(fd);
-    if (!opened.isFile()) throw new Error("not a regular file");
-    if ((opened.mode & 0o777) !== LOG_FILE_MODE) {
-      // Every machine that ran an older bridge has a log at 0644, and nothing else would
-      // ever narrow it. Through the descriptor, so it is this file and not whatever the
-      // path names by now.
-      fchmodSync(fd, LOG_FILE_MODE);
-      if ((fstatSync(fd).mode & 0o777) !== LOG_FILE_MODE) throw new Error("the mode did not change");
-    }
-  } catch (error) {
-    closeSync(fd);
     return refuse(`will not write ${logFile}: ${error.code ?? error.message}`);
   }
 
@@ -679,11 +737,18 @@ export function openEventLog(logFile) {
         // Through the descriptor that was checked, but by `appendFileSync` rather than
         // `writeSync`: a raw write may take only part of the line and report how much,
         // which would leave half a JSON object in an NDJSON file and call it a success.
-        // Codex caught that. This writes all of it or throws.
         appendFileSync(fd, line);
+        written += Buffer.byteLength(line, "utf8");
+        // The bridge runs for days, so rotating only at startup would bound nothing. The
+        // descriptor follows the file rather than the path, so the rename must happen with
+        // it closed and the new file must earn its own descriptor the same way the first
+        // one did — an unchecked reopen would write into whatever now sits at the path.
+        if (written >= LOG_MAX_BYTES) {
+          closeSync(fd);
+          rotateEventLog(logFile);
+          ({ fd, size: written } = openPrivateLog(logFile));
+        }
       } catch (error) {
-        // A descriptor that has stopped accepting writes is not going to start again, and
-        // an event every turn would be a line of stderr every turn.
         open = false;
         console.error(`gyredeck: stopped writing the event log — ${error.code ?? error.message}`);
         try { closeSync(fd); } catch { /* already gone */ }
@@ -3416,18 +3481,62 @@ function startBridge(config) {
   return { server, emitLocal, capabilities, eventLog };
 }
 
-function readRecentEvents(logFile, maxRecent) {
+/**
+ * Whole lines from the end of one file, and nothing from the start of a broken one.
+ *
+ * The first line of a tail is almost certainly cut in half by where the read began, so it
+ * is dropped. If dropping it leaves nothing — which happens when a single line is longer
+ * than the window, and `/ingest` puts no ceiling on how long an event may be — the window
+ * is widened rather than the line being lost, because the event that does not fit is
+ * exactly the one being asked for.
+ */
+const tailLines = (path, tailBytes) => {
+  let fd = null;
   try {
-    if (!existsSync(logFile)) return [];
-    return readFileSync(logFile, "utf8")
-      .trim()
-      .split("\n")
-      .slice(-maxRecent)
-      .map((line) => { try { return JSON.parse(line); } catch { return null; } })
-      .filter((event) => event && typeof event.type === "string" && typeof event.id === "string");
+    const { size } = statSync(path);
+    if (size === 0) return [];
+    let window = Math.min(size, Math.max(tailBytes, 1));
+    for (;;) {
+      const from = size - window;
+      fd = openSync(path, "r");
+      const buffer = Buffer.allocUnsafe(window);
+      const read = readSync(fd, buffer, 0, buffer.length, from);
+      closeSync(fd);
+      fd = null;
+      const lines = buffer.subarray(0, read).toString("utf8").trim().split("\n");
+      if (from > 0) lines.shift();
+      if (lines.length > 0 || window >= size) return lines;
+      // Nothing survived the cut: the last line alone is bigger than the window.
+      window = Math.min(size, window * 4);
+    }
   } catch {
     return [];
+  } finally {
+    if (fd !== null) { try { closeSync(fd); } catch { /* already gone */ } }
   }
+};
+
+/**
+ * The last events written, read from the end of the log rather than through all of it.
+ *
+ * This hydrates `/snapshot` at startup and wants at most `maxRecent` events, but it used to
+ * read the whole file to find them — 42 ms at 20 MB, growing with the file forever.
+ *
+ * **The rotated generation is read first.** The event that carries the log past its cap is
+ * appended to the file that is then moved aside, so on the next start the live log can be
+ * empty while the newest events sit in `.1`. Reading only the live log meant a bridge that
+ * restarted at that moment came up having forgotten what it had just been told. Codex
+ * reproduced that exactly: `live recent=[]`, `rotated recent=["crossing-newest"]`.
+ *
+ * Exported for the test, which is the only way to see a file larger than the window read
+ * correctly.
+ */
+export function readRecentEvents(logFile, maxRecent, tailBytes = LOG_TAIL_BYTES) {
+  const lines = [...tailLines(rotatedLogPath(logFile), tailBytes), ...tailLines(logFile, tailBytes)];
+  return lines
+    .slice(-maxRecent)
+    .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+    .filter((event) => event && typeof event.type === "string" && typeof event.id === "string");
 }
 
 // ── CLI ──

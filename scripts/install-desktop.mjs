@@ -18,46 +18,43 @@ const run = (command, args) => {
 };
 
 // createUpdaterArtifacts signs the bundle at build time, so a local install needs the
-// updater signing key. Load it from the local key file when present, so
-// `pnpm desktop:install` works without exporting anything by hand.
+// updater signing key. It is loaded from the key file so `pnpm desktop:install` works
+// without exporting anything by hand.
 //
-// The newer key is passphrase-protected and the passphrase lives in the Keychain, never
-// in a file beside the key and never in this repo. The one it replaces had no passphrase
-// at all and sat at mode 0644 until 2026-09-23, which is what the rotation is for. The old
-// key is still accepted here so an install works on a machine that has not been given the
-// new one yet; when the switch is finished it goes.
-const keychainPassword = (account, service) => {
-  const found = spawnSync("security", ["find-generic-password", "-a", account, "-s", service, "-w"], {
-    encoding: "utf8",
-  });
-  return found.status === 0 ? found.stdout.trim() : null;
-};
-
-const signingKeys = [
-  {
-    path: join(homedir(), ".config", "gyredeck", "gyredeck-updater-v2.key"),
-    password: () => keychainPassword("updater-signing", "gyredeck-updater-key-password"),
-  },
-  {
-    path: join(homedir(), ".config", "gyredeck", "gyredeck-updater.key"),
-    password: () => "",
-  },
-];
-
+// One key, and no falling back to the one it replaced. Every installed copy now verifies
+// against the new key, so a build signed by the old one would succeed here and produce
+// updater artifacts nothing can accept — a silent fallback would hide exactly that, and
+// keep a retired key in the signing path. Codex made the case for closing it once the
+// rotation finished. The old key file stays on disk until the first release signed by the
+// new one has been seen to update cleanly; nothing looks for it.
+const signingKeyPath = join(homedir(), ".config", "gyredeck", "gyredeck-updater-v2.key");
 if (!process.env.TAURI_SIGNING_PRIVATE_KEY) {
-  const key = signingKeys.find((candidate) => existsSync(candidate.path));
-  if (key) {
-    const password = key.password();
-    if (password === null) {
-      console.error(
-        `Found ${key.path} but not its passphrase in the Keychain. Add it with:\n` +
-          "  security add-generic-password -a updater-signing -s gyredeck-updater-key-password -w '<passphrase>' -U",
-      );
-      process.exit(1);
-    }
-    process.env.TAURI_SIGNING_PRIVATE_KEY = readFileSync(key.path, "utf8").trim();
-    process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ??= password;
+  if (!existsSync(signingKeyPath)) {
+    console.error(
+      `No updater signing key at ${signingKeyPath}.\n` +
+        "Copy it from a machine that has it, or set TAURI_SIGNING_PRIVATE_KEY yourself.",
+    );
+    process.exit(1);
   }
+  const found = spawnSync(
+    "security",
+    ["find-generic-password", "-a", "updater-signing", "-s", "gyredeck-updater-key-password", "-w"],
+    { encoding: "utf8" },
+  );
+  if (found.status !== 0) {
+    // `-w` last and empty, so `security` prompts for the passphrase instead of taking it
+    // from the command line — where it would land in the process list and the shell's
+    // history. `security help` says as much itself, and a recovery step for a signing key
+    // that leaks the passphrase on the way is not much of a recovery. Codex caught it here.
+    console.error(
+      "Found the signing key but not its passphrase in the Keychain. Add it with:\n" +
+        "  security add-generic-password -a updater-signing -s gyredeck-updater-key-password -U -w\n" +
+        "and type the passphrase at the prompt.",
+    );
+    process.exit(1);
+  }
+  process.env.TAURI_SIGNING_PRIVATE_KEY = readFileSync(signingKeyPath, "utf8").trim();
+  process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ??= found.stdout.trim();
 }
 
 run("pnpm", ["desktop:build"]);

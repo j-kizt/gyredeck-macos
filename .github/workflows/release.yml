@@ -84,20 +84,23 @@ jobs:
 
       # Which private key signs a release decides whether every installed copy can accept
       # it, and a published release cannot be taken back. Until this existed, the only
-      # thing standing behind that was the current value of a mutable secret. The two ids
-      # below are deliberately different while the signing key is being rotated: releases
-      # are still signed by the outgoing key so existing copies accept them, and carry the
-      # incoming public key so the copy that results trusts the next one. When the rotation
-      # finishes, `--expect-signing-pubkey` takes the same value as `--expect-config-pubkey`
-      # — the whole public key, not a key id: an id says which key something claims to be,
-      # and the thirty-two bytes after it are the key.
+      # thing standing behind that was the current value of a mutable secret.
+      #
+      # The two are the same key again: the rotation that made them differ is finished.
+      # They stay separate parameters because the next rotation will need them to differ
+      # again — a release signed by the key going out, carrying the key coming in — and a
+      # check that assumes they match cannot express that.
+      #
+      # Whole public keys, not key ids. An id says which key something claims to be; the
+      # thirty-two bytes after it are the key. The first version of this compared ids and
+      # would have passed a different key wearing the right one.
       - name: Check the signing key is the one this release expects
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: >
           node scripts/check-signing-key.mjs
-          --expect-signing-pubkey dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI2OUM4OTZFQjI0MEQxNEYKUldSUDBVQ3lib21jdG5uenY3QkErbmM4VG9UZllJNU1BVGlVQ2szNzdZUEZRNkkzNEtUR09ZQTMK
+          --expect-signing-pubkey dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNDNTEyMzAxRDU2QUUwMTMKUldRVDRHclZBU05SUEFUV3BWL3o3MHFZL0dNaG9oeXRVbHIvVTBXRTU3elFwd2tnQURHclhkWmgK
           --expect-config-pubkey dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNDNTEyMzAxRDU2QUUwMTMKUldRVDRHclZBU05SUEFUV3BWL3o3MHFZL0dNaG9oeXRVbHIvVTBXRTU3elFwd2tnQURHclhkWmgK
 
       - name: Build and release

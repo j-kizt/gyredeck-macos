@@ -1,5 +1,15 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## The first release signed with the new key — (v1.17.1)
+
+Nothing in Gyredeck behaves differently. This exists to prove the key replaced in v1.17.0 is
+the one signing releases now, on a version where being wrong costs an afternoon rather than
+an outage — and because the old key is not deleted until a release signed by the new one has
+been seen to install cleanly.
+
+If Update offers you this and installs it, that is the proof. If it refuses, say so: it means
+a copy somewhere did not take v1.17.0, and the fix is one manual download.
+
 ## The log stops growing, and the key that signs updates is replaced — (v1.17.0)
 
 **Install this one before the next release comes out.** It is what hands your copy the new

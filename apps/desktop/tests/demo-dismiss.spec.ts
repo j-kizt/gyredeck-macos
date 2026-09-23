@@ -4,8 +4,23 @@ const dismissedStorageKey = "gyredeck.dismissed-sessions";
 const deletedStorageKey = "gyredeck.deleted-sessions";
 const sessionEventsStorageKey = "gyredeck.session-events";
 
-test("clear hides ended sessions until fresh activity resumes", async ({ page }) => {
-  await page.goto("/?demo=1");
+/**
+ * Split in two, because the original raced the demo stream and lost about one run in eight
+ * under load.
+ *
+ * `?demo=1` pushes an event every 800 ms and cycles the conversation it belongs to every
+ * ten of them — `local-conv-demo-1` is alive for the first eight seconds, quiet for sixteen,
+ * then alive again. Clearing it and then asserting it stayed cleared is a bet on where in
+ * that cycle the click landed: near the end of it, fresh activity revives the session before
+ * the assertion can read the key, which is correct behaviour and a failing test.
+ *
+ * So each half is asked of a page where its answer cannot move. Clearing is asked of a
+ * static scenario with no stream at all; reviving is asked of a fresh `?demo=1` load, where
+ * the very first event — pushed synchronously, before the interval starts — belongs to
+ * `local-conv-demo-1`.
+ */
+test("clear hides a session that has ended", async ({ page }) => {
+  await page.goto("/?demo=1&demoScenario=done");
   await page.evaluate((key) => window.localStorage.removeItem(key), dismissedStorageKey);
   await page.reload();
 
@@ -13,11 +28,39 @@ test("clear hides ended sessions until fresh activity resumes", async ({ page })
   await clearButton.waitFor({ state: "visible", timeout: 10_000 });
   await clearButton.click();
 
-  await expect.poll(async () => page.evaluate((key) => window.localStorage.getItem(key), dismissedStorageKey)).toContain("local-conv-demo-1");
+  // Nothing is pushing events at this page, so the dismissal is the only thing that can
+  // move the key, and the row is the only thing that can leave the list.
+  await expect
+    .poll(async () => page.evaluate((key) => window.localStorage.getItem(key), dismissedStorageKey))
+    .toContain("local-conv-demo-done");
   await expect(page.getByText("Waiting for Claude Code")).toBeVisible({ timeout: 10_000 });
+});
 
-  await page.reload();
-  await expect.poll(async () => page.evaluate((key) => window.localStorage.getItem(key), dismissedStorageKey), { timeout: 10_000 }).not.toContain("local-conv-demo-1");
+test("fresh activity brings a cleared session back", async ({ page }) => {
+  // Seeded as already cleared, then handed a page whose first event is for that very
+  // conversation. The demo script restarts at index 0 on every load and pushes once
+  // immediately, before the 800 ms interval starts, so this waits on nothing.
+  //
+  // Two details, both load-bearing, both found by Codex reviewing the first version of
+  // this. The dismissal is written by `addInitScript`, which runs before the app does, so
+  // there is one load and no doubt about which event arrived first. And it is stamped a
+  // second in the past, because a session counts as still cleared while its dismissal is
+  // **at or after** its latest event — a dismissal written in the same millisecond as the
+  // first event would keep it hidden, correctly, and fail this test on a fast machine.
+  await page.addInitScript(
+    ([key, conversationId]) => {
+      window.localStorage.setItem(key, JSON.stringify({ [conversationId]: Date.now() - 1_000 }));
+    },
+    [dismissedStorageKey, "local-conv-demo-1"],
+  );
+  await page.goto("/?demo=1");
+
+  await expect
+    .poll(
+      async () => page.evaluate((key) => window.localStorage.getItem(key), dismissedStorageKey),
+      { timeout: 10_000 },
+    )
+    .not.toContain("local-conv-demo-1");
   await expect(page.getByText("gyredeck").first()).toBeVisible({ timeout: 10_000 });
 });
 

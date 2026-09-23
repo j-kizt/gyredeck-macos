@@ -17,13 +17,47 @@ const run = (command, args) => {
   if (result.status !== 0) process.exit(result.status ?? 1);
 };
 
-// createUpdaterArtifacts signs the bundle at build time, so a local install needs
-// the updater signing key. Load it from the local key file when present so
-// `pnpm desktop:install` works without manually exporting env vars.
-const signingKeyPath = join(homedir(), ".config", "gyredeck", "gyredeck-updater.key");
-if (!process.env.TAURI_SIGNING_PRIVATE_KEY && existsSync(signingKeyPath)) {
-  process.env.TAURI_SIGNING_PRIVATE_KEY = readFileSync(signingKeyPath, "utf8").trim();
-  process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ??= "";
+// createUpdaterArtifacts signs the bundle at build time, so a local install needs the
+// updater signing key. Load it from the local key file when present, so
+// `pnpm desktop:install` works without exporting anything by hand.
+//
+// The newer key is passphrase-protected and the passphrase lives in the Keychain, never
+// in a file beside the key and never in this repo. The one it replaces had no passphrase
+// at all and sat at mode 0644 until 2026-09-23, which is what the rotation is for. The old
+// key is still accepted here so an install works on a machine that has not been given the
+// new one yet; when the switch is finished it goes.
+const keychainPassword = (account, service) => {
+  const found = spawnSync("security", ["find-generic-password", "-a", account, "-s", service, "-w"], {
+    encoding: "utf8",
+  });
+  return found.status === 0 ? found.stdout.trim() : null;
+};
+
+const signingKeys = [
+  {
+    path: join(homedir(), ".config", "gyredeck", "gyredeck-updater-v2.key"),
+    password: () => keychainPassword("updater-signing", "gyredeck-updater-key-password"),
+  },
+  {
+    path: join(homedir(), ".config", "gyredeck", "gyredeck-updater.key"),
+    password: () => "",
+  },
+];
+
+if (!process.env.TAURI_SIGNING_PRIVATE_KEY) {
+  const key = signingKeys.find((candidate) => existsSync(candidate.path));
+  if (key) {
+    const password = key.password();
+    if (password === null) {
+      console.error(
+        `Found ${key.path} but not its passphrase in the Keychain. Add it with:\n` +
+          "  security add-generic-password -a updater-signing -s gyredeck-updater-key-password -w '<passphrase>' -U",
+      );
+      process.exit(1);
+    }
+    process.env.TAURI_SIGNING_PRIVATE_KEY = readFileSync(key.path, "utf8").trim();
+    process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ??= password;
+  }
 }
 
 run("pnpm", ["desktop:build"]);

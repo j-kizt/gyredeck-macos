@@ -41,5 +41,6 @@ these steps only when the user asks to release.
 
 - CI signs updater artifacts with the `TAURI_SIGNING_PRIVATE_KEY` GitHub Actions secret.
 - Actions caches are scoped per ref and only the default branch's are readable from tags, so `.github/workflows/cache-warm.yml` must keep tracking whatever the default branch is. Repointing it turns a ~4 min release back into ~9 min.
-- Local install for testing: `pnpm desktop:install` (reads the signing key from `~/.config/gyredeck/gyredeck-updater.key`).
+- Local install for testing: `pnpm desktop:install`. It prefers `~/.config/gyredeck/gyredeck-updater-v2.key`, whose passphrase it reads from the Keychain (account `updater-signing`, service `gyredeck-updater-key-password`), and falls back to the older passphrase-less `gyredeck-updater.key` for a machine that has not been given the new one.
+- **The signing key is mid-rotation.** `.github/workflows/release.yml` refuses to build unless the secret is the key it expects and `tauri.conf.json` carries the public key it expects — the two are deliberately different until the rotation finishes. Releases are still signed by the outgoing key so installed copies accept them; v1.17.0 is the bridge that hands them the incoming one. Switch `TAURI_SIGNING_PRIVATE_KEY` and its password, and set `--expect-signing-pubkey` in the workflow to the same public key as `--expect-config-pubkey` — both are whole keys, not key ids — only once every machine is past v1.17.0.
 - Never commit/push without explicit user approval.

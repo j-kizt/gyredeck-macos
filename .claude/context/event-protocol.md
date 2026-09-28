@@ -63,7 +63,7 @@ Bound to `127.0.0.1:47621`.
 | DELETE | `/sync/rooms/<code>/members/<id>` | Leave a room. |
 | GET | `/sync/rooms?as=<id>` | Which room a session is in, and who else. |
 | GET | `/mail/wait?as=<id>` | Long poll: the inbox, held until something arrives. |
-| POST | `/sync/rooms/<code>/passwords` | The founder reads the room's password. |
+| POST | `/sync/rooms/<code>/passwords` | The founder reads the room's password. Reading it out lets nobody in. |
 | POST | `/sync/rooms/<code>/confirm` | A joined session presents it and may then speak. |
 | DELETE | `/sync/rooms/<code>?as=<id>` | The founder ends the room for everyone. |
 
@@ -218,6 +218,13 @@ than from the hook. `cacheReadTokens` is reported as **0** on purpose, because C
 adding them turned 5.4% into 10.4% on a live thread. Antigravity reports neither, and
 its meter stays empty rather than guessing.
 
+Reading a room's password out — `POST /sync/rooms/<code>/passwords`, the *Copy password*
+button — confirms nobody. It used to confirm every unconfirmed Codex member present at the
+instant it was pressed, because Codex could not present a password itself; that made the
+press the credential rather than the password, and made the order decide, since nothing
+re-ran it for a session that joined afterwards. Now that a Codex session can be handed the
+password like any other, the press does one thing.
+
 `POST /hook/sync/confirm` is how the password reaches the bridge when the session is
 Codex. Codex's own hook never sees a prompt — it forwards `{inputCount: 1}` and nothing
 else — and Codex cannot open a socket from inside its sandbox, so before this route a
@@ -245,8 +252,7 @@ before claiming a reply, because a claimed reply is one nothing looks at again. 
 admission figure keeps a reserve under the push ceiling, since the confirmation carries the
 room's roster and the roster grows when somebody joins.
 
-Confirmation itself is one path for all three callers (`/passwords`, `/confirm`, this
-route): the state flips once, and what was said to the member while it waited is delivered
+Confirmation itself is one path for both callers (`/confirm` and this route): the state flips once, and what was said to the member while it waited is delivered
 then — messages from other sessions, not the room's own notices. A second paste of the
 same password is a no-op rather than a second announcement and a second copy of the
 backlog. Because notify fires when a turn *ends*, Codex has already answered the password

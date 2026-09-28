@@ -1472,11 +1472,12 @@ function startBridge(config) {
   /**
    * Let a member in, once, however the person's consent reached the bridge.
    *
-   * Three callers arrive here and each used to do its own half of the work: the founder
-   * reading the password out (`/sync/rooms/<code>/passwords`), a session presenting it
-   * itself (`/sync/rooms/<code>/confirm`), and Codex's notify handing over what the
-   * person typed (`/hook/sync/confirm`). The halves had already drifted — the founder's
-   * press announced a confirmation and delivered none of the backlog.
+   * Two callers arrive here: a session presenting the password itself
+   * (`/sync/rooms/<code>/confirm`), and Codex's notify handing over what the person typed
+   * (`/hook/sync/confirm`). A third used to — the founder reading the password out — and
+   * it did its own half of the work, announcing a confirmation and delivering none of the
+   * backlog. Reading the password out lets nobody in now; presenting it is the whole of
+   * how anyone gets in.
    *
    * How the session is told follows from what the session *is*, not from which caller
    * arrived: Codex is pushed to because it can be reached no other way, and everything
@@ -2998,16 +2999,18 @@ function startBridge(config) {
           return;
         }
         room.touchedAt = Date.now();
-        // Reading the password out is the founder's act of letting people in, and for
-        // an agent that cannot present it there is nothing further to wait for. Codex
-        // cannot open a socket from inside its sandbox, so asking it to confirm itself asks
-        // for something impossible; the key press is the consent, and it is applied
-        // here on its behalf.
-        for (const [conversationId, member] of room.members) {
-          if (member.confirmed === true) continue;
-          if (providerByConversation.get(conversationId) !== "codexCliHook") continue;
-          confirmRoomMember(code, room, conversationId);
-        }
+        // Reading the password out lets nobody in. It used to: the press confirmed every
+        // unconfirmed Codex member in the room at that instant, because Codex cannot open
+        // a socket from its sandbox and so could not present a password itself — the key
+        // press stood in for a consent it could not give.
+        //
+        // That is over. The password now reaches a Codex session the way it reaches every
+        // other: the person types it in, and `/hook/sync/confirm` carries it. So the press
+        // goes back to doing one thing, and the password goes back to being the thing that
+        // decides — a credential that confirms whoever holds it the moment it is copied is
+        // no credential at all. It also ends the order-dependence: pressing before a
+        // session joined confirmed nobody and nothing ever re-ran, which stranded it for
+        // good, and pressing after confirmed sessions the person had not meant to name.
         sendJson(200, { ok: true, room: code, password: room.password });
         return;
       }

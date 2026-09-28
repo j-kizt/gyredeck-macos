@@ -577,10 +577,11 @@ pub(crate) fn sync_create(conversation_id: &str) -> Result<SyncRoom, String> {
 
 /// Read the room's password, so the founder can copy it out.
 ///
-/// Only the founder may: handing out the right to speak in a room is the act of whoever
-/// set it up, not something a member can pass along. Password and token are one thing
-/// said two ways — a password to the person copying it, a token to the header that
-/// carries it on every read and send.
+/// Only the founder may: handing out a room's credential is the act of whoever set it up,
+/// not something a member can pass along. Reading it out grants nothing by itself — the
+/// session that holds it earns the right to speak by presenting it, and until then it is
+/// in the room and silent. Password and token are one thing said two ways — a password to
+/// the person copying it, a token to the header that carries it on every read and send.
 pub(crate) fn sync_issue_password(code: &str, conversation_id: &str) -> Result<String, String> {
     if !valid_room(code) || !valid_room(conversation_id) {
         return Err("Not a valid room".to_string());

@@ -28,3 +28,28 @@ test("nothing installed is nothing to reinstall", () => {
   // Flagging it would put a red dot on the gear every time the window opens.
   assert.equal(hookNeedsAttention(status(null, null)), false);
 });
+
+const { codexCanSync } = await import(module.href);
+const notify = (installed, stale) => ({ path: "/Users/x/.config/gyredeck/notify.mjs", installed, stale });
+
+test("Codex is offered sync only when the adapter that carries the password is current", () => {
+  assert.equal(codexCanSync(status(true, false), notify(true, false)), true);
+});
+
+test("a Codex hook alone is not enough", () => {
+  // The hook never sees a prompt. Without notify there is no way for a typed password to
+  // reach the bridge, and the room the person opens would never let the session speak.
+  assert.equal(codexCanSync(status(true, false), notify(false, null)), false);
+});
+
+test("an out-of-date notify is not enough either", () => {
+  // Updating the app does not replace what is installed in ~/.config/gyredeck. A notify
+  // from before this existed has no confirm path in it, and fails exactly as silently.
+  assert.equal(codexCanSync(status(true, false), notify(true, true)), false);
+});
+
+test("nothing is decided while anything is still unknown", () => {
+  assert.equal(codexCanSync(status(null, null), notify(true, false)), null);
+  assert.equal(codexCanSync(status(true, false), notify(null, null)), null);
+  assert.equal(codexCanSync(status(true, false), notify(true, null)), null);
+});

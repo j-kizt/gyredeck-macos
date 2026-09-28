@@ -1998,8 +1998,14 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     const created = await call("POST", "/sync/rooms", { conversationId: founder });
     const code = created.body.room;
     await call("POST", `/sync/rooms/${code}/members`, { conversationId: thread });
-    // Codex cannot present a password, so the founder reading it out is what lets it in.
-    await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+    // Codex cannot present a password itself — its sandbox refuses the socket — so its
+    // notify program carries the one the person typed at its prompt.
+    const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+    await call("POST", "/hook/sync/confirm", {
+      conversationId: thread,
+      turnId: "01a06082-8ef6-7900-ae39-44fe2e4600aa",
+      password: minted.body.password,
+    });
     // Reading a room needs the room's own password and a confirmed member to read as.
     // The machine token is deliberately not accepted for a room's messages: every agent
     // can read that file, so it can never carry the person's decision to let one
@@ -3989,9 +3995,10 @@ test("a room password carried in by notify lets that session in, once", async ()
     // real one does not have.
 
     const code = (await call("POST", "/sync/rooms", { conversationId: founder })).body.room;
-    // Press first, join second. `/passwords` confirms the Codex members that are in the
-    // room at the moment it is pressed and nothing re-runs that, so this is the order
-    // that used to strand a session for good.
+    // Press first, join second — the order that used to strand a session for good, back
+    // when `/passwords` confirmed the Codex members in the room at the moment it was
+    // pressed and nothing re-ran that. It confirms nobody at all now, so the order no
+    // longer decides anything; this reads as the starting state, not as the trap.
     const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
     await call("POST", `/sync/rooms/${code}/members`, { conversationId: joiner });
     assert.equal(await confirmedNow(), false, "joining after the press confirms nobody");
@@ -4324,6 +4331,82 @@ test("a confirmation that never reached Codex is retried, not reported as sent",
     });
     assert.equal(second.body.transitioned, false);
     assert.equal(second.body.delivered, false, "it tries again rather than claiming it went");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Reading the room's password out is not consent any more.
+ *
+ * It used to be: the press confirmed every unconfirmed Codex session in the room at that
+ * instant, because Codex could not present a password itself. That made the press the
+ * credential — whoever was in the room when somebody copied a string was in — and made
+ * the order decide, since nothing re-ran it for a session that joined afterwards. Codex
+ * can be handed the password now, through its notify program, so the press does one
+ * thing again.
+ */
+test("reading a room's password out lets nobody in", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-press-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "press-founder";
+  const codex = "01a06082-8ef6-7900-ae39-44fe2e4600bb";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const confirmedNow = async () =>
+      (await call("GET", `/sync/rooms?as=${codex}`)).body.members.find((m) => m.conversationId === codex)
+        .confirmed;
+
+    // Known to be Codex before the press — which is exactly when the old side effect
+    // fired, and so the only state in which this can be proven.
+    await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: codex, cwd: "/tmp/project",
+      runtime: { sourcePid: 3, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" },
+      data: { inputCount: 1 },
+    });
+
+    const code = (await call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: codex });
+    const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+    assert.equal(minted.status, 200, "the founder can still read it out");
+    assert.match(minted.body.password, /^[a-f0-9]{32}$/);
+    assert.equal(await confirmedNow(), false, "and reading it out confirmed nobody");
+
+    // Pressing it twice is still nothing. The password is what decides.
+    await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+    assert.equal(await confirmedNow(), false);
+
+    const carried = await call("POST", "/hook/sync/confirm", {
+      conversationId: codex,
+      turnId: "01a06082-8ef6-7900-ae39-44fe2e4600cc",
+      password: minted.body.password,
+    });
+    assert.equal(carried.body.confirmed, true, "typing it in is what lets the session in");
+    assert.equal(await confirmedNow(), true);
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();

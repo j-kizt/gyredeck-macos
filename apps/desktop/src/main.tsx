@@ -37,7 +37,7 @@ import {
 import type { DeletedSessionRegistry, DismissedSessionRegistry, ISessionDetail, ISessionSummary, IWorkspaceSessionGroup } from "./features/session/types";
 import { DEFAULT_BRIDGE_PORT, useGyredeckPresence } from "./features/presence/useGyredeckPresence";
 import { SetupPanel } from "./features/setup/SetupPanel";
-import { hookNeedsAttention, type IHookStatus } from "./features/setup/hookStatus";
+import { codexCanSync, hookNeedsAttention, type IHookStatus } from "./features/setup/hookStatus";
 import { useLaunchAtLogin } from "./features/setup/useLaunchAtLogin";
 import { useUpdater } from "./features/updater/useUpdater";
 import { readUsageSettings, writeUsageSettings } from "./features/usage/adapters";
@@ -1131,7 +1131,10 @@ const App = () => {
                         : selectedSession.provider === "Antigravity"
                           ? agyStatus.installed
                           : selectedSession.provider === "Codex"
-                            ? codexStatus.installed
+                            // Not the hook alone: the password a person types at a Codex
+                            // prompt is carried by its notify adapter, and nothing else
+                            // can carry it.
+                            ? codexCanSync(codexStatus, codexNotifyStatus)
                             : false
                     }
                   />

@@ -1,5 +1,35 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Pasting a room's password into Codex finally does something — (v1.17.2)
+
+If you have ever added Codex to a sync room and watched it sit there asking for a password it
+had already been given, this is that. It was not confused: nothing you did could reach it.
+
+### Fixes
+
+- **A session added to a room after you pressed Copy password was stuck for good.** That
+  button quietly confirms the Codex sessions that are in the room at the moment you press it,
+  and nothing ever ran that again — so adding Codex afterwards left it in the room, unable to
+  read a word or say one, with no way out but pressing the button a second time. Nothing said
+  so. Messages sent to it still reported success, its own answers were read and thrown away,
+  and both sides concluded the other was ignoring them.
+- **Pasting the password at the Codex prompt now works, which is what the app told you to do
+  all along.** It never had: Codex's hook deliberately forwards only that a turn began, never
+  what you typed, and Codex itself cannot reach Gyredeck from inside its sandbox. The password
+  now travels by the one channel that is neither — Codex's notify program — and only a value
+  that is already exactly the shape of a room password is ever sent. Nothing else you type
+  leaves the session.
+- **What was said to a session while it was waiting is now delivered when it is let in.**
+  Before, it was simply gone: an audit request left waiting for Codex had no way to arrive
+  even after the password was finally accepted.
+- **Codex's answer to the password itself no longer lands in the room.** It replies before
+  Gyredeck learns the password was typed, so a room's first word from Codex used to be it
+  wondering aloud whether you had sent it an MD5 hash.
+- **A room will not take mail it could not hand over.** Everything held for a session that
+  has not been let in yet has to leave in one piece, and that piece has a size limit the room
+  itself does not. Such a message is now refused when you send it, with a sentence naming who
+  is still waiting for the password — rather than accepted and quietly dropped later.
+
 ## The first release signed with the new key — (v1.17.1)
 
 Nothing in Gyredeck behaves differently. This exists to prove the key replaced in v1.17.0 is

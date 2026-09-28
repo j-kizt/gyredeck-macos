@@ -87,9 +87,33 @@ const main = async () => {
     }
 
     const endpoint = await readEndpoint();
+    const token = await readIngestToken();
     const cwd = process.cwd();
 
-    await post(endpoint, await readIngestToken(), "/hook/stop", {
+    // A room password the person typed at the Codex prompt, on its way to the bridge.
+    //
+    // Codex's own hook never sees a prompt — it forwards `{inputCount: 1}` and nothing
+    // else, deliberately — and Codex cannot call the bridge itself from inside its
+    // sandbox. So until now the password a person was told to paste did nothing at all,
+    // and the session sat waiting for a confirmation that could never come.
+    //
+    // Only a string that is already the exact shape of a room password is sent, and only
+    // the last thing typed. Everything else the person writes stays here, which is the
+    // same promise the hook makes; the bridge still has to recognise the value as the
+    // room's own password before it lets anybody in. Never logged, never echoed — it
+    // goes straight into the request.
+    const typed = Array.isArray(input["input-messages"]) ? input["input-messages"] : [];
+    const last = typeof typed.at(-1) === "string" ? typed.at(-1).trim() : "";
+    const threadId = typeof input["thread-id"] === "string" ? input["thread-id"] : "";
+    if (threadId && /^[a-f0-9]{32}$/i.test(last)) {
+      await post(endpoint, token, "/hook/sync/confirm", {
+        conversationId: threadId,
+        turnId: typeof input["turn-id"] === "string" ? input["turn-id"] : null,
+        password: last,
+      });
+    }
+
+    await post(endpoint, token, "/hook/stop", {
       hookId: randomUUID(),
       hookEventName: "Stop",
       source: "codex-notify",

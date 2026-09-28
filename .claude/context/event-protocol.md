@@ -36,7 +36,7 @@ Events are newline-delimited JSON in `~/.config/gyredeck/gyredeck.events.ndjson`
 | Antigravity (AGY) hook | `agyHost` | hook payload `modelName` |
 | Codex notify | `codex-notify` (via the `/hook/stop` relay `source` field) | not available |
 
-`POST /ingest`, `/hook/stop` and `/hook/attention` carry the machine-local `x-gyredeck-token` (a `0600` file at `~/.config/gyredeck/gyredeck.ingest-token`) or are refused with `401`. Not *every* mutation: creating and joining a sync room ask for nothing, on purpose, and the mail routes take one of two credentials depending on the route — both are set out further down. The token used to be advisory on those routes — an untrusted sender's event was still accepted, with its `runtime` field stripped before storage — which left any local process able to write into the presence stream and the audit log. The refusal names the fix, because the way it is met in practice is an adapter left behind by an update. Hook-derived signals (`/hook/stop`, `/hook/attention`) reuse a recently correlated scope only when it is unambiguous and inside the bounded active-scope window; an unscoped hook event leaves `runtime` null. Runtime metadata never grants process control and does not expose command arguments.
+`POST /ingest`, `/hook/stop`, `/hook/attention` and `/hook/sync/confirm` carry the machine-local `x-gyredeck-token` (a `0600` file at `~/.config/gyredeck/gyredeck.ingest-token`) or are refused with `401`. Not *every* mutation: creating and joining a sync room ask for nothing, on purpose, and the mail routes take one of two credentials depending on the route — both are set out further down. The token used to be advisory on those routes — an untrusted sender's event was still accepted, with its `runtime` field stripped before storage — which left any local process able to write into the presence stream and the audit log. The refusal names the fix, because the way it is met in practice is an adapter left behind by an update. Hook-derived signals (`/hook/stop`, `/hook/attention`) reuse a recently correlated scope only when it is unambiguous and inside the bounded active-scope window; an unscoped hook event leaves `runtime` null. Runtime metadata never grants process control and does not expose command arguments.
 
 The bridge keeps carry-forward scope **per conversation** (falling back to cwd), so scoped fields such as `model` never bleed from one agent/source into another — an Antigravity turn cannot stamp its model onto a Claude conversation.
 
@@ -52,6 +52,7 @@ Bound to `127.0.0.1:47621`.
 | POST | `/ingest` | Multi-provider event fan-in (accepts a full envelope). |
 | POST | `/hook/stop` | Turn-completion relay → `turn_complete`. |
 | POST | `/hook/attention` | Attention/permission relay → `attention_requested`. |
+| POST | `/hook/sync/confirm` | A room password typed at a Codex prompt, relayed by notify. |
 | GET | `/mail` | Mail rooms that currently exist, with how much is waiting in each. |
 | POST | `/mail/<room>` | Send a message into a room, and deliver it to the session that room belongs to. |
 | GET | `/mail/<room>?since=<seq>` | Read messages after `seq`. |
@@ -216,6 +217,41 @@ than from the hook. `cacheReadTokens` is reported as **0** on purpose, because C
 `input_tokens` already contains its cached tokens and the meter sums all three fields;
 adding them turned 5.4% into 10.4% on a live thread. Antigravity reports neither, and
 its meter stays empty rather than guessing.
+
+`POST /hook/sync/confirm` is how the password reaches the bridge when the session is
+Codex. Codex's own hook never sees a prompt — it forwards `{inputCount: 1}` and nothing
+else — and Codex cannot open a socket from inside its sandbox, so before this route a
+password typed at its prompt did nothing at all. Its `notify` program can: it is not a
+hook, so it is not subject to Codex's per-hook trust (`[hooks.state]` in
+`~/.codex/config.toml`, where an entry nobody has trusted is skipped in silence), and it
+is handed `thread-id`, `turn-id` and `input-messages`. The adapter tests only the last
+thing typed, trimmed, against `^[a-f0-9]{32}$` and sends nothing else the person wrote.
+
+The route needs both credentials and they answer different questions: the machine token
+says the caller is a local process, the room's own password says the person meant this
+session to be let in. Anything that does not let somebody in — no room, a wrong password,
+a session in no room at all — answers the same `{ok: true, confirmed: false}`, so a caller
+holding only the machine token learns nothing about which rooms exist or who is in them.
+
+Held mail has a second cap of its own. Everything waiting for a member who has not been
+let in yet leaves in a **single** `codex queue --message`, and that command takes its text
+as an argument — so it is bounded by `ARG_MAX` (1 MiB on macOS, shared with the whole
+environment) while a room is allowed 1 MiB by itself. The limit is therefore enforced at
+admission: a message that would put more behind an unconfirmed member than one push can
+carry is refused with `409 held_backlog_full` and never enters the room. Trimming it at
+delivery instead would be #88 in a new place — mail accepted and then eaten, with a count
+of what was eaten offered in its stead. Both Codex harvest paths ask the same question
+before claiming a reply, because a claimed reply is one nothing looks at again. The
+admission figure keeps a reserve under the push ceiling, since the confirmation carries the
+room's roster and the roster grows when somebody joins.
+
+Confirmation itself is one path for all three callers (`/passwords`, `/confirm`, this
+route): the state flips once, and what was said to the member while it waited is delivered
+then — messages from other sessions, not the room's own notices. A second paste of the
+same password is a no-op rather than a second announcement and a second copy of the
+backlog. Because notify fires when a turn *ends*, Codex has already answered the password
+prompt by the time the bridge hears about it; that turn is taken out of the harvest's way
+so the room's first word from Codex is not it puzzling over a hex string.
 
 `POST /sync/rooms/<code>/confirm` answers with a **`howTo` object**: the credential and
 identity to use, the exact send/receive/watch/wait calls with the password already in

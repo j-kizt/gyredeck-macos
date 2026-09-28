@@ -98,6 +98,30 @@ export const roomHasLostItsFounder = (room) =>
  */
 export const MAIL_MAX_MESSAGES = 500;
 export const MAIL_MAX_ROOM_BYTES = 1_048_576;
+/**
+ * The most that can be handed to `codex queue --message` in one go.
+ *
+ * `codex queue` takes its text as an argument and offers no stdin or file form, so a push
+ * is bounded by `ARG_MAX` — 1 MiB on this machine, shared with the whole environment. A
+ * room is allowed exactly that much in total, so a backlog that is perfectly legal for the
+ * room can be impossible to exec. Worse, `spawn` returns before the kernel refuses, so
+ * `E2BIG` arrives on the error event long after the caller has been told "queued".
+ *
+ * Measured before spawning rather than handled afterwards, and generous enough that no
+ * ordinary message comes near it: this is a ceiling on a failure nobody can see, not a
+ * budget anyone is meant to spend.
+ */
+export const CODEX_PUSH_MAX_BYTES = 98_304;
+/**
+ * Held mail is admitted against a smaller figure than the push can carry.
+ *
+ * The confirmation carries the room's brief, and the brief names everyone present — so a
+ * payload measured when a message was accepted grows when somebody else joins. A room is
+ * capped at `MAIL_MAX_MEMBERS` members with short provider labels, so the whole of that
+ * growth is a few hundred bytes; this reserve is an order of magnitude more, kept as
+ * headroom rather than as a calculation that has to be right.
+ */
+export const CODEX_PUSH_ENVELOPE_RESERVE = 4_096;
 
 /**
  * How many of the room's own notices it keeps.
@@ -989,12 +1013,20 @@ function startBridge(config) {
     // bridge read the new file from the top over and over until it outgrew the old one.
     let handledThrough = from;
     for (const reply of replies) {
+      // The turn that carried a room password: read past, never published. Codex answered
+      // it before the bridge knew the password had been typed at all, so the answer is to
+      // a question the room never asked.
+      if (turnWasConsumed(conversationId, reply.turnId)) { handledThrough = reply.endsAt; continue; }
+      const { text, routing } = routeCodexReply(found.room, reply.text);
       // Capacity first, and a refusal stops the batch rather than skipping one of it:
       // publishing what came after would put Codex's answers in the room out of order.
+      // Both kinds of full are asked before anything is claimed or the cursor moves —
+      // `publishMail` answers a refusal with `null`, and a claimed reply is one nothing
+      // will ever look at again.
       if (roomIsFull(found.room, Buffer.byteLength(reply.text ?? "", "utf8"))) break;
+      if (heldWouldOverflow(found.room, { from: conversationId, to: routing.to, kind: routing.kind, text })) break;
       if (!claimCodexReply(conversationId, reply)) { handledThrough = reply.endsAt; continue; }
       if (refuseToPublish(found.room, conversationId)) { handledThrough = reply.endsAt; continue; }
-      const { text, routing } = routeCodexReply(found.room, reply.text);
       // Codex never sees a refusal, so the run is broken by not publishing rather than
       // by answering — the next brief tells it no seq followed, which is the signal it
       // has for anything that did not arrive.
@@ -1295,6 +1327,7 @@ function startBridge(config) {
     if (member?.label) room.formerLabels.set(conversationId, member.label);
     room.members.delete(conversationId);
     harvestAt.delete(codexRolloutFor(conversationId) ?? "");
+    consumedTurns.delete(conversationId);
   };
 
   /**
@@ -1316,6 +1349,203 @@ function startBridge(config) {
     const told = publishMail(mailbox, ROOM_SENDER, text, null, false, { to: conversationId, kind: "tell" });
     deliverMail(conversationId, mailbox, text, ROOM_SENDER, told);
   };
+
+  /**
+   * What the room said to this member while it was still waiting for the password.
+   *
+   * A member joins at `readSeq: room.seq`, so this is only what arrived between joining
+   * and being let in — and until now it was lost outright: `deliverMail` gives an
+   * unconfirmed member the "you need the password" notice and nothing else, ever.
+   *
+   * What somebody said, not what the room said about itself. The membership notices this
+   * session missed are covered by being told directly that it was put in the room and
+   * that it is now confirmed; replaying them would hand it the announcement of its own
+   * confirmation as history.
+   */
+  const heldSoFar = (room, member, conversationId, ceiling = Infinity) => {
+    const from = Math.max(member.readSeq ?? 0, member.drainedThroughSeq ?? 0);
+    return room.messages.filter(
+      (message) =>
+        message.seq > from &&
+        message.seq <= ceiling &&
+        !isRoomsOwnVoice(message) &&
+        reachesMember(message, conversationId),
+    );
+  };
+
+  const heldFor = (room, conversationId) => {
+    const member = room.members.get(conversationId);
+    if (!member || typeof member.heldThroughSeq !== "number") return [];
+    // Bounded at the moment the member was let in. Without a ceiling a later paste would
+    // treat everything published since — messages already pushed as they arrived — as
+    // backlog, and send them all a second time.
+    return heldSoFar(room, member, conversationId, member.heldThroughSeq);
+  };
+
+  /**
+   * Everything a newly confirmed Codex session needs, in one push.
+   *
+   * Only Codex is handed anything here. Every other agent collects its inbox on its next
+   * turn and finds the same messages waiting, because nothing has moved its `readSeq`;
+   * Codex holds no inbox and no stream, so a push is the only way anything reaches it.
+   *
+   * One push rather than three. The roster announcement, the private confirmation and the
+   * backlog each used to spawn their own `codex queue` with no promised order between
+   * them; this is one process and one order.
+   *
+   * The cursor moves only if the push was taken. `deliverToCodex` answers `unavailable`
+   * when Codex cannot be reached, and recording a delivery that did not happen would lose
+   * the backlog for good — the member is confirmed by then, so nothing would try again.
+   * Tracked on its own field rather than by moving `readSeq`: that watermark decides when
+   * the room may drop old messages, and a push is not a read.
+   */
+  /**
+   * The one push that confirms a Codex session, built the same way wherever it is asked
+   * for — here to send it, and at the door to decide whether the next message can be
+   * accepted at all. Two formatters would mean a message admitted against one estimate
+   * and delivered against another.
+   */
+  const confirmationPayload = (room, conversationId, held) => {
+    const lead =
+      `[Gyredeck: you are confirmed in room ${room.name} and may speak here now. Reply to` +
+      " this with a reaction so the person at this terminal can see that it took: a" +
+      " reaction is a short line saying where this leaves you, it interrupts nobody, and" +
+      " nothing answers it.]";
+    return codexRoomEnvelope(
+      room.name,
+      room,
+      conversationId,
+      held.length === 0
+        ? lead
+        : `${lead}\n\n[Gyredeck: ${held.length} message${held.length === 1 ? "" : "s"} arrived` +
+          " here before you were let in. In order:]\n\n" +
+          held
+            .map((message) => `[${labelIn(room, message.from)} · ${message.kind}] ${message.text}`)
+            .join("\n\n"),
+    );
+  };
+
+  /**
+   * Whether accepting this message would make somebody's confirmation impossible to send.
+   *
+   * A room may hold a megabyte; one `codex queue` may carry far less. Held mail is the one
+   * place the two meet, because it all has to leave in a single push — so the limit is
+   * enforced at the door, where a sender can still be told, rather than at delivery, where
+   * the only options left are to drop mail the room already accepted or to send nothing.
+   * That is the fault #88 closed for the room's own cap, in a new place.
+   *
+   * Conservative on purpose: every unconfirmed member the message reaches is counted,
+   * whether or not the bridge yet knows it is Codex. The session this matters for is
+   * exactly the one nothing has heard from.
+   */
+  const heldWouldOverflow = (room, incoming) => {
+    for (const [conversationId, member] of room.members) {
+      if (member.confirmed === true) continue;
+      if (!reachesMember(incoming, conversationId) || isRoomsOwnVoice(incoming)) continue;
+      const held = [...heldSoFar(room, member, conversationId), incoming];
+      const bytes = Buffer.byteLength(confirmationPayload(room, conversationId, held), "utf8");
+      if (bytes > CODEX_PUSH_MAX_BYTES - CODEX_PUSH_ENVELOPE_RESERVE) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const tellConfirmedToCodex = (name, room, conversationId) => {
+    const all = heldFor(room, conversationId);
+    const delivered =
+      deliverToCodex(conversationId, room, confirmationPayload(room, conversationId, all)) === "queued";
+    const held = all;
+    const member = room.members.get(conversationId);
+    if (delivered && member) {
+      // Through the whole window, because the whole window went: nothing is trimmed here.
+      // A backlog too large to hand over in one push is refused at the door instead, so
+      // everything the room accepted for this member is in the message just sent.
+      if (all.length > 0) member.drainedThroughSeq = all[all.length - 1].seq;
+      // Everything owed has gone. Anything published from here on is ordinary mail and
+      // is pushed as it arrives; there is nothing left for a repeated paste to resend.
+      member.heldThroughSeq = null;
+    }
+    return { delivered, held: delivered ? held.length : 0 };
+  };
+
+  /**
+   * Let a member in, once, however the person's consent reached the bridge.
+   *
+   * Three callers arrive here and each used to do its own half of the work: the founder
+   * reading the password out (`/sync/rooms/<code>/passwords`), a session presenting it
+   * itself (`/sync/rooms/<code>/confirm`), and Codex's notify handing over what the
+   * person typed (`/hook/sync/confirm`). The halves had already drifted — the founder's
+   * press announced a confirmation and delivered none of the backlog.
+   *
+   * How the session is told follows from what the session *is*, not from which caller
+   * arrived: Codex is pushed to because it can be reached no other way, and everything
+   * else is left to collect. `transitioned` says whether this call was the one that let
+   * the member in; `held` is how much backlog actually went with it.
+   */
+  const confirmRoomMember = (code, room, conversationId) => {
+    const member = room.members.get(conversationId);
+    if (!member) return { transitioned: false, delivered: false, held: 0 };
+    const toCodex = providerByConversation.get(conversationId) === "codexCliHook";
+    if (member.confirmed === true) {
+      // Already in — but the one push that tells it so may never have landed, and a
+      // second paste is the only thing that can ask again. The question is whether that
+      // push is still owed, not whether any backlog came with it: a confirmation with
+      // nothing waiting behind it is exactly as lost, and reading the backlog count
+      // instead answered "delivered" to a session that had never heard anything.
+      if (member.heldThroughSeq === null || member.heldThroughSeq === undefined) {
+        return { transitioned: false, delivered: true, held: 0 };
+      }
+      return { transitioned: false, ...tellConfirmedToCodex(code, room, conversationId) };
+    }
+    member.confirmed = true;
+    member.toldUnconfirmed = false;
+    // Both the window the backlog is taken from and the record that the push carrying it
+    // is still owed. Taken before the confirmation notice is published, so the notice is
+    // not itself inside the window it describes, and set only for Codex — it is state
+    // about a push, and nothing else here is pushed to.
+    if (toCodex) member.heldThroughSeq = room.seq;
+    room.touchedAt = Date.now();
+    announceMembership(
+      code,
+      room,
+      `${labelIn(room, conversationId)} was confirmed by the room's owner and can now speak here.`,
+      // The session being announced hears it in its own push below; announcing it again
+      // is the second of the three that used to race.
+      toCodex ? conversationId : null,
+    );
+    if (!toCodex) {
+      tellConfirmed(code, room, conversationId);
+      return { transitioned: true, delivered: true, held: 0 };
+    }
+    return { transitioned: true, ...tellConfirmedToCodex(code, room, conversationId) };
+  };
+
+  /**
+   * Turns whose answer must never reach the room.
+   *
+   * Codex's notify fires when a turn *ends*, so by the time a password reaches the bridge
+   * Codex has already answered it — in testing, "That looks like a 32-character
+   * hexadecimal value, possibly an MD5 hash". Named by turn rather than by how far the
+   * log had been written: that answer may not be flushed when the confirmation arrives,
+   * and a cursor moved to the end of the file then would step over nothing at all.
+   *
+   * Two readers ask this — the harvest a stop triggers, and the poll a push starts — so
+   * it is a question, not a claim: forgetting a turn on the first read would let the
+   * other one publish the same answer. Oldest out past a small bound instead, which is
+   * generous for something a session has one of at a time.
+   */
+  const CONSUMED_TURN_MEMORY = 8;
+  const consumedTurns = new Map();
+  const consumeTurn = (conversationId, turnId) => {
+    if (typeof turnId !== "string" || turnId === "") return;
+    const seen = consumedTurns.get(conversationId) ?? new Set();
+    seen.add(turnId);
+    while (seen.size > CONSUMED_TURN_MEMORY) seen.delete(seen.values().next().value);
+    consumedTurns.set(conversationId, seen);
+  };
+  const turnWasConsumed = (conversationId, turnId) =>
+    typeof turnId === "string" && consumedTurns.get(conversationId)?.has(turnId) === true;
 
   /**
    * What to call a session in this room, whether or not it is still in it.
@@ -1512,6 +1742,10 @@ function startBridge(config) {
       // x-gyredeck-token header for every read and every send here. Password and token
       // are the same thing said two ways — it is a password to the person copying it
       // out of the panel, and a token to the header carrying it.
+      // Its own code. The confirmation a Codex session is pushed carries the room's
+      // brief, and that has to be buildable from the room alone — the size of it is
+      // checked when a message is accepted, long before anyone knows who will deliver it.
+      name,
       password: null,
       readSeq: 0,
       messages: [],
@@ -1798,7 +2032,7 @@ function startBridge(config) {
     },
   });
 
-  const announceMembership = (name, room, note) => {
+  const announceMembership = (name, room, note, except = null) => {
     const present = [...room.members.keys()].map((id) => labelIn(room, id));
     const text = `${note} Members now: ${present.join(", ") || "nobody"}.`;
     const notice = publishMail(room, ROOM_SENDER, text, null);
@@ -1806,7 +2040,7 @@ function startBridge(config) {
     // already rides on every message Codex is handed, so interrupting three sessions to
     // repeat it is pure cost. This was measured — a join and a confirmation woke every
     // member twice inside six seconds, and one of them answered each time.
-    deliverMail(name, room, text, ROOM_SENDER, notice);
+    deliverMail(name, room, text, ROOM_SENDER, notice, except);
   };
 
 
@@ -2078,6 +2312,17 @@ function startBridge(config) {
     // that somebody joined, and refusing one would be the same silent failure in a
     // different place; they are small, and the budget bounds what senders add.
     if (from !== ROOM_SENDER && roomIsFull(room, Buffer.byteLength(text, "utf8"))) return null;
+    if (
+      from !== ROOM_SENDER &&
+      heldWouldOverflow(room, {
+        from,
+        to: routing?.to ?? MAIL_EVERYONE,
+        kind: routing?.kind ?? MAIL_DEFAULT_KIND,
+        text,
+      })
+    ) {
+      return null;
+    }
     room.seq += 1;
     mailOrdinal += 1;
     room.touchedAt = Date.now();
@@ -2224,6 +2469,15 @@ function startBridge(config) {
   const deliverToCodex = (threadId, room, text) => {
     const binary = findAgentBinary("codex");
     if (!binary) return "unavailable";
+    // Answered before the spawn, because afterwards is too late to answer honestly: the
+    // kernel's refusal reaches the error event, and by then this function has returned.
+    if (Buffer.byteLength(text, "utf8") > CODEX_PUSH_MAX_BYTES) {
+      console.error(
+        `⚠ a message for Codex was ${Buffer.byteLength(text, "utf8")} bytes, past the` +
+          ` ${CODEX_PUSH_MAX_BYTES} a single \`codex queue\` can carry, and was not sent.`,
+      );
+      return "unavailable";
+    }
 
     const rolloutPath = codexRolloutFor(threadId);
     const since = Date.now();
@@ -2249,7 +2503,23 @@ function startBridge(config) {
         // A reply the room has no space for is not "seen": marking it so would stop the
         // polling that is the only thing that will ever look at it again. Nor may an
         // earlier success in the same pass end it — that was the second half of the fault.
-        if (roomIsFull(room, Buffer.byteLength(reply.text ?? "", "utf8"))) {
+        // Before capacity is weighed, not after: an answer that will be thrown away must
+        // not hold a full room's polling open until the deadline, nor stand in front of
+        // the reply behind it.
+        if (turnWasConsumed(threadId, reply.turnId)) {
+          seen.add(reply.turnId ?? reply.text);
+          continue;
+        }
+        const routed = routeCodexReply(room, reply.text);
+        if (
+          roomIsFull(room, Buffer.byteLength(reply.text ?? "", "utf8")) ||
+          heldWouldOverflow(room, {
+            from: threadId,
+            to: routed.routing.to,
+            kind: routed.routing.kind,
+            text: routed.text,
+          })
+        ) {
           waitingForRoom = true;
           break;
         }
@@ -2259,7 +2529,6 @@ function startBridge(config) {
         // confirmed does not get to speak just because the bridge is the one holding
         // the pen.
         if (refuseToPublish(room, threadId)) continue;
-        const routed = routeCodexReply(room, reply.text);
         const published = publishMail(room, threadId, routed.text, null, true, routed.routing);
         if (published?.seq) publishedForCodex.set(threadId, published.seq);
       }
@@ -2280,7 +2549,62 @@ function startBridge(config) {
    * that runs when their session next does, so there is nothing to send and nothing
    * to wait for.
    */
-  const deliverMail = (roomName, room, text, from, routing = null) => {
+  // `except` is one member this particular message is not carried to, because something
+  // else is already carrying it there — a newly confirmed Codex session hears the roster
+  // inside the single push that confirms it.
+  /**
+   * A room message as Codex has to receive it: the standing brief, then the words.
+   *
+   * Lifted out of `deliverMail` when a second caller appeared. A newly confirmed session
+   * is pushed to directly — one process carrying its confirmation and the backlog it
+   * missed — and a push that skipped this envelope would be the one message in the room
+   * that arrived with no rules, no roster and no seq, to a session that has just been let
+   * in and has read nothing yet.
+   */
+  const codexRoomEnvelope = (roomName, room, recipient, text) => {
+    const roster = [...room.members.keys()].map((id) => labelIn(room, id)).join(", ");
+    const wasPublished = publishedForCodex.get(recipient);
+    return (
+      `[Gyredeck · room ${roomName} — how to answer: write your reply as ordinary` +
+      " text in this turn. Do not call Gyredeck: your sandbox refuses the network" +
+      " syscall, so curl fails at connect even for 127.0.0.1, and a failed POST" +
+      " looks like nothing at all. The bridge reads what you write from your own" +
+      " session log and puts it in the room for you — that is the only path that" +
+      " works, and it needs nothing from you but the words. Only the last thing you" +
+      " write in a turn is taken, so say everything the room needs in one closing" +
+      " message rather than several. You also need no watch:" +
+      " messages are pushed into your session whether or not you are doing anything." +
+      // Say who it is for and what it is for, in the one place Codex can say
+      // anything. Telling it never to acknowledge was tried and did not hold: the
+      // rule was in front of it on every message while it offered its help every
+      // ten seconds, because "is there anything else?" is not an acknowledgement in
+      // its own reading. A label it writes is something it can get right.
+      " Open your message with one line saying who it is for and what it is:" +
+      " @everyone ask, @Antigravity tell, @everyone reaction, or any member's name" +
+      " in place of everyone. The line is removed before the room sees it. ask wants" +
+      " an answer; tell does not but may draw a reaction; a reaction is a short line" +
+      " saying it landed and where that leaves you — send one for a tell or for a" +
+      " notice that somebody joined or left, and never answer one, which is where an" +
+      " exchange stops. Leave the line out and it goes to everyone as tell, which" +
+      " interrupts them all. When you answer someone, name them: that is what keeps" +
+      " one exchange costing one wake instead of waking the room." +
+      // Its roster is memory of announcements it happened to receive: it cannot
+      // read the room's state, so a push that failed once would leave it wrong
+      // forever. Restating who is here on every message costs a line and closes it.
+      ` Members now: ${roster || "nobody"}.` +
+      // Never "wait for ok:true" — Codex cannot see a response to anything, so that
+      // rule was unsatisfiable while its messages were in fact being published.
+      (wasPublished
+        ? ` Your previous message reached the room as seq ${wasPublished}.`
+        : " Nothing of yours has been published in this room yet.") +
+      " You will not see a response to what you write — the bridge posts for you and" +
+      " tells you the seq here, on the next message you get. If a seq never follows," +
+      " what you wrote did not arrive.]\n\n" +
+      text
+    );
+  };
+
+  const deliverMail = (roomName, room, text, from, routing = null, except = null) => {
     // A message that should not interrupt is still in the room to be read; it just is
     // not carried to anyone. Codex is the reason this has to be decided here: it holds
     // no stream to filter and cannot choose whether to be woken, so the room chooses
@@ -2291,7 +2615,7 @@ function startBridge(config) {
     const recipients = room.members.size > 0
       // Nobody is delivered their own message, and a notice from the room itself goes
       // to everyone.
-      ? [...room.members.keys()].filter((id) => id !== from && carries(id))
+      ? [...room.members.keys()].filter((id) => id !== from && id !== except && carries(id))
       : [roomName];
     if (recipients.length === 0) return routing && routing.kind === "ack" ? "not_notified" : "no_recipients";
 
@@ -2369,45 +2693,7 @@ function startBridge(config) {
           else unavailable = true;
           continue;
         }
-        const roster = [...room.members.keys()].map((id) => labelIn(room, id)).join(", ");
-        const wasPublished = publishedForCodex.get(recipient);
-        const outgoing =
-          `[Gyredeck · room ${roomName} — how to answer: write your reply as ordinary` +
-          " text in this turn. Do not call Gyredeck: your sandbox refuses the network" +
-          " syscall, so curl fails at connect even for 127.0.0.1, and a failed POST" +
-          " looks like nothing at all. The bridge reads what you write from your own" +
-          " session log and puts it in the room for you — that is the only path that" +
-          " works, and it needs nothing from you but the words. Only the last thing you" +
-          " write in a turn is taken, so say everything the room needs in one closing" +
-          " message rather than several. You also need no watch:" +
-          " messages are pushed into your session whether or not you are doing anything." +
-          // Say who it is for and what it is for, in the one place Codex can say
-          // anything. Telling it never to acknowledge was tried and did not hold: the
-          // rule was in front of it on every message while it offered its help every
-          // ten seconds, because "is there anything else?" is not an acknowledgement in
-          // its own reading. A label it writes is something it can get right.
-          " Open your message with one line saying who it is for and what it is:" +
-          " @everyone ask, @Antigravity tell, @everyone reaction, or any member's name" +
-          " in place of everyone. The line is removed before the room sees it. ask wants" +
-          " an answer; tell does not but may draw a reaction; a reaction is a short line" +
-          " saying it landed and where that leaves you — send one for a tell or for a" +
-          " notice that somebody joined or left, and never answer one, which is where an" +
-          " exchange stops. Leave the line out and it goes to everyone as tell, which" +
-          " interrupts them all. When you answer someone, name them: that is what keeps" +
-          " one exchange costing one wake instead of waking the room." +
-          // Its roster is memory of announcements it happened to receive: it cannot
-          // read the room's state, so a push that failed once would leave it wrong
-          // forever. Restating who is here on every message costs a line and closes it.
-          ` Members now: ${roster || "nobody"}.` +
-          // Never "wait for ok:true" — Codex cannot see a response to anything, so that
-          // rule was unsatisfiable while its messages were in fact being published.
-          (wasPublished
-            ? ` Your previous message reached the room as seq ${wasPublished}.`
-            : " Nothing of yours has been published in this room yet.") +
-          " You will not see a response to what you write — the bridge posts for you and" +
-          " tells you the seq here, on the next message you get. If a seq never follows," +
-          " what you wrote did not arrive.]\n\n" +
-          text;
+        const outgoing = codexRoomEnvelope(roomName, room, recipient, text);
         const outcome = deliverToCodex(recipient, room, outgoing);
         if (outcome === "queued") queued = true;
         else unavailable = true;
@@ -2466,6 +2752,62 @@ function startBridge(config) {
       emitHookStop(body);
       res.writeHead(202, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
       res.end(JSON.stringify({ ok: true, type: "turn_complete" }));
+      return;
+    }
+
+    // POST /hook/sync/confirm — the password the person typed at a Codex prompt, carried
+    // here by the one channel Codex has that needs nobody's permission.
+    //
+    // Codex cannot open a socket from inside its sandbox, and its hooks are each trusted
+    // by hash in `~/.codex/config.toml`: a hook entry nobody has trusted is skipped in
+    // silence, so a new one would have shipped exactly the quiet failure this route
+    // exists to remove (measured on 0.157.1, 2026-09-28). `notify` carries no such gate,
+    // is already ours, and is handed `input-messages` — so the adapter tests the prompt
+    // against the shape of a room password and sends only that, never anything else the
+    // person typed.
+    //
+    // The machine token says the caller is a local process; it is the room's own password
+    // that says the person meant this session to be let in, and both are required.
+    if (req.method === "POST" && req.url === "/hook/sync/confirm") {
+      if (refuseHookCall(res, req)) return;
+      const body = await readJsonBody(req);
+      const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
+      const password = typeof body.password === "string" ? body.password.trim() : "";
+      const found = conversationId ? syncRoomFor(conversationId) : null;
+      // Nothing here says whether the session is in a room, whether a room exists, or
+      // whether the password was close: a caller holding the machine token alone learns
+      // only that this did not let anybody in.
+      if (!found || !holdsRoomPassword(found.room, password)) {
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+        res.end(JSON.stringify({ ok: true, confirmed: false }));
+        return;
+      }
+      // Named before the state changes, so the answer Codex has already given to the
+      // password cannot be harvested into the room on the way past. Required, not
+      // optional: without it that answer has nothing to be recognised by and would be
+      // published into the room as this session's first word.
+      const turnId = typeof body.turnId === "string" ? body.turnId.trim() : "";
+      if (turnId === "") {
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+        res.end(JSON.stringify({ ok: true, confirmed: false }));
+        return;
+      }
+      consumeTurn(conversationId, turnId);
+      // Only Codex's notify reaches this route, and it is the reason the route exists:
+      // the session it speaks for may never have had a hook run at all — Codex skips a
+      // hook nobody has trusted, in silence — so nothing else may ever have said what
+      // this thread is. Without this the member is confirmed and then never pushed to,
+      // which is the same silence in a new place.
+      providerByConversation.set(conversationId, "codexCliHook");
+      const { transitioned, delivered, held } = confirmRoomMember(
+        found.name,
+        found.room,
+        conversationId,
+      );
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+      res.end(
+        JSON.stringify({ ok: true, confirmed: true, transitioned, delivered, held, room: found.name }),
+      );
       return;
     }
 
@@ -2664,14 +3006,7 @@ function startBridge(config) {
         for (const [conversationId, member] of room.members) {
           if (member.confirmed === true) continue;
           if (providerByConversation.get(conversationId) !== "codexCliHook") continue;
-          member.confirmed = true;
-          member.toldUnconfirmed = false;
-          announceMembership(
-            code,
-            room,
-            `${labelIn(room, conversationId)} was confirmed by the room's owner and can now speak here.`,
-          );
-          tellConfirmed(code, room, conversationId);
+          confirmRoomMember(code, room, conversationId);
         }
         sendJson(200, { ok: true, room: code, password: room.password });
         return;
@@ -2731,15 +3066,7 @@ function startBridge(config) {
           });
           return;
         }
-        member.confirmed = true;
-        member.toldUnconfirmed = false;
-        room.touchedAt = Date.now();
-        announceMembership(
-          code,
-          room,
-          `${labelIn(room, conversationId)} was confirmed by the room's owner and can now speak here.`,
-        );
-        tellConfirmed(code, room, conversationId);
+        confirmRoomMember(code, room, conversationId);
         sendJson(200, {
           ok: true,
           ...describeRoom(code, room, conversationId),
@@ -3256,6 +3583,28 @@ function startBridge(config) {
           : [...room.members.keys()].find(
               (id) => labelIn(room, id).toLowerCase() === routedTo.toLowerCase(),
             ) ?? routedTo;
+        if (
+          heldWouldOverflow(room, { from, to: addressed, kind: routedKind, text })
+        ) {
+          // Everything held for a member who has not been let in yet leaves in one push,
+          // and one push is bounded by what a single command can carry. Refused here
+          // rather than trimmed there: a message accepted and then dropped is the fault
+          // #88 closed for the room's own cap, and saying how many were eaten is not the
+          // same as delivering them.
+          const waiting = [...room.members]
+            .filter(([, member]) => member.confirmed !== true)
+            .map(([id]) => labelIn(room, id));
+          sendJson(409, {
+            ok: false,
+            error: "held_backlog_full",
+            message:
+              "This message was not published: it would put more mail behind an unconfirmed" +
+              ` member than can be handed over in one go (${Math.round(CODEX_PUSH_MAX_BYTES / 1024)} KB).` +
+              (waiting.length > 0 ? ` Still waiting for the room's password: ${waiting.join(", ")}.` : "") +
+              " Give them the password and the backlog clears, or wait until they are in.",
+          });
+          return;
+        }
         if (roomIsFull(room, Buffer.byteLength(text, "utf8"))) {
           // Everything left in the room is owed to somebody, so making space would mean
           // taking a message from the session it was addressed to — which is what used to

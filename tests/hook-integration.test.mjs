@@ -2299,6 +2299,37 @@ for (const [label, adapter, args, payload, expectedPaths] of [
     ["/hook/stop"],
   ],
   [
+    // What a person types stays in the session. That is the promise the Codex hook keeps
+    // by forwarding `{inputCount: 1}` and nothing else, and it has to hold here too now
+    // that notify is the channel a room password travels on.
+    "codex-notify",
+    "adapters/codex/gyredeck-codex-notify.mjs",
+    [JSON.stringify({
+      type: "agent-turn-complete",
+      "thread-id": "01a06082-8ef6-7900-ae39-44fe2e460079",
+      "turn-id": "01a06082-8ef6-7900-ae39-44fe2e460080",
+      cwd: "/tmp/p",
+      "input-messages": ["run the tests and tell me what broke"],
+    })],
+    {},
+    ["/hook/stop"],
+  ],
+  [
+    // The one exception, and only in the exact shape of a room password — surrounding
+    // whitespace trimmed, because a paste into a terminal usually carries some.
+    "codex-notify",
+    "adapters/codex/gyredeck-codex-notify.mjs",
+    [JSON.stringify({
+      type: "agent-turn-complete",
+      "thread-id": "01a06082-8ef6-7900-ae39-44fe2e460079",
+      "turn-id": "01a06082-8ef6-7900-ae39-44fe2e460080",
+      cwd: "/tmp/p",
+      "input-messages": ["  0123456789abcdef0123456789abcdef  "],
+    })],
+    {},
+    ["/hook/sync/confirm", "/hook/stop"],
+  ],
+  [
     "antigravity",
     "adapters/antigravity/gyredeck-agy-hook.mjs",
     ["--event", "Stop"],
@@ -3857,6 +3888,442 @@ test("a running bridge rotates its event log rather than growing forever", async
       (await readFile(logFile, "utf8")).includes(conversationId),
       "and events still land in it after the rotation",
     );
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The password a person types at a Codex prompt has to reach the bridge somehow.
+ *
+ * Codex's hook never sees a prompt and Codex cannot call the bridge from inside its
+ * sandbox, so before this route the paste did nothing at all: the session waited for a
+ * confirmation that could only come from the founder pressing Copy password a second
+ * time, and whatever the room had said meanwhile was lost even then.
+ *
+ * The one test in this file that lets the bridge spawn an agent, because what it has to
+ * prove is that something was handed over — a count the bridge computed itself would pass
+ * just as happily with nothing delivered. The agent it spawns is a script written here
+ * that records its arguments, so no real CLI runs.
+ */
+test("a room password carried in by notify lets that session in, once", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-notify-confirm-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  // `~/.bun/bin` because `findAgentBinary` searches a fixed list before it looks at
+  // PATH, and `/opt/homebrew/bin` is on that list — a fake put only on PATH loses to a
+  // real `codex` installed on the machine, and the test then runs it.
+  const fakeBin = join(home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  const queued = join(home, "queued.log");
+  await writeFile(
+    join(fakeBin, "codex"),
+    // One line per invocation — a pushed message spans several lines of its own, and
+    // what is counted here is how many times the bridge spawned anything.
+    `#!${process.execPath}\n` +
+      "require('node:fs').appendFileSync(" +
+      `${JSON.stringify(queued)}, process.argv.slice(2).join(" ").replace(/\\s+/g, " ") + "\\n");\n`,
+  );
+  await chmod(join(fakeBin, "codex"), 0o755);
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        HOME: home,
+        // Undone for this one bridge, and pointed at the script above rather than at
+        // anything installed on the machine.
+        GYREDECK_NO_AGENT_SPAWN: "0",
+        PATH: fakeBin,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "notify-founder";
+  const joiner = "01a06082-8ef6-7900-ae39-44fe2e460001";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const confirmedNow = async () =>
+      (await call("GET", `/sync/rooms?as=${joiner}`)).body.members.find((m) => m.conversationId === joiner)
+        .confirmed;
+    const pushes = async () => {
+      try {
+        return (await readFile(queued, "utf8")).split("\n").filter((line) => line.trim());
+      } catch {
+        return [];
+      }
+    };
+    // The bridge spawns and does not wait; the script it spawned writes a moment later.
+    const settle = () => new Promise((resolve) => { setTimeout(resolve, 50); });
+    const pushesReach = async (count) => {
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        const lines = await pushes();
+        if (lines.length >= count) return lines;
+        await settle();
+      }
+      return pushes();
+    };
+
+    // Deliberately no `/ingest` first. The session this route exists for is one whose
+    // Codex hook never ran — an untrusted hook is skipped in silence — so nothing has
+    // ever said what this thread is, and seeding a provider here would test a case the
+    // real one does not have.
+
+    const code = (await call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    // Press first, join second. `/passwords` confirms the Codex members that are in the
+    // room at the moment it is pressed and nothing re-runs that, so this is the order
+    // that used to strand a session for good.
+    const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: joiner });
+    assert.equal(await confirmedNow(), false, "joining after the press confirms nobody");
+
+    // Said while it was still waiting: this is what used to vanish.
+    assert.equal(
+      (await call("POST", `/mail/${code}`, { from: founder, to: joiner, text: "the audit request" })).status,
+      202,
+    );
+    // Nothing has been pushed at all: with no hook ever having run, the bridge does not
+    // yet know this thread is Codex, so even the "you need the password" notice has
+    // nowhere to go. This is the state the route has to be able to start from.
+    await settle();
+    const beforeConfirm = await pushes();
+    assert.deepEqual(beforeConfirm, []);
+
+    const unauthorised = await fetch(`http://127.0.0.1:${port}/hook/sync/confirm`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ conversationId: joiner, password: minted.body.password }),
+    });
+    assert.equal(unauthorised.status, 401, "the machine token is required to carry a password here");
+    assert.equal(await confirmedNow(), false);
+
+    // Right shape, wrong value. The answer says only that nobody was let in — a caller
+    // holding the machine token learns nothing about which room this session is in.
+    const wrong = await call("POST", "/hook/sync/confirm", {
+      conversationId: joiner,
+      password: "0".repeat(32),
+    });
+    assert.equal(wrong.status, 200);
+    assert.deepEqual(wrong.body, { ok: true, confirmed: false });
+    assert.equal(await confirmedNow(), false, "a wrong password of the right shape opens nothing");
+    assert.deepEqual(await pushes(), beforeConfirm, "and pushes nothing");
+
+    // The right password with no turn named: the answer Codex has already given to it
+    // could not be recognised afterwards, so this lets nobody in either.
+    const untagged = await call("POST", "/hook/sync/confirm", {
+      conversationId: joiner,
+      password: minted.body.password,
+    });
+    assert.deepEqual(untagged.body, { ok: true, confirmed: false });
+    assert.equal(await confirmedNow(), false);
+
+    const accepted = await call("POST", "/hook/sync/confirm", {
+      conversationId: joiner,
+      turnId: "01a06082-8ef6-7900-ae39-44fe2e460002",
+      password: minted.body.password,
+    });
+    assert.equal(accepted.body.confirmed, true);
+    assert.equal(accepted.body.transitioned, true);
+    assert.equal(accepted.body.delivered, true);
+    assert.equal(accepted.body.room, code);
+    assert.equal(accepted.body.held, 1, "what the room said while it waited goes with it");
+    assert.equal(await confirmedNow(), true);
+
+    // One process, carrying both halves — not a confirmation, a roster announcement and
+    // a backlog racing each other into the session.
+    const afterConfirm = await pushesReach(beforeConfirm.length + 1);
+    assert.equal(afterConfirm.length, beforeConfirm.length + 1, "confirmed in one push, not three");
+    assert.match(afterConfirm.at(-1), /you are confirmed in room/);
+    assert.match(afterConfirm.at(-1), /the audit request/);
+    // And it arrives as a room message arrives: with the rules and the roster, not as a
+    // bare string to a session that has read nothing yet.
+    assert.match(afterConfirm.at(-1), /how to answer/);
+    assert.match(afterConfirm.at(-1), /Members now: /);
+
+    // Typing it twice is the same question. Nothing is announced again and nothing is
+    // pushed again, because there is nothing outstanding to carry.
+    const again = await call("POST", "/hook/sync/confirm", {
+      conversationId: joiner,
+      turnId: "01a06082-8ef6-7900-ae39-44fe2e460005",
+      password: minted.body.password,
+    });
+    assert.equal(again.body.confirmed, true);
+    assert.equal(again.body.transitioned, false);
+    assert.equal(again.body.held, 0);
+    await settle();
+    assert.deepEqual(await pushes(), afterConfirm, "a second paste sends nothing twice");
+
+    // Mail published after confirmation is ordinary mail: pushed as it arrives, and not
+    // backlog. A later paste used to treat it as "said before you were let in" — the
+    // member's `readSeq` never moves, so nothing else marked it as handed over.
+    assert.equal(
+      (await call("POST", `/mail/${code}`, { from: founder, to: joiner, text: "a later message" })).status,
+      202,
+    );
+    const afterLater = await pushesReach(afterConfirm.length + 1);
+    assert.equal(afterLater.length, afterConfirm.length + 1);
+    assert.match(afterLater.at(-1), /a later message/);
+    const third = await call("POST", "/hook/sync/confirm", {
+      conversationId: joiner,
+      turnId: "01a06082-8ef6-7900-ae39-44fe2e460004",
+      password: minted.body.password,
+    });
+    assert.equal(third.body.held, 0);
+    await settle();
+    assert.deepEqual(await pushes(), afterLater, "a paste after the fact resends nothing");
+    assert.equal(
+      afterLater.filter((line) => line.includes("a later message")).length,
+      1,
+      "and the message it might have resent was pushed exactly once",
+    );
+
+    // What Codex said to the password itself never reaches the room. Notify fires when a
+    // turn ends, so that answer may not even be written when the confirmation arrives —
+    // which is why the turn is named rather than the file measured. Written here after
+    // confirmation on purpose: measuring the log at confirm time would have stepped over
+    // nothing and let this through.
+    const sessions = join(home, ".codex", "sessions", "2026", "09", "28");
+    await mkdir(sessions, { recursive: true });
+    const rollout = join(sessions, `rollout-2026-09-28T00-00-00-${joiner}.jsonl`);
+    const turnLine = (turnId, text) =>
+      JSON.stringify({
+        type: "event_msg",
+        timestamp: new Date().toISOString(),
+        payload: { type: "task_complete", turn_id: turnId, last_agent_message: text },
+      }) + "\n";
+    await writeFile(
+      rollout,
+      turnLine("01a06082-8ef6-7900-ae39-44fe2e460002", "That looks like a 32-character hexadecimal value.") +
+        turnLine("01a06082-8ef6-7900-ae39-44fe2e460003", "@everyone tell — reading the audit request now."),
+    );
+    await call("POST", "/hook/stop", {
+      hookId: randomUUID(),
+      hookEventName: "Stop",
+      source: "hook",
+      workingDirectory: "/tmp/project",
+      conversationId: joiner,
+    });
+    const said = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
+      headers: { "x-gyredeck-token": minted.body.password },
+    });
+    const texts = (await said.json()).messages.map((message) => message.text);
+    assert.ok(
+      !texts.some((text) => text.includes("32-character hexadecimal")),
+      "the answer Codex gave to the password is not the room's to hear",
+    );
+    assert.ok(
+      texts.some((text) => text.includes("reading the audit request now")),
+      "the turn after it is published as usual",
+    );
+
+    // Mail held for someone who has not been let in yet all leaves in one push, and one
+    // push is bounded by what a single command can carry. The room refuses at the door
+    // rather than accepting and then eating it — accepting and eating is the fault #88
+    // closed for the room's own cap, and counting what was eaten is not delivering it.
+    const bulky = "x".repeat(4_000);
+    const joiner2 = "01a06082-8ef6-7900-ae39-44fe2e460009";
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: joiner2 });
+    const admitted = [];
+    let refused = null;
+    for (let index = 0; index < 60 && refused === null; index += 1) {
+      const marker = `bulky-${index}`;
+      const sent = await call("POST", `/mail/${code}`, {
+        from: founder,
+        to: joiner2,
+        text: `${marker} ${bulky}`,
+      });
+      if (sent.status === 202) admitted.push(marker);
+      else refused = { marker, ...sent };
+    }
+    assert.ok(refused, "the room says no rather than taking mail it cannot hand over");
+    assert.equal(refused.status, 409);
+    assert.equal(refused.body.error, "held_backlog_full");
+    assert.ok(admitted.length > 0);
+
+    // A Codex answer addressed into a room whose held backlog is full is refused the same
+    // way a person's message is — and, crucially, not claimed: the reply is read again
+    // once there is room for it, rather than counted as handled and lost.
+    await appendFile(
+      rollout,
+      // Big enough not to fit in what the admission loop left over: the loop stopped at
+      // the first message that did not fit, so a short reply would have slipped in.
+      turnLine(
+        "01a06082-8ef6-7900-ae39-44fe2e460020",
+        `@everyone tell — blocked-while-full ${"y".repeat(8_000)}`,
+      ),
+    );
+    await call("POST", "/hook/stop", {
+      hookId: randomUUID(),
+      hookEventName: "Stop",
+      source: "hook",
+      workingDirectory: "/tmp/project",
+      conversationId: joiner,
+    });
+    const whileFull = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
+      headers: { "x-gyredeck-token": minted.body.password },
+    });
+    assert.ok(
+      !(await whileFull.json()).messages.some((message) => message.text.includes("blocked-while-full")),
+      "a reply the room cannot hold for an unconfirmed member is not published",
+    );
+
+    const beforeBulky = await pushes();
+    const bulkyConfirm = await call("POST", "/hook/sync/confirm", {
+      conversationId: joiner2,
+      turnId: "01a06082-8ef6-7900-ae39-44fe2e460010",
+      password: minted.body.password,
+    });
+    assert.equal(bulkyConfirm.body.delivered, true);
+    assert.equal(bulkyConfirm.body.held, admitted.length, "everything the room accepted is handed over");
+    // Picked by who it is addressed to: confirming this one also tells the other Codex
+    // member the roster changed, and the two pushes have no promised order.
+    const carried = (await pushesReach(beforeBulky.length + 1))
+      .filter((line) => line.includes(`--thread ${joiner2}`))
+      .at(-1);
+    assert.ok(carried, "the newly confirmed session was pushed to");
+    for (const marker of admitted) {
+      assert.ok(carried.includes(marker), `${marker} was accepted, so it has to arrive`);
+    }
+    assert.ok(!carried.includes(refused.marker), "and the one that was refused is not there");
+    assert.ok(!carried.includes("could not be carried"), "nothing was quietly left out");
+
+    // Backlog cleared, so the reply that was held back is read again — once.
+    await call("POST", "/hook/stop", {
+      hookId: randomUUID(),
+      hookEventName: "Stop",
+      source: "hook",
+      workingDirectory: "/tmp/project",
+      conversationId: joiner,
+    });
+    const afterDrain = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
+      headers: { "x-gyredeck-token": minted.body.password },
+    });
+    const blocked = (await afterDrain.json()).messages.filter((message) =>
+      message.text.includes("blocked-while-full"),
+    );
+    assert.equal(blocked.length, 1, "it arrives exactly once, neither lost nor doubled");
+
+    // A session in no room at all is answered the same way as a wrong password.
+    const stranger = await call("POST", "/hook/sync/confirm", {
+      conversationId: "notify-stranger",
+      password: minted.body.password,
+    });
+    assert.deepEqual(stranger.body, { ok: true, confirmed: false });
+
+    // Confirming anything else must not reach for Codex. Everyone but Codex collects its
+    // own inbox and will find the same messages there; a shared confirmation helper that
+    // pushed regardless would run `codex queue --thread <a Claude session id>`.
+    const claudeJoiner = "notify-claude-joiner";
+    await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: claudeJoiner, cwd: "/tmp/project",
+      runtime: { sourcePid: 2, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+      data: { inputCount: 1 },
+    });
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: claudeJoiner });
+    assert.equal(
+      (await call("POST", `/mail/${code}`, { from: founder, to: claudeJoiner, text: "for the other one" })).status,
+      202,
+    );
+    assert.equal(
+      (await call("POST", `/sync/rooms/${code}/confirm`, {
+        conversationId: claudeJoiner,
+        password: minted.body.password,
+      })).status,
+      200,
+    );
+    await settle();
+    // The Codex member in the room is pushed to — the roster changed, and that is how it
+    // hears anything. What must not exist is a push aimed at the Claude session.
+    assert.ok(
+      (await pushes()).every((line) => !line.includes(`--thread ${claudeJoiner}`)),
+      "confirming a Claude session runs no `codex queue` against its id",
+    );
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A confirmation that could not be delivered is not a confirmation the session has had.
+ *
+ * No fake `codex` here and no spawn allowed, so every push fails. The member is let in —
+ * the password was right — but nothing reached it, and the only thing that can ask again
+ * is the person pasting the password a second time. Answering "delivered" to that leaves
+ * a session confirmed, silent, and with no way back.
+ */
+test("a confirmation that never reached Codex is retried, not reported as sent", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-notify-retry-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "retry-founder";
+  const joiner = "01a06082-8ef6-7900-ae39-44fe2e460011";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    const code = (await call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: joiner });
+
+    // Nothing waiting behind it: the confirmation itself is the whole of what is owed,
+    // and it is what used to be forgotten.
+    const first = await call("POST", "/hook/sync/confirm", {
+      conversationId: joiner,
+      turnId: "01a06082-8ef6-7900-ae39-44fe2e460012",
+      password: minted.body.password,
+    });
+    assert.equal(first.body.confirmed, true);
+    assert.equal(first.body.transitioned, true);
+    assert.equal(first.body.delivered, false, "nothing could be handed over");
+
+    const second = await call("POST", "/hook/sync/confirm", {
+      conversationId: joiner,
+      turnId: "01a06082-8ef6-7900-ae39-44fe2e460013",
+      password: minted.body.password,
+    });
+    assert.equal(second.body.transitioned, false);
+    assert.equal(second.body.delivered, false, "it tries again rather than claiming it went");
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();

@@ -1,5 +1,26 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## The room's password is the thing that lets a session in — (v1.17.3)
+
+**If Settings shows Codex notify needing an update, reinstall it from Plugins before using a
+sync room.** Updating Gyredeck does not replace what is installed in your config folder, and
+after this release a Codex session whose notify is out of date cannot be let into a room at
+all. Gyredeck will not offer Sync for such a session rather than let you paste a password
+into one that has gone quiet — but the fix is one press in Plugins.
+
+### Fixes
+
+- **Copying a room's password no longer lets people in by itself.** It used to confirm every
+  Codex session sitting in the room the moment you pressed the button, which made the press
+  the thing that granted access and the password decoration. It also meant the order decided:
+  press before a session joined and it was stranded, press after and you had just admitted
+  whoever happened to be there. Now the password does what a password is for — a session is
+  in once it has been given one, and not before.
+- **Gyredeck stops offering a sync room to a Codex session it could not actually let in.**
+  The password reaches Codex through its notify adapter, so a copy of that adapter from before
+  v1.17.2 has nowhere to put it. The Sync panel now waits for that adapter to be installed and
+  current, and Plugins already shows you which one is behind.
+
 ## Pasting a room's password into Codex finally does something — (v1.17.2)
 
 If you have ever added Codex to a sync room and watched it sit there asking for a password it

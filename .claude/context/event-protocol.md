@@ -34,7 +34,7 @@ Events are newline-delimited JSON in `~/.config/gyredeck/gyredeck.events.ndjson`
 | --- | --- | --- |
 | Claude Code hook | `claudeCodeHook` | tail of the transcript JSONL (`message.model`) |
 | Antigravity (AGY) hook | `agyHost` | hook payload `modelName` |
-| Codex notify | `codex-notify` (via the `/hook/stop` relay `source` field) | not available |
+| Codex notify | `codex-notify` — the relay sends its own `runtime` block, like every other adapter | not available |
 
 `POST /ingest`, `/hook/stop`, `/hook/attention`, `/hook/sync/confirm` and both `/sessions/names` routes carry the machine-local `x-gyredeck-token` (a `0600` file at `~/.config/gyredeck/gyredeck.ingest-token`) or are refused with `401`. Not *every* mutation: creating and joining a sync room ask for nothing, on purpose, and the mail routes take one of two credentials depending on the route — both are set out further down. The token used to be advisory on those routes — an untrusted sender's event was still accepted, with its `runtime` field stripped before storage — which left any local process able to write into the presence stream and the audit log. The refusal names the fix, because the way it is met in practice is an adapter left behind by an update. Hook-derived signals (`/hook/stop`, `/hook/attention`) reuse a recently correlated scope only when it is unambiguous and inside the bounded active-scope window; an unscoped hook event leaves `runtime` null. Runtime metadata never grants process control and does not expose command arguments.
 
@@ -226,6 +226,32 @@ instant it was pressed, because Codex could not present a password itself; that 
 press the credential rather than the password, and made the order decide, since nothing
 re-ran it for a session that joined afterwards. Now that a Codex session can be handed the
 password like any other, the press does one thing.
+
+Codex's `notify` reports the session and the directory **Codex names**, not the ones the
+notify process happens to be in. `process.cwd()` there is whatever spawned it — the shared
+app-server daemon, which keeps the directory it was first started in for as long as it
+lives — so a turn taken in one checkout was reported against another, under a
+`codex:<cwd>` id invented back when notify was told nothing else. That invented id made
+every directory look like a session of its own, with no agent behind it, sitting in the
+list beside the real one. It survives only as the fallback for a Codex too old to say.
+
+The two signals for one turn are therefore correlated by **session** rather than by
+directory: a notify stop waits briefly and a hook stop for the same session inside that
+wait replaces it. A directory was never quite the right key — two sessions in one checkout
+share a folder and not a turn. A hook stop also clears the hold under `codex:<its cwd>` — but only
+when the bridge knows of exactly one Codex session in that checkout. With two, the
+directory is a guess about whose turn it was, and the wrong guess is a turn nobody ever
+sees; an old adapter is left to publish a duplicate instead, which a reinstall from Plugins
+fixes.
+
+An authenticated notify stop also names its own runtime (`codex-notify`), so a session the
+bridge has heard of only through notify is a Codex session rather than an agent of no
+particular kind. Two different questions get different answers there: what *reported* the
+turn is notify, and that is what the event carries; what the **session** is decides whether
+the harvest may read its log and a room may push to it, and a notify that names a real
+thread has proved both — `codexRolloutFor` and `codex queue --thread` need the thread and
+nothing else — so such a session is recorded as `codexCliHook`. A notify too old to name
+one invents `codex:<cwd>`, which is not a thread and opens neither.
 
 A session's name is otherwise derived twice over — from the agent it is, and from the
 folder it is working in — and both move. The folder changes as an agent is driven around a

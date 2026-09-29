@@ -1172,12 +1172,19 @@ function startBridge(config) {
     }
   };
 
-  // One Codex turn ending can arrive twice: once from the full hooks under the real
-  // session id, and once from notify under `codex:<cwd>`, which it invents because it is
-  // told nothing else. Random hookIds mean shouldEmitHookSignal cannot pair them, so they
-  // are correlated stop-to-stop here: a notify stop waits briefly, and a full-hook stop
-  // for the same directory inside that wait replaces it — whichever order they arrive in,
-  // since Codex promises neither. The wait is the whole cost, and only notify pays it.
+  // One Codex turn ending can arrive twice: once from the full hooks and once from
+  // notify. Random hookIds mean shouldEmitHookSignal cannot pair them, so they are
+  // correlated stop-to-stop here: a notify stop waits briefly, and a full-hook stop for
+  // the same session inside that wait replaces it — whichever order they arrive in, since
+  // Codex promises neither. The wait is the whole cost, and only notify pays it.
+  //
+  // By session, not by directory. Notify used to invent `codex:<cwd>` because it was told
+  // nothing else, so a directory was the only thing the two signals had in common; it now
+  // reports the thread Codex names, which is the thing they actually share. A directory
+  // was never quite it — two sessions in one checkout share a folder and not a turn.
+  //
+  // A notify from before that change still sends `codex:<cwd>`, and a hook stop clears
+  // the hold under that name too, so the pair keeps working while one of them is old.
   //
   // Correlated on stops rather than on the hook having reported anything lately, because
   // "it sent an event" is not "its stop works" — a hook whose stop path is broken (an old
@@ -1185,24 +1192,87 @@ function startBridge(config) {
   // covers for it. And refused here rather than prevented in Settings: which adapters are
   // installed can be changed from outside the app entirely, so the only place the
   // duplicate can be ruled out is where both signals arrive.
+  /**
+   * Whether anybody *else* is working in this checkout.
+   *
+   * Asked before a stop is allowed to answer for a notify that named no session. Phrased
+   * as "another one" rather than "how many", because the session doing the asking may be
+   * a stop the bridge has no history for — a restart mid-turn loses the events the
+   * workspace map is built from — and counting would then see one other session, call
+   * that unambiguous, and hand it somebody else's turn.
+   *
+   * A stale folder for a session that has since moved makes this answer "yes" when it
+   * could have been "no", which costs a duplicate. The other way costs an event.
+   */
+  const anotherCodexSessionIn = (cwd, exceptConversationId) => {
+    for (const [conversationId, at] of workspaceByConversation) {
+      if (at !== cwd || conversationId === exceptConversationId) continue;
+      if (providerByConversation.get(conversationId) === "codexCliHook") return true;
+    }
+    return false;
+  };
+
+  /**
+   * Whether Codex's notify relay described itself in the shape the protocol says.
+   *
+   * A stop arrives over HTTP from a program the bridge does not control the version of.
+   * Copying whatever it sends would put an event on the wire that type-checks nowhere and
+   * that every reader has to be defensive about; refusing it leaves the session unnamed,
+   * which is the state it was in anyway.
+   */
+  const isNotifyRuntime = (value) =>
+    Boolean(value) &&
+    typeof value === "object" &&
+    // This relay and no other. A payload whose `source` says notify while its runtime
+    // claims to be some other agent would leave the event disagreeing with what the
+    // bridge recorded about the session.
+    value.sourceKind === "codex-notify" &&
+    Number.isInteger(value.sourcePid) &&
+    value.sourcePid > 0 &&
+    Number.isFinite(value.sourceStartedAtMs) &&
+    (value.sourcePpid === null || (Number.isInteger(value.sourcePpid) && value.sourcePpid > 0));
+
   const NOTIFY_STOP_HOLD_MS = 1_500;
   const CODEX_STOP_ECHO_MS = 5_000;
-  const codexStopAtByCwd = new Map();
-  const heldNotifyStopByCwd = new Map();
+  const codexStopAtBySession = new Map();
+  const heldNotifyStopBySession = new Map();
 
   const emitHookStop = (data = {}) => {
     const now = Date.now();
     const scope = tracker.hookScope(data, now);
-    if (data.source === "codex-notify" && scope.cwd) {
-      if (now - (codexStopAtByCwd.get(scope.cwd) ?? 0) <= CODEX_STOP_ECHO_MS) return;
+    const notifyKey = typeof scope.conversationId === "string" && scope.conversationId.length > 0
+      ? scope.conversationId
+      : scope.cwd;
+    // A turn reported by notify is a Codex turn, and saying so is the whole difference
+    // between a row that reads "Codex · thing" and one that reads "Agent". The call is
+    // refused without the machine token, so nothing unauthenticated reaches this.
+    //
+    // Two different questions, and they get different answers. What reported the turn is
+    // `codex-notify`, and that is what the event carries. What the *session* is decides
+    // whether the harvest may read its log and the room may push to it, and a notify that
+    // names a real thread has proved both are possible — `codexRolloutFor` and
+    // `codex queue --thread` need nothing else. A notify too old to name one invents
+    // `codex:<cwd>`, which is not a thread and opens neither.
+    if (data.source === "codex-notify" && typeof scope.conversationId === "string" && scope.conversationId.length > 0) {
+      observeSession(scope.conversationId, {
+        provider: sessionProviderFor(scope.conversationId, "codex-notify"),
+      });
+      // Replaced, not filled in. `hookScope` carries forward whatever the session was
+      // last seen with, so a session whose hook reported activity and then never sent its
+      // stop would have notify's completion published as though the hook had reported it
+      // — the one thing this split exists to stop. Nothing valid to say leaves it unsaid.
+      scope.runtime = isNotifyRuntime(data.runtime) ? { ...data.runtime } : null;
+    }
+    if (data.source === "codex-notify" && notifyKey) {
+      if (now - (codexStopAtBySession.get(notifyKey) ?? 0) <= CODEX_STOP_ECHO_MS) return;
       // A second notify inside the hold is the same turn again; the held one covers it.
-      if (heldNotifyStopByCwd.has(scope.cwd)) return;
+      if (heldNotifyStopBySession.has(notifyKey)) return;
       const timer = setTimeout(() => {
-        heldNotifyStopByCwd.delete(scope.cwd);
+        heldNotifyStopBySession.delete(notifyKey);
         finishHookStop(data, scope, Date.now());
       }, NOTIFY_STOP_HOLD_MS);
       timer.unref?.();
-      heldNotifyStopByCwd.set(scope.cwd, timer);
+      heldNotifyStopBySession.set(notifyKey, timer);
       return;
     }
     // A stop can be the first thing the bridge ever hears from a session — a restart
@@ -1215,12 +1285,24 @@ function startBridge(config) {
     if (data.sourceKind === "codexCliHook" && typeof scope.conversationId === "string" && scope.conversationId.length > 0) {
       observeSession(scope.conversationId, { provider: "codexCliHook" });
     }
-    if (scope.cwd && providerByConversation.get(scope.conversationId) === "codexCliHook") {
-      codexStopAtByCwd.set(scope.cwd, now);
-      const held = heldNotifyStopByCwd.get(scope.cwd);
-      if (held) { clearTimeout(held); heldNotifyStopByCwd.delete(scope.cwd); }
-      for (const [cwd, at] of codexStopAtByCwd) {
-        if (now - at > CODEX_STOP_ECHO_MS) codexStopAtByCwd.delete(cwd);
+    if (providerByConversation.get(scope.conversationId) === "codexCliHook") {
+      // This session, and — only when it cannot mean anybody else — the name a notify
+      // from before this change invents from the directory. Such a notify carries no
+      // thread, so it can be matched to a session only by where it happened; with two
+      // Codex sessions in one checkout that match is a guess, and guessing wrong makes
+      // somebody else's turn disappear. An old adapter leaving a duplicate until it is
+      // reinstalled is the cheaper of the two.
+      const names = [scope.conversationId];
+      if (scope.cwd && !anotherCodexSessionIn(scope.cwd, scope.conversationId)) {
+        names.push(`codex:${scope.cwd}`);
+      }
+      for (const name of names) {
+        codexStopAtBySession.set(name, now);
+        const held = heldNotifyStopBySession.get(name);
+        if (held) { clearTimeout(held); heldNotifyStopBySession.delete(name); }
+      }
+      for (const [name, at] of codexStopAtBySession) {
+        if (now - at > CODEX_STOP_ECHO_MS) codexStopAtBySession.delete(name);
       }
     }
     finishHookStop(data, scope, now);
@@ -1830,9 +1912,31 @@ function startBridge(config) {
     if (saveSessionKinds()) dirtyKinds = false;
   };
 
+  /**
+   * What an event's source kind says the *session* is.
+   *
+   * The two are the same for every agent but one. A turn reported by Codex's notify
+   * carries `codex-notify`, because that is what reported it — but what the session can
+   * do is a different question, and a notify that names a real thread has answered it:
+   * the harvest reads a rollout by thread, and `codex queue --thread` pushes by thread,
+   * so there is nothing else either of them needs. A notify too old to name one invents
+   * `codex:<cwd>`, which is not a thread and opens neither.
+   *
+   * Here rather than at the one place a notify stop arrives, because the same events are
+   * read back from the log at start: a rule applied only on the way in is undone by the
+   * next restart.
+   */
+  const sessionProviderFor = (conversationId, sourceKind) => {
+    if (sourceKind !== "codex-notify") return sourceKind;
+    return conversationId.startsWith("codex:") ? "codex-notify" : "codexCliHook";
+  };
+
   const rememberProvider = (payload) => {
-    observeSession(payload?.conversationId, {
-      provider: payload?.runtime?.sourceKind ?? null,
+    const conversationId = payload?.conversationId;
+    observeSession(conversationId, {
+      provider: typeof payload?.runtime?.sourceKind === "string" && typeof conversationId === "string"
+        ? sessionProviderFor(conversationId, payload.runtime.sourceKind)
+        : null,
       cwd: payload?.cwd ?? null,
     });
   };

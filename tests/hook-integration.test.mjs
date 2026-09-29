@@ -2419,6 +2419,8 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
   const lame = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-lame-")));
   const bare = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-bare-")));
   const cold = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-cold-")));
+  const shared = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-shared-")));
+  const coldShared = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-coldshared-")));
   const forged = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-forged-")));
   const port = await freePort();
   await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
@@ -2436,16 +2438,22 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
       session_id: sessionId, cwd, model: "gpt-5.6-luna", hook_event_name: event, ...extra,
     });
 
-  /** Codex calls notify with one JSON argument, in whatever directory it is running in. */
-  const runNotify = (workingDirectory) =>
+  /**
+   * Codex calls notify with one JSON argument, from whatever directory the thing that
+   * spawned it happened to be in — which is not the session's, and is the whole of the
+   * bug this pair of arguments exists to separate. `spawnedIn` is that directory;
+   * `payload` is what Codex actually says.
+   */
+  const runNotify = (spawnedIn, payload = {}) =>
     new Promise((resolve) => {
       const child = spawn(
         process.execPath,
         [join(repoRoot, "adapters/codex/gyredeck-codex-notify.mjs"), JSON.stringify({
           type: "agent-turn-complete",
           "last-assistant-message": "done",
+          ...payload,
         })],
-        { cwd: workingDirectory, env: { ...process.env, HOME: home }, stdio: ["ignore", "ignore", "pipe"] },
+        { cwd: spawnedIn, env: { ...process.env, HOME: home }, stdio: ["ignore", "ignore", "pipe"] },
       );
       child.on("close", resolve);
     });
@@ -2471,6 +2479,7 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
     let seen = await completions();
     assert.equal(seen.length, 1, "hook-then-notify reports once");
     assert.equal(seen[0].conversationId, hookFirst, "under the session the hook knows, not the directory");
+    assert.equal(seen[0].runtime?.sourceKind, "codexCliHook", "and as the hook's own kind");
 
     // Notify first, hook stop inside the hold: the held notify is replaced by the real one.
     await runNotify(hooked2);
@@ -2500,6 +2509,129 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
     assert.equal(seen.length, 4, "an unhooked directory still reports its turn");
     assert.equal(seen[3].conversationId, `codex:${bare}`);
 
+    // What Codex says, not where this program was started. The two are routinely
+    // different: notify is spawned by the shared app-server daemon, which keeps the
+    // directory it was first started in for as long as it lives — so a turn taken in one
+    // checkout was reported against another, under a session nobody had opened, with no
+    // agent behind it.
+    const realThread = "01a06082-8ef6-7900-ae39-44fe2e46eeee";
+    await runNotify(lame, { cwd: bare, "thread-id": realThread });
+    await settle();
+    seen = await completions();
+    assert.equal(seen.length, 5, "a turn Codex names is still one turn");
+    assert.equal(seen[4].conversationId, realThread, "reported under the session Codex names");
+    assert.equal(seen[4].cwd, bare, "and the directory Codex names, not the one this was spawned in");
+    // The third layer of the same bug: a session the bridge has heard of only through
+    // notify was an agent of no particular kind, and showed up as "Agent".
+    assert.equal(seen[4].runtime?.sourceKind, "codex-notify", "and as a Codex turn, not an anonymous one");
+    // Real numbers, because the protocol says numbers. An event that type-checks nowhere
+    // is one every reader has to be defensive about.
+    assert.ok(Number.isInteger(seen[4].runtime.sourcePid) && seen[4].runtime.sourcePid > 0);
+    assert.ok(Number.isFinite(seen[4].runtime.sourceStartedAtMs));
+    // What reported the turn and what the session can do are different questions. A
+    // notify that names a real thread has proved the harvest can read its log and the
+    // room can push to it — both need the thread and nothing else — so the session is
+    // recorded as a Codex session even though the event says notify reported it.
+    let realThreadKind = null;
+    for (let attempt = 0; attempt < 60 && realThreadKind === null; attempt += 1) {
+      const raw = await readFile(join(home, ...CONFIG_DIR, "gyredeck.session-kinds.json"), "utf8").catch(() => null);
+      realThreadKind = raw ? (JSON.parse(raw)[realThread]?.provider ?? null) : null;
+      if (realThreadKind === null) await new Promise((resolve) => { setTimeout(resolve, 50); });
+    }
+    assert.equal(realThreadKind, "codexCliHook", "a named thread is a session the room can work with");
+
+    // The same turn from both sides, now that they have a name in common. A directory
+    // never was one: two sessions in one checkout share a folder and not a turn.
+    const pairedThread = "01a06082-8ef6-7900-ae39-44fe2e46ffff";
+    await runHook("UserPromptSubmit", pairedThread, hooked);
+    await runHook("Stop", pairedThread, hooked);
+    await runNotify(lame, { cwd: hooked, "thread-id": pairedThread });
+    await settle();
+    seen = await completions();
+    assert.equal(seen.length, 6, "hook and notify naming one session report it once");
+    assert.equal(seen[5].conversationId, pairedThread);
+    // The echo is dropped, and must not take the session's identity with it on the way
+    // past. Read from what the bridge wrote down rather than from the events it
+    // published, because a dropped echo leaves no event — what it can damage is what the
+    // bridge believes this session *is*, and the harvest and the room's delivery both ask
+    // for `codexCliHook` by name.
+    const kindsPath = join(home, ...CONFIG_DIR, "gyredeck.session-kinds.json");
+    let pairedKind = null;
+    for (let attempt = 0; attempt < 60 && pairedKind === null; attempt += 1) {
+      const raw = await readFile(kindsPath, "utf8").catch(() => null);
+      pairedKind = raw ? (JSON.parse(raw)[pairedThread]?.provider ?? null) : null;
+      if (pairedKind === null) await new Promise((resolve) => { setTimeout(resolve, 50); });
+    }
+    assert.equal(pairedKind, "codexCliHook", "a dropped echo does not rewrite what the session is");
+
+    // The fallback names no thread, so it opens nothing: `codex:<cwd>` is not something
+    // `codex queue --thread` or the rollout reader can be pointed at.
+    let fallbackKind = null;
+    for (let attempt = 0; attempt < 60 && fallbackKind === null; attempt += 1) {
+      const raw = await readFile(join(home, ...CONFIG_DIR, "gyredeck.session-kinds.json"), "utf8").catch(() => null);
+      fallbackKind = raw ? (JSON.parse(raw)[`codex:${bare}`]?.provider ?? null) : null;
+      if (fallbackKind === null) await new Promise((resolve) => { setTimeout(resolve, 50); });
+    }
+    assert.equal(fallbackKind, "codex-notify", "and one that names no thread stays what it is");
+
+    // Two Codex sessions in one checkout, and a notify too old to say which of them it
+    // speaks for. Answering for it on the strength of the directory would take the other
+    // one's turn with it, so the old notify is published on its own instead — a duplicate
+    // is recoverable by reinstalling the adapter; a turn nobody ever sees is not.
+    const twinA = "01a06082-8ef6-7900-ae39-44fe2e4611aa";
+    const twinB = "01a06082-8ef6-7900-ae39-44fe2e4611bb";
+    await runHook("UserPromptSubmit", twinA, shared);
+    await runHook("UserPromptSubmit", twinB, shared);
+    const before = (await completions()).length;
+    await runNotify(shared);
+    await runHook("Stop", twinA, shared);
+    await settle();
+    seen = await completions();
+    assert.equal(seen.length, before + 2, "a stop that cannot know whose notify that was does not swallow it");
+    assert.ok(
+      seen.slice(before).some((event) => event.conversationId === twinA),
+      "the session that did stop is reported",
+    );
+    assert.ok(
+      seen.slice(before).some((event) => event.conversationId === `codex:${shared}`),
+      "and the notify nobody can place is reported rather than lost",
+    );
+
+    // The same question asked from the other side: a stop the bridge has no history for,
+    // in a checkout somebody else is already working in. Counting sessions there would
+    // find exactly one — the other one — call that unambiguous, and hand it the legacy
+    // notify, which may well have been its turn. The question has to be "is anybody else
+    // here", asked without relying on the asker being in the map at all.
+    const coldTwin = "01a06082-8ef6-7900-ae39-44fe2e4612aa";
+    const knownTwin = "01a06082-8ef6-7900-ae39-44fe2e4612bb";
+    await runHook("UserPromptSubmit", knownTwin, coldShared);
+    const beforeCold = (await completions()).length;
+    await runNotify(coldShared);
+    await runHook("Stop", coldTwin, coldShared);
+    await settle();
+    seen = await completions();
+    assert.equal(
+      seen.length,
+      beforeCold + 2,
+      "a stop with no history of its own does not answer for somebody else's notify",
+    );
+
+    // A hook that reported activity and then never sent its stop, with notify covering
+    // for it. The completion is notify's, and must say so: `hookScope` carries forward
+    // what the session was last seen with, so the event would otherwise claim the hook
+    // reported a stop it never sent.
+    const quietHook = "01a06082-8ef6-7900-ae39-44fe2e4614aa";
+    await runHook("UserPromptSubmit", quietHook, lame);
+    await runNotify(lame, { cwd: lame, "thread-id": quietHook });
+    await settle();
+    seen = await completions();
+    assert.equal(seen.at(-1).conversationId, quietHook);
+    assert.equal(
+      seen.at(-1).runtime?.sourceKind,
+      "codex-notify",
+      "the completion says who reported it, not who was last heard from",
+    );
+
     // A stop the bridge has no history for: a restart mid-turn loses the ingest events
     // the provider map is learned from, so the stop names its own runtime. Without that,
     // this stop would be emitted but not recorded, and the notify echo would follow it
@@ -2509,8 +2641,8 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
     await runNotify(cold);
     await settle();
     seen = await completions();
-    assert.equal(seen.length, 5, "a stop with no prior ingest still swallows its notify echo");
-    assert.equal(seen[4].conversationId, coldId);
+    assert.equal(seen.length, 12, "a stop with no prior ingest still swallows its notify echo");
+    assert.equal(seen.at(-1).conversationId, coldId);
 
     // A stop is a mutation like any other and the door is shut: without the machine
     // token the call is refused outright, so it cannot report a turn at all — and in
@@ -2536,8 +2668,8 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
     await runNotify(forged);
     await settle();
     seen = await completions();
-    assert.equal(seen.length, 6, "the refused stop reported nothing, and notify still covers the turn");
-    assert.equal(seen[5].conversationId, `codex:${forged}`);
+    assert.equal(seen.length, 13, "the refused stop reported nothing, and notify still covers the turn");
+    assert.equal(seen.at(-1).conversationId, `codex:${forged}`);
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
@@ -2548,6 +2680,8 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
     await rm(bare, { recursive: true, force: true });
     await rm(cold, { recursive: true, force: true });
     await rm(forged, { recursive: true, force: true });
+    await rm(shared, { recursive: true, force: true });
+    await rm(coldShared, { recursive: true, force: true });
   }
 });
 
@@ -4603,5 +4737,103 @@ test("a session can be given a name, and two unidentified ones are still told ap
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A Codex session the bridge has only ever heard about through notify survives a restart
+ * as a session the room can work with.
+ *
+ * The rule that reads a notify's real thread as a full Codex session has to live where
+ * the events are read back at start, not only where they first arrive. Applied on the way
+ * in alone it is undone by the next restart — and a bridge restarts with every update —
+ * leaving a session that looks right in the list and is unreachable in a room.
+ */
+test("what a notify says about a session survives the bridge that heard it", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-notify-replay-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-replay-cwd-")));
+  const thread = "01a06082-8ef6-7900-ae39-44fe2e4613aa";
+
+  const start = async () => {
+    const stderrRef = { value: "" };
+    const bridge = spawn(
+      process.execPath,
+      ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+      { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+    );
+    bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+    await waitForHealth(port, stderrRef);
+    return bridge;
+  };
+  const stop = async (bridge) => {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await new Promise((resolve) => bridge.once("close", resolve));
+  };
+  const kindsPath = join(home, ...CONFIG_DIR, "gyredeck.session-kinds.json");
+  const providerOf = async (id) => {
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const raw = await readFile(kindsPath, "utf8").catch(() => null);
+      const found = raw ? (JSON.parse(raw)[id]?.provider ?? null) : null;
+      if (found) return found;
+      await new Promise((resolve) => { setTimeout(resolve, 50); });
+    }
+    return null;
+  };
+
+  let bridge = await start();
+  try {
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    await fetch(`http://127.0.0.1:${port}/hook/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      body: JSON.stringify({
+        hookId: randomUUID(),
+        hookEventName: "Stop",
+        source: "codex-notify",
+        workingDirectory: workspace,
+        conversationId: thread,
+        runtime: {
+          sourcePid: 4242,
+          sourcePpid: 1,
+          sourceStartedAtMs: Date.now(),
+          sourceKind: "codex-notify",
+        },
+      }),
+    });
+    // Past the notify hold, so the event has actually been published and read back into
+    // the provider map by the same path a restart will use.
+    await new Promise((resolve) => { setTimeout(resolve, 2_500); });
+    assert.equal(await providerOf(thread), "codexCliHook", "a named thread is a session the room can work with");
+
+    await stop(bridge);
+    await rm(kindsPath, { force: true });
+    bridge = await start();
+    // The file is deleted first, so what comes back is the second bridge's own account of
+    // the session rather than the first one's — everything it knows it read out of the
+    // log. Prodded with an event that names no runtime, which moves the session up the
+    // recency order and makes it write, without telling it anything about what the
+    // session is.
+    const token2 = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    await fetch(`http://127.0.0.1:${port}/ingest`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": token2 },
+      body: JSON.stringify({
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId: thread, cwd: workspace, runtime: null, data: { inputCount: 1 },
+      }),
+    });
+    assert.equal(
+      await providerOf(thread),
+      "codexCliHook",
+      "and is still one after the restart that reads the log again",
+    );
+  } finally {
+    await stop(bridge).catch(() => undefined);
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
   }
 });

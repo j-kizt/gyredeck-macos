@@ -19,6 +19,14 @@ export interface ISessionSummary {
   detail: string;
   activityKind: ActivityKind;
   provider: string;
+  /**
+   * The name the person typed for this session, if they typed one.
+   *
+   * Beside `project` rather than instead of it: `project` is what the session *is* —
+   * the checkout it belongs to — and other things read it as that, the local services
+   * list among them. This is only what to draw where a person reads a name.
+   */
+  displayName: string | null;
   model: string;
   status: "idle" | "working" | "attention" | "inactive" | "done" | "error";
   lastActivityAt: string;

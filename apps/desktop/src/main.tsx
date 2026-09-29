@@ -37,6 +37,8 @@ import {
 import type { DeletedSessionRegistry, DismissedSessionRegistry, ISessionDetail, ISessionSummary, IWorkspaceSessionGroup } from "./features/session/types";
 import { DEFAULT_BRIDGE_PORT, useGyredeckPresence } from "./features/presence/useGyredeckPresence";
 import { SetupPanel } from "./features/setup/SetupPanel";
+import { SessionNameField } from "./features/session/SessionNameField";
+import { useSessionNames } from "./features/session/useSessionNames";
 import { codexCanSync, hookNeedsAttention, type IHookStatus } from "./features/setup/hookStatus";
 import { useLaunchAtLogin } from "./features/setup/useLaunchAtLogin";
 import { useUpdater } from "./features/updater/useUpdater";
@@ -154,13 +156,23 @@ const App = () => {
   const workspace = shortenPath(presence.cwd);
   const project = projectName(presence.cwd);
   const model = presence.model?.split("/").slice(-1)[0] ?? "Claude Code";
+  const { names: sessionNames, rename: renameSession } = useSessionNames(canUseNativeControls);
   const allSessions = useMemo(
     () =>
-      buildSessionSummaries(sessionEventRegistry, presence, now).filter(
-        (session) =>
-          !isDeletedAfter(deletedSessionIds, session.conversationId, session.lastActivityAt),
-      ),
-    [deletedSessionIds, now, presence, sessionEventRegistry],
+      buildSessionSummaries(sessionEventRegistry, presence, now)
+        .filter(
+          (session) =>
+            !isDeletedAfter(deletedSessionIds, session.conversationId, session.lastActivityAt),
+        )
+        // Carried beside `project`, not over it. `project` is the checkout this session
+        // belongs to and other things read it as that — the local services list names its
+        // owner with it — so overwriting it would put a person's name for one session on
+        // a row about a port.
+        .map((session) => ({
+          ...session,
+          displayName: sessionNames[session.conversationId] ?? null,
+        })),
+    [deletedSessionIds, now, presence, sessionEventRegistry, sessionNames],
   );
   const sessions = useMemo(
     () =>
@@ -1117,6 +1129,12 @@ const App = () => {
                 <div className="detail-body session-context-view" data-status={selectedSession.status}>
                   <SessionContextSummary session={selectedSession} />
                   <SessionContextMeter session={selectedSession} usage={contextUsage[selectedSession.conversationId]} />
+                  <SessionNameField
+                    conversationId={selectedSession.conversationId}
+                    name={sessionNames[selectedSession.conversationId] ?? ""}
+                    fallback={projectName(selectedSession.cwd)}
+                    onRename={renameSession}
+                  />
                   <div className="detail-path" title={selectedSession.cwd}>{shortenPath(selectedSession.cwd)}</div>
                   {sessionAction.message ? (
                     <div className="notice-row compact" data-online={sessionAction.ok === true} role="status" aria-live="polite">{sessionAction.message}</div>

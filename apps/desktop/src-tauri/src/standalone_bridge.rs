@@ -1033,3 +1033,59 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
     }
 }
 
+
+/// Every name the person has typed for a session.
+///
+/// The names live with the bridge rather than in the webview because they outlast it: a
+/// window that has never been opened still has the names in it, and a name kept only in
+/// the page would be gone with the next reload. Returned whole — there are a handful, and
+/// asking for one at a time would be a request per row of the session list.
+pub(crate) fn session_names() -> Result<serde_json::Value, String> {
+    let (status, value) = bridge_request("GET", "/sessions/names", None)?;
+    if !(200..300).contains(&status) {
+        return Err(sync_error(status, &value));
+    }
+    Ok(value.get("names").cloned().unwrap_or_else(|| serde_json::json!({})))
+}
+
+/// Name one session, or take the name back by passing an empty one.
+///
+/// What is stored is what the bridge makes of it, not what was typed: it trims, flattens
+/// anything that would break the line a name is printed on, and caps the length. The
+/// caller is told what was actually kept rather than left assuming its own string was.
+pub(crate) fn set_session_name(conversation_id: &str, name: &str) -> Result<Option<String>, String> {
+    if conversation_id.is_empty() || conversation_id.len() > 128 {
+        return Err("Not a valid session id".to_string());
+    }
+    let body = serde_json::json!({ "name": name }).to_string();
+    let (status, value) = bridge_request(
+        "PUT",
+        &format!("/sessions/names/{}", urlencoding_path(conversation_id)),
+        Some(body),
+    )?;
+    // A name that could not be written down was not set: the bridge changes nothing and
+    // says so, rather than answering yes with a flag saying the yes is temporary. There
+    // is no half-set name to explain here.
+    if !(200..300).contains(&status) {
+        return Err(sync_error(status, &value));
+    }
+    Ok(value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned))
+}
+
+/// Percent-encode the few characters that would otherwise change which path is asked for.
+/// A conversation id is a uuid in practice; this is here so that a malformed one cannot
+/// reach past its own path segment.
+fn urlencoding_path(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}

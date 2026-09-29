@@ -36,7 +36,7 @@ Events are newline-delimited JSON in `~/.config/gyredeck/gyredeck.events.ndjson`
 | Antigravity (AGY) hook | `agyHost` | hook payload `modelName` |
 | Codex notify | `codex-notify` (via the `/hook/stop` relay `source` field) | not available |
 
-`POST /ingest`, `/hook/stop`, `/hook/attention` and `/hook/sync/confirm` carry the machine-local `x-gyredeck-token` (a `0600` file at `~/.config/gyredeck/gyredeck.ingest-token`) or are refused with `401`. Not *every* mutation: creating and joining a sync room ask for nothing, on purpose, and the mail routes take one of two credentials depending on the route — both are set out further down. The token used to be advisory on those routes — an untrusted sender's event was still accepted, with its `runtime` field stripped before storage — which left any local process able to write into the presence stream and the audit log. The refusal names the fix, because the way it is met in practice is an adapter left behind by an update. Hook-derived signals (`/hook/stop`, `/hook/attention`) reuse a recently correlated scope only when it is unambiguous and inside the bounded active-scope window; an unscoped hook event leaves `runtime` null. Runtime metadata never grants process control and does not expose command arguments.
+`POST /ingest`, `/hook/stop`, `/hook/attention`, `/hook/sync/confirm` and both `/sessions/names` routes carry the machine-local `x-gyredeck-token` (a `0600` file at `~/.config/gyredeck/gyredeck.ingest-token`) or are refused with `401`. Not *every* mutation: creating and joining a sync room ask for nothing, on purpose, and the mail routes take one of two credentials depending on the route — both are set out further down. The token used to be advisory on those routes — an untrusted sender's event was still accepted, with its `runtime` field stripped before storage — which left any local process able to write into the presence stream and the audit log. The refusal names the fix, because the way it is met in practice is an adapter left behind by an update. Hook-derived signals (`/hook/stop`, `/hook/attention`) reuse a recently correlated scope only when it is unambiguous and inside the bounded active-scope window; an unscoped hook event leaves `runtime` null. Runtime metadata never grants process control and does not expose command arguments.
 
 The bridge keeps carry-forward scope **per conversation** (falling back to cwd), so scoped fields such as `model` never bleed from one agent/source into another — an Antigravity turn cannot stamp its model onto a Claude conversation.
 
@@ -53,6 +53,8 @@ Bound to `127.0.0.1:47621`.
 | POST | `/hook/stop` | Turn-completion relay → `turn_complete`. |
 | POST | `/hook/attention` | Attention/permission relay → `attention_requested`. |
 | POST | `/hook/sync/confirm` | A room password typed at a Codex prompt, relayed by notify. |
+| GET | `/sessions/names` | The names the person has typed for particular sessions. |
+| PUT | `/sessions/names/<id>` | Name one session, or clear it with an empty string. |
 | GET | `/mail` | Mail rooms that currently exist, with how much is waiting in each. |
 | POST | `/mail/<room>` | Send a message into a room, and deliver it to the session that room belongs to. |
 | GET | `/mail/<room>?since=<seq>` | Read messages after `seq`. |
@@ -224,6 +226,39 @@ instant it was pressed, because Codex could not present a password itself; that 
 press the credential rather than the password, and made the order decide, since nothing
 re-ran it for a session that joined afterwards. Now that a Codex session can be handed the
 password like any other, the press does one thing.
+
+A session's name is otherwise derived twice over — from the agent it is, and from the
+folder it is working in — and both move. The folder changes as an agent is driven around a
+checkout, so a row changes its name under the person reading it; and an agent whose hook
+has never reported is not known to be any particular agent, so several are "Agent" at once.
+`/sessions/names` holds the names a person types instead. They are stored by the bridge, in
+`~/.config/gyredeck/gyredeck.session-names.json` at `0600`, because they have to outlive
+both the window and the bridge's own restarts, and because two copies of a name are two
+names. What is kept is not always what was typed: it is trimmed, flattened to one line —
+a name is printed inside a sentence, and a newline in one would have the room appear to say
+something nobody said — and capped at 40 characters, counted by character so an emoji is
+not cut in half. The answer says what was kept. A name that could not be written down was
+not set: the file is written before anything in memory moves, and a failure answers `500
+not_saved` having changed nothing, rather than reporting a name the next restart would
+disagree with.
+
+What the bridge knows about a session — which agent it is, and the folder it was working
+in — is learnt from the events that agent's hook sends, and is now written down in
+`~/.config/gyredeck/gyredeck.session-kinds.json` (`0600`, most recent 200). It used to live
+only in memory, seeded at start from the last 500 events in the log, so a bridge restart —
+one happens with every update — left any session that had been quiet since before that
+window as "Agent", in no folder, with nothing wrong at either end. Every observation marks the
+snapshot dirty, including one that says nothing new: being heard from again is what moves a
+session up the recency order, and that order decides who is still in the file. Writes are
+collected behind a short timer rather than made per event, and flushed on the way out;
+nothing is written during the replay at start, and the log is layered on top of the file
+because the log is the fresher of the two wherever they disagree.
+
+**A typed name does not reach a room's roster.** It names a session in the person's own
+list, where they are the only reader; a roster is read by agents deciding who to address.
+The roster's own fix for the same complaint is separate: a session whose agent is unknown
+is now named from its folder straight away (`Agent · alpha`), rather than the first one
+taking the bare word and naming nothing while the second took a folder.
 
 `POST /hook/sync/confirm` is how the password reaches the bridge when the session is
 Codex. Codex's own hook never sees a prompt — it forwards `{inputCount: 1}` and nothing

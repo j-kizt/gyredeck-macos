@@ -1,5 +1,27 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Renaming a session moved to where its name is — (v1.18.2)
+
+The name field arrived in v1.18.0 in the worst possible place: the space the sync-room
+buttons live in. It is now a pencil beside the session's own title.
+
+### Fixes
+
+- **Create sync and Join sync are back.** The name field had taken their space, and with it
+  the only way into a sync room from a session. Renaming moved up to the title, where the
+  name already is: a pencil turns the title into a field with Save and Cancel beside it, the
+  way joining a room already looks. The name the session would go by on its own stays in
+  faint parentheses behind the one you gave it, so a row can still be matched against the
+  window it belongs to.
+- **Escape while renaming no longer throws you out of the session.** It was closing the whole
+  detail view and going back to the list. It now abandons the edit and leaves you where you
+  are.
+- **Cancelling a rename no longer cancels the next one.** Press Cancel, open the field again,
+  type a name, press Save — and the save was quietly discarded. Nothing told you; the old name
+  simply stayed.
+- **A rename cannot be typed over while it is being saved.** The field reopened before the
+  save had finished, so what you typed second could be replaced by the answer to the first.
+
 ## A Codex turn is filed under the session that took it — (v1.18.1)
 
 **If Settings shows Codex notify needing an update, reinstall it from Plugins.** Updating

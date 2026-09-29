@@ -1,5 +1,25 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A Codex turn is filed under the session that took it — (v1.18.1)
+
+**If Settings shows Codex notify needing an update, reinstall it from Plugins.** Updating
+Gyredeck does not replace what is installed in your config folder, and this fix lives in that
+file.
+
+### Fixes
+
+- **Sessions stopped appearing in projects nobody had opened.** A row called after some other
+  checkout, with no agent behind it, sitting beside the real one. Codex tells Gyredeck which
+  session finished a turn and where it was working, and the part of Gyredeck that listens was
+  ignoring both — it reported its own working directory instead, which belongs to a background
+  process Codex keeps running from wherever it first started. A turn taken in one project was
+  filed against another, under a session that did not exist.
+- **Two reports of the same finished turn are matched by session rather than by folder.** Two
+  Codex sessions in one checkout share a folder and not a turn, so the folder was never quite
+  the right thing to match on. Where an out-of-date copy of the adapter still says nothing but
+  the folder, Gyredeck matches it only when nobody else is working there — a repeated turn is
+  something you can see and fix by reinstalling; a turn that quietly vanished is not.
+
 ## Name a session yourself — (v1.18.0)
 
 A session has been named after the folder it is working in, and that moves: send an agent

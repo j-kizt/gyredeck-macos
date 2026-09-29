@@ -812,6 +812,19 @@ fn sync_issue_password(code: String, conversation_id: String) -> Result<String, 
     standalone_bridge::sync_issue_password(&code, &conversation_id)
 }
 
+/// Every name the person has given a session, keyed by conversation id.
+#[tauri::command]
+fn session_names() -> Result<serde_json::Value, String> {
+    standalone_bridge::session_names()
+}
+
+/// Name a session, or clear the name with an empty string. Answers with what was kept,
+/// which is not always what was typed — it is trimmed, flattened and capped.
+#[tauri::command]
+fn set_session_name(conversation_id: String, name: String) -> Result<Option<String>, String> {
+    standalone_bridge::set_session_name(&conversation_id, &name)
+}
+
 #[tauri::command]
 fn sync_join(code: String, conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
     standalone_bridge::sync_join(&code, &conversation_id)
@@ -5602,6 +5615,8 @@ pub fn run() {
             sync_create,
             sync_join,
             sync_issue_password,
+            session_names,
+            set_session_name,
             sync_close,
             sync_leave,
             set_bridge_port,

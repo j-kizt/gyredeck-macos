@@ -22,7 +22,7 @@
  *   POST /ingest    - Multi-provider event fan-in
  */
 
-import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
@@ -36,7 +36,129 @@ const MOD_DIR = join(homedir(), ".config", "gyredeck");
 const CONFIG_PATH = join(MOD_DIR, "gyredeck.config.json");
 const DEFAULT_LOG_FILE = join(MOD_DIR, "gyredeck.events.ndjson");
 const INGEST_TOKEN_PATH = join(MOD_DIR, "gyredeck.ingest-token");
+const SESSION_NAMES_PATH = join(MOD_DIR, "gyredeck.session-names.json");
+const SESSION_KINDS_PATH = join(MOD_DIR, "gyredeck.session-kinds.json");
 const BRIDGE_HOST = "127.0.0.1";
+
+/** The longest a person may make a session's name. Long enough for a sentence fragment,
+ *  short enough that a room roster and a session row still read at a glance. */
+export const SESSION_NAME_MAX = 40;
+
+/**
+ * Names the person has given particular sessions.
+ *
+ * A session's name is otherwise derived — from its agent, and from the folder it is
+ * working in — and both of those move. The folder changes as the session is driven
+ * around a checkout, so the name in the session list changes under the person who is
+ * reading it; and an agent whose hook has never reported is not known to be any
+ * particular agent at all, so several of them are "Agent" at once and none of them can
+ * be told apart. A name typed by hand is the one that holds still.
+ *
+ * Kept on disk rather than in the bridge's memory because the bridge restarts with every
+ * update, and a name that does not survive that is not worth typing. Kept by the bridge
+ * rather than in the app because the room labels are the bridge's to choose, and two
+ * copies of a name are two names.
+ */
+export const readSessionNames = (path) => {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return new Map();
+    // Cleaned on the way in as well as on the way out. The route sanitises what it is
+    // given, but the file is an ordinary file on the person's disk: something else may
+    // have written it, and a name is printed inside sentences.
+    const names = new Map();
+    for (const [id, value] of Object.entries(parsed)) {
+      if (typeof id !== "string") continue;
+      const name = cleanSessionName(value);
+      if (name) names.set(id, name);
+    }
+    return names;
+  } catch {
+    return new Map();
+  }
+};
+
+/**
+ * What a name has to be before it is kept.
+ *
+ * Trimmed, bounded, and free of the control characters that would let a name break the
+ * line it is printed on — a room's roster is a sentence, and a newline in the middle of
+ * one reads as the room saying something it did not say. Empty means "no name", which is
+ * how a person takes one back.
+ */
+export const cleanSessionName = (value) => {
+  if (typeof value !== "string") return null;
+  // eslint-disable-next-line no-control-regex
+  const flat = value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+  // By character, not by UTF-16 unit: `slice` would cut an emoji in half and leave a
+  // lone surrogate, which is not a string anybody can read or store cleanly.
+  return flat.length === 0 ? null : [...flat].slice(0, SESSION_NAME_MAX).join("");
+};
+
+/** How many sessions are remembered across a restart. Enough to cover a working day's
+ *  worth of them; the file is a line each, and the oldest fall off the end. */
+export const SESSION_KIND_MEMORY = 200;
+
+/**
+ * What kind of agent each session is, and where it was working.
+ *
+ * The bridge learns both from the events an agent's hook sends, and used to know them only
+ * for as long as those events stayed in the window it reads back at start — 500 of them.
+ * A bridge restarts with every update, so a session that had been quiet since before that
+ * window came back as "Agent", in no particular folder, with nothing wrong at either end.
+ * Two of those in a room are the same word twice and cannot be told apart.
+ *
+ * Kept beside the names for the same reason: a fact about a session that has to outlive
+ * the process that noticed it. Guessing is not the alternative — naming a Codex session
+ * "Claude Code" in a roster that agents read to decide who to address is worse than
+ * admitting the bridge does not know.
+ */
+export const readSessionKinds = (path) => {
+  const kinds = new Map();
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return kinds;
+    for (const [id, entry] of Object.entries(parsed)) {
+      if (typeof id !== "string" || !entry || typeof entry !== "object") continue;
+      const provider = typeof entry.provider === "string" && /^[A-Za-z-]{1,40}$/.test(entry.provider)
+        ? entry.provider
+        : null;
+      const cwd = typeof entry.cwd === "string" && entry.cwd.length > 0 && entry.cwd.length <= 1024
+        ? entry.cwd
+        : null;
+      if (provider || cwd) kinds.set(id, { provider, cwd });
+    }
+  } catch {}
+  return kinds;
+};
+
+/**
+ * Write a small JSON file the way a private file has to be written.
+ *
+ * `writeFileSync(path, ..., { mode })` sets the mode only when it creates the file, so a
+ * file that already exists as `0644` stays `0644` — and the directory it lives in is
+ * `0755`. It also truncates the destination before writing, so a process that dies
+ * halfway leaves a file the next start cannot parse and discards whole; and it follows a
+ * symlink to whatever it points at.
+ *
+ * Written to a fresh temp file beside it with `wx` and `0600`, then renamed over the top.
+ * Rename is atomic, replaces a symlink rather than following it, and leaves the previous
+ * contents untouched until the new ones are complete.
+ */
+export const writePrivateJson = (path, value) => {
+  const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    renameSync(temp, path);
+  } catch (error) {
+    try { unlinkSync(temp); } catch {}
+    throw error;
+  }
+};
 
 // ── Token management ──
 
@@ -1091,7 +1213,7 @@ function startBridge(config) {
     // longer an untrusted stop to guard against here. This is also what lets
     // finishHookStop harvest a Codex turn the bridge has no history for.
     if (data.sourceKind === "codexCliHook" && typeof scope.conversationId === "string" && scope.conversationId.length > 0) {
-      providerByConversation.set(scope.conversationId, "codexCliHook");
+      observeSession(scope.conversationId, { provider: "codexCliHook" });
     }
     if (scope.cwd && providerByConversation.get(scope.conversationId) === "codexCliHook") {
       codexStopAtByCwd.set(scope.cwd, now);
@@ -1274,6 +1396,37 @@ function startBridge(config) {
    */
   const workspaceByConversation = new Map();
 
+  /**
+   * The names the person has typed, and the one place they are written.
+   *
+   * Read once at start and kept in step in memory, so naming a session does not cost a
+   * file read on every roster line. Written whole rather than appended: the file is a
+   * handful of short strings, and a partial write of a map is a map with a hole in it.
+   */
+  const sessionNames = readSessionNames(SESSION_NAMES_PATH);
+  /**
+   * Set or clear a name, and mean it in both places or neither.
+   *
+   * Written first, kept second. Changing memory before the write left the bridge saying
+   * one thing and the file another: the app was told the name had failed and went on
+   * showing the old one, while `GET /sessions/names` answered with the new one, and a
+   * restart put back a third. A name that could not be written down was not set.
+   */
+  const setSessionName = (conversationId, name) => {
+    const candidate = new Map(sessionNames);
+    if (name === null) candidate.delete(conversationId);
+    else candidate.set(conversationId, name);
+    try {
+      writePrivateJson(SESSION_NAMES_PATH, Object.fromEntries(candidate));
+    } catch (error) {
+      console.error(`⚠ could not save session names to ${SESSION_NAMES_PATH}: ${error.message}`);
+      return false;
+    }
+    sessionNames.clear();
+    for (const [id, value] of candidate) sessionNames.set(id, value);
+    return true;
+  };
+
   const workspaceFor = (conversationId) => {
     const cwd = workspaceByConversation.get(conversationId);
     if (typeof cwd !== "string" || cwd.length === 0) return null;
@@ -1300,11 +1453,29 @@ function startBridge(config) {
     for (const member of room.members.values()) if (member.label) taken.add(member.label);
     const former = room.formerLabels.get(conversationId);
     if (former && !taken.has(former)) return former;
+    // A name the person typed is deliberately not consulted here. It names a session in
+    // their own list, where they are the only reader; a room's roster is read by agents
+    // deciding who to address, and a name chosen for one purpose is not automatically
+    // right for the other. If that changes it is one line — but it should change on
+    // purpose, not by the two happening to share a store.
     const provider = providerLabelFor(conversationId);
     const workspace = workspaceFor(conversationId);
     // Shortest first: a lone Codex is "Codex", the second one to arrive in another
     // checkout is "Codex · AD1", and a second one in the same checkout takes an id.
-    const candidates = workspace ? [provider, `${provider} · ${workspace}`] : [provider];
+    //
+    // Except when the agent is not known to be any particular agent. "Agent" says only
+    // that something is there, so a second unknown one arriving becomes "Agent · <folder>"
+    // while the first keeps a name that names nothing — and a person reading the roster
+    // cannot tell which is which. Unknown starts at the folder, and only falls back to
+    // the bare word when there is no folder either.
+    // Known means the kind maps to a name, not that a kind was recorded. `unknown`,
+    // `hookRelay` and anything else outside PROVIDER_LABELS all come back as "Agent", so
+    // reading the map's key alone counted those as identified and handed the first of
+    // them the bare word again.
+    const known = PROVIDER_LABELS[providerByConversation.get(conversationId)] !== undefined;
+    const candidates = workspace
+      ? (known ? [provider, `${provider} · ${workspace}`] : [`${provider} · ${workspace}`])
+      : [provider];
     for (const candidate of candidates) if (!taken.has(candidate)) return candidate;
     // An id means nothing to a person, which is why it is last. It still beats a name
     // that points at two sessions at once: a request to one would read as a request to
@@ -1562,16 +1733,112 @@ function startBridge(config) {
 
   const providerLabelFor = (conversationId) =>
     PROVIDER_LABELS[providerByConversation.get(conversationId)] ?? "Agent";
-  const rememberProvider = (payload) => {
-    const conversationId = payload?.conversationId;
-    const sourceKind = payload?.runtime?.sourceKind;
-    if (typeof conversationId === "string" && typeof sourceKind === "string") {
-      providerByConversation.set(conversationId, sourceKind);
+  /**
+   * Write down what has been learnt about sessions, so a restart does not unlearn it.
+   *
+   * This is reached from every event that arrives, and a file write per event would be a
+   * file write per keystroke of an agent's work.
+   * Bounded by dropping the oldest, which is insertion order — a session seen again is
+   * rewritten and moves to the end, so the ones that fall off are the ones nothing has
+   * mentioned for longest.
+   */
+  const saveSessionKinds = () => {
+    // Recency order, kept by `seenSessions` rather than read off the two maps: `Map.set`
+    // on a key that is already there does not move it, so insertion order says when a
+    // session was first seen and not when it was last. A session working every day
+    // without changing folder would have drifted to the front of the queue to be dropped.
+    const keep = [...seenSessions].slice(-SESSION_KIND_MEMORY);
+    const out = {};
+    for (const id of keep) {
+      out[id] = {
+        provider: providerByConversation.get(id) ?? null,
+        cwd: workspaceByConversation.get(id) ?? null,
+      };
     }
-    if (typeof conversationId === "string" && typeof payload?.cwd === "string") {
-      workspaceByConversation.set(conversationId, payload.cwd);
+    try {
+      writePrivateJson(SESSION_KINDS_PATH, out);
+      return true;
+    } catch (error) {
+      // Once, not per event: a disk that refuses will refuse again in a moment, and a
+      // line per event would bury the log it is written to.
+      if (!sessionKindsWarned) {
+        sessionKindsWarned = true;
+        console.error(`⚠ could not save what is known about sessions to ${SESSION_KINDS_PATH}: ${error.message}` +
+          " — names and folders will be forgotten when this bridge restarts.");
+      }
+      return false;
     }
   };
+  let sessionKindsWarned = false;
+
+  /**
+   * Every session this bridge has seen, oldest first.
+   *
+   * The order the file is trimmed by, and the reason it is its own set: a `Map` keyed by
+   * session does not reorder when a key is written again, so nothing the two lookup maps
+   * hold can say which session was heard from least recently.
+   */
+  const seenSessions = new Set();
+
+  /**
+   * The one place anything is learnt about a session.
+   *
+   * Three callers used to write `providerByConversation` directly and two of them never
+   * reached the file, so what was written down depended on which route happened to
+   * notice a session first. Everything goes through here now, and every call is worth
+   * writing down: being heard from is itself the fact the file is keeping.
+   */
+  const observeSession = (conversationId, { provider = null, cwd = null } = {}) => {
+    if (typeof conversationId !== "string" || conversationId.length === 0) return;
+    // Seen is seen. A session heard from again is the most recent one even when it says
+    // exactly what it said last time, and that is the whole of what keeps it in the file.
+    seenSessions.delete(conversationId);
+    seenSessions.add(conversationId);
+    if (typeof provider === "string") providerByConversation.set(conversationId, provider);
+    if (typeof cwd === "string" && cwd.length > 0) workspaceByConversation.set(conversationId, cwd);
+    // Every observation, not only the ones that changed a value. Being heard from is what
+    // keeps a session in the file, so an observation that says nothing new still has
+    // something to record — and if it only moved the queue in memory, a restart would
+    // undo exactly the thing this was added for.
+    if (!replayingRecent) scheduleSaveSessionKinds();
+  };
+
+  /**
+   * A whole-file write on the path every event takes is a whole-file write per event.
+   *
+   * Collected instead: the first change arms a timer, later ones ride it, and the file is
+   * written once. Unrefed so it cannot hold the process open, and flushed on the way out
+   * so a shutdown does not lose what the last few seconds learnt.
+   */
+  const SESSION_KIND_SAVE_MS = 750;
+  let dirtyKinds = false;
+  let kindSaveTimer = null;
+  const scheduleSaveSessionKinds = () => {
+    dirtyKinds = true;
+    if (kindSaveTimer) return;
+    kindSaveTimer = setTimeout(() => {
+      kindSaveTimer = null;
+      // Cleared only once the write has been made. A disk that refused leaves the debt
+      // standing, so the flush on the way out has something to try again with.
+      if (saveSessionKinds()) dirtyKinds = false;
+    }, SESSION_KIND_SAVE_MS);
+    kindSaveTimer.unref?.();
+  };
+  const flushSessionKinds = () => {
+    if (kindSaveTimer) { clearTimeout(kindSaveTimer); kindSaveTimer = null; }
+    if (!dirtyKinds) return;
+    if (saveSessionKinds()) dirtyKinds = false;
+  };
+
+  const rememberProvider = (payload) => {
+    observeSession(payload?.conversationId, {
+      provider: payload?.runtime?.sourceKind ?? null,
+      cwd: payload?.cwd ?? null,
+    });
+  };
+  // Seeding from the file and from the log is not new knowledge, and writing it back
+  // would rewrite the file once per remembered event on every start.
+  let replayingRecent = true;
 
   /**
    * Whether this bridge is allowed to start an agent CLI at all.
@@ -1618,9 +1885,16 @@ function startBridge(config) {
     return found;
   };
 
+  // What was written down last time comes back first, then the recent log on top of it:
+  // the log is the fresher of the two wherever they disagree, and it is the only one that
+  // can correct a session that has moved folder since.
+  for (const [conversationId, entry] of readSessionKinds(SESSION_KINDS_PATH)) {
+    observeSession(conversationId, { provider: entry.provider, cwd: entry.cwd });
+  }
   // Events already on disk tell us who owns which conversation, so a bridge that has
   // just restarted can still route a message without waiting for fresh activity.
   for (const payload of recent) rememberProvider(payload);
+  replayingRecent = false;
 
   const CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");
   const CODEX_REPLY_TIMEOUT_MS = 120_000;
@@ -2799,7 +3073,7 @@ function startBridge(config) {
       // hook nobody has trusted, in silence — so nothing else may ever have said what
       // this thread is. Without this the member is confirmed and then never pushed to,
       // which is the same silence in a new place.
-      providerByConversation.set(conversationId, "codexCliHook");
+      observeSession(conversationId, { provider: "codexCliHook" });
       const { transitioned, delivered, held } = confirmRoomMember(
         found.name,
         found.room,
@@ -2809,6 +3083,53 @@ function startBridge(config) {
       res.end(
         JSON.stringify({ ok: true, confirmed: true, transitioned, delivered, held, room: found.name }),
       );
+      return;
+    }
+
+    // GET /sessions/names — every name the person has typed, so the app can show them
+    // beside sessions it builds itself.
+    // PUT /sessions/names/<conversationId> — set one, or clear it with an empty string.
+    //
+    // The machine token and nothing else: a name is not secret, and the person who can
+    // read the token is the person whose sessions these are. What it must not be is
+    // open to a page in a browser, which the token already settles.
+    if (req.url === "/sessions/names" && req.method === "GET") {
+      if (refuseHookCall(res, req)) return;
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+      res.end(JSON.stringify({ ok: true, names: Object.fromEntries(sessionNames) }));
+      return;
+    }
+    if (req.method === "PUT" && req.url?.startsWith("/sessions/names/")) {
+      if (refuseHookCall(res, req)) return;
+      // `decodeURIComponent` throws on a half-written escape, and this handler is async:
+      // the rejection would leave the request hanging rather than answered. The caller
+      // holding the token is not a reason to trust the string it put in a path.
+      let conversationId = null;
+      try {
+        conversationId = decodeURIComponent(req.url.slice("/sessions/names/".length).split("?")[0]);
+      } catch {
+        conversationId = null;
+      }
+      if (!conversationId || Buffer.byteLength(conversationId, "utf8") > 128) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+        res.end(JSON.stringify({ ok: false, error: "no_session" }));
+        return;
+      }
+      const body = await readJsonBody(req);
+      const name = cleanSessionName(body.name);
+      if (!setSessionName(conversationId, name)) {
+        // Nothing happened, here or on disk. Answering 200 with a flag had the app and
+        // the bridge disagreeing about what this session is called.
+        res.writeHead(500, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+        res.end(JSON.stringify({
+          ok: false,
+          error: "not_saved",
+          message: "The name could not be written to ~/.config/gyredeck, so nothing was changed.",
+        }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+      res.end(JSON.stringify({ ok: true, conversationId, name }));
       return;
     }
 
@@ -3960,6 +4281,9 @@ if (isEntryPoint) {
   const shutdown = () => {
     console.log("\n⏹ Bridge shutting down...");
     server.close();
+    // What the last few seconds learnt is still sitting behind the save timer, and this
+    // process is about to be gone. A restart is exactly when the file is read back.
+    flushSessionKinds();
     eventLog.close();
     process.exit(0);
   };

@@ -4413,3 +4413,195 @@ test("reading a room's password out lets nobody in", async () => {
     await rm(home, { recursive: true, force: true });
   }
 });
+
+/**
+ * A name the person typed, and two sessions nothing has identified.
+ *
+ * Both halves of the same complaint: sessions in a room were all called "Agent", and the
+ * name in the session list moved as the agent was driven around a checkout. The typed
+ * name is deliberately for the list only — the roster is read by agents deciding who to
+ * address, and a name chosen for one reader is not automatically right for the other.
+ */
+test("a session can be given a name, and two unidentified ones are still told apart", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-names-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "names-founder";
+  const first = "names-unknown-first";
+  const second = "names-unknown-second";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    // The token is the whole of the gate, as it is for every other machine-local route.
+    const open = await fetch(`http://127.0.0.1:${port}/sessions/names`);
+    assert.equal(open.status, 401);
+
+    assert.deepEqual((await call("GET", "/sessions/names")).body.names, {});
+    const named = await call("PUT", `/sessions/names/${first}`, { name: "  the audit one \n" });
+    assert.equal(named.body.name, "the audit one", "kept is the cleaned name, not what was typed");
+    assert.equal(named.status, 200, "a name that was written down answers plainly");
+    assert.deepEqual((await call("GET", "/sessions/names")).body.names, { [first]: "the audit one" });
+
+    // A name survives the bridge, which is the whole reason it is not kept in memory.
+    const names = JSON.parse(await readFile(join(home, ...CONFIG_DIR, "gyredeck.session-names.json"), "utf8"));
+    assert.deepEqual(names, { [first]: "the audit one" });
+
+    // Clearing it is the only way out, and leaves nothing behind.
+    assert.equal((await call("PUT", `/sessions/names/${first}`, { name: "   " })).body.name, null);
+    assert.deepEqual((await call("GET", "/sessions/names")).body.names, {});
+
+    // The founder says what it is, so that "Agent" is free and the two below are the only
+    // ones competing for it. Without this the founder takes the bare word first and the
+    // rest of this proves nothing.
+    await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: founder, cwd: "/tmp/founder",
+      runtime: { sourcePid: 9, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+      data: { inputCount: 1 },
+    });
+    // A path the token holder can write but nobody meant: a half-written escape makes
+    // `decodeURIComponent` throw, and this handler is async, so an unanswered request
+    // would be the result rather than a refusal.
+    const malformed = await fetch(`http://127.0.0.1:${port}/sessions/names/%E0%A4%A`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ name: "x" }),
+    });
+    assert.equal(malformed.status, 400);
+    assert.equal((await malformed.json()).error, "no_session");
+    // And a session id far longer than one can be.
+    assert.equal((await call("PUT", `/sessions/names/${"a".repeat(200)}`, { name: "x" })).status, 400);
+
+    // Two sessions nothing has identified, in different checkouts. Both are "Agent" as
+    // far as the bridge knows, and both used to be — the first taking the bare word and
+    // naming nothing, the second taking the folder.
+    // One says nothing about itself, the other says something nobody has a name for. Both
+    // are "Agent" as far as a person reading the roster is concerned, and a kind that was
+    // recorded but cannot be turned into a name used to count as identified.
+    for (const [conversationId, cwd, runtime] of [
+      [first, "/tmp/alpha", null],
+      [second, "/tmp/beta", { sourcePid: 4, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "unknown" }],
+    ]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd,
+        runtime,
+        data: { inputCount: 1 },
+      });
+    }
+    const code = (await call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: first });
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: second });
+    const roster = (await call("GET", `/sync/rooms?as=${founder}`)).body.members;
+    const labelOf = (id) => roster.find((member) => member.conversationId === id)?.provider;
+    assert.equal(labelOf(first), "Agent · alpha");
+    assert.equal(labelOf(second), "Agent · beta");
+    assert.notEqual(labelOf(first), labelOf(second));
+
+    // What the bridge learnt is written down, so the next one does not have to relearn
+    // it from a log window that a quiet session falls out of. This is the difference
+    // between "Agent" meaning "nobody has ever said" and it meaning "restarted since".
+    // Written behind a short timer rather than on the path every event takes, so this
+    // waits for it instead of assuming it has already happened.
+    const kindsPath = join(home, ...CONFIG_DIR, "gyredeck.session-kinds.json");
+    let kindsRaw = null;
+    for (let attempt = 0; attempt < 60 && kindsRaw === null; attempt += 1) {
+      kindsRaw = await readFile(kindsPath, "utf8").catch(() => null);
+      if (kindsRaw === null) await new Promise((resolve) => { setTimeout(resolve, 50); });
+    }
+    assert.ok(kindsRaw, "what the bridge learnt reaches the disk");
+    const kinds = JSON.parse(kindsRaw);
+    assert.deepEqual(kinds[founder], { provider: "claudeCodeHook", cwd: "/tmp/founder" });
+    assert.deepEqual(kinds[first], { provider: null, cwd: "/tmp/alpha" });
+
+    // A name that could not be written down is a name that was not set: memory, disk and
+    // the answer agree, or nothing happened. Proven by making the file unwritable.
+    const namesDir = join(home, ...CONFIG_DIR);
+    await chmod(namesDir, 0o500);
+    const refused = await call("PUT", `/sessions/names/${first}`, { name: "should not stick" });
+    await chmod(namesDir, 0o700);
+    assert.equal(refused.status, 500);
+    assert.equal(refused.body.error, "not_saved");
+    assert.deepEqual(
+      (await call("GET", "/sessions/names")).body.names,
+      {},
+      "and the bridge is not left saying something the file does not",
+    );
+
+    // A file that already existed with the wrong mode is replaced, not written into: the
+    // mode on writeFileSync only applies when it creates the file, and this one holds
+    // what the person has named their sessions.
+    const namesPath = join(home, ...CONFIG_DIR, "gyredeck.session-names.json");
+    await chmod(namesPath, 0o644);
+    await call("PUT", `/sessions/names/${second}`, { name: "the other one" });
+    assert.equal((await stat(namesPath)).mode & 0o777, 0o600);
+
+    // Seen again with nothing new to say still counts as seen. Without that, a session
+    // working every day without changing folder drifts to the front of the queue to be
+    // dropped, and comes back after the next restart as "Agent".
+    for (let index = 0; index < 250; index += 1) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId: `crowd-${index}`, cwd: `/tmp/crowd/${index}`,
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+        data: { inputCount: 1 },
+      });
+    }
+    // Read in two steps on purpose. The founder has to be observed once the crowd has
+    // already been written and the save timer has gone quiet — observed while that batch
+    // was still pending it would ride the same timer, and the file would show it there
+    // whether or not being heard from again counts for anything.
+    const readKinds = async (predicate) => {
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const raw = await readFile(kindsPath, "utf8").catch(() => null);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (predicate(parsed)) return parsed;
+        }
+        await new Promise((resolve) => { setTimeout(resolve, 50); });
+      }
+      return null;
+    };
+    const crowded = await readKinds((parsed) => Boolean(parsed["crowd-249"]));
+    assert.ok(crowded, "the crowd reaches the file");
+    assert.ok(!crowded[founder], "and pushes the founder out of it, which is what makes the rest a test");
+    // Well past the save timer, so nothing is still owed from the crowd.
+    await new Promise((resolve) => { setTimeout(resolve, 1_200); });
+
+    // Heard from again, saying exactly what it said before. Nothing about it has changed;
+    // the only new fact is that it is still there.
+    await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: founder, cwd: "/tmp/founder",
+      runtime: { sourcePid: 9, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+      data: { inputCount: 1 },
+    });
+    const refreshed = await readKinds((parsed) => Boolean(parsed[founder]));
+    assert.ok(refreshed, "a session heard from again is written back, not left in memory to be lost");
+    assert.ok(Object.keys(refreshed).length <= 200, "and the file stays bounded");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

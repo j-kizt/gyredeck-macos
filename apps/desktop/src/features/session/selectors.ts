@@ -1,3 +1,4 @@
+import { sessionGroupKey } from "./grouping";
 import type { GyredeckEvent, IGyredeckPresence } from "@gyredeck/protocol";
 import {
   getEventActivity,
@@ -57,9 +58,7 @@ export const buildWorkspaceSessionGroups = (
 ): IWorkspaceSessionGroup[] => {
   const grouped = new Map<string, ISessionSummary[]>();
   for (const session of sessions) {
-    const key = session.workspacePath
-      ? `cwd:${session.workspacePath}`
-      : `session:${session.conversationId}`;
+    const key = sessionGroupKey(session);
     const group = grouped.get(key);
     if (group) group.push(session);
     else grouped.set(key, [session]);
@@ -88,7 +87,9 @@ export const buildWorkspaceSessionGroups = (
 
       return {
         key,
-        project: primarySession.project,
+        // A named session is a group of one, and the name is the whole reason it is not
+        // in the group it would otherwise be in — so it is what the row says.
+        project: primarySession.displayName ?? primarySession.project,
         workspace: primarySession.workspace,
         workspacePath: primarySession.workspacePath,
         status: primarySession.status,
@@ -128,6 +129,7 @@ export const buildSessionSummaries = (
     sessions.set(conversationId, {
       conversationId,
       project: projectName(workspacePath ?? latest.cwd),
+      displayName: null,
       workspace: shortenPath(workspacePath ?? latest.cwd),
       workspacePath,
       detail: activity.detail,
@@ -154,6 +156,7 @@ export const buildSessionSummaries = (
     sessions.set(presence.conversationId, {
       conversationId: presence.conversationId,
       project: projectName(workspacePath ?? presence.cwd),
+      displayName: null,
       workspace: shortenPath(workspacePath ?? presence.cwd),
       workspacePath,
       detail: "idle",

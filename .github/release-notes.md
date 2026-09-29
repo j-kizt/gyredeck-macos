@@ -1,5 +1,30 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Name a session yourself — (v1.18.0)
+
+A session has been named after the folder it is working in, and that moves: send an agent
+into a subdirectory and the row you were watching is suddenly called something else. You can
+give it a name of your own now.
+
+### Added
+
+- **A name field at the top of a session's detail.** Type what you call it — "the audit one",
+  "the long refactor" — and that is what the list shows. The placeholder is the name it is
+  going by now, so you can see what you are replacing; clear the field and that name comes
+  back. A named session sits on its own rather than folded into its project's group, because
+  being able to pick it out is the point. Names are kept by Gyredeck itself, so they survive
+  a restart and an update.
+
+### Fixes
+
+- **Sessions in a sync room are no longer all called "Agent".** Two of them could have the
+  same name and no way to tell which was which. Gyredeck knows what each session is from the
+  events its agent sends, but it only remembered while those events were recent — and it
+  restarts with every update, so anything that had been quiet for a while came back nameless
+  through no fault of its own. That is written down now. Where it still genuinely does not
+  know, the session is named after its folder from the start rather than taking the bare word
+  and leaving the next one to be told apart.
+
 ## The room's password is the thing that lets a session in — (v1.17.3)
 
 **If Settings shows Codex notify needing an update, reinstall it from Plugins before using a

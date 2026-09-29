@@ -482,48 +482,6 @@
   }
 }
 
-/* The name the person gave this session. Sits where the title is read rather than in a
-   settings panel, because it is the thing being renamed and the fallback has to be
-   visible beside it — an empty field showing the derived name as its placeholder says
-   both what the session is called and that nobody has called it anything. */
-.session-name-field {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.session-name-input {
-  width: 100%;
-  padding: 3px 6px;
-  border: 1px solid transparent;
-  border-radius: 5px;
-  background: transparent;
-  color: var(--text);
-  font-size: 12px;
-  font-weight: 600;
-  font-family: inherit;
-}
-
-.session-name-input::placeholder {
-  color: var(--text-3);
-  font-weight: 500;
-}
-
-.session-name-input:hover {
-  border-color: var(--hair);
-}
-
-.session-name-input:focus {
-  border-color: var(--accent);
-  background: var(--fill);
-  outline: none;
-}
-
-.session-name-error {
-  color: var(--danger);
-  font-size: 11px;
-}
-
 .detail-path {
   overflow: hidden;
   color: var(--text-3);

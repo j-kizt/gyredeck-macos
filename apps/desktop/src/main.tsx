@@ -1039,7 +1039,12 @@ const App = () => {
             ) : selectedSession ? (
               <div className="sheet-header detail-header" data-tauri-drag-region="false">
                 <StatusGlyph status={selectedSession.status} />
-                <span className="header-title">{headerLabel}</span>
+                <SessionNameField
+                  conversationId={selectedSession.conversationId}
+                  name={sessionNames[selectedSession.conversationId] ?? ""}
+                  fallback={headerLabel}
+                  onRename={renameSession}
+                />
                 <span className="spacer" />
               </div>
             ) : (
@@ -1129,12 +1134,6 @@ const App = () => {
                 <div className="detail-body session-context-view" data-status={selectedSession.status}>
                   <SessionContextSummary session={selectedSession} />
                   <SessionContextMeter session={selectedSession} usage={contextUsage[selectedSession.conversationId]} />
-                  <SessionNameField
-                    conversationId={selectedSession.conversationId}
-                    name={sessionNames[selectedSession.conversationId] ?? ""}
-                    fallback={projectName(selectedSession.cwd)}
-                    onRename={renameSession}
-                  />
                   <div className="detail-path" title={selectedSession.cwd}>{shortenPath(selectedSession.cwd)}</div>
                   {sessionAction.message ? (
                     <div className="notice-row compact" data-online={sessionAction.ok === true} role="status" aria-live="polite">{sessionAction.message}</div>

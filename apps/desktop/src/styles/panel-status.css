@@ -243,6 +243,108 @@
   white-space: nowrap;
 }
 
+/* The session's name, and the way to change it. Reads as the title it already was until
+   it is clicked — the pencil only appears under the pointer, so nothing is added to a
+   header somebody is using to watch an agent work. */
+.header-title-named {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  max-width: 100%;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  font: inherit;
+  cursor: text;
+}
+
+.header-title-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The name a session goes by without one of its own, kept beside the one it was given.
+   Quiet enough to read past, there for matching a row against a terminal window. */
+.header-title-derived {
+  overflow: hidden;
+  flex: none;
+  color: var(--text-3);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.header-title-pencil {
+  flex: none;
+  opacity: 0.45;
+  transition: opacity 90ms ease;
+}
+
+.header-title-named:hover {
+  border-color: var(--hair);
+}
+
+.header-title-named:hover .header-title-pencil,
+.header-title-named:focus-visible .header-title-pencil {
+  opacity: 0.9;
+}
+
+/* Something went wrong saving it. The title keeps its own colour — the name on screen is
+   still the name the session has — and the reason is in the tooltip. */
+.header-title-named[data-saving] {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.header-title-named[data-error] .header-title-pencil {
+  color: var(--danger);
+  opacity: 1;
+}
+
+.header-title-editing {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  min-width: 0;
+}
+
+.header-title-input {
+  min-width: 0;
+  flex: 1;
+  padding: 2px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  background: var(--fill);
+  color: inherit;
+  font: inherit;
+}
+
+.header-title-input:focus {
+  outline: none;
+}
+
+.header-title-action {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--hair);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.header-title-action:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
 .spacer {
   flex: 1;
   min-width: 0;

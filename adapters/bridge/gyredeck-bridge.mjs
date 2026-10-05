@@ -1234,11 +1234,28 @@ function startBridge(config) {
 
   const NOTIFY_STOP_HOLD_MS = 1_500;
   const CODEX_STOP_ECHO_MS = 5_000;
+  /**
+   * How long a remembered client is worth anything.
+   *
+   * It exists to survive the gap between a notify and the completion that is published in
+   * its place, and the two windows above are the whole of that gap. Past their sum the
+   * entry can answer no question, and keeping it only means the map grows for as long as
+   * the bridge runs — one entry per `codex exec`, which is a thing scripts do in loops.
+   */
+  const CLIENT_MEMORY_MS = NOTIFY_STOP_HOLD_MS + CODEX_STOP_ECHO_MS;
+  const pruneClients = (now) => {
+    for (const [conversationId, entry] of clientByConversation) {
+      if (now - entry.at > CLIENT_MEMORY_MS) clientByConversation.delete(conversationId);
+    }
+  };
   const codexStopAtBySession = new Map();
   const heldNotifyStopBySession = new Map();
 
   const emitHookStop = (data = {}) => {
     const now = Date.now();
+    // Every stop, not only the ones that write: the sweep has to run at least as often as
+    // the map grows, and what grows it is a flood of one-shots each reporting once.
+    pruneClients(now);
     const scope = tracker.hookScope(data, now);
     const notifyKey = typeof scope.conversationId === "string" && scope.conversationId.length > 0
       ? scope.conversationId
@@ -1257,6 +1274,10 @@ function startBridge(config) {
       observeSession(scope.conversationId, {
         provider: sessionProviderFor(scope.conversationId, "codex-notify"),
       });
+      // Before the echo and hold checks below, either of which can drop this very event.
+      if (typeof data.client === "string" && data.client.length > 0) {
+        clientByConversation.set(scope.conversationId, { client: data.client, at: now });
+      }
       // Replaced, not filled in. `hookScope` carries forward whatever the session was
       // last seen with, so a session whose hook reported activity and then never sent its
       // stop would have notify's completion published as though the hook had reported it
@@ -1316,6 +1337,12 @@ function startBridge(config) {
       data: {
         hookEventName: typeof data.hookEventName === "string" ? data.hookEventName : "Stop",
         source: typeof data.source === "string" ? data.source : "hook",
+        // Carried through rather than acted on here. What a session is allowed to do is
+        // decided by its provider; this says only which front end Codex ran, which is the
+        // one thing that separates a one-shot from a session a person is sitting in.
+        client: typeof data.client === "string"
+          ? data.client
+          : clientByConversation.get(scope.conversationId)?.client ?? null,
         message: typeof data.message === "string" ? data.message : null,
         // A hook that reports its own usage is believed; Codex reports none, so its log
         // is read instead. Only for Codex — the others put real numbers in the payload.
@@ -1461,6 +1488,20 @@ function startBridge(config) {
   // agent: Codex takes a queued message and wakes to read it, while the others are
   // handed theirs by their own hook on their next turn.
   const providerByConversation = new Map();
+  /**
+   * Which Codex front end a session's turns come from, as its `notify` names it.
+   *
+   * Written when the notify arrives and read when the turn is finally published, because
+   * those are usually two different events: the hook's own stop lands a few milliseconds
+   * later and is the one that gets published, with the notify dropped as an echo of it.
+   * Reading the client off the published event would therefore lose it exactly where it
+   * was not lost — hence a map, filled before anything is allowed to drop.
+   *
+   * Every `codex exec` is a new session id, so this is a map a day of batch commands
+   * grows without limit. Entries are kept only as long as the two windows that can
+   * separate a notify from the completion it belongs to, and swept on the way in.
+   */
+  const clientByConversation = new Map();
   // A member is addressed by conversation id, which says nothing a person or an agent
   // can read. The runtime kind the events carry is the only name available.
   const PROVIDER_LABELS = {

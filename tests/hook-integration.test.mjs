@@ -2490,6 +2490,21 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
     assert.equal(seen.length, 2, "notify-then-hook still reports once");
     assert.equal(seen[1].conversationId, notifyFirst);
 
+    // Which front end took the turn is only ever told to notify, and this is the ordering
+    // where notify's own event is the one thrown away: it is held, the hook's stop lands
+    // inside the hold, and the hook's event is what gets published. Read off the published
+    // event the client would be lost exactly here. It is written down when the notify
+    // arrives, before anything is allowed to drop, so the hook's event carries it.
+    const named = "01a06082-8ef6-7900-ae39-44fe2e46dddd";
+    await runNotify(hooked2, { cwd: hooked2, "thread-id": named, client: "codex-tui" });
+    await runHook("UserPromptSubmit", named, hooked2);
+    await runHook("Stop", named, hooked2);
+    await settle();
+    seen = await completions();
+    assert.equal(seen.length, 3, "still one turn");
+    assert.equal(seen[2].conversationId, named);
+    assert.equal(seen[2].data.client, "codex-tui", "the client survives the event that named it being dropped");
+
     // A hook that reports activity but whose stop never arrives must not silence notify —
     // this is the case that rules out keying on "the hook sent something lately".
     await runHook("PreToolUse", "01a06082-8ef6-7900-ae39-44fe2e46cccc", lame, {
@@ -2498,16 +2513,16 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
     await runNotify(lame);
     await settle();
     seen = await completions();
-    assert.equal(seen.length, 3, "a hook that never stops does not silence notify");
-    assert.equal(seen[2].conversationId, `codex:${lame}`);
+    assert.equal(seen.length, 4, "a hook that never stops does not silence notify");
+    assert.equal(seen[3].conversationId, `codex:${lame}`);
 
     // No hooks at all is the case notify exists for, and without this half the test
     // would pass just as well against a notify that had stopped working altogether.
     await runNotify(bare);
     await settle();
     seen = await completions();
-    assert.equal(seen.length, 4, "an unhooked directory still reports its turn");
-    assert.equal(seen[3].conversationId, `codex:${bare}`);
+    assert.equal(seen.length, 5, "an unhooked directory still reports its turn");
+    assert.equal(seen[4].conversationId, `codex:${bare}`);
 
     // What Codex says, not where this program was started. The two are routinely
     // different: notify is spawned by the shared app-server daemon, which keeps the
@@ -2515,19 +2530,22 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
     // checkout was reported against another, under a session nobody had opened, with no
     // agent behind it.
     const realThread = "01a06082-8ef6-7900-ae39-44fe2e46eeee";
-    await runNotify(lame, { cwd: bare, "thread-id": realThread });
+    await runNotify(lame, { cwd: bare, "thread-id": realThread, client: "codex_exec" });
     await settle();
     seen = await completions();
-    assert.equal(seen.length, 5, "a turn Codex names is still one turn");
-    assert.equal(seen[4].conversationId, realThread, "reported under the session Codex names");
-    assert.equal(seen[4].cwd, bare, "and the directory Codex names, not the one this was spawned in");
+    assert.equal(seen.length, 6, "a turn Codex names is still one turn");
+    assert.equal(seen[5].conversationId, realThread, "reported under the session Codex names");
+    assert.equal(seen[5].cwd, bare, "and the directory Codex names, not the one this was spawned in");
     // The third layer of the same bug: a session the bridge has heard of only through
     // notify was an agent of no particular kind, and showed up as "Agent".
-    assert.equal(seen[4].runtime?.sourceKind, "codex-notify", "and as a Codex turn, not an anonymous one");
+    assert.equal(seen[5].runtime?.sourceKind, "codex-notify", "and as a Codex turn, not an anonymous one");
+    // A one-shot reports its turn through notify and nothing else — `codex exec` fires no
+    // Stop hook at all — so here the client rides the notify's own event.
+    assert.equal(seen[5].data.client, "codex_exec", "and says which front end ran");
     // Real numbers, because the protocol says numbers. An event that type-checks nowhere
     // is one every reader has to be defensive about.
-    assert.ok(Number.isInteger(seen[4].runtime.sourcePid) && seen[4].runtime.sourcePid > 0);
-    assert.ok(Number.isFinite(seen[4].runtime.sourceStartedAtMs));
+    assert.ok(Number.isInteger(seen[5].runtime.sourcePid) && seen[5].runtime.sourcePid > 0);
+    assert.ok(Number.isFinite(seen[5].runtime.sourceStartedAtMs));
     // What reported the turn and what the session can do are different questions. A
     // notify that names a real thread has proved the harvest can read its log and the
     // room can push to it — both need the thread and nothing else — so the session is
@@ -2548,8 +2566,8 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
     await runNotify(lame, { cwd: hooked, "thread-id": pairedThread });
     await settle();
     seen = await completions();
-    assert.equal(seen.length, 6, "hook and notify naming one session report it once");
-    assert.equal(seen[5].conversationId, pairedThread);
+    assert.equal(seen.length, 7, "hook and notify naming one session report it once");
+    assert.equal(seen[6].conversationId, pairedThread);
     // The echo is dropped, and must not take the session's identity with it on the way
     // past. Read from what the bridge wrote down rather than from the events it
     // published, because a dropped echo leaves no event — what it can damage is what the
@@ -2641,7 +2659,7 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
     await runNotify(cold);
     await settle();
     seen = await completions();
-    assert.equal(seen.length, 12, "a stop with no prior ingest still swallows its notify echo");
+    assert.equal(seen.length, 13, "a stop with no prior ingest still swallows its notify echo");
     assert.equal(seen.at(-1).conversationId, coldId);
 
     // A stop is a mutation like any other and the door is shut: without the machine
@@ -2668,8 +2686,24 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
     await runNotify(forged);
     await settle();
     seen = await completions();
-    assert.equal(seen.length, 13, "the refused stop reported nothing, and notify still covers the turn");
+    assert.equal(seen.length, 14, "the refused stop reported nothing, and notify still covers the turn");
     assert.equal(seen.at(-1).conversationId, `codex:${forged}`);
+
+    // A client is remembered only for as long as it can answer anything — the hold plus
+    // the echo window, which is the whole of the gap between a notify and the completion
+    // published in its place. Past that the entry is swept, and the next turn of the same
+    // session must not be stamped with it: every `codex exec` is a new session id, so a
+    // map that never forgets is one a loop of batch commands grows without limit.
+    const stale = "01a06082-8ef6-7900-ae39-44fe2e46aaff";
+    await runNotify(hooked, { cwd: hooked, "thread-id": stale, client: "codex_exec" });
+    await settle();
+    assert.equal((await completions()).at(-1).data.client, "codex_exec", "named while it is fresh");
+    // Past NOTIFY_STOP_HOLD_MS + CODEX_STOP_ECHO_MS, with a little room for a slow box.
+    await new Promise((resolve) => { setTimeout(resolve, 7_000); });
+    await runHook("UserPromptSubmit", stale, hooked);
+    await runHook("Stop", stale, hooked);
+    await settle();
+    assert.equal((await completions()).at(-1).data.client, null, "and forgotten once it cannot");
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
@@ -4123,6 +4157,24 @@ test("a room password carried in by notify lets that session in, once", async ()
       return pushes();
     };
 
+    /**
+     * The push addressed to one thread, waited for by that and nothing else.
+     *
+     * Counting is the wrong oracle wherever one action pushes to two members: confirming
+     * a session also tells the others the roster changed, and those two pushes have no
+     * promised order. A wait for "one more push" is satisfied by whichever lands first,
+     * so the search for the other one then runs against a file that does not have it yet
+     * — and fails, rarely, in a way that looks like the product.
+     */
+    const pushForThread = async (thread) => {
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        const line = (await pushes()).filter((entry) => entry.includes(`--thread ${thread}`)).at(-1);
+        if (line) return line;
+        await settle();
+      }
+      return null;
+    };
+
     // Deliberately no `/ingest` first. The session this route exists for is one whose
     // Codex hook never ran — an untrusted hook is skipped in silence — so nothing has
     // ever said what this thread is, and seeding a provider here would test a case the
@@ -4327,7 +4379,6 @@ test("a room password carried in by notify lets that session in, once", async ()
       "a reply the room cannot hold for an unconfirmed member is not published",
     );
 
-    const beforeBulky = await pushes();
     const bulkyConfirm = await call("POST", "/hook/sync/confirm", {
       conversationId: joiner2,
       turnId: "01a06082-8ef6-7900-ae39-44fe2e460010",
@@ -4337,9 +4388,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     assert.equal(bulkyConfirm.body.held, admitted.length, "everything the room accepted is handed over");
     // Picked by who it is addressed to: confirming this one also tells the other Codex
     // member the roster changed, and the two pushes have no promised order.
-    const carried = (await pushesReach(beforeBulky.length + 1))
-      .filter((line) => line.includes(`--thread ${joiner2}`))
-      .at(-1);
+    const carried = await pushForThread(joiner2);
     assert.ok(carried, "the newly confirmed session was pushed to");
     for (const marker of admitted) {
       assert.ok(carried.includes(marker), `${marker} was accepted, so it has to arrive`);

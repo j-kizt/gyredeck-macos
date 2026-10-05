@@ -159,7 +159,7 @@ const App = () => {
   const { names: sessionNames, rename: renameSession } = useSessionNames(canUseNativeControls);
   const allSessions = useMemo(
     () =>
-      buildSessionSummaries(sessionEventRegistry, presence, now)
+      buildSessionSummaries(sessionEventRegistry, presence, now, selectedSessionId)
         .filter(
           (session) =>
             !isDeletedAfter(deletedSessionIds, session.conversationId, session.lastActivityAt),
@@ -172,7 +172,7 @@ const App = () => {
           ...session,
           displayName: sessionNames[session.conversationId] ?? null,
         })),
-    [deletedSessionIds, now, presence, sessionEventRegistry, sessionNames],
+    [deletedSessionIds, now, presence, selectedSessionId, sessionEventRegistry, sessionNames],
   );
   const sessions = useMemo(
     () =>

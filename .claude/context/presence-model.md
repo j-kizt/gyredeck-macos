@@ -55,9 +55,44 @@ The Sessions UI derives a smaller "activity kind" from raw events for recent-act
 | `tool_start` + memory/compaction | `memory` / `compact` | Memory/context work, content not exposed. |
 | `tool_end` | derived tool kind | History keeps the latest truthful activity; no fake running claim. |
 | `attention_requested` | `attention` | User input required; persists until later activity resolves it. |
-| `turn_complete` / `turn_stop` / `conversation_close` | `done` | Completed row remains sticky until explicit clear/dismiss. |
+| `turn_complete` / `turn_stop` / `conversation_close` | `done` | Completed row remains sticky until explicit clear/dismiss — except a one-shot, below. |
 | `bridge_error` | `error` | Error state; safe detail stays textual. |
 | lifecycle / idle | `session` / `bridge` | Identity stays visible without a false activity claim. |
+
+## One-shot sessions
+
+`codex exec` opens a real Codex session, takes a turn and closes it, all inside a couple of
+seconds. The sticky rule above was written for a session a person is sitting in, and it
+turned those two seconds into a row that outlived the command by days — one per command,
+beside the session actually in use.
+
+A session is retired from the list when all three are true (`features/session/retirement.ts`):
+
+| | |
+| --- | --- |
+| It closed | a `conversation_close` event exists for it |
+| It is a one-shot | some `turn_complete` carries `data.client` naming a one-shot front end (`codex_exec`) |
+| It has been seen | its newest event is at least `ONE_SHOT_GRACE_MS` (8s) old |
+
+`data.client` comes from Codex's `notify` and from nowhere else — no hook is told which
+front end ran. **An absent client is never read as one-shot**: a machine without that
+adapter keeps every row, which is the failure that loses nothing.
+
+The bridge writes the client down when the notify arrives, *before* the echo and hold
+checks that can drop that very event, and stamps it on a completion published in its place
+within the next few seconds. That covers the ordering that happens — notify first, the
+hook's stop a few milliseconds behind — and not the reverse: a hook stop published before
+the notify arrives carries no client, because at that moment nobody has said one. Such a
+session simply stays, which is the failure that loses nothing. Closing that half would mean
+coalescing the two sides by turn id, which both do carry; it is not done here.
+
+What is remembered is swept after `NOTIFY_STOP_HOLD_MS + CODEX_STOP_ECHO_MS`, the whole of
+the gap it exists to bridge. Every `codex exec` is a new session id, so a map that never
+forgot would grow for as long as the bridge ran.
+
+Measured order for a one-shot: the hook's `conversation_close` reaches the log first and
+the completion naming the client follows about 1.5 seconds later, so the rule reads the
+session's events as a set rather than trusting either to arrive first.
 
 Important limitation: there is no native `plan_start`, `thinking_delta`, or assistant-text event. "Planning" is inferred from plan/goal tools, "thinking" from `turn_start`/`llm_start`, and active work from tool/model/compaction lifecycle until a terminal event or inactivity.
 

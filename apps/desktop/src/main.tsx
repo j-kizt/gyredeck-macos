@@ -1135,7 +1135,7 @@ const App = () => {
                       <GitBranch size={13} strokeWidth={2.3} />
                     </button>
                   </div>
-                  <button className="header-tab" type="button" aria-label={hooksNeedAttention ? "Settings · an agent hook needs reinstalling" : "Settings"} data-flag={hooksNeedAttention} onClick={(event) => { event.stopPropagation(); openSetup(); }} data-tauri-drag-region="false" title={hooksNeedAttention ? "Settings · an agent hook needs reinstalling" : "Settings"}>
+                  <button className="header-tab" type="button" aria-label={hooksNeedAttention ? "Settings · an agent hook needs attention" : "Settings"} data-flag={hooksNeedAttention} onClick={(event) => { event.stopPropagation(); openSetup(); }} data-tauri-drag-region="false" title={hooksNeedAttention ? "Settings · an agent hook needs attention" : "Settings"}>
                     <Settings size={13} strokeWidth={2.3} />
                   </button>
                 </div>

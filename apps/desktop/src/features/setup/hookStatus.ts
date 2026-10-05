@@ -60,8 +60,14 @@ export const hookSettled = (status: IHookStatus): boolean =>
  * What the Codex hooks row says about approval, and what the person has to do about it.
  *
  * Null when there is nothing to say beyond "installed". The fix is in Codex, never a
- * reinstall: reinstalling an unapproved hook leaves it unapproved, and reinstalling an
- * approved one is what turns it into a changed one.
+ * reinstall: reinstalling an unapproved hook writes the same unapproved entry back.
+ *
+ * Approval belongs to the entry in `hooks.json` — its content and its place in the list —
+ * not to the script it runs. Measured against Codex 0.160.0: reinstalling over an approved
+ * hook keeps it approved, because the same entry is written back in the same place; a
+ * newer installer writing a different entry makes it `modified`; our entry moving in the
+ * list, which happens when another tool's hook shares the event, makes it `untrusted`.
+ * Changing the script alone changes nothing.
  */
 export const codexTrustCopy = (
   trust: CodexHookTrust | null | undefined,

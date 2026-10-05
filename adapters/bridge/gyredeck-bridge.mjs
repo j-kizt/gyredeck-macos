@@ -2213,9 +2213,10 @@ function startBridge(config) {
    */
   //
   // Joined only while the hooks are the ones that question was about. Approval is keyed by
-  // a hash of each entry, so a question started before a reinstall is a question about
-  // hooks that no longer exist — and handing its answer to someone asking after the
-  // reinstall would light the row with an approval the new hook does not have.
+  // each entry's content and its place in the list, so a question started before
+  // `hooks.json` changed — a newer installer, another tool's hook arriving beside ours — is
+  // a question about hooks that no longer exist, and handing its answer to someone asking
+  // after the change would light the row with an approval the new entry does not have.
   let codexTrustInFlight = null;
   const codexHookTrust = () => {
     const hooksJsonPath = codexHooksJsonPath();

@@ -786,7 +786,7 @@ The bridge asks Codex rather than recomputing its hash: it starts `codex app-ser
 | --- | --- |
 | `approved` | every Gyredeck hook (command contains `gyredeck-codex-hook.mjs`) is `enabled` and `trusted` or `managed` |
 | `untrusted` | any of ours has never been approved |
-| `modified` | approved once, changed since — what a reinstall does to an approved hook |
+| `modified` | approved once, and the entry has changed since — a newer installer writing a different entry |
 | `disabled` | approved, but switched off; Codex still reports these as `trusted`, so `enabled` is read on its own |
 | `unknown` | no `codex`, an app-server that would not start or answer, a refused method, a shape or status not recognised, or Codex listing none of ours — never read as fine |
 
@@ -803,9 +803,21 @@ Both sides find Codex's files by one rule — `CODEX_HOME` when set, `~/.codex` 
 approval always describe the same file.
 
 Overlapping asks share one app-server — but only while `hooks.json` reads the same as when
-that question started. Approval is keyed by each entry's content, so a question begun before
-a reinstall is about hooks that no longer exist; an ask after the file changed starts its
-own. Once a question has answered, the next ask is fresh. **Gyredeck never writes `trusted_hash` itself**,
+that question started. Approval is keyed by each entry, so a question begun before the file
+changed is about hooks that no longer exist; an ask after it starts its own. Once a question
+has answered, the next ask is fresh.
+
+**What does and does not lose an approval** — measured against Codex 0.160.0 with the real
+registration copied into a throwaway `CODEX_HOME`:
+
+| change | result |
+| --- | --- |
+| Reinstall, with ours the only hook on each event | still `trusted` — the same entry is written back in the same place |
+| A newer installer writing a different entry (e.g. another timeout) | `modified` |
+| Our entry moving in its event's list — the installer prunes ours and appends, so it moves when another tool's hook shares the event | `untrusted`: the key carries the position (`stop:0:0`), so a moved entry is a new one |
+| The script at the installed path changing | no effect — approval is of the entry, not the file |
+
+So Reinstall is never the fix for an unapproved hook, and usually not the cause of one. **Gyredeck never writes `trusted_hash` itself**,
 even though doing so would work: approving its own hooks is exactly the decision the gate
 leaves with the person.
 

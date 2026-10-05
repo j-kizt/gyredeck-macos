@@ -602,13 +602,19 @@ fn codex_hook_install_path() -> Result<PathBuf, String> {
 /// `CODEX_HOME` would have hooks installed in one place and their approval read from
 /// another, and the two halves of the settings row would describe different files.
 fn codex_home() -> Result<PathBuf, String> {
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-        let trimmed = codex_home.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
+    codex_home_from(
+        std::env::var("CODEX_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// The rule itself, with the environment passed in, so it can be tested without setting
+/// variables a parallel test run would race over.
+fn codex_home_from(codex_home: Option<&str>, home: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(trimmed) = codex_home.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(trimmed));
     }
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    let home = home.ok_or_else(|| "HOME is not set".to_string())?;
     Ok(PathBuf::from(home).join(".codex"))
 }
 
@@ -6391,9 +6397,10 @@ mod agy_discovery_tests {
 #[cfg(test)]
 mod hook_registration_tests {
     use super::{
-        agy_registration_present, codex_hook_registration_complete, hook_entry_present, runs_event,
-        CODEX_HOOK_MATCHED_EVENTS, CODEX_HOOK_PLAIN_EVENTS,
+        agy_registration_present, codex_home_from, codex_hook_registration_complete, hook_entry_present,
+        runs_event, CODEX_HOOK_MATCHED_EVENTS, CODEX_HOOK_PLAIN_EVENTS,
     };
+    use std::path::PathBuf;
 
 
     const SCRIPT: &str = "/Users/someone/.config/gyredeck/gyredeck-claude-hook.mjs";
@@ -6455,6 +6462,29 @@ mod hook_registration_tests {
                 "{event} missing still read as complete"
             );
         }
+    }
+
+    #[test]
+    fn codex_home_is_where_codex_says_when_it_says() {
+        // The rule the bridge uses too. With two rules a person who sets CODEX_HOME would
+        // have hooks installed in one place and their approval read from another.
+        assert_eq!(codex_home_from(Some("/custom/codex"), Some("/Users/x")), Ok(PathBuf::from("/custom/codex")));
+        assert_eq!(codex_home_from(Some("  /custom/codex  "), Some("/Users/x")), Ok(PathBuf::from("/custom/codex")));
+    }
+
+    #[test]
+    fn an_empty_codex_home_is_not_a_setting() {
+        // Set to nothing is not set: falling back is what Codex does, and taking "" as a
+        // path would put every file in the current directory.
+        for value in [None, Some(""), Some("   ")] {
+            assert_eq!(codex_home_from(value, Some("/Users/x")), Ok(PathBuf::from("/Users/x/.codex")), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn no_home_and_no_codex_home_is_an_error_not_a_guess() {
+        assert!(codex_home_from(None, None).is_err());
+        assert_eq!(codex_home_from(Some("/custom"), None), Ok(PathBuf::from("/custom")));
     }
 
     #[test]

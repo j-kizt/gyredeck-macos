@@ -1,5 +1,35 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Settings stops calling a Codex hook ready before Codex has agreed to run it — (v1.18.4)
+
+Codex runs only the hooks you have approved in its own `/hooks` screen, and skips every
+other one without a word. Gyredeck now asks Codex which of its hooks it will actually run,
+and tells you when the answer is no.
+
+### Fixes
+
+- **A Codex hook Codex has not approved is no longer shown as installed and working.**
+  Install the Codex plugin and Settings went green straight away — and then no Codex session
+  ever appeared, with nothing to say why. The row now says what Codex says: *waiting for
+  approval*, *changed since you approved it* or *turned off in Codex*, with the step to take
+  (open Codex, type `/hooks`, approve the Gyredeck hooks) and a **Recheck** button for when
+  you come back. Reinstalling is never offered as the fix, because it does not change Codex's
+  answer.
+- **No green while Gyredeck is still asking.** The row used to show a checkmark the moment
+  you pressed Install, before Codex had been asked anything. It now says it is checking, and
+  only shows the checkmark once Codex has answered.
+- **Every hook has to be approved, not just one.** Codex approving the hook that marks the
+  end of a turn while skipping the ones for tool calls still leaves the session list wrong,
+  so all of them have to pass. An install missing any of its hooks now shows as out of date.
+- **Coming back to Gyredeck checks again.** Approve the hooks in Codex, switch back, and the
+  row catches up on its own — and the same goes the other way if you switch one off.
+- **Where Codex could not be asked, Gyredeck says so** rather than guessing either way, and
+  does not light the Settings warning over a question that simply went unanswered.
+- **`CODEX_HOME` is respected everywhere.** If you keep Codex's files somewhere other than
+  `~/.codex`, installing and checking now both look there.
+
+Gyredeck never approves its own hooks. That is your decision, made in Codex.
+
 ## A finished one-off command stops pretending to be a session — (v1.18.3)
 
 **Reinstall the Codex plugins from Settings for this one.** Only Codex's notify adapter is

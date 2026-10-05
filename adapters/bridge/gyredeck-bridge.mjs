@@ -502,6 +502,96 @@ export const sweepRooms = (rooms, now, { close, idleMs }) => {
   }
 };
 
+const CODEX_TRUSTED_STATUSES = new Set(["trusted", "managed"]);
+const CODEX_KNOWN_STATUSES = new Set(["trusted", "managed", "untrusted", "modified"]);
+const GYREDECK_CODEX_HOOK = "gyredeck-codex-hook.mjs";
+
+/** `PreToolUse` → `pre_tool_use`, the spelling Codex uses in a hook's key. */
+const snakeEvent = (name) => name.replace(/(?<!^)(?=[A-Z])/g, "_").toLowerCase();
+
+/**
+ * The events Gyredeck registered in `hooks.json`, read from the file the installer wrote.
+ *
+ * Read rather than listed here: the installer is the only thing that decides which events
+ * we hook, and a second copy of that list in this file would be right until the day the
+ * installer changed. Codex is then held to every one of them.
+ */
+export const gyredeckCodexEvents = (hooksJson) => {
+  const events = new Set();
+  const hooks = hooksJson?.hooks;
+  if (!hooks || typeof hooks !== "object") return events;
+  for (const [event, groups] of Object.entries(hooks)) {
+    for (const group of Array.isArray(groups) ? groups : []) {
+      for (const hook of Array.isArray(group?.hooks) ? group.hooks : []) {
+        if (typeof hook?.command === "string" && hook.command.includes(GYREDECK_CODEX_HOOK)) events.add(snakeEvent(event));
+      }
+    }
+  }
+  return events;
+};
+
+/**
+ * What Codex's `hooks/list` answer says about Gyredeck's own hooks.
+ *
+ * Module scope, and exported, for the same reason `syncCodeChar` is: the test should hold
+ * the rule the bridge runs, not a copy of it.
+ *
+ * Every Gyredeck hook has to pass, not just one: a Stop that runs while the tool hooks are
+ * skipped still leaves the session list wrong, and the person still has to go and approve
+ * the rest. "Every" means every event the installer registered, not every one Codex
+ * happened to list — a hook Codex leaves out is a hook it will not run. The worst state wins, in the order the person would have to deal with them —
+ * never approved, then approved but since changed, then switched off.
+ *
+ * `enabled` is checked on its own. A hook the person turned off in Codex still reports
+ * `trusted`, so reading `trustStatus` alone would put the green back on a hook that will
+ * not run.
+ */
+export const summariseCodexHooks = (message, { hooksJsonPath = null, expectedEvents = new Set() } = {}) => {
+  const unknown = (reason, hooks = []) => ({ state: "unknown", reason, hooks });
+  const data = message?.result?.data;
+  if (!Array.isArray(data)) return unknown(message?.error ? "method_refused" : "unrecognised_shape");
+  // Nothing of ours in the file is a question for the install row, not for Codex.
+  if (expectedEvents.size === 0) return unknown("not_registered");
+  // Codex reported trouble reading hooks for this directory; what it did list may be partial.
+  if (data.some((entry) => Array.isArray(entry?.errors) && entry.errors.length > 0)) return unknown("codex_reported_errors");
+
+  const ours = [];
+  for (const entry of data) {
+    for (const hook of Array.isArray(entry?.hooks) ? entry.hooks : []) {
+      const command = typeof hook?.command === "string" ? hook.command : "";
+      if (!command.includes(GYREDECK_CODEX_HOOK)) continue;
+      // Ours by where it was read from as well as by what it runs: the same script named
+      // in some project's own hooks file is not the registration the installer made.
+      if (hooksJsonPath !== null && hook.sourcePath !== hooksJsonPath) continue;
+      const parts = typeof hook.key === "string" ? hook.key.split(":") : [];
+      ours.push({
+        key: parts.length >= 3 ? parts.slice(-3).join(":") : null,
+        event: parts.length >= 3 ? parts[parts.length - 3] : null,
+        enabled: hook.enabled,
+        trustStatus: hook.trustStatus,
+      });
+    }
+  }
+  if (ours.length === 0) return unknown("not_listed");
+  if (ours.some((hook) => !CODEX_KNOWN_STATUSES.has(hook.trustStatus) || typeof hook.enabled !== "boolean")) {
+    return unknown("unrecognised_status", ours);
+  }
+
+  const state = ours.some((hook) => hook.trustStatus === "untrusted") ? "untrusted"
+    : ours.some((hook) => hook.trustStatus === "modified") ? "modified"
+    : ours.some((hook) => !hook.enabled) ? "disabled"
+    : null;
+  if (state) return { state, reason: null, hooks: ours };
+
+  // Every hook Codex listed is fine — but a hook it did not list is one it will not run.
+  // "All the ones we saw are approved" is not "all of ours are approved".
+  const listed = new Set(ours.map((hook) => hook.event));
+  if ([...expectedEvents].some((event) => !listed.has(event))) return unknown("incomplete", ours);
+  return ours.every((hook) => CODEX_TRUSTED_STATUSES.has(hook.trustStatus))
+    ? { state: "approved", reason: null, hooks: ours }
+    : unknown("unrecognised_status", ours);
+};
+
 /** Characters a room code is drawn from: no `0/O`, no `1/l/I`, nothing that reads alike. */
 export const SYNC_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 
@@ -2030,6 +2120,116 @@ function startBridge(config) {
     return found;
   };
 
+  /**
+   * Whether Codex will actually run Gyredeck's hooks — asked of Codex, not worked out.
+   *
+   * Installing a hook and Codex being willing to run it are two different facts. Codex
+   * runs only hooks the person has approved in `/hooks`, keyed by a hash of each entry's
+   * content, and an entry without that approval is skipped without a word. The settings
+   * row used to read the first fact and report it as both, so a new install showed green
+   * while not one event ever arrived.
+   *
+   * Codex's own app-server answers the question directly: `hooks/list` reports every hook
+   * with `enabled` and a `trustStatus` of `trusted | managed | untrusted | modified`. That
+   * is the source of truth, rather than recomputing Codex's hash here — which would be a
+   * copy of somebody else's rule, and one step away from Gyredeck approving its own hooks,
+   * which is exactly the decision the gate exists to leave with the person.
+   *
+   * `unknown` is a real answer and the one every failure lands on: no `codex` on this
+   * machine, an app-server that will not start or answer, a Codex too old to have the
+   * method, a shape not recognised. None of those is evidence either way, so none of them
+   * is allowed to read as green or as red.
+   */
+  const CODEX_TRUST_TIMEOUT_MS = 8_000;
+  const codexHooksJsonPath = () => {
+    const codexHome = process.env.CODEX_HOME?.trim();
+    return join(codexHome ? codexHome : join(homedir(), ".codex"), "hooks.json");
+  };
+  const readCodexTrust = (hooksJsonPath, hooksJsonText) => new Promise((resolve) => {
+    const unknown = (reason) => resolve({ state: "unknown", reason, hooks: [] });
+    let hooksJson = null;
+    try { hooksJson = JSON.parse(hooksJsonText ?? ""); } catch {}
+    const expected = { hooksJsonPath, expectedEvents: gyredeckCodexEvents(hooksJson) };
+    const binary = findAgentBinary("codex");
+    if (!binary) { unknown("codex_not_found"); return; }
+
+    let child;
+    try {
+      child = spawn(binary, ["app-server"], { stdio: ["pipe", "pipe", "ignore"], env: process.env });
+    } catch {
+      unknown("spawn_failed");
+      return;
+    }
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { child.kill(); } catch {}
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish({ state: "unknown", reason: "timeout", hooks: [] }), CODEX_TRUST_TIMEOUT_MS);
+    timer.unref?.();
+    child.on("error", () => finish({ state: "unknown", reason: "spawn_failed", hooks: [] }));
+    child.on("exit", () => finish({ state: "unknown", reason: "exited", hooks: [] }));
+
+    const send = (message) => { try { child.stdin.write(`${JSON.stringify(message)}\n`); } catch {} };
+    let buffered = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffered += chunk;
+      let newline;
+      while ((newline = buffered.indexOf("\n")) >= 0) {
+        const line = buffered.slice(0, newline);
+        buffered = buffered.slice(newline + 1);
+        let message;
+        try { message = JSON.parse(line); } catch { continue; }
+        if (message?.id === 1) {
+          if (!message.result) { finish({ state: "unknown", reason: "initialize_refused", hooks: [] }); return; }
+          send({ method: "initialized" });
+          send({ id: 2, method: "hooks/list", params: { cwds: [homedir()] } });
+        } else if (message?.id === 2) {
+          finish(summariseCodexHooks(message, expected));
+          return;
+        }
+      }
+    });
+    send({
+      id: 1,
+      method: "initialize",
+      params: {
+        clientInfo: { name: "gyredeck", title: "Gyredeck", version: "1" },
+        capabilities: { experimentalApi: true, requestAttestation: false },
+      },
+    });
+  });
+  /**
+   * One question per version of `hooks.json`. Opening Settings, coming back to the window
+   * and pressing Recheck can all land within the same second, and each would otherwise
+   * start its own app-server — a real process that opens Codex's database, not a file
+   * read. Whoever asks while one is running about the same file waits for that answer,
+   * which was asked moments ago. Two can be out at once, but only when the file changed
+   * between them, and then they are about different hooks.
+   */
+  //
+  // Joined only while the hooks are the ones that question was about. Approval is keyed by
+  // a hash of each entry, so a question started before a reinstall is a question about
+  // hooks that no longer exist — and handing its answer to someone asking after the
+  // reinstall would light the row with an approval the new hook does not have.
+  let codexTrustInFlight = null;
+  const codexHookTrust = () => {
+    const hooksJsonPath = codexHooksJsonPath();
+    let hooksJsonText = null;
+    try { hooksJsonText = readFileSync(hooksJsonPath, "utf8"); } catch {}
+    if (codexTrustInFlight && codexTrustInFlight.hooksJsonText === hooksJsonText) return codexTrustInFlight.answer;
+    const flight = { hooksJsonText, answer: null };
+    flight.answer = readCodexTrust(hooksJsonPath, hooksJsonText).finally(() => {
+      if (codexTrustInFlight === flight) codexTrustInFlight = null;
+    });
+    codexTrustInFlight = flight;
+    return flight.answer;
+  };
+
   // What was written down last time comes back first, then the recent log on top of it:
   // the log is the fresher of the two wherever they disagree, and it is the only one that
   // can correct a session that has moved folder since.
@@ -3238,6 +3438,14 @@ function startBridge(config) {
     // The machine token and nothing else: a name is not secret, and the person who can
     // read the token is the person whose sessions these are. What it must not be is
     // open to a page in a browser, which the token already settles.
+    // GET /codex/hook-trust — whether Codex will run Gyredeck's hooks, in Codex's own words.
+    if (req.url === "/codex/hook-trust" && req.method === "GET") {
+      if (refuseHookCall(res, req)) return;
+      const trust = await codexHookTrust();
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+      res.end(JSON.stringify({ ok: true, ...trust }));
+      return;
+    }
     if (req.url === "/sessions/names" && req.method === "GET") {
       if (refuseHookCall(res, req)) return;
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...corsHeaders });

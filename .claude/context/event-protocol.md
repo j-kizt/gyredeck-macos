@@ -36,7 +36,7 @@ Events are newline-delimited JSON in `~/.config/gyredeck/gyredeck.events.ndjson`
 | Antigravity (AGY) hook | `agyHost` | hook payload `modelName` |
 | Codex notify | `codex-notify` — the relay sends its own `runtime` block, like every other adapter | not available |
 
-`POST /ingest`, `/hook/stop`, `/hook/attention`, `/hook/sync/confirm` and both `/sessions/names` routes carry the machine-local `x-gyredeck-token` (a `0600` file at `~/.config/gyredeck/gyredeck.ingest-token`) or are refused with `401`. Not *every* mutation: creating and joining a sync room ask for nothing, on purpose, and the mail routes take one of two credentials depending on the route — both are set out further down. The token used to be advisory on those routes — an untrusted sender's event was still accepted, with its `runtime` field stripped before storage — which left any local process able to write into the presence stream and the audit log. The refusal names the fix, because the way it is met in practice is an adapter left behind by an update. Hook-derived signals (`/hook/stop`, `/hook/attention`) reuse a recently correlated scope only when it is unambiguous and inside the bounded active-scope window; an unscoped hook event leaves `runtime` null. Runtime metadata never grants process control and does not expose command arguments.
+`POST /ingest`, `/hook/stop`, `/hook/attention`, `/hook/sync/confirm`, both `/sessions/names` routes and `/codex/hook-trust` carry the machine-local `x-gyredeck-token` (a `0600` file at `~/.config/gyredeck/gyredeck.ingest-token`) or are refused with `401`. Not *every* mutation: creating and joining a sync room ask for nothing, on purpose, and the mail routes take one of two credentials depending on the route — both are set out further down. The token used to be advisory on those routes — an untrusted sender's event was still accepted, with its `runtime` field stripped before storage — which left any local process able to write into the presence stream and the audit log. The refusal names the fix, because the way it is met in practice is an adapter left behind by an update. Hook-derived signals (`/hook/stop`, `/hook/attention`) reuse a recently correlated scope only when it is unambiguous and inside the bounded active-scope window; an unscoped hook event leaves `runtime` null. Runtime metadata never grants process control and does not expose command arguments.
 
 The bridge keeps carry-forward scope **per conversation** (falling back to cwd), so scoped fields such as `model` never bleed from one agent/source into another — an Antigravity turn cannot stamp its model onto a Claude conversation.
 
@@ -55,6 +55,7 @@ Bound to `127.0.0.1:47621`.
 | POST | `/hook/sync/confirm` | A room password typed at a Codex prompt, relayed by notify. |
 | GET | `/sessions/names` | The names the person has typed for particular sessions. |
 | PUT | `/sessions/names/<id>` | Name one session, or clear it with an empty string. |
+| GET | `/codex/hook-trust` | Whether Codex will run Gyredeck's hooks, asked of Codex's own app-server (`hooks/list`). `state` is `approved \| untrusted \| modified \| disabled \| unknown`; see below. |
 | GET | `/mail` | Mail rooms that currently exist, with how much is waiting in each. |
 | POST | `/mail/<room>` | Send a message into a room, and deliver it to the session that room belongs to. |
 | GET | `/mail/<room>?since=<seq>` | Read messages after `seq`. |
@@ -769,3 +770,45 @@ Provider-error shape:
 Reserved for bridge/runtime errors; carries a short `message` and optional `code`.
 
 > Note: the protocol type union (`packages/protocol/src/index.ts`) enumerates all event types above. Not every source emits every type — Claude hooks emit lifecycle/turn/tool/compact events, AGY emits tool/turn/lifecycle events, and Codex emits only a coarse turn-completion signal. `compact_end`, `llm_start`, and `llm_end` are part of the protocol for richer sources but are not produced by the current hook adapters.
+
+## Codex hook approval (`/codex/hook-trust`)
+
+Installing a Codex hook and Codex agreeing to run it are separate facts. Codex runs only the
+hooks the person has approved in `/hooks`, recorded as `trusted_hash` under
+`[hooks.state."<hooks.json>:<event>:<i>:<j>"]` in `~/.codex/config.toml`, and skips every other
+one **without a word**. The settings row used to read the install alone.
+
+The bridge asks Codex rather than recomputing its hash: it starts `codex app-server`, sends
+`initialize`, `initialized`, then `hooks/list` with `cwds: [$HOME]`, and reads each hook's
+`enabled` and `trustStatus` (`trusted | managed | untrusted | modified`). Bounded at 8s.
+
+| `state` | when |
+| --- | --- |
+| `approved` | every Gyredeck hook (command contains `gyredeck-codex-hook.mjs`) is `enabled` and `trusted` or `managed` |
+| `untrusted` | any of ours has never been approved |
+| `modified` | approved once, changed since — what a reinstall does to an approved hook |
+| `disabled` | approved, but switched off; Codex still reports these as `trusted`, so `enabled` is read on its own |
+| `unknown` | no `codex`, an app-server that would not start or answer, a refused method, a shape or status not recognised, or Codex listing none of ours — never read as fine |
+
+Precedence is the order above, worst first.
+
+The events Codex is held to are read from `hooks.json` itself, and that file is held to the
+installer: `codex_hook_status` reports an install as out of date unless **every** event in
+`CODEX_HOOK_MATCHED_EVENTS` and `CODEX_HOOK_PLAIN_EVENTS` is registered, not only `Stop`. A
+file holding `Stop` alone used to read as installed and current, and Codex approving that
+one hook then lit the row over nine that were never written.
+
+Both sides find Codex's files by one rule — `CODEX_HOME` when set, `~/.codex` otherwise
+(`codex_home()` in `lib.rs`, `codexHooksJsonPath()` in the bridge) — so the install and the
+approval always describe the same file.
+
+Overlapping asks share one app-server — but only while `hooks.json` reads the same as when
+that question started. Approval is keyed by each entry's content, so a question begun before
+a reinstall is about hooks that no longer exist; an ask after the file changed starts its
+own. Once a question has answered, the next ask is fresh. **Gyredeck never writes `trusted_hash` itself**,
+even though doing so would work: approving its own hooks is exactly the decision the gate
+leaves with the person.
+
+Measured against Codex 0.160.0 in a throwaway `CODEX_HOME`: no `hooks.state` entry →
+`untrusted`; a wrong hash → `modified`; `trusted_hash = currentHash` → `trusted`; that plus
+`enabled = false` → `trusted` with `enabled: false`.

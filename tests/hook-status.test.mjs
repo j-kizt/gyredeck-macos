@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 const module = new URL("../apps/desktop/src/features/setup/hookStatus.ts", import.meta.url);
-const { hookNeedsAttention } = await import(module.href);
+const { codexTrustCopy, hookNeedsAttention, hookSettled } = await import(module.href);
 
 const status = (installed, stale) => ({ path: "/Users/x/.config/gyredeck/hook.mjs", installed, stale });
 
@@ -52,4 +52,59 @@ test("nothing is decided while anything is still unknown", () => {
   assert.equal(codexCanSync(status(null, null), notify(true, false)), null);
   assert.equal(codexCanSync(status(true, false), notify(null, null)), null);
   assert.equal(codexCanSync(status(true, false), notify(true, null)), null);
+});
+
+// ── Codex approval ───────────────────────────────────────────────────────────────────
+
+const codex = (trust) => ({ ...status(true, false), trust });
+
+test("a Codex hook Codex has approved is not something to point at", () => {
+  assert.equal(hookNeedsAttention(codex("approved")), false);
+});
+
+test("one Codex has not approved is, however current the install", () => {
+  // The false green this exists to remove: installed and current, and skipped by Codex
+  // without a word because nobody approved it in /hooks.
+  for (const trust of ["untrusted", "modified", "disabled"]) {
+    assert.equal(hookNeedsAttention(codex(trust)), true, trust);
+  }
+});
+
+test("an approval that could not be read keeps the checkmark off, without the danger dot", () => {
+  // The dot is drawn in the danger colour, and one timeout from a slow app-server is not
+  // evidence that a hook is broken. The row still withholds its checkmark — Recheck is
+  // right there — but nothing turns red over a question that went unanswered.
+  assert.equal(hookNeedsAttention(codex("unknown")), false);
+  assert.equal(hookSettled(codex("unknown")), false);
+});
+
+test("while Codex is being asked, the row is not settled — this is the false green the work removes", () => {
+  // Straight after Install the row used to read installed-and-current and draw a
+  // checkmark while the question was still on its way to Codex. Being asked is neither
+  // a finding nor a pass.
+  assert.equal(hookSettled(codex(null)), false);
+  assert.equal(hookNeedsAttention(codex(null)), false);
+});
+
+test("only an approved Codex hook is settled", () => {
+  assert.equal(hookSettled(codex("approved")), true);
+  for (const trust of ["untrusted", "modified", "disabled", "unknown", null]) {
+    assert.equal(hookSettled(codex(trust)), false, String(trust));
+  }
+});
+
+test("rows that have no approval to ask about are settled as before", () => {
+  assert.equal(hookSettled(status(true, false)), true);
+  assert.equal(hookSettled(status(true, true)), false);
+});
+
+test("every state that is not approved tells the person what to do, and it is never reinstall", () => {
+  for (const trust of ["untrusted", "modified", "disabled", "unknown"]) {
+    const copy = codexTrustCopy(trust);
+    assert.ok(copy, trust);
+    assert.match(copy.step, /\/hooks/, `${trust} points at where approval happens`);
+    assert.doesNotMatch(copy.step, /reinstall/i, `${trust} — reinstalling changes nothing, or makes it worse`);
+  }
+  assert.equal(codexTrustCopy("approved"), null);
+  assert.match(codexTrustCopy(null).detail, /checking/i, "being asked says so");
 });

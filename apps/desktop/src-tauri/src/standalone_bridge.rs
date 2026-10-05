@@ -388,6 +388,19 @@ fn bridge_request(
     path: &str,
     body: Option<String>,
 ) -> Result<(u16, serde_json::Value), String> {
+    bridge_request_within(method, path, body, MAIL_REQUEST_TIMEOUT)
+}
+
+/// The same request, for the one caller whose answer takes longer than a mailbox read.
+///
+/// Connecting is still held to the short limit — an unreachable bridge is unreachable at
+/// once — and only the wait for the reply is stretched.
+fn bridge_request_within(
+    method: &str,
+    path: &str,
+    body: Option<String>,
+    reply_timeout: Duration,
+) -> Result<(u16, serde_json::Value), String> {
     let Some(token) = read_ingest_token() else {
         return Err("Ingest token is not available yet".to_string());
     };
@@ -396,7 +409,7 @@ fn bridge_request(
 
     let mut stream = TcpStream::connect_timeout(&address, MAIL_REQUEST_TIMEOUT)
         .map_err(|error| format!("Bridge is not reachable: {error}"))?;
-    let _ = stream.set_read_timeout(Some(MAIL_REQUEST_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(reply_timeout));
     let _ = stream.set_write_timeout(Some(MAIL_REQUEST_TIMEOUT));
 
     let mut request = format!(
@@ -1073,6 +1086,20 @@ pub(crate) fn set_session_name(conversation_id: &str, name: &str) -> Result<Opti
         .get("name")
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned))
+}
+
+/// Whether Codex will run Gyredeck's hooks, as Codex itself reports it.
+///
+/// The bridge starts Codex's app-server and asks it, which takes a couple of seconds and
+/// is bounded at eight; the reply wait here is a little past that so the bridge's own
+/// `unknown` arrives rather than a timeout of ours that says nothing about why.
+pub(crate) fn codex_hook_trust() -> Result<serde_json::Value, String> {
+    let (status, value) =
+        bridge_request_within("GET", "/codex/hook-trust", None, Duration::from_millis(9_500))?;
+    if !(200..300).contains(&status) {
+        return Err(sync_error(status, &value));
+    }
+    Ok(value)
 }
 
 /// Percent-encode the few characters that would otherwise change which path is asked for.

@@ -39,7 +39,7 @@ import { DEFAULT_BRIDGE_PORT, useGyredeckPresence } from "./features/presence/us
 import { SetupPanel } from "./features/setup/SetupPanel";
 import { SessionNameField } from "./features/session/SessionNameField";
 import { useSessionNames } from "./features/session/useSessionNames";
-import { codexCanSync, hookNeedsAttention, type IHookStatus } from "./features/setup/hookStatus";
+import { codexCanSync, hookNeedsAttention, type CodexHookTrust, type IHookStatus } from "./features/setup/hookStatus";
 import { useLaunchAtLogin } from "./features/setup/useLaunchAtLogin";
 import { useUpdater } from "./features/updater/useUpdater";
 import { readUsageSettings, writeUsageSettings } from "./features/usage/adapters";
@@ -873,18 +873,58 @@ const App = () => {
     }
   };
 
-  const loadCodexStatus = async () => {
+  const loadCodexStatus = async (): Promise<boolean> => {
     if (!canUseNativeControls) {
       clearHookStatus(setCodexStatus);
-      return;
+      return false;
     }
 
     try {
       const [path, installed, stale] = await invoke<[string, boolean, boolean | null]>("codex_hook_status");
-      setCodexStatus({ path, installed, stale });
+      // Kept, not cleared: re-reading the install should not wipe an approval already read.
+      setCodexStatus((current) => ({ path, installed, stale, trust: installed ? current.trust ?? null : null }));
+      return installed;
     } catch {
       clearHookStatus(setCodexStatus);
+      return false;
     }
+  };
+
+  /**
+   * Ask Codex whether it will run our hooks.
+   *
+   * Only when Settings is open, after an install, on Recheck and on coming back to the
+   * window — not on every launch: answering means starting Codex's app-server, which is a
+   * couple of seconds of somebody else's process for a question that matters on this one
+   * screen.
+   */
+  const codexTrustAsk = useRef(0);
+  const loadCodexTrust = async (): Promise<CodexHookTrust | null> => {
+    if (!canUseNativeControls) return null;
+    // The previous answer is withdrawn while a new one is fetched: an approval read before
+    // the person went to Codex is exactly the one that may no longer be true.
+    const ask = ++codexTrustAsk.current;
+    setCodexStatus((current) => ({ ...current, trust: null }));
+    let trust: CodexHookTrust;
+    try {
+      const answer = await invoke<{ state?: string }>("codex_hook_trust");
+      const known: CodexHookTrust[] = ["approved", "untrusted", "modified", "disabled", "unknown"];
+      trust = known.includes(answer.state as CodexHookTrust) ? (answer.state as CodexHookTrust) : "unknown";
+    } catch {
+      // The bridge could not be asked. That is "could not check", not "fine".
+      trust = "unknown";
+    }
+    // Only the newest question gets to answer. An older one finishing last would otherwise
+    // put back the state the person has just been to Codex to change.
+    if (ask !== codexTrustAsk.current) return null;
+    setCodexStatus((current) => ({ ...current, trust }));
+    return trust;
+  };
+
+  // Codex is asked only about hooks that are there. Asking with nothing installed would
+  // start an app-server every time Settings opened, to be told nothing of ours exists.
+  const recheckCodexTrust = async () => {
+    if (await loadCodexStatus()) await loadCodexTrust();
   };
 
   const installAgy = async () => {
@@ -960,10 +1000,24 @@ const App = () => {
       // migration that is meant to be one click.
       const wasInstalled = codexStatus.installed === true;
       const path = await invoke<string>("install_codex_hook");
-      setCodexStatus({ path, installed: true, stale: false });
-      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: wasInstalled
-          ? `Reinstalled → ${shortenPath(path)} · in effect from the next event`
-          : `Installed → ${shortenPath(path)} · restart Codex` });
+      // Not set to "installed and current" by hand. This is the moment a new person is
+      // looking at the row, and Codex has not approved anything yet — so the row is drawn
+      // from what Codex says, not from what was just written.
+      setCodexStatus({ path, installed: true, stale: false, trust: null });
+      // Awaited, so the install is not over — and its button not released — until the row
+      // can say what Codex will actually do.
+      const trust = await loadCodexTrust();
+      // The notice follows what Codex said, not what was written. "Restart Codex" in front
+      // of a hook Codex has not approved sends a new person straight past the one step
+      // that makes it work — the row would be right and the notice would undo it.
+      const done = wasInstalled ? `Reinstalled → ${shortenPath(path)}` : `Installed → ${shortenPath(path)}`;
+      const next =
+        trust === "untrusted" ? "approve it in Codex: type /hooks"
+        : trust === "modified" ? "approve it again in Codex: type /hooks"
+        : trust === "disabled" ? "turn it back on in Codex: type /hooks"
+        : trust === "approved" ? (wasInstalled ? "in effect from the next event" : "restart Codex")
+        : "could not check approval · open Codex and type /hooks";
+      setNativeAction({ bridgeOnline: nativeAction.bridgeOnline, message: `${done} · ${next}` });
     } catch (error) {
       setNativeAction({
         bridgeOnline: nativeAction.bridgeOnline,
@@ -996,12 +1050,24 @@ const App = () => {
     if (setupOpen) {
       void loadHookStatus();
       void loadAgyStatus();
-      void loadCodexStatus();
+      void recheckCodexTrust();
       void loadCodexNotifyStatus();
       void loadSyncReplies();
       void checkBridge();
     }
   }, [setupOpen]);
+
+  // Approval happens in Codex, in another window, and it can be taken away there as easily
+  // as given — so coming back here is a moment the answer may have changed either way, and
+  // it is asked again whatever the last one was. Asks that overlap are answered once by
+  // the bridge, so a burst of focus events starts one app-server, not several.
+  const codexHooksInstalled = codexStatus.installed === true;
+  useEffect(() => {
+    if (!setupOpen || !codexHooksInstalled) return;
+    const onFocus = () => { void loadCodexTrust(); };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [setupOpen, codexHooksInstalled]);
 
   // Also on mount, because the session detail decides whether to offer Sync session by
   // whether that agent's hook is installed. Loading these only when Settings opens hid
@@ -1116,6 +1182,7 @@ const App = () => {
                   onInstallHook={installHook}
                   onInstallAgy={installAgy}
                   onInstallCodex={installCodex}
+                  onRecheckCodexTrust={recheckCodexTrust}
                   codexNotifyStatus={codexNotifyStatus}
                   onInstallCodexNotify={installCodexNotify}
                   onKeepAwakeChange={updateKeepAwakeEnabled}

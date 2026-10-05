@@ -1,4 +1,5 @@
 import { sessionGroupKey } from "./grouping";
+import { shouldRetireFromList } from "./retirement";
 import type { GyredeckEvent, IGyredeckPresence } from "@gyredeck/protocol";
 import {
   getEventActivity,
@@ -116,6 +117,14 @@ export const buildSessionSummaries = (
   registry: SessionEventRegistry,
   presence: IGyredeckPresence,
   now: Date,
+  /**
+   * The session whose detail is open, if one is.
+   *
+   * A finished one-shot is kept on screen for a few seconds so that it can be seen — and
+   * seen means it can be clicked. Retiring it on a timer regardless would throw the
+   * person out of the very row the grace period invited them into.
+   */
+  selectedConversationId: string | null,
 ): ISessionSummary[] => {
   const sessions = new Map<string, ISessionSummary>();
 
@@ -123,6 +132,9 @@ export const buildSessionSummaries = (
     if (conversationId === "default" && isInternalOnlySession(sessionEvents)) continue;
     const latest = sessionEvents[0];
     if (!latest) continue;
+    // A `codex exec` that has finished is not a session anybody can go back to — unless
+    // they are already in it, in which case it stays until they leave.
+    if (shouldRetireFromList(conversationId, sessionEvents, now, selectedConversationId)) continue;
 
     const activity = getEventActivity(latest);
     const workspacePath = getSessionWorkspacePath(sessionEvents, latest.cwd);

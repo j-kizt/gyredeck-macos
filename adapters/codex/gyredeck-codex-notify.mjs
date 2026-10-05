@@ -140,6 +140,11 @@ const main = async () => {
       // real one. Kept only as the fallback for a Codex too old to say.
       conversationId: threadId || `codex:${cwd}`,
       toolName: null,
+      // Which front end took the turn. `codex_exec` is a session that lives for one
+      // command and is gone; `codex-tui` is a person at a terminal. Nothing else is told
+      // this — the hooks are not — and without it a one-shot is indistinguishable from a
+      // session somebody is still using.
+      client: typeof input.client === "string" ? input.client : null,
       message: typeof input["last-assistant-message"] === "string" ? "turn complete" : null,
     });
   } catch {

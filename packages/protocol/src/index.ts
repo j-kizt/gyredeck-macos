@@ -168,6 +168,14 @@ export interface IGyredeckTurnCompleteEvent extends IGyredeckBaseEvent {
     source: "hook" | string;
     message?: string | null;
     usage?: IGyredeckTurnUsage | null;
+    /**
+     * Which Codex front end took the turn, as Codex's own `notify` names it —
+     * `codex-tui` for a session a person is sitting in, `codex_exec` for a one-shot that
+     * exists for as long as the command runs. Only `notify` is told this, so it is absent
+     * wherever that adapter is not installed, and absent is not a claim that it is one or
+     * the other.
+     */
+    client?: string | null;
   };
 }
 

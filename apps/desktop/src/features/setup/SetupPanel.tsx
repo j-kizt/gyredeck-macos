@@ -7,7 +7,7 @@ import type { IUseUpdater } from "../updater/useUpdater";
 import { ProviderIcon } from "../github/components";
 import type { GitProvider, IGhAccount } from "../github/types";
 import { useGitCredentialHelper } from "./useGitCredentialHelper";
-import { hookNeedsAttention, type IHookStatus } from "./hookStatus";
+import { codexTrustCopy, hookNeedsAttention, hookSettled, type IHookStatus } from "./hookStatus";
 
 type SetupCategory = "connection" | "display" | "git" | "notification" | "permission" | "plugins" | "update";
 // Alphabetical. Arrow-key order and the visible order are the same list, because a
@@ -31,25 +31,42 @@ const TERMINAL_OPTIONS: Array<{ value: TerminalChoice; label: string }> = [
  * made to three of the four and the fourth went unnoticed, because nothing in TypeScript
  * can see that four lines were meant to agree. There is now one place for it to be wrong.
  */
-const PluginRow = ({ title, status, canUseNativeControls, busy, onInstall }: {
+const PluginRow = ({ title, status, canUseNativeControls, busy, onInstall, onRecheck, rechecking = false }: {
   title: string;
   status: IHookStatus;
   canUseNativeControls: boolean;
   busy: boolean;
   onInstall: () => void;
+  /** Codex hooks only: ask Codex again, after the person has been to `/hooks`. */
+  onRecheck?: () => void;
+  rechecking?: boolean;
 }) => {
+  // Out of date comes first: that one is fixed here, by installing, and installing is what
+  // changes the hook Codex was asked to approve — so approval is only worth reading once
+  // the hook is the current one.
+  // `trust` is absent on every row but Codex's, and `codexTrustCopy(undefined)` says nothing.
+  const trustCopy = status.installed === true && status.stale === false && status.trust !== undefined
+    ? codexTrustCopy(status.trust)
+    : null;
   const detail =
     status.stale === true ? "Out of date · install again so it keeps reporting"
     : status.installed === true && status.stale === null ? "Installed · could not check whether it is current"
+    : trustCopy ? trustCopy.detail
+    : status.installed === true && status.trust === "approved" ? `Installed · approved in Codex`
     : status.installed === true ? `Installed · ${shortenPath(status.path)}`
     : status.installed === false ? `Not installed · ${shortenPath(status.path)}`
     : canUseNativeControls ? "Checking install state"
     : "Tauri runtime needed";
-  // Settled and current is the only state with nothing to do. Unknown keeps its button,
-  // because the way to find out whether it is current is to install it again.
-  const settled = status.installed === true && !hookNeedsAttention(status);
+  // Settled is the only state with nothing to do or find out. An unknown currency keeps its
+  // button, because the way to find out is to install again; an approval still being read
+  // keeps the checkmark off until Codex has answered.
+  const settled = hookSettled(status);
+  // What Codex has not approved is not fixed by installing again, so the button asks
+  // Codex again instead of offering a reinstall that would change nothing.
+  const recheck = trustCopy !== null && onRecheck !== undefined;
+  const checking = rechecking || (recheck && status.trust === null);
   return (
-    <div className="setup-row"><span className="status-slot"><Download className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{title}</span><span className="setup-detail">{detail}</span></span>{settled ? (<span className="setup-installed"><Check size={12} strokeWidth={2.6} />Installed</span>) : (<button className="pill-btn accent" type="button" disabled={busy} onClick={onInstall} data-tauri-drag-region="false">{busy ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : <Download size={12} strokeWidth={2.3} />}{busy ? "Installing…" : status.installed === true ? "Reinstall" : "Install"}</button>)}</div>
+    <div className="setup-row"><span className="status-slot"><Download className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{title}</span><span className="setup-detail">{detail}</span>{trustCopy?.step ? <span className="setup-detail">{trustCopy.step}</span> : null}</span>{settled ? (<span className="setup-installed"><Check size={12} strokeWidth={2.6} />Installed</span>) : recheck ? (<button className="pill-btn accent" type="button" disabled={checking} onClick={onRecheck} data-tauri-drag-region="false"><RefreshCw className={checking ? "setup-spin" : undefined} size={12} strokeWidth={2.3} />{checking ? "Checking…" : "Recheck"}</button>) : (<button className="pill-btn accent" type="button" disabled={busy} onClick={onInstall} data-tauri-drag-region="false">{busy ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : <Download size={12} strokeWidth={2.3} />}{busy ? "Installing…" : status.installed === true ? "Reinstall" : "Install"}</button>)}</div>
   );
 };
 
@@ -81,6 +98,7 @@ export interface ISetupPanelProps {
   onInstallHook: () => Promise<void> | void;
   onInstallAgy: () => Promise<void> | void;
   onInstallCodex: () => Promise<void> | void;
+  onRecheckCodexTrust: () => Promise<void> | void;
   onKeepAwakeChange: (enabled: boolean) => void;
   bridgePort: number;
   onApplyBridgePort: (port: number) => Promise<void> | void;
@@ -300,7 +318,7 @@ const notificationPermissionDetail = (
   }
 };
 
-export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, launchAtLogin, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, mailRooms, notifications, onCloseRoom, syncRepliesAllowed, syncRepliesBusy, onSyncRepliesChange, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, codexNotifyStatus, onInstallCodexNotify, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
+export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle, guidance, isConnected, launchAtLogin, keepAwakeActive, keepAwakeEnabled, keepAwakeError, hookStatus, mailRooms, notifications, onCloseRoom, syncRepliesAllowed, syncRepliesBusy, onSyncRepliesChange, agyStatus, codexStatus, nativeAction, onCheckBridge, onInstallHook, onInstallAgy, onInstallCodex, onRecheckCodexTrust, codexNotifyStatus, onInstallCodexNotify, onKeepAwakeChange, bridgePort, onApplyBridgePort, gitAccounts, onRemoveGitAccount, onSetActiveGitAccount, syncGitIdentity, onSyncGitIdentityChange, terminal, onTerminalChange, updater }: ISetupPanelProps) => {
   const [activeCategory, setActiveCategory] = useState<SetupCategory>("connection");
   // Provisional and ephemeral deliver too; only these three mean a banner can appear.
   const notificationsAllowed =
@@ -443,7 +461,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
             <>
               <div className="setup-section-heading"><span>Plugins</span><small>Agent integrations</small></div>
               <PluginRow title="Antigravity hooks" status={agyStatus} canUseNativeControls={canUseNativeControls} busy={pendingAction === "agy"} onInstall={() => void runAction("agy", onInstallAgy)} />
-              <PluginRow title="Codex hooks" status={codexStatus} canUseNativeControls={canUseNativeControls} busy={pendingAction === "codex"} onInstall={() => void runAction("codex", onInstallCodex)} />
+              <PluginRow title="Codex hooks" status={codexStatus} canUseNativeControls={canUseNativeControls} busy={pendingAction === "codex"} onInstall={() => void runAction("codex", onInstallCodex)} onRecheck={() => void runAction("codexTrust", onRecheckCodexTrust)} rechecking={pendingAction === "codexTrust"} />
               <PluginRow title="Codex notify" status={codexNotifyStatus} canUseNativeControls={canUseNativeControls} busy={pendingAction === "codexNotify"} onInstall={() => void runAction("codexNotify", onInstallCodexNotify)} />
               <PluginRow title="Claude Code hooks" status={hookStatus} canUseNativeControls={canUseNativeControls} busy={pendingAction === "hook"} onInstall={() => void runAction("hook", onInstallHook)} />
             </>

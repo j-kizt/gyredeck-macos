@@ -1,9 +1,25 @@
+/**
+ * Whether Codex will run Gyredeck's hooks, as Codex's own app-server reports it.
+ *
+ * Installing a hook and Codex agreeing to run it are separate facts: Codex runs only the
+ * hooks a person has approved in `/hooks`, and skips the rest without a word.
+ * `unknown` means the question was asked and could not be answered — no `codex`, an
+ * app-server that would not answer, a shape not recognised — and is never read as fine.
+ */
+export type CodexHookTrust = "approved" | "untrusted" | "modified" | "disabled" | "unknown";
+
 /** What one agent integration's install looks like from the app's side. */
 export interface IHookStatus {
   path: string | null;
   installed: boolean | null;
   /** Installed, but not the copy this build ships — it needs installing again. */
   stale: boolean | null;
+  /**
+   * Codex hooks only; absent on every other row. `null` while Codex is being asked or has
+   * not been asked yet — which is not a finding, so it lights no dot, and is not a pass
+   * either, so the row shows no checkmark.
+   */
+  trust?: CodexHookTrust | null;
 }
 
 /**
@@ -17,7 +33,60 @@ export interface IHookStatus {
  * what they are pointing at.
  */
 export const hookNeedsAttention = (status: IHookStatus): boolean =>
-  status.installed === true && status.stale !== false;
+  status.installed === true &&
+  (status.stale !== false || (status.trust != null && CODEX_TRUST_TO_FIX.has(status.trust)));
+
+/**
+ * Approval states with something for the person to go and do — and only those light the
+ * dot, which is drawn in the danger colour.
+ *
+ * `unknown` is left out on purpose. It means the question could not be answered — a slow
+ * app-server, a Codex too old to have the method — and one timeout is not evidence that a
+ * hook is broken. It still keeps the checkmark off the row, where Recheck is one press away.
+ */
+const CODEX_TRUST_TO_FIX = new Set<CodexHookTrust>(["untrusted", "modified", "disabled"]);
+
+/**
+ * Whether a row has nothing left to show: installed, current, and — for the Codex row —
+ * approved by Codex. Not the negation of `hookNeedsAttention`, because a row can be still
+ * finding out (being asked, or not answerable) without that being something to fix.
+ */
+export const hookSettled = (status: IHookStatus): boolean =>
+  status.installed === true &&
+  !hookNeedsAttention(status) &&
+  (status.trust === undefined || status.trust === "approved");
+
+/**
+ * What the Codex hooks row says about approval, and what the person has to do about it.
+ *
+ * Null when there is nothing to say beyond "installed". The fix is in Codex, never a
+ * reinstall: reinstalling an unapproved hook writes the same unapproved entry back.
+ *
+ * Approval belongs to the entry in `hooks.json` — its content and its place in the list —
+ * not to the script it runs. Measured against Codex 0.160.0: reinstalling over an approved
+ * hook keeps it approved, because the same entry is written back in the same place; a
+ * newer installer writing a different entry makes it `modified`; our entry moving in the
+ * list, which happens when another tool's hook shares the event, makes it `untrusted`.
+ * Changing the script alone changes nothing.
+ */
+export const codexTrustCopy = (
+  trust: CodexHookTrust | null | undefined,
+): { detail: string; step: string | null } | null => {
+  switch (trust) {
+    case null:
+      return { detail: "Installed · checking approval in Codex…", step: null };
+    case "untrusted":
+      return { detail: "Installed · waiting for approval in Codex", step: "Open Codex → type /hooks → approve the Gyredeck hooks" };
+    case "modified":
+      return { detail: "Installed · changed since you approved it", step: "Open Codex → type /hooks → approve the Gyredeck hooks again" };
+    case "disabled":
+      return { detail: "Installed · turned off in Codex", step: "Open Codex → type /hooks → turn the Gyredeck hooks back on" };
+    case "unknown":
+      return { detail: "Installed · could not check approval in Codex", step: "To check by hand: open Codex → type /hooks" };
+    default:
+      return null;
+  }
+};
 
 /**
  * Whether a Codex session can be offered a sync room at all.

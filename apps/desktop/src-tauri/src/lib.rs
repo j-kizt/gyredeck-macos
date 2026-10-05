@@ -595,9 +595,31 @@ fn codex_hook_install_path() -> Result<PathBuf, String> {
         .join("gyredeck-codex-hook.mjs"))
 }
 
+/// Where Codex keeps its own files: `CODEX_HOME` when set, `~/.codex` otherwise.
+///
+/// One rule, used for every Codex file this app reads or writes and matched by the
+/// bridge, which asks Codex about the same `hooks.json`. With two rules a person who sets
+/// `CODEX_HOME` would have hooks installed in one place and their approval read from
+/// another, and the two halves of the settings row would describe different files.
+fn codex_home() -> Result<PathBuf, String> {
+    codex_home_from(
+        std::env::var("CODEX_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// The rule itself, with the environment passed in, so it can be tested without setting
+/// variables a parallel test run would race over.
+fn codex_home_from(codex_home: Option<&str>, home: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(trimmed) = codex_home.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(trimmed));
+    }
+    let home = home.ok_or_else(|| "HOME is not set".to_string())?;
+    Ok(PathBuf::from(home).join(".codex"))
+}
+
 fn codex_hooks_json_path() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
-    Ok(PathBuf::from(home).join(".codex").join("hooks.json"))
+    Ok(codex_home()?.join("hooks.json"))
 }
 
 /// Codex's matcher is a regex over the tool name.
@@ -725,6 +747,20 @@ fn agy_registration_present(hooks_json: &serde_json::Value, installed_path: &str
         .is_some_and(|hooks| hook_entry_present(hooks, "Stop", installed_path))
 }
 
+/// Whether every event this build's Codex installer registers is in `hooks.json`.
+///
+/// Read off the same two lists the installer writes from, so the check and the install
+/// cannot disagree about what "all of them" is.
+fn codex_hook_registration_complete(
+    hooks: &serde_json::Map<String, serde_json::Value>,
+    installed_path: &str,
+) -> bool {
+    CODEX_HOOK_MATCHED_EVENTS
+        .iter()
+        .chain(CODEX_HOOK_PLAIN_EVENTS.iter())
+        .all(|event| hook_entry_present(hooks, event, installed_path))
+}
+
 fn hook_entry_present(
     hooks: &serde_json::Map<String, serde_json::Value>,
     event: &str,
@@ -816,6 +852,18 @@ fn sync_issue_password(code: String, conversation_id: String) -> Result<String, 
 #[tauri::command]
 fn session_names() -> Result<serde_json::Value, String> {
     standalone_bridge::session_names()
+}
+
+/// Whether Codex will run Gyredeck's hooks — `approved`, `untrusted`, `modified`,
+/// `disabled` or `unknown`, as Codex's own app-server reports it.
+///
+/// Async so the couple of seconds it takes to start Codex's app-server and ask are spent
+/// off the main thread; the window would otherwise freeze while Settings opens.
+#[tauri::command]
+async fn codex_hook_trust() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(standalone_bridge::codex_hook_trust)
+        .await
+        .map_err(|error| format!("Hook trust check did not finish: {error}"))?
 }
 
 /// Name a session, or clear the name with an empty string. Answers with what was kept,
@@ -4292,8 +4340,7 @@ fn codex_notify_install_path() -> Result<PathBuf, String> {
 }
 
 fn codex_config_toml_path() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
-    Ok(PathBuf::from(home).join(".codex").join("config.toml"))
+    Ok(codex_home()?.join("config.toml"))
 }
 
 /// The `notify` line Codex needs, as this machine would write it.
@@ -4553,14 +4600,21 @@ fn codex_hook_status(app: tauri::AppHandle) -> Result<(String, bool, Option<bool
     let hooks_json_path = codex_hooks_json_path()?;
     let installed_path = install_path.to_string_lossy().to_string();
 
-    // Probe the exact command string for one event, the way the Claude status does:
-    // the file existing says nothing about whether Codex will actually call it.
+    // Probe the exact command string, the way the Claude status does: the file existing
+    // says nothing about whether Codex will actually call it.
+    //
+    // Stop decides whether it is installed at all; every other event this build registers
+    // decides whether it is complete. A file holding Stop alone — an older install, or one
+    // edited by hand — used to read as installed and current, and Codex approving that one
+    // hook then drew a green row over nine events that were never there.
     let mut in_hooks = false;
+    let mut complete = false;
     if hooks_json_path.exists() {
         if let Ok(content) = fs::read_to_string(&hooks_json_path) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(hooks) = json.get("hooks").and_then(|v| v.as_object()) {
                     in_hooks = hook_entry_present(hooks, "Stop", &installed_path);
+                    complete = codex_hook_registration_complete(hooks, &installed_path);
                 }
             }
         }
@@ -4568,8 +4622,15 @@ fn codex_hook_status(app: tauri::AppHandle) -> Result<(String, bool, Option<bool
 
     let installed = install_path.exists() && in_hooks;
     // Stale only matters once it is installed: an absent adapter is already reported
-    // as missing, and calling it out of date as well says the same thing twice.
-    let stale = if installed { hook_is_stale(&app, "gyredeck-codex-hook.mjs", &install_path) } else { Some(false) };
+    // as missing, and calling it out of date as well says the same thing twice. Missing
+    // events are out of date in the same sense — the fix is to install again.
+    let stale = if !installed {
+        Some(false)
+    } else if !complete {
+        Some(true)
+    } else {
+        hook_is_stale(&app, "gyredeck-codex-hook.mjs", &install_path)
+    };
     Ok((installed_path, installed, stale))
 }
 
@@ -5616,6 +5677,7 @@ pub fn run() {
             sync_join,
             sync_issue_password,
             session_names,
+            codex_hook_trust,
             set_session_name,
             sync_close,
             sync_leave,
@@ -6334,7 +6396,11 @@ mod agy_discovery_tests {
 
 #[cfg(test)]
 mod hook_registration_tests {
-    use super::{agy_registration_present, hook_entry_present, runs_event};
+    use super::{
+        agy_registration_present, codex_home_from, codex_hook_registration_complete, hook_entry_present,
+        runs_event, CODEX_HOOK_MATCHED_EVENTS, CODEX_HOOK_PLAIN_EVENTS,
+    };
+    use std::path::PathBuf;
 
 
     const SCRIPT: &str = "/Users/someone/.config/gyredeck/gyredeck-claude-hook.mjs";
@@ -6370,6 +6436,64 @@ mod hook_registration_tests {
     fn someone_elses_hook_is_not_ours() {
         let hooks = settings("node /Users/someone/other-tool/hook.mjs --event Stop");
         assert!(!hook_entry_present(&hooks, "Stop", SCRIPT));
+    }
+
+    /// Every event the Codex installer writes, each in the shape the installer writes it.
+    fn every_codex_event() -> serde_json::Map<String, serde_json::Value> {
+        let mut hooks = serde_json::Map::new();
+        for event in CODEX_HOOK_MATCHED_EVENTS.iter().chain(CODEX_HOOK_PLAIN_EVENTS.iter()) {
+            hooks.insert(
+                (*event).to_string(),
+                serde_json::json!([{"hooks": [{"type": "command", "command": format!("node {SCRIPT} --event {event}")}]}]),
+            );
+        }
+        hooks
+    }
+
+    #[test]
+    fn a_codex_install_is_complete_only_with_every_event_it_registers() {
+        assert!(codex_hook_registration_complete(&every_codex_event(), SCRIPT));
+        // Each one missing on its own, so no single event can quietly stop counting.
+        for event in CODEX_HOOK_MATCHED_EVENTS.iter().chain(CODEX_HOOK_PLAIN_EVENTS.iter()) {
+            let mut hooks = every_codex_event();
+            hooks.remove(*event);
+            assert!(
+                !codex_hook_registration_complete(&hooks, SCRIPT),
+                "{event} missing still read as complete"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_home_is_where_codex_says_when_it_says() {
+        // The rule the bridge uses too. With two rules a person who sets CODEX_HOME would
+        // have hooks installed in one place and their approval read from another.
+        assert_eq!(codex_home_from(Some("/custom/codex"), Some("/Users/x")), Ok(PathBuf::from("/custom/codex")));
+        assert_eq!(codex_home_from(Some("  /custom/codex  "), Some("/Users/x")), Ok(PathBuf::from("/custom/codex")));
+    }
+
+    #[test]
+    fn an_empty_codex_home_is_not_a_setting() {
+        // Set to nothing is not set: falling back is what Codex does, and taking "" as a
+        // path would put every file in the current directory.
+        for value in [None, Some(""), Some("   ")] {
+            assert_eq!(codex_home_from(value, Some("/Users/x")), Ok(PathBuf::from("/Users/x/.codex")), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn no_home_and_no_codex_home_is_an_error_not_a_guess() {
+        assert!(codex_home_from(None, None).is_err());
+        assert_eq!(codex_home_from(Some("/custom"), None), Ok(PathBuf::from("/custom")));
+    }
+
+    #[test]
+    fn stop_alone_is_installed_but_not_complete() {
+        // The false green: a file holding Stop and nothing else read as installed and
+        // current, and Codex approving that one hook lit the row over nine missing ones.
+        let hooks = settings(&format!("node {SCRIPT} --event Stop"));
+        assert!(hook_entry_present(&hooks, "Stop", SCRIPT));
+        assert!(!codex_hook_registration_complete(&hooks, SCRIPT));
     }
 
     #[test]

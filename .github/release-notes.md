@@ -1,5 +1,27 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A finished one-off command stops pretending to be a session — (v1.18.3)
+
+**Reinstall the Codex plugins from Settings for this one.** Only Codex's notify adapter is
+told which kind of Codex ran, and an update does not replace what is in your config folder.
+
+### Fixes
+
+- **A `codex exec` no longer leaves a session behind it.** Run one and it would open a real
+  Codex session, take its turn and close again, all inside about two seconds — and the row
+  would stay, marked done, looking exactly like a session you had open. Script a few dozen
+  commands and the list is mostly ghosts. A one-off is now shown while it runs, kept a few
+  seconds afterwards so you can see it finished, and then it goes. A session you are sitting
+  in is untouched: those still wait for you to clear them, the way they always have.
+- **A finished one-off you have opened stays open.** Those few seconds are there so you can
+  see it — and seeing it means you can click it. It stays until you go back to the list.
+- **Gyredeck no longer guesses.** Where nothing has said which kind of Codex ran — an older
+  adapter, or the notify plugin not installed — the row is left exactly where it was. The
+  only thing that can retire a row is being told, not being old.
+
+Rows left behind by earlier versions cannot be told apart from real sessions after the fact.
+**Clear completed** removes them in one go.
+
 ## Renaming a session moved to where its name is — (v1.18.2)
 
 The name field arrived in v1.18.0 in the worst possible place: the space the sync-room

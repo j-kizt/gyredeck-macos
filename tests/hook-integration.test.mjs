@@ -4886,3 +4886,433 @@ test("what a notify says about a session survives the bridge that heard it", asy
     await rm(workspace, { recursive: true, force: true });
   }
 });
+
+/**
+ * The reply poll after a push to Codex reads only what Codex wrote after the push.
+ *
+ * It used to re-read the whole rollout every second for up to two minutes, per message.
+ * A long session's log runs past 50 MB; a few messages in flight kept the bridge too busy
+ * to answer the app's health check, and the app killed it — every sync room with it.
+ *
+ * Proved by content, not by timing, so it cannot flake on a slow machine: the log already
+ * holds a finished turn stamped in the future when the message is pushed. A poll that
+ * reads from the top finds it — its timestamp passes the "after the push" filter — and
+ * publishes it. A poll that starts where the log ended at the push never sees it.
+ */
+test("the reply poll reads only what Codex wrote after the push, not the whole log", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-poll-tail-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  // `~/.bun/bin` because `findAgentBinary` searches a fixed list before PATH, and a real
+  // `codex` in `/opt/homebrew/bin` would otherwise be found and run.
+  const fakeBin = join(home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  await writeFile(join(fakeBin, "codex"), `#!${process.execPath}\nprocess.exit(0);\n`);
+  await chmod(join(fakeBin, "codex"), 0o755);
+
+  const thread = "01a0845e-eb31-76d3-a20e-dbebd7330001";
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "10", "07");
+  await mkdir(rolloutDir, { recursive: true });
+  const rollout = join(rolloutDir, `rollout-2026-10-07T15-00-00-${thread}.jsonl`);
+  const turn = (text, at) => JSON.stringify({
+    type: "event_msg",
+    timestamp: at.toISOString(),
+    payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: text },
+  }) + "\n";
+  // Before any push. Stamped an hour ahead, so only its position can keep it out.
+  await writeFile(rollout, turn("POISON-written-before-the-push", new Date(Date.now() + 3_600_000)));
+
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    {
+      cwd: repoRoot,
+      env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin },
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "poll-tail-founder";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    for (const [conversationId, sourceKind] of [[founder, "claudeCodeHook"], [thread, "codexCliHook"]]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    assert.equal((await joinConfirmed(call, code, founder, thread)).status, 200);
+
+    const said = await call("POST", `/mail/${code}`, { from: founder, to: thread, kind: "ask", text: "are you there?" });
+    assert.equal(said.body.ok, true, "the founder's message is accepted, and pushed to Codex");
+    // Codex answers after the push, the way it really does: appended to the same log.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await appendFile(rollout, turn("REAL-answer-after-the-push", new Date()));
+
+    const roomText = async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
+        headers: { "x-gyredeck-token": created.body.password },
+      });
+      return (await response.json()).messages.map((message) => message.text).join("\n");
+    };
+    let text = "";
+    for (let attempt = 0; attempt < 40 && !text.includes("REAL-answer-after-the-push"); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      text = await roomText();
+    }
+    assert.ok(text.includes("REAL-answer-after-the-push"), "the answer written after the push is harvested");
+    assert.ok(!text.includes("POISON-written-before-the-push"), "nothing written before the push was read at all");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A new member's harvest, and the usage read on every finished turn, both stay off the
+ * part of the log that was there before.
+ *
+ * The first harvest used to read from the top and filter by time; the usage read took the
+ * whole file every turn. Each is one long block of the bridge's only thread at 50 MB.
+ * Proved by content again: the old part of the log carries a reply stamped in the future
+ * and a usage figure nothing recent should report. Reading from the top publishes the one
+ * and reports the other.
+ */
+test("a new member's harvest and the usage read stay off the log from before", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-harvest-tail-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const thread = "01a0845e-eb31-76d3-a20e-dbebd7330002";
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "10", "07");
+  await mkdir(rolloutDir, { recursive: true });
+  const rollout = join(rolloutDir, `rollout-2026-10-07T16-00-00-${thread}.jsonl`);
+  const turn = (text, at) => JSON.stringify({
+    type: "event_msg", timestamp: at.toISOString(),
+    payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: text },
+  }) + "\n";
+  // The old usage line names a context window; the new one does not. Only a read that went
+  // back into the old part of the log can report that window.
+  const usage = (inputTokens, window) => JSON.stringify({
+    type: "event_msg", timestamp: new Date().toISOString(),
+    payload: { type: "token_count", info: { ...(window ? { model_context_window: window } : {}), last_token_usage: { input_tokens: inputTokens, output_tokens: 1 } } },
+  }) + "\n";
+  // The old part: a reply from the future and a usage figure, then over 256 KB of padding
+  // so neither can be in the window a tail read takes.
+  const padding = JSON.stringify({ type: "response_item", payload: { type: "message", content: "p".repeat(300_000) } }) + "\n";
+  await writeFile(rollout, turn("POISON-before-joining", new Date(Date.now() + 3_600_000)) + usage(111, 999_999) + padding);
+
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "harvest-tail-founder";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    for (const [conversationId, sourceKind] of [[founder, "claudeCodeHook"], [thread, "codexCliHook"]]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    assert.equal((await joinConfirmed(call, code, founder, thread)).status, 200);
+
+    // Codex finishes a turn after joining: its answer, and the usage that turn reported.
+    await appendFile(rollout, turn("REAL-after-joining", new Date()) + usage(222));
+    await call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook",
+      workingDirectory: "/tmp/project", conversationId: thread,
+    });
+
+    const roomText = async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
+        headers: { "x-gyredeck-token": created.body.password },
+      });
+      return (await response.json()).messages.map((message) => message.text).join("\n");
+    };
+    let text = "";
+    for (let attempt = 0; attempt < 40 && !text.includes("REAL-after-joining"); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      text = await roomText();
+    }
+    assert.ok(text.includes("REAL-after-joining"), "what Codex said after joining is harvested");
+    assert.ok(!text.includes("POISON-before-joining"), "nothing from before the join was read for the room");
+
+    const snapshot = await (await fetch(`http://127.0.0.1:${port}/snapshot`)).json();
+    const done = snapshot.recent.filter((event) => event.type === "turn_complete" && event.conversationId === thread).at(-1);
+    assert.equal(done?.data.usage?.inputTokens, 222, "usage is the latest turn's, read from the end");
+    // Unknown rather than borrowed from 300 KB back. Real logs carry the window near the end
+    // (measured on a 51 MB one); where one does not, saying so beats reading the whole file.
+    assert.equal(done?.data.usage?.contextWindow, null, "nothing was read from before the tail");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A session's harvest starts when it may speak — at confirmation, and again on every
+ * return — not when it was merely added.
+ *
+ * Added but unconfirmed, a session has no voice, yet what it writes waits in its log. The
+ * harvest used to start at the join, so the first one after confirmation published those
+ * words: the check that refuses an unconfirmed speaker looks at who it is *now*. Leaving
+ * and coming back had the same hole through a cursor kept from the first visit.
+ */
+test("words written before a session may speak are never published, on a first join or a return", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-harvest-confirm-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const thread = "01a0845e-eb31-76d3-a20e-dbebd7330003";
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "10", "07");
+  await mkdir(rolloutDir, { recursive: true });
+  const rollout = join(rolloutDir, `rollout-2026-10-07T17-00-00-${thread}.jsonl`);
+  const turn = (text) => JSON.stringify({
+    type: "event_msg", timestamp: new Date().toISOString(),
+    payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: text },
+  }) + "\n";
+  await writeFile(rollout, turn("from before anything"));
+
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "harvest-confirm-founder";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    for (const [conversationId, sourceKind] of [[founder, "claudeCodeHook"], [thread, "codexCliHook"]]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    const endTurn = () => call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook",
+      workingDirectory: "/tmp/project", conversationId: thread,
+    });
+    const roomText = async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
+        headers: { "x-gyredeck-token": created.body.password },
+      });
+      return (await response.json()).messages.map((message) => message.text).join("\n");
+    };
+    const waitFor = async (needle) => {
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        if ((await roomText()).includes(needle)) return true;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      return false;
+    };
+    const confirm = async () => {
+      const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+      return call("POST", `/sync/rooms/${code}/confirm`, { conversationId: thread, password: minted.body.password });
+    };
+
+    // Added, not yet allowed to speak — and it speaks anyway, the way a session does.
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: thread });
+    await appendFile(rollout, turn("UNCONFIRMED-said-this"));
+    await endTurn();
+    assert.equal((await confirm()).status, 200);
+    await appendFile(rollout, turn("CONFIRMED-said-this"));
+    await endTurn();
+    assert.ok(await waitFor("CONFIRMED-said-this"), "what it said once confirmed is harvested");
+    assert.ok(!(await roomText()).includes("UNCONFIRMED-said-this"), "what it said before it could speak is not");
+
+    // Leaves, says something while away, comes back.
+    await call("DELETE", `/sync/rooms/${code}/members/${thread}`);
+    await appendFile(rollout, turn("AWAY-said-this"));
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: thread });
+    assert.equal((await confirm()).status, 200);
+    await appendFile(rollout, turn("BACK-said-this"));
+    await endTurn();
+    assert.ok(await waitFor("BACK-said-this"), "what it said after coming back is harvested");
+    const text = await roomText();
+    assert.ok(!text.includes("AWAY-said-this"), "what it said while out of the room is not");
+    assert.ok(!text.includes("from before anything"), "and nothing from before it ever joined");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The reply poll, when the room can take the first answer but not the second.
+ *
+ * The cursor has to stop in front of the refused answer — not past it, or that answer is
+ * gone for good, and not at the start of the batch, or the first answer is read again.
+ * Once there is room, the second arrives, and each arrives exactly once.
+ */
+// TODO, not skipped for convenience: written at Codex's request on 2026-10-07, it fails on
+// `main` exactly as it does here, so it is older than the change it was written beside.
+//
+// Cause, confirmed: the long answer is published into the thread's **private mailbox**,
+// not the room. Joining pushes a notice into that mailbox, which starts a poll bound to
+// the mailbox; the question starts another bound to the room. Every poll claims through
+// `claimCodexReply(threadId, …)`, keyed by thread and not by room, so whichever wakes
+// first takes the answer to the place *it* is holding — and the other sees it claimed and
+// moves on. An answer can only belong to the conversation it answers; binding a reply to
+// the delivery that asked for it is the fix, and it is its own piece of work.
+// Kept running as a todo so it reports, rather than deleted so it is forgotten.
+test("the reply poll keeps an answer the room cannot take yet, and publishes each answer once", { todo: "pre-existing: a reply lost in the poll path near a full room" }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-poll-full-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const fakeBin = join(home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  await writeFile(join(fakeBin, "codex"), `#!${process.execPath}\nprocess.exit(0);\n`);
+  await chmod(join(fakeBin, "codex"), 0o755);
+  const thread = "01a0845e-eb31-76d3-a20e-dbebd7330004";
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "10", "07");
+  await mkdir(rolloutDir, { recursive: true });
+  const rollout = join(rolloutDir, `rollout-2026-10-07T18-00-00-${thread}.jsonl`);
+  await writeFile(rollout, "");
+  const turn = (text) => JSON.stringify({
+    type: "event_msg", timestamp: new Date().toISOString(),
+    payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: text },
+  }) + "\n";
+
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    {
+      cwd: repoRoot,
+      env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin },
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "poll-full-founder";
+  const sink = "poll-full-sink";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    for (const [conversationId, sourceKind] of [[founder, "claudeCodeHook"], [sink, "claudeCodeHook"], [thread, "codexCliHook"]]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    assert.equal((await joinConfirmed(call, code, founder, thread)).status, 200);
+    assert.equal((await joinConfirmed(call, code, founder, sink)).status, 200);
+
+    // Fill the room with mail a member is owed and has not collected — addressed to the
+    // sink, so none of it is pushed to Codex and none of it starts a poll of its own.
+    const fat = "x".repeat(4_000);
+    let full = false;
+    for (let i = 0; i < 400 && !full; i += 1) {
+      full = (await call("POST", `/mail/${code}`, { from: founder, to: sink, kind: "tell", text: `filler-${i} ${fat}` })).status === 409;
+    }
+    assert.ok(full, "the room has to be full of owed mail, or this proves nothing");
+
+    // Room for a short question to Codex, then a short answer and a long one.
+    const asked = await call("POST", `/mail/${code}`, { from: founder, to: thread, kind: "ask", text: "q" });
+    assert.equal(asked.body.ok, true, "the question fits");
+    await appendFile(rollout, turn("@everyone tell\nSHORT-FIRST") + turn(`@everyone tell\nLONG-SECOND ${fat}`));
+
+    const fromCodex = async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
+        headers: { "x-gyredeck-token": created.body.password },
+      });
+      return (await response.json()).messages.filter((message) => message.from === thread).map((message) => message.text);
+    };
+    let said = [];
+    for (let attempt = 0; attempt < 40 && !said.some((text) => text === "SHORT-FIRST"); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      said = await fromCodex();
+    }
+    assert.ok(said.includes("SHORT-FIRST"), "the answer that fits is published");
+    assert.ok(!said.some((text) => text.startsWith("LONG-SECOND")), "the one that does not, is not — yet");
+
+    // Everyone collects, which frees the room: space is only reclaimed below the slowest
+    // reader, so the sink reading its own mail is not enough. The poll is still running.
+    for (const reader of [sink, founder, thread]) {
+      for (let drain = 0; drain < 30; drain += 1) {
+        const seen = await (await fetch(`http://127.0.0.1:${port}/mail/inbox?as=${reader}&collect=1&limit=100`, { headers })).json();
+        if (!seen.messages?.length) break;
+      }
+    }
+    for (let attempt = 0; attempt < 40 && !said.some((text) => text.startsWith("LONG-SECOND")); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      said = await fromCodex();
+    }
+    // Not merely published once somewhere: published in this room. Today it lands in the
+    // thread's own mailbox, which is the fault this todo stands for.
+    const mailbox = await (await fetch(`http://127.0.0.1:${port}/mail/${thread}?since=0`, { headers })).json();
+    assert.ok(
+      !(mailbox.messages ?? []).some((message) => message.from === thread && message.text?.startsWith("LONG-SECOND")),
+      "the answer went to the thread's private mailbox instead of the room",
+    );
+    assert.ok(said.some((text) => text.startsWith("LONG-SECOND")), "the refused answer is read again once there is room");
+    assert.equal(said.filter((text) => text === "SHORT-FIRST").length, 1, "and the one before it is not published twice");
+    assert.equal(said.filter((text) => text.startsWith("LONG-SECOND")).length, 1, "nor the refused one");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

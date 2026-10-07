@@ -156,20 +156,23 @@ const withBridge = async (hooksListAnswer, run, { spawnAllowed = true, silent = 
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const fakeBin = join(home, ".bun", "bin");
   await mkdir(fakeBin, { recursive: true });
+  const codexHome = join(home, ".codex");
   if (silent) {
     // Present, and gone again without a word — an app-server that will not start.
     await writeFile(join(fakeBin, "codex"), `#!${process.execPath}\nprocess.exit(0);\n`);
     await chmod(join(fakeBin, "codex"), 0o755);
   } else if (hooksListAnswer !== null) {
     const listed = typeof hooksListAnswer === "function" ? hooksListAnswer(home) : hooksListAnswer;
-    // One answer per start, in order — the last one repeats. A single answer is a list of one.
-    const answers = Array.isArray(listed) ? listed : [listed];
+    // Either one answer, or an answer chosen by what `hooks.json` holds when this Codex
+    // reads it — the way the real one decides. Choosing by start order instead raced: two
+    // started together under load both believed they were first.
+    const byFile = listed && listed.whenFileHas ? listed : { whenFileHas: null, then: listed, otherwise: listed };
     await writeFile(
       join(fakeBin, "codex"),
       `#!${process.execPath}\n` +
-        `const answers = ${JSON.stringify(answers)};\n` +
-        `const started = require('node:fs').readFileSync(${JSON.stringify(join(home, "spawned.log"))}, { encoding: 'utf8', flag: 'a+' }).split('\\n').filter(Boolean).length;\n` +
-        "const answer = answers[Math.min(started, answers.length - 1)];\n" +
+        `const rule = ${JSON.stringify(byFile)};\n` +
+        `const file = (() => { try { return require('node:fs').readFileSync(${JSON.stringify(join(codexHome, "hooks.json"))}, 'utf8'); } catch { return ''; } })();\n` +
+        "const answer = rule.whenFileHas && file.includes(rule.whenFileHas) ? rule.then : rule.otherwise;\n" +
         `require('node:fs').appendFileSync(${JSON.stringify(join(home, "spawned.log"))}, 'x\\n');\n` +
         "let buffered = '';\n" +
         "process.stdin.setEncoding('utf8');\n" +
@@ -185,7 +188,6 @@ const withBridge = async (hooksListAnswer, run, { spawnAllowed = true, silent = 
     );
     await chmod(join(fakeBin, "codex"), 0o755);
   }
-  const codexHome = join(home, ".codex");
   await mkdir(codexHome, { recursive: true });
   await writeFile(join(codexHome, "hooks.json"), JSON.stringify({
     hooks: Object.fromEntries(registeredEvents.map((event) => [event, [{ hooks: [{ type: "command", command: `${OURS} ${event}` }] }]])),
@@ -282,14 +284,20 @@ test("an ask started before the hooks changed does not answer for the hooks afte
   // the second ask simply joined the first, the row would go green over a hook Codex now
   // calls modified.
   await withBridge(
-    (home) => [
-      answer(homeHook(home, "stop", "trusted"), homeHook(home, "pre_tool_use", "trusted")),
-      answer(homeHook(home, "stop", "modified"), homeHook(home, "pre_tool_use", "modified")),
-    ],
+    (home) => ({
+      // The change below sets a timeout of 30 on Stop; a Codex that reads the file after it
+      // answers about the changed hooks, one that read it before answers about the old.
+      whenFileHas: '"timeout":30',
+      then: answer(homeHook(home, "stop", "modified"), homeHook(home, "pre_tool_use", "modified")),
+      otherwise: answer(homeHook(home, "stop", "trusted"), homeHook(home, "pre_tool_use", "trusted")),
+    }),
     async (ask, spawned, { codexHome }) => {
       const before = ask();
-      // Wait until the first question is really out, then change what it was about.
-      for (let i = 0; i < 50 && (await spawned()) < 1; i += 1) await new Promise((r) => setTimeout(r, 20));
+      // Wait until the first question is really out — its Codex has read the file — then
+      // change what it was about. Long enough for a loaded machine, and checked rather than
+      // assumed: proceeding early is exactly how this test once raced.
+      for (let i = 0; i < 500 && (await spawned()) < 1; i += 1) await new Promise((r) => setTimeout(r, 20));
+      assert.equal(await spawned(), 1, "the first question reached Codex before the file changed");
       const hooksJson = join(codexHome, "hooks.json");
       const current = JSON.parse(await readFile(hooksJson, "utf8"));
       current.hooks.Stop[0].hooks[0].timeout = 30;

@@ -1,5 +1,30 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Sync rooms stop vanishing while you talk to Codex — (v1.18.5)
+
+If a sync room has ever disappeared mid-conversation — Codex's answer never arriving, a
+review lost halfway — this is the fix.
+
+### Fixes
+
+- **Talking to Codex no longer takes the room down.** After every message to Codex, Gyredeck
+  checks Codex's own log for the answer, once a second for up to two minutes — and each
+  check read the whole log from the beginning. A Codex session that has been running for a
+  while has a log of 50 MB or more, so with a few messages waiting Gyredeck spent nearly all
+  its time reading, stopped answering the app's check that it was still alive, and the app
+  restarted it. Every sync room lives inside it, so every room went with it, along with any
+  answer still on its way. Gyredeck now reads only what Codex has written since the message
+  was sent: a few kilobytes instead of fifty megabytes, however long the session has run.
+- **What a session wrote before it was let into a room stays out of it.** A session added to
+  a room but not yet confirmed could still have its earlier words published once it was
+  confirmed. Its answers now count from the moment it may speak.
+
+### Known issue
+
+When Codex is reached through two routes at once — a room, and its own mailbox — an answer
+can occasionally be delivered to the mailbox instead of the room. This is older than this
+release and is being fixed next.
+
 ## Settings stops calling a Codex hook ready before Codex has agreed to run it — (v1.18.4)
 
 Codex runs only the hooks you have approved in its own `/hooks` screen, and skips every

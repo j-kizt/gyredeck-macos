@@ -324,16 +324,6 @@ export const codexReplyFromLine = (line, sinceMs) => {
   return { turnId: entry.payload.turn_id ?? null, text: text.trim() };
 };
 
-export const readCodexReplies = (rolloutPath, sinceMs) => {
-  const replies = [];
-  let content = "";
-  try { content = readFileSync(rolloutPath, "utf8"); } catch { return replies; }
-  for (const line of content.split("\n")) {
-    const reply = codexReplyFromLine(line, sinceMs);
-    if (reply) replies.push(reply);
-  }
-  return replies;
-};
 
 /**
  * Everything Codex has said past `offset`, and the offset to resume from next time.
@@ -346,6 +336,32 @@ export const readCodexReplies = (rolloutPath, sinceMs) => {
  * Only whole lines are consumed. A log caught mid-write ends in a partial line, and
  * the returned offset stops in front of it so the next read sees it complete.
  */
+/**
+ * The last `bytes` of a file, starting at a whole line.
+ *
+ * The first line of the window is dropped because it is almost always cut through the
+ * middle — reading from an arbitrary byte can also land inside a multi-byte character,
+ * which only that first line could contain.
+ */
+export const readTail = (path, bytes) => {
+  let fd = null;
+  try {
+    const { size } = statSync(path);
+    const from = Math.max(0, size - bytes);
+    fd = openSync(path, "r");
+    const buffer = Buffer.allocUnsafe(size - from);
+    const read = readSync(fd, buffer, 0, buffer.length, from);
+    const text = buffer.subarray(0, read).toString("utf8");
+    if (from === 0) return text;
+    const firstBreak = text.indexOf("\n");
+    return firstBreak < 0 ? "" : text.slice(firstBreak + 1);
+  } catch {
+    return "";
+  } finally {
+    if (fd !== null) { try { closeSync(fd); } catch {} }
+  }
+};
+
 export const readCodexLog = (rolloutPath, offset, sinceMs) => {
   let size = 0;
   try { size = statSync(rolloutPath).size; } catch { return { replies: [], offset, from: offset }; }
@@ -1077,13 +1093,23 @@ function startBridge(config) {
    * thread turned 5.4% into 10.4%. Reported here in the shape the meter reads, with the
    * cache fields zeroed rather than omitted, because the meter sums all three.
    */
+  /**
+   * How much of the log's end the usage is read from.
+   *
+   * The latest usage is, by definition, near the end: Codex writes a token count with
+   * every turn. Reading the whole log for it cost ~350 ms at 51 MB on every finished turn.
+   * Measured on a 51 MB rollout, both fields sat inside the last 256 KB; a turn whose own
+   * output ran past that leaves usage unknown for that turn, which is what this already
+   * says when it cannot tell — never a reason to read the whole file again.
+   */
+  const CODEX_USAGE_TAIL_BYTES = 256 * 1024;
   const codexUsageFor = (threadId) => {
     const path = codexRolloutFor(threadId);
     if (!path) return null;
     let window = null;
     let last = null;
     try {
-      for (const line of readFileSync(path, "utf8").split("\n")) {
+      for (const line of readTail(path, CODEX_USAGE_TAIL_BYTES).split("\n")) {
         if (!line.trim()) continue;
         let entry;
         try { entry = JSON.parse(line); } catch { continue; }
@@ -1159,6 +1185,26 @@ function startBridge(config) {
 
   /** Where the last harvest of each Codex log stopped, as a byte offset into it. */
   const harvestAt = new Map();
+  /**
+   * Start a member's harvest at the end of its log as it stands, the moment it may speak.
+   *
+   * Nothing written before then belongs in the room. That covers two things the old start
+   * did not. A session added but not yet confirmed has no voice, yet its words would wait
+   * in the log and be published by the first harvest after confirmation, because the
+   * check that refuses them looks at who the member is *now*. And the first harvest read
+   * the whole log from the top to find out what to skip — once per member, every time a
+   * bridge came back up, at 50 MB and more.
+   *
+   * Set every time, not only when unset. Leaving already clears the cursor
+   * (`retireLabel`), so a return starts fresh either way — this does not rely on that.
+   * Where there is no log yet there is nothing to skip, and the first harvest falls back
+   * to the join-time filter.
+   */
+  const startHarvestAtEnd = (conversationId) => {
+    const path = codexRolloutFor(conversationId);
+    if (!path) return;
+    try { harvestAt.set(path, statSync(path).size); } catch {}
+  };
   /**
    * How the harvest is doing, because its failure mode is indistinguishable from quiet.
    *
@@ -1885,6 +1931,7 @@ function startBridge(config) {
     }
     member.confirmed = true;
     member.toldUnconfirmed = false;
+    startHarvestAtEnd(conversationId);
     // Both the window the backlog is taken from and the record that the push carrying it
     // is still owed. Taken before the confirmation notice is published, so the notice is
     // not itself inside the window it describes, and set only for Codex — it is state
@@ -3102,6 +3149,18 @@ function startBridge(config) {
 
     const rolloutPath = codexRolloutFor(threadId);
     const since = Date.now();
+    // Where the log ends now. The answer to this message is written after it, so nothing
+    // before here can be it — and reading from here is what keeps every pass to the few
+    // bytes Codex added, instead of the whole log.
+    //
+    // This used to re-read the entire rollout once a second for up to two minutes, per
+    // message. A long session's log runs past 50 MB, which is ~300 ms of the bridge doing
+    // nothing else; two or three messages in flight kept it busy for most of every
+    // second, the app's health check went unanswered three times running, and the app
+    // killed the bridge — taking every sync room with it. Measured and reproduced
+    // 2026-10-07.
+    let cursor = 0;
+    if (rolloutPath) { try { cursor = statSync(rolloutPath).size; } catch {} }
     const child = spawn(binary, ["queue", "--thread", threadId, "--message", text], {
       stdio: ["ignore", "ignore", "ignore"],
     });
@@ -3120,7 +3179,12 @@ function startBridge(config) {
       // out of replies. Per pass, so an earlier success cannot end the polling that the
       // refused reply still needs.
       let waitingForRoom = false;
-      for (const reply of readCodexReplies(rolloutPath, since)) {
+      const { replies, offset, from } = readCodexLog(rolloutPath, cursor, since);
+      // Where to resume next pass: past everything read, unless a reply is left waiting
+      // for room — then just in front of it, so it is read again rather than stepped over.
+      let next = offset;
+      let handledThrough = from;
+      for (const reply of replies) {
         // A reply the room has no space for is not "seen": marking it so would stop the
         // polling that is the only thing that will ever look at it again. Nor may an
         // earlier success in the same pass end it — that was the second half of the fault.
@@ -3129,6 +3193,7 @@ function startBridge(config) {
         // the reply behind it.
         if (turnWasConsumed(threadId, reply.turnId)) {
           seen.add(reply.turnId ?? reply.text);
+          handledThrough = reply.endsAt;
           continue;
         }
         const routed = routeCodexReply(room, reply.text);
@@ -3142,8 +3207,10 @@ function startBridge(config) {
           })
         ) {
           waitingForRoom = true;
+          next = handledThrough;
           break;
         }
+        handledThrough = reply.endsAt;
         seen.add(reply.turnId ?? reply.text);
         if (!claimCodexReply(threadId, reply)) continue;
         // A harvested answer is still that session speaking, and a session nobody
@@ -3153,6 +3220,7 @@ function startBridge(config) {
         const published = publishMail(room, threadId, routed.text, null, true, routed.routing);
         if (published?.seq) publishedForCodex.set(threadId, published.seq);
       }
+      cursor = next;
       if ((seen.size === 0 || waitingForRoom) && Date.now() < deadline) {
         setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
       }
@@ -3622,6 +3690,7 @@ function startBridge(config) {
           readSeq: room.seq,
           lastReadAt: null,
         });
+        startHarvestAtEnd(conversationId);
         room.touchedAt = Date.now();
         // Told after the room exists, so the notice can name it and say who is there.
         tellJoined(name, room, conversationId, "you created it");

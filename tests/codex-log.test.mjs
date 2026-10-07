@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { codexReplyFromLine, readCodexLog, readCodexReplies } from "../adapters/bridge/gyredeck-bridge.mjs";
+import { codexReplyFromLine, readCodexLog, readTail } from "../adapters/bridge/gyredeck-bridge.mjs";
 
 /**
  * The byte arithmetic behind harvesting Codex's answers out of its own rollout log.
@@ -109,8 +109,6 @@ test("what Codex said before a time is filtered out, by time and not by position
     const filtered = readCodexLog(path, 0, since);
     assert.deepEqual(filtered.replies.map((reply) => reply.text), ["just-now"]);
     assert.equal(filtered.offset, readCodexLog(path, 0, 0).offset, "filtering changes what is returned, not how far the read got");
-
-    assert.deepEqual(readCodexReplies(path, since).map((reply) => reply.text), ["just-now"]);
   });
 });
 
@@ -144,6 +142,42 @@ test("a log that is not there yet is not an error", () => {
   withLog((path) => {
     const read = readCodexLog(path, 0, 0);
     assert.deepEqual(read.replies, []);
-    assert.deepEqual(readCodexReplies(path, 0), []);
+    assert.equal(readTail(path, 1024), "");
+  });
+});
+
+test("the tail of a log starts at a whole line, and reads only the tail", () => {
+  withLog((path) => {
+    // A first line long enough that the window has to cut through it.
+    writeFileSync(path, turn("x".repeat(5_000)) + turn("second") + turn("last"));
+    const tail = readTail(path, 600);
+    const lines = tail.split("\n").filter(Boolean);
+    assert.ok(lines.length >= 1 && lines.length <= 2, "only what fits in the window");
+    for (const line of lines) assert.doesNotThrow(() => JSON.parse(line), "no line cut in half");
+    assert.equal(JSON.parse(lines.at(-1)).payload.last_agent_message, "last");
+    assert.ok(!tail.includes("xxxxx"), "the cut first line is dropped, not returned in pieces");
+  });
+});
+
+test("a tail wider than the file is the whole file", () => {
+  withLog((path) => {
+    // One line, built once: `turn` stamps the time, and two calls a millisecond apart are
+    // two different lines.
+    const only = turn("only");
+    writeFileSync(path, only);
+    assert.equal(readTail(path, 1_000_000), only);
+  });
+});
+
+test("a tail that starts inside a Thai character still decodes cleanly", () => {
+  // Reading from an arbitrary byte can land inside a three-byte character. Only the first
+  // line of the window can hold that, and it is the line that is dropped.
+  withLog((path) => {
+    const thai = "ภาษาไทย".repeat(200);
+    writeFileSync(path, turn(thai) + turn("after"));
+    for (let window = 100; window < 400; window += 7) {
+      const tail = readTail(path, window);
+      assert.ok(!tail.includes("\uFFFD"), `window ${window} decoded a broken character`);
+    }
   });
 });

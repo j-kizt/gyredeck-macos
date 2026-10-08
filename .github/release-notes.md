@@ -1,5 +1,24 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Two dependency security fixes — (v1.18.6)
+
+Nothing changes in how Gyredeck looks or behaves. Two libraries it is built with had
+security advisories published against them, and one of the two ships inside the app, so
+this release exists to get the fixed version onto your machine.
+
+### Fixes
+
+- **The TLS library behind Gyredeck's HTTPS calls is updated** (`rustls` 0.23.40 → 0.23.45,
+  with its `rustls-webpki` 0.103.13 → 0.103.15). That library carries every HTTPS request the
+  app makes — update checks, GitHub and GitLab, usage and sign-in — so the fix only reaches
+  you through a new build; nothing on the repo side could patch an installed app. The
+  advisory concerns how a TLS 1.3 handshake is accepted; it is not a way around certificate
+  checks, and no sign of it affecting Gyredeck was found. The local bridge speaks plain
+  HTTP to the app and does not use this library at all.
+- **A build-time library is updated** (`source-map-js` 1.2.1 → 1.2.2). It is part of the
+  toolchain that builds the window, not of the app you run, and is updated so the repo's
+  security alerts are closed rather than left open.
+
 ## Sync rooms stop vanishing while you talk to Codex — (v1.18.5)
 
 If a sync room has ever disappeared mid-conversation — Codex's answer never arriving, a

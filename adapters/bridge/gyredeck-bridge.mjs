@@ -127,7 +127,10 @@ export const readSessionKinds = (path) => {
       const cwd = typeof entry.cwd === "string" && entry.cwd.length > 0 && entry.cwd.length <= 1024
         ? entry.cwd
         : null;
-      if (provider || cwd) kinds.set(id, { provider, cwd });
+      // Provenance, not identity: only a bridge that heard the hook itself writes this,
+      // so a file from before the field existed says nothing either way.
+      const hookReported = entry.hookReported === true;
+      if (provider || cwd) kinds.set(id, { provider, cwd, hookReported });
     }
   } catch {}
   return kinds;
@@ -1987,6 +1990,41 @@ function startBridge(config) {
   const NOTIFY_STOP_HOLD_MS = 1_500;
   const CODEX_STOP_ECHO_MS = 5_000;
   /**
+   * Whether the thread a notify names is a session at all.
+   *
+   * Codex's TUI takes helper turns — naming a thread, recapping it — in temporary threads
+   * that inherit `notify` but keep no rollout, fire no hook and are unloaded a minute
+   * later (codex-cli 0.160.1, `start_temporary_thread`; confirmed with Codex 2026-10-10).
+   * Each one reported itself as a finished Codex session with no model, and 33 of them
+   * were sitting under COMPLETED by the time anyone asked. The payload carries nothing
+   * that tells them apart — `type`, `thread-id`, `turn-id`, `cwd`, `client`, the
+   * messages — so the question is answered the other way round: a session a person can
+   * see or resume is one a hook has reported — its own events, `hookReportedSessions`,
+   * not a provider that notify itself wrote down — or one Codex keeps a rollout for.
+   * Neither is not "proven internal", only unclassified, and unclassified is not shown.
+   *
+   * The limit this buys: a notify that arrives before either piece of evidence exists —
+   * before the hook has said anything and before a rollout is discoverable — is dropped,
+   * and nothing retries it. A rollout is expected to be on disk from the session's start,
+   * well before its first turn can end; that is an expectation, not a guarantee measured
+   * here. The provenance shares the kinds file's retention: 200 entries, oldest out.
+   *
+   * Not asked of the legacy `codex:<cwd>` name — that was never a thread to look up.
+   */
+  const notifyNamesASession = (conversationId) =>
+    hookReportedSessions.has(conversationId) || codexRolloutFor(conversationId) !== null;
+  const ignoredNotifyThreads = new Set();
+  const noteIgnoredNotify = (conversationId, cwd) => {
+    if (ignoredNotifyThreads.has(conversationId)) return;
+    if (ignoredNotifyThreads.size >= 64) ignoredNotifyThreads.clear();
+    ignoredNotifyThreads.add(conversationId);
+    console.error(
+      `gyredeck: a Codex notify for thread ${conversationId} in ${cwd ?? "an unknown directory"}` +
+        ` named a thread no hook has reported and ${CODEX_SESSIONS_DIR} holds no rollout for:` +
+        " unclassified; completion withheld.",
+    );
+  };
+  /**
    * How long a remembered client is worth anything.
    *
    * It exists to survive the gap between a notify and the completion that is published in
@@ -2023,6 +2061,12 @@ function startBridge(config) {
     // `codex queue --thread` need nothing else. A notify too old to name one invents
     // `codex:<cwd>`, which is not a thread and opens neither.
     if (data.source === "codex-notify" && typeof scope.conversationId === "string" && scope.conversationId.length > 0) {
+      // Before the session is written down anywhere: a thread that is not a session must
+      // not reach the kinds file either, or a restart would believe it.
+      if (!scope.conversationId.startsWith("codex:") && !notifyNamesASession(scope.conversationId)) {
+        noteIgnoredNotify(scope.conversationId, scope.cwd);
+        return;
+      }
       observeSession(scope.conversationId, {
         provider: sessionProviderFor(scope.conversationId, "codex-notify"),
       });
@@ -2056,6 +2100,7 @@ function startBridge(config) {
     // longer an untrusted stop to guard against here. This is also what lets
     // finishHookStop harvest a Codex turn the bridge has no history for.
     if (data.sourceKind === "codexCliHook" && typeof scope.conversationId === "string" && scope.conversationId.length > 0) {
+      hookReportedSessions.add(scope.conversationId);
       observeSession(scope.conversationId, { provider: "codexCliHook" });
     }
     if (providerByConversation.get(scope.conversationId) === "codexCliHook") {
@@ -2240,6 +2285,16 @@ function startBridge(config) {
   // agent: Codex takes a queued message and wakes to read it, while the others are
   // handed theirs by their own hook on their next turn.
   const providerByConversation = new Map();
+  /**
+   * Sessions a Codex hook has itself reported — the hook's own events, not a provider
+   * something else wrote down as `codexCliHook`. `sessionProviderFor` records a
+   * notify-named thread under that provider too, because that is what the session can
+   * do; whether a hook ever spoke for it is a different fact, and the one the notify rule
+   * (#139) needs. Persisted with the kinds and restored from them; never set by notify,
+   * and a kinds entry from before the field existed carries no provenance and counts for
+   * none.
+   */
+  const hookReportedSessions = new Set();
   /**
    * Which Codex front end a session's turns come from, as its `notify` names it.
    *
@@ -2629,6 +2684,7 @@ function startBridge(config) {
       out[id] = {
         provider: providerByConversation.get(id) ?? null,
         cwd: workspaceByConversation.get(id) ?? null,
+        ...(hookReportedSessions.has(id) ? { hookReported: true } : {}),
       };
     }
     try {
@@ -2733,6 +2789,11 @@ function startBridge(config) {
         : null,
       cwd: payload?.cwd ?? null,
     });
+    // The raw kind, before `sessionProviderFor` folds notify into it: this is the hook
+    // speaking for itself, which nothing else can claim.
+    if (payload?.runtime?.sourceKind === "codexCliHook" && typeof conversationId === "string") {
+      hookReportedSessions.add(conversationId);
+    }
   };
   // Seeding from the file and from the log is not new knowledge, and writing it back
   // would rewrite the file once per remembered event on every start.
@@ -2804,10 +2865,11 @@ function startBridge(config) {
    * is allowed to read as green or as red.
    */
   const CODEX_TRUST_TIMEOUT_MS = 8_000;
-  const codexHooksJsonPath = () => {
+  const codexHomeDir = () => {
     const codexHome = process.env.CODEX_HOME?.trim();
-    return join(codexHome ? codexHome : join(homedir(), ".codex"), "hooks.json");
+    return codexHome ? codexHome : join(homedir(), ".codex");
   };
+  const codexHooksJsonPath = () => join(codexHomeDir(), "hooks.json");
   const readCodexTrust = (hooksJsonPath, hooksJsonText) => new Promise((resolve) => {
     const unknown = (reason) => resolve({ state: "unknown", reason, hooks: [] });
     let hooksJson = null;
@@ -2899,13 +2961,17 @@ function startBridge(config) {
   // can correct a session that has moved folder since.
   for (const [conversationId, entry] of readSessionKinds(SESSION_KINDS_PATH)) {
     observeSession(conversationId, { provider: entry.provider, cwd: entry.cwd });
+    if (entry.hookReported) hookReportedSessions.add(conversationId);
   }
   // Events already on disk tell us who owns which conversation, so a bridge that has
   // just restarted can still route a message without waiting for fresh activity.
   for (const payload of recent) rememberProvider(payload);
   replayingRecent = false;
 
-  const CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");
+  // Codex's home is wherever Codex says it is. The harvest read `~/.codex` only, which
+  // cost it a log; now that the same directory decides whether a notify is a session at
+  // all (#139), reading the wrong one would cost the session.
+  const CODEX_SESSIONS_DIR = join(codexHomeDir(), "sessions");
   // Overridable so a test can watch what happens when the polling ends, which at two
   // minutes it could not; nothing else sets it.
   const CODEX_REPLY_TIMEOUT_MS = Number(process.env.GYREDECK_CODEX_REPLY_TIMEOUT_MS) || 120_000;
@@ -2925,6 +2991,37 @@ function startBridge(config) {
     } catch {}
     return newest?.path ?? null;
   };
+
+  // The same rule for what is already on disk. A bridge that restarts replays its log
+  // into the app's snapshot, and every helper turn it recorded before this rule would
+  // come back as a session each time — the row the maintainer kept clearing. A session
+  // the hook ever reported — by its own events, in this log or remembered in the kinds
+  // file from before they fell out of it — keeps all of its events; one heard from only
+  // through notify keeps them only if Codex keeps a rollout for it.
+  const notifyOnlyInRecent = new Map();
+  for (const payload of recent) {
+    const conversationId = payload?.conversationId;
+    if (typeof conversationId !== "string" || conversationId.startsWith("codex:")) continue;
+    const fromNotify = payload.type === "turn_complete" && payload.runtime?.sourceKind === "codex-notify";
+    notifyOnlyInRecent.set(conversationId, fromNotify && (notifyOnlyInRecent.get(conversationId) ?? true));
+  }
+  const replayedGhosts = new Set();
+  for (const [conversationId, notifyOnly] of notifyOnlyInRecent) {
+    if (notifyOnly && !hookReportedSessions.has(conversationId) && codexRolloutFor(conversationId) === null) {
+      replayedGhosts.add(conversationId);
+    }
+  }
+  if (replayedGhosts.size > 0) {
+    for (let index = recent.length - 1; index >= 0; index -= 1) {
+      if (replayedGhosts.has(recent[index].conversationId)) recent.splice(index, 1);
+    }
+    for (const conversationId of replayedGhosts) {
+      seenSessions.delete(conversationId);
+      providerByConversation.delete(conversationId);
+      workspaceByConversation.delete(conversationId);
+    }
+    scheduleSaveSessionKinds();
+  }
 
   /**
    * What Codex said after `sinceMs`, read from its own log rather than asked of it.

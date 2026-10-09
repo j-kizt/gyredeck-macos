@@ -94,6 +94,41 @@ Measured order for a one-shot: the hook's `conversation_close` reaches the log f
 the completion naming the client follows about 1.5 seconds later, so the rule reads the
 session's events as a set rather than trusting either to arrive first.
 
+## Notify-only threads
+
+Codex's TUI takes helper turns — naming a thread, recapping it — in temporary threads
+that inherit `notify` but keep no rollout, fire no hook and are unloaded a minute later
+(codex-cli 0.160.1 `start_temporary_thread`; confirmed with Codex, 2026-10-10). Each one
+reported itself as a finished Codex session with no model, and 33 of them were under
+COMPLETED on the maintainer's machine (#139). The notify payload carries nothing that tells
+them apart (`type`, `thread-id`, `turn-id`, `cwd`, `client`, the messages), so the bridge
+answers the question the other way round:
+
+| a notify names a thread that… | the bridge does |
+| --- | --- |
+| a Codex hook has reported, by its own events | publishes it, as before |
+| Codex keeps a rollout for under `$CODEX_HOME/sessions` (`~/.codex/sessions` unless set) | publishes it — the notify-only machine's case |
+| neither | withholds it: one stderr line per thread ("unclassified; completion withheld"), no event, no session-kinds entry |
+
+"A hook has reported it" is its own fact (`hookReportedSessions`), written only by
+`codexCliHook` events and persisted in the session-kinds file as `hookReported: true`.
+It is not the provider: a notify-named thread is recorded as `codexCliHook` too, because
+that is what the session can do, so the provider would have let every ghost through. A
+kinds entry from before the field existed carries no provenance and counts for none. The
+provenance shares the kinds file's retention bound: 200 entries, oldest out.
+
+The limit: a notify that arrives before either piece of evidence exists — before the hook
+has said anything and before a rollout is discoverable — is dropped, and nothing retries
+it. A rollout is expected to be on disk from the session's start, well before its first
+turn can end; that is an expectation, not a timing guarantee anyone has measured.
+
+Neither is not "proven internal", only unclassified — and unclassified is not shown. The
+same rule runs over the replayed log at start — the persisted provenance is what keeps a
+hook-reported session whose hook events have fallen out of the 500-event tail — so a
+helper turn recorded before the rule does not come back as a session on every restart.
+The legacy `codex:<cwd>` name is not a thread to look up and is left alone. Rows the app
+had already persisted are not touched by the bridge; they go with the row's clear button.
+
 Important limitation: there is no native `plan_start`, `thinking_delta`, or assistant-text event. "Planning" is inferred from plan/goal tools, "thinking" from `turn_start`/`llm_start`, and active work from tool/model/compaction lifecycle until a terminal event or inactivity.
 
 ## Privacy stance

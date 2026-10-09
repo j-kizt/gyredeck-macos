@@ -6427,3 +6427,123 @@ test("a rollout under CODEX_HOME counts, live and on replay", async () => {
     await rm(codexHome, { recursive: true, force: true });
   }
 });
+
+/** A turn Codex opened on its own for a goal: its start, then its answer. No UserMessage. */
+const goalTurn = (turnId, startedAt, answer) => JSON.stringify({
+  type: "event_msg", timestamp: startedAt.toISOString(),
+  payload: { type: "task_started", turn_attribution: { turn_id: turnId, turn_trigger: "goal", parent_turn_id: null, root_turn_id: turnId }, turn_id: turnId },
+}) + "\n" + turnAnswering(turnId, answer);
+
+test("a goal turn's answer reaches the room only when it names the room and the session was already in it", async () => {
+  // Codex's goal runner opened eight turns on 2026-10-09 with no UserMessage; the reader
+  // found no prompt and dropped every answer, two of which were room messages. The rule
+  // Codex proposed and the maintainer took: the room the session was confirmed in when the
+  // turn began, and only for an answer whose first line names a member or everyone;
+  // anything else a goal turn says stays in Codex's own terminal.
+  const room = await codexInARoom();
+  try {
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), `joined: ${room.stderrRef.value}`);
+    const now = Date.now();
+    const status = randomUUID();
+    const early = randomUUID();
+    const typed = randomUUID();
+    const addressed = randomUUID();
+    await appendFile(
+      room.rollout,
+      // Working status for its own terminal: no routing line.
+      goalTurn(status, new Date(now), "GOAL-STATUS-ONLY") +
+      // Addressed to the room, but the turn began an hour before this session was confirmed.
+      goalTurn(early, new Date(now - 3_600_000), "@everyone tell\nGOAL-BEFORE-JOINING") +
+      // A goal turn the person typed into — a private message pushed meanwhile; what was
+      // typed decides, as for any turn.
+      JSON.stringify({
+        type: "event_msg", timestamp: new Date(now).toISOString(),
+        payload: { type: "task_started", turn_attribution: { turn_id: typed, turn_trigger: "goal", parent_turn_id: null, root_turn_id: typed }, turn_id: typed },
+      }) + "\n" +
+      JSON.stringify({
+        type: "event_msg", timestamp: new Date(now).toISOString(),
+        payload: { type: "item_completed", turn_id: typed, item: { type: "UserMessage", id: randomUUID(), content: [{ type: "text", text: "[Gyredeck · mailbox — a message to you alone.]\n\nprivately" }] } },
+      }) + "\n" + turnAnswering(typed, "@everyone tell\nGOAL-TYPED-INTO") +
+      // Addressed to the room, begun after the session was in it: the case that was lost.
+      goalTurn(addressed, new Date(now), "@everyone tell\nGOAL-TO-THE-ROOM"),
+    );
+    await room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    assert.ok(await room.until(async () => (await room.saidInRoom()).includes("GOAL-TO-THE-ROOM")), `the addressed goal answer is published: ${room.stderrRef.value}`);
+    const said = await room.saidInRoom();
+    assert.ok(!said.includes("GOAL-STATUS-ONLY"), "status with no routing line stays in the terminal");
+    assert.ok(!said.includes("GOAL-BEFORE-JOINING"), "a turn begun before the session joined is not the room's");
+    assert.ok(!said.includes("GOAL-TYPED-INTO"), "what was typed into the turn decides: not the room");
+    assert.ok((await room.saidInMailbox()).includes("GOAL-TYPED-INTO"), "but the mailbox the typed message named");
+    assert.match(room.stderrRef.value, new RegExp(`turn ${status} was opened by Codex's goal runner and its answer names no member`));
+    assert.doesNotMatch(room.stderrRef.value, /was not found/, "no goal turn is reported as a turn without a prompt");
+  } finally {
+    await room.close();
+  }
+});
+
+test("a goal turn that began before the session was confirmed, or that spans a rejoin, is not the room's", async () => {
+  // Codex's audit of round one: the join time is not the confirmation. A session put in
+  // the room but not yet let in starts a goal turn, is confirmed while it runs, and
+  // answers the room — the room never asked it anything while it was speaking for it. The
+  // boundary is when confirmation was granted, kept on the member record and reset by a
+  // rejoin, so a goal that spans leaving and coming back is not the room's either.
+  //
+  // Two phases, each read to the end before the next begins: a later confirmation moves
+  // the harvest floor past everything written before it, and a first version of this
+  // test ran both in one read — the first case was withheld by the floor and proved
+  // nothing about the boundary.
+  const room = await codexInARoom();
+  try {
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), `joined: ${room.stderrRef.value}`);
+    const leave = () => room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`);
+    const joinUnconfirmed = () => room.call("POST", `/sync/rooms/${room.code}/members`, { conversationId: room.thread });
+    const confirm = async () => {
+      const minted = await room.call("POST", `/sync/rooms/${room.code}/passwords`, { conversationId: room.founder });
+      return room.call("POST", `/sync/rooms/${room.code}/confirm`, { conversationId: room.thread, password: minted.body.password });
+    };
+    const stop = () => room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    const goalStarted = (turnId) => JSON.stringify({
+      type: "event_msg", timestamp: new Date().toISOString(),
+      payload: { type: "task_started", turn_attribution: { turn_id: turnId, turn_trigger: "goal", parent_turn_id: null, root_turn_id: turnId }, turn_id: turnId },
+    }) + "\n";
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Phase 1 — unconfirmed when the goal began, confirmed while it ran.
+    assert.equal((await leave()).status, 200);
+    assert.equal((await joinUnconfirmed()).status, 200);
+    const whileUnconfirmed = randomUUID();
+    await appendFile(room.rollout, goalStarted(whileUnconfirmed));
+    await tick();
+    assert.equal((await confirm()).status, 200);
+    await tick();
+    const control1 = randomUUID();
+    await appendFile(room.rollout, turnAnswering(whileUnconfirmed, "@everyone tell\nGOAL-WHILE-UNCONFIRMED") + goalTurn(control1, new Date(), "@everyone tell\nGOAL-CONTROL-ONE"));
+    await stop();
+    assert.ok(await room.until(async () => (await room.saidInRoom()).includes("GOAL-CONTROL-ONE")), `phase 1 read to the end: ${room.stderrRef.value}`);
+    assert.ok(!(await room.saidInRoom()).includes("GOAL-WHILE-UNCONFIRMED"), "confirmed during the turn: not the room's");
+
+    // Phase 2 — confirmed when the goal began, then left and came back before it answered.
+    const acrossRejoin = randomUUID();
+    await appendFile(room.rollout, goalStarted(acrossRejoin));
+    await tick();
+    assert.equal((await leave()).status, 200);
+    assert.equal((await joinUnconfirmed()).status, 200);
+    assert.equal((await confirm()).status, 200);
+    await tick();
+    const control2 = randomUUID();
+    await appendFile(room.rollout, turnAnswering(acrossRejoin, "@everyone tell\nGOAL-ACROSS-REJOIN") + goalTurn(control2, new Date(), "@everyone tell\nGOAL-CONTROL-TWO"));
+    await stop();
+    assert.ok(await room.until(async () => (await room.saidInRoom()).includes("GOAL-CONTROL-TWO")), `phase 2 read to the end: ${room.stderrRef.value}`);
+    const said = await room.saidInRoom();
+    assert.ok(!said.includes("GOAL-ACROSS-REJOIN"), "left and rejoined during the turn: not the room's");
+    assert.ok(!said.includes("GOAL-WHILE-UNCONFIRMED"), "still not");
+    const mailbox = await room.saidInMailbox();
+    assert.ok(!mailbox.includes("GOAL-WHILE-UNCONFIRMED") && !mailbox.includes("GOAL-ACROSS-REJOIN"), "and not the mailbox either");
+  } finally {
+    await room.close();
+  }
+});

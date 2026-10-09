@@ -426,3 +426,50 @@ test("looking a prompt up through a long stretch of short lines stays cheap and 
     assert.ok(ticks >= 5);
   });
 });
+
+const goalStart = (turnId, at = new Date()) => `${JSON.stringify({
+  type: "event_msg",
+  timestamp: at.toISOString(),
+  payload: { type: "task_started", turn_attribution: { turn_id: turnId, turn_trigger: "goal", parent_turn_id: null, root_turn_id: turnId }, turn_id: turnId },
+})}\n`;
+
+test("a turn Codex opened for a goal is an entry, read off its attribution and nothing else", () => {
+  // Codex's goal runner starts turns with no UserMessage at all — its prompt is an internal
+  // steering item — so the reader found no opener and dropped the answer; two of those
+  // were room messages (#149). The attribution is the stable signature in 0.160.1; the
+  // steering wrapper is not read, because goal updates and budget steering wear it too.
+  const at = new Date("2026-10-09T16:14:01.000Z");
+  const opened = codexEntryFromLine(goalStart("turn-g", at).trim(), 0);
+  assert.deepEqual(opened, { kind: "goal", turnId: "turn-g", at: at.getTime(), });
+  // Turns a person or a push opened record a UserMessage and need nothing from here.
+  for (const trigger of ["queue", "user", "unknown"]) {
+    assert.equal(codexEntryFromLine(JSON.stringify({
+      type: "event_msg", timestamp: at.toISOString(),
+      payload: { type: "task_started", turn_attribution: { turn_id: "turn-q", turn_trigger: trigger }, turn_id: "turn-q" },
+    }), 0), null, `a ${trigger} turn's start is not an entry`);
+  }
+  assert.equal(codexEntryFromLine(JSON.stringify({
+    type: "event_msg", timestamp: at.toISOString(), payload: { type: "task_started", turn_id: "turn-old" },
+  }), 0), null, "a start with no attribution says nothing about who opened it");
+  // The steering wrapper alone is not a goal turn.
+  assert.equal(codexEntryFromLine(JSON.stringify({
+    type: "response_item", timestamp: at.toISOString(),
+    payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<codex_internal_context source=\"goal\">" }] },
+  }), 0), null);
+});
+
+test("looking back from a goal turn's answer finds its start, unless somebody typed into the turn", async () => {
+  await withLog(async (path) => {
+    const at = new Date("2026-10-09T16:14:01.000Z");
+    writeFileSync(path, prompt("t-before", "[Gyredeck · room sync-abcd — earlier]") + turn("earlier") + goalStart("t-goal", at) + turn("the goal's answer"));
+    const read = await readCodexLog(path, 0, 0);
+    assert.deepEqual(read.entries.map((entry) => entry.kind), ["prompt", "reply", "goal", "reply"], "a goal start is an entry in file order");
+    assert.deepEqual(await findCodexPrompt(path, "t-goal", read.offset), { found: true, goal: true, startedAt: at.getTime() });
+
+    // A person can type during a goal turn; Codex records that as a UserMessage under the
+    // same turn, above the start. Read backwards it is met first, and it decides.
+    appendFileSync(path, prompt("t-goal", "[Gyredeck · mailbox — typed meanwhile]") + turn("answer after typing"));
+    const after = await readCodexLog(path, 0, 0);
+    assert.deepEqual(await findCodexPrompt(path, "t-goal", after.offset), { found: true, text: "[Gyredeck · mailbox — typed meanwhile]" });
+  });
+});

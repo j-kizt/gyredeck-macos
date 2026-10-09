@@ -1,5 +1,20 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A private message to Codex is answered even when it takes its time — (v1.18.9)
+
+One small fix for a case found while auditing v1.18.7, and older than it.
+
+### Fixes
+
+- **A late answer to a private message no longer disappears.** When Gyredeck sends a
+  message to a Codex session that is not in any sync room — the notices it gives a session
+  about rooms, mostly — it watches that session's log for the answer for two minutes and
+  then stops watching. If Codex was busy and answered after that, nothing was watching:
+  the answer was written to Codex's log and never reached the mailbox it was meant for.
+  Gyredeck now remembers where it stopped reading, for half a day, and picks up from there
+  the moment Codex finishes the turn — so the answer arrives however long it took. A
+  session that was never sent anything is left alone as before.
+
 ## When the bridge is restarted, Gyredeck now writes down why — (v1.18.8)
 
 Nothing changes in how Gyredeck looks or behaves. What changes is what is left behind when

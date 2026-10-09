@@ -5810,3 +5810,281 @@ test("an answer whose prompt line cannot be read goes nowhere, not to the room",
     await room.close();
   }
 });
+
+/** A Codex session the bridge knows about that is in no room at all. */
+const codexInNoRoom = async ({ replyTimeoutMs = 1_000, env = {}, records = true } = {}) => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-roomless-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const fakeBin = join(home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  // `records: false` is a Codex that takes the push but has not started the turn yet —
+  // the prompt appears in its log only when the test writes it.
+  await writeFile(join(fakeBin, "codex"), records ? recordingCodexBinary : `#!${process.execPath}\nprocess.exit(0);\n`);
+  await chmod(join(fakeBin, "codex"), 0o755);
+  const thread = randomUUID();
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "10", "09");
+  await mkdir(rolloutDir, { recursive: true });
+  const rollout = join(rolloutDir, `rollout-2026-10-09T15-00-00-${thread}.jsonl`);
+  await writeFile(rollout, "");
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    {
+      cwd: repoRoot,
+      env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin, GYREDECK_CODEX_REPLY_TIMEOUT_MS: String(replyTimeoutMs), ...env },
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  await waitForHealth(port, stderrRef);
+  const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+  const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+  const call = async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+    return { status: response.status, body: await response.json() };
+  };
+  const sender = "roomless-sender";
+  for (const [conversationId, sourceKind] of [[sender, "claudeCodeHook"], [thread, "codexCliHook"]]) {
+    await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+      data: { inputCount: 1 },
+    });
+  }
+  const readers = async () => (await (await fetch(`http://127.0.0.1:${port}/health`)).json()).codexHarvest.readers;
+  const saidInMailbox = async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/mail/${thread}?since=0`, { headers });
+    return ((await response.json()).messages ?? []).filter((message) => message.from === thread).map((message) => message.text);
+  };
+  const endTurn = () => call("POST", "/hook/stop", {
+    hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: thread,
+  });
+  const until = async (ready, ms = 8_000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (await ready()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return ready();
+  };
+  const close = async () => {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  };
+  return { call, sender, thread, rollout, rolloutDir, readers, saidInMailbox, endTurn, until, close, stderr: () => stderrRef.value };
+};
+
+test("a late answer to a mailbox push reaches a session in no room, after its reader was let go", async () => {
+  // Found by Codex auditing #122 and older than it: the polling ended, the reader was
+  // dropped as idle, and the stop that ended the turn started no read for a session in
+  // no room. The reader is parked now, and the stop brings it back.
+  const session = await codexInNoRoom({ replyTimeoutMs: 1_000 });
+  try {
+    assert.equal((await session.call("POST", `/mail/${session.thread}`, { from: session.sender, to: session.thread, kind: "ask", text: "a slow private question" })).status, 202);
+    assert.ok(await session.until(async () => (await promptsIn(session.rollout)).some((prompt) => prompt.text.endsWith("a slow private question"))));
+    const question = (await promptsIn(session.rollout)).find((prompt) => prompt.text.endsWith("a slow private question"));
+    assert.ok(await session.until(async () => (await session.readers()) === 0, 8_000), "the polling ended and the reader was let go");
+
+    // Codex answers well after that, and its stop says so.
+    await appendFile(session.rollout, turnAnswering(question.turnId, "@everyone tell\nLATE-PRIVATE-ANSWER"));
+    await session.endTurn();
+    assert.ok(await session.until(async () => (await session.saidInMailbox()).includes("LATE-PRIVATE-ANSWER")), "the late answer reaches the mailbox");
+    assert.ok(await session.until(async () => (await session.readers()) === 0), "and the reader is parked again, not kept");
+
+    // The next push and its late answer work the same way, and the first is not repeated.
+    assert.equal((await session.call("POST", `/mail/${session.thread}`, { from: session.sender, to: session.thread, kind: "ask", text: "another one" })).status, 202);
+    assert.ok(await session.until(async () => (await promptsIn(session.rollout)).some((prompt) => prompt.text.endsWith("another one"))));
+    const second = (await promptsIn(session.rollout)).find((prompt) => prompt.text.endsWith("another one"));
+    assert.ok(await session.until(async () => (await session.readers()) === 0, 8_000));
+    await appendFile(session.rollout, turnAnswering(second.turnId, "@everyone tell\nSECOND-LATE-ANSWER"));
+    await session.endTurn();
+    assert.ok(await session.until(async () => (await session.saidInMailbox()).includes("SECOND-LATE-ANSWER")));
+    assert.equal((await session.saidInMailbox()).filter((text) => text === "LATE-PRIVATE-ANSWER").length, 1, "the earlier answer is not published twice");
+  } finally {
+    await session.close();
+  }
+});
+
+test("a session in no room that was never pushed to gets no reader when its turn ends", async () => {
+  const session = await codexInNoRoom();
+  try {
+    await appendFile(session.rollout, userTurn("something the user typed", "@everyone tell\nTO-NOBODY"));
+    await session.endTurn();
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.equal(await session.readers(), 0, "no reader was made for it");
+    assert.deepEqual(await session.saidInMailbox(), [], "and nothing was published anywhere");
+  } finally {
+    await session.close();
+  }
+});
+
+test("a stop that arrives while a read is under way still counts as a turn ending for the read that follows", async () => {
+  // The poll's read of a big log is in flight when the turn ends; the stop could only ask
+  // for another read, and that one was turned away as having nothing to read for. Codex
+  // built this one.
+  // Codex has not taken the push yet when the poll's read begins; the prompt, the answer
+  // and the stop all land while that read is still going, and the polling window ends
+  // before the read does. The read that follows has no open turn to go on and no window
+  // left — only the stop says there is something to read for.
+  const session = await codexInNoRoom({ replyTimeoutMs: 1_500, records: false });
+  try {
+    const pushedAt = Date.now();
+    assert.equal((await session.call("POST", `/mail/${session.thread}`, { from: session.sender, to: session.thread, kind: "ask", text: "a question before a long tool run" })).status, 202);
+    // Written after the push (the cursor sits at the push) and before the poll fires one
+    // second after it, so the poll's read is long.
+    const filler = JSON.stringify({
+      type: "event_msg", timestamp: new Date().toISOString(),
+      payload: { type: "token_count", info: { total_token_usage: { input_tokens: 1 } }, padding: "x".repeat(120) },
+    }) + "\n";
+    await appendFile(session.rollout, filler.repeat(Math.ceil((160 * 1024 * 1024) / filler.length)));
+    assert.ok(Date.now() - pushedAt < 1_000, "the log was written before the poll fired");
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, pushedAt + 1_150 - Date.now())));
+    const turnId = randomUUID();
+    await appendFile(session.rollout, JSON.stringify({
+      type: "event_msg", timestamp: new Date().toISOString(),
+      payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: randomUUID(), content: [{ type: "text", text: "[Gyredeck · mailbox — a message to you alone.]\n\na question before a long tool run" }] } },
+    }) + "\n" + turnAnswering(turnId, "@everyone tell\nANSWER-DURING-A-LONG-READ"));
+    await session.endTurn();
+    assert.ok(await session.until(async () => (await session.saidInMailbox()).includes("ANSWER-DURING-A-LONG-READ"), 20_000), "the answer reaches the mailbox");
+  } finally {
+    await session.close();
+  }
+});
+
+test("a parked reader brought back to a new rollout file reads the answer written before the stop", async () => {
+  // Codex can start a new rollout for the same thread. The parked cursor is for the old
+  // file; the new one is read from its start — floored at the first push, not at "now",
+  // or an answer written before the stop was filtered out. Codex built this one.
+  const session = await codexInNoRoom({ replyTimeoutMs: 1_000 });
+  try {
+    assert.equal((await session.call("POST", `/mail/${session.thread}`, { from: session.sender, to: session.thread, kind: "ask", text: "answered in a new file" })).status, 202);
+    assert.ok(await session.until(async () => (await promptsIn(session.rollout)).some((prompt) => prompt.text.endsWith("answered in a new file"))));
+    assert.ok(await session.until(async () => (await session.readers()) === 0, 8_000), "parked");
+    // The old file holds an answer that was already published, so a replay would show.
+    const earlier = (await promptsIn(session.rollout))[0];
+    await appendFile(session.rollout, turnAnswering(earlier.turnId, "@everyone tell\nOLD-FILE-ANSWER"));
+    await session.endTurn();
+    assert.ok(await session.until(async () => (await session.saidInMailbox()).includes("OLD-FILE-ANSWER")));
+    assert.ok(await session.until(async () => (await session.readers()) === 0, 8_000), "parked again");
+
+    // A newer rollout for the same thread, with its own prompt and answer, before the stop.
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    const fresh = join(session.rolloutDir, `rollout-2026-10-09T15-30-00-${session.thread}.jsonl`);
+    const turnId = randomUUID();
+    await writeFile(fresh, JSON.stringify({
+      type: "event_msg", timestamp: new Date().toISOString(),
+      payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: randomUUID(), content: [{ type: "text", text: "[Gyredeck · mailbox — a message to you alone.]\n\nin the new file" }] } },
+    }) + "\n" + turnAnswering(turnId, "@everyone tell\nNEW-FILE-ANSWER"));
+    await session.endTurn();
+    assert.ok(await session.until(async () => (await session.saidInMailbox()).includes("NEW-FILE-ANSWER")), "the answer in the new file is read");
+    assert.equal((await session.saidInMailbox()).filter((text) => text === "OLD-FILE-ANSWER").length, 1, "the old file's answer is not replayed");
+    assert.equal((await session.saidInMailbox()).filter((text) => text === "NEW-FILE-ANSWER").length, 1);
+  } finally {
+    await session.close();
+  }
+});
+
+test("a parked reader past its horizon is not brought back, and one evicted by newer ones is gone too", async () => {
+  // Twelve hours and 128 sessions in production; here half a second and two, so both
+  // ends can be watched. The horizon runs from the last time the reader was parked.
+  const session = await codexInNoRoom({ replyTimeoutMs: 500, env: { GYREDECK_CODEX_PARKED_HORIZON_MS: "500" } });
+  try {
+    assert.equal((await session.call("POST", `/mail/${session.thread}`, { from: session.sender, to: session.thread, kind: "ask", text: "answered too late" })).status, 202);
+    assert.ok(await session.until(async () => (await promptsIn(session.rollout)).some((prompt) => prompt.text.endsWith("answered too late"))));
+    const question = (await promptsIn(session.rollout)).find((prompt) => prompt.text.endsWith("answered too late"));
+    assert.ok(await session.until(async () => (await session.readers()) === 0, 8_000), "parked");
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    await appendFile(session.rollout, turnAnswering(question.turnId, "@everyone tell\nPAST-THE-HORIZON"));
+    await session.endTurn();
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.equal(await session.readers(), 0, "no reader was brought back");
+    assert.ok(!(await session.saidInMailbox()).includes("PAST-THE-HORIZON"), "and the answer is not read");
+  } finally {
+    await session.close();
+  }
+
+  const crowded = await codexInNoRoom({ replyTimeoutMs: 500, env: { GYREDECK_CODEX_PARKED_MEMORY: "1" } });
+  try {
+    // A second Codex session the bridge knows about, pushed to after the first, takes the
+    // one parking place; the first is then nobody's to resume.
+    const other = randomUUID();
+    const otherRollout = join(crowded.rolloutDir, `rollout-2026-10-09T15-00-00-${other}.jsonl`);
+    await writeFile(otherRollout, "");
+    await crowded.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: other, cwd: "/tmp/project",
+      runtime: { sourcePid: 3, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" },
+      data: { inputCount: 1 },
+    });
+    assert.equal((await crowded.call("POST", `/mail/${crowded.thread}`, { from: crowded.sender, to: crowded.thread, kind: "ask", text: "first" })).status, 202);
+    assert.ok(await crowded.until(async () => (await promptsIn(crowded.rollout)).some((prompt) => prompt.text.endsWith("first"))));
+    const first = (await promptsIn(crowded.rollout)).find((prompt) => prompt.text.endsWith("first"));
+    assert.ok(await crowded.until(async () => (await crowded.readers()) === 0, 8_000), "first parked");
+    assert.equal((await crowded.call("POST", `/mail/${other}`, { from: crowded.sender, to: other, kind: "ask", text: "second" })).status, 202);
+    assert.ok(await crowded.until(async () => (await promptsIn(otherRollout)).some((prompt) => prompt.text.endsWith("second"))));
+    assert.ok(await crowded.until(async () => (await crowded.readers()) === 0, 8_000), "second parked, evicting the first");
+    await appendFile(crowded.rollout, turnAnswering(first.turnId, "@everyone tell\nEVICTED-ANSWER"));
+    await crowded.endTurn();
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.equal(await crowded.readers(), 0);
+    assert.ok(!(await crowded.saidInMailbox()).includes("EVICTED-ANSWER"), "the evicted session's answer is not read");
+  } finally {
+    await crowded.close();
+  }
+});
+
+test("a late answer refused by a full room is published once the room is collected from, with no further push or stop", async () => {
+  // The reader left its cursor in front of the refused answer; its polling had run out
+  // and the turn had already ended, so nothing was coming to read again. Collecting is
+  // what frees the space, so collecting is what reads again. Codex built the case for a
+  // mailbox; a mailbox cannot fill from pushed mail (a push counts as collected), so the
+  // room is where it can happen, and the wake is by room name either way.
+  const room = await codexInARoom({ replyTimeoutMs: 1_000 });
+  const sink = "full-room-sink";
+  try {
+    await room.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: sink, cwd: "/tmp/project",
+      runtime: { sourcePid: 4, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+      data: { inputCount: 1 },
+    });
+    assert.equal((await joinConfirmed(room.call, room.code, room.founder, sink)).status, 200);
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    // Mail a member is owed and has not collected fills the room; none of it reaches Codex.
+    const fat = "x".repeat(4_000);
+    let full = false;
+    for (let index = 0; index < 400 && !full; index += 1) {
+      full = (await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: sink, kind: "tell", text: `filler-${index} ${fat}` })).body?.error === "room_full";
+    }
+    assert.ok(full, "the room has to be full of owed mail, or this proves nothing");
+    // A short question fits; its answer, later, will not.
+    assert.equal((await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "ask", text: "q" })).body.ok, true);
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("\n\nq"))));
+    const question = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("\n\nq"));
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    await appendFile(room.rollout, turnAnswering(question.turnId, `@everyone tell\nREFUSED-THEN-DELIVERED ${fat}`));
+    await room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    assert.ok(!(await room.saidInRoom()).some((text) => text.startsWith("REFUSED-THEN-DELIVERED")), "refused while the room is full");
+
+    // Everyone collects. Nothing else happens: no push, no stop.
+    for (const reader of [sink, room.founder, room.thread]) {
+      for (let drain = 0; drain < 60; drain += 1) {
+        const seen = await room.call("GET", `/mail/inbox?as=${reader}&collect=1&limit=100`);
+        if (!seen.body.messages?.length) break;
+      }
+    }
+    assert.ok(await room.until(async () => (await room.saidInRoom()).some((text) => text.startsWith("REFUSED-THEN-DELIVERED")), 10_000), "the answer arrives once there is room");
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.equal((await room.saidInRoom()).filter((text) => text.startsWith("REFUSED-THEN-DELIVERED")).length, 1, "exactly once");
+  } finally {
+    await room.close();
+  }
+});

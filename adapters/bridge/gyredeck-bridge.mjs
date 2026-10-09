@@ -1443,16 +1443,60 @@ function startBridge(config) {
    * that is only ever derived from the log can be dropped and derived again.
    */
   const codexReaders = new Map();
+  /**
+   * Where a reader that was let go had got to, kept so a later stop can pick up from there.
+   *
+   * A session in no room is pushed a message into its mailbox and takes longer than the
+   * polling window to answer: the reader was let go as idle, and the stop that ended the
+   * turn did not start one for a session in no room — the answer never reached the
+   * mailbox (#140). Parking the cursor costs a few bytes per session and lets that stop
+   * resume the read from where it stopped, with the prompt lookup routing the answer. Kept
+   * for a bounded time and number: a push is answered within a working day or not at all.
+   */
+  const codexParked = new Map();
+  // Both overridable so a test can watch a parked reader expire or be evicted, which at
+  // twelve hours and 128 sessions it could not; nothing else sets them. The horizon runs
+  // from the last time the reader was parked, not from the push.
+  const CODEX_PARKED_MEMORY = Number(process.env.GYREDECK_CODEX_PARKED_MEMORY) || 128;
+  const CODEX_PARKED_HORIZON_MS = Number(process.env.GYREDECK_CODEX_PARKED_HORIZON_MS) || 12 * 60 * 60 * 1000;
+  const parkCodexReader = (reader) => {
+    if (!reader.wasPushed || reader.cursor === undefined || reader.path === null) return;
+    codexParked.delete(reader.threadId);
+    codexParked.set(reader.threadId, {
+      path: reader.path,
+      cursor: reader.cursor,
+      skipping: reader.skipping,
+      pushedSince: reader.pushedSince,
+      refusedIn: reader.refusedIn,
+      at: Date.now(),
+    });
+    while (codexParked.size > CODEX_PARKED_MEMORY) {
+      codexParked.delete(codexParked.keys().next().value);
+    }
+  };
+  const parkedCodexReader = (threadId) => {
+    const parked = codexParked.get(threadId);
+    if (!parked) return null;
+    if (Date.now() - parked.at > CODEX_PARKED_HORIZON_MS) {
+      codexParked.delete(threadId);
+      return null;
+    }
+    return parked;
+  };
   const codexReaderFor = (threadId) => {
     let reader = codexReaders.get(threadId);
     if (!reader) {
+      // A reader that was parked comes back where it left off, so an answer written
+      // between then and now is not stepped over by a cursor placed at the end.
+      const parked = parkedCodexReader(threadId);
+      codexParked.delete(threadId);
       reader = {
         threadId,
-        path: null,
-        cursor: undefined,
+        path: parked?.path ?? null,
+        cursor: parked?.cursor,
         // Whether the cursor sits inside a line too long to keep: the read resumes by
         // discarding to the next line break, rather than parsing the tail of it.
-        skipping: false,
+        skipping: parked?.skipping ?? false,
         // Replies at or before this offset that no push asked for are not the room's: they
         // were said before the session was confirmed in it.
         roomFloor: 0,
@@ -1463,14 +1507,27 @@ function startBridge(config) {
         // turnId → where its answer goes, from the prompt that opened it. Deleted when the
         // answer is handled, or the turn aborted.
         origins: new Map(),
-        // Until when a push is still being waited for by polling. For a session in a room
-        // the deadline bounds the polling, not the answer: a turn that ends later is read
-        // by the stop that ends it, because the reader is kept for the room. For a session
-        // in no room it bounds the answer too — once the polling is over the reader is let
-        // go, and a stop that comes later does not start one, so an answer to a mailbox
-        // push after that is never read. Known, older than this reader, and tracked on
-        // the board.
+        // Until when a push is still being waited for by polling. The deadline bounds the
+        // polling, not the answer: a turn that ends later is read by the stop that ends
+        // it — for a session in a room because the reader is kept for the room, for a
+        // session in no room because the reader was parked when let go and the stop
+        // brings it back (#140).
         pollUntil: 0,
+        // Whether anything was ever pushed to this session: what makes it worth parking.
+        wasPushed: parked !== null,
+        // When the first push still being waited for was made. The floor for what is read
+        // when the log is a new file and no room's join time applies — without it the
+        // floor was "now", and an answer written before the stop that brought the reader
+        // back was filtered out.
+        pushedSince: parked?.pushedSince ?? null,
+        // A stop that arrived while a read was under way: the read that follows is for
+        // that turn, and must not be turned away as having nothing to read for.
+        turnEndedWhileReading: false,
+        // The room or mailbox that had no space for an answer the last read reached, by
+        // name. The cursor sits in front of that answer; what brings the reader back is
+        // somebody collecting from that room (`wakeCodexReadersAfterCollection`), since
+        // the polling may be over and no stop is coming — the turn already ended.
+        refusedIn: parked?.refusedIn ?? null,
         reading: false,
         again: false,
         timer: null,
@@ -1555,7 +1612,10 @@ function startBridge(config) {
     if (syncRoomFor(reader.threadId)) return;
     if (reader.timer) clearTimeout(reader.timer);
     reader.timer = null;
-    if (codexReaders.get(reader.threadId) === reader) codexReaders.delete(reader.threadId);
+    if (codexReaders.get(reader.threadId) === reader) {
+      parkCodexReader(reader);
+      codexReaders.delete(reader.threadId);
+    }
   };
   /**
    * A session left a room, or the room closed. Called for every member when a room closes.
@@ -1613,16 +1673,20 @@ function startBridge(config) {
    * read that follows rather than a read of its own, which is what keeps one log to one
    * read in flight.
    */
-  const readCodexSession = async (reader) => {
+  const readCodexSession = async (reader, { turnEnded = false } = {}) => {
     if (reader.reading) {
       reader.again = true;
+      if (turnEnded) reader.turnEndedWhileReading = true;
       return;
     }
     reader.reading = true;
     try {
       do {
         reader.again = false;
-        await readCodexSessionOnce(reader);
+        const forTurn = turnEnded || reader.turnEndedWhileReading;
+        reader.turnEndedWhileReading = false;
+        turnEnded = false;
+        await readCodexSessionOnce(reader, forTurn);
       } while (reader.again);
     } catch (error) {
       console.error(`⚠ reading a Codex log failed: ${error?.message ?? error}`);
@@ -1654,7 +1718,7 @@ function startBridge(config) {
     // this reader, or looked up — never on the strength of not knowing.
     return confirmedIn && reply.endsAt > reader.roomFloor ? confirmedIn : null;
   };
-  const readCodexSessionOnce = async (reader) => {
+  const readCodexSessionOnce = async (reader, turnEnded = false) => {
     const { threadId } = reader;
     const path = codexRolloutFor(threadId);
     if (!path) return;
@@ -1674,13 +1738,20 @@ function startBridge(config) {
       return { member, confirmedIn: member?.confirmed === true ? found : null };
     };
     const before = whereItSpeaks();
-    if (!before.confirmedIn && reader.origins.size === 0 && Date.now() >= reader.pollUntil) return;
+    // Nothing to read for — unless a turn just ended, which is the one moment an answer
+    // to an earlier push can be sitting there for a session in no room.
+    if (!turnEnded && !before.confirmedIn && reader.origins.size === 0 && Date.now() >= reader.pollUntil) return;
     // A log nobody has read yet starts at the moment this session joined the room, so a
     // conversation that was already long does not arrive in the room all at once. Every
     // read after that resumes from a byte offset, which cannot step over a line.
     const resuming = reader.cursor;
     const generation = reader.generation;
-    const sinceMs = resuming !== undefined ? 0 : Date.parse(before.member?.joinedAt ?? "") || Date.now();
+    // A log nobody has read yet: from the moment the session joined its room, or, with no
+    // room, from the first push still waited for — never simply "now", which filtered out
+    // an answer written before the stop that brought a parked reader back to a new file.
+    const sinceMs = resuming !== undefined
+      ? 0
+      : Date.parse(before.member?.joinedAt ?? "") || reader.pushedSince || Date.now();
     const { entries, offset, from, skipped, skipping } = await withCodexReadSlot(
       () => readCodexLog(path, resuming ?? 0, sinceMs, { skipping: resuming !== undefined && reader.skipping }),
     );
@@ -1713,6 +1784,7 @@ function startBridge(config) {
     // bridge read the new file from the top over and over until it outgrew the old one.
     let handledThrough = from;
     let sawReply = false;
+    let refusedIn = null;
     for (const entry of entries) {
       if (entry.kind === "prompt") {
         // Re-read after a refusal, the prompt is seen again; the turn is already open.
@@ -1780,8 +1852,13 @@ function startBridge(config) {
       // Both kinds of full are asked before anything is claimed or the cursor moves —
       // `publishMail` answers a refusal with `null`, and a claimed reply is one nothing
       // will ever look at again. The turn stays open: it is read again, prompt and all.
-      if (roomIsFull(destination.room, Buffer.byteLength(reply.text ?? "", "utf8"))) break;
-      if (heldWouldOverflow(destination.room, { from: threadId, to: routing.to, kind: routing.kind, text })) break;
+      if (
+        roomIsFull(destination.room, Buffer.byteLength(reply.text ?? "", "utf8")) ||
+        heldWouldOverflow(destination.room, { from: threadId, to: routing.to, kind: routing.kind, text })
+      ) {
+        refusedIn = destination.name;
+        break;
+      }
       handledThrough = reply.endsAt;
       reader.origins.delete(reply.turnId);
       if (!claimCodexReply(threadId, reply)) continue;
@@ -1817,6 +1894,7 @@ function startBridge(config) {
       // The read ended inside an overlong line only if the cursor got as far as its end.
       reader.skipping = handledThrough === offset && skipping;
     }
+    reader.refusedIn = refusedIn;
     if (
       !codexHarvest.warned &&
       codexHarvest.published === 0 &&
@@ -1840,10 +1918,11 @@ function startBridge(config) {
     const confirmed = found?.room.members.get(conversationId)?.confirmed === true;
     if (confirmed) codexHarvest.turns += 1;
     // A session in no room with nothing pushed to it has nothing to read for; giving it
-    // a reader would keep one for every session that ever finished a turn.
+    // a reader would keep one for every session that ever finished a turn. One that was
+    // pushed to and parked comes back for this turn, and is parked again after.
     const reader = codexReaders.get(conversationId);
-    if (!reader && !confirmed) return;
-    readCodexSession(reader ?? codexReaderFor(conversationId));
+    if (!reader && !confirmed && !parkedCodexReader(conversationId)) return;
+    readCodexSession(reader ?? codexReaderFor(conversationId), { turnEnded: true });
   };
   // One Codex turn ending can arrive twice: once from the full hooks and once from
   // notify. Random hookIds mean shouldEmitHookSignal cannot pair them, so they are
@@ -2939,7 +3018,10 @@ function startBridge(config) {
     const room = {
       // Its own name, because everything that publishes into a room is handed the room
       // and not the key it is filed under, and a reverse lookup to recover the one from
-      // the other is a scan that can disagree with itself.
+      // the other is a scan that can disagree with itself. The confirmation a Codex
+      // session is pushed carries the room's brief, which has to be buildable from the
+      // room alone — the size of it is checked when a message is accepted, long before
+      // anyone knows who will deliver it.
       name,
       seq: 0,
       // Who pressed Create. Only they are offered the key, because handing out the
@@ -2949,10 +3031,6 @@ function startBridge(config) {
       // x-gyredeck-token header for every read and every send here. Password and token
       // are the same thing said two ways — it is a password to the person copying it
       // out of the panel, and a token to the header carrying it.
-      // Its own code. The confirmation a Codex session is pushed carries the room's
-      // brief, and that has to be buildable from the room alone — the size of it is
-      // checked when a message is accepted, long before anyone knows who will deliver it.
-      name,
       password: null,
       readSeq: 0,
       messages: [],
@@ -2995,6 +3073,25 @@ function startBridge(config) {
     // identify a reader still shows something truthful.
     room.readSeq = Math.max(room.readSeq, reader.readSeq);
     room.lastReadAt = at;
+    wakeCodexReadersAfterCollection(room.name);
+  };
+  /**
+   * Somebody read from a room: an answer that room had no space for may fit now.
+   *
+   * The reader that was refused left its cursor in front of the answer and went on
+   * polling, or was parked when the polling ran out — and a parked reader with nothing
+   * coming (the turn already ended, the push already made) had nothing to bring it back.
+   * Collection is the event that frees space, so collection is what reads again. Only
+   * for readers refused by *this* room; everybody else is left alone. Codex found the
+   * case: late answer, full mailbox, then a collect that left the answer unpublished.
+   */
+  const wakeCodexReadersAfterCollection = (roomName) => {
+    for (const reader of codexReaders.values()) {
+      if (reader.refusedIn === roomName) readCodexSession(reader, { turnEnded: true });
+    }
+    for (const [threadId, parked] of codexParked) {
+      if (parked.refusedIn === roomName) readCodexSession(codexReaderFor(threadId), { turnEnded: true });
+    }
   };
 
   /** Which room a session has been put into, if any. A session belongs to at most one. */
@@ -3722,6 +3819,8 @@ function startBridge(config) {
     if (!rolloutPath) return "queued";
 
     reader.pollUntil = since + CODEX_REPLY_TIMEOUT_MS;
+    reader.wasPushed = true;
+    if (reader.pushedSince === null) reader.pushedSince = since;
     armCodexPoll(reader);
     return "queued";
   };

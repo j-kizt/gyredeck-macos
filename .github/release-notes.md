@@ -1,5 +1,35 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Codex's answers go where they were asked, and a long turn can't take the bridge down — (v1.18.7)
+
+Two more faults in how Gyredeck reads Codex's answers, both found while fixing the room
+losses in v1.18.5 and both of a kind that looked like silence rather than failure.
+
+### Fixes
+
+- **An answer to a question in the room no longer lands in Codex's private mailbox.** When a
+  Codex session was let into a room, Gyredeck pushed it a notice privately and then your
+  question in the room, and started watching for a reply to each — two watchers, one log.
+  Whichever woke first took the answer to the place *it* was watching for, so a reply to the
+  room could be filed into the session's own mailbox, where nobody was looking, and the room
+  heard nothing. Gyredeck now reads where an answer belongs off the message that asked for it:
+  every message it pushes to Codex opens with a line saying what it is, a room's message
+  names the room, and Codex's log pairs each answer with the message that opened its turn.
+  If Gyredeck comes across an answer whose question it did not see — it had just been
+  restarted, say — it looks the question up in the log rather than guessing; an answer it
+  cannot place goes nowhere and is noted in the bridge's log, never into the wrong room.
+- **One huge turn no longer gets the bridge killed.** v1.18.5 stopped Gyredeck re-reading the
+  whole of Codex's log every second, but what Codex had added since the last look was still
+  read in one go. A single turn that writes tens of megabytes — a long tool output — held the
+  bridge long enough for the app to decide it had hung and restart it, taking every sync room
+  with it. The log is now read in small pieces with the bridge answering in between, a line
+  too long to be a message is passed over unread, and no more than two logs are read at once.
+
+### Known limits
+
+- A reply to a private message pushed to a Codex session that is in **no** room, arriving
+  more than two minutes later, is not picked up. This is older than this release and tracked.
+
 ## Two dependency security fixes — (v1.18.6)
 
 Nothing changes in how Gyredeck looks or behaves. Two libraries it is built with had

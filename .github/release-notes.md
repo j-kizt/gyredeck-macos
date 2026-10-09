@@ -1,5 +1,24 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## What Codex says for the room while working a goal now reaches it — (v1.18.11)
+
+One fix, for two messages that were written and never arrived.
+
+### Fixes
+
+- **A Codex session working toward a goal can speak in its room again.** Codex can be
+  given a goal and will carry on with it on its own, turn after turn, without anyone
+  typing. Gyredeck reads what Codex says for a room out of Codex's own log, and it found
+  where each answer belonged by the message that opened the turn — but a turn Codex
+  opens for a goal has no such message, so every one of those answers was dropped as
+  "unknown", and on 9 October two of them were a report and an acknowledgement meant for
+  the room. Gyredeck now recognises a goal turn by how Codex marks it, and publishes its
+  answer to the room when the first line names a member of the room (or everyone) and
+  the session was already let into that room before the turn began. Status Codex writes
+  for its own terminal while working stays there; a turn that began before the session
+  was let in, or that spans leaving and rejoining, is not the room's; and if a person
+  types into a goal turn, what they typed decides where the answer goes, as before.
+
 ## A Codex session that was never a session no longer sits under COMPLETED — (v1.18.10)
 
 One fix, for a row that kept coming back.

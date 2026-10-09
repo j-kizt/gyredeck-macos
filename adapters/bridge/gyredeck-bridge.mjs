@@ -24,6 +24,7 @@
 
 import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { open as openFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -311,31 +312,73 @@ export const slowestReaderSeq = (room) => {
  * end. Neither was reachable from a test while this lived inside `startBridge`, so both had
  * to be accepted on the strength of reading the code. That is the debt this repays.
  */
-/** One line of a Codex rollout as a reply, or null when the line is anything else. */
-export const codexReplyFromLine = (line, sinceMs) => {
+/**
+ * One line of a Codex rollout, as the two kinds of line the bridge acts on, or null.
+ *
+ * A **reply** is a finished turn with its last message — what Codex said. A **prompt** is a
+ * user message Codex recorded together with the turn it opened, and that includes every
+ * message the bridge pushed through `codex queue`: Codex writes the pushed text into its
+ * log verbatim, under the same `turn_id` the answer will carry. That pairing is what binds
+ * an answer to the question that asked for it. A reply whose turn no prompt of ours opened
+ * is Codex talking to its own user.
+ */
+export const codexEntryFromLine = (line, sinceMs) => {
   if (!line.trim()) return null;
   let entry;
   try { entry = JSON.parse(line); } catch { return null; }
-  if (entry.type !== "event_msg" || entry.payload?.type !== "task_complete") return null;
-  const text = entry.payload.last_agent_message;
-  if (typeof text !== "string" || !text.trim()) return null;
-  const at = Date.parse(entry.timestamp ?? "");
-  if (Number.isFinite(at) && at < sinceMs) return null;
-  return { turnId: entry.payload.turn_id ?? null, text: text.trim() };
+  if (entry.type !== "event_msg") return null;
+  const payload = entry.payload;
+  if (!payload || typeof payload !== "object") return null;
+  const parsed = Date.parse(entry.timestamp ?? "");
+  const at = Number.isFinite(parsed) ? parsed : null;
+  if (payload.type === "task_complete") {
+    const text = payload.last_agent_message;
+    if (typeof text !== "string" || !text.trim()) return null;
+    if (at !== null && at < sinceMs) return null;
+    return { kind: "reply", turnId: payload.turn_id ?? null, text: text.trim(), at };
+  }
+  if (payload.type === "turn_aborted") {
+    if (typeof payload.turn_id !== "string" || payload.turn_id === "") return null;
+    return { kind: "aborted", turnId: payload.turn_id, at };
+  }
+  if (payload.type === "item_completed" && payload.item?.type === "UserMessage") {
+    if (typeof payload.turn_id !== "string" || payload.turn_id === "") return null;
+    const content = Array.isArray(payload.item.content) ? payload.item.content : [];
+    // Several parts is possible in the shape; one text part is what every pushed message
+    // has been. Joined without a separator so a split message reads back as it was sent.
+    const text = content
+      .filter((part) => part && typeof part.text === "string" && /^text$/i.test(String(part.type ?? "")))
+      .map((part) => part.text)
+      .join("");
+    if (!text) return null;
+    return { kind: "prompt", turnId: payload.turn_id, text, at };
+  }
+  return null;
+};
+
+/**
+ * Where the answer to a message the bridge pushed belongs, read off the message itself.
+ *
+ * Everything the bridge pushes opens with its own marker, and a room's message opens by
+ * naming the room. So a prompt in the log says where its answer goes, and nothing has to
+ * be remembered from the push to the answer — a record kept per push was lost three ways
+ * (to a count, to a deadline, to a clear on leaving) and each loss turned an answer into one
+ * nobody asked for. A prompt without the marker was typed by the session's own user: null.
+ */
+export const codexPushTarget = (text) => {
+  const room = /^\[Gyredeck · room (sync-[a-z2-9]{4}) /.exec(text);
+  if (room) return { kind: "room", name: room[1] };
+  if (/^\[Gyredeck[ ·:]/.test(text)) return { kind: "mailbox" };
+  return null;
+};
+
+/** One line of a Codex rollout as a reply, or null when the line is anything else. */
+export const codexReplyFromLine = (line, sinceMs) => {
+  const entry = codexEntryFromLine(line, sinceMs);
+  return entry?.kind === "reply" ? { turnId: entry.turnId, text: entry.text } : null;
 };
 
 
-/**
- * Everything Codex has said past `offset`, and the offset to resume from next time.
- *
- * A byte cursor rather than a clock, because this one advances and a clock cannot
- * advance safely: the old cursor moved to "now" before the file was read, so a line
- * flushed a moment late fell below the next read's floor and was never published. The
- * per-thread claim stops a reply being said twice; nothing stopped one being skipped.
- *
- * Only whole lines are consumed. A log caught mid-write ends in a partial line, and
- * the returned offset stops in front of it so the next read sees it complete.
- */
 /**
  * The last `bytes` of a file, starting at a whole line.
  *
@@ -343,6 +386,99 @@ export const codexReplyFromLine = (line, sinceMs) => {
  * middle — reading from an arbitrary byte can also land inside a multi-byte character,
  * which only that first line could contain.
  */
+/**
+ * How far back a reply's prompt is looked for when the reader does not have it.
+ *
+ * Wider than any one turn is likely to be, because a prompt that lies further back than
+ * this is reported as not found, and its answer goes nowhere. Codex measured a single tool
+ * output of 48 MiB inside one turn; the lookup is chunked and asynchronous, so the width
+ * costs time only on the rare turn the reader did not see open.
+ */
+export const CODEX_PROMPT_LOOKBACK_BYTES = 64 * 1024 * 1024;
+
+/**
+ * The prompt that opened a turn, found by reading the log backwards from the answer.
+ *
+ * The reader normally carries a turn's prompt to its answer in memory, and that memory
+ * can be lost — a reader dropped as idle, a cursor placed after the prompt when the session
+ * was let into a room, a bound overflowed. Every version that answered that loss with a
+ * guess ("no prompt known, so the user typed it") sent a private answer into a room. The
+ * prompt is in the log, before the answer, for as long as the log is; so it is looked up,
+ * in chunks and asynchronously like everything else here, and a turn whose prompt cannot be
+ * found within the lookback is a turn whose answer goes nowhere, said on stderr.
+ *
+ * Backwards from `beforeOffset`, which must be a line boundary — the end of the answer's
+ * own line is one. Lines are cut on raw bytes; the head of a line cut by a chunk boundary
+ * waits for the chunk below it.
+ *
+ * `{ found: true, text }` when the prompt is there. Otherwise `{ found: false, complete }`,
+ * where `complete` says whether everything before the answer was searched. That is a
+ * statement about the search, not about the turn: a prompt line the parser could not read
+ * — damaged, or a shape this bridge does not know — leaves the search complete and the
+ * turn's opener unknown, and unknown is not "the user".
+ */
+export const findCodexPrompt = async (
+  rolloutPath,
+  turnId,
+  beforeOffset,
+  { chunkBytes = CODEX_READ_CHUNK_BYTES, lookbackBytes = CODEX_PROMPT_LOOKBACK_BYTES } = {},
+) => {
+  const missing = (complete) => ({ found: false, complete });
+  if (typeof turnId !== "string" || turnId === "") return missing(false);
+  // Only a line that carries the turn id can be its prompt, and a byte search for the id is
+  // far cheaper than decoding and parsing every line of a long turn's tool output.
+  const needle = Buffer.from(turnId, "utf8");
+  let handle = null;
+  try {
+    handle = await openFile(rolloutPath, "r");
+    const floor = Math.max(0, beforeOffset - lookbackBytes);
+    let hi = beforeOffset;
+    // The part of a line below the lowest line break seen so far: it continues in the
+    // chunk below, and is only a line once that chunk has been read.
+    let head = Buffer.alloc(0);
+    while (hi > floor) {
+      const lo = Math.max(floor, hi - chunkBytes);
+      const buffer = Buffer.allocUnsafe(hi - lo);
+      const { bytesRead } = await handle.read(buffer, 0, hi - lo, lo);
+      if (bytesRead !== hi - lo) return missing(false);
+      const data = head.length > 0 ? Buffer.concat([buffer, head]) : buffer;
+      let end = data.length;
+      // `end` is the exclusive end of the line being cut; at 0 nothing is left. Asked for
+      // the last line break before -1, a Buffer searches from its end — and that turned a
+      // chunk beginning with a line break into a loop with no way out.
+      while (end > 0) {
+        const lineBreak = data.lastIndexOf(0x0a, end - 1);
+        if (lineBreak < 0) break;
+        // A line too long to have been read forwards is not read backwards either; it
+        // could not have been a prompt of ours, but it could hide one of the user's.
+        if (end - lineBreak - 1 > CODEX_LINE_MAX_BYTES) return missing(false);
+        // Within the line and no further: searching on to the chunk's end re-read the
+        // lines already cut, once per line — quadratic in the chunk, and 7 s with a 442 ms
+        // stall on 4 MiB of short lines. Codex measured it.
+        if (data.subarray(lineBreak + 1, end).indexOf(needle) >= 0) {
+          const entry = codexEntryFromLine(data.toString("utf8", lineBreak + 1, end), 0);
+          if (entry?.kind === "prompt" && entry.turnId === turnId) return { found: true, text: entry.text };
+        }
+        end = lineBreak;
+      }
+      if (end > CODEX_LINE_MAX_BYTES) return missing(false);
+      head = Buffer.from(data.subarray(0, end));
+      hi = lo;
+      if (hi > floor) await new Promise((resolve) => setImmediate(resolve));
+    }
+    // The lowest line of the window is whole only if the window starts at the file's start.
+    if (floor === 0 && head.length > 0 && head.indexOf(needle) >= 0) {
+      const entry = codexEntryFromLine(head.toString("utf8"), 0);
+      if (entry?.kind === "prompt" && entry.turnId === turnId) return { found: true, text: entry.text };
+    }
+    return missing(floor === 0);
+  } catch {
+    return missing(false);
+  } finally {
+    if (handle !== null) { try { await handle.close(); } catch {} }
+  }
+};
+
 export const readTail = (path, bytes) => {
   let fd = null;
   try {
@@ -362,9 +498,51 @@ export const readTail = (path, bytes) => {
   }
 };
 
-export const readCodexLog = (rolloutPath, offset, sinceMs) => {
+/** How much of a Codex log is read before the event loop is given back. */
+export const CODEX_READ_CHUNK_BYTES = 256 * 1024;
+/**
+ * The longest line that is decoded and parsed at all.
+ *
+ * A chunked read bounds how much is *read* at once, not how much one line can hold: a
+ * tool's output is written as a single JSON line, and one of 48 MiB took 2.3 s and 2.8 GiB
+ * to assemble and parse (Codex measured it) — the stall this read exists to prevent, in a
+ * different place. Nothing the bridge acts on comes near this: a pushed message is at most
+ * CODEX_PUSH_MAX_BYTES, and an answer longer than a room allows is refused anyway. A line
+ * past it is skipped unread, byte by byte to its line break, and counted so the caller can
+ * say so.
+ */
+export const CODEX_LINE_MAX_BYTES = 1024 * 1024;
+
+/**
+ * Everything Codex has said past `offset`, the prompts that opened those turns, and the
+ * offset to resume from next time.
+ *
+ * A byte cursor rather than a clock, because this one advances and a clock cannot
+ * advance safely: the old cursor moved to "now" before the file was read, so a line
+ * flushed a moment late fell below the next read's floor and was never published. The
+ * per-thread claim stops a reply being said twice; nothing stopped one being skipped.
+ *
+ * Only whole lines are consumed. A log caught mid-write ends in a partial line, and
+ * the returned offset stops in front of it so the next read sees it complete.
+ *
+ * Read in chunks, asynchronously, and never more than the file held when the read began.
+ * Reading the delta in one synchronous go was the second way this log killed the bridge:
+ * a single turn that adds tens of megabytes — a long tool output, a pasted file — blocks
+ * the event loop for as long as it takes to decode and parse, the app's health probe
+ * goes unanswered three times running, and the bridge is killed with every sync room in
+ * it. Each chunk is small enough to parse in a few milliseconds, and the loop runs
+ * between chunks. Lines are cut on the raw bytes, not on decoded text, because a chunk
+ * boundary can land inside a multi-byte character and only a whole line decodes safely.
+ */
+export const readCodexLog = async (
+  rolloutPath,
+  offset,
+  sinceMs,
+  { chunkBytes = CODEX_READ_CHUNK_BYTES, skipping: resumeSkipping = false } = {},
+) => {
+  const nothing = (at) => ({ entries: [], replies: [], prompts: [], offset: at, from: at, skipped: 0, skipping: false });
   let size = 0;
-  try { size = statSync(rolloutPath).size; } catch { return { replies: [], offset, from: offset }; }
+  try { size = statSync(rolloutPath).size; } catch { return nothing(offset); }
   // A file **smaller** than its cursor was truncated or rewritten shorter, and the cursor
   // now points past the end of a log that no longer holds what it was counting.
   //
@@ -376,37 +554,92 @@ export const readCodexLog = (rolloutPath, offset, sinceMs) => {
   // session and never reuses a path, so it has not come up; if it ever does, that is the
   // fix, not a wider comparison here.
   const from = offset > size ? 0 : offset;
-  if (from >= size) return { replies: [], offset: size, from };
-  let chunk = "";
-  let fd = null;
+  if (from >= size) return { entries: [], replies: [], prompts: [], offset: size, from, skipped: 0, skipping: from === offset && resumeSkipping };
+  // Every line the bridge acts on, in file order — the order matters, see the reader —
+  // with the replies and the prompts also on their own for whoever wants only those.
+  const entries = [];
+  let handle = null;
+  // Bytes after the last line break seen so far, and the absolute offset they start at —
+  // which is also where the next read has to begin if the file ends mid-line.
+  let carry = Buffer.alloc(0);
+  let lineStart = from;
+  let position = from;
+  // Inside a line too long to keep: nothing is kept until its line break goes past. If
+  // the file ends inside one, the returned offset is inside it too and `skipping` says
+  // so; the caller hands that back on the next read, which then discards to the break
+  // before it parses anything. The fragment cannot simply be trusted to fail to parse —
+  // a line that is a megabyte of whitespace followed by a valid object parses perfectly
+  // from the whitespace's end. Resuming at the line's start instead would scan the whole
+  // of it again on every read for as long as it is still being written.
+  let skipping = from === offset && resumeSkipping;
+  let skipped = 0;
   try {
-    fd = openSync(rolloutPath, "r");
-    const buffer = Buffer.allocUnsafe(size - from);
-    const read = readSync(fd, buffer, 0, buffer.length, from);
-    // Safe to decode from here: an offset only ever lands just past a newline, so it
-    // never cuts a multi-byte character in half.
-    chunk = buffer.subarray(0, read).toString("utf8");
+    handle = await openFile(rolloutPath, "r");
+    while (position < size) {
+      const want = Math.min(chunkBytes, size - position);
+      const buffer = Buffer.allocUnsafe(want);
+      const { bytesRead } = await handle.read(buffer, 0, want, position);
+      if (bytesRead === 0) break;
+      position += bytesRead;
+      let chunk = buffer.subarray(0, bytesRead);
+      if (skipping) {
+        const lineBreak = chunk.indexOf(0x0a);
+        if (lineBreak < 0) {
+          lineStart += bytesRead;
+          if (position < size) await new Promise((resolve) => setImmediate(resolve));
+          continue;
+        }
+        skipping = false;
+        lineStart += lineBreak + 1;
+        chunk = chunk.subarray(lineBreak + 1);
+      }
+      const data = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
+      let start = 0;
+      for (;;) {
+        const lineBreak = data.indexOf(0x0a, start);
+        if (lineBreak < 0) break;
+        // Where this line ends, so the caller can stop the cursor between two replies. A
+        // batch can be taken in part — the room may have space for the first answer and
+        // not the second — and one offset for the whole read cannot say that. Rereading
+        // the ones already published is not free either: `claimCodexReply` remembers only
+        // the last CODEX_PUBLISHED_MEMORY of them, so a long enough batch would republish
+        // its own head.
+        const endsAt = lineStart + lineBreak + 1;
+        if (lineBreak - start > CODEX_LINE_MAX_BYTES) {
+          skipped += 1;
+        } else {
+          const entry = codexEntryFromLine(data.toString("utf8", start, lineBreak), sinceMs);
+          if (entry) entries.push({ ...entry, endsAt });
+        }
+        start = lineBreak + 1;
+      }
+      if (data.length - start > CODEX_LINE_MAX_BYTES) {
+        skipping = true;
+        skipped += 1;
+        carry = Buffer.alloc(0);
+        lineStart += data.length;
+      } else {
+        // Copied, not sliced: a slice would pin the whole chunk in memory for the sake of
+        // its tail.
+        carry = Buffer.from(data.subarray(start));
+        lineStart += start;
+      }
+      if (position < size) await new Promise((resolve) => setImmediate(resolve));
+    }
   } catch {
-    return { replies: [], offset, from };
+    return nothing(offset);
   } finally {
-    if (fd !== null) { try { closeSync(fd); } catch {} }
+    if (handle !== null) { try { await handle.close(); } catch {} }
   }
-  const lastBreak = chunk.lastIndexOf("\n");
-  if (lastBreak < 0) return { replies: [], offset: from, from };
-  const whole = chunk.slice(0, lastBreak);
-  const replies = [];
-  // Where each reply ends, so the caller can stop the cursor between two of them. A
-  // batch can be taken in part — the room may have space for the first answer and not
-  // the second — and one offset for the whole read cannot say that. Rereading the ones
-  // already published is not free either: `claimCodexReply` remembers only the last
-  // CODEX_PUBLISHED_MEMORY of them, so a long enough batch would republish its own head.
-  let at = from;
-  for (const line of whole.split("\n")) {
-    at += Buffer.byteLength(line, "utf8") + 1;
-    const reply = codexReplyFromLine(line, sinceMs);
-    if (reply) replies.push({ ...reply, endsAt: at });
-  }
-  return { replies, offset: from + Buffer.byteLength(whole, "utf8") + 1, from };
+  return {
+    entries,
+    replies: entries.filter((entry) => entry.kind === "reply"),
+    prompts: entries.filter((entry) => entry.kind === "prompt"),
+    offset: lineStart,
+    from,
+    skipped,
+    skipping,
+  };
 };
 
 /**
@@ -1183,27 +1416,160 @@ function startBridge(config) {
     return { text: body || "ok", routing: { to, kind: asKind(match[2].toLowerCase()) } };
   };
 
-  /** Where the last harvest of each Codex log stopped, as a byte offset into it. */
-  const harvestAt = new Map();
   /**
-   * Start a member's harvest at the end of its log as it stands, the moment it may speak.
+   * One reader per Codex session: the byte cursor into its log, and the turns still open
+   * whose asker is known.
    *
-   * Nothing written before then belongs in the room. That covers two things the old start
-   * did not. A session added but not yet confirmed has no voice, yet its words would wait
-   * in the log and be published by the first harvest after confirmation, because the
-   * check that refuses them looks at who the member is *now*. And the first harvest read
-   * the whole log from the top to find out what to skip — once per member, every time a
-   * bridge came back up, at 50 MB and more.
+   * There used to be one cursor per log for the harvest a stop triggers, and a separate
+   * cursor with a one-second poll for every message pushed — a notice into the session's
+   * mailbox, a question in the room. All of them read the same log, and all of them claimed
+   * through the same per-thread memory, so whichever woke first took an answer to the place
+   * *it* was holding: the room's answer landed in the thread's private mailbox, and the poll
+   * for the room found it claimed and moved on. The log is one sequence; it gets one reader,
+   * and at most one read of it is in flight at a time.
    *
-   * Set every time, not only when unset. Leaving already clears the cursor
-   * (`retireLabel`), so a return starts fresh either way — this does not rely on that.
-   * Where there is no log yet there is nothing to skip, and the first harvest falls back
-   * to the join-time filter.
+   * What a reply answers is read from the log itself, and from nothing the bridge has to
+   * remember. Every pushed message comes back as a `UserMessage` carrying the turn it
+   * opened, verbatim — and everything the bridge pushes opens with its own marker, which
+   * for a room's message names the room (`codexPushTarget`). So the prompt says where its
+   * answer goes; the reader only has to carry that from the prompt line to the
+   * `task_complete` with the same turn, which is the *origin* it keeps per open turn. A
+   * prompt without the marker was typed by the session's own user, and that answer goes to
+   * the room the session is confirmed in, as the harvest always did.
+   *
+   * Nothing here is routed by a memory that can be forgotten. Three versions of this kept
+   * a record per push and lost it — to a count, to a deadline, to a clear on leaving — and
+   * each time the answer turned into "unasked-for" and fell back into the room. A record
+   * that is only ever derived from the log can be dropped and derived again.
+   */
+  const codexReaders = new Map();
+  const codexReaderFor = (threadId) => {
+    let reader = codexReaders.get(threadId);
+    if (!reader) {
+      reader = {
+        threadId,
+        path: null,
+        cursor: undefined,
+        // Whether the cursor sits inside a line too long to keep: the read resumes by
+        // discarding to the next line break, rather than parsing the tail of it.
+        skipping: false,
+        // Replies at or before this offset that no push asked for are not the room's: they
+        // were said before the session was confirmed in it.
+        roomFloor: 0,
+        // Bumped whenever the cursor is placed from outside a read. A read that began under
+        // an older generation hands back a result about a cursor that no longer exists, and
+        // is thrown away whole.
+        generation: 0,
+        // turnId → where its answer goes, from the prompt that opened it. Deleted when the
+        // answer is handled, or the turn aborted.
+        origins: new Map(),
+        // Until when a push is still being waited for by polling. For a session in a room
+        // the deadline bounds the polling, not the answer: a turn that ends later is read
+        // by the stop that ends it, because the reader is kept for the room. For a session
+        // in no room it bounds the answer too — once the polling is over the reader is let
+        // go, and a stop that comes later does not start one, so an answer to a mailbox
+        // push after that is never read. Known, older than this reader, and tracked on
+        // the board.
+        pollUntil: 0,
+        reading: false,
+        again: false,
+        timer: null,
+      };
+      codexReaders.set(threadId, reader);
+    }
+    return reader;
+  };
+  /**
+   * How many open turns one reader remembers the asker of.
+   *
+   * Codex runs its turns one after another, so in the log an answer always precedes the
+   * next turn's prompt, and the reader handles the two in that order — a turn is open for
+   * the span of one prompt-to-answer, and the only one that stays open is one Codex
+   * abandoned without writing `turn_aborted`. Past this many the oldest is dropped, and
+   * that costs nothing: an answer whose turn the reader does not know is routed by looking
+   * its prompt up in the log (`findCodexPrompt`), never by a guess.
+   */
+  const CODEX_ORIGIN_MEMORY = 64;
+  /**
+   * How many logs are read at once, across every session.
+   *
+   * A read is chunked and gives the loop back between chunks, so one cannot stall it; a
+   * dozen in flight would still add up to the same stall in slices. Two is enough for a
+   * room where two Codex sessions answer at the same moment.
+   */
+  const CODEX_READS_IN_FLIGHT_MAX = 2;
+  let codexReadsInFlight = 0;
+  const codexReadWaiters = [];
+  const withCodexReadSlot = async (read) => {
+    if (codexReadsInFlight >= CODEX_READS_IN_FLIGHT_MAX) {
+      // Handed the slot by whoever finishes; the count is not touched on either side.
+      await new Promise((resolve) => codexReadWaiters.push(resolve));
+    } else {
+      codexReadsInFlight += 1;
+    }
+    try {
+      return await read();
+    } finally {
+      const next = codexReadWaiters.shift();
+      if (next) next();
+      else codexReadsInFlight -= 1;
+    }
+  };
+
+  /**
+   * Mark the moment a member may speak: nothing it said before belongs in the room.
+   *
+   * That covers two things the old start did not. A session added but not yet confirmed
+   * has no voice, yet its words would wait in the log and be published by the first
+   * harvest after confirmation, because the check that refuses them looks at who the
+   * member is *now*. And the first harvest read the whole log from the top to find out
+   * what to skip — once per member, every time a bridge came back up, at 50 MB and more.
+   *
+   * A reader that is already following the log keeps its place and takes the floor; one
+   * that is not starts here. Moving an existing cursor forward would step over the prompt
+   * of a push made moments ago, and its answer would then have no origin to go by.
    */
   const startHarvestAtEnd = (conversationId) => {
     const path = codexRolloutFor(conversationId);
     if (!path) return;
-    try { harvestAt.set(path, statSync(path).size); } catch {}
+    const reader = codexReaderFor(conversationId);
+    try {
+      const { size } = statSync(path);
+      reader.roomFloor = size;
+      if (reader.cursor === undefined || reader.path !== path) {
+        reader.generation += 1;
+        reader.cursor = size;
+        reader.skipping = false;
+        reader.path = path;
+      }
+    } catch {}
+  };
+  /**
+   * A reader with nothing to do is let go: no room the session speaks in, no push still
+   * being polled for, no read under way. Otherwise every session that ever finished a turn
+   * would keep one. A turn still open at that point loses nothing — its answer, if it
+   * comes, is routed by looking its prompt up in the log.
+   */
+  const dropCodexReaderIfIdle = (reader) => {
+    if (reader.reading || Date.now() < reader.pollUntil) return;
+    if (syncRoomFor(reader.threadId)) return;
+    if (reader.timer) clearTimeout(reader.timer);
+    reader.timer = null;
+    if (codexReaders.get(reader.threadId) === reader) codexReaders.delete(reader.threadId);
+  };
+  /**
+   * A session left a room, or the room closed. Called for every member when a room closes.
+   *
+   * The cursor is kept where it is: the next room this session is let into sets a new
+   * floor, and that — not a cursor wound back — is what keeps what it said in between out
+   * of the room. Winding the cursor back used to be the way, and it stepped over the prompt
+   * of a push made just before the leave, whose answer then had no origin to go by. An
+   * answer to a turn that room opened is dropped where it is read, since the room no longer
+   * stands for this session. The reader stays only while a push is still being polled for.
+   */
+  const releaseCodexReader = (conversationId) => {
+    const reader = codexReaders.get(conversationId);
+    if (reader) dropCodexReaderIfIdle(reader);
   };
   /**
    * How the harvest is doing, because its failure mode is indistinguishable from quiet.
@@ -1231,23 +1597,226 @@ function startBridge(config) {
   // Several turns is enough to be past a slow flush and not enough to be a whole
   // working session lost before anyone hears about it.
   const CODEX_HARVEST_SUSPECT_AFTER = 5;
-  const harvestCodexTurn = (conversationId) => {
-    const found = syncRoomFor(conversationId);
-    const member = found?.room.members.get(conversationId);
-    if (!member || member.confirmed !== true) return;
-    const path = codexRolloutFor(conversationId);
+
+  const armCodexPoll = (reader) => {
+    if (reader.timer) return;
+    reader.timer = setTimeout(() => {
+      reader.timer = null;
+      readCodexSession(reader);
+    }, CODEX_REPLY_POLL_MS);
+    reader.timer.unref?.();
+  };
+  /**
+   * Read a session's log once, or once more if asked while already reading.
+   *
+   * A stop and a poll can both ask within the same second; the second asker gets the
+   * read that follows rather than a read of its own, which is what keeps one log to one
+   * read in flight.
+   */
+  const readCodexSession = async (reader) => {
+    if (reader.reading) {
+      reader.again = true;
+      return;
+    }
+    reader.reading = true;
+    try {
+      do {
+        reader.again = false;
+        await readCodexSessionOnce(reader);
+      } while (reader.again);
+    } catch (error) {
+      console.error(`⚠ reading a Codex log failed: ${error?.message ?? error}`);
+    } finally {
+      reader.reading = false;
+    }
+    dropCodexReaderIfIdle(reader);
+    if (codexReaders.get(reader.threadId) !== reader) return;
+    if (Date.now() < reader.pollUntil) armCodexPoll(reader);
+  };
+  /** Where a reply to a turn goes, or null for nowhere. */
+  const codexReplyDestination = (reader, origin, reply, confirmedIn) => {
+    const { threadId } = reader;
+    if (origin?.kind === "room") {
+      // The room that pushed, and only while it stands for this session: registered under
+      // that name, with this session confirmed in it. A question has only its asker to be
+      // answered to; a room the session has left or that closed gets nothing, and nor does
+      // any other.
+      const room = mailRooms.get(origin.name);
+      if (!room || room.members.get(threadId)?.confirmed !== true) return null;
+      return { name: origin.name, room };
+    }
+    if (origin?.kind === "mailbox") {
+      const mailbox = mailRoomFor(threadId, true);
+      return mailbox ? { name: threadId, room: mailbox } : null;
+    }
+    // Typed by the session's own user: the room the session speaks in, unless it was said
+    // before the session was let in. Only ever reached with the prompt in hand — read by
+    // this reader, or looked up — never on the strength of not knowing.
+    return confirmedIn && reply.endsAt > reader.roomFloor ? confirmedIn : null;
+  };
+  const readCodexSessionOnce = async (reader) => {
+    const { threadId } = reader;
+    const path = codexRolloutFor(threadId);
     if (!path) return;
+    // A different file is a different log, and a cursor into the old one says nothing
+    // about it. Looked up on every read rather than remembered: a cache here once served
+    // a resumed session its previous file.
+    if (reader.path !== path) {
+      reader.path = path;
+      reader.cursor = undefined;
+      reader.skipping = false;
+      reader.roomFloor = 0;
+      reader.generation += 1;
+    }
+    const whereItSpeaks = () => {
+      const found = syncRoomFor(threadId);
+      const member = found?.room.members.get(threadId);
+      return { member, confirmedIn: member?.confirmed === true ? found : null };
+    };
+    const before = whereItSpeaks();
+    if (!before.confirmedIn && reader.origins.size === 0 && Date.now() >= reader.pollUntil) return;
     // A log nobody has read yet starts at the moment this session joined the room, so a
     // conversation that was already long does not arrive in the room all at once. Every
     // read after that resumes from a byte offset, which cannot step over a line.
-    const resuming = harvestAt.get(path);
-    const { replies, offset, from } = readCodexLog(
-      path,
-      resuming ?? 0,
-      resuming === undefined ? Date.parse(member.joinedAt) || 0 : 0,
+    const resuming = reader.cursor;
+    const generation = reader.generation;
+    const sinceMs = resuming !== undefined ? 0 : Date.parse(before.member?.joinedAt ?? "") || Date.now();
+    const { entries, offset, from, skipped, skipping } = await withCodexReadSlot(
+      () => readCodexLog(path, resuming ?? 0, sinceMs, { skipping: resuming !== undefined && reader.skipping }),
     );
-    codexHarvest.turns += 1;
-    codexHarvest.published += replies.length;
+    // The cursor was placed elsewhere while the file was being read — the session was let
+    // into a room, or its log changed under it. This read's idea of where things stood is
+    // not the truth any more; read again from where the cursor is now.
+    if (reader.generation !== generation) {
+      reader.again = true;
+      return;
+    }
+    if (skipped > 0) {
+      console.error(
+        `⚠ codex log ${path}: skipped ${skipped} line(s) longer than ${CODEX_LINE_MAX_BYTES} bytes unread`,
+      );
+    }
+
+    // In file order, and nothing else: a prompt is handled before the answer it opened and
+    // after the answer to the turn before it, so one turn is open at a time, however many
+    // the read holds. Handling every prompt first would open them all before the first
+    // answer was placed, and the bound on open turns would then have dropped the first.
+    //
+    // How far the batch was actually taken. A reply the room has no space for must be read
+    // again later, and the byte cursor is what decides that: advancing it past a refusal
+    // loses the answer for good, whether or not it was claimed. Per reply rather than per
+    // batch, because keeping the whole batch for the sake of its tail re-reads the head —
+    // and `claimCodexReply` only remembers the last CODEX_PUBLISHED_MEMORY, so a long
+    // enough batch would publish its own beginning twice. Codex found both halves of this.
+    // Seeded from where the read actually began, not from the old cursor: a rotated or
+    // truncated log restarts at zero, and clamping to the previous offset would make the
+    // bridge read the new file from the top over and over until it outgrew the old one.
+    let handledThrough = from;
+    let sawReply = false;
+    for (const entry of entries) {
+      if (entry.kind === "prompt") {
+        // Re-read after a refusal, the prompt is seen again; the turn is already open.
+        if (!reader.origins.has(entry.turnId)) {
+          reader.origins.set(entry.turnId, codexPushTarget(entry.text) ?? { kind: "user" });
+          while (reader.origins.size > CODEX_ORIGIN_MEMORY) {
+            reader.origins.delete(reader.origins.keys().next().value);
+          }
+        }
+        handledThrough = entry.endsAt;
+        continue;
+      }
+      if (entry.kind === "aborted") {
+        reader.origins.delete(entry.turnId);
+        handledThrough = entry.endsAt;
+        continue;
+      }
+      const reply = entry;
+      sawReply = true;
+      let origin = reply.turnId === null ? undefined : reader.origins.get(reply.turnId);
+      // A turn this reader did not see open — its prompt lies below the cursor it was
+      // given, or the reader that saw it is gone. The prompt is still in the log, before
+      // the answer: it is looked up there. Found, it says where the answer goes, marker
+      // or no marker. Not found — beyond the lookback, on a line that could not be read,
+      // or simply not there — the opener is unknown, and unknown is not "the user": the
+      // answer goes nowhere, and stderr says so. The one exception is a reply with no
+      // turn id at all, which an older Codex wrote and which has nothing to look up by;
+      // that is read as the user's, as it always was, and is the only guess left here.
+      if (!origin && reply.turnId !== null && !turnWasConsumed(threadId, reply.turnId)) {
+        const prompt = await withCodexReadSlot(() => findCodexPrompt(path, reply.turnId, reply.endsAt));
+        if (reader.generation !== generation) {
+          reader.again = true;
+          return;
+        }
+        if (!prompt.found) {
+          console.error(
+            `⚠ codex log ${path}: the prompt of turn ${reply.turnId} was not found` +
+              (prompt.complete ? " anywhere before its answer" : ` within ${CODEX_PROMPT_LOOKBACK_BYTES} bytes before its answer`) +
+              "; the answer was not published",
+          );
+          handledThrough = reply.endsAt;
+          continue;
+        }
+        origin = codexPushTarget(prompt.text) ?? { kind: "user" };
+      }
+      // The turn that carried a room password: read past, never published. Codex answered
+      // it before the bridge knew the password had been typed at all, so the answer is to
+      // a question the room never asked. Before capacity is weighed: an answer that will
+      // be thrown away must not hold a full room's reading open, nor stand in front of
+      // the reply behind it.
+      if (turnWasConsumed(threadId, reply.turnId)) {
+        reader.origins.delete(reply.turnId);
+        handledThrough = reply.endsAt;
+        continue;
+      }
+      const destination = codexReplyDestination(reader, origin, reply, whereItSpeaks().confirmedIn);
+      if (!destination) {
+        reader.origins.delete(reply.turnId);
+        handledThrough = reply.endsAt;
+        continue;
+      }
+      const { text, routing } = routeCodexReply(destination.room, reply.text);
+      // Capacity first, and a refusal stops the batch rather than skipping one of it:
+      // publishing what came after would put Codex's answers in the room out of order.
+      // Both kinds of full are asked before anything is claimed or the cursor moves —
+      // `publishMail` answers a refusal with `null`, and a claimed reply is one nothing
+      // will ever look at again. The turn stays open: it is read again, prompt and all.
+      if (roomIsFull(destination.room, Buffer.byteLength(reply.text ?? "", "utf8"))) break;
+      if (heldWouldOverflow(destination.room, { from: threadId, to: routing.to, kind: routing.kind, text })) break;
+      handledThrough = reply.endsAt;
+      reader.origins.delete(reply.turnId);
+      if (!claimCodexReply(threadId, reply)) continue;
+      // A harvested answer is still that session speaking, and a session nobody
+      // confirmed does not get to speak just because the bridge is the one holding
+      // the pen.
+      if (refuseToPublish(destination.room, threadId)) continue;
+      // Codex never sees a refusal, so the run is broken by not publishing rather than
+      // by answering — the next brief tells it no seq followed, which is the signal it
+      // has for anything that did not arrive.
+      if (routing.kind === "reaction" && reactionRunExhausted(destination.room)) continue;
+      const published = publishMail(destination.room, threadId, text, null, true, routing);
+      if (published?.seq) publishedForCodex.set(threadId, published.seq);
+      codexHarvest.published += 1;
+      // Carried on to the other members of a room as any member's message is. A mailbox
+      // has one reader and it is the session that just spoke.
+      if (SYNC_CODE.test(destination.name)) {
+        deliverMail(destination.name, destination.room, text, threadId, published);
+      }
+    }
+    // Everything the room took, and not one byte more.
+    //
+    // With no replies at all the whole read is consumed — there was nothing to come back
+    // for. With replies but none handled, the cursor is left exactly as it was found, and
+    // on a first read that means leaving it *unset*: setting it to zero would turn the
+    // next read from "everything since this session joined the room" into "everything in
+    // the log", and publish answers Codex gave before it was ever in the room.
+    if (!sawReply) {
+      reader.cursor = offset;
+      reader.skipping = skipping;
+    } else if (handledThrough > from || resuming !== undefined) {
+      reader.cursor = handledThrough;
+      // The read ended inside an overlong line only if the cursor got as far as its end.
+      reader.skipping = handledThrough === offset && skipping;
+    }
     if (
       !codexHarvest.warned &&
       codexHarvest.published === 0 &&
@@ -1260,54 +1829,22 @@ function startBridge(config) {
           " are being lost silently.",
       );
     }
-    // How far the batch was actually taken. A reply the room has no space for must be read
-    // again later, and the byte cursor is what decides that: advancing it past a refusal
-    // loses the answer for good, whether or not it was claimed. Per reply rather than per
-    // batch, because keeping the whole batch for the sake of its tail re-reads the head —
-    // and `claimCodexReply` only remembers the last CODEX_PUBLISHED_MEMORY, so a long
-    // enough batch would publish its own beginning twice. Codex found both halves of this.
-    // Seeded from where the read actually began, not from the old cursor: a rotated or
-    // truncated log restarts at zero, and clamping to the previous offset would make the
-    // bridge read the new file from the top over and over until it outgrew the old one.
-    let handledThrough = from;
-    for (const reply of replies) {
-      // The turn that carried a room password: read past, never published. Codex answered
-      // it before the bridge knew the password had been typed at all, so the answer is to
-      // a question the room never asked.
-      if (turnWasConsumed(conversationId, reply.turnId)) { handledThrough = reply.endsAt; continue; }
-      const { text, routing } = routeCodexReply(found.room, reply.text);
-      // Capacity first, and a refusal stops the batch rather than skipping one of it:
-      // publishing what came after would put Codex's answers in the room out of order.
-      // Both kinds of full are asked before anything is claimed or the cursor moves —
-      // `publishMail` answers a refusal with `null`, and a claimed reply is one nothing
-      // will ever look at again.
-      if (roomIsFull(found.room, Buffer.byteLength(reply.text ?? "", "utf8"))) break;
-      if (heldWouldOverflow(found.room, { from: conversationId, to: routing.to, kind: routing.kind, text })) break;
-      if (!claimCodexReply(conversationId, reply)) { handledThrough = reply.endsAt; continue; }
-      if (refuseToPublish(found.room, conversationId)) { handledThrough = reply.endsAt; continue; }
-      // Codex never sees a refusal, so the run is broken by not publishing rather than
-      // by answering — the next brief tells it no seq followed, which is the signal it
-      // has for anything that did not arrive.
-      if (routing.kind === "reaction" && reactionRunExhausted(found.room)) { handledThrough = reply.endsAt; continue; }
-      const published = publishMail(found.room, conversationId, text, null, true, routing);
-      if (published?.seq) publishedForCodex.set(conversationId, published.seq);
-      deliverMail(found.name, found.room, text, conversationId, published);
-      handledThrough = reply.endsAt;
-    }
-    // Everything the room took, and not one byte more.
-    //
-    // With no replies at all the whole read is consumed — there was nothing to come back
-    // for. With replies but none handled, the cursor is left exactly as it was found, and
-    // on a first read that means leaving it *unset*: setting it to zero would turn the
-    // next read from "everything since this session joined the room" into "everything in
-    // the log", and publish answers Codex gave before it was ever in the room.
-    if (replies.length === 0) {
-      harvestAt.set(path, offset);
-    } else if (handledThrough > from || resuming !== undefined) {
-      harvestAt.set(path, handledThrough);
-    }
   };
-
+  /**
+   * A Codex turn ended: read what it said. The harvest a stop triggers and the poll a
+   * push runs are the same read; the stop only adds that a turn is known to have finished,
+   * which is what the suspect count is made of.
+   */
+  const harvestCodexTurn = (conversationId) => {
+    const found = syncRoomFor(conversationId);
+    const confirmed = found?.room.members.get(conversationId)?.confirmed === true;
+    if (confirmed) codexHarvest.turns += 1;
+    // A session in no room with nothing pushed to it has nothing to read for; giving it
+    // a reader would keep one for every session that ever finished a turn.
+    const reader = codexReaders.get(conversationId);
+    if (!reader && !confirmed) return;
+    readCodexSession(reader ?? codexReaderFor(conversationId));
+  };
   // One Codex turn ending can arrive twice: once from the full hooks and once from
   // notify. Random hookIds mean shouldEmitHookSignal cannot pair them, so they are
   // correlated stop-to-stop here: a notify stop waits briefly, and a full-hook stop for
@@ -1756,7 +2293,7 @@ function startBridge(config) {
     const member = room.members.get(conversationId);
     if (member?.label) room.formerLabels.set(conversationId, member.label);
     room.members.delete(conversationId);
-    harvestAt.delete(codexRolloutFor(conversationId) ?? "");
+    releaseCodexReader(conversationId);
     consumedTurns.delete(conversationId);
   };
 
@@ -2290,7 +2827,9 @@ function startBridge(config) {
   replayingRecent = false;
 
   const CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");
-  const CODEX_REPLY_TIMEOUT_MS = 120_000;
+  // Overridable so a test can watch what happens when the polling ends, which at two
+  // minutes it could not; nothing else sets it.
+  const CODEX_REPLY_TIMEOUT_MS = Number(process.env.GYREDECK_CODEX_REPLY_TIMEOUT_MS) || 120_000;
   const CODEX_REPLY_POLL_MS = 1_000;
 
   /** Newest rollout log for a Codex thread, or null when the session is unknown. */
@@ -3148,10 +3687,14 @@ function startBridge(config) {
     }
 
     const rolloutPath = codexRolloutFor(threadId);
+    const reader = codexReaderFor(threadId);
     const since = Date.now();
-    // Where the log ends now. The answer to this message is written after it, so nothing
-    // before here can be it — and reading from here is what keeps every pass to the few
-    // bytes Codex added, instead of the whole log.
+    // Where the log ends now, if nothing has been read from it yet. The answer to this
+    // message is written after here, so nothing before it can be the answer — and
+    // starting here is what keeps every read to the bytes Codex added, instead of the
+    // whole log. A reader already placed by a confirmation or an earlier push keeps its
+    // place: it is at or before this point, and what it reads on the way is either
+    // claimed already or belongs to the room.
     //
     // This used to re-read the entire rollout once a second for up to two minutes, per
     // message. A long session's log runs past 50 MB, which is ~300 ms of the bridge doing
@@ -3159,73 +3702,27 @@ function startBridge(config) {
     // second, the app's health check went unanswered three times running, and the app
     // killed the bridge — taking every sync room with it. Measured and reproduced
     // 2026-10-07.
-    let cursor = 0;
-    if (rolloutPath) { try { cursor = statSync(rolloutPath).size; } catch {} }
+    if (rolloutPath && reader.cursor === undefined) {
+      try {
+        reader.cursor = statSync(rolloutPath).size;
+        reader.path = rolloutPath;
+      } catch {}
+    }
     const child = spawn(binary, ["queue", "--thread", threadId, "--message", text], {
       stdio: ["ignore", "ignore", "ignore"],
     });
-    child.on("error", () => {});
+    // The caller has already been told "queued"; a push that could not even start is
+    // one line on stderr, which is more than the silence it used to be.
+    child.on("error", (error) => {
+      console.error(`⚠ codex queue could not be started (${error?.code ?? error}): ${binary}`);
+    });
 
     // Without a log to read there is nothing to harvest, but the message was still
     // delivered — the session will show it even if we cannot see the answer.
     if (!rolloutPath) return "queued";
 
-    const deadline = since + CODEX_REPLY_TIMEOUT_MS;
-    // Local, and only to decide when to stop looking. Whether a reply is published is
-    // not this harvest's call to make — an overlapping one may already have posted it.
-    const seen = new Set();
-    const poll = () => {
-      // Whether this pass stopped because the room was full rather than because it ran
-      // out of replies. Per pass, so an earlier success cannot end the polling that the
-      // refused reply still needs.
-      let waitingForRoom = false;
-      const { replies, offset, from } = readCodexLog(rolloutPath, cursor, since);
-      // Where to resume next pass: past everything read, unless a reply is left waiting
-      // for room — then just in front of it, so it is read again rather than stepped over.
-      let next = offset;
-      let handledThrough = from;
-      for (const reply of replies) {
-        // A reply the room has no space for is not "seen": marking it so would stop the
-        // polling that is the only thing that will ever look at it again. Nor may an
-        // earlier success in the same pass end it — that was the second half of the fault.
-        // Before capacity is weighed, not after: an answer that will be thrown away must
-        // not hold a full room's polling open until the deadline, nor stand in front of
-        // the reply behind it.
-        if (turnWasConsumed(threadId, reply.turnId)) {
-          seen.add(reply.turnId ?? reply.text);
-          handledThrough = reply.endsAt;
-          continue;
-        }
-        const routed = routeCodexReply(room, reply.text);
-        if (
-          roomIsFull(room, Buffer.byteLength(reply.text ?? "", "utf8")) ||
-          heldWouldOverflow(room, {
-            from: threadId,
-            to: routed.routing.to,
-            kind: routed.routing.kind,
-            text: routed.text,
-          })
-        ) {
-          waitingForRoom = true;
-          next = handledThrough;
-          break;
-        }
-        handledThrough = reply.endsAt;
-        seen.add(reply.turnId ?? reply.text);
-        if (!claimCodexReply(threadId, reply)) continue;
-        // A harvested answer is still that session speaking, and a session nobody
-        // confirmed does not get to speak just because the bridge is the one holding
-        // the pen.
-        if (refuseToPublish(room, threadId)) continue;
-        const published = publishMail(room, threadId, routed.text, null, true, routed.routing);
-        if (published?.seq) publishedForCodex.set(threadId, published.seq);
-      }
-      cursor = next;
-      if ((seen.size === 0 || waitingForRoom) && Date.now() < deadline) {
-        setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
-      }
-    };
-    setTimeout(poll, CODEX_REPLY_POLL_MS).unref?.();
+    reader.pollUntil = since + CODEX_REPLY_TIMEOUT_MS;
+    armCodexPoll(reader);
     return "queued";
   };
 
@@ -3378,7 +3875,18 @@ function startBridge(config) {
         // about addressing and rosters is about a room; a mailbox has one reader and
         // needs none of it.
         if (!SYNC_CODE.test(roomName)) {
-          if (deliverToCodex(recipient, room, text) === "queued") queued = true;
+          // The room's own notices open with the marker that tells the reader where the
+          // answer goes; a message from another session into this mailbox gets a line of
+          // its own saying what it is, for the same reason — and so that it does not
+          // arrive as a bare string from nowhere. Decided by who sent it, never by what it
+          // looks like: a sender can write the room's marker, and the bridge must not
+          // take its word for it.
+          const outgoing = from === ROOM_SENDER
+            ? text
+            : `[Gyredeck · mailbox — a message to you alone, from ${labelIn(room, from)}.` +
+              " Answer it as ordinary text in this turn; the bridge reads your answer from" +
+              " your own log and keeps it in your mailbox.]\n\n" + text;
+          if (deliverToCodex(recipient, room, outgoing) === "queued") queued = true;
           else unavailable = true;
           continue;
         }
@@ -3580,6 +4088,9 @@ function startBridge(config) {
             turns: codexHarvest.turns,
             published: codexHarvest.published,
             suspect: codexHarvest.published === 0 && codexHarvest.turns >= CODEX_HARVEST_SUSPECT_AFTER,
+            // How many sessions' logs are being followed. Bounded by the sessions in rooms
+            // or still owed an answer; a number that only grows is a leak.
+            readers: codexReaders.size,
           },
         }),
       );

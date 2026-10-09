@@ -24,6 +24,24 @@ const CONFIG_DIR = [".config", "gyredeck"];
  */
 process.env.GYREDECK_NO_AGENT_SPAWN = "1";
 
+/**
+ * A finished turn as Codex writes one: the user's prompt, then the answer, under one turn
+ * id. The reader routes an answer by the prompt that opened its turn, and an answer with
+ * no prompt anywhere is one it will not publish — so a fixture that wrote answers alone
+ * would be testing a log Codex never produces.
+ */
+const finishedTurn = (text, at = new Date(), turnId = randomUUID()) =>
+  JSON.stringify({
+    type: "event_msg",
+    timestamp: at.toISOString(),
+    payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: randomUUID(), content: [{ type: "text", text: "typed at the keyboard" }] } },
+  }) + "\n" +
+  JSON.stringify({
+    type: "event_msg",
+    timestamp: at.toISOString(),
+    payload: { type: "task_complete", turn_id: turnId, last_agent_message: text },
+  }) + "\n";
+
 /** Wait until the standalone bridge answers /health, or throw with captured stderr. */
 const waitForHealth = async (port, stderrRef) => {
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -2017,11 +2035,7 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
       return (await response.json()).messages;
     };
 
-    const turn = (text) => JSON.stringify({
-      type: "event_msg",
-      timestamp: new Date().toISOString(),
-      payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: text },
-    }) + "\n";
+    const turn = (text) => finishedTurn(text);
     const endTurn = () => call("POST", "/hook/stop", {
       hookId: randomUUID(),
       hookEventName: "Stop",
@@ -3702,11 +3716,7 @@ test("a Codex answer the room has no space for is kept, not stepped over", async
     }
     assert.ok(full, "the room has to be full, or this proves nothing");
 
-    const turn = (text, at = new Date()) => JSON.stringify({
-      type: "event_msg",
-      timestamp: at.toISOString(),
-      payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: text },
-    }) + "\n";
+    const turn = (text, at = new Date()) => finishedTurn(text, at);
     const endTurn = () => call("POST", "/hook/stop", {
       hookId: randomUUID(), hookEventName: "Stop", source: "hook",
       workingDirectory: "/tmp/project", conversationId: thread,
@@ -3970,11 +3980,7 @@ test("a batch re-read after the dedup window overflows still publishes each answ
     }
 
     const said = Array.from({ length: 66 }, (_, i) => `answer-${i}`);
-    await writeFile(rollout, said.map((text) => `${JSON.stringify({
-      type: "event_msg",
-      timestamp: new Date().toISOString(),
-      payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: `@everyone tell\n${text}` },
-    })}\n`).join(""));
+    await writeFile(rollout, said.map((text) => finishedTurn(`@everyone tell\n${text}`)).join(""));
 
     const stop = () => call("POST", "/hook/stop", {
       hookId: randomUUID(), hookEventName: "Stop", source: "hook",
@@ -4297,12 +4303,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     const sessions = join(home, ".codex", "sessions", "2026", "09", "28");
     await mkdir(sessions, { recursive: true });
     const rollout = join(sessions, `rollout-2026-09-28T00-00-00-${joiner}.jsonl`);
-    const turnLine = (turnId, text) =>
-      JSON.stringify({
-        type: "event_msg",
-        timestamp: new Date().toISOString(),
-        payload: { type: "task_complete", turn_id: turnId, last_agent_message: text },
-      }) + "\n";
+    const turnLine = (turnId, text) => finishedTurn(text, new Date(), turnId);
     await writeFile(
       rollout,
       turnLine("01a06082-8ef6-7900-ae39-44fe2e460002", "That looks like a 32-character hexadecimal value.") +
@@ -4315,17 +4316,27 @@ test("a room password carried in by notify lets that session in, once", async ()
       workingDirectory: "/tmp/project",
       conversationId: joiner,
     });
-    const said = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
-      headers: { "x-gyredeck-token": minted.body.password },
-    });
-    const texts = (await said.json()).messages.map((message) => message.text);
-    assert.ok(
-      !texts.some((text) => text.includes("32-character hexadecimal")),
-      "the answer Codex gave to the password is not the room's to hear",
-    );
+    // The stop answers before the log is read — the read is chunked and asynchronous now,
+    // so that a long one cannot hold the bridge — and what it publishes lands a moment
+    // later. Waited for, then the room is read once for both halves.
+    const roomTexts = async () => {
+      const said = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
+        headers: { "x-gyredeck-token": minted.body.password },
+      });
+      return (await said.json()).messages.map((message) => message.text);
+    };
+    let texts = [];
+    for (let attempt = 0; attempt < 60 && !texts.some((text) => text.includes("reading the audit request now")); attempt += 1) {
+      await settle();
+      texts = await roomTexts();
+    }
     assert.ok(
       texts.some((text) => text.includes("reading the audit request now")),
       "the turn after it is published as usual",
+    );
+    assert.ok(
+      !texts.some((text) => text.includes("32-character hexadecimal")),
+      "the answer Codex gave to the password is not the room's to hear",
     );
 
     // Mail held for someone who has not been let in yet all leaves in one push, and one
@@ -4371,11 +4382,13 @@ test("a room password carried in by notify lets that session in, once", async ()
       workingDirectory: "/tmp/project",
       conversationId: joiner,
     });
-    const whileFull = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
-      headers: { "x-gyredeck-token": minted.body.password },
-    });
+    // The read the stop started runs after the stop has answered; give it time to have
+    // published, so that "not published" is a statement about the read and not about
+    // the race.
+    await settle();
+    await settle();
     assert.ok(
-      !(await whileFull.json()).messages.some((message) => message.text.includes("blocked-while-full")),
+      !(await roomTexts()).some((text) => text.includes("blocked-while-full")),
       "a reply the room cannot hold for an unconfirmed member is not published",
     );
 
@@ -4404,12 +4417,13 @@ test("a room password carried in by notify lets that session in, once", async ()
       workingDirectory: "/tmp/project",
       conversationId: joiner,
     });
-    const afterDrain = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
-      headers: { "x-gyredeck-token": minted.body.password },
-    });
-    const blocked = (await afterDrain.json()).messages.filter((message) =>
-      message.text.includes("blocked-while-full"),
-    );
+    let blocked = [];
+    for (let attempt = 0; attempt < 60 && blocked.length === 0; attempt += 1) {
+      await settle();
+      blocked = (await roomTexts()).filter((text) => text.includes("blocked-while-full"));
+    }
+    await settle();
+    blocked = (await roomTexts()).filter((text) => text.includes("blocked-while-full"));
     assert.equal(blocked.length, 1, "it arrives exactly once, neither lost nor doubled");
 
     // A session in no room at all is answered the same way as a wrong password.
@@ -4913,11 +4927,7 @@ test("the reply poll reads only what Codex wrote after the push, not the whole l
   const rolloutDir = join(home, ".codex", "sessions", "2026", "10", "07");
   await mkdir(rolloutDir, { recursive: true });
   const rollout = join(rolloutDir, `rollout-2026-10-07T15-00-00-${thread}.jsonl`);
-  const turn = (text, at) => JSON.stringify({
-    type: "event_msg",
-    timestamp: at.toISOString(),
-    payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: text },
-  }) + "\n";
+  const turn = (text, at) => finishedTurn(text, at);
   // Before any push. Stamped an hour ahead, so only its position can keep it out.
   await writeFile(rollout, turn("POISON-written-before-the-push", new Date(Date.now() + 3_600_000)));
 
@@ -5001,10 +5011,7 @@ test("a new member's harvest and the usage read stay off the log from before", a
   const rolloutDir = join(home, ".codex", "sessions", "2026", "10", "07");
   await mkdir(rolloutDir, { recursive: true });
   const rollout = join(rolloutDir, `rollout-2026-10-07T16-00-00-${thread}.jsonl`);
-  const turn = (text, at) => JSON.stringify({
-    type: "event_msg", timestamp: at.toISOString(),
-    payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: text },
-  }) + "\n";
+  const turn = (text, at) => finishedTurn(text, at);
   // The old usage line names a context window; the new one does not. Only a read that went
   // back into the old part of the log can report that window.
   const usage = (inputTokens, window) => JSON.stringify({
@@ -5099,10 +5106,7 @@ test("words written before a session may speak are never published, on a first j
   const rolloutDir = join(home, ".codex", "sessions", "2026", "10", "07");
   await mkdir(rolloutDir, { recursive: true });
   const rollout = join(rolloutDir, `rollout-2026-10-07T17-00-00-${thread}.jsonl`);
-  const turn = (text) => JSON.stringify({
-    type: "event_msg", timestamp: new Date().toISOString(),
-    payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: text },
-  }) + "\n";
+  const turn = (text) => finishedTurn(text);
   await writeFile(rollout, turn("from before anything"));
 
   const port = await freePort();
@@ -5193,18 +5197,14 @@ test("words written before a session may speak are never published, on a first j
  * gone for good, and not at the start of the batch, or the first answer is read again.
  * Once there is room, the second arrives, and each arrives exactly once.
  */
-// TODO, not skipped for convenience: written at Codex's request on 2026-10-07, it fails on
-// `main` exactly as it does here, so it is older than the change it was written beside.
-//
-// Cause, confirmed: the long answer is published into the thread's **private mailbox**,
-// not the room. Joining pushes a notice into that mailbox, which starts a poll bound to
-// the mailbox; the question starts another bound to the room. Every poll claims through
-// `claimCodexReply(threadId, …)`, keyed by thread and not by room, so whichever wakes
-// first takes the answer to the place *it* is holding — and the other sees it claimed and
-// moves on. An answer can only belong to the conversation it answers; binding a reply to
-// the delivery that asked for it is the fix, and it is its own piece of work.
-// Kept running as a todo so it reports, rather than deleted so it is forgotten.
-test("the reply poll keeps an answer the room cannot take yet, and publishes each answer once", { todo: "pre-existing: a reply lost in the poll path near a full room" }, async () => {
+// Written at Codex's request on 2026-10-07 and kept as a todo until #122, because it failed
+// on `main`: the long answer was published into the thread's **private mailbox**, not the
+// room. Joining pushed a notice into that mailbox, which started a poll bound to the
+// mailbox; the question started another bound to the room; every poll claimed through
+// `claimCodexReply(threadId, …)`, keyed by thread and not by room, so whichever woke first
+// took the answer to the place *it* was holding. One reader per session now, and an answer
+// goes where its question was asked — the test below this one pins that half directly.
+test("the reply poll keeps an answer the room cannot take yet, and publishes each answer once", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-poll-full-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const fakeBin = join(home, ".bun", "bin");
@@ -5216,10 +5216,7 @@ test("the reply poll keeps an answer the room cannot take yet, and publishes eac
   await mkdir(rolloutDir, { recursive: true });
   const rollout = join(rolloutDir, `rollout-2026-10-07T18-00-00-${thread}.jsonl`);
   await writeFile(rollout, "");
-  const turn = (text) => JSON.stringify({
-    type: "event_msg", timestamp: new Date().toISOString(),
-    payload: { type: "task_complete", turn_id: randomUUID(), last_agent_message: text },
-  }) + "\n";
+  const turn = (text) => finishedTurn(text);
 
   const port = await freePort();
   await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
@@ -5300,8 +5297,8 @@ test("the reply poll keeps an answer the room cannot take yet, and publishes eac
       await new Promise((resolve) => setTimeout(resolve, 150));
       said = await fromCodex();
     }
-    // Not merely published once somewhere: published in this room. Today it lands in the
-    // thread's own mailbox, which is the fault this todo stands for.
+    // Not merely published once somewhere: published in this room, which is where it was
+    // asked. It used to land in the thread's own mailbox.
     const mailbox = await (await fetch(`http://127.0.0.1:${port}/mail/${thread}?since=0`, { headers })).json();
     assert.ok(
       !(mailbox.messages ?? []).some((message) => message.from === thread && message.text?.startsWith("LONG-SECOND")),
@@ -5314,5 +5311,502 @@ test("the reply poll keeps an answer the room cannot take yet, and publishes eac
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A `codex` that does what the real one does to its log: `codex queue --message M` makes
+ * Codex record M as a user message under the turn it opens, verbatim. The bridge reads
+ * that pairing back to know which answer is to which push, so a fake that only exits 0
+ * would leave every answer unbound and prove nothing about where answers go.
+ */
+const recordingCodexBinary = `#!${process.execPath}
+const { readdirSync, appendFileSync } = require("node:fs");
+const { join } = require("node:path");
+const { randomUUID } = require("node:crypto");
+const args = process.argv.slice(2);
+const thread = args[args.indexOf("--thread") + 1];
+const message = args[args.indexOf("--message") + 1];
+const root = join(process.env.HOME, ".codex", "sessions");
+const rollout = readdirSync(root, { recursive: true }).map(String).find((name) => name.endsWith(".jsonl") && name.includes(thread));
+if (rollout) {
+  appendFileSync(join(root, rollout), JSON.stringify({
+    type: "event_msg", timestamp: new Date().toISOString(),
+    payload: { type: "item_completed", turn_id: randomUUID(), item: { type: "UserMessage", id: randomUUID(), content: [{ type: "text", text: message }] } },
+  }) + "\\n");
+}
+process.exit(0);
+`;
+
+/** A turn the session's own user typed, prompt and answer, the way Codex writes them. */
+const userTurn = (typed, answer) => {
+  const turnId = randomUUID();
+  return JSON.stringify({
+    type: "event_msg", timestamp: new Date().toISOString(),
+    payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: randomUUID(), content: [{ type: "text", text: typed }] } },
+  }) + "\n" + turnAnswering(turnId, answer);
+};
+
+/** A finished turn with the turn id given, the way Codex writes one. */
+const turnAnswering = (turnId, text) => JSON.stringify({
+  type: "event_msg", timestamp: new Date().toISOString(),
+  payload: { type: "task_complete", turn_id: turnId, last_agent_message: text },
+}) + "\n";
+
+/** The prompts a rollout holds, as Codex recorded them. */
+const promptsIn = async (rollout) => (await readFile(rollout, "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line))
+  .filter((entry) => entry.payload?.type === "item_completed" && entry.payload.item?.type === "UserMessage")
+  .map((entry) => ({ turnId: entry.payload.turn_id, text: entry.payload.item.content.map((part) => part.text).join("") }));
+
+const codexInARoom = async ({ replyTimeoutMs = null } = {}) => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-bound-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const fakeBin = join(home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  await writeFile(join(fakeBin, "codex"), recordingCodexBinary);
+  await chmod(join(fakeBin, "codex"), 0o755);
+  const thread = randomUUID();
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "10", "09");
+  await mkdir(rolloutDir, { recursive: true });
+  const rollout = join(rolloutDir, `rollout-2026-10-09T12-00-00-${thread}.jsonl`);
+  await writeFile(rollout, "");
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    {
+      cwd: repoRoot,
+      env: {
+        ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin,
+        ...(replyTimeoutMs === null ? {} : { GYREDECK_CODEX_REPLY_TIMEOUT_MS: String(replyTimeoutMs) }),
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  await waitForHealth(port, stderrRef);
+  const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+  const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+  const call = async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+    return { status: response.status, body: await response.json() };
+  };
+  const founder = "bound-founder";
+  for (const [conversationId, sourceKind] of [[founder, "claudeCodeHook"], [thread, "codexCliHook"]]) {
+    await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+      data: { inputCount: 1 },
+    });
+  }
+  const created = await call("POST", "/sync/rooms", { conversationId: founder });
+  const code = created.body.room;
+  assert.equal((await joinConfirmed(call, code, founder, thread)).status, 200);
+  const saidInRoom = async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, { headers: { "x-gyredeck-token": created.body.password } });
+    return (await response.json()).messages.filter((message) => message.from === thread).map((message) => message.text);
+  };
+  const saidInMailbox = async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/mail/${thread}?since=0`, { headers });
+    return ((await response.json()).messages ?? []).filter((message) => message.from === thread).map((message) => message.text);
+  };
+  const until = async (ready, ms = 8_000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (await ready()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return ready();
+  };
+  const close = async () => {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  };
+  return { port, call, headers, founder, thread, code, rollout, stderrRef, saidInRoom, saidInMailbox, until, close };
+};
+
+test("an answer goes to the mailbox or the room that asked for it, not to whichever poll woke first", async () => {
+  const room = await codexInARoom();
+  try {
+    // Being put in and let in pushes three things at Codex: two notices into its mailbox
+    // (that it is in a room, then which room) and the confirmation into the room. Each is
+    // recorded by the fake under its own turn. Then a question, in the room.
+    assert.ok(
+      await room.until(async () => (await promptsIn(room.rollout)).length >= 3),
+      `the fake codex recorded the pushes: ${JSON.stringify(await promptsIn(room.rollout))} / bridge said: ${room.stderrRef.value}`,
+    );
+    const asked = await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "ask", text: "what time is it" });
+    assert.equal(asked.body.ok, true);
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 4), "and the question");
+    const prompts = await promptsIn(room.rollout);
+    const question = prompts.find((prompt) => prompt.text.endsWith("what time is it"));
+    const notice = prompts.find((prompt) => prompt.text.startsWith("[Gyredeck: you are now in sync room"));
+    assert.ok(question && notice, `both pushes were recorded with their turns: ${JSON.stringify(prompts.map((prompt) => prompt.text.slice(0, 60)))}`);
+
+    // Codex answers the mailbox notice first and the question second, in one flush — the
+    // order that used to hand both to the mailbox's poll.
+    await appendFile(room.rollout, turnAnswering(notice.turnId, "@everyone reaction\nMAILBOX-REPLY") + turnAnswering(question.turnId, "@everyone tell\nROOM-REPLY"));
+
+    assert.ok(await room.until(async () => (await room.saidInRoom()).includes("ROOM-REPLY")), "the answer to the question reaches the room");
+    assert.ok(await room.until(async () => (await room.saidInMailbox()).includes("MAILBOX-REPLY")), "the reaction to the mailbox notice reaches the mailbox");
+    // Neither in the other place, and neither twice — checked after both have landed, so
+    // a slow second publish could not slip in after the assertion.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    assert.deepEqual((await room.saidInRoom()).filter((text) => /REPLY/.test(text)), ["ROOM-REPLY"]);
+    assert.deepEqual((await room.saidInMailbox()).filter((text) => /REPLY/.test(text)), ["MAILBOX-REPLY"]);
+  } finally {
+    await room.close();
+  }
+});
+
+test("a turn that adds tens of megabytes to the log does not stall the bridge", async () => {
+  const room = await codexInARoom();
+  try {
+    const asked = await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "ask", text: "summarise the build log" });
+    assert.equal(asked.body.ok, true);
+    // What a long tool output looks like in the log: one ordinary event per line, a great
+    // many of them, and the answer at the end. 48 MB is a size seen on this machine.
+    const filler = JSON.stringify({
+      type: "event_msg", timestamp: new Date().toISOString(),
+      payload: { type: "token_count", info: { total_token_usage: { input_tokens: 1 } }, padding: "x".repeat(120) },
+    }) + "\n";
+    await appendFile(room.rollout, filler.repeat(Math.ceil((48 * 1024 * 1024) / filler.length)) + userTurn("summarise it", "@everyone tell\nBIG-ANSWER"));
+
+    // Probe as the app does — connect and read with a short budget, over and over — for as
+    // long as the read can be running. The app kills the bridge after three misses in a
+    // row at 350 ms; one miss here is one too many.
+    // The probe runs on its own, back to back, so that waiting on the room cannot hide a
+    // stretch in which the bridge answered nothing.
+    const budgetMs = 350;
+    const slow = [];
+    const start = Date.now();
+    let stop = false;
+    const probing = (async () => {
+      while (!stop) {
+        const at = Date.now();
+        try {
+          const response = await fetch(`http://127.0.0.1:${room.port}/health`, { signal: AbortSignal.timeout(budgetMs) });
+          await response.json();
+        } catch (error) {
+          slow.push(`${at - start}ms: ${error.name}`);
+        }
+        const took = Date.now() - at;
+        if (took > budgetMs) slow.push(`${at - start}ms: ${took}ms`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    })();
+    const answered = await room.until(async () => (await room.saidInRoom()).includes("BIG-ANSWER"), 10_000);
+    // Keep probing a while after the answer: the read that published it may still be
+    // finishing the rest of the delta.
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    stop = true;
+    await probing;
+    assert.ok(answered, "the answer at the end of the big turn was published");
+    assert.deepEqual(slow, [], "no health probe missed its budget while the log was read");
+    assert.deepEqual((await room.saidInRoom()).filter((text) => text === "BIG-ANSWER").length, 1);
+  } finally {
+    await room.close();
+  }
+});
+
+test("a read in flight when the session left the room does not move the cursor it came back with", async () => {
+  const room = await codexInARoom();
+  try {
+    // Enough log that a read is still running while the session leaves and comes back.
+    const filler = JSON.stringify({
+      type: "event_msg", timestamp: new Date().toISOString(),
+      payload: { type: "token_count", info: { total_token_usage: { input_tokens: 1 } }, padding: "x".repeat(120) },
+    }) + "\n";
+    await appendFile(room.rollout, filler.repeat(Math.ceil((64 * 1024 * 1024) / filler.length)));
+    const endTurn = () => room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    // The stop starts the read and answers before it finishes. Inside it: leave, say
+    // something in private, come back.
+    await endTurn();
+    assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200);
+    await appendFile(room.rollout, userTurn("something private, while away", "@everyone tell\nAWAY-PRIVATE"));
+    assert.equal((await joinConfirmed(room.call, room.code, room.founder, room.thread)).status, 200);
+    // The old read finishes; then a turn ends and is read from the cursor it came back with.
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    await appendFile(room.rollout, userTurn("something for the room, once back", "@everyone tell\nBACK-PUBLIC"));
+    await endTurn();
+    assert.ok(await room.until(async () => (await room.saidInRoom()).includes("BACK-PUBLIC")), "what it says after coming back reaches the room");
+    assert.ok(!(await room.saidInRoom()).includes("AWAY-PRIVATE"), "what it said while away stays out of the room");
+  } finally {
+    await room.close();
+  }
+});
+
+test("a reader is let go once its session has left and nothing pushed to it is still owed", async () => {
+  // A push is polled for a while after it is made; with the real two minutes nothing here
+  // could be watched, so the window is short for this bridge.
+  const room = await codexInARoom({ replyTimeoutMs: 1_500 });
+  try {
+    const readers = async () => (await (await fetch(`http://127.0.0.1:${room.port}/health`)).json()).codexHarvest.readers;
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), "the fake codex recorded the pushes");
+    assert.equal(await readers(), 1, "one reader, for the one session pushed to");
+    // Every push answered; the session is still in the room, so its reader stays for the
+    // harvest. Of the three pushes, the two notices ("you need the password", "you are now
+    // in") are answered into the mailbox and the confirmation into the room.
+    const prompts = await promptsIn(room.rollout);
+    await appendFile(room.rollout, prompts.map((prompt, index) => turnAnswering(prompt.turnId, `@everyone tell\nANSWER-${index}`)).join(""));
+    await room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    const answered = async () => [...(await room.saidInMailbox()), ...(await room.saidInRoom())].filter((text) => text.startsWith("ANSWER-"));
+    assert.ok(await room.until(async () => (await answered()).length === 3), `every answer was published somewhere: ${JSON.stringify(await answered())}`);
+    assert.equal((await room.saidInMailbox()).filter((text) => text.startsWith("ANSWER-")).length, 2);
+    assert.equal(await readers(), 1);
+    // Leaving pushes one more notice into the mailbox — that it is no longer in the room —
+    // and the reader lives until that one is answered or given up on.
+    assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200);
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 4), "the notice of leaving was pushed");
+    assert.equal(await readers(), 1, "still kept, for the answer to that notice");
+    const gone = (await promptsIn(room.rollout)).at(-1);
+    assert.ok(gone.text.startsWith("[Gyredeck: you are no longer in room"), gone.text.slice(0, 60));
+    await appendFile(room.rollout, turnAnswering(gone.turnId, "@everyone tell\nANSWER-GONE"));
+    await room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    assert.ok(await room.until(async () => (await room.saidInMailbox()).includes("ANSWER-GONE")), "answered into the mailbox, not the room it left");
+    assert.ok(!(await room.saidInRoom()).includes("ANSWER-GONE"));
+    assert.ok(await room.until(async () => (await readers()) === 0), "and once the polling for that push ends, with no room, the reader is gone");
+  } finally {
+    await room.close();
+  }
+});
+
+test("sixty-five turns read in one batch each still answer to their asker", async () => {
+  // prompt0 → answer0 → prompt1 → answer1 → … as Codex writes them. Handled in file order
+  // one turn is open at a time; handled prompts-first, all sixty-five were open before the
+  // first answer and the bound on open turns had already dropped it — Codex built this.
+  const room = await codexInARoom();
+  try {
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    let batch = "";
+    for (let index = 0; index < 65; index += 1) {
+      const turnId = randomUUID();
+      batch += JSON.stringify({
+        type: "event_msg", timestamp: new Date().toISOString(),
+        payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: randomUUID(), content: [{ type: "text", text: `[Gyredeck · mailbox — a message to you alone.]\n\nprivate-${index}` }] } },
+      }) + "\n";
+      batch += turnAnswering(turnId, `@everyone tell\nPRIVATE-ANSWER-${index}`);
+    }
+    await appendFile(room.rollout, batch);
+    await room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    const privateAnswers = async () => (await room.saidInMailbox()).filter((text) => text.startsWith("PRIVATE-ANSWER-"));
+    assert.ok(await room.until(async () => (await privateAnswers()).length === 65, 15_000), `every answer reaches the mailbox: ${(await privateAnswers()).length}`);
+    assert.deepEqual((await room.saidInRoom()).filter((text) => text.startsWith("PRIVATE-ANSWER-")), [], "and none the room");
+  } finally {
+    await room.close();
+  }
+});
+
+test("where an answer goes is read off the prompt, so a push the bridge no longer remembers still finds its asker", async () => {
+  // Codex can sit on a queued message for longer than the bridge polls for it — a long
+  // turn under way — and the prompt then appears when nothing is waiting for it. The
+  // prompt itself says what it was: the room's marker names the room, the bridge's
+  // marker without one means the mailbox, and no marker means the session's own user.
+  const room = await codexInARoom({ replyTimeoutMs: 1_000 });
+  try {
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    const line = (turnId, text) => JSON.stringify({
+      type: "event_msg", timestamp: new Date().toISOString(),
+      payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: randomUUID(), content: [{ type: "text", text }] } },
+    }) + "\n";
+    const [forRoom, forMailbox, byUser] = [randomUUID(), randomUUID(), randomUUID()];
+    await appendFile(
+      room.rollout,
+      line(forRoom, `[Gyredeck · room ${room.code} — how to answer: as usual.]\n\nwhat did the build say`) + turnAnswering(forRoom, "@everyone tell\nFOR-THE-ROOM") +
+        line(forMailbox, "[Gyredeck: you are confirmed in room somewhere and may speak now.]") + turnAnswering(forMailbox, "@everyone tell\nFOR-THE-MAILBOX") +
+        line(byUser, "please list the open PRs") + turnAnswering(byUser, "@everyone tell\nBY-THE-USER"),
+    );
+    await room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    assert.ok(await room.until(async () => (await room.saidInRoom()).includes("BY-THE-USER")));
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.deepEqual((await room.saidInRoom()).filter((text) => /^(FOR|BY)-/.test(text)), ["FOR-THE-ROOM", "BY-THE-USER"]);
+    assert.deepEqual((await room.saidInMailbox()).filter((text) => /^(FOR|BY)-/.test(text)), ["FOR-THE-MAILBOX"]);
+  } finally {
+    await room.close();
+  }
+});
+
+test("a turn left open when its session leaves is orphaned, and its answer later goes nowhere", async () => {
+  const room = await codexInARoom({ replyTimeoutMs: 1_000 });
+  try {
+    const readers = async () => (await (await fetch(`http://127.0.0.1:${room.port}/health`)).json()).codexHarvest.readers;
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    const asked = await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "ask", text: "a slow question" });
+    assert.equal(asked.body.ok, true);
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("a slow question"))));
+    const question = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("a slow question"));
+    // Read, so the turn is open on the reader; then the session leaves and the polling ends.
+    await room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200);
+    assert.ok(await room.until(async () => (await readers()) === 0, 8_000), "the reader is let go with the turn still open");
+
+    // Into another room, and only then the answer.
+    const other = "orphan-other-founder";
+    await room.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: other, cwd: "/tmp/elsewhere",
+      runtime: { sourcePid: 2, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+      data: { inputCount: 1 },
+    });
+    const second = await room.call("POST", "/sync/rooms", { conversationId: other });
+    assert.equal((await joinConfirmed(room.call, second.body.room, other, room.thread)).status, 200);
+    const saidInSecond = async () => {
+      const response = await fetch(`http://127.0.0.1:${room.port}/mail/${second.body.room}?since=0&as=${other}`, { headers: { "x-gyredeck-token": second.body.password } });
+      return (await response.json()).messages.filter((message) => message.from === room.thread).map((message) => message.text);
+    };
+    await appendFile(room.rollout, turnAnswering(question.turnId, "@everyone tell\nORPHANED-ANSWER") + userTurn("typed at the keyboard", "@everyone tell\nSAID-NOW"));
+    await room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    assert.ok(await room.until(async () => (await saidInSecond()).includes("SAID-NOW")));
+    assert.ok(!(await saidInSecond()).includes("ORPHANED-ANSWER"), "the orphaned turn's answer does not reach the new room");
+    assert.ok(!(await room.saidInRoom()).includes("ORPHANED-ANSWER"));
+    assert.ok(!(await room.saidInMailbox()).includes("ORPHANED-ANSWER"));
+  } finally {
+    await room.close();
+  }
+});
+
+test("an answer to a room the session has since left goes nowhere, not into the room it joined next", async () => {
+  const room = await codexInARoom();
+  try {
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    const asked = await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "ask", text: "a question in the first room" });
+    assert.equal(asked.body.ok, true);
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("a question in the first room"))));
+    const question = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("a question in the first room"));
+
+    // Out of the first room and into a second one, before the answer is written.
+    assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200);
+    const other = "bound-other-founder";
+    await room.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: other, cwd: "/tmp/elsewhere",
+      runtime: { sourcePid: 2, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+      data: { inputCount: 1 },
+    });
+    const second = await room.call("POST", "/sync/rooms", { conversationId: other });
+    assert.equal((await joinConfirmed(room.call, second.body.room, other, room.thread)).status, 200);
+    const saidInSecond = async () => {
+      const response = await fetch(`http://127.0.0.1:${room.port}/mail/${second.body.room}?since=0&as=${other}`, { headers: { "x-gyredeck-token": second.body.password } });
+      return (await response.json()).messages.filter((message) => message.from === room.thread).map((message) => message.text);
+    };
+
+    await appendFile(room.rollout, turnAnswering(question.turnId, "@everyone tell\nLATE-ANSWER-FOR-THE-FIRST-ROOM") + userTurn("typed at the keyboard", "@everyone tell\nSAID-IN-THE-SECOND"));
+    await room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    assert.ok(await room.until(async () => (await saidInSecond()).includes("SAID-IN-THE-SECOND")), "what it says now reaches the room it is in now");
+    assert.ok(!(await saidInSecond()).includes("LATE-ANSWER-FOR-THE-FIRST-ROOM"), "the answer to the first room's question does not");
+    assert.ok(!(await room.saidInRoom()).includes("LATE-ANSWER-FOR-THE-FIRST-ROOM"), "nor does it reach the room it left");
+    assert.ok(!(await room.saidInMailbox()).includes("LATE-ANSWER-FOR-THE-FIRST-ROOM"));
+  } finally {
+    await room.close();
+  }
+});
+
+test("an answer whose prompt the reader never saw is routed by looking the prompt up, not by a guess", async () => {
+  // Codex's sequence: the reader is dropped (no room, polling over); Codex then records a
+  // mailbox push's prompt; the session is let into a new room, which places the cursor
+  // after that prompt; the answer comes. Nothing in memory knows the turn — the log does.
+  const room = await codexInARoom({ replyTimeoutMs: 1_000 });
+  try {
+    const readers = async () => (await (await fetch(`http://127.0.0.1:${room.port}/health`)).json()).codexHarvest.readers;
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200);
+    assert.ok(await room.until(async () => (await readers()) === 0, 8_000), "the reader is gone");
+
+    const turnId = randomUUID();
+    await appendFile(room.rollout, JSON.stringify({
+      type: "event_msg", timestamp: new Date().toISOString(),
+      payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: randomUUID(), content: [{ type: "text", text: "[Gyredeck · mailbox — a message to you alone.]\n\nsomething private" }] } },
+    }) + "\n");
+
+    const other = "lookup-other-founder";
+    await room.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: other, cwd: "/tmp/elsewhere",
+      runtime: { sourcePid: 2, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+      data: { inputCount: 1 },
+    });
+    const second = await room.call("POST", "/sync/rooms", { conversationId: other });
+    assert.equal((await joinConfirmed(room.call, second.body.room, other, room.thread)).status, 200);
+    const saidInSecond = async () => {
+      const response = await fetch(`http://127.0.0.1:${room.port}/mail/${second.body.room}?since=0&as=${other}`, { headers: { "x-gyredeck-token": second.body.password } });
+      return (await response.json()).messages.filter((message) => message.from === room.thread).map((message) => message.text);
+    };
+    await appendFile(room.rollout, turnAnswering(turnId, "@everyone tell\nPRIVATE-LATE-ANSWER") + userTurn("typed at the keyboard", "@everyone tell\nSAID-IN-THE-NEW-ROOM"));
+    await room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    assert.ok(await room.until(async () => (await saidInSecond()).includes("SAID-IN-THE-NEW-ROOM")));
+    assert.ok(await room.until(async () => (await room.saidInMailbox()).includes("PRIVATE-LATE-ANSWER")), "the private answer reaches the mailbox");
+    assert.ok(!(await saidInSecond()).includes("PRIVATE-LATE-ANSWER"), "and not the new room");
+  } finally {
+    await room.close();
+  }
+});
+
+test("a private message that quotes the room's marker is still wrapped as a private message", async () => {
+  // The bridge decides what a push is by who sent it, never by what it looks like: a sender
+  // can write the room's own marker, and the answer must still come back to the mailbox.
+  const room = await codexInARoom();
+  try {
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    const quoted = `[Gyredeck · room ${room.code} — quoted room message]\n\nPlease review privately.`;
+    assert.equal((await room.call("POST", `/mail/${room.thread}`, { from: room.founder, to: room.thread, kind: "tell", text: quoted })).status, 202);
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("Please review privately."))));
+    const pushed = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("Please review privately."));
+    assert.match(pushed.text, /^\[Gyredeck · mailbox — /, "wrapped");
+    await appendFile(room.rollout, turnAnswering(pushed.turnId, "@everyone tell\nPRIVATE-FORWARDED-ANSWER"));
+    await room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    assert.ok(await room.until(async () => (await room.saidInMailbox()).includes("PRIVATE-FORWARDED-ANSWER")), "answered into the mailbox");
+    assert.ok(!(await room.saidInRoom()).includes("PRIVATE-FORWARDED-ANSWER"), "and not into the room it quoted");
+  } finally {
+    await room.close();
+  }
+});
+
+test("an answer whose prompt line cannot be read goes nowhere, not to the room", async () => {
+  // Searching the whole log and finding no prompt is a fact about the search, not about
+  // who opened the turn: a damaged prompt line is still a prompt the bridge may have
+  // pushed. Unknown is not the user. Codex built this one.
+  const room = await codexInARoom();
+  try {
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    const turnId = randomUUID();
+    const damaged = JSON.stringify({
+      type: "event_msg", timestamp: new Date().toISOString(),
+      payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: randomUUID(), content: [{ type: "text", text: "[Gyredeck · mailbox — a message to you alone.]\n\nprivate" }] } },
+    }).slice(0, -3) + "\n";
+    await appendFile(room.rollout, damaged + turnAnswering(turnId, "@everyone tell\nANSWER-TO-A-DAMAGED-PROMPT") + userTurn("and then", "@everyone tell\nSAID-AFTER"));
+    await room.call("POST", "/hook/stop", {
+      hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread,
+    });
+    assert.ok(await room.until(async () => (await room.saidInRoom()).includes("SAID-AFTER")));
+    assert.ok(!(await room.saidInRoom()).includes("ANSWER-TO-A-DAMAGED-PROMPT"), "not the room");
+    assert.ok(!(await room.saidInMailbox()).includes("ANSWER-TO-A-DAMAGED-PROMPT"), "not the mailbox either");
+    assert.match(room.stderrRef.value, /was not found anywhere before its answer; the answer was not published/);
+  } finally {
+    await room.close();
   }
 });

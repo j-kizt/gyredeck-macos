@@ -324,6 +324,14 @@ export const slowestReaderSeq = (room) => {
  * log verbatim, under the same `turn_id` the answer will carry. That pairing is what binds
  * an answer to the question that asked for it. A reply whose turn no prompt of ours opened
  * is Codex talking to its own user.
+ *
+ * A **goal** is a turn Codex started on its own, to carry on a goal its user set
+ * (`task_started` with `turn_attribution.turn_trigger === "goal"`, codex-cli 0.160.1). Such
+ * a turn records no `UserMessage` — its prompt is an internal steering item — so without
+ * this the reader found no opener and dropped the answer, and two of them were room
+ * messages (#149). Only the attribution is read, never the steering wrapper: goal updates
+ * and budget steering wear the same wrapper, and a person can still type during a goal
+ * turn, which records a `UserMessage` that then says where the answer goes.
  */
 export const codexEntryFromLine = (line, sinceMs) => {
   if (!line.trim()) return null;
@@ -343,6 +351,13 @@ export const codexEntryFromLine = (line, sinceMs) => {
   if (payload.type === "turn_aborted") {
     if (typeof payload.turn_id !== "string" || payload.turn_id === "") return null;
     return { kind: "aborted", turnId: payload.turn_id, at };
+  }
+  if (payload.type === "task_started") {
+    const attribution = payload.turn_attribution;
+    if (!attribution || typeof attribution !== "object" || attribution.turn_trigger !== "goal") return null;
+    const turnId = typeof attribution.turn_id === "string" && attribution.turn_id !== "" ? attribution.turn_id : payload.turn_id;
+    if (typeof turnId !== "string" || turnId === "") return null;
+    return { kind: "goal", turnId, at };
   }
   if (payload.type === "item_completed" && payload.item?.type === "UserMessage") {
     if (typeof payload.turn_id !== "string" || payload.turn_id === "") return null;
@@ -414,7 +429,10 @@ export const CODEX_PROMPT_LOOKBACK_BYTES = 64 * 1024 * 1024;
  * own line is one. Lines are cut on raw bytes; the head of a line cut by a chunk boundary
  * waits for the chunk below it.
  *
- * `{ found: true, text }` when the prompt is there. Otherwise `{ found: false, complete }`,
+ * `{ found: true, text }` when the prompt is there; `{ found: true, goal: true, startedAt }`
+ * when the turn was opened by Codex's goal runner and nobody typed into it — read backwards,
+ * a typed message lies above the turn's start and is met first, so it wins. Otherwise
+ * `{ found: false, complete }`,
  * where `complete` says whether everything before the answer was searched. That is a
  * statement about the search, not about the turn: a prompt line the parser could not read
  * — damaged, or a shape this bridge does not know — leaves the search complete and the
@@ -461,6 +479,7 @@ export const findCodexPrompt = async (
         if (data.subarray(lineBreak + 1, end).indexOf(needle) >= 0) {
           const entry = codexEntryFromLine(data.toString("utf8", lineBreak + 1, end), 0);
           if (entry?.kind === "prompt" && entry.turnId === turnId) return { found: true, text: entry.text };
+          if (entry?.kind === "goal" && entry.turnId === turnId) return { found: true, goal: true, startedAt: entry.at };
         }
         end = lineBreak;
       }
@@ -473,6 +492,7 @@ export const findCodexPrompt = async (
     if (floor === 0 && head.length > 0 && head.indexOf(needle) >= 0) {
       const entry = codexEntryFromLine(head.toString("utf8"), 0);
       if (entry?.kind === "prompt" && entry.turnId === turnId) return { found: true, text: entry.text };
+      if (entry?.kind === "goal" && entry.turnId === turnId) return { found: true, goal: true, startedAt: entry.at };
     }
     return missing(floor === 0);
   } catch {
@@ -1402,21 +1422,25 @@ function startBridge(config) {
   const routeCodexReply = (room, text) => {
     const [first, ...rest] = text.split("\n");
     const match = CODEX_ROUTING_LINE.exec(first.trim());
-    if (!match) return { text, routing: { to: MAIL_EVERYONE, kind: MAIL_DEFAULT_KIND } };
+    // `explicit` says the line named somebody the room knows — everyone, or a member by id
+    // or label. A goal turn's answer is published on that and nothing else; a line that
+    // named nobody, or somebody not here, is not a message to this room (#149).
+    if (!match) return { text, routing: { to: MAIL_EVERYONE, kind: MAIL_DEFAULT_KIND }, explicit: false };
     const inline = (match[3] ?? "").trim();
     const target = match[1].trim();
-    const to = /^everyone$/i.test(target)
+    const named = /^everyone$/i.test(target)
       ? MAIL_EVERYONE
       : room.members.has(target)
         ? target
         : [...room.members.keys()].find(
             (id) => labelIn(room, id).toLowerCase() === target.toLowerCase(),
-          ) ?? MAIL_EVERYONE;
+          ) ?? null;
+    const to = named ?? MAIL_EVERYONE;
     // A line with nothing under it said everything it meant in the line. Falling back
     // to the whole text published `@everyone ack` as the message body, which is the
     // instruction wearing the costume of a reply.
     const body = [inline, rest.join("\n").trim()].filter(Boolean).join("\n");
-    return { text: body || "ok", routing: { to, kind: asKind(match[2].toLowerCase()) } };
+    return { text: body || "ok", routing: { to, kind: asKind(match[2].toLowerCase()) }, explicit: named !== null };
   };
 
   /**
@@ -1716,6 +1740,20 @@ function startBridge(config) {
       const mailbox = mailRoomFor(threadId, true);
       return mailbox ? { name: threadId, room: mailbox } : null;
     }
+    if (origin?.kind === "goal") {
+      // Codex continuing a goal on its own: the room the session speaks in, and only if it
+      // was already confirmed there when the turn began — the confirmation boundary, not
+      // the join: a session let in while the turn ran was not speaking for the room when
+      // the turn started (Codex found this). A member that left and came back is a new
+      // record with a new boundary, so a goal that spans a rejoin is not the room's
+      // either. A personal goal run while in no room goes nowhere. "Goal" is not proof the
+      // work belongs to the room — the explicit routing line on the answer is asked for
+      // separately, by the reader (#149).
+      if (!confirmedIn || origin.startedAt === null) return null;
+      const confirmedAt = Date.parse(confirmedIn.room.members.get(threadId)?.confirmedAt ?? "");
+      if (!Number.isFinite(confirmedAt) || confirmedAt > origin.startedAt) return null;
+      return reply.endsAt > reader.roomFloor ? confirmedIn : null;
+    }
     // Typed by the session's own user: the room the session speaks in, unless it was said
     // before the session was let in. Only ever reached with the prompt in hand — read by
     // this reader, or looked up — never on the strength of not knowing.
@@ -1789,9 +1827,22 @@ function startBridge(config) {
     let sawReply = false;
     let refusedIn = null;
     for (const entry of entries) {
-      if (entry.kind === "prompt") {
-        // Re-read after a refusal, the prompt is seen again; the turn is already open.
+      if (entry.kind === "goal") {
+        // Opened by Codex's goal runner, with nothing typed into it so far. Anything typed
+        // later in the turn arrives as a prompt below and replaces this.
         if (!reader.origins.has(entry.turnId)) {
+          reader.origins.set(entry.turnId, { kind: "goal", startedAt: entry.at });
+          while (reader.origins.size > CODEX_ORIGIN_MEMORY) {
+            reader.origins.delete(reader.origins.keys().next().value);
+          }
+        }
+        handledThrough = entry.endsAt;
+        continue;
+      }
+      if (entry.kind === "prompt") {
+        // Re-read after a refusal, the prompt is seen again; the turn is already open. A
+        // turn opened as a goal is the one exception: what the person typed decides.
+        if (!reader.origins.has(entry.turnId) || reader.origins.get(entry.turnId)?.kind === "goal") {
           reader.origins.set(entry.turnId, codexPushTarget(entry.text) ?? { kind: "user" });
           while (reader.origins.size > CODEX_ORIGIN_MEMORY) {
             reader.origins.delete(reader.origins.keys().next().value);
@@ -1831,7 +1882,9 @@ function startBridge(config) {
           handledThrough = reply.endsAt;
           continue;
         }
-        origin = codexPushTarget(prompt.text) ?? { kind: "user" };
+        origin = prompt.goal
+          ? { kind: "goal", startedAt: prompt.startedAt }
+          : codexPushTarget(prompt.text) ?? { kind: "user" };
       }
       // The turn that carried a room password: read past, never published. Codex answered
       // it before the bridge knew the password had been typed at all, so the answer is to
@@ -1849,7 +1902,19 @@ function startBridge(config) {
         handledThrough = reply.endsAt;
         continue;
       }
-      const { text, routing } = routeCodexReply(destination.room, reply.text);
+      const { text, routing, explicit } = routeCodexReply(destination.room, reply.text);
+      // A goal turn's answer is a message to the room only when it says so — a first line
+      // naming a member or everyone. Status Codex writes for its own terminal while working
+      // a goal stays there; the room is not told, and stderr says so once per turn.
+      if (origin?.kind === "goal" && !explicit) {
+        console.error(
+          `codex log ${path}: turn ${reply.turnId} was opened by Codex's goal runner and its answer` +
+            " names no member of the room; left in the terminal, not published",
+        );
+        reader.origins.delete(reply.turnId);
+        handledThrough = reply.endsAt;
+        continue;
+      }
       // Capacity first, and a refusal stops the batch rather than skipping one of it:
       // publishing what came after would put Codex's answers in the room out of order.
       // Both kinds of full are asked before anything is claimed or the cursor moves —
@@ -2601,6 +2666,10 @@ function startBridge(config) {
       return { transitioned: false, ...tellConfirmedToCodex(code, room, conversationId) };
     }
     member.confirmed = true;
+    // The confirmation boundary: a goal turn's answer belongs to this room only if the
+    // turn began after this moment (#149). Set when confirmation is granted and never
+    // moved by a repeat; a member that left and came back is a new record with a new one.
+    member.confirmedAt = new Date().toISOString();
     member.toldUnconfirmed = false;
     startHarvestAtEnd(conversationId);
     // Both the window the backlog is taken from and the record that the push carrying it
@@ -4392,6 +4461,7 @@ function startBridge(config) {
           // intent the password exists to capture, so the founder needs no password.
           confirmed: true,
           joinedAt: new Date().toISOString(),
+          confirmedAt: new Date().toISOString(),
           // Joining mid-conversation should not replay what was said before: a member
           // starts from where the room is now.
           readSeq: room.seq,
@@ -5015,7 +5085,11 @@ function startBridge(config) {
         // itself — the bridge reads its answer out of its own log and publishes on its
         // behalf, with no header to carry anything.
         if (room.members.has(from) && holdsRoomPassword(room, headerToken)) {
-          room.members.get(from).confirmed = true;
+          const member = room.members.get(from);
+          if (member.confirmed !== true) {
+            member.confirmed = true;
+            member.confirmedAt = new Date().toISOString();
+          }
         }
         const refusal = refuseToPublish(room, from);
         if (refusal) {

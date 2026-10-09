@@ -135,6 +135,23 @@ carries the whole answer in `last_agent_message`, already bounded to a turn:
 Filter by the log entry's `timestamp` against when the message was queued and nothing
 the session said beforehand is ever read.
 
+**Where an answer goes is read off the prompt that opened its turn** (`codexPushTarget`,
+#122): a pushed message carries the bridge's marker and names the room; a prompt without
+one was typed by the session's own user and goes to the room the session is confirmed in;
+a turn whose prompt cannot be found is unknown, and unknown goes nowhere. One more shape
+since #149: a turn Codex's **goal runner** opened on its own records no `UserMessage` at
+all — only `task_started` with `turn_attribution.turn_trigger: "goal"` (codex-cli 0.160.1;
+the `<codex_internal_context source="goal">` steering item is not read, goal updates and
+budget steering wear it too). Its answer goes to the room the session was already confirmed
+in when the turn began (the member's `confirmedAt` ≤ the start — confirmation, not the join:
+a session let in while the turn ran was not speaking for the room when it started, and a
+rejoin is a new record with a new boundary), and only when the answer's first line names
+a member or everyone (`@… tell|ask|reaction`); otherwise it stays in Codex's terminal, with
+a stderr line per turn. A person typing into a goal turn records a `UserMessage` under it,
+and that decides as for any turn. "Goal" is not proof the work belongs to the room — eight
+goal turns on 2026-10-09 were dropped, two of which were room messages; the explicit line
+is what recovers those without taking the rest.
+
 **Deduplicate per thread, not per harvest.** Every delivery starts its own harvest with
 its own window, and windows overlap — a room notice and a question sent moments apart
 both see the one answer Codex writes. A harvest that only remembers what it published

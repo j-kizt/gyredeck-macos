@@ -1,10 +1,11 @@
 use std::{
+    collections::VecDeque,
     fs,
     io::{ErrorKind, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -17,6 +18,257 @@ const BRIDGE_PROBE_TIMEOUT: Duration = Duration::from_millis(350);
 const MAIL_REQUEST_TIMEOUT: Duration = Duration::from_millis(1500);
 const BRIDGE_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
 const OWNED_BRIDGE_FAILURE_LIMIT: u8 = 3;
+/// How many of the bridge's last stderr lines are kept to be written down with a kill —
+/// and how many bytes, in total and per line, because a line is whatever the bridge
+/// chose to put before a newline, and one of 4 MiB was kept whole until both bounds
+/// existed. A longer line is cut and says so.
+const BRIDGE_STDERR_TAIL_LINES: usize = 40;
+const BRIDGE_STDERR_TAIL_MAX_BYTES: usize = 8 * 1024;
+const BRIDGE_STDERR_LINE_MAX_BYTES: usize = 512;
+/// A record longer than this is replaced by a line saying so: the file has a cap, and one
+/// record must not be the thing that blows through it.
+const SUPERVISOR_RECORD_MAX_BYTES: usize = 64 * 1024;
+/// How long an exited bridge's stderr is given to be read to its end before the exit is
+/// written down — the pipe closes with the process, so this is a bound, not a wait.
+const BRIDGE_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+/// The supervisor log is rotated past this, one generation kept. It grows by a line per
+/// start, exit or kill, so this is years of ordinary use and an afternoon of a crash loop.
+const SUPERVISOR_LOG_MAX_BYTES: u64 = 256 * 1024;
+
+/// Where the supervisor writes down what it did to the bridge, and why.
+///
+/// The kills of 2026-10-07 — three in an afternoon, every sync room lost each time — were
+/// reported only through `eprintln!`, which nothing keeps once the app is not run from a
+/// terminal. They had to be reproduced live to be proven at all. This file is the trace
+/// that was missing: one JSON line per start, exit, kill and failed probe run, with the
+/// probe failures that led to a kill and the bridge's last stderr lines beside it.
+pub(crate) fn supervisor_log_path() -> Option<PathBuf> {
+    super::home_dir().map(|home| {
+        home.join(".config")
+            .join("gyredeck")
+            .join("gyredeck.supervisor.log")
+    })
+}
+
+/// An append-only NDJSON log, private to the user, one generation of rotation.
+#[derive(Clone)]
+pub(crate) struct SupervisorLog {
+    path: Option<PathBuf>,
+}
+
+impl SupervisorLog {
+    pub(crate) fn at(path: Option<PathBuf>) -> Self {
+        Self { path }
+    }
+
+    #[cfg(test)]
+    fn none() -> Self {
+        Self { path: None }
+    }
+
+    /// One line, with the time and the event's name in front of whatever else is given.
+    /// Writing it can fail, and that is reported on stderr and not otherwise: the log is
+    /// evidence for later, never something the supervisor's own loop depends on.
+    pub(crate) fn record(&self, event: &str, mut fields: serde_json::Map<String, serde_json::Value>) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        let at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "unknown".to_string());
+        let mut line = serde_json::Map::new();
+        line.insert("at".to_string(), serde_json::Value::String(at.clone()));
+        line.insert("event".to_string(), serde_json::Value::String(event.to_string()));
+        line.append(&mut fields);
+        let mut text = serde_json::Value::Object(line).to_string();
+        if text.len() > SUPERVISOR_RECORD_MAX_BYTES {
+            let mut short = serde_json::Map::new();
+            short.insert("at".to_string(), serde_json::Value::String(at));
+            short.insert("event".to_string(), serde_json::Value::String(event.to_string()));
+            short.insert("truncated".to_string(), serde_json::Value::Bool(true));
+            short.insert("bytes".to_string(), serde_json::Value::from(text.len()));
+            text = serde_json::Value::Object(short).to_string();
+        }
+        if let Err(error) = append_private_line(path, &text) {
+            eprintln!(
+                "Gyredeck could not write its supervisor log at {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Append one line to a file that only the user may read, rotating it past the cap.
+///
+/// Created with mode 0600 and never widened: the events log was world-readable for a year
+/// because nothing created it deliberately, and this one carries the bridge's stderr.
+fn append_private_line(path: &Path, line: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    // Narrowed on the handle, every time, and a failure is a failure: a file created
+    // earlier by something less careful would otherwise be rotated aside still readable by
+    // everyone, and "private" would be a word in a comment.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    if file.metadata()?.len() >= SUPERVISOR_LOG_MAX_BYTES {
+        // Already private, so what is moved aside is too. The handle is dropped first: on
+        // some filesystems a rename under an open append handle is refused.
+        drop(file);
+        fs::rename(path, path.with_extension("log.1"))?;
+        return append_private_line(path, line);
+    }
+    file.write_all(line.as_bytes())?;
+    file.write_all(b"\n")
+}
+
+/// The bridge's last stderr lines, kept so a kill can say what the bridge was saying.
+///
+/// Read on a thread of its own, line by line, each line also passed on to the app's own
+/// stderr as it always was — `Stdio::inherit` used to do that, and gave the supervisor no
+/// way to see any of it.
+#[derive(Default)]
+struct TailBuffer {
+    lines: VecDeque<String>,
+    bytes: usize,
+}
+
+impl TailBuffer {
+    fn push(&mut self, line: String) {
+        self.bytes += line.len();
+        self.lines.push_back(line);
+        while self.lines.len() > BRIDGE_STDERR_TAIL_LINES || self.bytes > BRIDGE_STDERR_TAIL_MAX_BYTES {
+            if let Some(dropped) = self.lines.pop_front() {
+                self.bytes -= dropped.len();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct StderrTail {
+    kept: Arc<Mutex<TailBuffer>>,
+    reader: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+impl StderrTail {
+    /// Read `stderr` to its end on a thread of its own, in bytes, with a bound per line.
+    ///
+    /// Not `BufReader::lines()`: that assembles a whole line before handing it over, so a
+    /// line with no newline in sight costs as much memory as the bridge cares to write, and
+    /// it stops at the first byte that is not UTF-8, keeping nothing said after it. Bytes
+    /// past the per-line bound are counted and dropped, the line is marked as cut, and text
+    /// is decoded leniently.
+    fn follow(&self, stderr: impl Read + Send + 'static) {
+        let kept = Arc::clone(&self.kept);
+        let handle = thread::Builder::new()
+            .name("gyredeck-bridge-stderr".to_string())
+            .spawn(move || {
+                let mut stderr = stderr;
+                let mut chunk = [0_u8; 4096];
+                let mut line: Vec<u8> = Vec::new();
+                let mut dropped = 0_usize;
+                let flush = |line: &mut Vec<u8>, dropped: &mut usize| {
+                    if line.is_empty() && *dropped == 0 {
+                        return;
+                    }
+                    let mut text = String::from_utf8_lossy(line).into_owned();
+                    if *dropped > 0 {
+                        text.push_str(&format!(" …[{} more bytes cut]", *dropped));
+                    }
+                    eprintln!("{text}");
+                    if let Ok(mut kept) = kept.lock() {
+                        kept.push(text);
+                    }
+                    line.clear();
+                    *dropped = 0;
+                };
+                loop {
+                    let read = match stderr.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(read) => read,
+                        Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    };
+                    for &byte in &chunk[..read] {
+                        if byte == b'\n' {
+                            flush(&mut line, &mut dropped);
+                        } else if line.len() < BRIDGE_STDERR_LINE_MAX_BYTES {
+                            line.push(byte);
+                        } else {
+                            dropped += 1;
+                        }
+                    }
+                }
+                flush(&mut line, &mut dropped);
+            })
+            .ok();
+        if let Ok(mut reader) = self.reader.lock() {
+            *reader = handle;
+        }
+    }
+
+    /// Wait, briefly, for the reader to reach the end of the pipe: a process that wrote its
+    /// last words and exited has them in flight for a moment after `try_wait` says so.
+    fn drain(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let finished = self
+                .reader
+                .lock()
+                .map(|reader| reader.as_ref().map_or(true, JoinHandle::is_finished))
+                .unwrap_or(true);
+            if finished || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.kept
+            .lock()
+            .map(|kept| kept.lines.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+fn describe_exit(status: std::process::ExitStatus) -> serde_json::Value {
+    let mut fields = serde_json::Map::new();
+    if let Some(code) = status.code() {
+        fields.insert("code".to_string(), serde_json::Value::from(code));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            fields.insert("signal".to_string(), serde_json::Value::from(signal));
+        }
+    }
+    fields.insert("status".to_string(), serde_json::Value::String(status.to_string()));
+    serde_json::Value::Object(fields)
+}
+
+fn probe_name(probe: BridgeProbe) -> &'static str {
+    match probe {
+        BridgeProbe::Healthy => "healthy",
+        BridgeProbe::Offline => "offline",
+        BridgeProbe::Occupied => "occupied",
+    }
+}
 
 fn bridge_config_path() -> Option<PathBuf> {
     super::home_dir().map(|home| {
@@ -115,6 +367,15 @@ enum BridgeProbe {
     Offline,
 }
 
+/// What a probe saw, finer than the verdict: the verdict decides, the reason is written
+/// down. A stalled bridge connects and then says nothing (`read_timeout`); a dead one
+/// refuses the connection; an impostor answers the wrong thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProbeOutcome {
+    verdict: BridgeProbe,
+    reason: &'static str,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct BridgeEndpoint {
     address: SocketAddr,
@@ -147,7 +408,12 @@ impl StandaloneBridgeState {
         if let Ok(mut script) = self.script.lock() {
             *script = Some(bridge_script.clone());
         }
-        self.start_with(bridge_script, node, BridgeEndpoint::default())
+        self.start_with(
+            bridge_script,
+            node,
+            BridgeEndpoint::default(),
+            SupervisorLog::at(supervisor_log_path()),
+        )
     }
 
     /// Stop the current supervisor and start a fresh one, re-reading the
@@ -168,6 +434,7 @@ impl StandaloneBridgeState {
         bridge_script: PathBuf,
         node: PathBuf,
         endpoint: BridgeEndpoint,
+        log: SupervisorLog,
     ) -> Result<(), String> {
         if !bridge_script.is_file() {
             return Err(format!(
@@ -187,7 +454,7 @@ impl StandaloneBridgeState {
         let (stop_tx, stop_rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("gyredeck-bridge-supervisor".to_string())
-            .spawn(move || supervise_bridge(bridge_script, node, endpoint, stop_rx))
+            .spawn(move || supervise_bridge(bridge_script, node, endpoint, stop_rx, log))
             .map_err(|error| format!("Failed to start standalone bridge supervisor: {error}"))?;
         *supervisor = Some(BridgeSupervisorHandle { stop_tx, join });
         Ok(())
@@ -220,56 +487,151 @@ pub(crate) fn port_available_for_bridge(port: u16) -> bool {
     !matches!(probe_bridge(endpoint), BridgeProbe::Occupied)
 }
 
+/// A bridge the supervisor started, with what it needs to say about it later.
+struct OwnedBridge {
+    child: Child,
+    pid: u32,
+    started: Instant,
+    stderr: StderrTail,
+    /// The failed probes since the last healthy one, oldest first: what a kill is made of.
+    failures: Vec<serde_json::Value>,
+}
+
+impl OwnedBridge {
+    fn fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("pid".to_string(), serde_json::Value::from(self.pid));
+        fields.insert(
+            "uptimeMs".to_string(),
+            serde_json::Value::from(self.started.elapsed().as_millis() as u64),
+        );
+        fields.insert(
+            "stderr".to_string(),
+            serde_json::Value::Array(
+                self.stderr
+                    .snapshot()
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+        fields
+    }
+}
+
 fn supervise_bridge(
     bridge_script: PathBuf,
     node: PathBuf,
     endpoint: BridgeEndpoint,
     stop_rx: mpsc::Receiver<()>,
+    log: SupervisorLog,
 ) {
-    let mut owned_child: Option<Child> = None;
-    let mut consecutive_failures = 0_u8;
+    let mut owned: Option<OwnedBridge> = None;
 
     loop {
         if stop_rx.try_recv().is_ok() {
             break;
         }
 
-        if let Some(child) = owned_child.as_mut() {
-            match child.try_wait() {
+        if let Some(bridge) = owned.as_mut() {
+            match bridge.child.try_wait() {
                 Ok(Some(status)) => {
                     eprintln!("Gyredeck standalone bridge exited: {status}");
-                    owned_child = None;
-                    consecutive_failures = 0;
+                    // Its last words may still be in the pipe. And this is an exit the
+                    // supervisor did not ask for — one it asked for is written down as
+                    // `killed` or `stopped` and never seen here, so the field says so.
+                    bridge.stderr.drain(BRIDGE_STDERR_DRAIN_TIMEOUT);
+                    let mut fields = bridge.fields();
+                    fields.insert("exit".to_string(), describe_exit(status));
+                    fields.insert("byGyredeck".to_string(), serde_json::Value::Bool(false));
+                    log.record("exited", fields);
+                    owned = None;
                 }
                 Err(error) => {
                     eprintln!("Gyredeck could not inspect its standalone bridge: {error}");
-                    owned_child = None;
-                    consecutive_failures = 0;
+                    let mut fields = bridge.fields();
+                    fields.insert(
+                        "error".to_string(),
+                        serde_json::Value::String(error.to_string()),
+                    );
+                    log.record("lost", fields);
+                    owned = None;
                 }
                 Ok(None) => {}
             }
         }
 
-        let probe = probe_bridge(endpoint);
-        if owned_child.is_some() {
+        let probed_at = Instant::now();
+        let outcome = probe_bridge_detailed(endpoint);
+        let probe = outcome.verdict;
+        let probe_took = probed_at.elapsed();
+        if let Some(bridge) = owned.as_mut() {
             if probe == BridgeProbe::Healthy {
-                consecutive_failures = 0;
+                if !bridge.failures.is_empty() {
+                    let mut fields = bridge.fields();
+                    fields.insert(
+                        "failures".to_string(),
+                        serde_json::Value::Array(std::mem::take(&mut bridge.failures)),
+                    );
+                    log.record("recovered", fields);
+                }
             } else {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                if consecutive_failures >= OWNED_BRIDGE_FAILURE_LIMIT {
-                    stop_owned_child(&mut owned_child);
-                    consecutive_failures = 0;
+                let mut failure = serde_json::Map::new();
+                failure.insert(
+                    "probe".to_string(),
+                    serde_json::Value::String(probe_name(probe).to_string()),
+                );
+                failure.insert(
+                    "reason".to_string(),
+                    serde_json::Value::String(outcome.reason.to_string()),
+                );
+                failure.insert(
+                    "tookMs".to_string(),
+                    serde_json::Value::from(probe_took.as_millis() as u64),
+                );
+                failure.insert(
+                    "afterMs".to_string(),
+                    serde_json::Value::from(bridge.started.elapsed().as_millis() as u64),
+                );
+                bridge.failures.push(serde_json::Value::Object(failure));
+                if bridge.failures.len() >= usize::from(OWNED_BRIDGE_FAILURE_LIMIT) {
+                    // Written before the kill, so the stderr tail is what the bridge said
+                    // up to the moment it was judged, not what it said while dying.
+                    let mut fields = bridge.fields();
+                    fields.insert(
+                        "failures".to_string(),
+                        serde_json::Value::Array(std::mem::take(&mut bridge.failures)),
+                    );
+                    log.record("killed", fields);
+                    eprintln!(
+                        "Gyredeck is restarting its standalone bridge: {OWNED_BRIDGE_FAILURE_LIMIT} health probes in a row failed"
+                    );
+                    stop_owned_child(&mut owned);
                 }
             }
         } else if probe == BridgeProbe::Offline {
-            owned_child = match spawn_bridge(&node, &bridge_script, endpoint) {
-                Ok(child) => Some(child),
+            owned = match spawn_bridge(&node, &bridge_script, endpoint) {
+                Ok(bridge) => {
+                    let mut fields = serde_json::Map::new();
+                    fields.insert("pid".to_string(), serde_json::Value::from(bridge.pid));
+                    fields.insert(
+                        "port".to_string(),
+                        serde_json::Value::from(endpoint.address.port()),
+                    );
+                    log.record("started", fields);
+                    Some(bridge)
+                }
                 Err(error) => {
                     eprintln!("Gyredeck could not start its standalone bridge: {error}");
+                    let mut fields = serde_json::Map::new();
+                    fields.insert(
+                        "error".to_string(),
+                        serde_json::Value::String(error.to_string()),
+                    );
+                    log.record("spawn_failed", fields);
                     None
                 }
             };
-            consecutive_failures = 0;
         }
 
         match stop_rx.recv_timeout(BRIDGE_SUPERVISOR_INTERVAL) {
@@ -278,15 +640,18 @@ fn supervise_bridge(
         }
     }
 
-    stop_owned_child(&mut owned_child);
+    if let Some(bridge) = owned.as_ref() {
+        log.record("stopped", bridge.fields());
+    }
+    stop_owned_child(&mut owned);
 }
 
 fn spawn_bridge(
     node: &Path,
     bridge_script: &Path,
     endpoint: BridgeEndpoint,
-) -> std::io::Result<Child> {
-    Command::new(node)
+) -> std::io::Result<OwnedBridge> {
+    let mut child = Command::new(node)
         .arg(bridge_script)
         .arg("--port")
         .arg(endpoint.address.port().to_string())
@@ -296,12 +661,24 @@ fn spawn_bridge(
         .env("PATH", super::enriched_cli_path())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stderr = StderrTail::default();
+    if let Some(pipe) = child.stderr.take() {
+        stderr.follow(pipe);
+    }
+    Ok(OwnedBridge {
+        pid: child.id(),
+        child,
+        started: Instant::now(),
+        stderr,
+        failures: Vec::new(),
+    })
 }
 
-fn stop_owned_child(child: &mut Option<Child>) {
-    if let Some(mut child) = child.take() {
+fn stop_owned_child(owned: &mut Option<OwnedBridge>) {
+    if let Some(bridge) = owned.take() {
+        let mut child = bridge.child;
         drop(child.stdin.take());
         let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline {
@@ -316,9 +693,21 @@ fn stop_owned_child(child: &mut Option<Child>) {
 }
 
 fn probe_bridge(endpoint: BridgeEndpoint) -> BridgeProbe {
+    probe_bridge_detailed(endpoint).verdict
+}
+
+fn probe_bridge_detailed(endpoint: BridgeEndpoint) -> ProbeOutcome {
+    let outcome = |verdict, reason| ProbeOutcome { verdict, reason };
     let mut stream = match TcpStream::connect_timeout(&endpoint.address, BRIDGE_PROBE_TIMEOUT) {
         Ok(stream) => stream,
-        Err(error) => return classify_connect_error(&error),
+        Err(error) => {
+            let reason = match error.kind() {
+                ErrorKind::ConnectionRefused => "connect_refused",
+                ErrorKind::TimedOut | ErrorKind::WouldBlock => "connect_timeout",
+                _ => "connect_failed",
+            };
+            return outcome(classify_connect_error(&error), reason);
+        }
     };
     let _ = stream.set_read_timeout(Some(BRIDGE_PROBE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(BRIDGE_PROBE_TIMEOUT));
@@ -327,16 +716,23 @@ fn probe_bridge(endpoint: BridgeEndpoint) -> BridgeProbe {
         endpoint.address.port()
     );
     if stream.write_all(request.as_bytes()).is_err() {
-        return BridgeProbe::Occupied;
+        return outcome(BridgeProbe::Occupied, "write_failed");
     }
 
     let mut response = String::new();
-    let _ = stream.take(64 * 1024).read_to_string(&mut response);
+    let read = stream.take(64 * 1024).read_to_string(&mut response);
     if is_gyredeck_health_response(&response) {
-        BridgeProbe::Healthy
-    } else {
-        BridgeProbe::Occupied
+        return outcome(BridgeProbe::Healthy, "healthy");
     }
+    let reason = match read {
+        Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+            if response.is_empty() { "read_timeout" } else { "read_timeout_mid_response" }
+        }
+        Err(_) => "read_failed",
+        Ok(_) if response.is_empty() => "closed_without_answer",
+        Ok(_) => "unexpected_response",
+    };
+    outcome(BridgeProbe::Occupied, reason)
 }
 
 /// One mail room as the bridge reports it.
@@ -914,7 +1310,7 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
 
         let state = StandaloneBridgeState::default();
         state
-            .start_with(script, node, endpoint)
+            .start_with(script, node, endpoint, SupervisorLog::none())
             .expect("start supervisor");
         assert!(wait_for_probe(endpoint, BridgeProbe::Healthy));
         state.stop();
@@ -967,7 +1363,7 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
 
             let state = StandaloneBridgeState::default();
             state
-                .start_with(script, node.clone(), endpoint)
+                .start_with(script, node.clone(), endpoint, SupervisorLog::none())
                 .expect("start supervisor");
             thread::sleep(Duration::from_millis(1_250));
             assert!(!marker.exists(), "{label} listener was replaced");
@@ -1028,7 +1424,7 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
 
         let state = StandaloneBridgeState::default();
         state
-            .start_with(script, node, endpoint)
+            .start_with(script, node, endpoint, SupervisorLog::none())
             .expect("start supervisor");
         thread::sleep(Duration::from_millis(1_250));
         assert!(
@@ -1042,6 +1438,295 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
         assert!(marker.exists(), "standalone fallback never took ownership");
         state.stop();
         assert!(wait_for_probe(endpoint, BridgeProbe::Offline));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    fn fixture_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("gyredeck-{name}-{unique}"));
+        fs::create_dir_all(&directory).expect("fixture directory");
+        directory
+    }
+
+    fn log_lines(path: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON line"))
+            .collect()
+    }
+
+    #[test]
+    fn supervisor_log_lines_are_json_private_and_rotated() {
+        let directory = fixture_dir("supervisor-log");
+        let path = directory.join("nested").join("supervisor.log");
+        let log = SupervisorLog::at(Some(path.clone()));
+        let mut fields = serde_json::Map::new();
+        fields.insert("pid".to_string(), serde_json::Value::from(42));
+        log.record("started", fields);
+
+        let lines = log_lines(&path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["event"], "started");
+        assert_eq!(lines[0]["pid"], 42);
+        assert!(lines[0]["at"].as_str().expect("a timestamp").ends_with('Z'));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).expect("log").permissions().mode() & 0o777, 0o600);
+        }
+
+        // Past the cap the file is moved aside, once, and a fresh one begins. Filled with
+        // records each under the record cap, since one over it is replaced by a short line.
+        let padding = "x".repeat(SUPERVISOR_RECORD_MAX_BYTES - 200);
+        while fs::metadata(&path).expect("log").len() < SUPERVISOR_LOG_MAX_BYTES {
+            let mut fields = serde_json::Map::new();
+            fields.insert("padding".to_string(), serde_json::Value::String(padding.clone()));
+            log.record("padded", fields);
+        }
+        log.record("after", serde_json::Map::new());
+        let rotated = path.with_extension("log.1");
+        assert!(rotated.is_file(), "the full log was moved aside");
+        let lines = log_lines(&path);
+        assert_eq!(lines.len(), 1, "the live log restarted with the line written after rotation");
+        assert_eq!(lines[0]["event"], "after");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_log_with_no_path_writes_nothing_and_does_not_fail() {
+        SupervisorLog::none().record("started", serde_json::Map::new());
+    }
+
+    #[test]
+    fn stderr_tail_keeps_only_the_last_lines() {
+        let tail = StderrTail::default();
+        let text: String = (0..(BRIDGE_STDERR_TAIL_LINES + 5))
+            .map(|index| format!("line {index}\n"))
+            .collect();
+        tail.follow(std::io::Cursor::new(text.into_bytes()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tail.snapshot().len() < BRIDGE_STDERR_TAIL_LINES && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let kept = tail.snapshot();
+        assert_eq!(kept.len(), BRIDGE_STDERR_TAIL_LINES);
+        assert_eq!(kept.first().map(String::as_str), Some("line 5"));
+        assert_eq!(
+            kept.last().map(String::as_str),
+            Some(format!("line {}", BRIDGE_STDERR_TAIL_LINES + 4).as_str())
+        );
+    }
+
+    #[test]
+    fn a_kill_is_written_down_with_the_probes_that_led_to_it_and_the_last_stderr() {
+        let Some(node) = find_node_binary() else {
+            return;
+        };
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve test port");
+        let port = listener.local_addr().expect("test address").port();
+        drop(listener);
+        let endpoint = BridgeEndpoint {
+            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+        };
+        assert_eq!(probe_bridge(endpoint), BridgeProbe::Offline, "port {port}");
+        let directory = fixture_dir("bridge-kill");
+        let script = directory.join("bridge.mjs");
+        // Answers two health probes, says what it is about to do on stderr, then holds the
+        // event loop for good — the shape of the 2026-10-07 kills, where a synchronous read
+        // of a 50 MB log kept the bridge from answering.
+        fs::write(
+            &script,
+            r#"import { createServer } from 'node:http'
+const args = process.argv.slice(2)
+const port = Number(args[args.indexOf('--port') + 1])
+let answered = 0
+const server = createServer((request, response) => {
+  if (request.url === '/health') {
+    answered += 1
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({ ok: true, name: 'gyredeck', version: 2, mode: 'standalone' }))
+    if (answered === 2) {
+      console.error('bridge fixture: about to stall the event loop')
+      setTimeout(() => { for (;;) {} }, 50)
+    }
+    return
+  }
+  response.writeHead(404)
+  response.end()
+})
+server.listen(port, '127.0.0.1')
+process.stdin.resume()
+process.stdin.on('end', () => server.close(() => process.exit(0)))
+"#,
+        )
+        .expect("fixture script");
+        let log_path = directory.join("supervisor.log");
+
+        let state = StandaloneBridgeState::default();
+        state
+            .start_with(script, node, endpoint, SupervisorLog::at(Some(log_path.clone())))
+            .expect("start supervisor");
+        // The first bridge is killed after three failed probes, and a second one started in
+        // its place: the stall is in the fixture, so the second stalls too — one kill is
+        // enough to prove the record, and the second start proves the supervisor went on.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let lines = log_lines(&log_path);
+            let starts = lines.iter().filter(|line| line["event"] == "started").count();
+            if lines.iter().any(|line| line["event"] == "killed") && starts >= 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        state.stop();
+
+        let lines = log_lines(&log_path);
+        let killed = lines
+            .iter()
+            .find(|line| line["event"] == "killed")
+            .unwrap_or_else(|| panic!("a kill was written down: {lines:?}"));
+        let failures = killed["failures"].as_array().expect("the probes that led to it");
+        assert_eq!(failures.len(), usize::from(OWNED_BRIDGE_FAILURE_LIMIT));
+        for failure in failures {
+            assert_eq!(failure["probe"], "occupied", "a stalled bridge connects but does not answer");
+            assert_eq!(failure["reason"], "read_timeout", "and the reason says which half it failed at");
+            assert!(failure["tookMs"].as_u64().is_some());
+            assert!(failure["afterMs"].as_u64().is_some());
+        }
+        assert!(killed["pid"].as_u64().is_some());
+        assert!(killed["uptimeMs"].as_u64().is_some());
+        let stderr = killed["stderr"].as_array().expect("the bridge's last stderr");
+        assert!(
+            stderr.iter().any(|line| line.as_str() == Some("bridge fixture: about to stall the event loop")),
+            "what the bridge said before it was judged is beside the kill: {stderr:?}"
+        );
+        let first_start = lines.iter().position(|line| line["event"] == "started").expect("a start");
+        let kill_at = lines.iter().position(|line| line["event"] == "killed").expect("the kill");
+        assert!(first_start < kill_at, "started before killed");
+        assert!(
+            lines.iter().skip(kill_at).any(|line| line["event"] == "started"),
+            "a bridge was started again after the kill"
+        );
+        assert!(
+            lines.iter().any(|line| line["event"] == "stopped" || line["event"] == "exited"),
+            "the end of the supervisor is written down too: {lines:?}"
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stderr_tail_is_bounded_in_bytes_and_survives_bytes_that_are_not_text() {
+        // One 4 MiB line, then bytes that are not UTF-8, then a last word. `lines()` kept the
+        // whole 4 MiB and stopped at the bad bytes; Codex measured both.
+        let tail = StderrTail::default();
+        let mut text: Vec<u8> = Vec::new();
+        text.extend(std::iter::repeat(b'x').take(4 * 1024 * 1024));
+        text.push(b'\n');
+        text.extend_from_slice(b"good\n");
+        text.extend_from_slice(&[0xff, 0xfe, b'b', b'a', b'd', b'\n']);
+        text.extend_from_slice(b"last");
+        tail.follow(std::io::Cursor::new(text));
+        tail.drain(Duration::from_secs(10));
+        let kept = tail.snapshot();
+        assert_eq!(kept.len(), 4, "{kept:?}");
+        assert!(kept[0].starts_with(&"x".repeat(BRIDGE_STDERR_LINE_MAX_BYTES)));
+        assert!(kept[0].ends_with("more bytes cut]"), "the long line says it was cut: {}", &kept[0][kept[0].len() - 40..]);
+        assert!(kept[0].len() < BRIDGE_STDERR_LINE_MAX_BYTES + 64);
+        assert_eq!(kept[1], "good");
+        assert!(kept[2].ends_with("bad"), "decoded leniently, not dropped: {:?}", kept[2]);
+        assert_eq!(kept[3], "last", "the last word, with no newline after it, is kept");
+        let total: usize = kept.iter().map(String::len).sum();
+        assert!(total <= BRIDGE_STDERR_TAIL_MAX_BYTES);
+
+        // Many short lines: the byte bound, not only the line bound, decides what stays.
+        let tail = StderrTail::default();
+        let text: String = (0..BRIDGE_STDERR_TAIL_LINES).map(|index| format!("{index:0>400}\n")).collect();
+        tail.follow(std::io::Cursor::new(text.into_bytes()));
+        tail.drain(Duration::from_secs(10));
+        let kept = tail.snapshot();
+        assert!(kept.len() < BRIDGE_STDERR_TAIL_LINES);
+        assert!(kept.iter().map(String::len).sum::<usize>() <= BRIDGE_STDERR_TAIL_MAX_BYTES);
+        assert!(kept.last().expect("something kept").ends_with(&format!("{}", BRIDGE_STDERR_TAIL_LINES - 1)));
+    }
+
+    #[test]
+    fn a_log_left_readable_by_an_older_build_is_narrowed_before_it_is_moved_aside() {
+        let directory = fixture_dir("supervisor-log-narrow");
+        let path = directory.join("supervisor.log");
+        fs::write(&path, "x".repeat(SUPERVISOR_LOG_MAX_BYTES as usize)).expect("a full log");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("widen");
+        }
+        SupervisorLog::at(Some(path.clone())).record("after", serde_json::Map::new());
+        let rotated = path.with_extension("log.1");
+        assert!(rotated.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&rotated).expect("rotated").permissions().mode() & 0o777, 0o600, "moved aside private");
+            assert_eq!(fs::metadata(&path).expect("live").permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(log_lines(&path).len(), 1);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_record_too_large_for_the_file_is_replaced_by_a_line_that_says_so() {
+        let directory = fixture_dir("supervisor-log-record");
+        let path = directory.join("supervisor.log");
+        let mut fields = serde_json::Map::new();
+        fields.insert("blob".to_string(), serde_json::Value::String("y".repeat(SUPERVISOR_RECORD_MAX_BYTES)));
+        SupervisorLog::at(Some(path.clone())).record("huge", fields);
+        let lines = log_lines(&path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["event"], "huge");
+        assert_eq!(lines[0]["truncated"], true);
+        assert!(lines[0]["bytes"].as_u64().expect("size") > SUPERVISOR_RECORD_MAX_BYTES as u64);
+        assert!(lines[0].get("blob").is_none());
+        assert!(fs::metadata(&path).expect("log").len() < 1024);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_bridge_that_dies_on_its_own_is_written_down_with_its_last_words() {
+        let Some(node) = find_node_binary() else {
+            return;
+        };
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve test port");
+        let port = listener.local_addr().expect("test address").port();
+        drop(listener);
+        let endpoint = BridgeEndpoint {
+            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+        };
+        let directory = fixture_dir("bridge-dies");
+        let script = directory.join("bridge.mjs");
+        // Says why, and is gone — the words are still in the pipe when the exit is seen.
+        fs::write(&script, "console.error('bridge fixture: cannot bind, giving up')\nprocess.exit(3)\n").expect("fixture script");
+        let log_path = directory.join("supervisor.log");
+        let state = StandaloneBridgeState::default();
+        state
+            .start_with(script, node, endpoint, SupervisorLog::at(Some(log_path.clone())))
+            .expect("start supervisor");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && !log_lines(&log_path).iter().any(|line| line["event"] == "exited") {
+            thread::sleep(Duration::from_millis(100));
+        }
+        state.stop();
+        let lines = log_lines(&log_path);
+        let exited = lines.iter().find(|line| line["event"] == "exited").unwrap_or_else(|| panic!("{lines:?}"));
+        assert_eq!(exited["exit"]["code"], 3);
+        assert_eq!(exited["byGyredeck"], false);
+        let stderr = exited["stderr"].as_array().expect("stderr");
+        assert!(
+            stderr.iter().any(|line| line.as_str() == Some("bridge fixture: cannot bind, giving up")),
+            "the last words were read before the exit was written: {stderr:?}"
+        );
         let _ = fs::remove_dir_all(directory);
     }
 }

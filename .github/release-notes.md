@@ -1,5 +1,24 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A Codex session that was never a session no longer sits under COMPLETED — (v1.18.10)
+
+One fix, for a row that kept coming back.
+
+### Fixes
+
+- **Codex's own housekeeping no longer shows up as finished sessions.** Codex's terminal
+  takes a few helper turns of its own — naming a thread, writing a recap — in temporary
+  threads that live for a minute and keep no log. Each one told Gyredeck it had finished a
+  turn, and Gyredeck, hearing a finished turn from a thread it did not know, showed a
+  session: `Done · turn complete · Codex`, with no model, that no terminal matched and that
+  came back the next time Codex started. Thirty-three of them had collected under
+  COMPLETED by the time it was traced. A finished turn now counts as a session only when
+  there is something to show for it — a Codex hook that reported the thread itself, or a
+  session log Codex keeps for it under its own home — and a turn with neither is written
+  down as unclassified and withheld. The same rule is applied to what Gyredeck replays
+  when it starts, so the ones already on disk do not return; the rows that were already on
+  screen go with the group's clear button, once.
+
 ## A private message to Codex is answered even when it takes its time — (v1.18.9)
 
 One small fix for a case found while auditing v1.18.7, and older than it.

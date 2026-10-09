@@ -1,5 +1,25 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## When the bridge is restarted, Gyredeck now writes down why — (v1.18.8)
+
+Nothing changes in how Gyredeck looks or behaves. What changes is what is left behind when
+something goes wrong underneath it.
+
+### Fixes
+
+- **A bridge restart leaves a record.** Gyredeck keeps the bridge — the small local process
+  that carries sessions, usage and sync rooms — alive by checking on it every second, and
+  restarts it when three checks in a row go unanswered. Until now that restart was reported
+  only to a terminal nobody was watching, so when it happened three times in one afternoon
+  in early October, taking every sync room with it, there was nothing to look at afterwards
+  and the cause had to be caught in the act. Gyredeck now writes a private log at
+  `~/.config/gyredeck/gyredeck.supervisor.log`: every start, every stop, and every restart
+  with the three checks that led to it — what each one saw and how long it waited — and the
+  last lines the bridge printed before it was judged. A bridge that dies on its own is
+  written down the same way, with its exit code and its last words. The file is readable by
+  you alone, stays under a quarter of a megabyte, and nothing in the app reads it yet — it is
+  there for the day something needs explaining.
+
 ## Codex's answers go where they were asked, and a long turn can't take the bridge down — (v1.18.7)
 
 Two more faults in how Gyredeck reads Codex's answers, both found while fixing the room

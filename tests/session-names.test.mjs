@@ -75,6 +75,10 @@ test("what is known about a session survives a restart, and junk in the file doe
     const path = join(home, "kinds.json");
     await writeFile(path, JSON.stringify({
       good: { provider: "codexCliHook", cwd: "/Users/x/Workspace/thing" },
+      // Provenance is a boolean written by the bridge that heard the hook, and only
+      // `true` is evidence: a file from before the field, or anything else in it, is not.
+      heard: { provider: "codexCliHook", cwd: "/Users/x/Workspace/thing", hookReported: true },
+      claimed: { provider: "codexCliHook", cwd: "/Users/x/Workspace/thing", hookReported: "yes" },
       onlyCwd: { cwd: "/Users/x/other" },
       onlyProvider: { provider: "claudeCodeHook" },
       // A provider is a kind name, not free text: it reaches a room's roster, and a
@@ -84,10 +88,12 @@ test("what is known about a session survives a restart, and junk in the file doe
       wrong: "codexCliHook",
     }));
     const kinds = readSessionKinds(path);
-    assert.deepEqual(kinds.get("good"), { provider: "codexCliHook", cwd: "/Users/x/Workspace/thing" });
-    assert.deepEqual(kinds.get("onlyCwd"), { provider: null, cwd: "/Users/x/other" });
-    assert.deepEqual(kinds.get("onlyProvider"), { provider: "claudeCodeHook", cwd: null });
-    assert.deepEqual(kinds.get("shouty"), { provider: null, cwd: "/tmp/x" });
+    assert.deepEqual(kinds.get("good"), { provider: "codexCliHook", cwd: "/Users/x/Workspace/thing", hookReported: false });
+    assert.deepEqual(kinds.get("heard"), { provider: "codexCliHook", cwd: "/Users/x/Workspace/thing", hookReported: true });
+    assert.deepEqual(kinds.get("claimed"), { provider: "codexCliHook", cwd: "/Users/x/Workspace/thing", hookReported: false });
+    assert.deepEqual(kinds.get("onlyCwd"), { provider: null, cwd: "/Users/x/other", hookReported: false });
+    assert.deepEqual(kinds.get("onlyProvider"), { provider: "claudeCodeHook", cwd: null, hookReported: false });
+    assert.deepEqual(kinds.get("shouty"), { provider: null, cwd: "/tmp/x", hookReported: false });
     assert.equal(kinds.has("empty"), false);
     assert.equal(kinds.has("wrong"), false);
 

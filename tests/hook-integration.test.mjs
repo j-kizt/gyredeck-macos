@@ -2422,6 +2422,14 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
   // that still covers for it.
   const home = await mkdtemp(join(tmpdir(), "gyredeck-codex-both-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  // Every thread a notify names below is a real Codex thread, and a real thread has a
+  // rollout from the moment it starts. Without one the bridge now reads the notify as a
+  // temporary helper turn and ignores it (#139), which is not what this test is about.
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "10", "10");
+  await mkdir(rolloutDir, { recursive: true });
+  for (const thread of ["01a06082-8ef6-7900-ae39-44fe2e46dddd", "01a06082-8ef6-7900-ae39-44fe2e46eeee", "01a06082-8ef6-7900-ae39-44fe2e46aaff"]) {
+    await writeFile(join(rolloutDir, `rollout-2026-10-10T01-00-00-${thread}.jsonl`), "");
+  }
   // Resolved, because a hook reports the directory Codex is in and notify reports
   // `process.cwd()` — and on macOS the temp path is a symlink, so the two would
   // otherwise spell the same directory differently and never line up.
@@ -4819,6 +4827,10 @@ test("what a notify says about a session survives the bridge that heard it", asy
   await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
   const workspace = await realpath(await mkdtemp(join(tmpdir(), "gyredeck-replay-cwd-")));
   const thread = "01a06082-8ef6-7900-ae39-44fe2e4613aa";
+  // A real thread, so it has a rollout; a notify for one without is ignored since #139.
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "10", "10");
+  await mkdir(rolloutDir, { recursive: true });
+  await writeFile(join(rolloutDir, `rollout-2026-10-10T01-00-00-${thread}.jsonl`), "");
 
   const start = async () => {
     const stderrRef = { value: "" };
@@ -6086,5 +6098,332 @@ test("a late answer refused by a full room is published once the room is collect
     assert.equal((await room.saidInRoom()).filter((text) => text.startsWith("REFUSED-THEN-DELIVERED")).length, 1, "exactly once");
   } finally {
     await room.close();
+  }
+});
+
+/**
+ * A bridge in a fresh home for the two tests below, with a Codex rollout written for one
+ * thread so that "Codex keeps a rollout for it" is a thing the test can make true.
+ */
+const bridgeWithCodexHome = async ({ log = null, kinds = null, codexHome = null, env = {}, withRollout = randomUUID() } = {}) => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-notify-threads-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const rolloutDir = join(codexHome ?? join(home, ".codex"), "sessions", "2026", "10", "10");
+  await mkdir(rolloutDir, { recursive: true });
+  await writeFile(join(rolloutDir, `rollout-2026-10-10T01-00-00-${withRollout}.jsonl`), finishedTurn("hello"));
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  if (log !== null) await writeFile(join(home, ...CONFIG_DIR, "gyredeck.events.ndjson"), log);
+  if (kinds !== null) await writeFile(join(home, ...CONFIG_DIR, "gyredeck.session-kinds.json"), JSON.stringify(kinds));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home, ...env }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  await waitForHealth(port, stderrRef);
+  const kindsPath = join(home, ...CONFIG_DIR, "gyredeck.session-kinds.json");
+  return {
+    home, port, withRollout, stderrRef, rolloutDir,
+    completions: async () => {
+      const snapshot = await (await fetch(`http://127.0.0.1:${port}/snapshot`)).json();
+      return snapshot.recent.filter((event) => event.type === "turn_complete");
+    },
+    recent: async () => (await (await fetch(`http://127.0.0.1:${port}/snapshot`)).json()).recent,
+    kinds: async () => JSON.parse(await readFile(kindsPath, "utf8").catch(() => "{}")),
+    runNotify: (payload) => new Promise((resolve) => {
+      const child = spawn(
+        process.execPath,
+        [join(repoRoot, "adapters/codex/gyredeck-codex-notify.mjs"), JSON.stringify({
+          type: "agent-turn-complete", "last-assistant-message": "done", cwd: "/tmp/project", client: "codex-tui", ...payload,
+        })],
+        { cwd: home, env: { ...process.env, HOME: home }, stdio: ["ignore", "ignore", "pipe"] },
+      );
+      child.on("close", resolve);
+    }),
+    runHook: (event, sessionId, extra = {}) =>
+      runAdapter("adapters/codex/gyredeck-codex-hook.mjs", ["--event", event], home, {
+        session_id: sessionId, cwd: "/tmp/project", model: "gpt-5.6-luna", hook_event_name: event, ...extra,
+      }),
+    settle: () => new Promise((resolve) => setTimeout(resolve, 2_200)),
+    close: async () => {
+      bridge.stdin.end();
+      if (bridge.exitCode === null) bridge.kill();
+      await rm(home, { recursive: true, force: true });
+    },
+  };
+};
+
+test("a Codex notify for a thread nothing else knows creates no session", async () => {
+  // Codex's TUI takes helper turns (naming a thread, recapping it) in temporary threads
+  // that inherit `notify` but keep no rollout and fire no hook. Each one arrived as a
+  // finished Codex session with no model; 33 of them were under COMPLETED on the
+  // maintainer's machine (#139). The payload cannot tell them apart, so the rule is the
+  // other way round: a session is something a hook reported or Codex keeps a rollout for.
+  const bridge = await bridgeWithCodexHome();
+  try {
+    const helper = randomUUID();
+    await bridge.runNotify({ "thread-id": helper });
+    await bridge.settle();
+    let seen = await bridge.completions();
+    assert.equal(seen.length, 0, "a notify for an unknown thread with no rollout publishes nothing");
+    assert.ok(bridge.stderrRef.value.includes(`a Codex notify for thread ${helper}`) && bridge.stderrRef.value.includes("unclassified; completion withheld"), `said so on stderr: ${bridge.stderrRef.value}`);
+    assert.equal((await bridge.kinds())[helper], undefined, "and the thread is not written down as a session");
+
+    // A machine without the hooks adapter hears about sessions only through notify, and
+    // every one of those is a real thread with a rollout — kept, so that nothing is lost
+    // for the case notify exists for.
+    await bridge.runNotify({ "thread-id": bridge.withRollout });
+    await bridge.settle();
+    seen = await bridge.completions();
+    assert.equal(seen.length, 1, "a notify for a thread Codex keeps a rollout for is a session");
+    assert.equal(seen[0].conversationId, bridge.withRollout);
+    assert.equal(seen[0].runtime?.sourceKind, "codex-notify");
+
+    // A thread the hook has reported is a session whatever the sessions directory says:
+    // the hook's own activity is the evidence, and a stop that never comes must not
+    // silence the notify that covers for it (the rule the dedupe already keeps).
+    const hooked = randomUUID();
+    await bridge.runHook("PreToolUse", hooked, { tool_name: "Bash", tool_use_id: "exec-1", tool_input: { command: "ls" } });
+    await bridge.runNotify({ "thread-id": hooked });
+    await bridge.settle();
+    seen = await bridge.completions();
+    assert.equal(seen.length, 2, "a notify for a hook-reported thread is published");
+    assert.equal(seen[1].conversationId, hooked);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("a replayed log hands no helper-thread session back to the app", async () => {
+  // The same rule on restart. The bridge replays its log into the app's snapshot, so a
+  // helper turn recorded before the rule would otherwise come back as a session on every
+  // start — the row the maintainer kept clearing.
+  const ghost = randomUUID();
+  const hooked = randomUUID();
+  const notifyRuntime = { sourcePid: 7, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codex-notify" };
+  const hookRuntime = { sourcePid: 8, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" };
+  const at = new Date().toISOString();
+  const completion = (conversationId, runtime) => ({
+    version: 2, id: randomUUID(), type: "turn_complete", timestamp: at, conversationId, cwd: "/tmp/project", model: null, runtime,
+    data: { hookEventName: "Stop", source: "codex-notify", client: "codex-tui", message: "turn complete" },
+  });
+  const home = await bridgeWithCodexHome({
+    log: [
+      completion(ghost, notifyRuntime),
+      { version: 2, id: randomUUID(), type: "turn_start", timestamp: at, conversationId: hooked, cwd: "/tmp/project", runtime: hookRuntime, data: { inputCount: 1 } },
+      completion(hooked, notifyRuntime),
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+    kinds: { [ghost]: { provider: "codexCliHook", cwd: "/tmp/project" } },
+  });
+  // Written after the bridge is already running would not do: the rollout has to be on
+  // disk when the log is replayed, which is at start — so it goes in the fixture home
+  // before the bridge is spawned. `withRollout` is that thread.
+  try {
+    const recent = await home.recent();
+    const ids = new Set(recent.map((event) => event.conversationId));
+    assert.ok(!ids.has(ghost), "a notify-only thread with no rollout is not replayed");
+    assert.ok(ids.has(hooked), "a thread the hook reported keeps every event, the notify completion included");
+    assert.equal(recent.filter((event) => event.conversationId === hooked).length, 2);
+    let kinds = await home.kinds();
+    for (let attempt = 0; attempt < 60 && kinds[ghost] !== undefined; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      kinds = await home.kinds();
+    }
+    assert.equal(kinds[ghost], undefined, "and it is struck from what the bridge wrote down about sessions");
+  } finally {
+    await home.close();
+  }
+});
+
+test("a replayed notify-only thread that Codex keeps a rollout for is a session", async () => {
+  // The other half of the replay rule, so that it cannot be satisfied by dropping every
+  // notify-only thread: the one with a rollout is exactly what a machine without the
+  // hooks adapter has, and losing it on restart would lose every session it had.
+  const withRollout = randomUUID();
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-notify-replay-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "10", "10");
+  await mkdir(rolloutDir, { recursive: true });
+  await writeFile(join(rolloutDir, `rollout-2026-10-10T01-00-00-${withRollout}.jsonl`), finishedTurn("hello"));
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.events.ndjson"), JSON.stringify({
+    version: 2, id: randomUUID(), type: "turn_complete", timestamp: new Date().toISOString(), conversationId: withRollout, cwd: "/tmp/project", model: null,
+    runtime: { sourcePid: 7, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codex-notify" },
+    data: { hookEventName: "Stop", source: "codex-notify", client: "codex-tui", message: "turn complete" },
+  }) + "\n");
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  try {
+    await waitForHealth(port, stderrRef);
+    const recent = (await (await fetch(`http://127.0.0.1:${port}/snapshot`)).json()).recent;
+    assert.equal(recent.filter((event) => event.conversationId === withRollout).length, 1, "kept on replay");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a notify names a session on the hook's own evidence, not on a provider somebody wrote down", async () => {
+  // Codex's first audit of #139: `providerByConversation` says what a session *is*, and
+  // a notify-named thread is recorded there as `codexCliHook` too — so a thread the
+  // bridge had once heard from through notify alone, or read back from the kinds file,
+  // would have counted as hook-reported and gone straight through. Hook evidence is its
+  // own fact, written only by the hook's own events and persisted beside the kinds; an
+  // entry from before the field existed carries none.
+  const noProvenance = randomUUID();
+  const withProvenance = randomUUID();
+  const bridge = await bridgeWithCodexHome({
+    kinds: {
+      [noProvenance]: { provider: "codexCliHook", cwd: "/tmp/project" },
+      [withProvenance]: { provider: "codexCliHook", cwd: "/tmp/project", hookReported: true },
+    },
+  });
+  try {
+    await bridge.runNotify({ "thread-id": noProvenance });
+    await bridge.settle();
+    let seen = await bridge.completions();
+    assert.equal(seen.length, 0, "a kinds entry without provenance is not hook evidence");
+    assert.ok(bridge.stderrRef.value.includes(`a Codex notify for thread ${noProvenance}`) && bridge.stderrRef.value.includes("unclassified; completion withheld"));
+
+    await bridge.runNotify({ "thread-id": withProvenance });
+    await bridge.settle();
+    seen = await bridge.completions();
+    assert.equal(seen.length, 1, "one the hook reported, remembered across a restart, is");
+    assert.equal(seen[0].conversationId, withProvenance);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("hook evidence outlives the log it was in", async () => {
+  // The replay keeps the last 500 events. "Every retained event is a notify" is not "no
+  // hook ever reported it": a session the hook opened this morning, with a day's worth
+  // of other sessions' events behind it, has only its notify completion left in the
+  // tail. The bridge that heard the hook writes that down, and the next one reads it.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-provenance-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const kindsPath = join(home, ...CONFIG_DIR, "gyredeck.session-kinds.json");
+  const logPath = join(home, ...CONFIG_DIR, "gyredeck.events.ndjson");
+  const hooked = randomUUID();
+  const ghost = randomUUID();
+  const start = async () => {
+    const stderrRef = { value: "" };
+    const bridge = spawn(
+      process.execPath,
+      ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+      { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+    );
+    bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+    await waitForHealth(port, stderrRef);
+    return bridge;
+  };
+  const stop = (bridge) => new Promise((resolve) => {
+    bridge.on("exit", resolve);
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+  });
+  const kinds = async () => JSON.parse(await readFile(kindsPath, "utf8").catch(() => "{}"));
+  const notifyCompletion = (conversationId) => JSON.stringify({
+    version: 2, id: randomUUID(), type: "turn_complete", timestamp: new Date().toISOString(), conversationId, cwd: "/tmp/project", model: null,
+    runtime: { sourcePid: 7, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codex-notify" },
+    data: { hookEventName: "Stop", source: "codex-notify", client: "codex-tui", message: "turn complete" },
+  });
+
+  let bridge = await start();
+  try {
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const posted = await fetch(`http://127.0.0.1:${port}/ingest`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      body: JSON.stringify({
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId: hooked, cwd: "/tmp/project", model: "gpt-5.6-luna",
+        runtime: { sourcePid: 9, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" },
+        data: { inputCount: 1 },
+      }),
+    });
+    assert.equal(posted.status, 202);
+    let written = await kinds();
+    for (let attempt = 0; attempt < 60 && written[hooked]?.hookReported !== true; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      written = await kinds();
+    }
+    assert.equal(written[hooked]?.hookReported, true, "the bridge that heard the hook writes the provenance down");
+    await stop(bridge);
+
+    // Push the hook's event out of the replayed tail, then end both sessions through
+    // notify. The ghost is given a kinds entry of the old shape, as a bridge before this
+    // change would have left it: identity, no provenance.
+    const filler = [];
+    for (let index = 0; index < 600; index += 1) {
+      filler.push(JSON.stringify({
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: `filler-${index}`, cwd: "/tmp/elsewhere",
+        runtime: { sourcePid: 3, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 },
+      }));
+    }
+    await appendFile(logPath, filler.join("\n") + "\n" + notifyCompletion(hooked) + "\n" + notifyCompletion(ghost) + "\n");
+    written = await kinds();
+    written[ghost] = { provider: "codexCliHook", cwd: "/tmp/project" };
+    await writeFile(kindsPath, JSON.stringify(written));
+
+    bridge = await start();
+    const recent = (await (await fetch(`http://127.0.0.1:${port}/snapshot`)).json()).recent;
+    assert.ok(!recent.some((event) => event.conversationId === hooked && event.type === "turn_start"), "the fixture's premise: the hook's own event is gone from the tail");
+    assert.equal(recent.filter((event) => event.conversationId === hooked).length, 1, "the hooked session's completion is kept on the strength of what was written down");
+    assert.equal(recent.filter((event) => event.conversationId === ghost).length, 0, "the ghost's is not — its entry carries no provenance");
+    let after = await kinds();
+    for (let attempt = 0; attempt < 60 && after[ghost] !== undefined; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      after = await kinds();
+    }
+    assert.equal(after[ghost], undefined);
+    assert.equal(after[hooked]?.hookReported, true, "and the provenance survives the second bridge too");
+  } finally {
+    await stop(bridge);
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a rollout under CODEX_HOME counts, live and on replay", async () => {
+  // Codex's home is wherever Codex says it is. The harvest reading `~/.codex` only cost
+  // it a log; the same lookup deciding whether a notify is a session at all would cost
+  // the session.
+  const codexHome = await mkdtemp(join(tmpdir(), "gyredeck-codex-home-"));
+  const replayed = randomUUID();
+  const bridge = await bridgeWithCodexHome({
+    codexHome,
+    env: { CODEX_HOME: codexHome },
+    withRollout: replayed,
+    log: JSON.stringify({
+      version: 2, id: randomUUID(), type: "turn_complete", timestamp: new Date().toISOString(), conversationId: replayed, cwd: "/tmp/project", model: null,
+      runtime: { sourcePid: 7, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codex-notify" },
+      data: { hookEventName: "Stop", source: "codex-notify", client: "codex-tui", message: "turn complete" },
+    }) + "\n",
+  });
+  try {
+    assert.ok(!existsSync(join(bridge.home, ".codex", "sessions")), "the fixture's premise: nothing under ~/.codex");
+    const recent = await bridge.recent();
+    assert.equal(recent.filter((event) => event.conversationId === replayed).length, 1, "a replayed notify whose rollout is under CODEX_HOME is kept");
+
+    const live = randomUUID();
+    await writeFile(join(bridge.rolloutDir, `rollout-2026-10-10T01-00-01-${live}.jsonl`), "");
+    await bridge.runNotify({ "thread-id": live });
+    await bridge.settle();
+    const seen = await bridge.completions();
+    assert.equal(seen.filter((event) => event.conversationId === live).length, 1, "and a live one is published");
+  } finally {
+    await bridge.close();
+    await rm(codexHome, { recursive: true, force: true });
   }
 });

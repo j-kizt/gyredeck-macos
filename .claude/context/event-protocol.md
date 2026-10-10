@@ -196,6 +196,67 @@ Neither credential is per-session, so neither says *which* session is asking. Th
 
 So a secret held in a file, or handed over through the hooks as they work today, is not a security boundary — it only looks like one, which is worse than this paragraph. What would close it is a change of trust boundary rather than another credential: a native broker that attests the calling process through the OS and maps it to a conversation id, or agents separated by sandbox or account so that each session's secret lands somewhere the others cannot read. Either is real work with a real design, and until one exists this is a documented limit, not an oversight.
 
+### The mailbox broker — verified process identity plus first-claim session binding
+
+The change of trust boundary the paragraph above asks for, in three releases (#119, #136,
+#137; one tagged release, v1.19.0). The app listens on a Unix socket
+(`~/.config/gyredeck/broker/gyredeck.broker.sock`, directory 0700 and socket 0600, both this
+user's and never followed through a link) and, for every connection, asks the kernel who
+connected (`LOCAL_PEERTOKEN`, falling back to `LOCAL_PEERPID`), reads that process's
+ancestry with `proc_pidinfo` — past any shell, since Antigravity runs hooks through
+`sh -c` — and checks the first non-shell ancestor is a **known CLI running its vendor's
+signed code**: `claude` (`com.anthropic.claude-code`, Anthropic PBC) or `agy` (`cli`,
+Google LLC), verified in-process through the Security framework against the Developer ID
+requirement, no `codesign` forked. A process is keyed by pid, the kernel's never-reused
+unique id and its start time, and the peer is re-read after the check so a pid handed to
+something else meanwhile is served nothing.
+
+The protocol is one JSON object per line, under 4 KiB, within five seconds of connecting,
+eight connections at a time, versioned (`"v": 1`):
+
+| request | answer |
+| --- | --- |
+| `{"v":1,"bind":{"conversationId"}}` — from `SessionStart` / `UserPromptSubmit` (Claude Code) and every `PreInvocation` (Antigravity) | `{"ok":true,"bound":{"conversationId","pid","cli"}}` — the ancestor now speaks for that session |
+| `{"v":1,"collect":{"limit"}}` — the hook names no session | the bridge's `/mail/inbox` answer for the bound session, plus `"boundTo"` |
+| anything else, or an unversioned line | `{"ok":false,"error":…}` |
+
+Errors: `unsupported` (no attestation on this platform), `ineligible` (not a known CLI, or a
+known name whose code does not verify — an unsigned or locally built CLI), `unattested` (the
+OS could not name the peer, or the peer changed while it was being looked at), `unbound`,
+`conflict` (the id is held by another live process, or this process claimed two ids —
+then it is served nothing until it exits), `busy`, `timeout`, `too_long`, `invalid`.
+
+**Binding rules.** One session per process and one process per session. The first live
+claim holds; the same process claiming again is nothing new; a holder that has exited is
+replaced, which is a resumed session in a new process. A live holder is never evicted, and
+a process that claims a second id is **ambiguous**: it loses both and is refused every bind
+and collect until it exits. Eligibility is asked of the OS on every request, not remembered.
+
+**What the hook does with the answer.** It prefers the broker and falls back to TCP `?as=`
+only when there is no broker (no socket, nothing listening) or the broker says it cannot
+serve this process (`unsupported`, `ineligible`). Every other answer — `unbound`,
+`conflict`, a timeout, a line it could not read — withholds the mail for that turn and says
+so on stderr: falling back on a refusal would hand the hook exactly the bypass the broker
+exists to close.
+
+**What it is not.** The signature check says the process is a genuine `claude` or `agy`;
+the binding says it was the first such process to claim this id while it lives. Neither
+proves the id is *its*: a second genuine CLI claiming an id before its owner, or after the
+owner exits, is the hole that remains. Say *verified process identity plus first-claim
+session binding*, never *proof of identity*.
+
+**Codex needs no binding.** Its adapters never read mail — the bridge pushes into the thread
+(`codex queue`) and harvests the reply from the rollout — so a Codex session's mailbox has no
+legitimate external reader, and release 3 closes every external read of it outright. Should
+a Codex-spawned process ever need to read on its own, the daemon that spawns Codex's hooks
+is shared across threads and nothing in the hook's payload or environment is OS-verifiable:
+openai/codex#52783 asks for a per-thread capability.
+
+**Release 1 (this one)** ships the broker and hooks that prefer it; the bridge is unchanged
+and still serves `?as=` over TCP. Release 2 serves collect only when the broker vouches;
+release 3 closes TCP read and collect per session for the providers that bind, and for
+Codex.
+
 Requiring the machine token on `/snapshot` and `/events` would keep conversation ids away from a process that has no token at all. That is worth doing for its own sake, and it is **not** a fix for this: an attacker who can read the token reads the ids too.
 
 Reading a room takes both halves: its password **and** `?as=` naming a confirmed member. The password alone is not enough, because a session that has been disconnected still remembers it. This was written twice and the copies had drifted — the stream applied it and the backlog read beside it applied nothing, so a whole room could be read by anything that sent the header non-empty. It is one rule now.

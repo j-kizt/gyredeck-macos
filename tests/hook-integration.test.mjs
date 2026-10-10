@@ -4,6 +4,7 @@ import { appendFile, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeF
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { createServer } from "node:net";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 
@@ -6545,5 +6546,323 @@ test("a goal turn that began before the session was confirmed, or that spans a r
     assert.ok(!mailbox.includes("GOAL-WHILE-UNCONFIRMED") && !mailbox.includes("GOAL-ACROSS-REJOIN"), "and not the mailbox either");
   } finally {
     await room.close();
+  }
+});
+
+/**
+ * A broker that answers one line per connection, as the app's does, so the hook can be
+ * watched choosing between it and TCP. `answer(request)` returns the JSON to send back;
+ * every request is recorded.
+ */
+const fakeBroker = async (home, answer) => {
+  const dir = join(home, ...CONFIG_DIR, "broker");
+  await mkdir(dir, { recursive: true });
+  const path = join(dir, "gyredeck.broker.sock");
+  const requests = [];
+  const server = createServer((socket) => {
+    let text = "";
+    socket.on("data", (chunk) => {
+      text += chunk;
+      const end = text.indexOf("\n");
+      if (end < 0) return;
+      const request = JSON.parse(text.slice(0, end));
+      requests.push(request);
+      socket.end(`${JSON.stringify(answer(request))}\n`);
+    });
+  });
+  await new Promise((resolve) => server.listen(path, resolve));
+  return { requests, close: () => new Promise((resolve) => server.close(resolve)) };
+};
+
+test("a hook collects through the broker when it can, and falls back only when the broker is absent or declines", async () => {
+  // Release 1 of the broker (#119): the hook names no `?as=` when the app can say which
+  // process it is. Two answers send it back to TCP — no broker, or a broker that cannot
+  // serve this process (unsupported, ineligible). A refusal does not: falling back on
+  // `conflict` would hand the hook the bypass the broker exists to close.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-broker-hook-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const conversationId = "1a4f2c3e-0000-4d8c-9b3a-aa11bb22cc33";
+  const prompt = async () => {
+    const result = await runAdapter(
+      "adapters/claude/gyredeck-claude-hook.mjs",
+      ["--event", "UserPromptSubmit"],
+      home,
+      { hook_event_name: "UserPromptSubmit", session_id: conversationId, cwd: "/tmp/claude-project", prompt: "hi" },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    return { context: result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "", stderr: result.stderr };
+  };
+  // Closed in `finally` as well: a fake left listening after a failed assertion keeps the
+  // test runner alive forever, which is how a red run once looked like a hang.
+  let broker = null;
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const send = (text) => fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, { method: "POST", headers, body: JSON.stringify({ from: "codex", text, replyTo: "codex-room" }) });
+    const unread = async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/mail/inbox?as=${conversationId}`, { headers });
+      return ((await response.json()).messages ?? []).map((message) => message.text);
+    };
+
+    // 1. The broker serves the collect; the hook never touches `?as=` on TCP, so what is
+    //    waiting in the bridge's mailbox stays waiting — only what the broker handed over
+    //    reaches the prompt.
+    await send("ON-TCP-ONLY");
+    broker = await fakeBroker(home, (request) =>
+      request.collect
+        ? { v: 1, ok: true, messages: [{ seq: 1, from: "codex", text: "VIA-BROKER", replyTo: "codex-room", ts: new Date().toISOString() }], boundTo: conversationId }
+        : { v: 1, ok: true, bound: { conversationId: request.bind.conversationId, pid: 1 } });
+    let delivered = await prompt();
+    assert.match(delivered.context, /VIA-BROKER/, delivered.stderr);
+    assert.doesNotMatch(delivered.context, /ON-TCP-ONLY/, "nothing was taken over TCP");
+    assert.deepEqual(await unread(), ["ON-TCP-ONLY"], "the bridge's mailbox was not collected");
+    assert.deepEqual(broker.requests.map((request) => Object.keys(request).filter((key) => key !== "v")), [["bind"], ["collect"]], "bound first, then collected, both at protocol 1");
+    assert.ok(broker.requests.every((request) => request.v === 1));
+    assert.equal(broker.requests[0].bind.conversationId, conversationId);
+    assert.equal(broker.requests[1].collect.limit, 10, "the hook's own cap goes to the broker");
+    await broker.close();
+
+    // 2. `unsupported` is the seam on another platform: back to TCP, and the mailbox drains.
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "unsupported", message: "not here" }));
+    delivered = await prompt();
+    assert.match(delivered.context, /ON-TCP-ONLY/, delivered.stderr);
+    assert.deepEqual(await unread(), [], "collected over TCP");
+    await broker.close();
+
+    // 3. `ineligible` likewise — an unsigned CLI keeps its TCP path.
+    await send("AFTER-INELIGIBLE");
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "ineligible", message: "unsigned" }));
+    delivered = await prompt();
+    assert.match(delivered.context, /AFTER-INELIGIBLE/, delivered.stderr);
+    await broker.close();
+
+    // 4. A refusal is not a fallback. `conflict` (and `unbound`, `denied`, a timeout) withhold
+    //    the mail for this turn; the bridge's mailbox is left exactly as it was.
+    await send("WITHHELD");
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "conflict", message: "two claims" }));
+    delivered = await prompt();
+    assert.equal(delivered.context, "", "nothing reached the prompt");
+    assert.match(delivered.stderr, /mail withheld this turn — conflict/);
+    assert.deepEqual(await unread(), ["WITHHELD"], "and nothing was taken over TCP");
+    await broker.close();
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" }));
+    delivered = await prompt();
+    assert.equal(delivered.context, "");
+    assert.deepEqual(await unread(), ["WITHHELD"]);
+    await broker.close();
+
+    broker = null;
+    // 5. No broker at all: TCP, as every hook before this one.
+    delivered = await prompt();
+    assert.match(delivered.context, /WITHHELD/, delivered.stderr);
+    assert.deepEqual(await unread(), []);
+  } finally {
+    if (broker) await broker.close();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("the Antigravity hook takes the same path to the broker", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-broker-agy-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const conversationId = "agy-1a4f2c3e-0000-4d8c-9b3a-aa11bb22cc33";
+  const invoke = async () => {
+    const result = await runAdapter(
+      "adapters/antigravity/gyredeck-agy-hook.mjs",
+      ["--event", "PreInvocation"],
+      home,
+      { conversationId, invocationNum: 1, cwd: "/tmp/agy-project" },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const steps = JSON.parse(result.stdout).injectSteps ?? [];
+    return { text: steps.map((step) => step.ephemeralMessage ?? step.userMessage ?? "").join("\n"), stderr: result.stderr };
+  };
+  let broker = null;
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const unread = async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/mail/inbox?as=${conversationId}`, { headers });
+      return ((await response.json()).messages ?? []).map((message) => message.text);
+    };
+    await fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, { method: "POST", headers, body: JSON.stringify({ from: "codex", text: "AGY-ON-TCP", replyTo: "codex-room" }) });
+
+    broker = await fakeBroker(home, (request) =>
+      request.collect
+        ? { v: 1, ok: true, messages: [{ seq: 1, from: "codex", text: "AGY-VIA-BROKER", replyTo: "codex-room", ts: new Date().toISOString() }], boundTo: conversationId }
+        : { v: 1, ok: true, bound: { conversationId: request.bind.conversationId, pid: 1 } });
+    let delivered = await invoke();
+    assert.match(delivered.text, /AGY-VIA-BROKER/, delivered.stderr);
+    assert.deepEqual(await unread(), ["AGY-ON-TCP"], "TCP untouched");
+    assert.deepEqual(broker.requests.map((request) => Object.keys(request).filter((key) => key !== "v")), [["bind"], ["collect"]]);
+    await broker.close();
+
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "conflict", message: "two claims" }));
+    delivered = await invoke();
+    assert.doesNotMatch(delivered.text, /AGY-ON-TCP/, "withheld, not fetched over TCP");
+    assert.match(delivered.stderr, /mail withheld this turn/);
+    assert.deepEqual(await unread(), ["AGY-ON-TCP"]);
+    await broker.close();
+    broker = null;
+
+    delivered = await invoke();
+    assert.match(delivered.text, /AGY-ON-TCP/, "no broker: TCP as before");
+  } finally {
+    if (broker) await broker.close();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a hook believes the broker only when the answer is for it, and never collects after a refused bind", async () => {
+  // Codex's adapter audit of PR1: a refused bind must end the drain — collecting anyway
+  // and injecting whatever came back put session A's mail into session B's prompt in the
+  // fixture; an answer with the wrong version or the wrong `boundTo` is somebody else's
+  // mail or another protocol and is withheld, not used and not fallen back from; and a
+  // Thai character split across two socket chunks must arrive whole.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-broker-trust-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const conversationId = "2b5e3d4f-0000-4d8c-9b3a-aa11bb22cc33";
+  const prompt = async () => {
+    const result = await runAdapter(
+      "adapters/claude/gyredeck-claude-hook.mjs",
+      ["--event", "UserPromptSubmit"],
+      home,
+      { hook_event_name: "UserPromptSubmit", session_id: conversationId, cwd: "/tmp/claude-project", prompt: "hi" },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    return { context: result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "", stderr: result.stderr };
+  };
+  const message = (text) => ({ seq: 1, from: "codex", text, replyTo: "codex-room", ts: new Date().toISOString() });
+  let broker = null;
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    await fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, { method: "POST", headers, body: JSON.stringify({ from: "codex", text: "ON-TCP", replyTo: "codex-room" }) });
+    const unread = async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/mail/inbox?as=${conversationId}`, { headers });
+      return ((await response.json()).messages ?? []).map((m) => m.text);
+    };
+
+    // A refused bind ends the drain: no collect is sent, nothing is injected, TCP untouched.
+    broker = await fakeBroker(home, (request) =>
+      request.bind
+        ? { v: 1, ok: false, error: "conflict", message: "held by another" }
+        : { v: 1, ok: true, messages: [message("SOMEBODY-ELSES-MAIL")], boundTo: "another-session" });
+    let delivered = await prompt();
+    assert.equal(delivered.context, "", delivered.stderr);
+    assert.match(delivered.stderr, /mail withheld this turn — conflict/);
+    assert.deepEqual(broker.requests.map((r) => Object.keys(r).filter((k) => k !== "v")), [["bind"]], "no collect after a refused bind");
+    assert.deepEqual(await unread(), ["ON-TCP"]);
+    await broker.close();
+
+    // The wrong version is another protocol: withheld, not used, not fallen back from.
+    broker = await fakeBroker(home, (request) =>
+      request.bind ? { v: 1, ok: true, bound: { conversationId, pid: 1 } } : { v: 999, ok: true, messages: [message("FUTURE-PROTOCOL")], boundTo: conversationId });
+    delivered = await prompt();
+    assert.equal(delivered.context, "", delivered.stderr);
+    assert.match(delivered.stderr, /mail withheld this turn/);
+    assert.deepEqual(await unread(), ["ON-TCP"]);
+    await broker.close();
+
+    // Mail bound to another session is not this hook's whatever the broker says.
+    broker = await fakeBroker(home, (request) =>
+      request.bind ? { v: 1, ok: true, bound: { conversationId, pid: 1 } } : { v: 1, ok: true, messages: [message("NOT-MINE")], boundTo: "another-session" });
+    delivered = await prompt();
+    assert.equal(delivered.context, "", delivered.stderr);
+    assert.match(delivered.stderr, /mail withheld this turn/);
+    assert.deepEqual(await unread(), ["ON-TCP"]);
+    await broker.close();
+
+    // A broker that keeps the socket busy without ever finishing its line is cut off at
+    // the hook's deadline, and the mail is withheld — not fetched over TCP instead.
+    {
+      const dir = join(home, ...CONFIG_DIR, "broker");
+      const path = join(dir, "gyredeck.broker.sock");
+      const server = createServer((socket) => {
+        // The hook will hang up first; a write after that is EPIPE, which is the point.
+        socket.on("error", () => {});
+        const drip = setInterval(() => { if (!socket.destroyed) socket.write(" "); }, 200);
+        const stop = setTimeout(() => { clearInterval(drip); if (!socket.destroyed) socket.end(); }, 3_000);
+        socket.on("close", () => { clearInterval(drip); clearTimeout(stop); });
+      });
+      await new Promise((resolve) => server.listen(path, resolve));
+      broker = { requests: [], close: () => new Promise((resolve) => server.close(resolve)) };
+      const started = Date.now();
+      delivered = await prompt();
+      const took = Date.now() - started;
+      assert.equal(delivered.context, "", delivered.stderr);
+      assert.match(delivered.stderr, /mail withheld this turn — the broker did not answer in time/);
+      assert.ok(took < 2_600, `cut off at the deadline, not when the broker felt like closing (${took} ms)`);
+      assert.deepEqual(await unread(), ["ON-TCP"], "and not fetched over TCP");
+      await broker.close();
+    }
+
+    // A Thai character cut in two by the socket arrives whole.
+    const thai = "ข้อความภาษาไทย ทดสอบ";
+    const dir = join(home, ...CONFIG_DIR, "broker");
+    const path = join(dir, "gyredeck.broker.sock");
+    const requests = [];
+    const server = createServer((socket) => {
+      let text = "";
+      socket.on("data", (chunk) => {
+        text += chunk;
+        if (!text.includes("\n")) return;
+        const request = JSON.parse(text.slice(0, text.indexOf("\n")));
+        requests.push(request);
+        const answer = request.bind
+          ? { v: 1, ok: true, bound: { conversationId, pid: 1 } }
+          : { v: 1, ok: true, messages: [message(thai)], boundTo: conversationId };
+        const bytes = Buffer.from(`${JSON.stringify(answer)}\n`);
+        // Cut inside the first multi-byte character of the Thai text.
+        const cut = bytes.indexOf(Buffer.from("ข")) + 1;
+        socket.write(bytes.subarray(0, cut));
+        setTimeout(() => socket.end(bytes.subarray(cut)), 30);
+      });
+    });
+    await new Promise((resolve) => server.listen(path, resolve));
+    broker = { requests, close: () => new Promise((resolve) => server.close(resolve)) };
+    delivered = await prompt();
+    assert.ok(delivered.context.includes(thai), `the text arrived whole: ${JSON.stringify(delivered.context.slice(0, 200))} ${delivered.stderr}`);
+    await broker.close();
+    broker = null;
+  } finally {
+    if (broker) await broker.close();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
   }
 });

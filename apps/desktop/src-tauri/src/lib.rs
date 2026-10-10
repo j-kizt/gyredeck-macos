@@ -5747,6 +5747,25 @@ pub fn run() {
             let preference = read_display_preference(app.handle());
             app.state::<DisplayPreferenceState>().set(preference);
 
+            // The broker's secret is minted before the bridge starts, so every bridge hears
+            // it on its stdin before it serves. Without one the broker is not started at
+            // all: hooks find no socket and use the old path, the bridge protects nothing,
+            // and `/health` says `vouching: false` — the world before #136, said out loud,
+            // never a broker that collects plain.
+            let broker_secret = match app.state::<broker::BrokerState>().secret() {
+                Ok(secret) => Some(secret),
+                Err(error) => {
+                    eprintln!("Gyredeck mailbox broker is disabled, no secret could be minted: {error}");
+                    None
+                }
+            };
+            if let Some(secret) = broker_secret.as_ref() {
+                let bindings = std::sync::Arc::clone(&app.state::<broker::BrokerState>().bindings);
+                app.state::<StandaloneBridgeState>().set_broker_handshake(standalone_bridge::BrokerHandshake {
+                    secret: secret.clone(),
+                    protected: std::sync::Arc::new(move || bindings.lock().map(|table| table.protected()).unwrap_or_default()),
+                });
+            }
             match app.path().resolve(
                 "gyredeck-bridge.mjs",
                 tauri::path::BaseDirectory::Resource,
@@ -5761,14 +5780,26 @@ pub fn run() {
                 }
             }
             // The mailbox broker listens beside the bridge. A collect it has decided on is
-            // one bridge call with the machine token, for the session the OS bound.
-            if let Err(error) = app.state::<broker::BrokerState>().start_default(std::sync::Arc::new(
-                |session: &str, limit: u64| {
-                    let path = format!("/mail/inbox?as={session}&collect=1&limit={limit}");
-                    standalone_bridge::bridge_request("GET", &path, None).map(|(_, body)| body)
-                },
-            )) {
-                eprintln!("Gyredeck mailbox broker is unavailable: {error}");
+            // one bridge call with the machine token and the broker's word, for the session
+            // the OS bound; a bind is answered only once the bridge acknowledged it, so the
+            // bridge can refuse that session's old path from then on.
+            if let Some(secret) = broker_secret {
+                let collect = {
+                    let secret = secret.clone();
+                    std::sync::Arc::new(move |session: &str, limit: u64| {
+                        let path = format!("/mail/inbox?as={session}&collect=1&limit={limit}");
+                        standalone_bridge::bridge_request_vouched("GET", &path, None, &secret).map(|(_, body)| body)
+                    })
+                };
+                let report_bound = std::sync::Arc::new(move |session: &str| {
+                    let body = serde_json::json!({ "conversationId": session }).to_string();
+                    standalone_bridge::bridge_request_vouched("POST", "/broker/bound", Some(body), &secret).and_then(
+                        |(status, body)| if status == 200 { Ok(()) } else { Err(format!("HTTP {status}: {body}")) },
+                    )
+                });
+                if let Err(error) = app.state::<broker::BrokerState>().start_default(collect, report_bound) {
+                    eprintln!("Gyredeck mailbox broker is unavailable: {error}");
+                }
             }
 
             if let Some(window) = app.get_webview_window("main") {

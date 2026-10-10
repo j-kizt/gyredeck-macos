@@ -44,6 +44,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IN_FLIGHT: usize = 8;
 /// How many sessions may be bound at once. One per live CLI; a flood is refused, not grown.
 const MAX_BINDINGS: usize = 512;
+/// How many sessions the protection ledger holds before a new one is refused. It is
+/// append-only for the life of the app — nothing in it is ever served the old path again
+/// — so past the cap a bind fails closed rather than a member falling out.
+const MAX_PROTECTED: usize = 65_536;
 /// How many shells the walk steps past between the hook and the CLI that ran it.
 const MAX_SHELL_DEPTH: usize = 4;
 /// The most messages one collect may take, whatever the hook asks.
@@ -152,6 +156,12 @@ pub(crate) type Liveness = Arc<dyn Fn(ProcessKey) -> bool + Send + Sync>;
 pub(crate) type ChainCheck = Arc<dyn Fn(&Peer) -> bool + Send + Sync>;
 /// What a collect does once the broker has decided whose mailbox it is: the bridge call.
 pub(crate) type Collector = Arc<dyn Fn(&str, u64) -> Result<Value, String> + Send + Sync>;
+/// What a bind tells the bridge: that this session now reads through the broker, so a
+/// collect for it that arrives the old way is an outdated hook (#136). A bind the bridge
+/// did not acknowledge is not answered `ok`: the hook withholds the mail for that turn and
+/// claims again on the next, rather than being told it is protected while the bridge
+/// still serves the old path.
+pub(crate) type BoundReporter = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 /// Everything a running broker needs that is not the socket.
 #[derive(Clone)]
@@ -160,6 +170,7 @@ pub(crate) struct Policy {
     pub alive: Liveness,
     pub chain_holds: ChainCheck,
     pub collect: Collector,
+    pub report_bound: BoundReporter,
 }
 
 /// The sessions bound to processes, both ways, and the rules that govern them.
@@ -170,6 +181,17 @@ pub(crate) struct Bindings {
     /// Processes that claimed a second session while bound to a first. The broker does not
     /// pick which of the two was meant: such a process is served nothing until it exits.
     ambiguous: std::collections::HashSet<ProcessKey>,
+    /// The protection ledger: every session a bind ever admitted, whether or not its
+    /// holder is still bound — a holder that turned ambiguous loses its binding, not the
+    /// session's protection. Append-only; what a freshly spawned bridge is told to refuse
+    /// the old path for. Written under the same lock as the binding and before the bridge
+    /// is told, so a snapshot taken at any moment holds every session any bridge has
+    /// acknowledged or will.
+    protected: std::collections::HashSet<String>,
+    /// The sessions a bridge has acknowledged as protected. A collect is served only for
+    /// one of these: a claim the bridge never heard is a pending claim, not a binding the
+    /// hook may read through.
+    acknowledged: std::collections::HashSet<String>,
 }
 
 /// Why a bind was refused.
@@ -220,8 +242,12 @@ impl Bindings {
         if self.by_process.len() + self.ambiguous.len() >= MAX_BINDINGS {
             return Err(BindRefusal::Full);
         }
+        if !self.protected.contains(session) && self.protected.len() >= MAX_PROTECTED {
+            return Err(BindRefusal::Full);
+        }
         self.by_session.insert(session.to_string(), holder);
         self.by_process.insert(holder, session.to_string());
+        self.protected.insert(session.to_string());
         Ok(())
     }
 
@@ -254,6 +280,24 @@ impl Bindings {
 
     pub(crate) fn len(&self) -> usize {
         self.by_session.len()
+    }
+
+    /// The protection ledger, sorted — what a freshly spawned bridge is told to refuse the
+    /// old path for. Over-telling is safe: a session the broker admitted once reads
+    /// through it.
+    pub(crate) fn protected(&self) -> Vec<String> {
+        let mut sessions: Vec<String> = self.protected.iter().cloned().collect();
+        sessions.sort();
+        sessions
+    }
+
+    /// The bridge acknowledged that this session is protected: collects may be served.
+    pub(crate) fn acknowledge(&mut self, session: &str) {
+        self.acknowledged.insert(session.to_string());
+    }
+
+    pub(crate) fn is_acknowledged(&self, session: &str) -> bool {
+        self.acknowledged.contains(session)
     }
 
     /// Everything the broker remembers: bound and ambiguous identities together.
@@ -311,14 +355,31 @@ pub(crate) fn handle_request(
         let Some(session) = bind.get("conversationId").and_then(Value::as_str).filter(|id| is_session_id(id)) else {
             return refused("invalid", "bind needs a conversationId.".to_string());
         };
-        let Ok(mut table) = bindings.lock() else {
-            return refused("busy", "The broker's table is unavailable.".to_string());
+        let bound = {
+            let Ok(mut table) = bindings.lock() else {
+                return refused("busy", "The broker's table is unavailable.".to_string());
+            };
+            table.bind(session, peer.ancestor, &*policy.alive)
         };
-        return match table.bind(session, peer.ancestor, &*policy.alive) {
-            Ok(()) => json!({
-                "v": PROTOCOL_VERSION, "ok": true,
-                "bound": { "conversationId": session, "pid": peer.ancestor.pid, "cli": cli.label() },
-            }),
+        return match bound {
+            // The ledger already holds the session; the bridge is told without the table
+            // locked, since telling it is a network call. Until the bridge acknowledges,
+            // the claim is pending: not answered ok, and not served a collect.
+            Ok(()) => match (policy.report_bound)(session) {
+                Ok(()) => {
+                    if let Ok(mut table) = bindings.lock() {
+                        table.acknowledge(session);
+                    }
+                    json!({
+                        "v": PROTOCOL_VERSION, "ok": true,
+                        "bound": { "conversationId": session, "pid": peer.ancestor.pid, "cli": cli.label() },
+                    })
+                }
+                Err(message) => refused(
+                    "bridge",
+                    format!("The bridge did not acknowledge that {session} is bound ({message}); mail is withheld until it does."),
+                ),
+            },
             Err(BindRefusal::Conflict { session: held, holder }) => refused(
                 "conflict",
                 format!("Session {held} is bound to live process {}; a second process cannot take it while that one runs.", holder.pid),
@@ -345,7 +406,12 @@ pub(crate) fn handle_request(
             if table.is_ambiguous(peer.ancestor) {
                 return refused("conflict", format!("Process {} claimed two sessions; it is served nothing until it exits.", peer.ancestor.pid));
             }
-            table.session_of(peer.ancestor).map(str::to_string)
+            match table.session_of(peer.ancestor) {
+                Some(session) if !table.is_acknowledged(session) => {
+                    return refused("bridge", format!("The bridge has not acknowledged that {session} is bound; bind again before collecting."));
+                }
+                session => session.map(str::to_string),
+            }
         };
         let Some(session) = session else {
             return refused("unbound", format!("Process {} ({}) is bound to no session; bind first, from a hook of the same process.", peer.ancestor.pid, cli.label()));
@@ -379,9 +445,22 @@ pub(crate) struct BrokerHandle {
 pub(crate) struct BrokerState {
     handle: Mutex<Option<BrokerHandle>>,
     pub(crate) bindings: Arc<Mutex<Bindings>>,
+    secret: Mutex<Option<String>>,
 }
 
 impl BrokerState {
+    /// The broker's secret for this run: 32 random bytes as hex, minted once, kept in
+    /// memory, handed to the bridge on its stdin and sent back on every vouched call.
+    pub(crate) fn secret(&self) -> Result<String, String> {
+        let mut slot = self.secret.lock().map_err(|_| "Broker state is unavailable".to_string())?;
+        if let Some(secret) = slot.as_ref() {
+            return Ok(secret.clone());
+        }
+        let secret = platform::random_hex(32)?;
+        *slot = Some(secret.clone());
+        Ok(secret)
+    }
+
     /// Listen at the given path with the given policy.
     pub(crate) fn start(&self, path: PathBuf, policy: Policy) -> Result<(), String> {
         let mut handle = self
@@ -405,7 +484,7 @@ impl BrokerState {
     }
 
     /// The production policy: the OS answers eligibility and liveness, the bridge collects.
-    pub(crate) fn start_default(&self, collect: Collector) -> Result<(), String> {
+    pub(crate) fn start_default(&self, collect: Collector, report_bound: BoundReporter) -> Result<(), String> {
         let path = broker_socket_path().ok_or_else(|| "HOME is not set".to_string())?;
         self.start(
             path,
@@ -414,6 +493,7 @@ impl BrokerState {
                 alive: Arc::new(|key: ProcessKey| platform::process_key(key.pid).is_some_and(|now| now == key)),
                 chain_holds: Arc::new(platform::chain_holds),
                 collect,
+                report_bound,
             },
         )
     }
@@ -554,6 +634,15 @@ mod platform {
     pub(super) type Connection = UnixStream;
     /// Device and inode of the socket this broker created.
     pub(super) type SocketIdentity = (u64, u64);
+
+    /// `n` random bytes from the system's generator, as lowercase hex.
+    pub(super) fn random_hex(n: usize) -> Result<String, String> {
+        let mut bytes = vec![0_u8; n];
+        security_framework::random::SecRandom::default()
+            .copy_bytes(&mut bytes)
+            .map_err(|error| format!("No randomness for the broker's secret: {error}"))?;
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
 
     const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "ksh"];
 
@@ -830,6 +919,9 @@ mod platform {
     pub(super) type SocketIdentity = (u64, u64);
 
     pub(super) fn remove_own_socket(_path: &Path, _identity: SocketIdentity) {}
+    pub(super) fn random_hex(_n: usize) -> Result<String, String> {
+        Err("The mailbox broker is only available on macOS".to_string())
+    }
 
     pub(super) fn listen(_path: &Path) -> Result<(Listener, SocketIdentity), String> {
         Err("The mailbox broker is only available on macOS".to_string())
@@ -875,6 +967,7 @@ mod tests {
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
             collect: Arc::new(|session: &str, limit: u64| Ok(json!({ "ok": true, "messages": [], "askedFor": session, "limit": limit }))),
+            report_bound: Arc::new(|_| Ok(())),
         }
     }
 
@@ -1027,10 +1120,142 @@ mod tests {
             // the middle was replaced; the OS no longer describes what connected.
             chain_holds: Arc::new(|_| false),
             collect: Arc::new(|_, _| Ok(json!({ "ok": true }))),
+            report_bound: Arc::new(|_| Ok(())),
         };
         let claude = peer(42, 40, "claude");
         assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s" } }), Some(&claude), &bindings, &policy)["error"], "unattested");
         assert_eq!(bindings.lock().unwrap().len(), 0, "nothing was bound on its behalf");
+    }
+
+    #[test]
+    fn a_bind_is_answered_ok_only_once_the_bridge_acknowledged_it() {
+        let bindings = Mutex::new(Bindings::default());
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let fail_next = Arc::new(Mutex::new(false));
+        let policy = Policy {
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            alive: Arc::new(|_| true),
+            chain_holds: Arc::new(|_| true),
+            collect: Arc::new(|_, _| Ok(json!({ "ok": true }))),
+            report_bound: Arc::new({
+                let reported = Arc::clone(&reported);
+                let fail_next = Arc::clone(&fail_next);
+                move |session: &str| {
+                    reported.lock().unwrap().push(session.to_string());
+                    if *fail_next.lock().unwrap() { Err("bridge down".into()) } else { Ok(()) }
+                }
+            }),
+        };
+        let claude = peer(42, 40, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&claude), &bindings, &policy)["ok"], true);
+        assert_eq!(*reported.lock().unwrap(), vec!["s1".to_string()], "the bridge is told which session is bound");
+        *fail_next.lock().unwrap() = true;
+        let unheard = ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&claude), &bindings, &policy);
+        assert_eq!(unheard["error"], "bridge", "a bind the bridge did not acknowledge is not answered ok");
+        assert_eq!(reported.lock().unwrap().len(), 2);
+        assert_eq!(bindings.lock().unwrap().protected(), vec!["s1".to_string()], "the ledger keeps the session for the next claim");
+        *fail_next.lock().unwrap() = false;
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&claude), &bindings, &policy)["ok"], true, "and the next claim is reported again");
+        assert_eq!(reported.lock().unwrap().len(), 3);
+        let other = peer(52, 50, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&other), &bindings, &policy)["error"], "conflict");
+        assert_eq!(reported.lock().unwrap().len(), 3, "a refused bind is not reported");
+    }
+
+    #[test]
+    fn a_claim_the_bridge_never_acknowledged_is_served_no_collect() {
+        // A bind during a bridge restart: the claim is in the ledger, the bridge did not
+        // hear it. Until a later claim is acknowledged, a collect is refused — the hook
+        // withholds rather than reading through a binding the bridge does not enforce.
+        let bindings = Mutex::new(Bindings::default());
+        let bridge_up = Arc::new(Mutex::new(false));
+        let policy = Policy {
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            alive: Arc::new(|_| true),
+            chain_holds: Arc::new(|_| true),
+            collect: Arc::new(|_, _| Ok(json!({ "ok": true, "messages": [] }))),
+            report_bound: Arc::new({
+                let bridge_up = Arc::clone(&bridge_up);
+                move |_: &str| if *bridge_up.lock().unwrap() { Ok(()) } else { Err("connection refused".into()) }
+            }),
+        };
+        let claude = peer(42, 40, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&claude), &bindings, &policy)["error"], "bridge");
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy)["error"], "bridge", "a pending claim is not a binding to read through");
+        *bridge_up.lock().unwrap() = true;
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&claude), &bindings, &policy)["ok"], true);
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy)["boundTo"], "s1");
+    }
+
+    #[test]
+    fn a_bind_that_spans_a_bridge_restart_is_in_the_snapshot_or_acknowledged_by_the_new_bridge() {
+        // The transition itself: bridge A acknowledges s1; A dies; s2 is claimed while
+        // nothing listens; B is spawned from a snapshot; B acknowledges the next claim.
+        // Both sessions are in the snapshot B was handed, and neither hook read through a
+        // claim no bridge enforced.
+        let bindings = Mutex::new(Bindings::default());
+        let bridge = Arc::new(Mutex::new(Some("A")));
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let policy = Policy {
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            alive: Arc::new(|_| true),
+            chain_holds: Arc::new(|_| true),
+            collect: Arc::new(|_, _| Ok(json!({ "ok": true, "messages": [] }))),
+            report_bound: Arc::new({
+                let bridge = Arc::clone(&bridge);
+                let heard = Arc::clone(&heard);
+                move |session: &str| match *bridge.lock().unwrap() {
+                    Some(name) => { heard.lock().unwrap().push(format!("{name}:{session}")); Ok(()) }
+                    None => Err("connection refused".into()),
+                }
+            }),
+        };
+        let one = peer(42, 40, "claude");
+        let two = peer(52, 50, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&one), &bindings, &policy)["ok"], true);
+        *bridge.lock().unwrap() = None;
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s2" } }), Some(&two), &bindings, &policy)["error"], "bridge");
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&two), &bindings, &policy)["error"], "bridge", "the pending claim reads nothing");
+        // The supervisor spawns B only once A is reaped and the port is silent; the
+        // snapshot it hands B is the ledger as of that moment.
+        let snapshot = bindings.lock().unwrap().protected();
+        assert_eq!(snapshot, vec!["s1".to_string(), "s2".to_string()], "the claim that spanned the restart is in the snapshot");
+        *bridge.lock().unwrap() = Some("B");
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&two), &bindings, &policy)["error"], "bridge", "still nothing until B acknowledged a claim");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s2" } }), Some(&two), &bindings, &policy)["ok"], true);
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&two), &bindings, &policy)["boundTo"], "s2");
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&one), &bindings, &policy)["boundTo"], "s1", "s1 was acknowledged by A and carried to B in the snapshot");
+        assert_eq!(*heard.lock().unwrap(), vec!["A:s1".to_string(), "B:s2".to_string()]);
+    }
+
+    #[test]
+    fn the_ledger_outlives_the_binding_that_turned_ambiguous() {
+        // What a respawned bridge is told: every session ever admitted. A process that
+        // claimed a second id loses both bindings, and neither session's old path reopens.
+        let alive = |_: ProcessKey| true;
+        let mut table = Bindings::default();
+        assert_eq!(table.bind("s1", key(10), &alive), Ok(()));
+        assert_eq!(table.bind("s2", key(10), &alive), Err(BindRefusal::Ambiguous));
+        assert_eq!(table.len(), 0, "the ambiguous process holds nothing");
+        assert_eq!(table.protected(), vec!["s1".to_string()], "but s1 stays protected");
+        assert_eq!(table.bind("s3", key(11), &alive), Ok(()));
+        table.sweep(&|_| false);
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.protected(), vec!["s1".to_string(), "s3".to_string()], "exits do not thin the ledger either");
+    }
+
+    #[test]
+    fn the_ledger_refuses_past_its_cap_rather_than_dropping_a_member() {
+        let alive = |_: ProcessKey| true;
+        let mut table = Bindings::default();
+        for n in 0..MAX_PROTECTED {
+            let holder = key(n as i32);
+            assert_eq!(table.bind(&format!("s{n}"), holder, &alive), Ok(()));
+            table.sweep(&|_| false);
+        }
+        assert_eq!(table.protected().len(), MAX_PROTECTED);
+        assert_eq!(table.bind("one-more", key(1), &alive), Err(BindRefusal::Full), "a new session is refused, closed");
+        assert_eq!(table.bind("s7", key(1), &alive), Ok(()), "a session already in the ledger is still admitted");
     }
 
     #[test]
@@ -1045,6 +1270,7 @@ mod tests {
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
             collect: Arc::new(|_, _| Ok(json!({ "ok": true }))),
+            report_bound: Arc::new(|_| Ok(())),
         };
         let claude = peer(42, 40, "claude");
         assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s" } }), Some(&claude), &bindings, &policy)["ok"], true);
@@ -1072,6 +1298,7 @@ mod tests {
             alive: Arc::new(|key: ProcessKey| platform::process_key(key.pid).is_some_and(|now| now == key)),
             chain_holds: Arc::new(platform::chain_holds),
             collect: Arc::new(|session: &str, _| Ok(json!({ "ok": true, "messages": [], "askedFor": session }))),
+            report_bound: Arc::new(|_| Ok(())),
         };
         state.start(path.clone(), policy).unwrap();
 
@@ -1225,6 +1452,7 @@ mod tests {
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
             collect: Arc::new(|_, _| Ok(json!({ "ok": true }))),
+            report_bound: Arc::new(|_| Ok(())),
         };
 
         // Codex's fixture: the socket is moved away and a regular file is put in its place.
@@ -1270,6 +1498,7 @@ mod tests {
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
             collect: Arc::new(|_, _| Ok(json!({ "ok": true }))),
+            report_bound: Arc::new(|_| Ok(())),
         };
         let refused = state.start(dir.join("broker").join("broker.sock"), policy);
         assert!(matches!(refused, Err(ref message) if message.contains("not a directory")), "{refused:?}");

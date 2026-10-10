@@ -6866,3 +6866,112 @@ test("a hook believes the broker only when the answer is for it, and never colle
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("the bridge refuses an old-path collect for a session the broker has bound, on the broker's word", async () => {
+  // Release 2 of the broker (#136): the app hands the bridge, on stdin, a per-run secret,
+  // the sessions its ledger protects, and `broker-ready`; the bridge does not listen
+  // before the last of these. The broker sends the secret on its collects and reports
+  // what it binds. A collect over TCP for a protected session without that word is an
+  // outdated hook: refused with a message that says what to do, counted where the app can
+  // see it. Everything else is served as before.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-broker-word-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const secret = "cd".repeat(32);
+  const bound = "aaaa1111-0000-4d8c-9b3a-aa11bb22cc33";
+  const remembered = "cccc3333-0000-4d8c-9b3a-aa11bb22cc33";
+  const unbound = "bbbb2222-0000-4d8c-9b3a-aa11bb22cc33";
+  const healthOrNull = () => fetch(`http://127.0.0.1:${port}/health`).then((r) => r.json()).catch(() => null);
+  try {
+    // A delayed `broker-ready` keeps the bridge off the port: no partial protection.
+    bridge.stdin.write(`broker-secret ${secret}\nbroker-bound ${remembered}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    assert.equal(bridge.exitCode, null, "the bridge is alive");
+    assert.equal(await healthOrNull(), null, "and not listening before broker-ready");
+    bridge.stdin.write("broker-ready\n");
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, extra = {}, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { ...headers, ...extra }, body: body ? JSON.stringify(body) : undefined });
+      return { status: response.status, body: await response.json() };
+    };
+    const health = async () => (await healthOrNull()).broker;
+    assert.deepEqual(await health(), { vouching: true, bound: 1, refusedTcpCollects: [] }, "the bridge heard the secret and the ledger on stdin");
+
+    // Only the broker may say what it has bound.
+    assert.equal((await call("POST", "/broker/bound", {}, { conversationId: bound })).status, 401, "the machine token alone is not the broker's word");
+    assert.equal((await call("POST", "/broker/bound", { "x-gyredeck-broker": "ef".repeat(32) }, { conversationId: bound })).status, 401, "nor is a wrong secret");
+    assert.equal((await call("POST", "/broker/bound", { "x-gyredeck-broker": secret }, { conversationId: bound })).status, 200);
+    assert.equal((await call("POST", "/broker/bound", { "x-gyredeck-broker": secret }, { conversationId: "no good" })).status, 400);
+
+    for (const id of [bound, remembered, unbound]) {
+      await call("POST", `/mail/${id}`, {}, { from: "codex", text: `for ${id}`, replyTo: "codex-room" });
+    }
+    // The old path, for a protected session: refused, with the fix in the message, and counted.
+    const refused = await call("GET", `/mail/inbox?as=${bound}&collect=1`);
+    assert.equal(refused.status, 403);
+    assert.equal(refused.body.error, "broker_required");
+    assert.match(refused.body.message, /Settings → Plugins/);
+    const waited = await call("GET", `/mail/wait?as=${bound}&timeout=1&collect=1`);
+    assert.equal(waited.status, 403, "wait with collect is the same door");
+    assert.equal((await call("GET", `/mail/inbox?as=${remembered}&collect=1`)).status, 403, "a session the ledger carried over is protected from the first request");
+    assert.match(stderrRef.value, /refused a TCP collect for session aaaa1111/);
+    assert.equal(stderrRef.value.split("refused a TCP collect").length - 1, 2, "said once per session");
+    const seen = await health();
+    assert.equal(seen.bound, 2);
+    assert.deepEqual(seen.refusedTcpCollects.map((r) => [r.conversationId, r.count]), [[bound, 2], [remembered, 1]]);
+    // Reading without collecting is not closed in this release.
+    assert.equal((await call("GET", `/mail/inbox?as=${bound}`)).status, 200);
+    // The broker's own collect, with its word, is served and takes the mail.
+    const served = await call("GET", `/mail/inbox?as=${bound}&collect=1`, { "x-gyredeck-broker": secret });
+    assert.equal(served.status, 200);
+    assert.deepEqual(served.body.messages.map((m) => m.text), [`for ${bound}`]);
+    assert.deepEqual((await call("GET", `/mail/inbox?as=${bound}`)).body.messages, [], "collected");
+    // A session the broker never bound is served the old way as before.
+    const old = await call("GET", `/mail/inbox?as=${unbound}&collect=1`);
+    assert.equal(old.status, 200);
+    assert.deepEqual(old.body.messages.map((m) => m.text), [`for ${unbound}`]);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a bridge that was handed no secret vouches for nobody and serves every path as before", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-broker-noword-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const health = (await (await fetch(`http://127.0.0.1:${port}/health`)).json()).broker;
+    assert.deepEqual(health, { vouching: false, bound: 0, refusedTcpCollects: [] });
+    const told = await fetch(`http://127.0.0.1:${port}/broker/bound`, { method: "POST", headers: { ...headers, "x-gyredeck-broker": "ab".repeat(32) }, body: JSON.stringify({ conversationId: "some-session" }) });
+    assert.equal(told.status, 401, "with no secret, no word is the broker's");
+    const collect = await fetch(`http://127.0.0.1:${port}/mail/inbox?as=some-session&collect=1`, { headers });
+    assert.equal(collect.status, 200);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

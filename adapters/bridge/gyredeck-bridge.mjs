@@ -3621,6 +3621,59 @@ function startBridge(config) {
   const holdsMachineToken = (headerValue) => matchesIngestToken(config.ingestToken, headerValue);
 
   /**
+   * The broker's word (#136, release 2 of #119).
+   *
+   * The app mints a secret for each run and hands it over on the bridge's stdin — not a
+   * file every agent can read, not an argument or an environment variable `ps` can print.
+   * (It is still in two processes' memory; a debugger with the right entitlement reads
+   * that, and this is not a defence against one.) The broker sends it as
+   * `x-gyredeck-broker` on the collects it performs, and reports every session it binds.
+   * A collect over TCP that names a session the broker has bound, without the broker's
+   * word, is the old path being used for a session that has a new one: refused, with a
+   * message that says what to do, counted where the app can see it. A session the broker
+   * has never bound is served as before — a Codex session, an unsigned CLI, another
+   * platform.
+   */
+  let brokerSecret = null;
+  const setBrokerSecret = (value) => {
+    if (typeof value === "string" && /^[a-f0-9]{64}$/i.test(value)) brokerSecret = value.toLowerCase();
+  };
+  const holdsBrokerSecret = (headerValue) => brokerSecret !== null && matchesIngestToken(brokerSecret, headerValue);
+  // The sessions the broker holds: protection state, never evicted — a session the broker
+  // has bound once reads through it for the life of this bridge, because the hook that
+  // bound it does not get older. The set is capped by refusing admission, not by dropping
+  // a member: past the cap a new registration fails, the broker refuses that bind, and the
+  // hook withholds its mail — closed, never quietly open. The refusal counters are
+  // diagnostics and bounded on their own.
+  const BROKER_BOUND_MAX = 65_536;
+  const BROKER_REFUSALS_MAX = 256;
+  const brokerBound = new Set();
+  const brokerRefusals = new Map();
+  // Answers "admitted" (true) or "the table is full" (false); a malformed id is neither,
+  // and the caller that sent it is told so by its own door.
+  const noteBrokerBound = (conversationId) => {
+    if (typeof conversationId !== "string" || !MAIL_ROOM_NAME.test(conversationId)) return null;
+    if (brokerBound.has(conversationId)) return true;
+    if (brokerBound.size >= BROKER_BOUND_MAX) return false;
+    brokerBound.add(conversationId);
+    return true;
+  };
+  const BROKER_REQUIRED_HINT =
+    "This session reads its mail through the Gyredeck broker now; the hook that asked over" +
+    " TCP is older than that. Reinstall the hook from Settings → Plugins (or run `pnpm hooks:install`).";
+  const refuseTcpCollect = (as) => {
+    const refusal = brokerRefusals.get(as) ?? { count: 0, lastAt: null };
+    refusal.count += 1;
+    refusal.lastAt = new Date().toISOString();
+    brokerRefusals.delete(as);
+    brokerRefusals.set(as, refusal);
+    while (brokerRefusals.size > BROKER_REFUSALS_MAX) brokerRefusals.delete(brokerRefusals.keys().next().value);
+    if (refusal.count === 1) {
+      console.error(`gyredeck: refused a TCP collect for session ${as}, which the broker has bound — ${BROKER_REQUIRED_HINT}`);
+    }
+  };
+
+  /**
    * Whether a caller holds *a* credential that reaches a mailbox nobody was put into.
    *
    * Two callers are legitimate and they hold different things. A hook holds the machine
@@ -4357,6 +4410,14 @@ function startBridge(config) {
             // or still owed an answer; a number that only grows is a leak.
             readers: codexReaders.size,
           },
+          // Whether the app has handed over the broker's word, how many sessions the
+          // broker has bound, and the old-path collects refused on their behalf — the one
+          // place an outdated hook's failure can be seen from.
+          broker: {
+            vouching: brokerSecret !== null,
+            bound: brokerBound.size,
+            refusedTcpCollects: [...brokerRefusals].map(([conversationId, refusal]) => ({ conversationId, ...refusal })),
+          },
         }),
       );
       return;
@@ -4702,6 +4763,30 @@ function startBridge(config) {
       return;
     }
 
+    // What the broker tells the bridge, on the broker's word alone.
+    if (req.url === "/broker/bound" && req.method === "POST") {
+      const sendJson = (status, body) => {
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+        res.end(JSON.stringify(body));
+      };
+      if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"])) {
+        sendJson(401, { ok: false, error: "unauthorized", message: "Only the broker may say what it has bound, and it says so with the secret the app handed the bridge." });
+        return;
+      }
+      const payload = await readJsonBody(req);
+      const admitted = noteBrokerBound(payload?.conversationId);
+      if (admitted === null) {
+        sendJson(400, { ok: false, error: "invalid_session" });
+        return;
+      }
+      if (!admitted) {
+        sendJson(507, { ok: false, error: "full", message: `The bridge holds ${BROKER_BOUND_MAX} bound sessions and admits no more until it restarts.` });
+        return;
+      }
+      sendJson(200, { ok: true, bound: brokerBound.size });
+      return;
+    }
+
     if (req.url === "/mail" || req.url.startsWith("/mail/") || req.url.startsWith("/mail?")) {
       const sendJson = (status, body) => {
         res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
@@ -4721,6 +4806,7 @@ function startBridge(config) {
       // holding. It used to admit any non-empty string, which left every route behind it
       // looking guarded while proving nothing at all about the caller.
       const headerToken = req.headers["x-gyredeck-token"];
+      const brokerHeader = req.headers["x-gyredeck-broker"];
       if (typeof headerToken !== "string" || !CREDENTIAL_SHAPE.test(headerToken)) {
         sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
         return;
@@ -4798,6 +4884,11 @@ function startBridge(config) {
           return;
         }
         const collect = url.searchParams.get("collect") === "1";
+        if (collect && brokerBound.has(as) && !holdsBrokerSecret(brokerHeader)) {
+          refuseTcpCollect(as);
+          sendJson(403, { ok: false, error: "broker_required", message: BROKER_REQUIRED_HINT });
+          return;
+        }
         // The cap has to be applied by whoever advances the position. A caller that
         // trimmed the list itself would leave the rest marked as read and never
         // delivered — the position must only ever move as far as what was handed over.
@@ -5355,7 +5446,7 @@ function startBridge(config) {
     res.end(JSON.stringify({ ok: false, error: "not_found" }));
   });
 
-  return { server, emitLocal, capabilities, eventLog };
+  return { server, emitLocal, capabilities, eventLog, setBrokerSecret, noteBrokerBound };
 }
 
 /**
@@ -5423,6 +5514,10 @@ const portArg = args.includes("--port") ? Number(args[args.indexOf("--port") + 1
 const hostArg = args.includes("--host") ? args[args.indexOf("--host") + 1] : null;
 const daemon = args.includes("--daemon");
 const parentStdio = args.includes("--parent-stdio");
+// The parent has a broker handshake to give on stdin, and the bridge must not listen
+// until it has all of it (`broker-ready`). Without the flag — an older app, a hand-run
+// bridge — there is nothing to wait for.
+const brokerHandshake = parentStdio && args.includes("--broker-handshake");
 
 /**
  * Everything below starts a bridge, so it runs only when this file is the program.
@@ -5439,7 +5534,7 @@ if (isEntryPoint) {
   if (portArg && Number.isInteger(portArg)) config.port = portArg;
   if (hostArg === BRIDGE_HOST) config.host = hostArg;
 
-  const { server, emitLocal, eventLog } = startBridge(config);
+  const { server, emitLocal, eventLog, setBrokerSecret, noteBrokerBound } = startBridge(config);
 
   server.on("error", (error) => {
     if (error.code === "EADDRINUSE") {
@@ -5450,7 +5545,16 @@ if (isEntryPoint) {
     process.exit(1);
   });
 
-  server.listen(config.port, config.host, () => {
+  // With a handshake coming, the bridge does not listen until the parent has finished it
+  // (`broker-ready`): the sessions the broker protects must be known before the first
+  // request, or a respawn would serve an old-path collect the previous bridge refused.
+  // There is no timer: a handshake that never finishes is a bridge that never serves,
+  // which the supervisor sees as an unhealthy probe and restarts.
+  let listening = false;
+  const listen = () => {
+    if (listening) return;
+    listening = true;
+    server.listen(config.port, config.host, () => {
     const bridgeReadyEvent = {
       version: PROTOCOL_VERSION,
       id: randomUUID(),
@@ -5479,7 +5583,9 @@ if (isEntryPoint) {
       process.stdout.write("");
       if (typeof process.disconnect === "function") process.disconnect();
     }
-  });
+    });
+  };
+  if (!brokerHandshake) listen();
 
   // Graceful shutdown
   const shutdown = () => {
@@ -5494,7 +5600,29 @@ if (isEntryPoint) {
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
   if (parentStdio) {
-    process.stdin.resume();
+    // The parent's end of this pipe closing is the shutdown signal; before that it writes
+    // the broker's handshake, one line each: the secret for this run (which lives here
+    // and nowhere on disk), the sessions the broker holds, and `broker-ready`.
+    let pending = "";
+    let unadmitted = 0;
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => {
+      pending += chunk;
+      let end;
+      while ((end = pending.indexOf("\n")) >= 0) {
+        const line = pending.slice(0, end).trim();
+        pending = pending.slice(end + 1);
+        if (line.startsWith("broker-secret ")) {
+          setBrokerSecret(line.slice("broker-secret ".length).trim());
+        } else if (line.startsWith("broker-bound ")) {
+          if (noteBrokerBound(line.slice("broker-bound ".length).trim()) === false) unadmitted += 1;
+        } else if (line === "broker-ready") {
+          if (unadmitted > 0) console.error(`gyredeck: ${unadmitted} bound session(s) the app remembers could not be admitted — the bridge's table is full`);
+          listen();
+        }
+      }
+      if (pending.length > 4_096) pending = "";
+    });
     process.stdin.once("end", shutdown);
     process.stdin.once("error", shutdown);
   }

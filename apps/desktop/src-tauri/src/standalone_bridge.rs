@@ -398,9 +398,45 @@ struct BridgeSupervisorHandle {
 pub(crate) struct StandaloneBridgeState {
     supervisor: Mutex<Option<BridgeSupervisorHandle>>,
     script: Mutex<Option<PathBuf>>,
+    /// What every bridge this supervisor spawns is told on its stdin, before it serves:
+    /// the broker's secret for this run of the app and the sessions the broker holds. Set
+    /// before the first start; `None` leaves the bridge vouching for nobody.
+    broker_handshake: Mutex<Option<BrokerHandshake>>,
+}
+
+/// The broker's side of the handshake with a freshly spawned bridge. The secret is the
+/// same for the life of the app; the bound sessions are read at each spawn, because the
+/// broker's table outlives any one bridge and the bridge's copy of it does not.
+#[derive(Clone)]
+pub(crate) struct BrokerHandshake {
+    pub secret: String,
+    pub protected: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+}
+
+impl BrokerHandshake {
+    /// The lines written to the bridge's stdin: the secret, one line per bound session,
+    /// then `broker-ready`, which is what lets the bridge start listening.
+    fn lines(&self) -> String {
+        let mut out = format!("broker-secret {}\n", self.secret);
+        for session in (self.protected)() {
+            out.push_str(&format!("broker-bound {session}\n"));
+        }
+        out.push_str("broker-ready\n");
+        out
+    }
 }
 
 impl StandaloneBridgeState {
+    pub(crate) fn set_broker_handshake(&self, handshake: BrokerHandshake) {
+        if let Ok(mut slot) = self.broker_handshake.lock() {
+            *slot = Some(handshake);
+        }
+    }
+
+    fn broker_handshake(&self) -> Option<BrokerHandshake> {
+        self.broker_handshake.lock().ok().and_then(|slot| slot.clone())
+    }
+
     pub(crate) fn start(&self, bridge_script: PathBuf) -> Result<(), String> {
         let node = find_node_binary().ok_or_else(|| {
             "Gyredeck could not find Node.js for the standalone bridge".to_string()
@@ -452,9 +488,10 @@ impl StandaloneBridgeState {
         }
 
         let (stop_tx, stop_rx) = mpsc::channel();
+        let handshake = self.broker_handshake();
         let join = thread::Builder::new()
             .name("gyredeck-bridge-supervisor".to_string())
-            .spawn(move || supervise_bridge(bridge_script, node, endpoint, stop_rx, log))
+            .spawn(move || supervise_bridge(bridge_script, node, endpoint, handshake, stop_rx, log))
             .map_err(|error| format!("Failed to start standalone bridge supervisor: {error}"))?;
         *supervisor = Some(BridgeSupervisorHandle { stop_tx, join });
         Ok(())
@@ -523,6 +560,7 @@ fn supervise_bridge(
     bridge_script: PathBuf,
     node: PathBuf,
     endpoint: BridgeEndpoint,
+    handshake: Option<BrokerHandshake>,
     stop_rx: mpsc::Receiver<()>,
     log: SupervisorLog,
 ) {
@@ -610,7 +648,7 @@ fn supervise_bridge(
                 }
             }
         } else if probe == BridgeProbe::Offline {
-            owned = match spawn_bridge(&node, &bridge_script, endpoint) {
+            owned = match spawn_bridge(&node, &bridge_script, endpoint, handshake.as_ref()) {
                 Ok(bridge) => {
                     let mut fields = serde_json::Map::new();
                     fields.insert("pid".to_string(), serde_json::Value::from(bridge.pid));
@@ -650,14 +688,22 @@ fn spawn_bridge(
     node: &Path,
     bridge_script: &Path,
     endpoint: BridgeEndpoint,
+    handshake: Option<&BrokerHandshake>,
 ) -> std::io::Result<OwnedBridge> {
-    let mut child = Command::new(node)
+    let mut command = Command::new(node);
+    command
         .arg(bridge_script)
         .arg("--port")
         .arg(endpoint.address.port().to_string())
         .arg("--host")
         .arg(BRIDGE_HOST)
-        .arg("--parent-stdio")
+        .arg("--parent-stdio");
+    // With a handshake to give, the bridge is told to wait for it: no listening, and no
+    // timer that would open service with a partial ledger, until `broker-ready` is read.
+    if handshake.is_some() {
+        command.arg("--broker-handshake");
+    }
+    let mut child = command
         .env("PATH", super::enriched_cli_path())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -666,6 +712,13 @@ fn spawn_bridge(
     let stderr = StderrTail::default();
     if let Some(pipe) = child.stderr.take() {
         stderr.follow(pipe);
+    }
+    // The broker's side of the handshake, on the bridge's stdin, before the bridge serves
+    // anything: the secret, the sessions the broker holds, and the word that lets it
+    // listen. The pipe stays open — closing it is the stop signal.
+    if let (Some(handshake), Some(stdin)) = (handshake, child.stdin.as_mut()) {
+        let _ = stdin.write_all(handshake.lines().as_bytes());
+        let _ = stdin.flush();
     }
     Ok(OwnedBridge {
         pid: child.id(),
@@ -784,7 +837,18 @@ pub(crate) fn bridge_request(
     path: &str,
     body: Option<String>,
 ) -> Result<(u16, serde_json::Value), String> {
-    bridge_request_within(method, path, body, MAIL_REQUEST_TIMEOUT)
+    bridge_request_within(method, path, body, MAIL_REQUEST_TIMEOUT, None)
+}
+
+/// The same request with the broker's word attached: `x-gyredeck-broker`, which the bridge
+/// compares with what this app handed it on stdin. Only the broker calls this.
+pub(crate) fn bridge_request_vouched(
+    method: &str,
+    path: &str,
+    body: Option<String>,
+    broker_secret: &str,
+) -> Result<(u16, serde_json::Value), String> {
+    bridge_request_within(method, path, body, MAIL_REQUEST_TIMEOUT, Some(broker_secret))
 }
 
 /// The same request, for the one caller whose answer takes longer than a mailbox read.
@@ -796,6 +860,7 @@ fn bridge_request_within(
     path: &str,
     body: Option<String>,
     reply_timeout: Duration,
+    broker_secret: Option<&str>,
 ) -> Result<(u16, serde_json::Value), String> {
     let Some(token) = read_ingest_token() else {
         return Err("Ingest token is not available yet".to_string());
@@ -811,6 +876,9 @@ fn bridge_request_within(
     let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {BRIDGE_HOST}:{port}\r\nAccept: application/json\r\nX-Gyredeck-Token: {token}\r\nConnection: close\r\n"
     );
+    if let Some(secret) = broker_secret {
+        request.push_str(&format!("X-Gyredeck-Broker: {secret}\r\n"));
+    }
     match &body {
         Some(payload) => request.push_str(&format!(
             "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
@@ -1302,17 +1370,35 @@ const server = createServer((request, response) => {
   response.end()
 })
 server.listen(port, '127.0.0.1')
-process.stdin.resume()
+import { writeFileSync } from 'node:fs'
+let heard = ''
+process.stdin.setEncoding('utf8')
+process.stdin.on('data', (chunk) => { heard += chunk; if (heard.includes('broker-ready\n')) writeFileSync(process.argv[1] + '.heard', heard) })
 process.stdin.on('end', () => server.close(() => process.exit(0)))
 "#,
         )
         .expect("fixture script");
 
         let state = StandaloneBridgeState::default();
+        state.set_broker_handshake(BrokerHandshake {
+            secret: "ab".repeat(32),
+            protected: Arc::new(|| vec!["s-one".to_string(), "s-two".to_string()]),
+        });
         state
-            .start_with(script, node, endpoint, SupervisorLog::none())
+            .start_with(script.clone(), node, endpoint, SupervisorLog::none())
             .expect("start supervisor");
         assert!(wait_for_probe(endpoint, BridgeProbe::Healthy));
+        let heard_path = PathBuf::from(format!("{}.heard", script.display()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !heard_path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let heard = fs::read_to_string(&heard_path).unwrap_or_default();
+        assert_eq!(
+            heard,
+            format!("broker-secret {}\nbroker-bound s-one\nbroker-bound s-two\nbroker-ready\n", "ab".repeat(32)),
+            "the handshake reached the bridge on stdin: secret, bound sessions, ready"
+        );
         state.stop();
         assert!(wait_for_probe(endpoint, BridgeProbe::Offline));
         let _ = fs::remove_dir_all(directory);
@@ -1780,7 +1866,7 @@ pub(crate) fn set_session_name(conversation_id: &str, name: &str) -> Result<Opti
 /// `unknown` arrives rather than a timeout of ours that says nothing about why.
 pub(crate) fn codex_hook_trust() -> Result<serde_json::Value, String> {
     let (status, value) =
-        bridge_request_within("GET", "/codex/hook-trust", None, Duration::from_millis(9_500))?;
+        bridge_request_within("GET", "/codex/hook-trust", None, Duration::from_millis(9_500), None)?;
     if !(200..300).contains(&status) {
         return Err(sync_error(status, &value));
     }

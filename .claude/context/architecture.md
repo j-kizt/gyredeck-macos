@@ -74,8 +74,10 @@ Tauri v2 shell. Native responsibilities:
 - **Mailbox broker** (`broker.rs`) — a Unix socket the hooks prefer over TCP for collecting
   mail. The app asks the OS which process connected, walks past shells to the CLI that spawned
   the hook, verifies it is a signed `claude` or `agy` through the Security framework, binds it to
-  the session it names, and performs the collect itself against the bridge. See
-  `event-protocol.md` → "The mailbox broker" for the protocol, the rules and the limits.
+  the session it names, and performs the collect itself against the bridge — vouched by a
+  per-run secret the app hands the bridge on its stdin, so the bridge can refuse the old
+  TCP collect for a session the broker holds. See `event-protocol.md` → "The mailbox
+  broker" for the protocol, the rules and the limits.
 - **Hook installers** — `install_claude_hook`, `install_agy_hook`, `install_codex_hook` and
   `install_codex_notify` copy the adapter and register it, reporting install status back to
   Settings → Plugins. Status also reports **stale**: the installed copy is compared byte for

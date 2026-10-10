@@ -739,13 +739,17 @@ fn spawn_bridge(
             return Err(std::io::Error::other("the bridge was spawned without a stdin to hand the handshake to"));
         };
         let (done_tx, done_rx) = mpsc::channel();
-        thread::Builder::new()
+        let writer = thread::Builder::new()
             .name("gyredeck-bridge-handshake".to_string())
             .spawn(move || {
                 let written = stdin.write_all(lines.as_bytes()).and_then(|()| stdin.flush());
                 let _ = done_tx.send(written.map(|()| stdin));
-            })
-            .map_err(|error| std::io::Error::other(format!("the handshake thread could not start: {error}")))?;
+            });
+        if let Err(error) = writer {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other(format!("the handshake thread could not start: {error}")));
+        }
         match done_rx.recv_timeout(BRIDGE_HANDSHAKE_TIMEOUT) {
             Ok(Ok(stdin)) => child.stdin = Some(stdin),
             Ok(Err(error)) => {
@@ -1586,6 +1590,14 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
             protected: Arc::new(|| Ok((0..65_536).map(|n| format!("session-{n:05}-aaaa-bbbb-cccc-dddddddddddd")).collect())),
         };
         let endpoint = BridgeEndpoint { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1) };
+        // The fixture writes its pid to a file as its first act, so the test can ask the
+        // OS afterwards whether that process is gone — reaped, not merely signalled.
+        let pid_path = directory.join("deaf.pid");
+        fs::write(
+            &script,
+            format!("import {{ writeFileSync }} from 'node:fs'\nwriteFileSync({:?}, String(process.pid))\nsetInterval(() => {{}}, 1000)\n", pid_path.display()),
+        )
+        .expect("fixture script");
         let started = Instant::now();
         let outcome = spawn_bridge(&node, &script, endpoint, Some(&handshake));
         let took = started.elapsed();
@@ -1593,6 +1605,10 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
         assert!(error.to_string().contains("did not take the broker's handshake"), "{error}");
         assert!(took < BRIDGE_HANDSHAKE_TIMEOUT + Duration::from_secs(2), "came back in {took:?}");
         assert!(took >= BRIDGE_HANDSHAKE_TIMEOUT, "it waited the whole bound before giving up: {took:?}");
+        let pid: i32 = fs::read_to_string(&pid_path).expect("the fixture ran").trim().parse().expect("a pid");
+        // kill(pid, 0) answers ESRCH once the process is reaped; a zombie would still answer 0.
+        let gone = unsafe { libc::kill(pid, 0) } == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        assert!(gone, "the deaf bridge (pid {pid}) was killed and reaped");
         let _ = fs::remove_dir_all(directory);
     }
 

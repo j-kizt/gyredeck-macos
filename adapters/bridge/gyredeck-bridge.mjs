@@ -5619,8 +5619,13 @@ if (isEntryPoint) {
       pending += chunk;
       let end;
       while ((end = pending.indexOf("\n")) >= 0) {
-        const line = pending.slice(0, end).trim();
+        const raw = pending.slice(0, end);
         pending = pending.slice(end + 1);
+        // The cap is on the raw line, whole or not, before anything is trimmed away: a
+        // line padded past it and delivered in one chunk is as malformed as one that
+        // never ended.
+        if (raw.length > 4_096) { fail("a handshake line is longer than 4096 characters"); continue; }
+        const line = raw.trim();
         if (line.startsWith("broker-secret ")) {
           if (setBrokerSecret(line.slice("broker-secret ".length).trim())) secretGiven = true;
           else fail("the secret line is malformed");

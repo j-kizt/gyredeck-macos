@@ -6985,6 +6985,10 @@ test("a broker handshake that is not whole is a bridge that exits, never one tha
     { name: "ready without a secret", lines: "broker-ready\n", rule: /no secret was given/ },
     { name: "a malformed id", lines: `broker-secret ${secret}\nbroker-bound not a session\nbroker-ready\n`, rule: /bound session id is malformed/ },
     { name: "a ledger past the table", lines: `broker-secret ${secret}\n${Array.from({ length: 65_537 }, (_, n) => `broker-bound s${n}\n`).join("")}broker-ready\n`, rule: /exceeds the bridge's table/ },
+    // The cap is on the raw line, whether it arrives whole or in pieces: padding that
+    // trim would remove does not make an over-long line short.
+    { name: "an over-long line delivered whole", lines: `broker-secret ${" ".repeat(5000)}${secret}\nbroker-ready\n`, rule: /longer than 4096/ },
+    { name: "an over-long line delivered in pieces", lines: [`broker-secret ${" ".repeat(3000)}`, `${" ".repeat(2000)}${secret}\nbroker-ready\n`], rule: /longer than 4096/ },
   ];
   for (const { name, lines, rule } of cases) {
     const home = await mkdtemp(join(tmpdir(), "gyredeck-broker-broken-"));
@@ -7000,7 +7004,10 @@ test("a broker handshake that is not whole is a bridge that exits, never one tha
     bridge.stderr.on("data", (chunk) => { stderr += chunk; });
     try {
       const exited = new Promise((resolve) => bridge.once("exit", resolve));
-      bridge.stdin.write(lines);
+      for (const piece of Array.isArray(lines) ? lines : [lines]) {
+        bridge.stdin.write(piece);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       const code = await Promise.race([exited, new Promise((resolve) => setTimeout(() => resolve("still running"), 15_000))]);
       assert.equal(code, 1, `${name}: the bridge exits 1`);
       assert.match(stderr, rule, `${name}: the rule that failed is named`);

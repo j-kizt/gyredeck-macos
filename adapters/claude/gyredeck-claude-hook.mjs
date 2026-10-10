@@ -3,6 +3,7 @@ import { connect } from "node:net";
 import { readFile, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
 /**
@@ -193,7 +194,7 @@ const MAIL_MAX_MESSAGES = 10;
 const BROKER_SOCKET = join(CONFIG_DIR, "broker", "gyredeck.broker.sock");
 const BROKER_PROTOCOL = 1;
 const BROKER_DEADLINE_MS = 1_500;
-const askBroker = (request) =>
+const askBroker = (request, deadlineMs = BROKER_DEADLINE_MS) =>
   new Promise((resolve) => {
     let settled = false;
     const chunks = [];
@@ -201,10 +202,10 @@ const askBroker = (request) =>
     // One deadline for the whole exchange, from before the connect: a socket timeout is an
     // idle timeout, and a broker that dribbled a byte every so often would hold the hook —
     // and the person's prompt behind it — for as long as it liked.
-    const deadline = setTimeout(() => { socket.destroy(); done({ timedOut: true }); }, BROKER_DEADLINE_MS);
+    const deadline = setTimeout(() => { socket.destroy(); done({ timedOut: true }); }, deadlineMs);
     const done = (value) => { if (!settled) { settled = true; clearTimeout(deadline); resolve(value); } };
     const socket = connect(BROKER_SOCKET);
-    socket.setTimeout(BROKER_DEADLINE_MS);
+    socket.setTimeout(deadlineMs);
     socket.on("connect", () => socket.write(`${JSON.stringify({ v: BROKER_PROTOCOL, ...request })}\n`));
     socket.on("data", (chunk) => {
       // Bytes until the line ends, decoded once: a multi-byte character the socket cut in
@@ -263,6 +264,164 @@ const collectThroughBroker = async (conversationId, limit) => {
     return { withheld: `the broker answered for ${JSON.stringify(collected.result.boundTo)}, not this session` };
   }
   return collected;
+};
+/**
+ * Say the batch has been taken, once the output that carries it is built. The broker keeps
+ * a batch it handed over until it hears this, and hands it again to the next collect for
+ * the session — so a hook that gave up before its answer arrived loses nothing. At least
+ * once: if this does not land, the same batch comes back next turn. Nothing to say for an
+ * answer that carried no delivery (empty, or read over TCP).
+ */
+const ackDelivery = async (result, deadlineMs = BROKER_DEADLINE_MS) => {
+  if (Number.isInteger(result?.delivery) && deadlineMs > 0) {
+    await askBroker({ ack: { delivery: result.delivery } }, Math.min(BROKER_DEADLINE_MS, deadlineMs));
+  }
+};
+/** A batch from the broker that can be read: messages a list, missed absent or a list. Anything else is withheld and never acknowledged. */
+const brokerBatchReadable = (result) =>
+  Array.isArray(result?.messages) && (result.missed === undefined || Array.isArray(result.missed));
+
+/**
+ * `node <this file> wait <seconds> [conversationId]` — the WAIT an agent runs by hand,
+ * through the broker (#137). The old WAIT was a TCP collect of the mailbox with the room's
+ * password, which release 3 closes for a protected session; this one asks the broker,
+ * which knows which process is asking. Rules: collect only, never a bind — a bind belongs
+ * to the hook that has the payload; the id on the command line validates `boundTo` and
+ * chooses nothing. TCP is used only where the hook's drain would use it (no broker,
+ * `unsupported`, `ineligible`), with the id given, and a `403` from the bridge there is
+ * withheld mail, never an empty timeout: an absent broker does not make a session
+ * unprotected. Exit 0 with the JSON (messages, or `timedOut: true` with
+ * `yourLastMessage`), 2 when mail is withheld (said on stderr), 3 for usage.
+ */
+const WAIT_POLL_MS = 2_000;
+/** What a collect answer must look like to be believed — messages a list, missed absent or a list. */
+const wellFormedCollect = (body) =>
+  Boolean(body) && typeof body === "object" && body.ok === true &&
+  Array.isArray(body.messages) &&
+  (body.missed === undefined || Array.isArray(body.missed));
+const WAIT_MAX_SECONDS = 600;
+/** The bridge's own rule for a mailbox name: what an id on the command line must look like before it is sent anywhere. */
+const WAIT_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const waitForMail = async (secondsArg, expected) => {
+  const seconds = Number.parseInt(secondsArg ?? "", 10);
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > WAIT_MAX_SECONDS || (expected !== undefined && !WAIT_ID.test(expected))) {
+    process.stderr.write(`usage: wait <seconds 1-${WAIT_MAX_SECONDS}> [conversationId]\n`);
+    return 3;
+  }
+  const withheld = (reason) => {
+    process.stderr.write(`gyredeck: wait withheld — ${reason}\n`);
+    return 2;
+  };
+  const deliver = (body) => {
+    process.stdout.write(`${JSON.stringify(body)}\n`);
+    return 0;
+  };
+  // One elapsed budget for the whole wait, and every call inside it — each broker
+  // request, the TCP fallback, each sleep — is capped by what is left of it: a broker
+  // that took its full allowance on every poll could not stretch the wait past it.
+  const deadline = Date.now() + (seconds + 2) * 1_000;
+  const remainingMs = () => Math.max(0, deadline - Date.now());
+  // `timedOut: true` is said only on the strength of at least one collect that was
+  // served and found nothing; a wait that never got an answer is withheld, not empty.
+  let last = null;
+  for (;;) {
+    if (remainingMs() === 0) {
+      return last
+        ? deliver({ ok: true, timedOut: true, yourLastMessage: last.yourLastMessage ?? null, ...last, messages: [] })
+        : withheld("the broker did not answer within the wait");
+    }
+    const judged = judgeBrokerAnswer(await askBroker({ collect: { limit: MAIL_MAX_MESSAGES } }, Math.min(BROKER_DEADLINE_MS, Math.max(1, remainingMs()))));
+    if (judged.fallback) {
+      if (!expected) return withheld(`${judged.fallback}, and no session id was given to wait as`);
+      const remainingSeconds = Math.max(1, Math.floor(remainingMs() / 1_000));
+      const endpoint = await readEndpoint();
+      const token = await readIngestToken();
+      if (remainingMs() === 0) return withheld("the wait ran out before the bridge could be asked");
+      const reply = await getJsonStatus(endpoint, token, `/mail/wait?as=${expected}&timeout=${remainingSeconds}&collect=1`, remainingMs());
+      if (reply.status === 200 && wellFormedCollect(reply.body)) return deliver(reply.body);
+      if (reply.status === 403) return withheld(`the bridge refused the read (${reply.body?.error ?? 403}): ${reply.body?.message ?? ""}`);
+      if (reply.status === 200) return withheld("the bridge's answer could not be read");
+      return withheld(reply.status ? `the bridge answered ${reply.status}` : "the bridge did not answer");
+    }
+    if (!judged.result) return withheld(judged.withheld);
+    const result = judged.result;
+    // An answer is evidence of an empty mailbox only if it has the shape of one: a
+    // missing or malformed list is an answer that could not be read, not silence.
+    if (!wellFormedCollect(result)) return withheld("the broker's answer is not a collect this hook can read");
+    if (expected && result.boundTo !== expected) {
+      return withheld(`the broker answered for ${JSON.stringify(result.boundTo)}, not ${expected}`);
+    }
+    // Anything the collect carried is a result: a message, and a notice of mail that
+    // was dropped before it could be handed over — both are things to act on.
+    const messages = Array.isArray(result.messages) ? result.messages : [];
+    const missed = Array.isArray(result.missed) ? result.missed : [];
+    if (messages.length > 0 || missed.length > 0) {
+      // The output is prepared before anything is acknowledged, and the acknowledgement
+      // gets only what is left of the wait: if nothing is, the batch is printed
+      // unacknowledged and comes again next time — a duplicate, never a loss.
+      const prepared = `${JSON.stringify({ ok: true, timedOut: false, ...result })}\n`;
+      await ackDelivery(result, remainingMs());
+      process.stdout.write(prepared);
+      return 0;
+    }
+    last = result;
+    if (remainingMs() <= WAIT_POLL_MS) {
+      return deliver({ ok: true, timedOut: true, yourLastMessage: last.yourLastMessage ?? null, ...result, messages: [] });
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(WAIT_POLL_MS, remainingMs())));
+  }
+};
+
+/** A GET that keeps the status, with its own deadline — the drain's getJson folds every failure into null. */
+const getJsonStatus = (endpoint, token, path, timeoutMs) =>
+  new Promise((resolve) => {
+    // One elapsed deadline for the whole exchange: a request's own timeout is an idle
+    // timeout, and a bridge that dribbled a byte at a time could hold the wait past its
+    // budget for as long as it liked.
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      resolve(value);
+    };
+    const deadline = setTimeout(() => { req.destroy(); done({ status: 0, body: null }); }, timeoutMs);
+    const req = request(
+      {
+        hostname: endpoint.hostname,
+        port: endpoint.port,
+        path,
+        method: "GET",
+        headers: { accept: "application/json", "x-gyredeck-token": token },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > 65_536) { req.destroy(); done({ status: 0, body: null }); }
+        });
+        res.on("end", () => {
+          let parsed = null;
+          try { parsed = JSON.parse(body); } catch { parsed = null; }
+          done({ status: res.statusCode, body: parsed });
+        });
+        res.on("error", () => done({ status: 0, body: null }));
+      },
+    );
+    req.on("error", () => done({ status: 0, body: null }));
+    req.end();
+  });
+
+/**
+ * How this hook is named in an instruction: the installed path under `~`, which is the
+ * form the app's allow-rule matches, or wherever it actually is when run from elsewhere.
+ */
+const hookCommandPath = () => {
+  const here = fileURLToPath(import.meta.url);
+  const installed = join(CONFIG_DIR, "gyredeck-claude-hook.mjs");
+  return here === installed ? "~/.config/gyredeck/gyredeck-claude-hook.mjs" : here;
 };
 const MAIL_MAX_TEXT = 2_000;
 /** `from` the desktop app uses when the person sends a message themselves. */
@@ -392,6 +551,10 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
   const viaBroker = await collectThroughBroker(room, MAIL_MAX_MESSAGES);
   let result = null;
   if (viaBroker.result) {
+    if (!brokerBatchReadable(viaBroker.result)) {
+      process.stderr.write("gyredeck: mail withheld this turn — the broker's answer could not be read as a batch\n");
+      return null;
+    }
     result = viaBroker.result;
   } else if (viaBroker.fallback) {
     result = await getJson(endpoint, token, `/mail/inbox?as=${room}&collect=1&limit=${MAIL_MAX_MESSAGES}`);
@@ -408,7 +571,10 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
   // Nothing waiting is normally nothing to say. A confirmation is the exception: the
   // session has just been given the right to speak here and has to be told, or the
   // grant the person just made goes unnoticed.
-  if (delivered.length === 0 && !justConfirmed) return null;
+  if (delivered.length === 0 && !justConfirmed) {
+    await ackDelivery(result);
+    return null;
+  }
 
 
   // Who a message is from decides what the agent may do about it, and there are three
@@ -609,14 +775,15 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
       "WAIT \u2014 if you send a request whose answer you need before you can carry on," +
         " you may wait for it instead of ending your turn. Run this once, and only while" +
         " an answer is genuinely outstanding:\n" +
-        `curl -s "http://${endpoint.hostname}:${endpoint.port}/mail/wait?as=${room}&timeout=60&collect=1" ` +
-        "-H \"x-gyredeck-token: THE ROOM PASSWORD\"\n" +
-        "It returns as soon as something arrives, or after the timeout with" +
-        " \"timedOut\": true. A timed-out answer also carries yourLastMessage, saying who your last message went to, what kind it was, and whether that is why nothing came back — read it before deciding anything. If it says the message was addressed correctly and delivered, the silence is theirs: say so and stop, and do not send it again.",
+        `node ${hookCommandPath()} wait 60 ${room}\n` +
+        "It prints what arrived as soon as something does, or after the timeout with" +
+        " \"timedOut\": true. A timed-out answer also carries yourLastMessage, saying who your last message went to, what kind it was, and whether that is why nothing came back — read it before deciding anything. If it says the message was addressed correctly and delivered, the silence is theirs: say so and stop, and do not send it again. It exits 2 and says why when the mail is being withheld; do not work around that with curl.",
     );
   }
 
-  return lines.join("\n\n");
+  const text = lines.join("\n\n");
+  await ackDelivery(result);
+  return text;
 };
 
 /** Parse a CLI flag value, e.g. --event PreToolUse. */
@@ -786,4 +953,8 @@ const main = async () => {
   }
 };
 
-main();
+if (process.argv[2] === "wait") {
+  waitForMail(process.argv[3], process.argv[4]).then((code) => process.exit(code));
+} else {
+  main();
+}

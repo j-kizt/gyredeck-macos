@@ -476,6 +476,9 @@ fn sync_reply_rules(host: &str, port: u16) -> Vec<String> {
         // guessed between.
         format!("Bash(curl -s -X POST http://{host}:{port}/mail/:*)"),
         format!("Bash(curl -s \"http://{host}:{port}/mail/:*)"),
+        // The WAIT the Claude hook prints (#137): through the broker, by the installed
+        // hook's own path, which is why the instruction names it under `~`.
+        "Bash(node ~/.config/gyredeck/gyredeck-claude-hook.mjs wait:*)".to_string(),
     ]
 }
 
@@ -484,6 +487,7 @@ fn sync_reply_rules(host: &str, port: u16) -> Vec<String> {
 fn is_sync_reply_rule(rule: &str) -> bool {
     rule.starts_with("Bash(TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); curl ")
         || (rule.starts_with("Bash(curl -s") && rule.contains("/mail/:*)"))
+        || rule.starts_with("Bash(node ~/.config/gyredeck/gyredeck-claude-hook.mjs wait")
 }
 
 /// Add or remove the rules in a parsed settings document. Other entries are untouched:

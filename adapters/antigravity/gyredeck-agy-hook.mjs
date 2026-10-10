@@ -340,6 +340,21 @@ const collectThroughBroker = async (conversationId, limit) => {
   }
   return collected;
 };
+/**
+ * Say the batch has been taken, once the output that carries it is built. The broker keeps
+ * a batch it handed over until it hears this, and hands it again to the next collect for
+ * the session — so a hook that gave up before its answer arrived loses nothing. At least
+ * once: if this does not land, the same batch comes back next turn. Nothing to say for an
+ * answer that carried no delivery (empty, or read over TCP).
+ */
+const ackDelivery = async (result, deadlineMs = BROKER_DEADLINE_MS) => {
+  if (Number.isInteger(result?.delivery) && deadlineMs > 0) {
+    await askBroker({ ack: { delivery: result.delivery } }, Math.min(BROKER_DEADLINE_MS, deadlineMs));
+  }
+};
+/** A batch from the broker that can be read: messages a list, missed absent or a list. Anything else is withheld and never acknowledged. */
+const brokerBatchReadable = (result) =>
+  Array.isArray(result?.messages) && (result.missed === undefined || Array.isArray(result.missed));
 const MAIL_MAX_TEXT = 2_000;
 /** `from` the desktop app uses when the person sends a message themselves. */
 const APP_SENDER = "gyredeck";
@@ -449,6 +464,10 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
   const viaBroker = await collectThroughBroker(room, MAIL_MAX_STEPS);
   let result = null;
   if (viaBroker.result) {
+    if (!brokerBatchReadable(viaBroker.result)) {
+      process.stderr.write("gyredeck: mail withheld this turn — the broker's answer could not be read as a batch\n");
+      return [];
+    }
     result = viaBroker.result;
   } else if (viaBroker.fallback) {
     result = await getJson(endpoint, token, `/mail/inbox?as=${room}&collect=1&limit=${MAIL_MAX_STEPS}`);
@@ -463,7 +482,10 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
     // read as one thread. The cost is that a session would otherwise be handed its own
     // last reply back as fresh mail on its next turn, and answer itself forever.
     .filter((message) => message.from !== room);
-  if (delivered.length === 0) return [];
+  if (delivered.length === 0) {
+    await ackDelivery(result);
+    return [];
+  }
 
 
   // A message sent from the desktop app came from the person, and one sent by another
@@ -609,7 +631,7 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
   const header = { ephemeralMessage: parts.join(" ") };
   const reply = replyInstruction(endpoint, room, replyRooms);
 
-  return [
+  const steps = [
     header,
     ...delivered.map((message) => {
       const from = label(message);
@@ -620,6 +642,8 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
     // Last, so the command is the freshest thing in context when the model acts.
     ...(reply ? [reply] : []),
   ];
+  await ackDelivery(result);
+  return steps;
 };
 
 /** Parse a CLI flag value, e.g. --event PreToolUse. */

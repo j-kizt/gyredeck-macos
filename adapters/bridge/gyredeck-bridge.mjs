@@ -3636,7 +3636,9 @@ function startBridge(config) {
    */
   let brokerSecret = null;
   const setBrokerSecret = (value) => {
-    if (typeof value === "string" && /^[a-f0-9]{64}$/i.test(value)) brokerSecret = value.toLowerCase();
+    if (typeof value !== "string" || !/^[a-f0-9]{64}$/i.test(value)) return false;
+    brokerSecret = value.toLowerCase();
+    return true;
   };
   const holdsBrokerSecret = (headerValue) => brokerSecret !== null && matchesIngestToken(brokerSecret, headerValue);
   // The sessions the broker holds: protection state, never evicted — a session the broker
@@ -5603,8 +5605,15 @@ if (isEntryPoint) {
     // The parent's end of this pipe closing is the shutdown signal; before that it writes
     // the broker's handshake, one line each: the secret for this run (which lives here
     // and nowhere on disk), the sessions the broker holds, and `broker-ready`.
+    // A handshake is whole or it is nothing: with `--broker-handshake`, `broker-ready`
+    // opens service only if a valid secret was read and every `broker-bound` line was
+    // well-formed and admitted. Anything else — no secret, a malformed id, a ledger past
+    // the table's cap, a line past the buffer — is a bridge that says which rule failed
+    // and exits, which the supervisor sees as an exit and never as a serving bridge.
     let pending = "";
-    let unadmitted = 0;
+    let broken = null;
+    let secretGiven = false;
+    const fail = (reason) => { broken ??= reason; };
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", (chunk) => {
       pending += chunk;
@@ -5613,15 +5622,24 @@ if (isEntryPoint) {
         const line = pending.slice(0, end).trim();
         pending = pending.slice(end + 1);
         if (line.startsWith("broker-secret ")) {
-          setBrokerSecret(line.slice("broker-secret ".length).trim());
+          if (setBrokerSecret(line.slice("broker-secret ".length).trim())) secretGiven = true;
+          else fail("the secret line is malformed");
         } else if (line.startsWith("broker-bound ")) {
-          if (noteBrokerBound(line.slice("broker-bound ".length).trim()) === false) unadmitted += 1;
+          const admitted = noteBrokerBound(line.slice("broker-bound ".length).trim());
+          if (admitted === null) fail("a bound session id is malformed");
+          else if (admitted === false) fail(`the ledger exceeds the bridge's table (${BROKER_BOUND_MAX})`);
         } else if (line === "broker-ready") {
-          if (unadmitted > 0) console.error(`gyredeck: ${unadmitted} bound session(s) the app remembers could not be admitted — the bridge's table is full`);
+          if (!secretGiven) fail("no secret was given");
+          if (brokerHandshake && broken !== null) {
+            // Written and flushed before the exit: stderr is a pipe here, and what is
+            // said about the failure must reach the supervisor's tail.
+            process.stderr.write(`gyredeck: the broker's handshake failed — ${broken}; this bridge serves nothing and exits\n`, () => process.exit(1));
+            return;
+          }
           listen();
         }
       }
-      if (pending.length > 4_096) pending = "";
+      if (pending.length > 4_096) { fail("a handshake line is longer than 4096 characters"); pending = ""; }
     });
     process.stdin.once("end", shutdown);
     process.stdin.once("error", shutdown);

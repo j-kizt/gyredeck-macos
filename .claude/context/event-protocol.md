@@ -261,9 +261,14 @@ broker's protection ledger, then `broker-ready`. Stdin keeps the secret off disk
 `argv` and out of the environment; it is still in two processes' memory, and this is not a
 defence against a debugger with the entitlement to read that. The pipe stays open because
 its closing is the stop signal. A bridge spawned with `--broker-handshake` does **not**
-listen until `broker-ready` has been read — no timer, so a late or partial handshake is a
-bridge that never serves (the supervisor's probe restarts it), never one that serves with
-part of the ledger; a bridge started without the flag listens at once and protects nothing.
+listen until `broker-ready` has been read, and then only if the handshake was whole: a
+valid secret, every `broker-bound` id well-formed and admitted. Otherwise it names the rule
+that failed on stderr and exits 1 — a partial protection state is closed, never partly
+open. There is no timer. The write itself is bounded on the app's side: a bridge that has
+not taken the handshake within 5 s is killed and reaped and the spawn fails with the
+reason, so a ledger past the pipe's capacity and a bridge that never reads cannot hold the
+supervisor. A ledger that cannot be read spawns no bridge at all. A bridge started without
+the flag listens at once and protects nothing.
 
 From then on the broker sends the secret as `x-gyredeck-broker` on the collects it
 performs, and tells the bridge every session it binds with `POST /broker/bound

@@ -5763,7 +5763,12 @@ pub fn run() {
                 let bindings = std::sync::Arc::clone(&app.state::<broker::BrokerState>().bindings);
                 app.state::<StandaloneBridgeState>().set_broker_handshake(standalone_bridge::BrokerHandshake {
                     secret: secret.clone(),
-                    protected: std::sync::Arc::new(move || bindings.lock().map(|table| table.protected()).unwrap_or_default()),
+                    protected: std::sync::Arc::new(move || {
+                        bindings
+                            .lock()
+                            .map(|table| table.protected())
+                            .map_err(|_| "the ledger's lock is poisoned".to_string())
+                    }),
                 });
             }
             match app.path().resolve(

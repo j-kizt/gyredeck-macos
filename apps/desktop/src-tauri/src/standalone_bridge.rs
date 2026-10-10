@@ -31,6 +31,10 @@ const SUPERVISOR_RECORD_MAX_BYTES: usize = 64 * 1024;
 /// How long an exited bridge's stderr is given to be read to its end before the exit is
 /// written down — the pipe closes with the process, so this is a bound, not a wait.
 const BRIDGE_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long a freshly spawned bridge gets to take the broker's handshake off its stdin. A
+/// bridge that does not read is killed and reaped inside that bound, so the supervisor's
+/// loop — probes, restarts, shutdown — is never held behind a full pipe.
+const BRIDGE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The supervisor log is rotated past this, one generation kept. It grows by a line per
 /// start, exit or kill, so this is years of ordinary use and an afternoon of a crash loop.
 const SUPERVISOR_LOG_MAX_BYTES: u64 = 256 * 1024;
@@ -410,19 +414,21 @@ pub(crate) struct StandaloneBridgeState {
 #[derive(Clone)]
 pub(crate) struct BrokerHandshake {
     pub secret: String,
-    pub protected: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// The protection ledger as of now, or why it could not be read — a ledger that
+    /// cannot be read is a bridge that is not spawned, never one handed an empty list.
+    pub protected: Arc<dyn Fn() -> Result<Vec<String>, String> + Send + Sync>,
 }
 
 impl BrokerHandshake {
     /// The lines written to the bridge's stdin: the secret, one line per bound session,
     /// then `broker-ready`, which is what lets the bridge start listening.
-    fn lines(&self) -> String {
+    fn lines(&self) -> Result<String, String> {
         let mut out = format!("broker-secret {}\n", self.secret);
-        for session in (self.protected)() {
+        for session in (self.protected)()? {
             out.push_str(&format!("broker-bound {session}\n"));
         }
         out.push_str("broker-ready\n");
-        out
+        Ok(out)
     }
 }
 
@@ -690,6 +696,14 @@ fn spawn_bridge(
     endpoint: BridgeEndpoint,
     handshake: Option<&BrokerHandshake>,
 ) -> std::io::Result<OwnedBridge> {
+    // Read the ledger before anything is spawned: a ledger that cannot be read is a
+    // bridge that does not start, with the reason, not a bridge protecting nobody.
+    let lines = match handshake {
+        Some(handshake) => Some(handshake.lines().map_err(|reason| {
+            std::io::Error::other(format!("the broker's protection ledger could not be read: {reason}"))
+        })?),
+        None => None,
+    };
     let mut command = Command::new(node);
     command
         .arg(bridge_script)
@@ -715,10 +729,41 @@ fn spawn_bridge(
     }
     // The broker's side of the handshake, on the bridge's stdin, before the bridge serves
     // anything: the secret, the sessions the broker holds, and the word that lets it
-    // listen. The pipe stays open — closing it is the stop signal.
-    if let (Some(handshake), Some(stdin)) = (handshake, child.stdin.as_mut()) {
-        let _ = stdin.write_all(handshake.lines().as_bytes());
-        let _ = stdin.flush();
+    // listen. The pipe stays open — closing it is the stop signal. The write is a
+    // thread's, waited on with a deadline: a ledger past the pipe's capacity and a bridge
+    // that never reads would otherwise hold the supervisor here for good.
+    if let Some(lines) = lines {
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other("the bridge was spawned without a stdin to hand the handshake to"));
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("gyredeck-bridge-handshake".to_string())
+            .spawn(move || {
+                let written = stdin.write_all(lines.as_bytes()).and_then(|()| stdin.flush());
+                let _ = done_tx.send(written.map(|()| stdin));
+            })
+            .map_err(|error| std::io::Error::other(format!("the handshake thread could not start: {error}")))?;
+        match done_rx.recv_timeout(BRIDGE_HANDSHAKE_TIMEOUT) {
+            Ok(Ok(stdin)) => child.stdin = Some(stdin),
+            Ok(Err(error)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::other(format!("the bridge did not take the broker's handshake: {error}")));
+            }
+            Err(_) => {
+                // Killing the child closes the pipe's read end, which ends the writer
+                // thread with EPIPE; nothing is left blocked.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::other(format!(
+                    "the bridge did not take the broker's handshake within {} s; it was stopped",
+                    BRIDGE_HANDSHAKE_TIMEOUT.as_secs()
+                )));
+            }
+        }
     }
     Ok(OwnedBridge {
         pid: child.id(),
@@ -1382,7 +1427,7 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
         let state = StandaloneBridgeState::default();
         state.set_broker_handshake(BrokerHandshake {
             secret: "ab".repeat(32),
-            protected: Arc::new(|| vec!["s-one".to_string(), "s-two".to_string()]),
+            protected: Arc::new(|| Ok(vec!["s-one".to_string(), "s-two".to_string()])),
         });
         state
             .start_with(script.clone(), node, endpoint, SupervisorLog::none())
@@ -1525,6 +1570,44 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
         state.stop();
         assert!(wait_for_probe(endpoint, BridgeProbe::Offline));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_bridge_that_never_reads_its_handshake_is_stopped_inside_the_bound() {
+        // 65 536 ids are megabytes, far past the pipe's capacity; a child that never reads
+        // would hold a blocking write for good. spawn_bridge must come back inside its
+        // deadline with the child gone, so the supervisor's loop keeps running.
+        let Some(node) = find_node_binary() else { return };
+        let directory = fixture_dir("handshake-deaf");
+        let script = directory.join("deaf.mjs");
+        fs::write(&script, "setInterval(() => {}, 1000)\n").expect("fixture script");
+        let handshake = BrokerHandshake {
+            secret: "ab".repeat(32),
+            protected: Arc::new(|| Ok((0..65_536).map(|n| format!("session-{n:05}-aaaa-bbbb-cccc-dddddddddddd")).collect())),
+        };
+        let endpoint = BridgeEndpoint { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1) };
+        let started = Instant::now();
+        let outcome = spawn_bridge(&node, &script, endpoint, Some(&handshake));
+        let took = started.elapsed();
+        let error = outcome.err().expect("a deaf bridge is not owned");
+        assert!(error.to_string().contains("did not take the broker's handshake"), "{error}");
+        assert!(took < BRIDGE_HANDSHAKE_TIMEOUT + Duration::from_secs(2), "came back in {took:?}");
+        assert!(took >= BRIDGE_HANDSHAKE_TIMEOUT, "it waited the whole bound before giving up: {took:?}");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_ledger_that_cannot_be_read_spawns_no_bridge() {
+        let Some(node) = find_node_binary() else { return };
+        let handshake = BrokerHandshake {
+            secret: "ab".repeat(32),
+            protected: Arc::new(|| Err("the ledger's lock is poisoned".to_string())),
+        };
+        let endpoint = BridgeEndpoint { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1) };
+        let error = spawn_bridge(&node, Path::new("/nonexistent/bridge.mjs"), endpoint, Some(&handshake))
+            .err()
+            .expect("no bridge");
+        assert!(error.to_string().contains("the ledger's lock is poisoned"), "{error}");
     }
 
     fn fixture_dir(name: &str) -> PathBuf {

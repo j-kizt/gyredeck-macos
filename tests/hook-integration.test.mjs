@@ -6975,3 +6975,39 @@ test("a bridge that was handed no secret vouches for nobody and serves every pat
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("a broker handshake that is not whole is a bridge that exits, never one that serves with part of the ledger", async () => {
+  // Three ways a handshake can be wrong: no secret before ready, a malformed session id,
+  // a ledger past the bridge's table. Each exits 1 with the rule named, and the port is
+  // never served — an incomplete protection state is closed, not partly open.
+  const secret = "cd".repeat(32);
+  const cases = [
+    { name: "ready without a secret", lines: "broker-ready\n", rule: /no secret was given/ },
+    { name: "a malformed id", lines: `broker-secret ${secret}\nbroker-bound not a session\nbroker-ready\n`, rule: /bound session id is malformed/ },
+    { name: "a ledger past the table", lines: `broker-secret ${secret}\n${Array.from({ length: 65_537 }, (_, n) => `broker-bound s${n}\n`).join("")}broker-ready\n`, rule: /exceeds the bridge's table/ },
+  ];
+  for (const { name, lines, rule } of cases) {
+    const home = await mkdtemp(join(tmpdir(), "gyredeck-broker-broken-"));
+    await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+    const port = await freePort();
+    await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+    let stderr = "";
+    const bridge = spawn(
+      process.execPath,
+      ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+      { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+    );
+    bridge.stderr.on("data", (chunk) => { stderr += chunk; });
+    try {
+      const exited = new Promise((resolve) => bridge.once("exit", resolve));
+      bridge.stdin.write(lines);
+      const code = await Promise.race([exited, new Promise((resolve) => setTimeout(() => resolve("still running"), 15_000))]);
+      assert.equal(code, 1, `${name}: the bridge exits 1`);
+      assert.match(stderr, rule, `${name}: the rule that failed is named`);
+      assert.equal(await fetch(`http://127.0.0.1:${port}/health`).then(() => "served").catch(() => null), null, `${name}: nothing was ever served`);
+    } finally {
+      if (bridge.exitCode === null) bridge.kill();
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+});

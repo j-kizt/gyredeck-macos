@@ -1,5 +1,85 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A session's mail is read by the process the broker bound to it, and by nothing else — (v1.19.0)
+
+One feature, built in three parts, for a hole that had been written down since the mailbox was
+built: any program on the machine could read any session's mail.
+
+### Added
+
+- **The mailbox broker.** Every session's mail used to be behind one credential that every
+  agent on the machine could read — a file in the home folder — so a hook asking for one
+  session's mail was trusted on its word alone, and any local program could name another
+  session and empty its inbox. Gyredeck now asks the operating system instead. When a hook
+  connects, the app learns from the kernel which process it is, walks past any shell to the
+  command-line tool that spawned it, and checks that the tool is the genuine, signed
+  `claude` or `agy` from its vendor. The first such process to claim a session holds it
+  while it lives; one session per process, one process per session; a process that claims
+  two is served nothing until it exits. The hook's own mail then comes through the broker,
+  and the hook never names a session again. A hook that meets a refusal says so and waits
+  for the next turn rather than going around it.
+- **The bridge takes the broker's word, and no one else's, for a protected session.** The
+  app hands its bridge a secret for each run, on a channel nothing on disk and nothing in a
+  process list can see, together with the list of sessions the broker protects; the bridge
+  does not serve until it has all of it, and a bridge handed a broken list stops rather than
+  serving with part of one. From then on, a request to read a protected session's mail over
+  the old path — a peek, a collect, the backlog, the stream, or a room collect in that
+  session's name — is refused with a message that names the fix, counted where the app can
+  see it, said once on the bridge's log. While the app runs, a session the broker has
+  bound is never reopened — not by the bridge restarting, a CLI exiting, or a full table;
+  past every cap the answer is closed, not open.
+- **Codex's mail has no reader at all.** Gyredeck delivers to a Codex session by pushing into
+  its thread and reads its answers from Codex's own log, so nothing outside needs to read
+  its mailbox — and now nothing can, the broker included, from the moment the bridge knows a
+  session is Codex's. That knowledge is kept in its own record, which nothing can push an
+  entry out of, survives a restart, and closes every read if it is full or damaged.
+- **Codex's private answers go to whoever asked.** They used to be left in Codex's own
+  mailbox for the asker to come and fetch, which the line above now forbids. The bridge
+  writes where the answer goes into the message it hands Codex, checks it again when the
+  answer comes back, and delivers it the way the asker reads: pushed to a Codex session,
+  collected by a Claude Code or Antigravity session's hook. The `replyTo` a message was
+  accepted with chooses where the answer goes; nothing in the message's text or the
+  sender's label can change it.
+- **Mail is not lost when a hook gives up early.** The broker used to take a session's mail
+  from the bridge and lose it if the hook had stopped waiting before the answer arrived. It
+  now keeps each batch until the hook says it has it, and hands it over again on the next
+  turn — including to the same session resumed in a new process. The cost, stated: a batch
+  can arrive twice, and one taken just before the app restarts is lost.
+- **Waiting for an answer goes through the broker too.** The instruction a Claude Code
+  session is given for waiting inside a turn used to be a request over the old path, with
+  the room's password. It is now one command through the hook, which asks the broker on the
+  session's behalf — collect only, never a new claim — and stops after the time given,
+  whatever the broker or the bridge took to answer. A wait that is being refused says so and
+  stops; it does not pretend the silence was the room's.
+
+### What it is not, and what is not closed
+
+A room's own messages are still the room's: anyone holding the room's password may read
+them and watch the stream in a member's name. The password does not prove who is reading;
+a member who left still holds it, and watching in a member's name moves that member's
+place in the stream. That is the limit of a shared password, written down in the
+protocol document rather than dressed up; the founder's remedy is to rotate it or close
+the room. And the broker says which process a hook came from and who claimed a session
+first — a permission scoped to a bound process, not a proof of identity: a second genuine
+tool claiming an id before its owner, or after the owner exits, is the hole that remains,
+and it is written down too.
+
+Where the old path still works, on purpose:
+
+- **A CLI the broker cannot verify** — an unsigned or locally built `claude` or `agy`, or a
+  platform without process attestation — keeps reading its mail the old way.
+- **A session the bridge has never heard from** is served the old way until its first event
+  says what it is. A Codex session's mail may already be waiting by then; reads close the
+  moment the bridge knows.
+- **A private message Codex was handed before this release** has no destination written on
+  it, so its answer stays in Codex's own mailbox, which nothing outside reads now. Send it
+  again and the answer will reach you.
+- **Right after the app restarts**, the broker has forgotten which sessions it bound, so
+  each one reads the old way until its hook binds again on its next turn.
+- **A batch of mail taken just before the app quits** and not yet acknowledged is lost,
+  since the bridge had already moved on. While the app runs, a batch can arrive twice
+  rather than not at all.
+
 ## What Codex says for the room while working a goal now reaches it — (v1.18.11)
 
 One fix, for two messages that were written and never arrived.

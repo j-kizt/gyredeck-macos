@@ -1,4 +1,5 @@
 import { request } from "node:http";
+import { connect } from "node:net";
 import { readFile, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -175,6 +176,94 @@ const post = (endpoint, token, path, payload) =>
  */
 const MAIL_ROOM_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 const MAIL_MAX_MESSAGES = 10;
+
+/**
+ * The mailbox broker: one line over a Unix socket, one line back.
+ *
+ * The broker is the app asking the operating system which process this hook belongs to,
+ * and choosing the mailbox itself; this hook names no `?as=` on that path. The answer
+ * decides what happens next, and only two answers send the hook back to TCP: no broker
+ * at all (no socket, nothing listening) and a broker that says it cannot or will not
+ * serve this process (`unsupported` on a platform without attestation, `ineligible` for a
+ * CLI it does not know or cannot verify). Everything else — unbound, a conflict, a
+ * refusal, a timeout, an answer that could not be read — withholds the mail for this
+ * turn: falling back to `?as=` on a refusal would hand the hook exactly the bypass the
+ * broker exists to close. (#119)
+ */
+const BROKER_SOCKET = join(CONFIG_DIR, "broker", "gyredeck.broker.sock");
+const BROKER_PROTOCOL = 1;
+const BROKER_DEADLINE_MS = 1_500;
+const askBroker = (request) =>
+  new Promise((resolve) => {
+    let settled = false;
+    const chunks = [];
+    let length = 0;
+    // One deadline for the whole exchange, from before the connect: a socket timeout is an
+    // idle timeout, and a broker that dribbled a byte every so often would hold the hook —
+    // and the person's prompt behind it — for as long as it liked.
+    const deadline = setTimeout(() => { socket.destroy(); done({ timedOut: true }); }, BROKER_DEADLINE_MS);
+    const done = (value) => { if (!settled) { settled = true; clearTimeout(deadline); resolve(value); } };
+    const socket = connect(BROKER_SOCKET);
+    socket.setTimeout(BROKER_DEADLINE_MS);
+    socket.on("connect", () => socket.write(`${JSON.stringify({ v: BROKER_PROTOCOL, ...request })}\n`));
+    socket.on("data", (chunk) => {
+      // Bytes until the line ends, decoded once: a multi-byte character the socket cut in
+      // two is not two characters.
+      chunks.push(chunk);
+      length += chunk.length;
+      const joined = Buffer.concat(chunks);
+      const end = joined.indexOf(0x0a);
+      if (end >= 0) {
+        try { done({ answer: JSON.parse(joined.subarray(0, end).toString("utf8")) }); } catch { done({ broken: true }); }
+        socket.destroy();
+      } else if (length > 1_048_576) {
+        socket.destroy();
+        done({ broken: true });
+      }
+    });
+    socket.on("timeout", () => { socket.destroy(); done({ timedOut: true }); });
+    socket.on("error", (error) => done(error?.code === "ENOENT" || error?.code === "ECONNREFUSED" ? { absent: true } : { broken: true }));
+    socket.on("close", () => done({ broken: true }));
+  });
+
+/** Ask the broker to bind this hook's CLI to the session. Best effort at session start; the answer is read by the drain. */
+const bindThroughBroker = (conversationId) => askBroker({ bind: { conversationId } });
+
+/**
+ * What one answer from the broker means for the drain: a result to use, a reason to fall
+ * back to TCP, or a reason to withhold the mail this turn. Only an absent broker and a
+ * broker that cannot serve this process (`unsupported`, `ineligible`) send the hook back
+ * to TCP; a refusal of any other kind, an unreadable answer and another protocol version
+ * all withhold — falling back on a refusal would be the bypass the broker exists to close.
+ */
+const judgeBrokerAnswer = (reply) => {
+  if (reply.absent) return { fallback: "no broker" };
+  const answer = reply.answer;
+  if (!answer || typeof answer !== "object") {
+    return { withheld: reply.timedOut ? "the broker did not answer in time" : "the broker's answer could not be read" };
+  }
+  if (answer.v !== BROKER_PROTOCOL) return { withheld: `the broker speaks protocol ${JSON.stringify(answer.v)}, this hook speaks ${BROKER_PROTOCOL}` };
+  if (answer.ok !== true) {
+    if (answer.error === "unsupported" || answer.error === "ineligible") return { fallback: answer.error };
+    return { withheld: `${typeof answer.error === "string" ? answer.error : "refused"}${typeof answer.message === "string" ? ` — ${answer.message}` : ""}` };
+  }
+  return { result: answer };
+};
+
+/**
+ * Bind, then collect, through the broker — the bind's answer decides whether the collect
+ * is even sent, and the collect's answer is believed only when it is for this session.
+ */
+const collectThroughBroker = async (conversationId, limit) => {
+  const bound = judgeBrokerAnswer(await askBroker({ bind: { conversationId } }));
+  if (!bound.result) return bound;
+  const collected = judgeBrokerAnswer(await askBroker({ collect: { limit } }));
+  if (!collected.result) return collected;
+  if (collected.result.boundTo !== conversationId) {
+    return { withheld: `the broker answered for ${JSON.stringify(collected.result.boundTo)}, not this session` };
+  }
+  return collected;
+};
 const MAIL_MAX_TEXT = 2_000;
 /** `from` the desktop app uses when the person sends a message themselves. */
 const APP_SENDER = "gyredeck";
@@ -300,7 +389,16 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
   // The cap goes to the bridge rather than being applied here: it is what advances
   // this reader's position, and trimming afterwards would mark the remainder read
   // without ever delivering it.
-  const result = await getJson(endpoint, token, `/mail/inbox?as=${room}&collect=1&limit=${MAIL_MAX_MESSAGES}`);
+  const viaBroker = await collectThroughBroker(room, MAIL_MAX_MESSAGES);
+  let result = null;
+  if (viaBroker.result) {
+    result = viaBroker.result;
+  } else if (viaBroker.fallback) {
+    result = await getJson(endpoint, token, `/mail/inbox?as=${room}&collect=1&limit=${MAIL_MAX_MESSAGES}`);
+  } else {
+    process.stderr.write(`gyredeck: mail withheld this turn — ${viaBroker.withheld}\n`);
+    return null;
+  }
   const messages = Array.isArray(result?.messages) ? result.messages : [];
   const delivered = messages
     .filter((message) => Number.isInteger(message?.seq) && typeof message?.text === "string")
@@ -591,6 +689,9 @@ const main = async () => {
           reason: typeof input.source === "string" ? input.source : "startup",
           previousConversationId: null,
         })));
+        // The first thing a session does is tell the broker which process it is: the OS
+        // names the process, the hook only names the session.
+        if (conversationId) posts.push(bindThroughBroker(conversationId));
         break;
       case "UserPromptSubmit":
         posts.push(post(endpoint, token, "/ingest", buildEvent("turn_start", {
@@ -605,6 +706,8 @@ const main = async () => {
           // drain: confirming first means the same turn can be told it may now speak,
           // and the notice the confirmation puts in the room arrives with everything
           // else rather than a turn later.
+          // The drain binds through the broker itself, every turn: a broker that restarted
+          // has forgotten, and a bind for a process it already holds is nothing new.
           mailDrain = confirmRoomPassword(endpoint, token, conversationId, input.prompt)
             .then((confirmed) =>
               drainMailIntoContext(endpoint, token, conversationId, confirmed),

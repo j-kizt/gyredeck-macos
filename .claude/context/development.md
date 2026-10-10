@@ -37,6 +37,9 @@ pnpm desktop:web        # browser-only demo/dev server (no native features)
 pnpm mod:tail           # tail the local NDJSON event log
 pnpm test:demo          # browser demo Playwright suite
 cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
+# The broker's live signature gate, against a real CLI on this machine (ignored by default):
+GYREDECK_BROKER_LIVE_PID=<pid of a running claude or agy> GYREDECK_BROKER_LIVE_NAME=<claude|agy> \
+  cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib broker::tests::the_real_check_accepts_a_live_signed_cli -- --ignored
 ```
 
 The menu-bar window, tray toggle, terminal focus, notifications, and real event streams must be validated in the installed/native app — the browser demo is only for layout and interaction checks.

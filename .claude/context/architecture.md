@@ -71,6 +71,11 @@ Tauri v2 shell. Native responsibilities:
 - **Services scan** (`local_services.rs`) — enumerates listening TCP sockets via `lsof`, probes HTTP roots, and exposes a guarded stop/force-kill control for eligible current-user listeners. See `services.md`.
 - **Git Monitor** (`github.rs`) — per-repo latest commit, CI status (GitHub Actions / GitLab pipelines), and open PRs/MRs for **GitHub and GitLab** via their REST APIs, using an own provider-tagged token store (`~/.config/gyredeck/github-accounts.json`, `0600`). Accounts are added via OAuth 2.0 device flow (GitLab tokens carry a refresh token + expiry and auto-refresh) or imported from the optional `gh`/`glab` CLIs. A built-in git credential helper (`gyredeck-desktop git-credential`) serves `git push`/`pull` without those CLIs, per-host (A1: fills only hosts with no existing gh/glab helper); GitLab uses username `oauth2`. An optional "Sync git identity" toggle writes the global `user.name`/`user.email` (+ `gh auth switch`) on account switch; with it off, switching is view-only.
 - **Display / keep-awake** — persisted display selection and a keep-display-awake toggle.
+- **Mailbox broker** (`broker.rs`) — a Unix socket the hooks prefer over TCP for collecting
+  mail. The app asks the OS which process connected, walks past shells to the CLI that spawned
+  the hook, verifies it is a signed `claude` or `agy` through the Security framework, binds it to
+  the session it names, and performs the collect itself against the bridge. See
+  `event-protocol.md` → "The mailbox broker" for the protocol, the rules and the limits.
 - **Hook installers** — `install_claude_hook`, `install_agy_hook`, `install_codex_hook` and
   `install_codex_notify` copy the adapter and register it, reporting install status back to
   Settings → Plugins. Status also reports **stale**: the installed copy is compared byte for

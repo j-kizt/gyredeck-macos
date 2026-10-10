@@ -779,7 +779,7 @@ fn read_ingest_token() -> Option<String> {
 /// is a 404 the join field has to render as "no room with that code", and a session
 /// already in a room is a 409. Collapsing those into one error string would leave the
 /// panel unable to say which happened.
-fn bridge_request(
+pub(crate) fn bridge_request(
     method: &str,
     path: &str,
     body: Option<String>,

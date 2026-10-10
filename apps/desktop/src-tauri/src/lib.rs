@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+mod broker;
 mod github;
 mod keep_awake;
 mod local_services;
@@ -5738,6 +5739,7 @@ pub fn run() {
         .manage(DisplayPreferenceState::default())
         .manage(LocalServicesControlState::default())
         .manage(StandaloneBridgeState::default())
+        .manage(broker::BrokerState::default())
         .invoke_handler(move |invoke| command_handler(invoke))
         .setup(|app| {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -5757,6 +5759,16 @@ pub fn run() {
                 Err(error) => {
                     eprintln!("Gyredeck standalone bridge resource is unavailable: {error}");
                 }
+            }
+            // The mailbox broker listens beside the bridge. A collect it has decided on is
+            // one bridge call with the machine token, for the session the OS bound.
+            if let Err(error) = app.state::<broker::BrokerState>().start_default(std::sync::Arc::new(
+                |session: &str, limit: u64| {
+                    let path = format!("/mail/inbox?as={session}&collect=1&limit={limit}");
+                    standalone_bridge::bridge_request("GET", &path, None).map(|(_, body)| body)
+                },
+            )) {
+                eprintln!("Gyredeck mailbox broker is unavailable: {error}");
             }
 
             if let Some(window) = app.get_webview_window("main") {
@@ -5807,6 +5819,7 @@ pub fn run() {
 
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+            app_handle.state::<broker::BrokerState>().stop();
             app_handle.state::<StandaloneBridgeState>().stop();
             let _ = app_handle.state::<KeepAwakeState>().set_active(false);
         }

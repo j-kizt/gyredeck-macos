@@ -192,6 +192,23 @@ pub(crate) struct Bindings {
     /// one of these: a claim the bridge never heard is a pending claim, not a binding the
     /// hook may read through.
     acknowledged: std::collections::HashSet<String>,
+    /// The batch each session was last handed and has not yet acknowledged, by delivery
+    /// id. The bridge's cursor moved when the broker collected it; until a hook says it has
+    /// the batch, this copy is the only one, so the next collect for that session gets it
+    /// again instead of asking the bridge for more. Keyed by session, not process: a CLI
+    /// that exits and resumes under a new process is the same session, and its mail must
+    /// survive the change — only the session's current verified binding can read or
+    /// acknowledge it, and an ambiguous process is refused, never handed it. At least once
+    /// while the app runs: a hook that took the batch but whose acknowledgement did not
+    /// land is handed it again. Not across an app restart: this lives in the app's memory,
+    /// and the bridge's cursor has already moved, so a restart between collect and
+    /// acknowledgement loses that batch.
+    outstanding: HashMap<String, (u64, Value)>,
+    /// Sessions with a collect in flight — reserved before the bridge is asked, so a retry
+    /// while the first is still running is refused (`busy`, retryable) rather than let two
+    /// collects take two batches and one replace the other.
+    collecting: std::collections::HashSet<String>,
+    next_delivery: u64,
 }
 
 /// Why a bind was refused.
@@ -292,6 +309,29 @@ impl Bindings {
     }
 
     /// The bridge acknowledged that this session is protected: collects may be served.
+    /// The batch this session was handed and has not acknowledged, if any.
+    pub(crate) fn outstanding_for(&self, session: &str) -> Option<(u64, Value)> {
+        self.outstanding.get(session).cloned()
+    }
+
+    /// Keep a batch for this session until it is acknowledged; answers its delivery id.
+    pub(crate) fn hold(&mut self, session: &str, batch: Value) -> u64 {
+        self.next_delivery += 1;
+        self.outstanding.insert(session.to_string(), (self.next_delivery, batch));
+        self.next_delivery
+    }
+
+    /// The session's binding says it has the batch with this id. Only that one.
+    pub(crate) fn delivered(&mut self, session: &str, delivery: u64) -> bool {
+        match self.outstanding.get(session) {
+            Some((id, _)) if *id == delivery => {
+                self.outstanding.remove(session);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn acknowledge(&mut self, session: &str) {
         self.acknowledged.insert(session.to_string());
     }
@@ -406,21 +446,71 @@ pub(crate) fn handle_request(
             if table.is_ambiguous(peer.ancestor) {
                 return refused("conflict", format!("Process {} claimed two sessions; it is served nothing until it exits.", peer.ancestor.pid));
             }
-            match table.session_of(peer.ancestor) {
+            let session = match table.session_of(peer.ancestor) {
                 Some(session) if !table.is_acknowledged(session) => {
                     return refused("bridge", format!("The bridge has not acknowledged that {session} is bound; bind again before collecting."));
                 }
                 session => session.map(str::to_string),
+            };
+            let Some(session) = session else {
+                return refused("unbound", format!("Process {} ({}) is bound to no session; bind first, from a hook of the same process.", peer.ancestor.pid, cli.label()));
+            };
+            // What this session was handed and has not acknowledged comes first, and alone:
+            // the bridge is not asked for more until it has been taken.
+            if let Some((delivery, mut batch)) = table.outstanding_for(&session) {
+                if let Value::Object(map) = &mut batch {
+                    map.insert("delivery".to_string(), json!(delivery));
+                    map.insert("redelivered".to_string(), Value::Bool(true));
+                }
+                return batch;
             }
+            // Reserved before the bridge is asked: a retry while this collect runs is told
+            // to come back, and is then handed what this one took.
+            if table.collecting.contains(&session) {
+                return refused("busy", format!("A collect for {session} is already in flight; ask again in a moment."));
+            }
+            // Bounded by refusing, not by dropping: batches held for sessions are mail the
+            // bridge no longer has. A collect in flight may become one, so it counts too.
+            if table.outstanding.len() + table.collecting.len() >= MAX_BINDINGS {
+                return refused("full", "The broker holds as many unacknowledged batches as it will; nothing was collected.".to_string());
+            }
+            table.collecting.insert(session.clone());
+            session
         };
-        let Some(session) = session else {
-            return refused("unbound", format!("Process {} ({}) is bound to no session; bind first, from a hook of the same process.", peer.ancestor.pid, cli.label()));
+        let collected = (policy.collect)(&session, limit);
+        let Ok(mut table) = bindings.lock() else {
+            return refused("busy", "The broker's table is unavailable.".to_string());
         };
-        return match (policy.collect)(&session, limit) {
+        table.collecting.remove(&session);
+        return match collected {
             Ok(mut answer) => {
                 if let Value::Object(map) = &mut answer {
                     map.insert("v".to_string(), json!(PROTOCOL_VERSION));
-                    map.insert("boundTo".to_string(), Value::String(session));
+                    map.insert("boundTo".to_string(), Value::String(session.clone()));
+                }
+                // Anything handed over is kept until acknowledged; an empty answer moved
+                // nothing and needs no acknowledgement.
+                let carries = answer.get("messages").and_then(Value::as_array).is_some_and(|list| !list.is_empty())
+                    || answer.get("missed").and_then(Value::as_array).is_some_and(|list| !list.is_empty());
+                // Kept for the session whatever happened to this process meanwhile: it is
+                // the session's mail, and only that session's binding can take it.
+                let delivery = carries.then(|| table.hold(&session, answer.clone()));
+                // The bridge was asked on the strength of a binding checked before the
+                // call. Asked again now: a requester that turned ambiguous, lost or changed
+                // its binding, or whose chain no longer holds while the call ran is
+                // refused, and the batch waits for the session's next verified binding.
+                table.sweep(&*policy.alive);
+                if table.is_ambiguous(peer.ancestor) {
+                    return refused("conflict", format!("Process {} claimed two sessions while its collect ran; it is served nothing until it exits.", peer.ancestor.pid));
+                }
+                if table.session_of(peer.ancestor) != Some(session.as_str()) {
+                    return refused("unbound", format!("Process {} is no longer bound to {session}; its mail is kept for the session's next binding.", peer.ancestor.pid));
+                }
+                if !(policy.chain_holds)(peer) {
+                    return refused("unattested", "The process that asked changed while its collect ran; the mail is kept for the session.".to_string());
+                }
+                if let (Some(delivery), Value::Object(map)) = (delivery, &mut answer) {
+                    map.insert("delivery".to_string(), json!(delivery));
                 }
                 answer
             }
@@ -428,7 +518,28 @@ pub(crate) fn handle_request(
         };
     }
 
-    refused("invalid", "A request is {\"v\":1,\"bind\":{\"conversationId\"}} or {\"v\":1,\"collect\":{\"limit\"}}.".to_string())
+    if let Some(ack) = request.get("ack") {
+        let Some(delivery) = ack.get("delivery").and_then(Value::as_u64) else {
+            return refused("invalid", "An acknowledgement names the delivery it is for.".to_string());
+        };
+        let Ok(mut table) = bindings.lock() else {
+            return refused("busy", "The broker's table is unavailable.".to_string());
+        };
+        table.sweep(&*policy.alive);
+        if table.is_ambiguous(peer.ancestor) {
+            return refused("conflict", format!("Process {} claimed two sessions; it is served nothing until it exits.", peer.ancestor.pid));
+        }
+        let Some(session) = table.session_of(peer.ancestor).map(str::to_string) else {
+            return refused("unbound", format!("Process {} is bound to no session.", peer.ancestor.pid));
+        };
+        return if table.delivered(&session, delivery) {
+            json!({ "v": PROTOCOL_VERSION, "ok": true, "acked": delivery })
+        } else {
+            refused("invalid", format!("{session} has no outstanding delivery {delivery}."))
+        };
+    }
+
+    refused("invalid", "A request is {\"v\":1,\"bind\":{\"conversationId\"}}, {\"v\":1,\"collect\":{\"limit\"}} or {\"v\":1,\"ack\":{\"delivery\"}}.".to_string())
 }
 
 /// A running broker: its socket, its thread, and the way to stop it.
@@ -1259,6 +1370,267 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_handed_over_is_kept_until_the_same_process_acknowledges_it() {
+        // The hook can give up on an answer the broker already collected — its deadline is
+        // its own. The batch must survive that: the next collect from the same process gets
+        // it again, and the bridge is not asked for more until it has been acknowledged.
+        let bindings = Mutex::new(Bindings::default());
+        let calls = Arc::new(Mutex::new(0_u32));
+        let policy = Policy {
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            alive: Arc::new(|_| true),
+            chain_holds: Arc::new(|_| true),
+            collect: Arc::new({
+                let calls = Arc::clone(&calls);
+                move |_: &str, _| {
+                    let mut n = calls.lock().unwrap();
+                    *n += 1;
+                    Ok(json!({ "ok": true, "messages": [{ "seq": *n, "text": format!("message-{n}") }] }))
+                }
+            }),
+            report_bound: Arc::new(|_| Ok(())),
+        };
+        let claude = peer(42, 40, "claude");
+        let other = peer(52, 50, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&claude), &bindings, &policy)["ok"], true);
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s2" } }), Some(&other), &bindings, &policy)["ok"], true);
+
+        let first = ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy);
+        let delivery = first["delivery"].as_u64().expect("a batch with messages carries a delivery id");
+        assert_eq!(first["messages"][0]["text"], "message-1");
+        // The hook timed out: no acknowledgement. The same batch comes back, and the bridge is not asked.
+        let again = ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy);
+        assert_eq!(again["messages"][0]["text"], "message-1");
+        assert_eq!(again["delivery"], delivery);
+        assert_eq!(again["redelivered"], true);
+        assert_eq!(*calls.lock().unwrap(), 1, "nothing more is collected while a batch is outstanding");
+        // Only its own process may acknowledge it, and only by its id.
+        assert_eq!(ask(json!({ "v": 1, "ack": { "delivery": delivery } }), Some(&other), &bindings, &policy)["error"], "invalid", "another process cannot acknowledge it");
+        assert_eq!(ask(json!({ "v": 1, "ack": { "delivery": delivery + 99 } }), Some(&claude), &bindings, &policy)["error"], "invalid", "nor a wrong id");
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy)["messages"][0]["text"], "message-1", "still kept");
+        assert_eq!(ask(json!({ "v": 1, "ack": { "delivery": delivery } }), Some(&claude), &bindings, &policy)["ok"], true);
+        // Acknowledged: the next collect asks the bridge, and later mail is not lost.
+        let next = ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy);
+        assert_eq!(next["messages"][0]["text"], "message-2");
+        assert_ne!(next["delivery"], delivery);
+        // An acknowledgement retried after it landed is refused, and takes nothing with it.
+        assert_eq!(ask(json!({ "v": 1, "ack": { "delivery": delivery } }), Some(&claude), &bindings, &policy)["error"], "invalid");
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy)["messages"][0]["text"], "message-2", "the newer batch is untouched");
+    }
+
+    #[test]
+    fn an_empty_collect_needs_no_acknowledgement_and_an_exit_keeps_the_batch_for_the_resumed_session() {
+        let bindings = Mutex::new(Bindings::default());
+        let alive = Arc::new(Mutex::new(true));
+        let full = Arc::new(Mutex::new(false));
+        let policy = Policy {
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            alive: Arc::new({ let alive = Arc::clone(&alive); move |_| *alive.lock().unwrap() }),
+            chain_holds: Arc::new(|_| true),
+            collect: Arc::new({
+                let full = Arc::clone(&full);
+                move |_: &str, _| Ok(if *full.lock().unwrap() { json!({ "ok": true, "messages": [{ "seq": 1, "text": "x" }] }) } else { json!({ "ok": true, "messages": [] }) })
+            }),
+            report_bound: Arc::new(|_| Ok(())),
+        };
+        let claude = peer(42, 40, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&claude), &bindings, &policy)["ok"], true);
+        let empty = ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy);
+        assert!(empty.get("delivery").is_none(), "nothing handed over, nothing to acknowledge");
+        *full.lock().unwrap() = true;
+        assert!(ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy)["delivery"].is_u64());
+        let held = ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy)["delivery"].clone();
+        // The CLI exits; the session resumes under a new process, which binds the same id.
+        *alive.lock().unwrap() = false;
+        bindings.lock().unwrap().sweep(&|_| false);
+        assert!(bindings.lock().unwrap().outstanding_for("s1").is_some(), "an exit does not take the session's mail with it");
+        *alive.lock().unwrap() = true;
+        let resumed = peer(62, 60, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&resumed), &bindings, &policy)["ok"], true);
+        let recovered = ask(json!({ "v": 1, "collect": {} }), Some(&resumed), &bindings, &policy);
+        assert_eq!(recovered["delivery"], held, "the resumed session recovers the batch");
+        assert_eq!(recovered["redelivered"], true);
+        assert_eq!(ask(json!({ "v": 1, "ack": { "delivery": held } }), Some(&resumed), &bindings, &policy)["ok"], true);
+    }
+
+    #[test]
+    fn an_ambiguous_process_is_refused_the_batch_and_the_batch_survives_it() {
+        let bindings = Mutex::new(Bindings::default());
+        let policy = Policy {
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            alive: Arc::new(|_| true),
+            chain_holds: Arc::new(|_| true),
+            collect: Arc::new(|_: &str, _| Ok(json!({ "ok": true, "messages": [{ "seq": 1, "text": "for-s1" }] }))),
+            report_bound: Arc::new(|_| Ok(())),
+        };
+        let claude = peer(42, 40, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&claude), &bindings, &policy)["ok"], true);
+        let held = ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy)["delivery"].clone();
+        // The process claims a second id: it is ambiguous, and is handed neither session's mail.
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s2" } }), Some(&claude), &bindings, &policy)["error"], "conflict");
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy)["error"], "conflict");
+        assert_eq!(ask(json!({ "v": 1, "ack": { "delivery": held } }), Some(&claude), &bindings, &policy)["error"], "conflict", "nor may it acknowledge, and so destroy, the batch");
+        assert!(bindings.lock().unwrap().outstanding_for("s1").is_some(), "the batch is still s1's");
+        assert!(bindings.lock().unwrap().outstanding_for("s2").is_none(), "and was never carried into s2");
+    }
+
+    #[test]
+    fn a_retry_while_the_first_collect_is_in_flight_is_refused_and_then_handed_what_the_first_took() {
+        // Reserved before the bridge is asked: two collects for one session at once must
+        // not take two batches.
+        let bindings = Arc::new(Mutex::new(Bindings::default()));
+        let calls = Arc::new(Mutex::new(0_u32));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let policy = Arc::new(Policy {
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            alive: Arc::new(|_| true),
+            chain_holds: Arc::new(|_| true),
+            collect: Arc::new({
+                let calls = Arc::clone(&calls);
+                let gate = Arc::clone(&gate);
+                move |_: &str, _| {
+                    *calls.lock().unwrap() += 1;
+                    let (lock, cvar) = &*gate;
+                    let mut open = lock.lock().unwrap();
+                    while !*open { open = cvar.wait(open).unwrap(); }
+                    Ok(json!({ "ok": true, "messages": [{ "seq": 1, "text": "THE-ONE-BATCH" }] }))
+                }
+            }),
+            report_bound: Arc::new(|_| Ok(())),
+        });
+        let claude = peer(42, 40, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&claude), &bindings, &policy)["ok"], true);
+        let first = {
+            let (bindings, policy, claude) = (Arc::clone(&bindings), Arc::clone(&policy), claude.clone());
+            std::thread::spawn(move || ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy))
+        };
+        while *calls.lock().unwrap() == 0 { std::thread::sleep(Duration::from_millis(5)); }
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy)["error"], "busy", "a retry while the first runs is told to come back");
+        { let (lock, cvar) = &*gate; *lock.lock().unwrap() = true; cvar.notify_all(); }
+        let _ = first.join().unwrap();
+        let retried = ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy);
+        assert_eq!(retried["messages"][0]["text"], "THE-ONE-BATCH", "and is then handed what the first took");
+        assert_eq!(*calls.lock().unwrap(), 1, "only one batch was ever taken from the bridge");
+    }
+
+    #[test]
+    fn a_requester_that_turns_ambiguous_while_its_collect_runs_is_refused_and_the_batch_waits_for_the_session() {
+        let bindings = Arc::new(Mutex::new(Bindings::default()));
+        let started = Arc::new(Mutex::new(false));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let policy = Arc::new(Policy {
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            alive: Arc::new(|_| true),
+            chain_holds: Arc::new(|_| true),
+            collect: Arc::new({
+                let started = Arc::clone(&started);
+                let gate = Arc::clone(&gate);
+                move |_: &str, _| {
+                    *started.lock().unwrap() = true;
+                    let (lock, cvar) = &*gate;
+                    let mut open = lock.lock().unwrap();
+                    while !*open { open = cvar.wait(open).unwrap(); }
+                    Ok(json!({ "ok": true, "messages": [{ "seq": 1, "text": "PRIVATE-S1" }] }))
+                }
+            }),
+            report_bound: Arc::new(|_| Ok(())),
+        });
+        let claude = peer(42, 40, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&claude), &bindings, &policy)["ok"], true);
+        let pending = {
+            let (bindings, policy, claude) = (Arc::clone(&bindings), Arc::clone(&policy), claude.clone());
+            std::thread::spawn(move || ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy))
+        };
+        while !*started.lock().unwrap() { std::thread::sleep(Duration::from_millis(5)); }
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s2" } }), Some(&claude), &bindings, &policy)["error"], "conflict");
+        { let (lock, cvar) = &*gate; *lock.lock().unwrap() = true; cvar.notify_all(); }
+        let late = pending.join().unwrap();
+        assert_eq!(late["error"], "conflict", "the late result is not handed to a requester that turned ambiguous: {late}");
+        assert!(late.get("messages").is_none());
+        // Kept for s1, and recovered by the session's next verified binding.
+        let resumed = peer(62, 60, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&resumed), &bindings, &policy)["ok"], true);
+        let recovered = ask(json!({ "v": 1, "collect": {} }), Some(&resumed), &bindings, &policy);
+        assert_eq!(recovered["messages"][0]["text"], "PRIVATE-S1");
+        assert_eq!(recovered["redelivered"], true);
+    }
+
+    #[test]
+    fn collects_in_flight_count_against_the_cap_on_held_batches() {
+        let mut table = Bindings::default();
+        for n in 0..MAX_BINDINGS - 1 {
+            table.hold(&format!("held-{n}"), json!({ "messages": [1] }));
+        }
+        table.collecting.insert("in-flight".to_string());
+        assert_eq!(table.outstanding.len() + table.collecting.len(), MAX_BINDINGS, "one held short of the cap, plus one in flight, is the cap");
+        let bindings = Mutex::new(table);
+        let policy = Policy {
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            alive: Arc::new(|_| true),
+            chain_holds: Arc::new(|_| true),
+            collect: Arc::new(|_: &str, _| panic!("the bridge must not be asked past the cap")),
+            report_bound: Arc::new(|_| Ok(())),
+        };
+        let claude = peer(42, 40, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "another" } }), Some(&claude), &bindings, &policy)["ok"], true);
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy)["error"], "full", "refused before anything is taken");
+    }
+
+    #[test]
+    fn a_collect_whose_response_timed_out_can_be_retried_without_losing_mail() {
+        // Codex's regression, through the real socket: the collector takes a message and
+        // answers after 1.8 s; the client's 1.5 s read gives up; the retry recovers it.
+        let dir = std::env::temp_dir().join(format!("gyredeck-broker-unreceived-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("broker").join("broker.sock");
+        let drained = Arc::new(Mutex::new(false));
+        let policy = Policy {
+            eligible: Arc::new(|_| Ok(KnownCli::Claude)),
+            alive: Arc::new(|_| true),
+            chain_holds: Arc::new(|_| true),
+            report_bound: Arc::new(|_| Ok(())),
+            collect: Arc::new({
+                let drained = drained.clone();
+                move |_, _| {
+                    let first = { let mut taken = drained.lock().unwrap(); let first = !*taken; *taken = true; first };
+                    if first {
+                        std::thread::sleep(Duration::from_millis(1800));
+                        Ok(json!({ "ok": true, "messages": [{ "text": "MAIL-THAT-MUST-SURVIVE" }] }))
+                    } else {
+                        Ok(json!({ "ok": true, "messages": [] }))
+                    }
+                }
+            }),
+        };
+        let state = BrokerState::default();
+        if state.start(path.clone(), policy).is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // not macOS: no peer attestation, nothing to serve
+        }
+        let roundtrip = |request: &str| {
+            let mut stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(stream), &mut line).unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        assert_eq!(roundtrip("{\"v\":1,\"bind\":{\"conversationId\":\"session-a\"}}\n")["ok"], true);
+        let mut first = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        first.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+        first.write_all(b"{\"v\":1,\"collect\":{}}\n").unwrap();
+        let mut line = String::new();
+        assert!(std::io::BufRead::read_line(&mut std::io::BufReader::new(&first), &mut line).is_err(), "the hook's deadline expired before the broker answered");
+        drop(first);
+        std::thread::sleep(Duration::from_millis(400));
+        let retried = roundtrip("{\"v\":1,\"collect\":{}}\n");
+        state.stop();
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(retried["messages"][0]["text"], "MAIL-THAT-MUST-SURVIVE", "after withholding the first response, retry must recover it: {retried}");
+    }
+
+    #[test]
     fn eligibility_is_asked_on_every_request_not_remembered() {
         let bindings = Mutex::new(Bindings::default());
         let verdicts = Arc::new(Mutex::new(vec![Ok(KnownCli::Claude), Err(Ineligible::UnverifiedCode { cli: "claude", reason: "replaced".into() })]));
@@ -1303,7 +1675,7 @@ mod tests {
         state.start(path.clone(), policy).unwrap();
 
         let ask = |line: &str| -> Value {
-            let mut stream = UnixStream::connect(&path).unwrap();
+            let mut stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
             stream.write_all(format!("{line}\n").as_bytes()).unwrap();
             let mut answer = String::new();
             BufReader::new(stream).read_line(&mut answer).unwrap();

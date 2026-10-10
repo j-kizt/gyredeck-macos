@@ -217,7 +217,8 @@ eight connections at a time, versioned (`"v": 1`):
 | request | answer |
 | --- | --- |
 | `{"v":1,"bind":{"conversationId"}}` — from `SessionStart` / `UserPromptSubmit` (Claude Code) and every `PreInvocation` (Antigravity) | `{"ok":true,"bound":{"conversationId","pid","cli"}}` — the ancestor now speaks for that session |
-| `{"v":1,"collect":{"limit"}}` — the hook names no session | the bridge's `/mail/inbox` answer for the bound session, plus `"boundTo"` |
+| `{"v":1,"collect":{"limit"}}` — the hook names no session | the bridge's `/mail/inbox` answer for the bound session, plus `"boundTo"`, and `"delivery"` when it carries anything |
+| `{"v":1,"ack":{"delivery"}}` — the hook has the batch | `{"ok":true,"acked"}`; a wrong id, or a process not bound to that session, is refused and the batch kept |
 | anything else, or an unversioned line | `{"ok":false,"error":…}` |
 
 Errors: `unsupported` (no attestation on this platform), `ineligible` (not a known CLI, or a
@@ -232,6 +233,22 @@ replaced, which is a resumed session in a new process. A live holder is never ev
 a process that claims a second id is **ambiguous**: it loses both and is refused every bind
 and collect until it exits. Eligibility is asked of the OS on every request, not remembered.
 
+**Delivered at least once while the app runs.** A collect moves the bridge's cursor, and
+the hook can give up before the answer reaches it — its 1.5 s deadline is its own. So the
+broker keeps what it handed over: per *session*, not per process, under a delivery id, until
+the session's current verified binding acknowledges it (`ack`). Until then the next collect
+for that session gets the same batch back (`"redelivered": true`) and the bridge is not
+asked for more. The slot is reserved before the bridge is asked, so a collect for the same
+session while one is in flight is refused `busy` (retryable) rather than let two collects
+take two batches. A CLI that exits and resumes as a new process recovers the batch through
+its new binding; an ambiguous process is refused it, and it is never carried into another
+session. At most 512 batches are held, counting collects in flight; past that a collect is refused
+`full` before the bridge is asked, and nothing is taken. Hooks acknowledge only after the output carrying the batch is built; if the
+acknowledgement does not land, the batch comes again next turn — at least once, with that
+duplicate as the cost. **Not across an app restart:** the batches live in the app's memory
+and the bridge's cursor has already moved, so a restart between collect and acknowledgement
+loses that batch.
+
 **What the hook does with the answer.** It prefers the broker and falls back to TCP `?as=`
 only when there is no broker (no socket, nothing listening) or the broker says it cannot
 serve this process (`unsupported`, `ineligible`). Every other answer — `unbound`,
@@ -240,10 +257,12 @@ so on stderr: falling back on a refusal would hand the hook exactly the bypass t
 exists to close.
 
 **What it is not.** The signature check says the process is a genuine `claude` or `agy`;
-the binding says it was the first such process to claim this id while it lives. Neither
-proves the id is *its*: a second genuine CLI claiming an id before its owner, or after the
-owner exits, is the hole that remains. Say *verified process identity plus first-claim
-session binding*, never *proof of identity*.
+the binding says it was the first such process to claim this id while it lives. Together
+they are a **permission scoped to a bound process** — the right to read one mailbox, held
+by one OS-verified process — and never *proof of identity*: a second genuine CLI claiming
+an id before its owner, or after the owner exits, is the hole that remains, and it is
+written down here rather than papered over. Say *verified process identity plus
+first-claim session binding*.
 
 **Codex needs no binding.** Its adapters never read mail — the bridge pushes into the thread
 (`codex queue`) and harvests the reply from the rollout — so a Codex session's mailbox has no
@@ -287,17 +306,87 @@ counters are diagnostics, bounded separately.
 A **collect** over TCP (`/mail/inbox` or `/mail/wait` with `collect=1`) that names a
 protected session, without the broker's word, is refused `403 broker_required` with a
 message that says what to do (reinstall the hook); the bridge says so on stderr once per
-session and counts it under `/health` → `broker.refusedTcpCollects`, beside `vouching`
-(whether a secret was handed over) and `bound`. Reading without collecting is not closed
-in this release, nor is any session the broker never bound — a Codex session, an unsigned
-CLI, another platform; release 3 closes those reads before v1.19.0 ships. An app that
+session and counts it under `/health` → `broker.refusedReads`, beside `vouching`
+(whether a secret was handed over) and `bound`. Release 3, below, closes
+every other read of a protected session's mailbox and every read of a Codex session's. An app that
 could not mint a secret **does not start the broker**: it says so on stderr, hooks find no
 socket and use the old path, the bridge protects nothing and `/health` says
 `vouching: false` — the world before #136, said out loud, never a broker collecting plain.
 
+**One reader or none (release 3, #137).** A session's private mailbox has exactly one
+external reader — the process the broker bound — or none. Every read of it over TCP is
+asked the same question, peek or collect, backlog (`GET /mail/<id>`) or stream
+(`GET /mail/<id>/events`), `/mail/inbox` and `/mail/wait` alike, and so is a sync-room
+collect made in the session's name (`GET /mail/<room>?as=<id>&collect=1`), since it moves
+the same cursor. **Codex first:** a session the bridge knows as Codex's (from an event, a
+stop, a confirm or the kinds file) has no reader at all — the bridge pushes into the
+thread — so the answer is `403 codex_mailbox_closed`, the broker's word included.
+
+That holds only because **Codex's answer to a private message goes to the asker**, not
+into Codex's own mailbox to be fetched (the first design missed this: "Codex's hooks never
+read mail" was true, "nobody reads Codex's mailbox" did not follow — the asker did). The
+bridge writes where the answer goes into its own header on the push,
+`[Gyredeck · mailbox — … from <label>. … (reply-to <id>).]`: the `replyTo` the message was
+accepted with, or the sender's own name when that is a mailbox name, and nothing else. The
+reader parses only that header, up to its first `]`; the sender's text follows it and
+cannot reach back into it, and the label is written with every bracket, parenthesis and
+line break removed (an unknown sender is labelled by provider, so its own name never
+appears). At publish the destination is checked again — a sync code must still be open
+with the session confirmed in it, never brought back; anything else is the asker's private
+mailbox — and the answer is published there `from` the Codex thread and delivered the
+ordinary way: pushed to a Codex asker, collected by a Claude asker's hook through the
+broker. A sender that named nowhere usable is said once on stderr and its answer stays in
+Codex's own mailbox, as is an answer to a pushed message from a bridge before the header
+carried the destination, and an answer to the room's own notices, which have no asker —
+kept, published, and read by no one outside, never guessed into another mailbox. A reply
+published into another session's mailbox does not mark that mailbox read, and a confirmed
+Codex member's room cursor moves past mail not addressed to it, as a collect moves anyone
+else's: Codex has no collect of its own, and a room with a Codex member would otherwise
+never free space. Then a
+**protected** session (one the broker has bound) is served only with `x-gyredeck-broker`:
+`403 broker_required`, counted under `/health` → `broker.refusedReads`. A session the broker
+never bound and the bridge does not know as Codex — an unsigned CLI, another platform — is
+served as before; that is the limit, stated. **Codex reads close once the bridge knows the
+provider**, which it learns from the session's first event, stop or confirm, or from the
+kinds file it kept across a restart; the mailbox may already hold mail by then, since a
+send can create and fill it first, and nothing here claims otherwise. Once known, it stays
+known: a later event naming another provider does not replace Codex (the route that
+reports providers takes the shared machine token, so a replacement would be a way to
+reopen the mailbox), and the closure is written to its own record,
+`~/.config/gyredeck/gyredeck.codex-closed` — one id per line, appended once, `0600`, never
+followed through a link, read before the bridge serves, never evicted. It is kept apart
+from the kinds file on purpose: that file is display history and drops old entries, and a
+record that newer reports can push entries out of is a way to reopen a mailbox after a
+restart. The record is bounded by refusing, not by forgetting: at 65 536 entries it writes
+`#full`, and from then on every private-mailbox read without the broker's word is refused
+(`closure_ledger_full`). The same refusal holds for the rest of a run in which the record
+cannot be trusted: a write to it failed, or at startup it existed but could not be read
+cleanly — unreadable (a directory in its place, a permission error), a line that is neither
+an id nor `#full`, or a last line cut off before its newline. An absent record is a fresh
+start; a present one that cannot be read is never taken as empty. The bridge says which on
+stderr, once, at startup.
+
+The sync room's own reads stay the room's: `GET /mail/<room>` without collect and the
+room's stream take the room's password and `?as=` a confirmed member. The password admits
+a reader who names *any* confirmed member — it does not attest the caller, a member who
+left still holds it, and a watch moves that member's resume cursor. That is the limit of a
+shared password, written down; the founder's remedy is to rotate it or close the room.
+`/events` and `/snapshot` still hand out 160-character previews of room messages to
+anyone on the machine, for the app's own panel; closing that is its own card.
+
+**WAIT goes through the broker.** The instruction the Claude hook prints is now
+`node ~/.config/gyredeck/gyredeck-claude-hook.mjs wait 60 <id>` (an allow-rule for it is
+written beside the curl rules): collect only, never a bind — a bind belongs to the hook
+that has the payload; the id validates `boundTo` and chooses nothing; polled every 2 s
+inside one elapsed deadline, broker calls included; an empty inbox collect now carries
+`yourLastMessage` so a timed-out wait keeps its diagnosis. TCP is used only where the
+drain would use it (no broker, `unsupported`, `ineligible`), and a `403` there is withheld
+mail (exit 2, said on stderr), never an empty timeout — an absent broker does not make a
+session unprotected. Antigravity prints no wait; Codex is never told to read anything.
+
 **Release 1** shipped the broker and hooks that prefer it with the bridge unchanged;
-**release 2** is the paragraph above; release 3 closes TCP read and collect per session
-for the providers that bind, and for Codex.
+**release 2** the broker's word; **release 3** one reader or none. All three ship as
+v1.19.0.
 
 Requiring the machine token on `/snapshot` and `/events` would keep conversation ids away from a process that has no token at all. That is worth doing for its own sake, and it is **not** a fix for this: an attacker who can read the token reads the ids too.
 

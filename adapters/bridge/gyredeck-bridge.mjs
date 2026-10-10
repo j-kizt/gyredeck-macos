@@ -22,7 +22,7 @@
  *   POST /ingest    - Multi-provider event fan-in
  */
 
-import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -99,6 +99,60 @@ export const cleanSessionName = (value) => {
 /** How many sessions are remembered across a restart. Enough to cover a working day's
  *  worth of them; the file is a line each, and the oldest fall off the end. */
 export const SESSION_KIND_MEMORY = 200;
+
+/**
+ * Which sessions' mailboxes are closed because they are Codex's (#137) — authoritative,
+ * and so kept apart from the kinds file, which is display history and drops old entries.
+ * One id per line, appended once when a session is first known as Codex's, read before
+ * the bridge serves, never evicted: anything holding the machine token can report
+ * sessions, so a window that newer reports push entries out of is a way to reopen one.
+ * Bounded by refusing, not by forgetting: at the cap the file says `#full`, and from then
+ * on every private-mailbox read without the broker's word is refused.
+ */
+const CODEX_CLOSED_PATH = join(MOD_DIR, "gyredeck.codex-closed");
+export const CODEX_CLOSED_MAX = Number.parseInt(process.env.GYREDECK_CODEX_CLOSED_MAX ?? "", 10) > 0
+  ? Number.parseInt(process.env.GYREDECK_CODEX_CLOSED_MAX, 10)
+  : 65_536;
+const CODEX_CLOSED_FULL = "#full";
+/**
+ * The record as it stands: the ids, whether it is full, and — when it exists but cannot
+ * be trusted — why. Absent is a fresh start. Anything else that stops a clean read (not a
+ * file, unreadable, a line that is neither an id nor `#full`, a last line cut off before
+ * its newline) is `broken`: the bridge cannot know which mailboxes it closed, and fails
+ * closed for the run rather than reading that as "none".
+ */
+export const readCodexClosed = (path) => {
+  const ids = new Set();
+  let full = false;
+  let text;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { ids, full: false, broken: null };
+    return { ids, full: false, broken: `it could not be read (${error?.code ?? error?.message ?? "error"})` };
+  }
+  if (text.length > 0 && !text.endsWith("\n")) {
+    return { ids, full: false, broken: "its last line was cut off before it ended" };
+  }
+  for (const line of text.split("\n")) {
+    if (line === "") continue;
+    if (line === CODEX_CLOSED_FULL) full = true;
+    else if (/^[A-Za-z0-9_-]{1,64}$/.test(line)) ids.add(line);
+    else return { ids, full: false, broken: "a line in it is not a session id" };
+  }
+  return { ids, full: full || ids.size >= CODEX_CLOSED_MAX, broken: null };
+};
+/** One line onto the ledger: created 0600, never followed through a link. */
+const appendCodexClosed = (path, line) => {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW, 0o600);
+  try {
+    fchmodSync(fd, 0o600);
+    writeSync(fd, `${line}\n`);
+  } finally {
+    closeSync(fd);
+  }
+};
 
 /**
  * What kind of agent each session is, and where it was working.
@@ -386,9 +440,24 @@ export const codexEntryFromLine = (line, sinceMs) => {
 export const codexPushTarget = (text) => {
   const room = /^\[Gyredeck · room (sync-[a-z2-9]{4}) /.exec(text);
   if (room) return { kind: "room", name: room[1] };
-  if (/^\[Gyredeck[ ·:]/.test(text)) return { kind: "mailbox" };
+  // A message pushed into the session's own mailbox carries where its answer goes — the
+  // sender's mailbox or room — at the end of the bridge's bracketed header, as
+  // `(reply-to <id>)`. Only the header is read, up to its first `]`: the sender's text
+  // follows it and cannot reach back into it, and the label inside it is written by the
+  // bridge with every bracket, parenthesis and line break removed (`codexEnvelopeLabel`),
+  // so nothing a sender controls can end the header early or plant a marker in it.
+  const mailbox = /^\[Gyredeck · mailbox — [^\]\n]*\(reply-to ([A-Za-z0-9_-]{1,64})\)\.?\]/.exec(text);
+  if (mailbox) return { kind: "mailbox", replyTo: mailbox[1] };
+  // A message envelope from before the marker existed: its answer has nowhere named to
+  // go. A notice from the room itself (`[Gyredeck: …]`) names none either, by design.
+  if (/^\[Gyredeck · mailbox — /.test(text)) return { kind: "mailbox", replyTo: null, legacy: true };
+  if (/^\[Gyredeck[ ·:]/.test(text)) return { kind: "mailbox", replyTo: null };
   return null;
 };
+
+/** A sender's label as it may appear inside the machine-read header: no brackets, no parentheses, one line, bounded. */
+export const codexEnvelopeLabel = (label) =>
+  String(label ?? "Agent").replace(/[\[\]()\r\n]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 40) || "Agent";
 
 /** One line of a Codex rollout as a reply, or null when the line is anything else. */
 export const codexReplyFromLine = (line, sinceMs) => {
@@ -1725,6 +1794,7 @@ function startBridge(config) {
     if (Date.now() < reader.pollUntil) armCodexPoll(reader);
   };
   /** Where a reply to a turn goes, or null for nowhere. */
+  const legacyEnvelopeSaid = new Set();
   const codexReplyDestination = (reader, origin, reply, confirmedIn) => {
     const { threadId } = reader;
     if (origin?.kind === "room") {
@@ -1737,6 +1807,30 @@ function startBridge(config) {
       return { name: origin.name, room };
     }
     if (origin?.kind === "mailbox") {
+      // Where the sender said it listens, carried in the envelope and checked again now:
+      // a room must still be open with this session confirmed in it — a room is issued,
+      // never brought back by an answer to it — and anything else is a private mailbox,
+      // the sender's own, which an answer may create. An envelope that names nowhere
+      // (from before the marker existed, or a notice from the room itself) keeps its
+      // answer in this session's own mailbox, as before — which nothing outside reads now
+      // (#137), so a legacy envelope is said once per session rather than guessed at.
+      if (origin.replyTo) {
+        if (SYNC_CODE.test(origin.replyTo)) {
+          const room = mailRooms.get(origin.replyTo);
+          if (!room || room.members.get(threadId)?.confirmed !== true) return null;
+          return { name: origin.replyTo, room };
+        }
+        const mailbox = mailRoomFor(origin.replyTo, true);
+        return mailbox ? { name: origin.replyTo, room: mailbox } : null;
+      }
+      if (origin.legacy && !legacyEnvelopeSaid.has(threadId)) {
+        legacyEnvelopeSaid.add(threadId);
+        console.error(
+          `codex session ${threadId}: a message in its mailbox was pushed by a bridge from before answers` +
+            " carried their destination; the answer is kept in the session's own mailbox, which nothing" +
+            " outside reads — send it again and the answer will reach you",
+        );
+      }
       const mailbox = mailRoomFor(threadId, true);
       return mailbox ? { name: threadId, room: mailbox } : null;
     }
@@ -1941,9 +2035,10 @@ function startBridge(config) {
       const published = publishMail(destination.room, threadId, text, null, true, routing);
       if (published?.seq) publishedForCodex.set(threadId, published.seq);
       codexHarvest.published += 1;
-      // Carried on to the other members of a room as any member's message is. A mailbox
-      // has one reader and it is the session that just spoke.
-      if (SYNC_CODE.test(destination.name)) {
+      // Carried on as any member's message is: to the other members of a room, or to the
+      // sender whose mailbox the answer was put in — pushed if that sender is Codex, left
+      // for its hook otherwise. An answer kept in this session's own mailbox goes nowhere.
+      if (destination.name !== threadId) {
         deliverMail(destination.name, destination.room, text, threadId, published);
       }
     }
@@ -2376,6 +2471,40 @@ function startBridge(config) {
   const clientByConversation = new Map();
   // A member is addressed by conversation id, which says nothing a person or an agent
   // can read. The runtime kind the events carry is the only name available.
+  const CODEX_PROVIDERS = new Set(["codexCliHook", "codex-notify", "codex"]);
+  const codexClosed = readCodexClosed(CODEX_CLOSED_PATH);
+  // Set when the record cannot be trusted — it exists and could not be read cleanly, or a
+  // write to it failed this run: until the bridge restarts it refuses every unvouched read
+  // rather than trust a record that may be missing an entry.
+  let codexClosedUnrecorded = codexClosed.broken !== null;
+  if (codexClosedUnrecorded) {
+    console.error(
+      `gyredeck: the record of closed Codex mailboxes at ${CODEX_CLOSED_PATH} cannot be trusted — ${codexClosed.broken};` +
+        " every private-mailbox read without the broker's word is refused until it is repaired or removed",
+    );
+  }
+  const recordCodexClosed = (conversationId) => {
+    if (codexClosed.ids.has(conversationId) || !/^[A-Za-z0-9_-]{1,64}$/.test(conversationId)) return;
+    if (codexClosed.full) return;
+    try {
+      if (codexClosed.ids.size + 1 >= CODEX_CLOSED_MAX) {
+        appendCodexClosed(CODEX_CLOSED_PATH, conversationId);
+        appendCodexClosed(CODEX_CLOSED_PATH, CODEX_CLOSED_FULL);
+        codexClosed.ids.add(conversationId);
+        codexClosed.full = true;
+        console.error(`gyredeck: the record of closed Codex mailboxes is full (${CODEX_CLOSED_MAX}); every private-mailbox read without the broker's word is refused from now on`);
+        return;
+      }
+      appendCodexClosed(CODEX_CLOSED_PATH, conversationId);
+      codexClosed.ids.add(conversationId);
+    } catch (error) {
+      codexClosedUnrecorded = true;
+      console.error(`gyredeck: could not record that ${conversationId}'s mailbox is closed (${error.message}); refusing every unvouched mailbox read until the bridge restarts`);
+    }
+  };
+  /** Whether this conversation is Codex's — from the ledger, or from an event, a stop, a confirm or the kinds file this run. */
+  const isCodexSession = (conversationId) =>
+    codexClosed.ids.has(conversationId) || CODEX_PROVIDERS.has(providerByConversation.get(conversationId));
   const PROVIDER_LABELS = {
     claudeCodeHook: "Claude Code",
     codexCliHook: "Codex",
@@ -2795,7 +2924,15 @@ function startBridge(config) {
     // exactly what it said last time, and that is the whole of what keeps it in the file.
     seenSessions.delete(conversationId);
     seenSessions.add(conversationId);
-    if (typeof provider === "string") providerByConversation.set(conversationId, provider);
+    // Once known as Codex's, a session stays Codex's. The provider is also what closes
+    // its mailbox to every outside reader (#137), and the route that reports it takes
+    // the shared machine token — so a later event naming another provider is a caller
+    // trying to reopen that mailbox, not news. Kept in memory and, through the kinds
+    // file, across a restart. A session not yet known as Codex's may still become so.
+    if (typeof provider === "string" && !(CODEX_PROVIDERS.has(providerByConversation.get(conversationId)) && !CODEX_PROVIDERS.has(provider))) {
+      providerByConversation.set(conversationId, provider);
+    }
+    if (CODEX_PROVIDERS.has(providerByConversation.get(conversationId))) recordCodexClosed(conversationId);
     if (typeof cwd === "string" && cwd.length > 0) workspaceByConversation.set(conversationId, cwd);
     // Every observation, not only the ones that changed a value. Being heard from is what
     // keeps a session in the file, so an observation that says nothing new still has
@@ -3489,12 +3626,10 @@ function startBridge(config) {
         " or you were disconnected from it.",
     },
     wait: {
-      what: "Block inside this turn for an answer you need before you can carry on.",
-      method: "GET",
-      url: `http://${host}:${port}/mail/wait?as=${conversationId}&timeout=60&collect=1`,
-      command:
-        `curl -s "http://${host}:${port}/mail/wait?as=${conversationId}&timeout=60&collect=1"` +
-        ` -H 'x-gyredeck-token: ${password}'`,
+      what: "Block inside this turn for an answer you need before you can carry on. Claude Code sessions only: the wait goes through the Gyredeck broker, which knows which process is asking; Antigravity has no wait.",
+      method: "command",
+      url: null,
+      command: `node ~/.config/gyredeck/gyredeck-claude-hook.mjs wait 60 ${conversationId}`,
       success: '{"ok":true,"timedOut":false,"messages":[...]} — same message shape as the stream.',
       rule:
         "Only while an answer is genuinely outstanding. It answers timedOut:true if" +
@@ -3663,7 +3798,10 @@ function startBridge(config) {
   const BROKER_REQUIRED_HINT =
     "This session reads its mail through the Gyredeck broker now; the hook that asked over" +
     " TCP is older than that. Reinstall the hook from Settings → Plugins (or run `pnpm hooks:install`).";
-  const refuseTcpCollect = (as) => {
+  const CODEX_MAILBOX_HINT =
+    "A Codex session's mailbox has no reader but the bridge, which pushes into the thread" +
+    " itself; nothing outside reads it, the broker included.";
+  const noteRefusedRead = (as) => {
     const refusal = brokerRefusals.get(as) ?? { count: 0, lastAt: null };
     refusal.count += 1;
     refusal.lastAt = new Date().toISOString();
@@ -3671,8 +3809,35 @@ function startBridge(config) {
     brokerRefusals.set(as, refusal);
     while (brokerRefusals.size > BROKER_REFUSALS_MAX) brokerRefusals.delete(brokerRefusals.keys().next().value);
     if (refusal.count === 1) {
-      console.error(`gyredeck: refused a TCP collect for session ${as}, which the broker has bound — ${BROKER_REQUIRED_HINT}`);
+      console.error(`gyredeck: refused a TCP read of session ${as}'s mailbox, which the broker protects — ${BROKER_REQUIRED_HINT}`);
     }
+  };
+  /**
+   * Release 3 (#137): a session's private mailbox has exactly one external reader — the
+   * process the broker bound — or none. Asked on every read of it, peek or collect,
+   * backlog or stream, and on a sync-room collect made in the session's name, since that
+   * moves the same cursor. Codex is asked first: its mailbox has no reader at all, the
+   * bridge pushes into the thread, so not even the broker's word opens it. Then a
+   * protected session (one the broker has bound) is served only with that word. A session
+   * the broker never bound and the bridge does not know as Codex — an unsigned CLI,
+   * another platform, a session before its first event — is served as before, and that
+   * is written down as the limit it is.
+   */
+  const refuseMailboxRead = (as, brokerHeader) => {
+    if (isCodexSession(as)) return { error: "codex_mailbox_closed", message: CODEX_MAILBOX_HINT };
+    // Fail closed when what is closed cannot all be known: the ledger is full, or a write
+    // to it failed. Only the broker's own collect is served then.
+    if ((codexClosed.full || codexClosedUnrecorded) && !holdsBrokerSecret(brokerHeader)) {
+      return {
+        error: "closure_ledger_full",
+        message: "The bridge cannot vouch that this mailbox is not a closed Codex mailbox, so it serves only the broker's collect until its record of them is cleared.",
+      };
+    }
+    if (brokerBound.has(as) && !holdsBrokerSecret(brokerHeader)) {
+      noteRefusedRead(as);
+      return { error: "broker_required", message: BROKER_REQUIRED_HINT };
+    }
+    return null;
   };
 
   /**
@@ -3915,7 +4080,12 @@ function startBridge(config) {
     // nothing ever calls the read endpoint on it.
     // A push is a delivery, and so is a message the session itself produced — neither
     // is waiting for anyone to collect it.
-    if (pushed || fromSession) {
+    // The session's own output counts as delivered only where it is the session's own
+    // place: a room, whose room-level number is "the furthest anyone got", or its own
+    // mailbox. Put into *another* session's mailbox — an answer delivered to its asker
+    // (#137) — it is exactly what that reader is waiting to collect, and that mailbox's
+    // one position is the asker's, not the author's.
+    if (pushed || (fromSession && (room.members.size > 0 || room.name === from))) {
       room.readSeq = Math.max(room.readSeq, message.seq);
       room.lastReadAt = message.ts;
     }
@@ -4110,7 +4280,15 @@ function startBridge(config) {
     );
   };
 
+  const noDestinationSaid = new Set();
   const deliverMail = (roomName, room, text, from, routing = null, except = null) => {
+    // A push into Codex is Codex reading: nothing else ever collects in its name — its
+    // hooks never read, and since #137 nothing outside may — so the only way its cursor
+    // in a room could move was a collect nobody makes, and a room with a Codex member
+    // would fill to its cap and stay there. The message handed over moves the cursor.
+    const readByPush = (recipient) => {
+      if (Number.isInteger(routing?.seq)) markRead(room, recipient, routing.seq, new Date().toISOString());
+    };
     // A message that should not interrupt is still in the room to be read; it just is
     // not carried to anyone. Codex is the reason this has to be decided here: it holds
     // no stream to filter and cannot choose whether to be woken, so the room chooses
@@ -4123,6 +4301,18 @@ function startBridge(config) {
       // to everyone.
       ? [...room.members.keys()].filter((id) => id !== from && id !== except && carries(id))
       : [roomName];
+    // A message that is not for a confirmed Codex member is not owed to it, and Codex has
+    // no collect of its own to step past it — its hooks never read, and since #137 nothing
+    // outside may read in its name. So its place moves past it here, as a collect moves
+    // any other member's past mail not addressed to it; only when nothing before it is
+    // still outstanding, so a gap is never skipped over.
+    if (room.members.size > 0 && Number.isInteger(routing?.seq)) {
+      for (const [id, member] of room.members) {
+        if (id === from || recipients.includes(id) || member.confirmed !== true) continue;
+        if (providerByConversation.get(id) !== "codexCliHook") continue;
+        if ((member.readSeq ?? 0) >= routing.seq - 1) markRead(room, id, routing.seq, new Date().toISOString());
+      }
+    }
     if (recipients.length === 0) return routing && routing.kind === "ack" ? "not_notified" : "no_recipients";
 
     let queued = false;
@@ -4201,19 +4391,40 @@ function startBridge(config) {
           // arrive as a bare string from nowhere. Decided by who sent it, never by what it
           // looks like: a sender can write the room's marker, and the bridge must not
           // take its word for it.
+          // Where the answer goes is the sender's say — the `replyTo` it gave, or its own
+          // mailbox when its name is one — written into the header the reader parses
+          // back (`codexPushTarget`). A sender that named nowhere usable is told so here,
+          // once, and its answer stays in this mailbox, which nothing outside reads.
+          const replyTo = typeof routing?.replyTo === "string" && MAIL_ROOM_NAME.test(routing.replyTo)
+            ? routing.replyTo
+            : MAIL_ROOM_NAME.test(from) ? from : null;
+          if (from !== ROOM_SENDER && replyTo === null && !noDestinationSaid.has(recipient)) {
+            noDestinationSaid.add(recipient);
+            console.error(
+              `mail from ${JSON.stringify(from)} into ${recipient}'s mailbox names no mailbox or room to answer to` +
+                " (no replyTo, and the sender's name is not a mailbox name); the answer will stay in" +
+                " that mailbox, which nothing outside reads",
+            );
+          }
           const outgoing = from === ROOM_SENDER
             ? text
-            : `[Gyredeck · mailbox — a message to you alone, from ${labelIn(room, from)}.` +
+            : `[Gyredeck · mailbox — a message to you alone, from ${codexEnvelopeLabel(labelIn(room, from))}.` +
               " Answer it as ordinary text in this turn; the bridge reads your answer from" +
-              " your own log and keeps it in your mailbox.]\n\n" + text;
-          if (deliverToCodex(recipient, room, outgoing) === "queued") queued = true;
-          else unavailable = true;
+              (replyTo === null
+                ? " your own log and keeps it in your mailbox.]\n\n"
+                : ` your own log and delivers it to the sender (reply-to ${replyTo}).]\n\n`) + text;
+          if (deliverToCodex(recipient, room, outgoing) === "queued") {
+            queued = true;
+            readByPush(recipient);
+          } else unavailable = true;
           continue;
         }
         const outgoing = codexRoomEnvelope(roomName, room, recipient, text);
         const outcome = deliverToCodex(recipient, room, outgoing);
-        if (outcome === "queued") queued = true;
-        else unavailable = true;
+        if (outcome === "queued") {
+          queued = true;
+          readByPush(recipient);
+        } else unavailable = true;
       } else if (provider === "agyHost" || provider === "claudeCodeHook") {
         waiting = true;
       }
@@ -4418,7 +4629,7 @@ function startBridge(config) {
           broker: {
             vouching: brokerSecret !== null,
             bound: brokerBound.size,
-            refusedTcpCollects: [...brokerRefusals].map(([conversationId, refusal]) => ({ conversationId, ...refusal })),
+            refusedReads: [...brokerRefusals].map(([conversationId, refusal]) => ({ conversationId, ...refusal })),
           },
         }),
       );
@@ -4885,10 +5096,34 @@ function startBridge(config) {
           sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
           return;
         }
+        const diagnoseSilence = (sync) => {
+          if (!sync) return null;
+          const mine = [...sync.room.messages].reverse().find((message) => message.from === as);
+          if (!mine) return { sent: false, reason: "You have not said anything in this room yet." };
+          const base = { seq: mine.seq, to: mine.to, kind: mine.kind };
+          if (mine.kind === "ack") {
+            return { ...base, reason: "kind \"ack\" reaches the room but wakes nobody. Nothing was notified of this. Send it as \"ask\" if you need an answer." };
+          }
+          if (mine.to !== MAIL_EVERYONE && !sync.room.members.has(mine.to)) {
+            return { ...base, reason: `Addressed to "${mine.to}", who is not in this room. Nobody received it. Address it to everyone, or to a name from the members list.` };
+          }
+          const target = mine.to === MAIL_EVERYONE
+            ? [...sync.room.members.keys()].filter((id) => id !== as)
+            : [mine.to];
+          const unconfirmed = target.filter((id) => sync.room.members.get(id)?.confirmed !== true);
+          if (target.length > 0 && unconfirmed.length === target.length) {
+            return { ...base, reason: "Everyone it was addressed to is still waiting for the room's password, so none of them can read it yet." };
+          }
+          if (target.length === 0) {
+            return { ...base, reason: "There is nobody else in this room to answer." };
+          }
+          return { ...base, reason: "Addressed correctly and delivered. The silence is theirs, not a mistake in what you sent — do not send it again on account of this." };
+        };
+
         const collect = url.searchParams.get("collect") === "1";
-        if (collect && brokerBound.has(as) && !holdsBrokerSecret(brokerHeader)) {
-          refuseTcpCollect(as);
-          sendJson(403, { ok: false, error: "broker_required", message: BROKER_REQUIRED_HINT });
+        const closed = refuseMailboxRead(as, brokerHeader);
+        if (closed) {
+          sendJson(403, { ok: false, ...closed });
           return;
         }
         // The cap has to be applied by whoever advances the position. A caller that
@@ -4994,30 +5229,6 @@ function startBridge(config) {
            * first: an asker that "fixes" a message that was already correct and sends
            * it again is the start of the next loop.
            */
-          const diagnoseSilence = (sync) => {
-            if (!sync) return null;
-            const mine = [...sync.room.messages].reverse().find((message) => message.from === as);
-            if (!mine) return { sent: false, reason: "You have not said anything in this room yet." };
-            const base = { seq: mine.seq, to: mine.to, kind: mine.kind };
-            if (mine.kind === "ack") {
-              return { ...base, reason: "kind \"ack\" reaches the room but wakes nobody. Nothing was notified of this. Send it as \"ask\" if you need an answer." };
-            }
-            if (mine.to !== MAIL_EVERYONE && !sync.room.members.has(mine.to)) {
-              return { ...base, reason: `Addressed to "${mine.to}", who is not in this room. Nobody received it. Address it to everyone, or to a name from the members list.` };
-            }
-            const target = mine.to === MAIL_EVERYONE
-              ? [...sync.room.members.keys()].filter((id) => id !== as)
-              : [mine.to];
-            const unconfirmed = target.filter((id) => sync.room.members.get(id)?.confirmed !== true);
-            if (target.length > 0 && unconfirmed.length === target.length) {
-              return { ...base, reason: "Everyone it was addressed to is still waiting for the room's password, so none of them can read it yet." };
-            }
-            if (target.length === 0) {
-              return { ...base, reason: "There is nobody else in this room to answer." };
-            }
-            return { ...base, reason: "Addressed correctly and delivered. The silence is theirs, not a mistake in what you sent — do not send it again on account of this." };
-          };
-
           const answer = (collected, sync, timedOut, missed = []) =>
             sendJson(200, {
               ok: true,
@@ -5079,7 +5290,13 @@ function startBridge(config) {
         }
 
         const { collected, sync, missed } = collectInbox();
-        sendJson(200, { ok: true, ...describeInbox(collected, sync, as, missed) });
+        sendJson(200, {
+          ok: true,
+          // A collect that found nothing says why the last thing this session said drew
+          // nothing, as a timed-out wait does: the hook's `wait` is built from collects.
+          ...(collect && collected.length === 0 ? { yourLastMessage: diagnoseSilence(sync) } : {}),
+          ...describeInbox(collected, sync, as, missed),
+        });
         return;
       }
 
@@ -5311,6 +5528,18 @@ function startBridge(config) {
             return;
           }
         }
+        // A private mailbox is read by its one reader or by nobody; a sync room is read by
+        // anyone holding its password, but *taken* in a member's name only by that
+        // member's reader — the cursor it moves is the same one the broker's collect moves.
+        const closed = !SYNC_CODE.test(name)
+          ? refuseMailboxRead(name, brokerHeader)
+          : url.searchParams.get("collect") === "1"
+            ? refuseMailboxRead(url.searchParams.get("as") ?? "", brokerHeader)
+            : null;
+        if (closed) {
+          sendJson(403, { ok: false, ...closed });
+          return;
+        }
         const parsed = Number.parseInt(url.searchParams.get("since") ?? "", 10);
         const since = Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
         const messages = room ? room.messages.filter((message) => message.seq > since) : [];
@@ -5349,6 +5578,19 @@ function startBridge(config) {
         if ((standing?.members.size ?? 0) === 0 && !holdsMailboxCredential(name, headerToken)) {
           refuseStream(401, "unauthorized", TOKEN_HINT);
           return;
+        }
+        // The stream of a private mailbox is a read of it, and the same door applies.
+        // A sync room's stream is the room's: its password admits a watcher who names
+        // any confirmed member — it does not attest the caller, an ex-member still holds
+        // it, and the watch moves that member's resume cursor. That is the limit of a
+        // shared password, written down rather than dressed up; the founder's remedy is
+        // to rotate the password or close the room.
+        if (!SYNC_CODE.test(name)) {
+          const closed = refuseMailboxRead(name, brokerHeader);
+          if (closed) {
+            refuseStream(403, closed.error, closed.message);
+            return;
+          }
         }
         const room = SYNC_CODE.test(name) ? mailRooms.get(name) : mailRoomFor(name, true);
         if (!room) {

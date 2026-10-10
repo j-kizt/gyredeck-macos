@@ -1,6 +1,6 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
-## A session's mail is read by the process it belongs to, and by nothing else — (v1.19.0)
+## A session's mail is read by the process the broker bound to it, and by nothing else — (v1.19.0)
 
 One feature, built in three parts, for a hole that had been written down since the mailbox was
 built: any program on the machine could read any session's mail.
@@ -25,8 +25,9 @@ built: any program on the machine could read any session's mail.
   serving with part of one. From then on, a request to read a protected session's mail over
   the old path — a peek, a collect, the backlog, the stream, or a room collect in that
   session's name — is refused with a message that names the fix, counted where the app can
-  see it, said once on the bridge's log. A session the broker has bound is never reopened
-  by a restart, an exit, or a full table; past every cap the answer is closed, not open.
+  see it, said once on the bridge's log. While the app runs, a session the broker has
+  bound is never reopened — not by the bridge restarting, a CLI exiting, or a full table;
+  past every cap the answer is closed, not open.
 - **Codex's mail has no reader at all.** Gyredeck delivers to a Codex session by pushing into
   its thread and reads its answers from Codex's own log, so nothing outside needs to read
   its mailbox — and now nothing can, the broker included, from the moment the bridge knows a
@@ -36,8 +37,9 @@ built: any program on the machine could read any session's mail.
   mailbox for the asker to come and fetch, which the line above now forbids. The bridge
   writes where the answer goes into the message it hands Codex, checks it again when the
   answer comes back, and delivers it the way the asker reads: pushed to a Codex session,
-  collected by a Claude Code or Antigravity session's hook. Nothing a sender writes can
-  change where it goes.
+  collected by a Claude Code or Antigravity session's hook. The `replyTo` a message was
+  accepted with chooses where the answer goes; nothing in the message's text or the
+  sender's label can change it.
 - **Mail is not lost when a hook gives up early.** The broker used to take a session's mail
   from the bridge and lose it if the hook had stopped waiting before the answer arrived. It
   now keeps each batch until the hook says it has it, and hands it over again on the next
@@ -72,6 +74,8 @@ Where the old path still works, on purpose:
 - **A private message Codex was handed before this release** has no destination written on
   it, so its answer stays in Codex's own mailbox, which nothing outside reads now. Send it
   again and the answer will reach you.
+- **Right after the app restarts**, the broker has forgotten which sessions it bound, so
+  each one reads the old way until its hook binds again on its next turn.
 - **A batch of mail taken just before the app quits** and not yet acknowledged is lost,
   since the bridge had already moved on. While the app runs, a batch can arrive twice
   rather than not at all.

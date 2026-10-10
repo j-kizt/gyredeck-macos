@@ -252,10 +252,52 @@ a Codex-spawned process ever need to read on its own, the daemon that spawns Cod
 is shared across threads and nothing in the hook's payload or environment is OS-verifiable:
 openai/codex#52783 asks for a per-thread capability.
 
-**Release 1 (this one)** ships the broker and hooks that prefer it; the bridge is unchanged
-and still serves `?as=` over TCP. Release 2 serves collect only when the broker vouches;
-release 3 closes TCP read and collect per session for the providers that bind, and for
-Codex.
+**The broker's word (release 2, #136).** The bridge has to know which collects come from
+the broker and which sessions the broker protects, and it must learn both from the app
+alone. The app mints a 32-byte secret for each run (`SecRandomCopyBytes`), keeps it in
+memory, and at every spawn writes the **handshake** to the bridge's stdin before the bridge
+serves anything: `broker-secret <64 hex>`, one `broker-bound <id>` per session in the
+broker's protection ledger, then `broker-ready`. Stdin keeps the secret off disk, out of
+`argv` and out of the environment; it is still in two processes' memory, and this is not a
+defence against a debugger with the entitlement to read that. The pipe stays open because
+its closing is the stop signal. A bridge spawned with `--broker-handshake` does **not**
+listen until `broker-ready` has been read, and then only if the handshake was whole: a
+valid secret, every `broker-bound` id well-formed and admitted. Otherwise it names the rule
+that failed on stderr and exits 1 — a partial protection state is closed, never partly
+open. There is no timer. The write itself is bounded on the app's side: a bridge that has
+not taken the handshake within 5 s is killed and reaped and the spawn fails with the
+reason, so a ledger past the pipe's capacity and a bridge that never reads cannot hold the
+supervisor. A ledger that cannot be read spawns no bridge at all. A bridge started without
+the flag listens at once and protects nothing.
+
+From then on the broker sends the secret as `x-gyredeck-broker` on the collects it
+performs, and tells the bridge every session it binds with `POST /broker/bound
+{conversationId}`, which only that header admits (`401` otherwise). A **bind is answered
+`ok` only once the bridge acknowledged it**; until then it is a pending claim — refused
+`bridge`, which the hook withholds on (never a TCP fallback), and served no collect — and
+the next claim from the same process reports it again. The app keeps a **protection
+ledger**: every session a bind ever admitted, append-only for the life of the app,
+written under the binding's lock and before the bridge is told, so a handshake snapshot
+taken at any moment holds every session any bridge has acknowledged or will. A holder that
+turned ambiguous, or exited, loses its binding and not the session's protection. The
+ledger is capped at 65 536 and refuses a new session past that (the bind fails `full`, closed);
+the bridge's own table is capped the same way (`507 full`) and evicts nothing. Refusal
+counters are diagnostics, bounded separately.
+
+A **collect** over TCP (`/mail/inbox` or `/mail/wait` with `collect=1`) that names a
+protected session, without the broker's word, is refused `403 broker_required` with a
+message that says what to do (reinstall the hook); the bridge says so on stderr once per
+session and counts it under `/health` → `broker.refusedTcpCollects`, beside `vouching`
+(whether a secret was handed over) and `bound`. Reading without collecting is not closed
+in this release, nor is any session the broker never bound — a Codex session, an unsigned
+CLI, another platform; release 3 closes those reads before v1.19.0 ships. An app that
+could not mint a secret **does not start the broker**: it says so on stderr, hooks find no
+socket and use the old path, the bridge protects nothing and `/health` says
+`vouching: false` — the world before #136, said out loud, never a broker collecting plain.
+
+**Release 1** shipped the broker and hooks that prefer it with the bridge unchanged;
+**release 2** is the paragraph above; release 3 closes TCP read and collect per session
+for the providers that bind, and for Codex.
 
 Requiring the machine token on `/snapshot` and `/events` would keep conversation ids away from a process that has no token at all. That is worth doing for its own sake, and it is **not** a fix for this: an attacker who can read the token reads the ids too.
 

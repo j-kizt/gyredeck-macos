@@ -370,6 +370,9 @@ pub(crate) struct BrokerHandle {
     stop_tx: mpsc::Sender<()>,
     join: JoinHandle<()>,
     path: PathBuf,
+    /// The socket inode this broker created, so that only it is ever removed — never
+    /// whatever somebody has since put at the same path.
+    identity: platform::SocketIdentity,
 }
 
 #[derive(Default)]
@@ -388,15 +391,16 @@ impl BrokerState {
         if handle.is_some() {
             return Ok(());
         }
-        let listener = platform::listen(&path)?;
+        let (listener, identity) = platform::listen(&path)?;
         let (stop_tx, stop_rx) = mpsc::channel();
         let bindings = Arc::clone(&self.bindings);
         let socket_path = path.clone();
+        let own = identity;
         let join = thread::Builder::new()
             .name("gyredeck-broker".to_string())
-            .spawn(move || serve(listener, socket_path, bindings, policy, stop_rx))
+            .spawn(move || serve(listener, socket_path, own, bindings, policy, stop_rx))
             .map_err(|error| format!("Failed to start the broker: {error}"))?;
-        *handle = Some(BrokerHandle { stop_tx, join, path });
+        *handle = Some(BrokerHandle { stop_tx, join, path, identity });
         Ok(())
     }
 
@@ -421,11 +425,12 @@ impl BrokerState {
             .ok()
             .and_then(|mut handle| handle.take());
         if let Some(handle) = handle {
+            // The accept loop polls for this between accepts; nothing has to reach the
+            // socket for the stop to land, so a path that no longer points at the listener
+            // cannot keep the broker alive.
             let _ = handle.stop_tx.send(());
-            // The accept loop is blocked; one connection lets it see the stop.
-            let _ = platform::nudge(&handle.path);
             let _ = handle.join.join();
-            let _ = std::fs::remove_file(&handle.path);
+            platform::remove_own_socket(&handle.path, handle.identity);
         }
     }
 }
@@ -433,14 +438,23 @@ impl BrokerState {
 fn serve(
     listener: platform::Listener,
     path: PathBuf,
+    identity: platform::SocketIdentity,
     bindings: Arc<Mutex<Bindings>>,
     policy: Policy,
     stop_rx: mpsc::Receiver<()>,
 ) {
     let in_flight = Arc::new(Mutex::new(0_usize));
     loop {
+        // Non-blocking accept with a bounded wait between tries, so a stop is seen within
+        // a tenth of a second whether or not anything ever connects again.
         let connection = match platform::accept(&listener) {
             Ok(connection) => connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                match stop_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                }
+            }
             Err(_) => {
                 if stop_rx.try_recv().is_ok() {
                     break;
@@ -483,7 +497,7 @@ fn serve(
             }
         }
     }
-    let _ = std::fs::remove_file(&path);
+    platform::remove_own_socket(&path, identity);
 }
 
 fn serve_one(connection: platform::Connection, bindings: &Mutex<Bindings>, policy: &Policy) {
@@ -538,10 +552,26 @@ mod platform {
 
     pub(super) type Listener = UnixListener;
     pub(super) type Connection = UnixStream;
+    /// Device and inode of the socket this broker created.
+    pub(super) type SocketIdentity = (u64, u64);
 
     const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "ksh"];
 
-    pub(super) fn listen(path: &Path) -> Result<UnixListener, String> {
+    /// Remove the socket at `path` only if it is the very inode this broker created. A
+    /// socket that was moved away, or a file somebody put in its place, is not ours to
+    /// delete — Codex renamed the socket, planted a regular file, and watched the first
+    /// version of this remove it.
+    pub(super) fn remove_own_socket(path: &Path, identity: SocketIdentity) {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_socket() && (meta.dev(), meta.ino()) == identity => {
+                let _ = std::fs::remove_file(path);
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn listen(path: &Path) -> Result<(UnixListener, SocketIdentity), String> {
         use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
         let dir = path.parent().ok_or_else(|| "Broker socket has no directory".to_string())?;
         // The directory is this user's alone, created so, and never followed through a
@@ -585,19 +615,18 @@ mod platform {
         let listener = UnixListener::bind(path).map_err(|error| format!("Broker socket: {error}"))?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("Broker socket mode: {error}"))?;
-        Ok(listener)
+        listener.set_nonblocking(true).map_err(|error| format!("Broker socket: {error}"))?;
+        let meta = std::fs::symlink_metadata(path).map_err(|error| format!("Broker socket: {error}"))?;
+        Ok((listener, (meta.dev(), meta.ino())))
     }
 
     pub(super) fn accept(listener: &UnixListener) -> std::io::Result<UnixStream> {
         let (stream, _) = listener.accept()?;
+        stream.set_nonblocking(false)?;
         // Short per-read waits; the elapsed deadline is kept by the reader loop.
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(250)));
         let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
         Ok(stream)
-    }
-
-    pub(super) fn nudge(path: &Path) -> std::io::Result<()> {
-        UnixStream::connect(path).map(|_| ())
     }
 
     pub(super) fn split(stream: UnixStream) -> std::io::Result<(BufReader<UnixStream>, UnixStream)> {
@@ -798,15 +827,15 @@ mod platform {
 
     pub(super) struct Listener;
     pub(super) struct Connection;
+    pub(super) type SocketIdentity = (u64, u64);
 
-    pub(super) fn listen(_path: &Path) -> Result<Listener, String> {
+    pub(super) fn remove_own_socket(_path: &Path, _identity: SocketIdentity) {}
+
+    pub(super) fn listen(_path: &Path) -> Result<(Listener, SocketIdentity), String> {
         Err("The mailbox broker is only available on macOS".to_string())
     }
     pub(super) fn accept(_listener: &Listener) -> std::io::Result<Connection> {
         Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no broker on this platform"))
-    }
-    pub(super) fn nudge(_path: &Path) -> std::io::Result<()> {
-        Ok(())
     }
     pub(super) fn split(_c: Connection) -> std::io::Result<(BufReader<std::io::Empty>, std::io::Sink)> {
         Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no broker on this platform"))
@@ -1179,6 +1208,53 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn platform_unique_version(pid: i32) -> (u64, u32) {
         platform::unique_info_for_tests(pid).expect("alive")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shutdown_removes_only_the_socket_it_created_and_needs_no_path_to_stop() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        let dir = std::env::temp_dir().join(format!("gyredeck-broker-shutdown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("broker").join("broker.sock");
+        let policy = Policy {
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            alive: Arc::new(|_| true),
+            chain_holds: Arc::new(|_| true),
+            collect: Arc::new(|_, _| Ok(json!({ "ok": true }))),
+        };
+
+        // Codex's fixture: the socket is moved away and a regular file is put in its place.
+        // The listener still answers at its new path; the stop must land without the old
+        // path pointing anywhere useful, and the file must survive the shutdown.
+        let state = BrokerState::default();
+        state.start(path.clone(), policy.clone()).unwrap();
+        let moved = dir.join("broker").join("moved.sock");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, b"not a socket").unwrap();
+        let mut stream = UnixStream::connect(&moved).unwrap();
+        stream.write_all(b"{\"v\":1,\"collect\":{}}\n").unwrap();
+        let mut answer = String::new();
+        BufReader::new(stream).read_line(&mut answer).unwrap();
+        assert!(answer.contains("unbound"), "still serving at the moved path: {answer}");
+        let stopped = std::time::Instant::now();
+        state.stop();
+        assert!(stopped.elapsed() < Duration::from_secs(3), "stopped without anything connecting through the old path");
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a socket", "the replacement file is not ours and was left alone");
+        assert!(moved.exists(), "the moved socket was not found by path either; nothing else was removed");
+
+        // The ordinary case: our own socket, at our own path, is removed on stop.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&moved);
+        let again = BrokerState::default();
+        again.start(path.clone(), policy).unwrap();
+        assert!(path.exists());
+        again.stop();
+        assert!(!path.exists(), "our socket, our path: removed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "macos")]

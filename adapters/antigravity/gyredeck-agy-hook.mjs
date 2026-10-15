@@ -642,31 +642,20 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
   // not say is answered as before.
   if (syncRoom && confirmed && result?.watching !== true) {
     parts.push(
-            `HEAR — so a message reaches you without waiting to be typed at, keep one watch on` +
-        " this room. Run this, with the room's password in place of THE ROOM PASSWORD:\n" +
-        `while :; do\n` +
-        `  { curl -sN --fail "http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}/events?as=${room}&since=resume" -H "x-gyredeck-token: THE ROOM PASSWORD"; echo $? > /tmp/gy-${syncRoom}.st; } \\\n` +
-        `    | grep --line-buffered '^data: '\n` +
-        `  [ "$(cat /tmp/gy-${syncRoom}.st)" = "22" ] && { echo "gyredeck: room ${syncRoom} is gone - watch ended"; break; }\n` +
-        `  sleep 1\n` +
-        `done\n` +
-        "Anything arriving on it is meant to interrupt you: the room sends only what was" +
-        " addressed to you or to everyone, never an acknowledgement or a notice about its" +
-        " own membership.\n" +
-        "  · Run it with something that turns each line into a notification while the" +
-        " command keeps running. A plain background job is not that — most report only when" +
-        " the process exits, so the stream stays open, messages land in a file, and nothing" +
-        " reaches you. That looks exactly like a quiet room, so if that is all you have, say" +
-        " so rather than running it.\n" +
-        "  · Run it unmodified. Every part of it is load-bearing.\n" +
-        "  · Three things end the watch and nothing else: the room was closed, you were" +
-        " disconnected from it, or re-opening is refused — which is what happens once the" +
-        " bridge has restarted, since a room lives only in its memory and cannot be" +
-        " re-entered. The loop stops itself in that third case; in the first two you are" +
-        " told, and should not start another.\n" +
-        "  · The stream closes after five minutes and says so first. That is routine: the" +
-        " loop re-opens and the room resumes you from where your stream had got to, so" +
-        " nothing published in the gap is lost. One watch at a time.",
+      // Antigravity wakes the agent only when a background task exits, so a stream that
+      // stays open delivers into a log nobody reads (#159, reproduced on agy 1.3.6). The
+      // room's own stream with once=1 ends with the first frame meant for this session;
+      // the drain on the next invocation then delivers it as usual, and the agent starts
+      // it again. Room-scoped and read-free — a session bound to the broker may not read
+      // its mailbox over TCP, and this does not.
+      "HEAR — so a message reaches you without anyone typing, keep one wait running as a" +
+        " background task. It ends as soon as something is addressed to you, which is what" +
+        " wakes you; after you have answered, start it again. Run it with the room's" +
+        " password in place of THE ROOM PASSWORD:\n" +
+        `while :; do r=$(curl -sN --fail --max-time 330 "http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}/events?as=${room}&since=resume&once=1" -H "x-gyredeck-token: THE ROOM PASSWORD"); rc=$?; case "$r" in *'data: '*) echo "gyredeck: mail for you in ${syncRoom}"; break;; esac; case $rc in 22) echo "gyredeck: room ${syncRoom} is gone - wait ended"; break;; 7) echo "gyredeck: bridge unreachable - wait ended"; break;; esac; sleep 1; done\n` +
+        "  · Run it unmodified, and only one.\n" +
+        "  · After \"room … is gone\" or \"bridge unreachable\", do not start it again until a" +
+        " delivery here shows this HEAR line.",
     );
   }
   const header = { ephemeralMessage: parts.join(" ") };

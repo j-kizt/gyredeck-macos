@@ -193,7 +193,7 @@ which is worse than either being wrong alone.
 
 ```
 bridge → Codex        pushed in, ~2s, nothing to set up
-bridge → Claude, AGY  not pushable — they hold a watch on the room and wake themselves
+bridge → Claude, AGY  not pushable — Claude holds a watch, AGY a wait that ends on mail (#159)
 ```
 
 Codex is reached from outside because the bridge runs `codex queue` and is not inside its

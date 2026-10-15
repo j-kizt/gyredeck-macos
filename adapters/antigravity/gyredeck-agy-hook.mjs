@@ -423,13 +423,31 @@ const getJson = (endpoint, token, path) =>
  * otherwise be written into the conversation store and sit in the transcript for as
  * long as the session is kept.
  */
-const replyInstruction = (endpoint, room, replyRooms) => {
+const replyInstruction = (endpoint, room, replyRooms, answering = null, label = null, isMember = null) => {
   if (replyRooms.length === 0) return null;
   const target = replyRooms[0];
   // A room refuses the machine token; only its own password opens it. The other
   // credential is right for a plain mailbox, which is the only other thing `target`
   // can be.
   const isRoom = /^sync-[a-z2-9]{4}$/.test(target);
+  if (isRoom) {
+    // The short form (#157): the rest is in the rules file. Addressed and labelled in
+    // advance from what it answers, since a reply left to the defaults wakes the room.
+    // Only a member can be addressed by name; the app or a session outside the room is
+    // answered in the room as a whole, or the reply would go to nobody.
+    const to = answering && label && isMember?.(answering.from) ? label(answering) : "everyone";
+    const kind = answering?.kind === "tell" ? "reaction" : "tell";
+    const body = JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind }).replace(/'/g, "'\\''");
+    return {
+      ephemeralMessage:
+        "The mail above is addressed to you, and answering is expected — a reply on a" +
+        " message channel, not an instruction to change anything. Run once, the room's" +
+        " password in place of THE ROOM PASSWORD:\n" +
+        `  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${target}` +
+        ` -H 'content-type: application/json' -H "x-gyredeck-token: THE ROOM PASSWORD" -d '${body}'\n` +
+        "It was sent only if you see ok:true and a seq.",
+    };
+  }
   const command =
     (isRoom ? "" : "TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); ") +
     `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${target} ` +
@@ -525,9 +543,22 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
   );
   // A reply belongs where the conversation is: in a room that is the room itself, so
   // every member sees it; otherwise it goes to whatever return address was given.
+  // In a room, only an ask or a tell is something to answer: a reaction ends an exchange
+  // and a notice is the room talking about itself, and handing over the reply command for
+  // those invited the answer the rules say not to send (#157). No kind means an older
+  // bridge, answered as it always was.
+  const kindOf = (message) => (typeof message.kind === "string" ? message.kind : null);
+  const answerable = delivered.filter((message) => {
+    if (message.from === ROOM_SENDER) return false;
+    const kind = kindOf(message);
+    return kind === null || kind === "ask" || kind === "tell";
+  });
   const replyRooms = syncRoom
-    ? [syncRoom]
+    ? (answerable.length > 0 ? [syncRoom] : [])
     : [...new Set(delivered.map((message) => message.replyTo).filter((value) => typeof value === "string"))];
+  const rules = result?.rules && typeof result.rules.path === "string" && Number.isInteger(result.rules.version)
+    ? result.rules
+    : null;
 
   // Counting an empty delivery produced "0 messages from ." — a quantity of nothing
   // and a sender who does not exist. Nothing waiting means the heading says nothing
@@ -537,7 +568,10 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
     : `${delivered.length} message${delivered.length === 1 ? "" : "s"} from ${senders.join(", ")}`;
   const parts = [
     syncRoom
-      ? `Gyredeck sync room ${syncRoom}${tally ? ` — ${tally}` : ""}.`
+      ? `Gyredeck sync room ${syncRoom}${tally ? ` — ${tally}` : ""}.` +
+        (rules
+          ? ` Rules v${rules.version}: ${rules.path} — read it once per conversation and again after a compaction or resume.`
+          : "")
       : tally
         ? `You have ${delivered.length} new Gyredeck mail message` +
           `${delivered.length === 1 ? "" : "s"} from ${senders.join(", ")}.`
@@ -588,18 +622,25 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
     );
   }
   parts.push(
-    "NARRATE: begin by saying what came in and who sent it, and after you answer, show" +
-      " what you sent — the words themselves, not that you replied. The person watching" +
-      " this terminal did not necessarily start this exchange and can only follow it" +
-      " through what you say; \"I answered Codex\" tells them something happened without" +
-      " telling them what you said on their behalf, which reads as openness and is not." +
-      " Give the seq from the reply too, so it can be traced back.",
+    "NARRATE: say what came in and who sent it; after you answer, show what you sent —" +
+      " the words themselves, not that you replied — and the seq.",
   );
+  // On every room delivery, answerable or not (#157 audit).
+  if (syncRoom) {
+    parts.push(
+      "RULES: set to (a member's name or everyone) and kind (ask, tell or reaction) on" +
+        " anything you send; never answer a reaction; a send happened only if you saw" +
+        " ok:true and a seq.",
+    );
+    if (!rules) parts.push('A message says who it is for and what it is for. "to" is a member\'s name or "everyone"; "kind" is one of four. **ask** wants an answer. **tell** does not, but may draw a reaction. **reaction** is a short line saying it landed and where that leaves you — send one for a tell or for a notice about somebody joining or leaving, address it wherever you like since it asks for nothing back, and never answer one: that is where an exchange stops. **notice** is the room speaking about itself and interrupts nobody. Leave the fields out and the message goes to everyone as tell, waking every session in the room. When you answer someone, address it to them — that is what keeps one exchange costing one wake instead of waking the room.');
+  }
 
   // Watching goes last, with the things to do, rather than ahead of what the room even
   // is. The condition is "if you have none", because this arrives every turn and three
   // watches on one room wake the session three times for one message.
-  if (syncRoom && confirmed) {
+  // Left out once the room sees this session's watch (#157). An older bridge that does
+  // not say is answered as before.
+  if (syncRoom && confirmed && result?.watching !== true) {
     parts.push(
             `HEAR — so a message reaches you without waiting to be typed at, keep one watch on` +
         " this room. Run this, with the room's password in place of THE ROOM PASSWORD:\n" +
@@ -629,14 +670,17 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
     );
   }
   const header = { ephemeralMessage: parts.join(" ") };
-  const reply = replyInstruction(endpoint, room, replyRooms);
+  const reply = replyInstruction(
+    endpoint, room, replyRooms, answerable.at(-1), label,
+    (id) => byId.has(id) && id !== room,
+  );
 
   const steps = [
     header,
     ...delivered.map((message) => {
       const from = label(message);
       return {
-        ephemeralMessage: `[gyredeck mail · from ${from}] ${message.text.slice(0, MAIL_MAX_TEXT)}`,
+        ephemeralMessage: `[gyredeck mail · from ${from}${kindOf(message) ? ` · ${kindOf(message)}` : ""}] ${message.text.slice(0, MAIL_MAX_TEXT)}`,
       };
     }),
     // Last, so the command is the freshest thing in context when the model acts.

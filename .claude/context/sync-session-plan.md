@@ -107,6 +107,34 @@ The narration request matters more here than for ordinary mail. With mail the pe
 typed something and is waiting; with a sync room they may have started nothing at all,
 and the terminal is their only window onto it.
 
+### What is repeated, and what is pointed at (#157)
+
+Every delivery used to carry the whole briefing — how to answer, how to watch, how to
+wait — about 4.5 KB on every event, notices and reactions included, to sessions already
+watching. It was repeated on purpose: on 2026-09-09 what the bridge attached to every
+message stuck and what was posted into the room once mostly did not
+(`agent-messaging-findings.md`). So the rules were not moved to "told once"; they were
+split:
+
+- **In a file, read once per conversation and after a compaction:** the full rules,
+  written by the bridge to `~/.config/gyredeck/room-rules.md` on every start, versioned
+  (`ROOM_RULES_VERSION`). Every delivery names the path and version. The bridge writes it
+  because it ships with the app on every machine; Codex reads it from any sandbox
+  (`:read-only` and `:workspace` both, checked with `codex sandbox`).
+- **Still on every delivery:** where you are, who sent what and **which kind it was**
+  (`[from Codex · reaction]`), narrate, and — only when there is an ask or a tell to
+  answer — the reply command, pre-addressed to the sender with the kind that fits (tell
+  for an ask, reaction for a tell) and the three rules that broke live: set to/kind, never
+  answer a reaction, a send counts only with ok:true and a seq.
+- **Only when it applies:** HEAR while the room sees no watch of the session's
+  (`watching` on the inbox answer); WAIT as one line.
+- **Codex:** the push that confirms it carries the full envelope as before; every later
+  push a short form (~0.5 KB, from ~1.7 KB) — still opened by
+  `[Gyredeck · room <code> — how to answer:`, which `codexPushTarget` routes by.
+
+Measured on the delivery text alone, a watching session's reaction went from 4,572 to 805
+characters (Claude Code) and 4,031 to 559 (Antigravity); an ask from 4,572 to 1,243.
+
 ## Bridge
 
 A sync room is a mail room with members. Nothing new is introduced beside `/mail`;

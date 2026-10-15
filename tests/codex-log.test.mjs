@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { CODEX_LINE_MAX_BYTES, CODEX_READ_CHUNK_BYTES, codexEntryFromLine, codexEnvelopeLabel, codexPushTarget, readCodexClosed, findCodexPrompt, codexReplyFromLine, readCodexLog, readTail } from "../adapters/bridge/gyredeck-bridge.mjs";
+import { CODEX_LINE_MAX_BYTES, CODEX_READ_CHUNK_BYTES, codexEntryFromLine, codexEnvelopeLabel, codexPushTarget, codexRoomTag, readCodexClosed, findCodexPrompt, codexReplyFromLine, readCodexLog, readTail } from "../adapters/bridge/gyredeck-bridge.mjs";
 
 /**
  * The byte arithmetic behind harvesting Codex's answers out of its own rollout log.
@@ -520,4 +520,18 @@ test("the record of closed Codex mailboxes is absent, trusted, or broken — nev
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("a room message is introduced to Codex by the sender's exact name, so an answer to it routes (#157)", () => {
+  // The room routes `@<name> tell` by exact member name. Brackets, parentheses and a long
+  // name sharing a prefix with a shorter one must all survive, or the answer goes nowhere.
+  for (const name of [
+    "Claude Code · blue(team)",
+    "Claude Code · blue(team) [x]",
+    "Claude Code · a-very-long-workspace-name-that-goes-on-well-past-forty-characters",
+  ]) {
+    const tag = codexRoomTag(name, "ask", "q");
+    assert.equal(tag, `[from ${name} · ask] q`);
+  }
+  assert.equal(codexRoomTag("A\nB", "tell", "t"), "[from A B · tell] t", "one line");
 });

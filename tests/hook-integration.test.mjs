@@ -744,8 +744,8 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     assert.match(header.ephemeralMessage, /Answering a question it asks is not that/);
     assert.doesNotMatch(header.ephemeralMessage, /what you are here for/);
     assert.deepEqual(body, [
-      { ephemeralMessage: "[gyredeck mail · from codex] build is green" },
-      { ephemeralMessage: "[gyredeck mail · from claude-code] ack" },
+      { ephemeralMessage: "[gyredeck mail · from codex · tell] build is green" },
+      { ephemeralMessage: "[gyredeck mail · from claude-code · tell] ack" },
     ]);
 
     // The hook keeps no memory between runs. What stops the next invocation
@@ -813,20 +813,20 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     // Singular when there is one message, so the announcement does not read as a lie.
     assert.match(singleHeader.ephemeralMessage, /1 new Gyredeck mail message from codex\./);
     assert.deepEqual(single, [
-      { ephemeralMessage: "[gyredeck mail · from codex] one more" },
+      { ephemeralMessage: "[gyredeck mail · from codex · tell] one more" },
     ]);
 
     // A burst is capped per invocation; the remainder keeps its place in the room.
     for (let index = 0; index < 14; index += 1) await send("codex", `bulk-${index}`);
     const first = await preInvocation(4);
     assert.equal(first.length, 11, "header plus ten messages");
-    assert.equal(first[1].ephemeralMessage, "[gyredeck mail · from codex] bulk-0");
+    assert.equal(first[1].ephemeralMessage, "[gyredeck mail · from codex · tell] bulk-0");
     const rest = (await preInvocation(5)).slice(1);
     assert.deepEqual(rest.map((step) => step.ephemeralMessage), [
-      "[gyredeck mail · from codex] bulk-10",
-      "[gyredeck mail · from codex] bulk-11",
-      "[gyredeck mail · from codex] bulk-12",
-      "[gyredeck mail · from codex] bulk-13",
+      "[gyredeck mail · from codex · tell] bulk-10",
+      "[gyredeck mail · from codex · tell] bulk-11",
+      "[gyredeck mail · from codex · tell] bulk-12",
+      "[gyredeck mail · from codex · tell] bulk-13",
     ]);
 
     // With the bridge gone the hook must still answer, and quickly: this response
@@ -1009,7 +1009,7 @@ test("claude UserPromptSubmit delivers mail as additional context exactly once",
     assert.equal(delivered.hookSpecificOutput.hookEventName, "UserPromptSubmit");
     const context = delivered.hookSpecificOutput.additionalContext;
     assert.match(context, /1 message from codex/);
-    assert.match(context, /\[from codex\] build is green/);
+    assert.match(context, /\[from codex · tell\] build is green/);
     // From outside any room this session is in, so the caution applies.
     assert.match(context, /information only/);
     assert.doesNotMatch(context, /what you are here for/);
@@ -1494,6 +1494,238 @@ test("a session can wait inside its turn for an answer it needs", async () => {
   }
 });
 
+test("a room delivery carries only what the session can use, and points at the rules for the rest (#157)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-brief-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const me = "claude-session-1";
+  const peer = "codex-session-1";
+  const agy = "0313999f-b335-40b3-bc51-b8a9e65df5ce";
+  const watch = new AbortController();
+  try {
+    await waitForHealth(port, stderrRef);
+    // The file every delivery points at exists as soon as the bridge does, at the version
+    // a delivery names.
+    const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
+    assert.match(rules, /^# Gyredeck room rules — v1\n/);
+    assert.match(rules, /Never answer a reaction/);
+
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const post = (path, body) =>
+      fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
+    const context = async () => {
+      const result = await runAdapter(
+        "adapters/claude/gyredeck-claude-hook.mjs",
+        ["--event", "UserPromptSubmit"],
+        home,
+        { hook_event_name: "UserPromptSubmit", session_id: me, cwd: "/tmp/project", prompt: "hi" },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
+    };
+    const steps = async () => {
+      const result = await runAdapter(
+        "adapters/antigravity/gyredeck-agy-hook.mjs",
+        ["--event", "PreInvocation"],
+        home,
+        { conversationId: agy, invocationNum: 1, workspacePaths: ["/tmp/agy-project"], modelName: "gemini-3-pro" },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return (JSON.parse(result.stdout).injectSteps ?? []).map((step) => step.ephemeralMessage).join("\n\n");
+    };
+    for (const [conversationId, sourceKind] of [[me, "claudeCodeHook"], [peer, "codexCliHook"], [agy, "agyHost"]]) {
+      await post("/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const code = (await post("/sync/rooms", { conversationId: me })).room;
+    await post(`/sync/rooms/${code}/members`, { conversationId: peer });
+    await post(`/sync/rooms/${code}/members`, { conversationId: agy });
+    const minted = await post(`/sync/rooms/${code}/passwords`, { conversationId: me });
+    await post(`/sync/rooms/${code}/confirm`, { conversationId: peer, password: minted.password });
+    await post(`/sync/rooms/${code}/confirm`, { conversationId: agy, password: minted.password });
+    await steps();
+    const opening = await context();
+    assert.match(opening, /Rules v1: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
+    // Nothing but the room talking about itself: nothing to answer, so no command for it.
+    assert.doesNotMatch(opening, /REPLY —/);
+
+    // A reaction ends an exchange. The session sees that it was one, and is not handed
+    // the command to answer it.
+    await post(`/mail/${code}`, { from: peer, to: me, kind: "reaction", text: "got it" });
+    const reaction = await context();
+    assert.match(reaction, /\[from Codex · reaction\] got it/);
+    assert.doesNotMatch(reaction, /REPLY —/);
+    // Nothing to answer is exactly where the rules that broke live are needed (#157 audit).
+    assert.match(reaction, /never answer a reaction/);
+    assert.match(reaction, /ok:true and a seq/);
+
+    // A tell may draw a reaction, addressed to whoever sent it rather than the room.
+    await post(`/mail/${code}`, { from: peer, to: me, kind: "tell", text: "build is green" });
+    const tell = await context();
+    assert.match(tell, /REPLY —/);
+    assert.match(tell, /"to":"Codex","kind":"reaction"/);
+
+    // An ask wants an answer, to the asker.
+    await post(`/mail/${code}`, { from: peer, to: me, kind: "ask", text: "which branch?" });
+    const ask = await context();
+    assert.match(ask, /"to":"Codex","kind":"tell"/);
+    // No watch yet, so how to open one is part of the delivery.
+    assert.match(ask, /HEAR —/);
+
+    // With a watch of its own open, the session is not told again how to open one.
+    const stream = await fetch(`${base}/mail/${code}/events?as=${me}&since=resume`, {
+      headers: { "x-gyredeck-token": minted.password },
+      signal: watch.signal,
+    });
+    assert.equal(stream.status, 200);
+    await post(`/mail/${code}`, { from: peer, to: me, kind: "ask", text: "and the PR?" });
+    const watching = await context();
+    assert.match(watching, /and the PR\?/);
+    assert.doesNotMatch(watching, /HEAR —/);
+    // The rules that broke live when they were told only once stay inline.
+    assert.match(watching, /never answer a reaction/);
+    assert.match(watching, /ok:true and a seq/);
+
+    // A watch that has gone is not counted: the next delivery says how to open one again.
+    watch.abort();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await post(`/mail/${code}`, { from: peer, to: me, kind: "ask", text: "still there?" });
+    assert.match(await context(), /HEAR —/);
+
+    // The person's own message, through the app, is not a member: a reply addressed to
+    // their label would go to nobody, so it goes to the room (#157 audit).
+    await post(`/mail/${me}`, { from: "gyredeck", text: "which file?" });
+    const fromApp = await context();
+    assert.match(fromApp, /REPLY —/);
+    assert.match(fromApp, /"to":"everyone"/);
+    assert.doesNotMatch(fromApp, /"to":"the user/);
+
+    // Antigravity is briefed the same way: a reaction draws no reply step, a tell does,
+    // and it is pointed at the rules.
+    await post(`/mail/${code}`, { from: peer, to: agy, kind: "reaction", text: "noted" });
+    const agyReaction = await steps();
+    assert.match(agyReaction, /\[gyredeck mail · from Codex · reaction\] noted/);
+    assert.match(agyReaction, /Rules v1: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.doesNotMatch(agyReaction, /answering is expected/);
+    assert.match(agyReaction, /never answer a reaction/);
+    assert.match(agyReaction, /ok:true and a seq/);
+    await post(`/mail/${code}`, { from: peer, to: agy, kind: "tell", text: "deploy done" });
+    const agyTell = await steps();
+    assert.match(agyTell, /answering is expected/);
+    assert.match(agyTell, /"to":"Codex","kind":"reaction"/);
+    assert.match(agyTell, /HEAR —/, "no watch of its own yet");
+    await post(`/mail/${agy}`, { from: "gyredeck", text: "status?" });
+    const agyApp = await steps();
+    assert.match(agyApp, /"to":"everyone"/);
+    assert.doesNotMatch(agyApp, /"to":"the user/);
+  } finally {
+    watch.abort();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a room watch is sent a heartbeat, and with no rules file the rules go out in full (#157)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-norules-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  // Something that cannot be replaced by a file stands where the rules go.
+  await mkdir(join(home, ...CONFIG_DIR, "room-rules.md"));
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home, GYREDECK_SSE_HEARTBEAT_MS: "200" }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const base = `http://127.0.0.1:${port}`;
+  const me = "claude-session-1";
+  const peer = "codex-session-1";
+  const watch = new AbortController();
+  try {
+    await waitForHealth(port, stderrRef);
+    assert.match(stderrRef.value, /room rules not written/);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const post = (path, body) =>
+      fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
+    for (const [conversationId, sourceKind] of [[me, "claudeCodeHook"], [peer, "codexCliHook"]]) {
+      await post("/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const code = (await post("/sync/rooms", { conversationId: me })).room;
+    await post(`/sync/rooms/${code}/members`, { conversationId: peer });
+    const minted = await post(`/sync/rooms/${code}/passwords`, { conversationId: me });
+    await post(`/sync/rooms/${code}/confirm`, { conversationId: peer, password: minted.password });
+
+    // A watch hears from the room even when nothing is said, which is how one that has
+    // gone gets noticed and dropped instead of counted.
+    const stream = await fetch(`${base}/mail/${code}/events?as=${me}&since=resume`, {
+      headers: { "x-gyredeck-token": minted.password },
+      signal: watch.signal,
+    });
+    const reader = stream.body.getReader();
+    const decoder = new TextDecoder();
+    let seen = "";
+    // Bounded per read, not only per loop: a read that never returns would otherwise wait
+    // out a heartbeat far slower than the one configured and still pass.
+    const started = Date.now();
+    const deadline = started + 3_000;
+    while (!seen.includes(": ping") && Date.now() < deadline) {
+      const next = await Promise.race([
+        reader.read(),
+        new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), Math.max(0, deadline - Date.now()))),
+      ]);
+      if (next.timedOut || next.done) break;
+      seen += decoder.decode(next.value);
+    }
+    assert.match(seen, /^: ping$/m);
+    assert.ok(Date.now() - started < 3_000, "within the deadline");
+    watch.abort();
+
+    // No file to point at: no pointer, and the long form in its place.
+    await post(`/mail/${code}`, { from: peer, to: me, kind: "reaction", text: "got it" });
+    const result = await runAdapter(
+      "adapters/claude/gyredeck-claude-hook.mjs",
+      ["--event", "UserPromptSubmit"],
+      home,
+      { hook_event_name: "UserPromptSubmit", session_id: me, cwd: "/tmp/project", prompt: "hi" },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+    assert.doesNotMatch(context, /Rules v1/);
+    assert.match(context, /\*\*reaction\*\* is a short line/);
+    assert.match(context, /never answer a reaction/);
+  } finally {
+    watch.abort();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("what an agent may act on depends on who sent it, in three tiers", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-tiers-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
@@ -1549,7 +1781,7 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     // The room announcing a join is a fact about who is present: neither a request to
     // act on nor something to be warned about, so it carries neither framing.
     const notice = await context();
-    assert.match(notice, /\[from the room\] Codex joined this room/);
+    assert.match(notice, /\[from the room · notice\] Codex joined this room/);
     assert.doesNotMatch(notice, /what you are here for/);
     assert.doesNotMatch(notice, /information only/);
 
@@ -1568,7 +1800,7 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     assert.match(fromRoomMate, /Also here: Codex\./);
     assert.match(fromRoomMate, /what you are here for/);
     assert.doesNotMatch(fromRoomMate, /information only/);
-    assert.match(fromRoomMate, /\[from Codex\]/, "labelled by provider");
+    assert.match(fromRoomMate, /\[from Codex · /, "labelled by provider");
     // A reply belongs in the room, so every member sees it and the exchange stays in
     // one place rather than splitting into private mailboxes.
     assert.match(fromRoomMate, new RegExp(`/mail/${code}`));
@@ -1592,7 +1824,7 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     for (const injected of [fromRoomMate, fromUser, fromStranger]) {
       // The words sent, not the fact of sending: "I answered Codex" reads as openness
       // while telling the person nothing about what was said for them.
-      assert.match(injected, /show what you sent — the words themselves/);
+      assert.match(injected, /show what you sent — the words themselves, not that you replied — and the seq/);
     }
   } finally {
     bridge.stdin.end();
@@ -4291,6 +4523,10 @@ test("a room password carried in by notify lets that session in, once", async ()
     // bare string to a session that has read nothing yet.
     assert.match(afterConfirm.at(-1), /how to answer/);
     assert.match(afterConfirm.at(-1), /Members now: /);
+    // The confirming push is the full brief, and names the rules file the short form of
+    // every later push points at (#157).
+    assert.match(afterConfirm.at(-1), /Do not call Gyredeck/);
+    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v1\)/);
 
     // Typing it twice is the same question. Nothing is announced again and nothing is
     // pushed again, because there is nothing outstanding to carry.
@@ -4315,6 +4551,17 @@ test("a room password carried in by notify lets that session in, once", async ()
     const afterLater = await pushesReach(afterConfirm.length + 1);
     assert.equal(afterLater.length, afterConfirm.length + 1);
     assert.match(afterLater.at(-1), /a later message/);
+    // Every later push carries the short form: still opened by the header the answer is
+    // routed by, still the routing line and the roster, without the paragraph already
+    // given on confirmation (#157).
+    assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} — how to answer: `));
+    assert.match(afterLater.at(-1), /@<member or everyone> ask\|tell\|reaction — never answer a reaction/);
+    assert.match(afterLater.at(-1), /Rules v1: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(afterLater.at(-1), /Members now: /);
+    assert.doesNotMatch(afterLater.at(-1), /Do not call Gyredeck/);
+    // And says which kind it is: a tell and a reaction with the same words must not
+    // arrive identical, or "never answer a reaction" cannot be kept (#157 audit).
+    assert.match(afterLater.at(-1), /\[from [^\]]+ · tell\] a later message/);
     const third = await call("POST", "/hook/sync/confirm", {
       conversationId: joiner,
       turnId: "01a06082-8ef6-7900-ae39-44fe2e460004",
@@ -6125,8 +6372,8 @@ test("a late answer refused by a full room is published once the room is collect
     assert.ok(full, "the room has to be full of owed mail, or this proves nothing");
     // A short question fits; its answer, later, will not.
     assert.equal((await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "ask", text: "q" })).body.ok, true);
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("\n\nq"))));
-    const question = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("\n\nq"));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith(" · ask] q"))));
+    const question = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith(" · ask] q"));
     await new Promise((resolve) => setTimeout(resolve, 1_500));
     await appendFile(room.rollout, turnAnswering(question.turnId, `@everyone tell\nREFUSED-THEN-DELIVERED ${fat}`));
     await room.call("POST", "/hook/stop", {

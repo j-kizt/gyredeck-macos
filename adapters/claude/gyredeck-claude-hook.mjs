@@ -616,8 +616,16 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
   const tally = delivered.length === 0
     ? null
     : `${delivered.length} message${delivered.length === 1 ? "" : "s"} from ${senders.join(", ")}`;
+  // The full rules live in a file the bridge writes (#157); a delivery names it and the
+  // version it expects, and repeats inline only what broke live when told once.
+  const rules = result?.rules && typeof result.rules.path === "string" && Number.isInteger(result.rules.version)
+    ? result.rules
+    : null;
   const heading = room_
-    ? `Gyredeck sync room ${room_}${tally ? ` — ${tally}` : ""}.`
+    ? `Gyredeck sync room ${room_}${tally ? ` — ${tally}` : ""}.` +
+      (rules
+        ? ` Rules v${rules.version}: ${rules.path} — read it once per conversation and again after a compaction or resume.`
+        : "")
     : `Gyredeck mail${tally ? `: ${tally}` : ""}.`;
 
   /**
@@ -680,18 +688,39 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
   }
 
   standing.push(
-    "NARRATE: begin by saying what came in and who sent it, and after you answer, show" +
-      " what you sent — the words themselves, not that you replied. The person watching" +
-      " this terminal did not necessarily start this exchange and can only follow it" +
-      " through what you say; \"I answered Codex\" tells them something happened without" +
-      " telling them what you said on their behalf, which reads as openness and is not." +
-      " Give the seq from the reply too, so it can be traced back.",
+    "NARRATE: say what came in and who sent it; after you answer, show what you sent —" +
+      " the words themselves, not that you replied — and the seq.",
   );
+  // The rules that broke live when they were told only once ride on every room delivery,
+  // whether or not it carries anything to answer (#157 audit): a reaction-only delivery
+  // is exactly where "never answer a reaction" is needed.
+  if (room_) {
+    standing.push(
+      "RULES: set to (a member's name or everyone) and kind (ask, tell or reaction) on" +
+        " anything you send; never answer a reaction; a send happened only if you saw" +
+        " ok:true and a seq.",
+    );
+  }
 
+  // The kind travels with each message: a session that cannot see that a line was a
+  // reaction answers it, which is the loop the kinds exist to stop.
+  const kindOf = (message) => (typeof message.kind === "string" ? message.kind : null);
   const lines = [
     [heading, ...standing].join(" "),
-    ...delivered.map((message) => `[from ${label(message)}] ${message.text.slice(0, MAIL_MAX_TEXT)}`),
+    ...delivered.map((message) =>
+      `[from ${label(message)}${kindOf(message) ? ` · ${kindOf(message)}` : ""}] ${message.text.slice(0, MAIL_MAX_TEXT)}`),
   ];
+
+  // Something to answer: an ask or a tell from somebody. A reaction ends an exchange and a
+  // notice is the room talking about itself; handing a session the reply command for
+  // those only invited the answer the rules say not to send (#157). A message with no
+  // kind is from an older bridge and is treated as answerable, as it always was.
+  const answerable = delivered.filter((message) => {
+    if (message.from === ROOM_SENDER) return false;
+    const kind = kindOf(message);
+    return kind === null || kind === "ask" || kind === "tell";
+  });
+  const lastAnswerable = answerable.at(-1);
 
   // A reply belongs where the conversation is. In a room that is the room itself, so
   // every member sees it and the exchange stays in one place; otherwise it goes to
@@ -700,19 +729,30 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
     room_ ??
     delivered.map((message) => message.replyTo).find((value) => typeof value === "string") ??
     null;
-  if (replyTo) {
-    // Which credential differs by where the reply goes. A room needs the room's own
-    // password, which is not on disk anywhere and has to be pasted in; a plain mailbox
-    // still takes the machine token, read at send time rather than written in here so
-    // no credential lands in the transcript.
-    const header = room_
-      ? "-H \"x-gyredeck-token: THE ROOM PASSWORD\""
-      : "-H \"x-gyredeck-token: $TOKEN\"";
-    const prelude = room_ ? "" : "  TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); ";
+  if (replyTo && room_ && (answerable.length > 0 || justConfirmed)) {
+    // Addressed and labelled in advance from what it answers — the asker, and a tell for
+    // an ask or a reaction for a tell — since a reply left to the defaults goes to the
+    // whole room and wakes everyone.
+    // Only a member can be addressed by name; anyone else — the app, a session outside the
+    // room — is answered in the room as a whole, or the reply would go to nobody.
+    const to = lastAnswerable && byId.has(lastAnswerable.from) && lastAnswerable.from !== room
+      ? label(lastAnswerable)
+      : "everyone";
+    const kind = kindOf(lastAnswerable) === "tell" ? "reaction" : "tell";
     lines.push(
-      "ANSWER — run this once, with your reply in place of YOUR REPLY HERE" +
-        (room_ ? " and this room's password in place of THE ROOM PASSWORD" : "") +
-        ":\n" +
+      "REPLY — run once, the room's password in place of THE ROOM PASSWORD:\n" +
+        `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${replyTo} ` +
+        `-H 'content-type: application/json' -H "x-gyredeck-token: THE ROOM PASSWORD" ` +
+        `-d '${JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind }).replace(/'/g, "'\\''")}'\n` +
+        "It was sent only if you see ok:true and a seq.",
+    );
+  } else if (replyTo && !room_) {
+    // A plain mailbox takes the machine token, read at send time rather than written in
+    // here so no credential lands in the transcript.
+    const header = "-H \"x-gyredeck-token: $TOKEN\"";
+    const prelude = "  TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); ";
+    lines.push(
+      "ANSWER — run this once, with your reply in place of YOUR REPLY HERE:\n" +
         prelude +
         `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${replyTo} ` +
         `-H 'content-type: application/json' ${header} ` +
@@ -736,7 +776,18 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
   // obvious way to write that captures the stream into a variable — after which nothing
   // reaches the notifier and the room looks silent. The exit-code check because a room
   // that has gone cannot be re-opened, and a loop told only to reopen retries forever.
-  if (room_ && confirmed) {
+  // No rules file to point at — the bridge could not write it — so the long form goes in
+  // full rather than a pointer to nothing.
+  if (room_ && !rules) {
+    lines.push(
+      'A message says who it is for and what it is for. "to" is a member\'s name or "everyone"; "kind" is one of four. **ask** wants an answer. **tell** does not, but may draw a reaction. **reaction** is a short line saying it landed and where that leaves you — send one for a tell or for a notice about somebody joining or leaving, address it wherever you like since it asks for nothing back, and never answer one: that is where an exchange stops. **notice** is the room speaking about itself and interrupts nobody. Leave the fields out and the message goes to everyone as tell, waking every session in the room. When you answer someone, address it to them — that is what keeps one exchange costing one wake instead of waking the room.',
+    );
+  }
+
+  // Left out once the room sees a watch of this session's: it is the longest part of a
+  // delivery and went to sessions already watching on every turn (#157). An older bridge
+  // that does not say is answered as before.
+  if (room_ && confirmed && result?.watching !== true) {
     lines.push(
       `HEAR — so a message reaches you without waiting to be typed at, keep one watch on` +
         " this room. Run this, with the room's password in place of THE ROOM PASSWORD:\n" +
@@ -772,12 +823,9 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
   // one that simply ended its turn.
   if (room_) {
     lines.push(
-      "WAIT \u2014 if you send a request whose answer you need before you can carry on," +
-        " you may wait for it instead of ending your turn. Run this once, and only while" +
-        " an answer is genuinely outstanding:\n" +
-        `node ${hookCommandPath()} wait 60 ${room}\n` +
-        "It prints what arrived as soon as something does, or after the timeout with" +
-        " \"timedOut\": true. A timed-out answer also carries yourLastMessage, saying who your last message went to, what kind it was, and whether that is why nothing came back — read it before deciding anything. If it says the message was addressed correctly and delivered, the silence is theirs: say so and stop, and do not send it again. It exits 2 and says why when the mail is being withheld; do not work around that with curl.",
+      "WAIT \u2014 only while an answer you need before you can carry on is outstanding:" +
+        ` node ${hookCommandPath()} wait 60 ${room}` +
+        (rules ? ` (what it prints and when to stop: ${rules.path}, Wait)` : ""),
     );
   }
 

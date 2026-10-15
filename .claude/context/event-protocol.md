@@ -609,6 +609,8 @@ on a timeout.
 
 This is what the adapters use, and it is why they hold no cursor. The position each reader has reached lives with the room whose messages it counts, so the two are lost together on a restart. An on-disk cursor could outlive the room it pointed at, keep counting past a `seq` the new room would not reach for a while, and silently discard everything sent afterwards while the hook reported success — which is exactly what happened once.
 
+Two more fields ride on the same answer when the session is in a sync room (#157). `rules` — `{ path, version }` — names the room rules file the bridge writes to `~/.config/gyredeck/room-rules.md` on every start; a delivery points at it instead of pasting all of it each time. `watching` says whether that reader already holds a watch on the room (`GET /mail/<room>/events?as=<id>`), so a hook can leave out how to open one. An older bridge sends neither and the hooks fall back to what they did before.
+
 `limit` caps the batch, and it is applied **by the bridge** rather than by the caller. Whoever advances the position has to be the one that trims: a caller that took the first ten of fourteen would leave four marked as read and never delivered. Only what is actually handed over moves the position, per room.
 
 ### Read position is per member
@@ -721,7 +723,7 @@ The cursor, caps, reset recovery and failure behaviour match the Antigravity dra
 Antigravity is the reason the buffered read path exists. It offers no way to push a message into a live session — no queue command, no socket — but its `PreInvocation` hook response accepts `injectSteps`, steps handed to the agent before it runs. So the adapter drains the room on every invocation:
 
 - The room is named after the **conversation id**, because a message is addressed to a session rather than to Antigravity in general.
-- Messages arrive as `ephemeralMessage` steps labelled `[gyredeck mail · from <sender>]`. Never `userMessage`: that would attribute another process's text to the person at the keyboard, and any local caller holding the token could then issue instructions carrying the user's authority.
+- Messages arrive as `ephemeralMessage` steps labelled `[gyredeck mail · from <sender> · <kind>]`. Never `userMessage`: that would attribute another process's text to the person at the keyboard, and any local caller holding the token could then issue instructions carrying the user's authority.
 - A message sent from the desktop app *is* the user speaking, and is labelled "the user, via Gyredeck". The caution about peers is left out for those, since describing the user's own message as untrusted is both wrong and an invitation to discount it.
 - `PreInvocation` fires per invocation, not per user message, so a message landing mid-turn is delivered at the next one.
 - The cursor lives in `~/.config/gyredeck/mail-cursors.json` (`{room: seq}`, 64 rooms, `0600`). A hook process keeps no memory between runs, so without it every invocation would re-inject the whole room.

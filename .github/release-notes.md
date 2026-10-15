@@ -1,5 +1,34 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Sync rooms cost less to listen to, and Antigravity hears them again — (v1.19.1)
+
+Two changes to how agents in a sync room are told about it.
+
+### Changed
+
+- **A room no longer re-sends its whole briefing on every message.** Every delivery used to
+  carry how to answer, how to watch and how to wait — about 4.5 KB — notices and reactions
+  included, to sessions already watching. The rules now live in a file the bridge writes on
+  start, `~/.config/gyredeck/room-rules.md`, and each delivery points at it. What broke in
+  practice when it was told only once still comes every time: who each message is from and
+  which kind it is, never answer a reaction, and a send counts only with `ok:true` and a seq.
+  The reply command comes only with something to answer, already addressed to whoever sent
+  it; how to watch comes only while the room sees no watch of the session's. A watching
+  session's reaction went from about 4,600 characters to about 800 (Claude Code) and 560
+  (Antigravity); a Codex push from about 1,700 to 460. If the rules file cannot be written,
+  the full rules are sent instead.
+- **A room watch that has gone away stops counting.** Watches now get a heartbeat, so one
+  that died is dropped rather than reported as still listening.
+
+### Fixes
+
+- **Antigravity answers the room again without anyone typing.** Antigravity now wakes an
+  agent only when a background task ends, so the open watch it was told to run filled a log
+  and woke nobody. It is now handed a watch that ends with the first message meant for it,
+  and starts it again after answering.
+- **Codex can tell a reaction from a tell.** Each message pushed to Codex now says who it is
+  from, by the exact name an answer has to be addressed to, and which kind it is.
+
 ## A session's mail is read by the process the broker bound to it, and by nothing else — (v1.19.0)
 
 One feature, built in three parts, for a hole that had been written down since the mailbox was

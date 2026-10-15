@@ -16,7 +16,7 @@ This document is the ground truth it is built on.
 | | Reach an **idle** session | Deliver into a running one | Reply without a keypress |
 | --- | --- | --- | --- |
 | **Codex** | ✅ `codex queue --thread <id> --message`, from outside | — | ✅ read its rollout log |
-| **Antigravity** | ✅ **only by watching its own room** | `PreInvocation` → `injectSteps` | ✅ it runs `curl` unprompted |
+| **Antigravity** | ✅ **only by a wait that ends on mail** (#159) | `PreInvocation` → `injectSteps` | ✅ it runs `curl` unprompted |
 | **Claude Code** | ✅ **only by watching its own room** | `UserPromptSubmit` → `additionalContext` | ✅ it runs `curl` unprompted |
 
 Codex is the only one reachable **from outside**. The other two reach themselves: an
@@ -27,6 +27,21 @@ session reporting from its own trajectory log that every turn since joining was
 started by its watch (task-214, task-227, task-238 — the numbers change because the
 stream expires every five minutes and re-arming is the intended response). The bridge
 corroborated it throughout: `subscribers` stayed at one per watching session.
+
+**Antigravity no longer wakes on a stream (2026-10-15, agy 1.3.6, #159).** Run as a
+background task, the stream received every frame into `task-*.log` and no turn started
+until the person typed — agy now wakes the agent only when a background task **exits**.
+What works, four times in a row with nobody typing, 8–10 s from publish to answer: a
+`GET /mail/wait` (plain read, not `collect=1`) in a loop that skips timeouts and exits on
+mail; the next invocation's drain delivers and briefs as before, and the agent starts the
+wait again. A one-event stream (`curl … | sed -n '/^data: /{p;q;}'`) does not: `sed`
+exits but `curl` lingers until the next write, so the task ends only when something else
+is published. What shipped is the same shape on the room's own stream: `GET
+/mail/<room>/events?as=<id>&since=resume&once=1`, which the bridge **ends** after the first
+frame meant for that member — a session the broker has bound may not read its mailbox over
+TCP (`/mail/wait` answers `403 broker_required`), and the room's stream reads no mailbox.
+`agy agentapi send-message` would be a true push, but only from a process
+agy starts itself (a sidecar) — from outside it answers `missing CSRF token`; that is #161.
 
 **Corrected 2026-09-07, and again 2026-09-08 for Antigravity.** This document said for
 most of a day that only Codex could be woken and that there was no way around it. Both

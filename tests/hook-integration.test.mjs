@@ -1518,7 +1518,7 @@ test("a room delivery carries only what the session can use, and points at the r
     // The file every delivery points at exists as soon as the bridge does, at the version
     // a delivery names.
     const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
-    assert.match(rules, /^# Gyredeck room rules — v1\n/);
+    assert.match(rules, /^# Gyredeck room rules — v2\n/);
     assert.match(rules, /Never answer a reaction/);
 
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
@@ -1561,7 +1561,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/sync/rooms/${code}/confirm`, { conversationId: agy, password: minted.password });
     await steps();
     const opening = await context();
-    assert.match(opening, /Rules v1: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
+    assert.match(opening, /Rules v2: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
     // Nothing but the room talking about itself: nothing to answer, so no command for it.
     assert.doesNotMatch(opening, /REPLY —/);
 
@@ -1621,7 +1621,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/mail/${code}`, { from: peer, to: agy, kind: "reaction", text: "noted" });
     const agyReaction = await steps();
     assert.match(agyReaction, /\[gyredeck mail · from Codex · reaction\] noted/);
-    assert.match(agyReaction, /Rules v1: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(agyReaction, /Rules v2: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.doesNotMatch(agyReaction, /answering is expected/);
     assert.match(agyReaction, /never answer a reaction/);
     assert.match(agyReaction, /ok:true and a seq/);
@@ -1630,6 +1630,29 @@ test("a room delivery carries only what the session can use, and points at the r
     assert.match(agyTell, /answering is expected/);
     assert.match(agyTell, /"to":"Codex","kind":"reaction"/);
     assert.match(agyTell, /HEAR —/, "no watch of its own yet");
+    // Antigravity wakes only when a background task exits, so it is handed a watch that
+    // ends with its first frame, not a stream that never ends (#159) — the room's own
+    // stream, which reads no mailbox, so a session bound to the broker may use it.
+    assert.match(agyTell, new RegExp(`/mail/${code}/events\\?as=${agy}&since=resume&once=1`));
+    assert.doesNotMatch(agyTell, /\/mail\/wait\?/);
+    assert.match(agyTell, /start it again/);
+    const onceWatch = await fetch(`${base}/mail/${code}/events?as=${agy}&since=resume&once=1`, {
+      headers: { "x-gyredeck-token": minted.password },
+    });
+    assert.equal(onceWatch.status, 200);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const listening = await fetch(`${base}/mail/inbox?as=${agy}`, { headers: { "x-gyredeck-token": minted.password } }).then((r) => r.json());
+    assert.equal(listening.watching, true, "a held wake-only watch counts as listening");
+    await post(`/mail/${code}`, { from: peer, to: agy, kind: "ask", text: "wake up" });
+    // It ends by itself with that frame — the ending is the wake.
+    const body = await Promise.race([
+      onceWatch.text(),
+      new Promise((resolve) => setTimeout(() => resolve("STILL OPEN"), 3_000)),
+    ]);
+    assert.notEqual(body, "STILL OPEN");
+    assert.match(body, /^data: .*wake up/m);
+    // Reading nothing: the drain still has the message to deliver and brief.
+    assert.match(await steps(), /wake up/);
     await post(`/mail/${agy}`, { from: "gyredeck", text: "status?" });
     const agyApp = await steps();
     assert.match(agyApp, /"to":"everyone"/);
@@ -1715,7 +1738,7 @@ test("a room watch is sent a heartbeat, and with no rules file the rules go out 
     );
     assert.equal(result.code, 0, result.stderr);
     const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
-    assert.doesNotMatch(context, /Rules v1/);
+    assert.doesNotMatch(context, /Rules v\d/);
     assert.match(context, /\*\*reaction\*\* is a short line/);
     assert.match(context, /never answer a reaction/);
   } finally {
@@ -4526,7 +4549,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // The confirming push is the full brief, and names the rules file the short form of
     // every later push points at (#157).
     assert.match(afterConfirm.at(-1), /Do not call Gyredeck/);
-    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v1\)/);
+    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v2\)/);
 
     // Typing it twice is the same question. Nothing is announced again and nothing is
     // pushed again, because there is nothing outstanding to carry.
@@ -4556,7 +4579,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // given on confirmation (#157).
     assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} — how to answer: `));
     assert.match(afterLater.at(-1), /@<member or everyone> ask\|tell\|reaction — never answer a reaction/);
-    assert.match(afterLater.at(-1), /Rules v1: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(afterLater.at(-1), /Rules v2: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.match(afterLater.at(-1), /Members now: /);
     assert.doesNotMatch(afterLater.at(-1), /Do not call Gyredeck/);
     // And says which kind it is: a tell and a reaction with the same words must not
@@ -7256,6 +7279,20 @@ test("the bridge refuses an old-path collect for a session the broker has bound,
     assert.equal(roomPeek.status, 200, "the room's backlog is the room's: password and membership");
     const roomCollect = await call("GET", `/mail/${code}?as=${bound}&collect=1`, { "x-gyredeck-token": password });
     assert.equal(roomCollect.status, 403, "but taken in the protected member's name only by its reader");
+    // How Antigravity is told to listen (#159) is the room's own stream with once=1, which
+    // reads no mailbox: a session the broker has bound may use it, and it ends with the
+    // first frame meant for that member.
+    const onceWatch = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${bound}&since=resume&once=1`, {
+      headers: { "x-gyredeck-token": password },
+    });
+    assert.equal(onceWatch.status, 200, "not refused for a bound session");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await call("POST", `/mail/${code}`, { "x-gyredeck-token": password }, { from: unbound, text: "wake the bound one", to: bound, kind: "ask" });
+    const woke = await Promise.race([
+      onceWatch.text(),
+      new Promise((resolve) => setTimeout(() => resolve("STILL OPEN"), 3_000)),
+    ]);
+    assert.match(woke, /^data: .*wake the bound one/m, "and ends with the frame that wakes it");
     assert.equal(roomCollect.body.error, "broker_required");
     const roomCollectVouched = await call("GET", `/mail/${code}?as=${bound}&collect=1`, { "x-gyredeck-token": password, "x-gyredeck-broker": secret });
     assert.equal(roomCollectVouched.status, 200);

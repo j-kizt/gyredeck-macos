@@ -609,6 +609,8 @@ on a timeout.
 
 This is what the adapters use, and it is why they hold no cursor. The position each reader has reached lives with the room whose messages it counts, so the two are lost together on a restart. An on-disk cursor could outlive the room it pointed at, keep counting past a `seq` the new room would not reach for a while, and silently discard everything sent afterwards while the hook reported success — which is exactly what happened once.
 
+`GET /mail/<room>/events?…&once=1` is a wake-only watch (#159): the bridge ends the response after the first frame meant for that watcher, or straight after the resume backlog if that already held one. It is what Antigravity is told to run, since agy wakes the agent only when a background task exits. It reads no mailbox and moves no read position; the drain delivers the mail.
+
 Two more fields ride on the same answer when the session is in a sync room (#157). `rules` — `{ path, version }` — names the room rules file the bridge writes to `~/.config/gyredeck/room-rules.md` on every start; a delivery points at it instead of pasting all of it each time. `watching` says whether that reader already holds a watch on the room (`GET /mail/<room>/events?as=<id>`), so a hook can leave out how to open one. An older bridge sends neither and the hooks fall back to what they did before.
 
 `limit` caps the batch, and it is applied **by the bridge** rather than by the caller. Whoever advances the position has to be the one that trims: a caller that took the first ten of fourteen would leave four marked as read and never delivered. Only what is actually handed over moves the position, per room.

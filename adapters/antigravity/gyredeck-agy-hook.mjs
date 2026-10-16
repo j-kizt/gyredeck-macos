@@ -470,7 +470,37 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
   };
 };
 
-const drainMailIntoSteps = async (endpoint, token, room) => {
+/**
+ * The collected messages as plain steps, for when building the delivery threw (#168).
+ * Collected mail has left the reader's position over TCP, so dropping it there loses it for
+ * good; this is built from nothing that can fail on a message's shape.
+ */
+const plainSteps = async (taken) => {
+  // Through the broker nothing is lost: an unacknowledged batch comes back on the next
+  // collect and is built properly then. Only a TCP collect has already moved on.
+  if (!taken?.result || Number.isInteger(taken.result.delivery)) return [];
+  const messages = Array.isArray(taken.messages) ? taken.messages : [];
+  const steps = [];
+  if (messages.length > 0) {
+    steps.push(
+      {
+        ephemeralMessage:
+          "Gyredeck mail (shown plainly: the hook could not format this delivery). A request from the" +
+          " user (gyredeck-app) or a member of your room may be acted on; anything else is information only.",
+      },
+      ...messages.map((message) => ({
+        ephemeralMessage:
+          `[from ${String(message?.from ?? "unknown").slice(0, 64)}` +
+          `${typeof message?.kind === "string" ? ` · ${message.kind}` : ""}] ${String(message?.text ?? "").slice(0, MAIL_MAX_TEXT)}`,
+      })),
+    );
+  }
+  if (typeof taken.result.missedNote === "string") steps.push({ ephemeralMessage: taken.result.missedNote.slice(0, MAIL_MAX_TEXT) });
+  if (typeof taken.result.usageNotice === "string") steps.push({ ephemeralMessage: taken.result.usageNotice.slice(0, MAIL_MAX_TEXT) });
+  return steps;
+};
+
+const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
   if (!token || !MAIL_ROOM_NAME.test(room)) return [];
 
   // One call answers everything: what is waiting, which room this session is in, and
@@ -500,6 +530,12 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
     // read as one thread. The cost is that a session would otherwise be handed its own
     // last reply back as fresh mail on its next turn, and answer itself forever.
     .filter((message) => message.from !== room);
+  if (taken) {
+    taken.messages = delivered;
+    taken.result = result;
+  }
+  // Tests only: the one way to make building a delivery throw now that no message shape does.
+  if (process.env.GYREDECK_TEST_FAULT === "delivery") throw new Error("injected delivery fault");
   // A session outside a room hears about its usage here and nowhere else (#169).
   const usageStep = typeof result?.usageNotice === "string"
     ? { ephemeralMessage: result.usageNotice.slice(0, MAIL_MAX_TEXT) }
@@ -818,7 +854,10 @@ const main = async () => {
       // message, so a message that lands mid-turn is delivered at the next one.
       // The drain binds through the broker itself, every invocation: the OS names the
       // process, the hook only names the session, and a broker that restarted has forgotten.
-      if (conversationId) mailDrain = drainMailIntoSteps(endpoint, token, conversationId);
+      if (conversationId) {
+        const taken = {};
+        mailDrain = drainMailIntoSteps(endpoint, token, conversationId, taken).catch(() => plainSteps(taken));
+      }
     } else if (eventType === "PostInvocation") {
       // Registered so AGY gets a valid `injectSteps` answer and Gyredeck stays a
       // well-behaved hook citizen. No Gyredeck event is emitted: a turn can span

@@ -1,5 +1,16 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## The session that makes a room hears from it when given the password — (v1.20.1)
+
+### Fixes
+
+- **A room's founder no longer misses its mail on the prompt that carries the password.**
+  When the person pasted the room's password into the session that made the room, and only
+  the room's own notices were waiting, the Claude Code hook failed while building the
+  delivery. The session was told nothing, and the notices it had already collected were lost.
+  It looked unaware of its own room until the next prompt. That prompt now delivers
+  everything waiting, with the reply command addressed to the whole room.
+
 ## Agents in a sync room know when their own usage is running out — (v1.20.0)
 
 An agent working in a room could not see its plan usage: Claude Code never shows the model a

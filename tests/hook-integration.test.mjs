@@ -27,6 +27,31 @@ const CONFIG_DIR = [".config", "gyredeck"];
 process.env.GYREDECK_NO_AGENT_SPAWN = "1";
 
 /**
+ * The app's half of a room password (#124). The bridge hands the password over once, when
+ * the room is created, and keeps only a hash, so `/passwords` answers whether the caller is
+ * the founder and nothing more. The app remembers the password and supplies it, and these
+ * tests play the app here, so a test that reads the password the way the panel does still
+ * gets it. `bridgeFetch` is the bridge with nobody playing the app.
+ */
+const bridgeFetch = globalThis.fetch;
+const passwordsHeldByApp = new Map();
+globalThis.fetch = async (input, init) => {
+  const response = await bridgeFetch(input, init);
+  if ((init?.method ?? "GET") !== "POST") return response;
+  const { pathname } = new URL(typeof input === "string" ? input : input.url);
+  const minting = /^\/sync\/rooms\/([^/]+)\/passwords$/.exec(pathname);
+  if (pathname !== "/sync/rooms" && !minting) return response;
+  const text = await response.text();
+  let body;
+  try { body = JSON.parse(text); } catch { return new Response(text, { status: response.status, headers: response.headers }); }
+  if (!minting && body?.ok && typeof body.room === "string" && typeof body.password === "string") {
+    passwordsHeldByApp.set(body.room, body.password);
+  }
+  if (minting && body?.ok) body = { ...body, password: passwordsHeldByApp.get(minting[1]) };
+  return new Response(JSON.stringify(body), { status: response.status, headers: response.headers });
+};
+
+/**
  * A finished turn as Codex writes one: the user's prompt, then the answer, under one turn
  * id. The reader routes an answer by the prompt that opened its turn, and an answer with
  * no prompt anywhere is one it will not publish — so a fixture that wrote answers alone
@@ -2207,6 +2232,63 @@ test("mail a hook has collected still reaches the session when building the deli
     } finally {
       await broker.close();
       broker = null;
+    }
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("the bridge keeps only a hash of a room's password, and hands the plaintext over once (#124)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-room-hash-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const founder = "a1240000-0000-4000-8000-000000000001";
+  const joiner = "a1240000-0000-4000-8000-000000000002";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const raw = async (method, path, body, credential = token) => {
+      const response = await bridgeFetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+        headers: { "content-type": "application/json", "x-gyredeck-token": credential },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, text: await response.text() };
+    };
+    const created = await raw("POST", "/sync/rooms", { conversationId: founder });
+    const { room: code, password } = JSON.parse(created.text);
+    assert.match(password, /^[0-9a-f]{32}$/, "handed over once, at create");
+
+    // Asked again, the bridge says who is the founder and has nothing more to give.
+    const asked = await raw("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+    assert.equal(asked.status, 200);
+    assert.deepEqual(JSON.parse(asked.text), { ok: true, room: code });
+    assert.ok(!asked.text.includes(password));
+    assert.equal((await raw("POST", `/sync/rooms/${code}/passwords`, { conversationId: joiner })).status, 403);
+
+    // The hash still decides: the right password confirms and opens the room, a wrong one does not.
+    await raw("POST", `/sync/rooms/${code}/members`, { conversationId: joiner });
+    assert.equal((await raw("POST", `/sync/rooms/${code}/confirm`, { conversationId: joiner, password: "ab".repeat(16) })).status, 403);
+    const confirmed = await raw("POST", `/sync/rooms/${code}/confirm`, { conversationId: joiner, password });
+    assert.equal(confirmed.status, 200);
+    assert.ok(JSON.parse(confirmed.text).howTo, "the session that proved it holds the password is told how to use it");
+    assert.equal((await raw("POST", `/mail/${code}`, { from: joiner, text: "in" }, password)).status, 202);
+    assert.equal((await raw("POST", `/mail/${code}`, { from: joiner, text: "in" }, "cd".repeat(16))).status, 403, "a wrong password is refused");
+
+    // Nothing the bridge answers carries it again.
+    for (const path of [`/sync/rooms?as=${founder}`, `/sync/rooms?as=${joiner}`, `/mail/inbox?as=${joiner}`, "/sync/rooms"]) {
+      const answer = await raw("GET", path, null, path.startsWith("/mail") ? password : token);
+      assert.ok(!answer.text.includes(password), `${path} does not carry the password`);
     }
   } finally {
     bridge.stdin.end();

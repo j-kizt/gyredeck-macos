@@ -29,7 +29,7 @@ import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 
 const PROTOCOL_VERSION = 2;
 const DEFAULT_PORT = 47621;
@@ -3439,11 +3439,10 @@ function startBridge(config) {
       // Who pressed Create. Only they are offered the key, because handing out the
       // right to speak is the founder's act, not something any member can pass on.
       createdBy: null,
-      // The room's password: one string, created with the room, presented in the
-      // x-gyredeck-token header for every read and every send here. Password and token
-      // are the same thing said two ways — it is a password to the person copying it
-      // out of the panel, and a token to the header carrying it.
-      password: null,
+      // The room's password, presented in the x-gyredeck-token header for every read and
+      // every send here, kept only as its sha256 (#124): the plaintext is handed to the
+      // founder's app once, at create, and the app holds it in memory.
+      passwordHash: null,
       readSeq: 0,
       messages: [],
       // The highest seq this room has dropped to stay inside its caps. A reader whose
@@ -4024,8 +4023,14 @@ function startBridge(config) {
    * carry the person's decision to let one particular session in. The room's password
    * is copied by hand from the founder's panel into the joining session's terminal.
    */
+  // Only a hash is kept (#124): the plaintext goes to the founder's app once, at create, and
+  // the app holds it in memory. Hashing the presented value first makes both sides one length,
+  // so the comparison is constant-time whatever was sent.
+  const hashRoomPassword = (password) => createHash("sha256").update(password).digest("hex");
   const holdsRoomPassword = (room, headerValue) =>
-    typeof room.password === "string" && matchesIngestToken(room.password, headerValue);
+    typeof room.passwordHash === "string" &&
+    typeof headerValue === "string" &&
+    matchesIngestToken(room.passwordHash, hashRoomPassword(headerValue));
 
   /**
    * Whether a request carries the machine's own token.
@@ -5045,7 +5050,8 @@ function startBridge(config) {
           return;
         }
         room.createdBy = conversationId;
-        room.password = newRoomPassword();
+        const password = newRoomPassword();
+        room.passwordHash = hashRoomPassword(password);
         room.members.set(conversationId, {
           label: allocateLabel(room, conversationId),
           // Pressing Create in this session's own detail panel is the same act of
@@ -5064,7 +5070,7 @@ function startBridge(config) {
         tellJoined(name, room, conversationId, "you created it");
         // The founder is handed the room's token once, here; everyone else gets it
         // from them, by hand, into the terminal of the session being let in.
-        sendJson(201, { ok: true, password: room.password, ...describeRoom(name, room, conversationId) });
+        sendJson(201, { ok: true, password, ...describeRoom(name, room, conversationId) });
         return;
       }
 
@@ -5123,7 +5129,9 @@ function startBridge(config) {
         // no credential at all. It also ends the order-dependence: pressing before a
         // session joined confirmed nobody and nothing ever re-ran, which stranded it for
         // good, and pressing after confirmed sessions the person had not meant to name.
-        sendJson(200, { ok: true, room: code, password: room.password });
+        // The bridge no longer has it to read out (#124): this answers only whether the caller
+        // is the founder, and the app shows the password it holds in memory.
+        sendJson(200, { ok: true, room: code });
         return;
       }
 
@@ -5177,7 +5185,7 @@ function startBridge(config) {
           sendJson(200, {
             ok: true,
             ...describeRoom(code, room, conversationId),
-            howTo: howToUseRoom(code, room.password, conversationId, BRIDGE_HOST, config.port),
+            howTo: howToUseRoom(code, password, conversationId, BRIDGE_HOST, config.port),
           });
           return;
         }
@@ -5190,7 +5198,7 @@ function startBridge(config) {
           // itself, and so the one place an instruction is certain to be read —
           // everything a hook injects lands a turn later, by which point the session has
           // usually guessed.
-          howTo: howToUseRoom(code, room.password, conversationId, BRIDGE_HOST, config.port),
+          howTo: howToUseRoom(code, password, conversationId, BRIDGE_HOST, config.port),
         });
         return;
       }

@@ -1,16 +1,63 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     io::{ErrorKind, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{mpsc, Arc, LazyLock, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 pub(crate) const BRIDGE_HOST: &str = "127.0.0.1";
+
+/// The password of each room this app created, by code (#124). The bridge keeps only a hash
+/// and hands the plaintext over once, at create. It is held here in memory and never written
+/// to disk or the Keychain: a room lives only as long as the bridge, which lives only as long
+/// as this app (`--parent-stdio`), and a Keychain item would ask for permission again after
+/// every update that changes the app's signature.
+static ROOM_PASSWORDS: LazyLock<Mutex<RoomPasswords>> = LazyLock::new(|| Mutex::new(RoomPasswords::default()));
+
+fn room_passwords() -> std::sync::MutexGuard<'static, RoomPasswords> {
+    ROOM_PASSWORDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Each password with the generation it was stored at, so a list of rooms read before a room
+/// was created cannot be taken as proof that room has ended (#124 audit).
+#[derive(Default)]
+struct RoomPasswords {
+    generation: u64,
+    by_code: HashMap<String, (String, u64)>,
+}
+
+impl RoomPasswords {
+    fn insert(&mut self, code: &str, password: &str) {
+        self.generation += 1;
+        self.by_code.insert(code.to_owned(), (password.to_owned(), self.generation));
+    }
+    fn get(&self, code: &str) -> Option<String> {
+        self.by_code.get(code).map(|(password, _)| password.clone())
+    }
+    fn remove(&mut self, code: &str) {
+        self.by_code.remove(code);
+    }
+    fn clear(&mut self) {
+        self.by_code.clear();
+    }
+    /// Where the store stands now; pass it back to `forget_ended_rooms` with a list read after.
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+    /// Forget the password of every room the bridge no longer has. A room can end without this
+    /// app closing it — its founder left, its founder's session ended, it sat empty — and its
+    /// password is not kept past it. Only what was stored before the list was asked for is
+    /// judged by it.
+    fn forget_ended_rooms(&mut self, live: &[String], asked_at: u64) {
+        self.by_code
+            .retain(|code, (_, stored)| *stored > asked_at || live.iter().any(|name| name == code));
+    }
+}
 pub(crate) const BRIDGE_PORT: u16 = 47_621;
 const BRIDGE_MIN_PORT: u16 = 1024;
 const BRIDGE_PROBE_TIMEOUT: Duration = Duration::from_millis(350);
@@ -698,6 +745,8 @@ fn spawn_bridge(
 ) -> std::io::Result<OwnedBridge> {
     // Read the ledger before anything is spawned: a ledger that cannot be read is a
     // bridge that does not start, with the reason, not a bridge protecting nobody.
+    // A new bridge holds none of the old one's rooms.
+    room_passwords().clear();
     let lines = match handshake {
         Some(handshake) => Some(handshake.lines().map_err(|reason| {
             std::io::Error::other(format!("the broker's protection ledger could not be read: {reason}"))
@@ -1098,6 +1147,12 @@ pub(crate) fn sync_create(conversation_id: &str) -> Result<SyncRoom, String> {
     if !(200..300).contains(&status) {
         return Err(sync_error(status, &value));
     }
+    if let (Some(code), Some(password)) = (
+        value.get("room").and_then(serde_json::Value::as_str),
+        value.get("password").and_then(serde_json::Value::as_str),
+    ) {
+        room_passwords().insert(code, password);
+    }
     Ok(parse_sync_room(&value, conversation_id))
 }
 
@@ -1117,14 +1172,17 @@ pub(crate) fn sync_issue_password(code: &str, conversation_id: &str) -> Result<S
     if !(200..300).contains(&status) {
         return Err(match value.get("error").and_then(serde_json::Value::as_str) {
             Some("not_the_founder") => "Only the session that created this room can invite".to_string(),
+            Some("no_such_room") => {
+                room_passwords().remove(code);
+                sync_error(status, &value)
+            }
             _ => sync_error(status, &value),
         });
     }
-    value
-        .get("password")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| "Bridge returned no password".to_string())
+    // The bridge said this is the founder; the password itself is only here (#124).
+    room_passwords()
+        .get(code)
+        .ok_or_else(|| "This app no longer holds the room's password. Close the room and create a new one".to_string())
 }
 
 /// Close a room for everyone in it.
@@ -1149,6 +1207,7 @@ pub(crate) fn sync_close(code: &str, conversation_id: &str) -> Result<(), String
             _ => sync_error(status, &value),
         });
     }
+    room_passwords().remove(code);
     Ok(())
 }
 
@@ -1176,6 +1235,10 @@ pub(crate) fn sync_leave(code: &str, conversation_id: &str) -> Result<(), String
         bridge_request("DELETE", &format!("/sync/rooms/{code}/members/{conversation_id}"), None)?;
     // Already gone is the state the caller wanted.
     if status == 404 || (200..300).contains(&status) {
+        // The founder leaving ends the room, and so does the last member.
+        if value.get("closed").and_then(serde_json::Value::as_bool) == Some(true) {
+            room_passwords().remove(code);
+        }
         return Ok(());
     }
     Err(sync_error(status, &value))
@@ -1192,10 +1255,16 @@ fn valid_room(room: &str) -> bool {
 
 /// Ask the bridge which mail rooms exist and how much is waiting in each.
 pub(crate) fn mail_rooms() -> Result<Vec<MailRoom>, String> {
+    let asked_at = room_passwords().generation();
     let parsed = mail_request("GET", "/mail", None)?;
     let Some(rooms) = parsed.get("rooms").and_then(|value| value.as_array()) else {
         return Ok(Vec::new());
     };
+    let live: Vec<String> = rooms
+        .iter()
+        .filter_map(|room| room.get("room")?.as_str().map(ToOwned::to_owned))
+        .collect();
+    room_passwords().forget_ended_rooms(&live, asked_at);
 
     Ok(rooms
         .iter()
@@ -1298,6 +1367,23 @@ pub(crate) fn find_node_binary() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_room_that_ended_leaves_no_password_behind() {
+        let mut passwords = super::RoomPasswords::default();
+        passwords.insert("sync-live", &"a".repeat(32));
+        passwords.insert("sync-gone", &"b".repeat(32));
+        let asked_at = passwords.generation();
+        passwords.forget_ended_rooms(&["sync-live".to_string(), "conv-1".to_string()], asked_at);
+        assert!(passwords.get("sync-gone").is_none());
+        assert!(passwords.get("sync-live").is_some());
+        // A room created while the list was being read is not in it, and is not forgotten.
+        let asked_at = passwords.generation();
+        passwords.insert("sync-new", &"c".repeat(32));
+        passwords.forget_ended_rooms(&[], asked_at);
+        assert!(passwords.get("sync-live").is_none());
+        assert_eq!(passwords.get("sync-new"), Some("c".repeat(32)));
+    }
+
     use super::*;
     use std::{
         net::TcpListener,

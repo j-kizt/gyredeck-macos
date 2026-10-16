@@ -1,5 +1,17 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A room's password is no longer held in plain text by the bridge — (v1.21.2)
+
+### Changed
+
+- **The bridge keeps only a hash of each room's password.** The password is handed to the app
+  once, when the room is created, and the app holds it in memory to show beside the room. It
+  is never written to disk. The bridge checks every read and send against a sha256 of it,
+  compared in constant time, and nothing it answers carries the password again.
+- **A room's password is forgotten when the room ends.** This covers the room being closed,
+  its founder leaving, and the bridge restarting. A room created while the app was reading
+  the list of rooms is never mistaken for one that has ended.
+
 ## Mail a hook has collected is never dropped — (v1.21.1)
 
 ### Fixes

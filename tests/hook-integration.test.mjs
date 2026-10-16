@@ -1900,6 +1900,189 @@ test("a room member hears when its own provider's limit runs low, and can ask fo
   }
 });
 
+test("an agent outside a room learns it can ask for its usage, and hears when it runs low (#169)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-usage-out-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  // Where `findAgentBinary` looks before PATH, so the fake wins over a real codex.
+  const fakeBin = join(home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  const queued = join(home, "queued.log");
+  await writeFile(
+    join(fakeBin, "codex"),
+    `#!${process.execPath}\n` +
+      "require('node:fs').appendFileSync(" +
+      `${JSON.stringify(queued)}, process.argv.slice(2).join(" ").replace(/\\s+/g, " ") + "\\n");\n`,
+  );
+  await chmod(join(fakeBin, "codex"), 0o755);
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const base = `http://127.0.0.1:${port}`;
+  const claude = "a1690000-0000-4000-8000-000000000001";
+  const agy = "a1690000-0000-4000-8000-000000000002";
+  const codex = "a1690000-0000-4000-8000-000000000003";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const post = (path, body) =>
+      fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
+    for (const [conversationId, sourceKind] of [[claude, "claudeCodeHook"], [agy, "agyHost"], [codex, "codexCliHook"]]) {
+      await post("/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const reading = (provider, used) => ({
+      providerId: provider,
+      displayName: { claude: "Claude Code", agy: "Antigravity", codex: "Codex" }[provider],
+      lines: [{ type: "progress", label: "Session", used, limit: 100, resetsAt: "2026-10-16T05:00:00Z" }],
+      fetchedAt: new Date().toISOString(),
+    });
+    const claudeContext = async () => {
+      const result = await runAdapter(
+        "adapters/claude/gyredeck-claude-hook.mjs",
+        ["--event", "UserPromptSubmit"],
+        home,
+        { hook_event_name: "UserPromptSubmit", session_id: claude, cwd: "/tmp/project", prompt: "hi" },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
+    };
+    const agySteps = async () => {
+      const result = await runAdapter(
+        "adapters/antigravity/gyredeck-agy-hook.mjs",
+        ["--event", "PreInvocation"],
+        home,
+        { hookEventName: "PreInvocation", conversationId: agy, workspacePaths: ["/tmp/project"] },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return JSON.parse(result.stdout).injectSteps ?? [];
+    };
+    await post("/usage", reading("claude", 50));
+
+    // Told once where to ask — the token read at call time, never written into context.
+    const intro = await claudeContext();
+    assert.match(intro, new RegExp(`curl -s "http://127\\.0\\.0\\.1:${port}/usage\\?as=${claude}"`));
+    assert.match(intro, /\$\(cat ~\/\.config\/gyredeck\/gyredeck\.ingest-token\)/);
+    assert.ok(!intro.includes(token), "the machine token itself never reaches the session");
+    assert.equal(await claudeContext(), "", "and not again");
+    const asked = await fetch(`${base}/usage?as=${claude}`, { headers: { "x-gyredeck-token": token } }).then((r) => r.json());
+    assert.equal(asked.usage.lines[0].leftPct, 50, "the call the intro names answers outside a room");
+
+    // Crossing 10% is told once, staying low says nothing, coming back says so.
+    await post("/usage", reading("claude", 95));
+    assert.match(await claudeContext(), /USAGE: your Claude Code limits — Session 5% left, resets 2026-10-16T05:00:00Z/);
+    await post("/usage", reading("claude", 96));
+    assert.equal(await claudeContext(), "");
+    await post("/usage", reading("claude", 30));
+    assert.match(await claudeContext(), /Session back to 70% left/);
+
+    // Told in a room, not told again on leaving it (#169 audit).
+    const member = "a1690000-0000-4000-8000-000000000004";
+    await post("/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: member, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+      data: { inputCount: 1 },
+    });
+    const memberContext = async () => {
+      const result = await runAdapter(
+        "adapters/claude/gyredeck-claude-hook.mjs",
+        ["--event", "UserPromptSubmit"],
+        home,
+        { hook_event_name: "UserPromptSubmit", session_id: member, cwd: "/tmp/project", prompt: "hi" },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
+    };
+    // And one that leaves before reading the room's warning still gets it (#169 audit).
+    const unread = "a1690000-0000-4000-8000-000000000005";
+    await post("/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: unread, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+      data: { inputCount: 1 },
+    });
+    const contextOf = async (session_id) => {
+      const result = await runAdapter(
+        "adapters/claude/gyredeck-claude-hook.mjs",
+        ["--event", "UserPromptSubmit"],
+        home,
+        { hook_event_name: "UserPromptSubmit", session_id, cwd: "/tmp/project", prompt: "hi" },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
+    };
+    const code = (await post("/sync/rooms", { conversationId: member })).room;
+    await post(`/sync/rooms/${code}/members`, { conversationId: unread });
+    const { password } = await post(`/sync/rooms/${code}/passwords`, { conversationId: member });
+    await post(`/sync/rooms/${code}/confirm`, { conversationId: unread, password });
+    await memberContext();
+    // Its private mailbox is brought level with the seq the room's warning will take, so a
+    // collect of the private message with that number must not count as the warning read
+    // (#169 audit — the case Gyre Audit reproduced).
+    const roomBefore = await fetch(`${base}/mail/${code}?as=${member}`, { headers: { "x-gyredeck-token": password } }).then((r) => r.json());
+    const warningSeq = Math.max(...roomBefore.messages.map((message) => message.seq)) + 2;
+    const privateBefore = await fetch(`${base}/mail/${unread}`, { headers }).then((r) => r.json());
+    for (let seq = Math.max(0, ...privateBefore.messages.map((message) => message.seq)); seq < warningSeq; seq += 1) {
+      await post(`/mail/${unread}`, { from: "gyredeck-room", text: `private notice ${seq + 1}`, to: unread, kind: "tell" });
+    }
+    await post("/usage", reading("claude", 95));
+    assert.match(await memberContext(), /your Claude Code Session limit has 5% left/);
+    // A wait that only looks does not count as being told (#169 audit).
+    const peeked = await fetch(`${base}/mail/wait?as=${unread}&timeout=1`, { headers: { "x-gyredeck-token": password } }).then((r) => r.json());
+    assert.ok(peeked.messages.some((message) => message.text.includes("limit has 5% left")), "the peek saw the warning");
+    let collidingCollected = false;
+    for (let n = 0; n < 30 && !collidingCollected; n += 1) {
+      const one = await fetch(`${base}/mail/inbox?as=${unread}&collect=1&limit=1`, { headers: { "x-gyredeck-token": password } }).then((r) => r.json());
+      assert.ok(one.messages.length > 0, "a private message is still waiting");
+      collidingCollected = one.messages[0].room === unread && one.messages[0].seq === warningSeq;
+    }
+    assert.ok(collidingCollected, "the private message sharing the warning's seq was collected");
+    // The founder leaving ends the room for both.
+    await fetch(`${base}/sync/rooms/${code}/members/${member}`, { method: "DELETE", headers });
+    const after = await memberContext();
+    assert.match(after, /USAGE: ask Gyredeck/, "outside the room it learns where to ask");
+    assert.doesNotMatch(after, /low now/, "but not the 5% the room already told it");
+    assert.match(await contextOf(unread), /low now: Session 5% left/, "the one that never read it is told");
+    await post("/usage", reading("claude", 96));
+    assert.equal(await memberContext(), "");
+    assert.equal(await contextOf(unread), "");
+
+    // A session that first speaks while its limit is already low hears it in the intro.
+    await post("/usage", reading("agy", 50));
+    await post("/usage", reading("agy", 92));
+    const steps = await agySteps();
+    assert.equal(steps.length, 1);
+    assert.match(steps[0].ephemeralMessage, /USAGE: ask Gyredeck .* low now: Session 8% left/);
+
+    // Codex cannot call; a live Codex session outside a room is pushed the crossing.
+    await post("/usage", reading("codex", 50));
+    await post("/usage", reading("codex", 91));
+    let pushed = [];
+    for (let tries = 0; tries < 40 && pushed.length === 0; tries += 1) {
+      await new Promise((resolve) => { setTimeout(resolve, 50); });
+      pushed = existsSync(queued) ? (await readFile(queued, "utf8")).split("\n").filter(Boolean) : [];
+    }
+    assert.equal(pushed.length, 1);
+    assert.ok(pushed[0].includes(`--thread ${codex}`));
+    assert.match(pushed[0], /your Codex Session limit has 9% left/);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("what an agent may act on depends on who sent it, in three tiers", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-tiers-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });

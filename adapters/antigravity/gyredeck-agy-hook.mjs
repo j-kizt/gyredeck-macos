@@ -500,9 +500,13 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
     // read as one thread. The cost is that a session would otherwise be handed its own
     // last reply back as fresh mail on its next turn, and answer itself forever.
     .filter((message) => message.from !== room);
+  // A session outside a room hears about its usage here and nowhere else (#169).
+  const usageStep = typeof result?.usageNotice === "string"
+    ? { ephemeralMessage: result.usageNotice.slice(0, MAIL_MAX_TEXT) }
+    : null;
   if (delivered.length === 0) {
     await ackDelivery(result);
-    return [];
+    return usageStep ? [usageStep] : [];
   }
 
 
@@ -672,6 +676,7 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
         ephemeralMessage: `[gyredeck mail · from ${from}${kindOf(message) ? ` · ${kindOf(message)}` : ""}] ${message.text.slice(0, MAIL_MAX_TEXT)}`,
       };
     }),
+    ...(usageStep ? [usageStep] : []),
     // Last, so the command is the freshest thing in context when the model acts.
     ...(reply ? [reply] : []),
   ];

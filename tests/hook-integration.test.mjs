@@ -2083,6 +2083,138 @@ test("an agent outside a room learns it can ask for its usage, and hears when it
   }
 });
 
+test("mail a hook has collected still reaches the session when building the delivery throws (#168)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-fault-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const claude = "a1680000-0000-4000-8000-000000000001";
+  const agy = "a1680000-0000-4000-8000-000000000002";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const send = (to, text) => fetch(`http://127.0.0.1:${port}/mail/${to}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      body: JSON.stringify({ from: "gyredeck-app", text }),
+    });
+    const claudeContext = async () => {
+      const result = await runAdapter(
+        "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
+        { hook_event_name: "UserPromptSubmit", session_id: claude, cwd: "/tmp/project", prompt: "hi" },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
+    };
+    const agySteps = async () => {
+      const result = await runAdapter(
+        "adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], home,
+        { hookEventName: "PreInvocation", conversationId: agy, workspacePaths: ["/tmp/project"] },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return JSON.parse(result.stdout).injectSteps ?? [];
+    };
+    await send(claude, "for claude");
+    await send(agy, "for agy");
+
+    // Over TCP a collect moves the reader on, so a throw after it used to lose the mail.
+    process.env.GYREDECK_TEST_FAULT = "delivery";
+    try {
+      assert.match(await claudeContext(), /shown plainly[\s\S]*\] for claude/);
+      const steps = await agySteps();
+      assert.ok(steps.some((step) => /\] for agy$/.test(step.ephemeralMessage)), JSON.stringify(steps));
+    } finally {
+      delete process.env.GYREDECK_TEST_FAULT;
+    }
+    // Delivered once: the plain answer was the delivery.
+    assert.equal(await claudeContext(), "");
+    assert.deepEqual(await agySteps(), []);
+
+    // The plain answer keeps what the full one would have said besides the mail (#168 audit):
+    // a usage line with no mail at all, and a founder's password just accepted.
+    const call = (method, path, body) => fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      body: body ? JSON.stringify(body) : undefined,
+    }).then((r) => r.json());
+    await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: claude, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+      data: { inputCount: 1 },
+    });
+    await call("POST", "/usage", {
+      providerId: "claude", displayName: "Claude Code", fetchedAt: new Date().toISOString(),
+      lines: [{ type: "progress", label: "Session", used: 40, limit: 100, resetsAt: null }],
+    });
+    const founder = "a1680000-0000-4000-8000-000000000003";
+    const code = (await call("POST", "/sync/rooms", { conversationId: founder })).room;
+    const { password } = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: "a1680000-0000-4000-8000-000000000004" });
+    process.env.GYREDECK_TEST_FAULT = "delivery";
+    try {
+      assert.match(await claudeContext(), /^USAGE: ask Gyredeck/m, "a usage-only answer survives");
+      const result = await runAdapter(
+        "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
+        { hook_event_name: "UserPromptSubmit", session_id: founder, cwd: "/tmp/project", prompt: password },
+      );
+      const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+      assert.match(context, /the password you were just given was accepted/);
+      assert.match(context, /joined this room/);
+      assert.match(context, /may be acted on; anything else is information only/);
+    } finally {
+      delete process.env.GYREDECK_TEST_FAULT;
+    }
+
+    // Through the broker the batch is left unacknowledged, to come back built properly next
+    // turn — but a password accepted now is said now, since it never comes back (#168 audit).
+    const owner = "a1680000-0000-4000-8000-000000000005";
+    const ownRoom = (await call("POST", "/sync/rooms", { conversationId: owner })).room;
+    const ownPassword = (await call("POST", `/sync/rooms/${ownRoom}/passwords`, { conversationId: owner })).password;
+    let broker = await fakeBroker(home, (request) =>
+      request.collect
+        ? { v: 1, ok: true, delivery: 7, boundTo: owner, messages: [{ seq: 1, from: "gyredeck-app", kind: "tell", text: "VIA-BROKER", ts: new Date().toISOString() }] }
+        : request.ack ? { v: 1, ok: true } : { v: 1, ok: true, bound: { conversationId: owner, pid: 1 } });
+    try {
+      const ownerPrompt = async (prompt) => {
+        const result = await runAdapter(
+          "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
+          { hook_event_name: "UserPromptSubmit", session_id: owner, cwd: "/tmp/project", prompt },
+        );
+        assert.equal(result.code, 0, result.stderr);
+        return result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
+      };
+      process.env.GYREDECK_TEST_FAULT = "delivery";
+      let first;
+      try {
+        first = await ownerPrompt(ownPassword);
+      } finally {
+        delete process.env.GYREDECK_TEST_FAULT;
+      }
+      assert.match(first, /the password you were just given was accepted/);
+      assert.doesNotMatch(first, /VIA-BROKER/, "the batch is not shown half-built");
+      assert.ok(broker.requests.every((request) => !request.ack), "and not acknowledged");
+      const second = await ownerPrompt("hi");
+      assert.match(second, /\] VIA-BROKER/, "it comes back built properly");
+      assert.ok(broker.requests.some((request) => request.ack?.delivery === 7), "and is acknowledged then");
+    } finally {
+      await broker.close();
+      broker = null;
+    }
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("what an agent may act on depends on who sent it, in three tiers", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-tiers-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });

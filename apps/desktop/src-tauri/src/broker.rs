@@ -95,6 +95,17 @@ impl KnownCli {
         match name {
             "claude" => Some(Self::Claude),
             "agy" => Some(Self::Antigravity),
+            // agy updates itself in place: the running binary is renamed `agy.<digits>.old`
+            // and a session that was bound as `agy` keeps running from it. Its signature is
+            // still checked against agy's requirement, so the name alone grants nothing
+            // (#178 — the session was bound, then refused, and could read nowhere).
+            _ if name
+                .strip_prefix("agy.")
+                .and_then(|rest| rest.strip_suffix(".old"))
+                .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())) =>
+            {
+                Some(Self::Antigravity)
+            }
             _ => None,
         }
     }
@@ -1112,6 +1123,14 @@ mod tests {
         assert!(!table.is_ambiguous(key(10)), "ambiguity dies with the process");
         let reborn = ProcessKey { pid: 10, unique_id: 777, start_time_us: 9 };
         assert_eq!(table.bind("s3", reborn, &|_| true), Ok(()), "a new process on the old pid starts clean");
+    }
+
+    #[test]
+    fn an_agy_that_updated_itself_is_still_agy_and_nothing_else_is() {
+        assert_eq!(KnownCli::from_executable_name("agy.1792133654528639000.old"), Some(KnownCli::Antigravity));
+        for name in ["agy.old", "agy..old", "agy.12x.old", "agy.123", "xagy.1.old", "agy.1.old.sh", "claude.1.old"] {
+            assert_eq!(KnownCli::from_executable_name(name), None, "{name}");
+        }
     }
 
     #[test]

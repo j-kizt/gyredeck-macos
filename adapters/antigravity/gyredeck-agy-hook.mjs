@@ -362,6 +362,49 @@ const APP_SENDER = "gyredeck";
 const ROOM_SENDER = "gyredeck-room";
 
 /** GET JSON from the bridge. Mail requires the token, so it always goes out. */
+/**
+ * A GET that keeps the status, so a refusal can be told from an empty answer (#178). One
+ * elapsed deadline for the whole exchange: a request's own timeout is an idle timeout, and
+ * a bridge that dribbled a byte at a time could hold the invocation for as long as it liked.
+ */
+const getJsonStatus = (endpoint, token, path, deadlineMs = 750) =>
+  new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      resolve(value);
+    };
+    const deadline = setTimeout(() => { req.destroy(); done({ status: 0, body: null }); }, deadlineMs);
+    const req = request(
+      {
+        hostname: endpoint.hostname,
+        port: endpoint.port,
+        path,
+        method: "GET",
+        headers: { accept: "application/json", "x-gyredeck-token": token },
+        timeout: deadlineMs,
+      },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > 65_536) { req.destroy(); done({ status: 0, body: null }); }
+        });
+        res.on("end", () => {
+          let parsed = null;
+          try { parsed = JSON.parse(body); } catch {}
+          done({ status: res.statusCode ?? 0, body: parsed });
+        });
+      },
+    );
+    req.on("error", () => done({ status: 0, body: null }));
+    req.on("timeout", () => { req.destroy(); done({ status: 0, body: null }); });
+    req.end();
+  });
+
 const getJson = (endpoint, token, path) =>
   new Promise((resolve) => {
     const req = request(
@@ -518,7 +561,17 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
     }
     result = viaBroker.result;
   } else if (viaBroker.fallback) {
-    result = await getJson(endpoint, token, `/mail/inbox?as=${room}&collect=1&limit=${MAIL_MAX_STEPS}`);
+    const answer = await getJsonStatus(endpoint, token, `/mail/inbox?as=${room}&collect=1&limit=${MAIL_MAX_STEPS}`);
+    // The broker sent this hook to TCP and the bridge will only serve the broker: mail is
+    // waiting that no path can read. Said, not swallowed — swallowed, it looked exactly
+    // like an empty mailbox (#178).
+    if (answer.status === 403 && typeof answer.body?.error === "string") {
+      process.stderr.write(`gyredeck: mail withheld this turn — the broker said ${viaBroker.fallback}, the bridge said ${answer.body.error}\n`);
+      return [{
+        ephemeralMessage: `Gyredeck is holding mail for this session that it cannot hand over: the broker said "${viaBroker.fallback}" and the bridge said "${answer.body.error}". Tell the person at this terminal; restarting this session usually clears it.`,
+      }];
+    }
+    result = answer.status === 200 ? answer.body : null;
   } else {
     process.stderr.write(`gyredeck: mail withheld this turn — ${viaBroker.withheld}\n`);
     return [];

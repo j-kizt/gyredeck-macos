@@ -587,7 +587,15 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
     }
     result = viaBroker.result;
   } else if (viaBroker.fallback) {
-    result = await getJson(endpoint, token, `/mail/inbox?as=${room}&collect=1&limit=${MAIL_MAX_MESSAGES}`);
+    const answer = await getJsonStatus(endpoint, token, `/mail/inbox?as=${room}&collect=1&limit=${MAIL_MAX_MESSAGES}`, 750);
+    // The broker sent this hook to TCP and the bridge will only serve the broker: mail is
+    // waiting that no path can read. Said, not swallowed — swallowed, it looked exactly
+    // like an empty mailbox (#178).
+    if (answer.status === 403 && typeof answer.body?.error === "string") {
+      process.stderr.write(`gyredeck: mail withheld this turn — the broker said ${viaBroker.fallback}, the bridge said ${answer.body.error}\n`);
+      return `Gyredeck is holding mail for this session that it cannot hand over: the broker said "${viaBroker.fallback}" and the bridge said "${answer.body.error}". Tell the person at this terminal; restarting this session usually clears it.`;
+    }
+    result = answer.status === 200 ? answer.body : null;
   } else {
     process.stderr.write(`gyredeck: mail withheld this turn — ${viaBroker.withheld}\n`);
     return null;

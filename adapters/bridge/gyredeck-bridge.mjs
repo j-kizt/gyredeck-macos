@@ -3015,6 +3015,8 @@ function startBridge(config) {
    * hold can say which session was heard from least recently.
    */
   const seenSessions = new Set();
+  /** When each session was last heard from, in memory only — who is live enough to be told about usage (#169). */
+  const heardAt = new Map();
 
   /**
    * The one place anything is learnt about a session.
@@ -3030,6 +3032,7 @@ function startBridge(config) {
     // exactly what it said last time, and that is the whole of what keeps it in the file.
     seenSessions.delete(conversationId);
     seenSessions.add(conversationId);
+    heardAt.set(conversationId, Date.now());
     // Once known as Codex's, a session stays Codex's. The provider is also what closes
     // its mailbox to every outside reader (#137), and the route that reports it takes
     // the shared machine token — so a later event naming another provider is a caller
@@ -3574,10 +3577,97 @@ function startBridge(config) {
         for (const [conversationId, member] of room.members) {
           if (member.confirmed !== true || usageProviderFor(conversationId) !== reading.provider) continue;
           const told = publishMail(room, ROOM_SENDER, text, null, false, { to: conversationId, kind: "tell" });
-          if (told) deliverMail(name, room, text, ROOM_SENDER, told);
+          if (told) {
+            deliverMail(name, room, text, ROOM_SENDER, told);
+            // Counted as told only once the member collects it, so leaving the room before
+            // reading it does not lose the warning, and reading it first does not repeat it
+            // outside (#169 audit).
+            if (reading.provider !== "codex") usageRoomTells.set(`${name}:${told.seq}`, { conversationId, label: line.label, low });
+          }
         }
       }
+      // Codex outside a room has no hook that reads and no call it can make from its
+      // sandbox, so the push is the only way it hears; only a session heard from lately,
+      // since a push into a thread nobody is using resumes it for nothing (#169).
+      if (reading.provider !== "codex") continue;
+      for (const [conversationId, at] of heardAt) {
+        if (Date.now() - at > USAGE_CODEX_LIVE_MS || usageProviderFor(conversationId) !== "codex") continue;
+        if (inConfirmedRoom(conversationId)) continue;
+        const mailbox = mailRoomFor(conversationId, true);
+        if (!mailbox) continue;
+        const outside = low
+          ? `[Gyredeck: your ${reading.displayName} ${line.label} limit has ${line.leftPct}% left.${when}` +
+            " Finish what you are doing at a safe point before the limit stops you mid-reply.]"
+          : text;
+        const told = publishMail(mailbox, ROOM_SENDER, outside, null, false, { to: conversationId, kind: "tell" });
+        if (told) deliverMail(conversationId, mailbox, outside, ROOM_SENDER, told);
+      }
     }
+  };
+
+  const USAGE_CODEX_LIVE_MS = 30 * 60_000;
+  const inConfirmedRoom = (conversationId) => {
+    for (const [name, room] of mailRooms) {
+      if (SYNC_CODE.test(name) && room.members.get(conversationId)?.confirmed === true) return true;
+    }
+    return false;
+  };
+
+  /**
+   * What a Claude Code or Antigravity session outside a room is told about its usage on a
+   * collect (#169): once, the call that answers it any time; after that, only a limit
+   * crossing 10% — measured against what this session was last told, so a session that
+   * starts with a limit already low hears it, and one told once is not told again. A
+   * confirmed room member is left to the room, which says the same in its own words.
+   */
+  const usageToldBySession = new Map();
+  /** Room tells about usage not yet collected, by `<room>:<seq>`. */
+  const usageRoomTells = new Map();
+  const noteUsageCollected = (roomName, collected, as) => {
+    for (const message of collected) {
+      const key = `${roomName}:${message.seq}`;
+      const tell = usageRoomTells.get(key);
+      if (!tell || tell.conversationId !== as) continue;
+      usageRoomTells.delete(key);
+      usageStateFor(as).low.set(tell.label, tell.low);
+    }
+  };
+  const usageStateFor = (conversationId) => {
+    let state = usageToldBySession.get(conversationId);
+    if (!state) {
+      state = { introduced: false, low: new Map() };
+      usageToldBySession.set(conversationId, state);
+    }
+    return state;
+  };
+  const usageNoticeFor = (conversationId) => {
+    const provider = usageProviderFor(conversationId);
+    if ((provider !== "claude" && provider !== "agy") || inConfirmedRoom(conversationId)) return null;
+    // Nothing to point at until the app has read this provider: the call would answer
+    // null, and the intro is better kept for when it says something.
+    const reading = usageByProvider.get(provider) ?? null;
+    if (!reading) return null;
+    const lowNow = (line) => line.leftPct <= USAGE_LOW_PCT;
+    const describe = (line) => `${line.label} ${line.leftPct}% left${line.resetsAt ? `, resets ${line.resetsAt}` : ""}`;
+    const state = usageStateFor(conversationId);
+    const told = state.low;
+    if (!state.introduced) {
+      state.introduced = true;
+      const low = reading.lines.filter((line) => lowNow(line) && told.get(line.label) !== true);
+      for (const line of reading.lines) told.set(line.label, lowNow(line));
+      return "USAGE: ask Gyredeck how much of your plan is left at any time: " +
+        `curl -s "http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}/usage?as=${conversationId}" ` +
+        '-H "x-gyredeck-token: $(cat ~/.config/gyredeck/gyredeck.ingest-token)"' +
+        (low.length > 0 ? ` — low now: ${low.map(describe).join("; ")}. Finish at a safe point.` : "");
+    }
+    const changed = [];
+    for (const line of reading.lines) {
+      const was = told.get(line.label);
+      told.set(line.label, lowNow(line));
+      if (was === undefined || was === lowNow(line)) continue;
+      changed.push(lowNow(line) ? `${describe(line)} — finish at a safe point` : `${line.label} back to ${line.leftPct}% left`);
+    }
+    return changed.length > 0 ? `USAGE: your ${reading.displayName} limits — ${changed.join("; ")}.` : null;
   };
 
   /** Which room a session has been put into, if any. A session belongs to at most one. */
@@ -5504,13 +5594,15 @@ function startBridge(config) {
            * first: an asker that "fixes" a message that was already correct and sends
            * it again is the start of the next loop.
            */
-          const answer = (collected, sync, timedOut, missed = []) =>
+          const answer = (collected, sync, timedOut, missed = []) => {
+            if (collect && sync) noteUsageCollected(sync.name, collected.filter((message) => message.room === sync.name && message.from === ROOM_SENDER), as);
             sendJson(200, {
               ok: true,
               timedOut,
               ...(timedOut ? { yourLastMessage: diagnoseSilence(sync) } : {}),
               ...describeInbox(collected, sync, as, missed),
             });
+          };
 
           const first = collectInbox();
           if (first.collected.length > 0) {
@@ -5571,6 +5663,11 @@ function startBridge(config) {
           // nothing, as a timed-out wait does: the hook's `wait` is built from collects.
           ...(collect && collected.length === 0 ? { yourLastMessage: diagnoseSilence(sync) } : {}),
           ...describeInbox(collected, sync, as, missed),
+          ...(() => {
+            if (collect && sync) noteUsageCollected(sync.name, collected.filter((message) => message.room === sync.name && message.from === ROOM_SENDER), as);
+            const usageNotice = collect ? usageNoticeFor(as) : null;
+            return usageNotice ? { usageNotice } : {};
+          })(),
         });
         return;
       }

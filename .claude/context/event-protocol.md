@@ -590,6 +590,22 @@ tells each confirmed room member on that provider — a room `tell` addressed to
 so it wakes it. Edge-triggered: the first reading is never news, and staying low says nothing
 more. Usage is per provider account, so every member on one provider hears the same thing.
 
+**Outside a room (#169).** A collecting read of `/mail/inbox` (or `/mail/wait`) by a
+Claude Code or Antigravity session that is not a confirmed room member may carry
+`usageNotice`, and both hooks show it even when no mail came:
+
+- Once per session, after the app has read that provider, it names the call:
+  `curl …/usage?as=<id> -H "x-gyredeck-token: $(cat ~/.config/gyredeck/gyredeck.ingest-token)"`.
+  The token is read at call time, so it never lands in context.
+- After that, the notice says when a limit crosses 10 %, measured against what *this session*
+  was last told.
+- A room's usage `tell` counts as told only once the member **collects** it, from that room
+  (matched on `room` and `seq`). A session that leaves before reading the warning still gets
+  it outside, and one that read it is not told twice.
+
+Codex cannot call the bridge from its sandbox. A Codex session outside a room, heard from in
+the last 30 minutes, is pushed each crossing into its own mailbox, delivered with `codex queue`.
+
 ### One inbox per session
 
 Merged reads are ordered by a **bridge-wide publish ordinal**, not by `seq`. `seq`

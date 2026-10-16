@@ -571,9 +571,11 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
   // Nothing waiting is normally nothing to say. A confirmation is the exception: the
   // session has just been given the right to speak here and has to be told, or the
   // grant the person just made goes unnoticed.
+  // A session outside a room hears about its usage here and nowhere else (#169).
+  const usageNotice = typeof result?.usageNotice === "string" ? result.usageNotice.slice(0, MAIL_MAX_TEXT) : null;
   if (delivered.length === 0 && !justConfirmed) {
     await ackDelivery(result);
-    return null;
+    return usageNotice;
   }
 
 
@@ -829,6 +831,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
     );
   }
 
+  if (usageNotice) lines.push(usageNotice);
   const text = lines.join("\n\n");
   await ackDelivery(result);
   return text;

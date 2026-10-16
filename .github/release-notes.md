@@ -1,5 +1,17 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Mail a hook has collected is never dropped — (v1.21.1)
+
+### Fixes
+
+- **Mail survives a delivery that fails to build.** If something went wrong while Claude Code's
+  or Antigravity's hook was putting a delivery together, the mail it had just collected could
+  be lost. That was the cause of a room's owner missing its own notices in v1.20.0. Read
+  through the app's broker, the mail is now left to be delivered properly on the next turn,
+  and a password accepted in that turn is still acknowledged straight away. Read directly,
+  the collected mail is shown plainly. Either way, who it is from, what kind of message it is,
+  any usage line, and whether it may be acted on are kept.
+
 ## An agent outside a sync room knows its own usage too — (v1.21.0)
 
 Until now only an agent in a sync room could see how much of its plan was left. A session

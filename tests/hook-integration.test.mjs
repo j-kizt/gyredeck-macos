@@ -2297,6 +2297,87 @@ test("the bridge keeps only a hash of a room's password, and hands the plaintext
   }
 });
 
+test("a session the broker bound and then turned away is told its mail is held, not handed silence (#178)", async () => {
+  // Live, 2026-10-16: agy updated itself mid-session, its running binary became
+  // `agy.<n>.old`, and the broker that had bound the session as `agy` answered every later
+  // hook `ineligible`. The hook fell back to TCP, the bridge refused the bound session's
+  // TCP read, and the hook read that refusal as an empty mailbox — so the session never
+  // heard it had been put in a room.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-held-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const claude = "a1780000-0000-4000-8000-000000000001";
+  const agy = "a1780000-0000-4000-8000-000000000002";
+  let broker = null;
+  try {
+    bridge.stdin.write(`broker-secret ${"cd".repeat(32)}\nbroker-bound ${claude}\nbroker-bound ${agy}\nbroker-ready\n`);
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    for (const to of [claude, agy]) {
+      await fetch(`http://127.0.0.1:${port}/mail/${to}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-gyredeck-token": token },
+        body: JSON.stringify({ from: "gyredeck-app", text: "you are in a room" }),
+      });
+    }
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "ineligible", message: "not a CLI this broker binds" }));
+
+    const claudeRun = await runAdapter(
+      "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
+      { hook_event_name: "UserPromptSubmit", session_id: claude, cwd: "/tmp/project", prompt: "hi" },
+    );
+    assert.equal(claudeRun.code, 0, claudeRun.stderr);
+    assert.match(JSON.parse(claudeRun.stdout).hookSpecificOutput.additionalContext, /holding mail for this session that it cannot hand over.*"ineligible".*"broker_required"/);
+    assert.match(claudeRun.stderr, /mail withheld this turn/);
+
+    const agyRun = await runAdapter(
+      "adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], home,
+      { hookEventName: "PreInvocation", conversationId: agy, workspacePaths: ["/tmp/project"] },
+    );
+    assert.equal(agyRun.code, 0, agyRun.stderr);
+    const steps = JSON.parse(agyRun.stdout).injectSteps ?? [];
+    assert.ok(steps.some((step) => /holding mail for this session that it cannot hand over/.test(step.ephemeralMessage)), JSON.stringify(steps));
+    assert.match(agyRun.stderr, /mail withheld this turn/);
+
+    // A bridge that answers a byte at a time cannot hold the invocation: the read has one
+    // deadline for the whole exchange, not an idle timeout (#178 audit).
+    const slowPort = await freePort();
+    const slow = createHttpServer((req, res) => {
+      if (!req.url.startsWith("/mail/inbox")) { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); return; }
+      res.writeHead(200, { "content-type": "application/json" });
+      const drip = setInterval(() => res.write(" "), 200);
+      req.on("close", () => clearInterval(drip));
+    });
+    await new Promise((resolve) => slow.listen(slowPort, "127.0.0.1", resolve));
+    try {
+      await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port: slowPort }));
+      const started = Date.now();
+      const dripped = await runAdapter(
+        "adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], home,
+        { hookEventName: "PreInvocation", conversationId: agy, workspacePaths: ["/tmp/project"] },
+      );
+      assert.equal(dripped.code, 0, dripped.stderr);
+      assert.ok(Date.now() - started < 2_000, `the hook answered in ${Date.now() - started} ms`);
+    } finally {
+      slow.closeAllConnections();
+      await new Promise((resolve) => slow.close(resolve));
+    }
+  } finally {
+    if (broker) await broker.close();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("what an agent may act on depends on who sent it, in three tiers", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-tiers-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });

@@ -1665,6 +1665,58 @@ test("a room delivery carries only what the session can use, and points at the r
   }
 });
 
+test("the founder's prompt that carries the room password still gets its mail (#167)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-founder-pass-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "aaaaaaaa-1111-4111-8111-111111111167";
+  const joiner = "bbbbbbbb-2222-4222-8222-222222222167";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+        headers: { "content-type": "application/json", "x-gyredeck-token": token },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const code = (await call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    const { password } = (await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder })).body;
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: joiner });
+
+    // Live, 2026-10-16: the founder pasted the password as the whole prompt. Its confirm
+    // answers ok, and with only the room's own notices waiting there was nothing to
+    // answer — the reply line then read the kind of a message that did not exist, the
+    // hook threw, and the mail it had already collected never reached the session.
+    const result = await runAdapter(
+      "adapters/claude/gyredeck-claude-hook.mjs",
+      ["--event", "UserPromptSubmit"],
+      home,
+      { hook_event_name: "UserPromptSubmit", session_id: founder, cwd: "/tmp/claude-project", prompt: password },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+    assert.match(context, /joined this room/);
+    assert.match(context, /the password you were just given was accepted/);
+    assert.match(context, /"to":"everyone","kind":"tell"/);
+  } finally {
+    bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("a room watch is sent a heartbeat, and with no rules file the rules go out in full (#157)", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-norules-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });

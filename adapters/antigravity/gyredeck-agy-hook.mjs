@@ -547,7 +547,7 @@ const drainMailIntoSteps = async (endpoint, token, room) => {
   // and a notice is the room talking about itself, and handing over the reply command for
   // those invited the answer the rules say not to send (#157). No kind means an older
   // bridge, answered as it always was.
-  const kindOf = (message) => (typeof message.kind === "string" ? message.kind : null);
+  const kindOf = (message) => (typeof message?.kind === "string" ? message.kind : null);
   const answerable = delivered.filter((message) => {
     if (message.from === ROOM_SENDER) return false;
     const kind = kindOf(message);

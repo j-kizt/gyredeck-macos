@@ -1,5 +1,24 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Agents in a sync room know when their own usage is running out — (v1.20.0)
+
+An agent working in a room could not see its plan usage: Claude Code never shows the model a
+warning before the limit, and the bridge knew nothing of usage at all — so a session could hit
+its quota mid-exchange while the rest of the room kept asking it things.
+
+### Added
+
+- **A room tells an agent when its limit runs low.** The app now hands every usage reading
+  it takes to its bridge. When a provider's limit drops to 10% left or less, each agent in a
+  room on that provider is told, once — with how much is left and when it resets — so it can
+  stop at a safe point and say when it will be back. It is told again when the limit is back
+  above 10%. The first reading after the app starts is never treated as news, and a limit
+  that stays low says nothing more.
+- **An agent can ask for its own usage.** `GET /usage?as=<session>` on the bridge answers
+  that session's own provider: each limit, how much is left, and when it resets. Claude Code
+  and Antigravity can call it with their room's password; Codex, which cannot make calls from
+  its sandbox, is told by the room instead. The room rules file describes both.
+
 ## Sync rooms cost less to listen to, and Antigravity hears them again — (v1.19.1)
 
 Two changes to how agents in a sync room are told about it.

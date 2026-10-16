@@ -1,5 +1,17 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## An Antigravity session that updated itself keeps hearing its room — (v1.21.3)
+
+### Fixes
+
+- **Antigravity no longer goes deaf after updating itself mid-session.** When agy updates
+  while a session is open, the session keeps running from the old, renamed copy of the
+  program. Gyredeck stopped recognising that copy, and the mail meant for the session could
+  then be read by nobody. The session never heard it had been put in a room. The renamed copy
+  is now recognised, and its signature is still checked.
+- **Held mail is said, not hidden.** If mail for a Claude Code or Antigravity session cannot
+  be handed over, the session is told so, instead of being shown an empty mailbox.
+
 ## A room's password is no longer held in plain text by the bridge — (v1.21.2)
 
 ### Changed

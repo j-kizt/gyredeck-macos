@@ -66,7 +66,7 @@ Bound to `127.0.0.1:47621`.
 | DELETE | `/sync/rooms/<code>/members/<id>` | Leave a room. |
 | GET | `/sync/rooms?as=<id>` | Which room a session is in, and who else. |
 | GET | `/mail/wait?as=<id>` | Long poll: the inbox, held until something arrives. |
-| POST | `/sync/rooms/<code>/passwords` | The founder reads the room's password. Reading it out lets nobody in. |
+| POST | `/sync/rooms/<code>/passwords` | Whether the caller is the founder: `{ ok, room }`, no password. The bridge keeps only a sha256 of it (#124) and hands the plaintext over once, in the `201` from `POST /sync/rooms`; the app holds it in memory and shows it from there. Reading it out lets nobody in. |
 | POST | `/sync/rooms/<code>/confirm` | A joined session presents it and may then speak. |
 | DELETE | `/sync/rooms/<code>?as=<id>` | The founder ends the room for everyone. |
 

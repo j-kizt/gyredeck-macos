@@ -704,7 +704,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null)
 
   // The kind travels with each message: a session that cannot see that a line was a
   // reaction answers it, which is the loop the kinds exist to stop.
-  const kindOf = (message) => (typeof message.kind === "string" ? message.kind : null);
+  const kindOf = (message) => (typeof message?.kind === "string" ? message.kind : null);
   const lines = [
     [heading, ...standing].join(" "),
     ...delivered.map((message) =>

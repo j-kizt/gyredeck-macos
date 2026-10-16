@@ -230,9 +230,10 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 2;
+export const ROOM_RULES_VERSION = 3;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
-export const ROOM_RULES = `# Gyredeck room rules — v${ROOM_RULES_VERSION}
+/** The rules, for the bridge serving at `origin`: the one command in them names it. */
+export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
 
 Read this once per conversation, and again after a compaction or a resume. Every message from a
 room names the version it expects; if it names a newer one than you read, read this file again.
@@ -272,6 +273,13 @@ carries the command for as long as the room sees none of yours.
 - It ends for three reasons only: the room closed, you were disconnected, or re-opening is refused because the bridge restarted. The loop stops itself in the third case; in the first two you are told — do not start another.
 - The stream closes every five minutes and says so first. That is routine: the loop re-opens and resumes where it stopped.
 
+## Your usage
+- When your provider's limit drops to 10% left or less, the room tells you, once; and again when it is
+  back above. Finish at a safe point, then tell the room when you expect to be back.
+- Claude Code and Antigravity can look any time:
+  \`curl -s "${origin}/usage?as=<your id>" -H "x-gyredeck-token: THE ROOM PASSWORD"\`
+  — each limit's label, how much is left, and when it resets. Codex cannot call it; the room tells it.
+
 ## Wait (Claude Code)
 Only while an answer you need before you can carry on is outstanding:
 \`node ~/.config/gyredeck/gyredeck-claude-hook.mjs wait 60 <your id>\`.
@@ -285,11 +293,11 @@ Exit 2 means the mail is being withheld — do not work around it with curl.
  *  reader never sees half of it. Answers whether the file is there to be read: a delivery
  *  that points at a file that could not be written would be pointing at nothing, so the
  *  bridge sends the full rules instead whenever this is false. */
-export const writeRoomRules = (path = ROOM_RULES_PATH) => {
+export const writeRoomRules = (origin, path = ROOM_RULES_PATH) => {
   const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
   try {
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(temp, ROOM_RULES, { encoding: "utf8", flag: "wx", mode: 0o644 });
+    writeFileSync(temp, roomRules(origin), { encoding: "utf8", flag: "wx", mode: 0o644 });
     renameSync(temp, path);
     return true;
   } catch (error) {
@@ -1435,7 +1443,8 @@ export function openEventLog(logFile) {
 }
 
 function startBridge(config) {
-  const roomRulesReady = writeRoomRules();
+  // Written for the port this bridge serves on, since the rules carry a command that names it.
+  const roomRulesReady = writeRoomRules(`http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}`);
   const eventLog = openEventLog(config.logFile);
   if (!eventLog.enabled) console.error(`gyredeck: event log disabled — ${eventLog.why}`);
 
@@ -3494,6 +3503,83 @@ function startBridge(config) {
     }
   };
 
+  // ── Usage seen by the app, per provider (#158) ──
+
+  /** Below this much left, a member is told, once per crossing — and again when it is back above. */
+  const USAGE_LOW_PCT = 10;
+  const usageByProvider = new Map();
+  const USAGE_PROVIDER_OF_KIND = {
+    claudeCodeHook: "claude",
+    codexCliHook: "codex",
+    "codex-notify": "codex",
+    codex: "codex",
+    agyHost: "agy",
+  };
+  const usageProviderFor = (conversationId) =>
+    USAGE_PROVIDER_OF_KIND[providerByConversation.get(conversationId)] ?? null;
+
+  /**
+   * The app's usage snapshot, reduced to what an agent needs: each limit's label, how much
+   * is left, and when it resets. Left is computed the way the Usage panel computes it
+   * (`getProgressPercent` in the app), so the two never disagree about the number.
+   */
+  const readUsageSnapshot = (body) => {
+    const provider = typeof body?.providerId === "string" ? body.providerId : null;
+    if (!provider || !["claude", "codex", "agy"].includes(provider) || !Array.isArray(body.lines)) return null;
+    const lines = [];
+    for (const line of body.lines.slice(0, 16)) {
+      if (line?.type !== "progress" || typeof line.used !== "number" || typeof line.label !== "string") continue;
+      const usedPct = typeof line.limit === "number" && line.limit > 0 && line.limit !== 100
+        ? (line.used / line.limit) * 100
+        : line.used;
+      const used = Math.min(100, Math.max(0, Math.round(usedPct)));
+      lines.push({
+        label: line.label.slice(0, 64),
+        leftPct: 100 - used,
+        resetsAt: typeof line.resetsAt === "string" ? line.resetsAt : null,
+      });
+    }
+    return {
+      provider,
+      displayName: typeof body.displayName === "string" ? body.displayName.slice(0, 40) : provider,
+      lines,
+      fetchedAt: typeof body.fetchedAt === "string" ? body.fetchedAt : new Date().toISOString(),
+    };
+  };
+
+  /**
+   * Keep the reading, and tell the room's members on that provider when a limit crosses
+   * the line — edge-triggered, as every alert here is: the first reading is never news, a
+   * limit that stays low says nothing more, and one that comes back up says so once.
+   */
+  const noteUsage = (reading) => {
+    const before = usageByProvider.get(reading.provider);
+    usageByProvider.set(reading.provider, reading);
+    if (!before) return;
+    const was = new Map(before.lines.map((line) => [line.label, line.leftPct]));
+    for (const line of reading.lines) {
+      const prior = was.get(line.label);
+      if (prior === undefined) continue;
+      const low = prior > USAGE_LOW_PCT && line.leftPct <= USAGE_LOW_PCT;
+      const back = prior <= USAGE_LOW_PCT && line.leftPct > USAGE_LOW_PCT;
+      if (!low && !back) continue;
+      const when = line.resetsAt ? ` It resets at ${line.resetsAt}.` : "";
+      const text = low
+        ? `[Gyredeck: your ${reading.displayName} ${line.label} limit has ${line.leftPct}% left.${when}` +
+          " Finish what you are doing at a safe point, then tell the room when you expect to be back," +
+          " before the limit stops you mid-reply.]"
+        : `[Gyredeck: your ${reading.displayName} ${line.label} limit is back to ${line.leftPct}% left.]`;
+      for (const [name, room] of mailRooms) {
+        if (!SYNC_CODE.test(name)) continue;
+        for (const [conversationId, member] of room.members) {
+          if (member.confirmed !== true || usageProviderFor(conversationId) !== reading.provider) continue;
+          const told = publishMail(room, ROOM_SENDER, text, null, false, { to: conversationId, kind: "tell" });
+          if (told) deliverMail(name, room, text, ROOM_SENDER, told);
+        }
+      }
+    }
+  };
+
   /** Which room a session has been put into, if any. A session belongs to at most one. */
   const syncRoomFor = (conversationId) => {
     for (const [name, room] of mailRooms) {
@@ -5138,6 +5224,54 @@ function startBridge(config) {
         return;
       }
       sendJson(200, { ok: true, bound: brokerBound.size });
+      return;
+    }
+
+    // ── Usage (#158) ──
+    // POST /usage — the app hands over each provider's usage as it reads it (machine token).
+    // GET /usage?as=<id> — that session's own provider's usage (machine token, or the
+    // password of the room the session is in, the same door as its inbox).
+    if (req.url === "/usage" || req.url.startsWith("/usage?")) {
+      const sendJson = (status, body) => {
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+        res.end(JSON.stringify(body));
+      };
+      const headerToken = req.headers["x-gyredeck-token"];
+      if (typeof headerToken !== "string" || !CREDENTIAL_SHAPE.test(headerToken)) {
+        sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+        return;
+      }
+      const url = new URL(req.url, "http://127.0.0.1");
+      if (req.method === "POST") {
+        if (!holdsMachineToken(headerToken)) {
+          sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+          return;
+        }
+        const reading = readUsageSnapshot(await readJsonBody(req));
+        if (!reading) {
+          sendJson(400, { ok: false, error: "invalid_usage" });
+          return;
+        }
+        noteUsage(reading);
+        sendJson(200, { ok: true });
+        return;
+      }
+      if (req.method === "GET") {
+        const as = url.searchParams.get("as") ?? "";
+        if (!MAIL_ROOM_NAME.test(as)) {
+          sendJson(400, { ok: false, error: "invalid_session" });
+          return;
+        }
+        if (!holdsMailboxCredential(as, headerToken)) {
+          sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+          return;
+        }
+        const provider = usageProviderFor(as);
+        const usage = provider ? usageByProvider.get(provider) ?? null : null;
+        sendJson(200, { ok: true, provider, usage });
+        return;
+      }
+      sendJson(405, { ok: false, error: "method_not_allowed" });
       return;
     }
 

@@ -953,9 +953,18 @@ fn set_keep_awake(state: tauri::State<'_, KeepAwakeState>, active: bool) -> Resu
     state.set_active(active)
 }
 
+/// Hands each usage reading to the bridge, so agents in a room can be told when their own
+/// limit runs low and can ask for it (#158). Best effort: a bridge that is down misses one
+/// reading, and the next refresh carries it.
+fn relay_usage(snapshot: &CodexUsageSnapshot) {
+    if let Ok(body) = serde_json::to_string(snapshot) {
+        let _ = standalone_bridge::bridge_request("POST", "/usage", Some(body));
+    }
+}
+
 #[tauri::command]
 async fn codex_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(codex_usage_blocking)
+    tauri::async_runtime::spawn_blocking(|| codex_usage_blocking().inspect(relay_usage))
         .await
         .map_err(|error| format!("Codex usage task failed: {error}"))?
 }
@@ -1038,7 +1047,7 @@ fn format_codex_usage_error(error: CodexUsageFetchError) -> String {
 
 #[tauri::command]
 async fn agy_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(agy_usage_blocking)
+    tauri::async_runtime::spawn_blocking(|| agy_usage_blocking().inspect(relay_usage))
         .await
         .map_err(|error| format!("Antigravity usage task failed: {error}"))?
 }
@@ -1088,7 +1097,7 @@ fn agy_usage_blocking() -> Result<CodexUsageSnapshot, String> {
 
 #[tauri::command]
 async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(claude_usage_blocking)
+    tauri::async_runtime::spawn_blocking(|| claude_usage_blocking().inspect(relay_usage))
         .await
         .map_err(|error| format!("Claude usage task failed: {error}"))?
 }

@@ -577,6 +577,19 @@ Rooms with members are exempt from the idle sweep — they were set up deliberat
 
 A `conversation_close` takes that session out of its room. An ended session can never collect its mail, so leaving it listed would tell everyone else it is still there, and an agent handing work to it would wait for an answer that cannot come; its `pending` would also climb forever with nothing to reclaim it. Sessions are resumable and keep their id, so a resumed one finds itself out of the room and has to be put back — one action for the person, against a peer that silently is not there.
 
+### Usage (#158)
+
+| Method | Path | Credential | What |
+|---|---|---|---|
+| POST | `/usage` | machine token (the app) | One provider's usage snapshot, as the Usage panel reads it — the app relays every successful `claude_usage` / `codex_usage` / `agy_usage` (`relay_usage` in `lib.rs`). |
+| GET | `/usage?as=<id>` | machine token, or the password of that session's room | That session's own provider: `{ provider, usage: { provider, displayName, lines: [{ label, leftPct, resetsAt }], fetchedAt } | null }`. |
+
+Left is computed as the panel computes it (`getProgressPercent`), so the two never disagree.
+When a limit crosses to **10 % left or less**, and again when it comes back above, the bridge
+tells each confirmed room member on that provider — a room `tell` addressed to that member,
+so it wakes it. Edge-triggered: the first reading is never news, and staying low says nothing
+more. Usage is per provider account, so every member on one provider hears the same thing.
+
 ### One inbox per session
 
 Merged reads are ordered by a **bridge-wide publish ordinal**, not by `seq`. `seq`

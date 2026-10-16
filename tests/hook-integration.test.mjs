@@ -1518,7 +1518,7 @@ test("a room delivery carries only what the session can use, and points at the r
     // The file every delivery points at exists as soon as the bridge does, at the version
     // a delivery names.
     const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
-    assert.match(rules, /^# Gyredeck room rules — v2\n/);
+    assert.match(rules, /^# Gyredeck room rules — v3\n/);
     assert.match(rules, /Never answer a reaction/);
 
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
@@ -1561,7 +1561,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/sync/rooms/${code}/confirm`, { conversationId: agy, password: minted.password });
     await steps();
     const opening = await context();
-    assert.match(opening, /Rules v2: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
+    assert.match(opening, /Rules v3: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
     // Nothing but the room talking about itself: nothing to answer, so no command for it.
     assert.doesNotMatch(opening, /REPLY —/);
 
@@ -1621,7 +1621,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/mail/${code}`, { from: peer, to: agy, kind: "reaction", text: "noted" });
     const agyReaction = await steps();
     assert.match(agyReaction, /\[gyredeck mail · from Codex · reaction\] noted/);
-    assert.match(agyReaction, /Rules v2: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(agyReaction, /Rules v3: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.doesNotMatch(agyReaction, /answering is expected/);
     assert.match(agyReaction, /never answer a reaction/);
     assert.match(agyReaction, /ok:true and a seq/);
@@ -1743,6 +1743,105 @@ test("a room watch is sent a heartbeat, and with no rules file the rules go out 
     assert.match(context, /never answer a reaction/);
   } finally {
     watch.abort();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a room member hears when its own provider's limit runs low, and can ask for it (#158)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-usage-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const base = `http://127.0.0.1:${port}`;
+  const me = "claude-session-1";
+  const other = "0313999f-b335-40b3-bc51-b8a9e65df5ce";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const post = (path, body) =>
+      fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
+    for (const [conversationId, sourceKind] of [[me, "claudeCodeHook"], [other, "agyHost"]]) {
+      await post("/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const code = (await post("/sync/rooms", { conversationId: me })).room;
+    await post(`/sync/rooms/${code}/members`, { conversationId: other });
+    const minted = await post(`/sync/rooms/${code}/passwords`, { conversationId: me });
+    await post(`/sync/rooms/${code}/confirm`, { conversationId: other, password: minted.password });
+    const context = async () => {
+      const result = await runAdapter(
+        "adapters/claude/gyredeck-claude-hook.mjs",
+        ["--event", "UserPromptSubmit"],
+        home,
+        { hook_event_name: "UserPromptSubmit", session_id: me, cwd: "/tmp/project", prompt: "hi" },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
+    };
+    await context();
+    const reading = (provider, used) => ({
+      providerId: provider,
+      displayName: provider === "claude" ? "Claude Code" : "Antigravity",
+      lines: [{ type: "progress", label: "Session", used, limit: 100, resetsAt: "2026-10-16T05:00:00Z" }],
+      fetchedAt: new Date().toISOString(),
+    });
+    const usage = (as, credential) =>
+      fetch(`${base}/usage?as=${as}`, { headers: { "x-gyredeck-token": credential } }).then(async (r) => ({ status: r.status, body: await r.json() }));
+
+    // The rules name this bridge, on whatever port it serves — not the default (#158 audit).
+    const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
+    assert.ok(port !== 47621);
+    assert.match(rules, new RegExp(`curl -s "http://127\\.0\\.0\\.1:${port}/usage\\?as=<your id>"`));
+    assert.doesNotMatch(rules, /47621/);
+
+    // Only the app hands readings over.
+    const refused = await fetch(`${base}/usage`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": minted.password },
+      body: JSON.stringify(reading("claude", 50)),
+    });
+    assert.equal(refused.status, 401, "a room password is not the app");
+    assert.deepEqual(await post("/usage", reading("claude", 50)), { ok: true });
+
+    // A member asks with the room's password and gets its own provider's figure.
+    const asked = await usage(me, minted.password);
+    assert.equal(asked.status, 200);
+    assert.equal(asked.body.provider, "claude");
+    assert.deepEqual(asked.body.usage.lines, [{ label: "Session", leftPct: 50, resetsAt: "2026-10-16T05:00:00Z" }]);
+    assert.equal((await usage(me, "ab".repeat(16))).status, 401, "and nobody else's word opens it");
+    assert.equal((await usage(other, minted.password)).body.usage, null, "Antigravity has no reading yet");
+
+    // The first reading was not news. Crossing to 10% or less is, for that provider's members only.
+    assert.equal(await context(), "");
+    await post("/usage", reading("claude", 95));
+    const low = await context();
+    assert.match(low, /your Claude Code Session limit has 5% left\. It resets at 2026-10-16T05:00:00Z/);
+    const agyNow = await fetch(`${base}/mail/inbox?as=${other}`, { headers: { "x-gyredeck-token": minted.password } }).then((r) => r.json());
+    assert.ok(agyNow.messages.every((message) => !message.text.includes("limit has")), "not told about someone else's limit");
+    // Staying low says nothing more; coming back says so once.
+    await post("/usage", reading("claude", 97));
+    assert.equal(await context(), "");
+    await post("/usage", reading("claude", 20));
+    assert.match(await context(), /your Claude Code Session limit is back to 80% left/);
+    // An Antigravity reading that starts low is a first look: nothing.
+    await post("/usage", reading("agy", 99));
+    const agyAfter = await fetch(`${base}/mail/inbox?as=${other}`, { headers: { "x-gyredeck-token": minted.password } }).then((r) => r.json());
+    assert.ok(agyAfter.messages.every((message) => !message.text.includes("limit has")));
+  } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true });
@@ -4549,7 +4648,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // The confirming push is the full brief, and names the rules file the short form of
     // every later push points at (#157).
     assert.match(afterConfirm.at(-1), /Do not call Gyredeck/);
-    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v2\)/);
+    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v3\)/);
 
     // Typing it twice is the same question. Nothing is announced again and nothing is
     // pushed again, because there is nothing outstanding to carry.
@@ -4579,7 +4678,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // given on confirmation (#157).
     assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} — how to answer: `));
     assert.match(afterLater.at(-1), /@<member or everyone> ask\|tell\|reaction — never answer a reaction/);
-    assert.match(afterLater.at(-1), /Rules v2: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(afterLater.at(-1), /Rules v3: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.match(afterLater.at(-1), /Members now: /);
     assert.doesNotMatch(afterLater.at(-1), /Do not call Gyredeck/);
     // And says which kind it is: a tell and a reaction with the same words must not

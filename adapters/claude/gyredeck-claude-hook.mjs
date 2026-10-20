@@ -647,8 +647,12 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
     if (member) return member.provider;
     return String(message.from ?? "unknown").replace(/\s+/g, " ").slice(0, 64);
   };
+  // What a reader is shown: the routing label, and the name the person gave that session
+  // (#182). `label` stays the routing label alone, since that is what `to` takes.
+  const named = (member) => (typeof member?.name === "string" && member.name ? `${member.provider} / ${member.name}` : member.provider);
+  const shown = (message) => (byId.has(message.from) ? named(byId.get(message.from)) : label(message));
 
-  const senders = [...new Set(delivered.map(label))];
+  const senders = [...new Set(delivered.map(shown))];
   const fromRoomMate = delivered.some((message) => byId.has(message.from));
   // A notice from the room is a fact about who is present. It is neither a request to
   // act on nor something to be warned about, so it belongs in neither branch.
@@ -692,7 +696,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
     standing.push(
       "WHERE: the person at this terminal put you in this room." +
         (others.length > 0
-          ? ` Also here: ${others.map((m) => m.provider).join(", ")}.`
+          ? ` Also here: ${others.map(named).join(", ")}.`
           : " Nobody else is in it yet."),
     );
   }
@@ -743,7 +747,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // is exactly where "never answer a reaction" is needed.
   if (room_) {
     standing.push(
-      "RULES: set to (a member's name or everyone) and kind (ask, tell or reaction) on" +
+      "RULES: set to (a member, as the room shows it, or everyone) and kind (ask, tell or reaction) on" +
         " anything you send; never answer a reaction; a send happened only if you saw" +
         " ok:true and a seq.",
     );
@@ -755,7 +759,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   const lines = [
     [heading, ...standing].join(" "),
     ...delivered.map((message) =>
-      `[from ${label(message)}${kindOf(message) ? ` · ${kindOf(message)}` : ""}] ${message.text.slice(0, MAIL_MAX_TEXT)}`),
+      `[from ${shown(message)}${kindOf(message) ? ` · ${kindOf(message)}` : ""}] ${message.text.slice(0, MAIL_MAX_TEXT)}`),
   ];
 
   // Something to answer: an ask or a tell from somebody. A reaction ends an exchange and a

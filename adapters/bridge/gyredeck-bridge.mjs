@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 4;
+export const ROOM_RULES_VERSION = 5;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -250,7 +250,9 @@ room names the version it expects; if it names a newer one than you read, read t
 ## Sending
 - Claude Code and Antigravity: the command is in the delivery, under REPLY, whenever there is something to answer. Put the room's password in place of \`THE ROOM PASSWORD\`.
 - Codex: you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\` — and is removed before the room sees it. Say everything in one closing message.
-- A send happened only if you saw \`ok:true\` and a \`seq\` (Codex: the seq is reported on the next message you get). Never say you sent something you did not see land.
+- A send happened only if you saw \`ok:true\` and a \`seq\`. Never say you sent something you did not see land.
+- Codex: your seq is reported on the next message you get, with the turn, recipient and kind it belongs to. Until then a message has not failed — **do not send it again**. The room posts an identical tell to the same member within a minute only once. Claude Code and Antigravity, which post with curl, can add \`"again": true\` to say the same thing again on purpose; Codex has no such switch, so a word-for-word repeat within the minute is taken as a resend.
+- \`listening\` in a receipt names the members with a watch open; a member that is pushed to, as Codex is, hears you without one.
 - Never put the room's password in a message body.
 
 ## Narrate
@@ -2117,6 +2119,25 @@ function startBridge(config) {
       // Both kinds of full are asked before anything is claimed or the cursor moves —
       // `publishMail` answers a refusal with `null`, and a claimed reply is one nothing
       // will ever look at again. The turn stays open: it is read again, prompt and all.
+      // A word-for-word repeat is settled before any capacity check: it takes no room, and
+      // asking first would leave it held behind a full room and posted later as new (#183
+      // audit). It is handled like any read answer — cursor on, claimed — and this turn is
+      // told which seq it repeated, so the next brief does not name an older turn.
+      const repeated = recentDuplicate(destination.room, threadId, text, routing);
+      if (repeated) {
+        handledThrough = reply.endsAt;
+        reader.origins.delete(reply.turnId);
+        if (claimCodexReply(threadId, reply)) {
+          publishedForCodex.set(threadId, {
+            seq: repeated.seq,
+            turnId: reply.turnId,
+            to: (repeated.to ?? MAIL_EVERYONE) === MAIL_EVERYONE ? "everyone" : labelIn(destination.room, repeated.to),
+            kind: repeated.kind,
+            repeatOf: true,
+          });
+        }
+        continue;
+      }
       if (
         roomIsFull(destination.room, Buffer.byteLength(reply.text ?? "", "utf8")) ||
         heldWouldOverflow(destination.room, { from: threadId, to: routing.to, kind: routing.kind, text })
@@ -2136,7 +2157,15 @@ function startBridge(config) {
       // has for anything that did not arrive.
       if (routing.kind === "reaction" && reactionRunExhausted(destination.room)) continue;
       const published = publishMail(destination.room, threadId, text, null, true, routing);
-      if (published?.seq) publishedForCodex.set(threadId, published.seq);
+      if (published?.seq) {
+        const to = published.to ?? MAIL_EVERYONE;
+        publishedForCodex.set(threadId, {
+          seq: published.seq,
+          turnId: reply.turnId,
+          to: to === MAIL_EVERYONE ? "everyone" : labelIn(destination.room, to),
+          kind: published.kind ?? routing?.kind ?? MAIL_DEFAULT_KIND,
+        });
+      }
       codexHarvest.published += 1;
       // Carried on as any member's message is: to the other members of a room, or to the
       // sender whose mailbox the answer was put in — pushed if that sender is Codex, left
@@ -4326,6 +4355,25 @@ function startBridge(config) {
    */
   const wakesMember = (message, conversationId) => reachesMember(message, conversationId);
 
+  /**
+   * The same tell from the same sender to the same address within a minute, if there is
+   * one. A sender that has not yet seen its seq re-sends, and the receiver then reads the
+   * same words twice (#183: seq 9 and 12). The room answers with the first one instead.
+   */
+  // Overridable so a test can watch a repeat outlive the window; nothing else sets it.
+  const MAIL_DUPLICATE_WINDOW_MS = Number(process.env.GYREDECK_MAIL_DUPLICATE_WINDOW_MS) || 60_000;
+  const recentDuplicate = (room, from, text, routing) => {
+    if ((routing?.kind ?? MAIL_DEFAULT_KIND) !== "tell") return null;
+    const to = routing?.to ?? MAIL_EVERYONE;
+    const since = Date.now() - MAIL_DUPLICATE_WINDOW_MS;
+    for (let index = room.messages.length - 1; index >= 0; index -= 1) {
+      const earlier = room.messages[index];
+      if (Date.parse(earlier.ts) < since) break;
+      if (earlier.from === from && earlier.text === text && earlier.kind === "tell" && (earlier.to ?? MAIL_EVERYONE) === to) return earlier;
+    }
+    return null;
+  };
+
   const publishMail = (room, from, text, replyTo, fromSession = false, routing = null) => {
     // Capacity is decided here, not at one caller. The HTTP route checks first so it can
     // answer with a sentence naming who has not read; every other way into a room — a
@@ -4579,10 +4627,17 @@ function startBridge(config) {
    */
   const codexRoomEnvelope = (roomName, room, recipient, text, { full = false } = {}) => {
     const roster = [...room.members.keys()].map((id) => shownIn(room, id)).join(", ");
+    // Named by its turn, recipient and kind, so a late seq is matched to the message that
+    // earned it and not to a newer one (#183: seq 63 was taken for 61). It comes on the
+    // next push only — waking Codex to say a number would cost a turn (the user,
+    // 2026-10-20) — so the brief says that no seq yet is not a failure.
     const wasPublished = publishedForCodex.get(recipient);
     const seqLine = wasPublished
-      ? ` Your previous message reached the room as seq ${wasPublished}.`
-      : " Nothing of yours has been published in this room yet.";
+      ? (wasPublished.repeatOf
+          ? ` Your previous message (turn ${String(wasPublished.turnId ?? "?").slice(0, 8)}, ${wasPublished.kind} to ${wasPublished.to}) repeated seq ${wasPublished.seq} word for word, so it was not posted again.`
+          : ` Your previous message (turn ${String(wasPublished.turnId ?? "?").slice(0, 8)}, ${wasPublished.kind} to ${wasPublished.to}) reached the room as seq ${wasPublished.seq}.`) +
+        " A message whose seq you have not seen yet has not failed: do not send it again."
+      : " Nothing of yours has been published in this room yet. A message whose seq you have not seen yet has not failed: do not send it again.";
     // Every other push carries the short form (#157): the rules that broke live when told
     // once — the routing line, never answering a reaction, where the seq comes from — plus
     // the roster and seq, which are state and change. The rest is in the rules file, and
@@ -5863,6 +5918,20 @@ function startBridge(config) {
         const addressed = routedTo === MAIL_EVERYONE || room.members.has(routedTo)
           ? routedTo
           : memberByAddress(room, routedTo) ?? routedTo;
+        // Before any capacity check, so a repeat is answered with the seq it already has
+        // rather than refused as if it were new (#183 audit). `again: true` is the sender
+        // saying it means to say the same thing twice.
+        const duplicate = body.again === true ? null : recentDuplicate(room, from, text, { to: addressed, kind: routedKind });
+        if (duplicate) {
+          sendJson(202, {
+            ok: true,
+            room: name,
+            seq: duplicate.seq,
+            duplicate: true,
+            message: `The same tell to the same member reached the room a moment ago as seq ${duplicate.seq}; it was not posted twice. Send it with "again": true to post it again on purpose.`,
+          });
+          return;
+        }
         if (
           heldWouldOverflow(room, { from, to: addressed, kind: routedKind, text })
         ) {
@@ -5925,7 +5994,9 @@ function startBridge(config) {
           ok: true,
           room: name,
           seq: message.seq,
-          subscribers: room.clients.size,
+          // Who has a watch open, by name. A count read as "who will hear this" and was
+          // wrong whenever a member is pushed to instead of watching, as Codex is (#183).
+          listening: [...new Set([...room.clients].map((res) => res.gyredeckWatcher).filter((id) => room.members.has(id)))].map((id) => shownIn(room, id)),
           delivery,
         });
         return;

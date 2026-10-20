@@ -1543,7 +1543,7 @@ test("a room delivery carries only what the session can use, and points at the r
     // The file every delivery points at exists as soon as the bridge does, at the version
     // a delivery names.
     const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
-    assert.match(rules, /^# Gyredeck room rules — v4\n/);
+    assert.match(rules, /^# Gyredeck room rules — v5\n/);
     assert.match(rules, /Never answer a reaction/);
 
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
@@ -1586,7 +1586,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/sync/rooms/${code}/confirm`, { conversationId: agy, password: minted.password });
     await steps();
     const opening = await context();
-    assert.match(opening, /Rules v4: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
+    assert.match(opening, /Rules v5: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
     // Nothing but the room talking about itself: nothing to answer, so no command for it.
     assert.doesNotMatch(opening, /REPLY —/);
 
@@ -1646,7 +1646,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/mail/${code}`, { from: peer, to: agy, kind: "reaction", text: "noted" });
     const agyReaction = await steps();
     assert.match(agyReaction, /\[gyredeck mail · from Codex · reaction\] noted/);
-    assert.match(agyReaction, /Rules v4: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(agyReaction, /Rules v5: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.doesNotMatch(agyReaction, /answering is expected/);
     assert.match(agyReaction, /never answer a reaction/);
     assert.match(agyReaction, /ok:true and a seq/);
@@ -4701,6 +4701,93 @@ test("speaking does not count as reading: a busy session keeps the mail it has n
   }
 });
 
+test("a Codex repeat is settled before the room is full, so it is never held and posted later as new (#183)", async () => {
+  // Gyre Audit, #183 round 2: the repeat check came after the capacity check on Codex's
+  // path, so a word-for-word repeat waited behind a full room and, once the minute had
+  // passed, was posted as if new. The window is two seconds here so that can be watched.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-repeat-full-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const thread = "01a0845e-eb31-76d3-a20e-dbebd733f183";
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "10", "20");
+  await mkdir(rolloutDir, { recursive: true });
+  const fakeBin = join(home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  await writeFile(join(fakeBin, "codex"), "#!/bin/sh\nexit 0\n");
+  await chmod(join(fakeBin, "codex"), 0o755);
+  const rollout = join(rolloutDir, `rollout-2026-10-20T09-00-00-${thread}.jsonl`);
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin, GYREDECK_MAIL_DUPLICATE_WINDOW_MS: "2000" }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const founder = "repeat-full-founder";
+  const sink = "repeat-full-sink";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+      return { status: response.status, body: await response.json() };
+    };
+    for (const [conversationId, sourceKind] of [[founder, "claudeCodeHook"], [thread, "codexCliHook"], [sink, "claudeCodeHook"]]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    assert.equal((await joinConfirmed(call, code, founder, thread)).status, 200);
+    assert.equal((await joinConfirmed(call, code, founder, sink)).status, 200);
+    const said = async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${founder}&since=0`, { headers: { "x-gyredeck-token": created.body.password } });
+      return (await response.json()).messages.filter((message) => message.from === thread).map((message) => message.text);
+    };
+    const endTurn = () => call("POST", "/hook/stop", { hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: thread });
+    const words = `REPEATED-WORDS ${"z".repeat(3_000)}`;
+
+    // Codex says it once, and it lands.
+    await appendFile(rollout, finishedTurn(`@everyone tell\n${words}`));
+    await endTurn();
+    for (let i = 0; i < 40 && !(await said()).includes(words); i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal((await said()).filter((text) => text === words).length, 1);
+
+    // The room fills with mail the sink never collects, then Codex says the same again.
+    const fat = "x".repeat(4_000);
+    let full = false;
+    for (let i = 0; i < 400 && !full; i += 1) {
+      full = (await call("POST", `/mail/${code}`, { from: founder, to: sink, kind: "tell", text: `filler-${i} ${fat}` })).status === 409;
+    }
+    assert.ok(full, "the room has to be full, or this proves nothing");
+    await appendFile(rollout, finishedTurn(`@everyone tell\n${words}`));
+    await endTurn();
+
+    // Past the window, the sink drains: a repeat that had been held would post now.
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    for (let drain = 0; drain < 30; drain += 1) {
+      const seen = await (await fetch(`http://127.0.0.1:${port}/mail/inbox?as=${sink}&collect=1&limit=100`, { headers })).json();
+      if (seen.messages.length === 0) break;
+    }
+    // Something new from Codex is what reads the log again from where it was held.
+    await appendFile(rollout, finishedTurn("@everyone tell\nAFTER-THE-DRAIN"));
+    await endTurn();
+    for (let i = 0; i < 40 && !(await said()).includes("AFTER-THE-DRAIN"); i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.ok((await said()).includes("AFTER-THE-DRAIN"), "the log was read again past the full room");
+    assert.equal((await said()).filter((text) => text === words).length, 1, "the repeat was settled when it was read, not posted later");
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("a Codex answer the room has no space for is kept, not stepped over", async () => {
   // Codex found this twice. Moving the capacity check in front of `claimCodexReply` was
   // not enough: `harvestAt` had already advanced past the reply, so the next pass read
@@ -5326,7 +5413,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // The confirming push is the full brief, and names the rules file the short form of
     // every later push points at (#157).
     assert.match(afterConfirm.at(-1), /Do not call Gyredeck/);
-    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v4\)/);
+    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v5\)/);
 
     // Typing it twice is the same question. Nothing is announced again and nothing is
     // pushed again, because there is nothing outstanding to carry.
@@ -5356,7 +5443,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // given on confirmation (#157).
     assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} — how to answer: `));
     assert.match(afterLater.at(-1), /@<member or everyone> ask\|tell\|reaction — never answer a reaction/);
-    assert.match(afterLater.at(-1), /Rules v4: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(afterLater.at(-1), /Rules v5: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.match(afterLater.at(-1), /Members now: /);
     assert.doesNotMatch(afterLater.at(-1), /Do not call Gyredeck/);
     // And says which kind it is: a tell and a reaction with the same words must not
@@ -6560,6 +6647,66 @@ test("an answer goes to the mailbox or the room that asked for it, not to whiche
     assert.deepEqual((await room.saidInRoom()).filter((text) => /REPLY/.test(text)), ["ROOM-REPLY"]);
     assert.deepEqual((await room.saidInMailbox()).filter((text) => /REPLY/.test(text)), [], "nothing of Codex's lands in the founder's mailbox unasked");
     assert.equal(await published(), 2);
+  } finally {
+    await room.close();
+  }
+});
+
+test("a receipt says what landed: listening by name, one post for a repeated tell, and Codex's seq with its turn (#183)", async () => {
+  const room = await codexInARoom();
+  try {
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), room.stderrRef.value);
+    const password = (await room.call("POST", `/sync/rooms/${room.code}/passwords`, { conversationId: room.founder })).body.password;
+    const post = async (body) => {
+      const response = await fetch(`http://127.0.0.1:${room.port}/mail/${room.code}`, {
+        method: "POST", headers: { "content-type": "application/json", "x-gyredeck-token": password }, body: JSON.stringify(body),
+      });
+      return response.json();
+    };
+
+    // Nobody holds a watch: the receipt names nobody, rather than a count that read as
+    // "one session will hear this" while Codex, pushed to, hears it anyway.
+    const first = await post({ from: room.founder, to: room.thread, kind: "tell", text: "the build is green" });
+    assert.deepEqual(first.listening, []);
+    assert.equal(first.subscribers, undefined);
+    // The same tell again within the minute is not posted twice: the first seq comes back.
+    const again = await post({ from: room.founder, to: room.thread, kind: "tell", text: "the build is green" });
+    assert.deepEqual([again.ok, again.seq, again.duplicate], [true, first.seq, true]);
+    const onPurpose = await post({ from: room.founder, to: room.thread, kind: "tell", text: "the build is green", again: true });
+    assert.ok(onPurpose.seq > first.seq && !onPurpose.duplicate, "again: true posts it a second time");
+    const asked = await post({ from: room.founder, to: room.thread, kind: "ask", text: "the build is green" });
+    assert.notEqual(asked.seq, first.seq, "an ask is never folded into a tell");
+
+    // Codex answers; the next push tells it which turn, recipient and kind its seq is for.
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("the build is green"))));
+    const question = (await promptsIn(room.rollout)).filter((prompt) => prompt.text.endsWith("the build is green")).at(-1);
+    await appendFile(room.rollout, turnAnswering(question.turnId, "@Claude Code tell\nCODEX-ANSWER"));
+    assert.ok(await room.until(async () => (await room.saidInRoom()).includes("CODEX-ANSWER")));
+    await post({ from: room.founder, to: room.thread, kind: "tell", text: "thanks" });
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("thanks"))));
+    const receipt = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("thanks")).text;
+    assert.match(receipt, new RegExp(`Your previous message \\(turn ${question.turnId.slice(0, 8)}, tell to Claude Code\\) reached the room as seq \\d+\\.`));
+    assert.match(receipt, /has not failed: do not send it again/);
+
+    // Codex repeating a tell is posted once too.
+    const before = (await room.saidInRoom()).filter((text) => text === "SAID-TWICE").length;
+    const again2 = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("thanks"));
+    await appendFile(room.rollout, turnAnswering(again2.turnId, "@Claude Code tell\nSAID-TWICE") + turnAnswering(again2.turnId, "@Claude Code tell\nSAID-TWICE"));
+    assert.ok(await room.until(async () => (await room.saidInRoom()).includes("SAID-TWICE")));
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    assert.equal((await room.saidInRoom()).filter((text) => text === "SAID-TWICE").length - before, 1);
+    // A Codex turn that only repeated an earlier tell is told so on the next push.
+    const third = (await promptsIn(room.rollout)).length;
+    await post({ from: room.founder, to: room.thread, kind: "tell", text: "one more" });
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length > third));
+    const later = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("one more"));
+    await appendFile(room.rollout, turnAnswering(later.turnId, "@Claude Code tell\nSAID-TWICE"));
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    assert.equal((await room.saidInRoom()).filter((text) => text === "SAID-TWICE").length - before, 1, "still one");
+    await post({ from: room.founder, to: room.thread, kind: "tell", text: "last" });
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("last"))));
+    const told = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("last")).text;
+    assert.match(told, new RegExp(`\\(turn ${later.turnId.slice(0, 8)}, tell to Claude Code\\) repeated seq \\d+ word for word, so it was not posted again`));
   } finally {
     await room.close();
   }

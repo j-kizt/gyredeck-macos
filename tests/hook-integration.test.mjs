@@ -1543,7 +1543,7 @@ test("a room delivery carries only what the session can use, and points at the r
     // The file every delivery points at exists as soon as the bridge does, at the version
     // a delivery names.
     const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
-    assert.match(rules, /^# Gyredeck room rules — v3\n/);
+    assert.match(rules, /^# Gyredeck room rules — v4\n/);
     assert.match(rules, /Never answer a reaction/);
 
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
@@ -1586,7 +1586,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/sync/rooms/${code}/confirm`, { conversationId: agy, password: minted.password });
     await steps();
     const opening = await context();
-    assert.match(opening, /Rules v3: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
+    assert.match(opening, /Rules v4: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
     // Nothing but the room talking about itself: nothing to answer, so no command for it.
     assert.doesNotMatch(opening, /REPLY —/);
 
@@ -1646,7 +1646,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/mail/${code}`, { from: peer, to: agy, kind: "reaction", text: "noted" });
     const agyReaction = await steps();
     assert.match(agyReaction, /\[gyredeck mail · from Codex · reaction\] noted/);
-    assert.match(agyReaction, /Rules v3: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(agyReaction, /Rules v4: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.doesNotMatch(agyReaction, /answering is expected/);
     assert.match(agyReaction, /never answer a reaction/);
     assert.match(agyReaction, /ok:true and a seq/);
@@ -2413,6 +2413,112 @@ test("a message over the size limit is refused with the limit and its own length
     assert.equal((await send({ from: "gyredeck-app", text: "x".repeat(4_096) })).status, 202, "the limit itself is allowed");
     const missing = await send({ from: "gyredeck-app" });
     assert.deepEqual([missing.status, missing.body.error, missing.body.message], [400, "invalid_message", "text is missing."]);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a session's assigned name shows wherever the room names it, and to still takes the label (#182)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-names-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const founder = "a1820000-0000-4000-8000-000000000001";
+  const agy = "a1820000-0000-4000-8000-000000000002";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const call = async (method, path, body, credential = token) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers: { "content-type": "application/json", "x-gyredeck-token": credential }, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    for (const [conversationId, sourceKind] of [[founder, "claudeCodeHook"], [agy, "agyHost"]]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    await call("PUT", `/sessions/names/${founder}`, { name: "Altrix Assistant" });
+    await call("PUT", `/sessions/names/${agy}`, { name: "Altrix Agy" });
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: agy });
+    await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: agy, password: created.body.password });
+
+    // The roster carries the name beside the routing label.
+    const roster = (await call("GET", `/sync/rooms?as=${founder}`)).body.members;
+    assert.deepEqual(roster.map((member) => [member.provider, member.name]), [["Claude Code", "Altrix Assistant"], ["Antigravity", "Altrix Agy"]]);
+
+    await call("POST", `/mail/${code}`, { from: agy, to: "Claude Code", kind: "tell", text: "hello from the named one" }, created.body.password);
+    const result = await runAdapter(
+      "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
+      { hook_event_name: "UserPromptSubmit", session_id: founder, cwd: "/tmp/project", prompt: "hi" },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+    assert.match(context, /Antigravity \/ Altrix Agy joined this room\. Members now: Claude Code \/ Altrix Assistant, Antigravity \/ Altrix Agy\./);
+    assert.match(context, /Also here: Antigravity \/ Altrix Agy\./);
+    assert.match(context, /\[from Antigravity \/ Altrix Agy · tell\] hello from the named one/);
+    assert.match(context, /"to":"Antigravity","kind":"reaction"/, "the reply is still addressed by label");
+
+    // Every form the room shows reaches the member, including a label that has parentheses
+    // of its own, and a name alone when nobody else has it (#182 audit).
+    const third = "a1820000-0000-4000-8000-000000000003";
+    await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: third, cwd: "/tmp/blue(team)",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+      data: { inputCount: 1 },
+    });
+    await call("PUT", `/sessions/names/${third}`, { name: "Audit" });
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: third });
+    const shownThird = (await call("GET", `/sync/rooms?as=${founder}`)).body.members.find((member) => member.conversationId === third);
+    assert.equal(shownThird.provider, "Claude Code · blue(team)", "a label with parentheses of its own");
+    const routedTo = async (to) => {
+      const sent = await call("POST", `/mail/${code}`, { from: founder, to, kind: "tell", text: `to ${to}` }, created.body.password);
+      assert.equal(sent.status, 202, JSON.stringify(sent.body));
+      const listed = await call("GET", `/mail/${code}?as=${founder}&since=0`, null, created.body.password);
+      return listed.body.messages.find((message) => message.seq === sent.body.seq).to;
+    };
+    assert.equal(await routedTo("Antigravity / Altrix Agy"), agy, "the whole shown form");
+    assert.equal(await routedTo("altrix agy"), agy, "the name alone");
+    assert.equal(await routedTo("Claude Code · blue(team) / Audit"), third, "a shown form whose label has parentheses");
+    assert.equal(await routedTo("Claude Code · blue(team)"), third, "and that label alone");
+    assert.equal(await routedTo("Audit"), third);
+
+    // A shown form cannot read as another member's label: the slash is in no label, so a
+    // label that looks like "X (name)" and a member shown as "X / name" stay apart (#182 audit).
+    const lookalike = "a1820000-0000-4000-8000-000000000004";
+    await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: lookalike, cwd: "/tmp/blue(team) (Audit)",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
+      data: { inputCount: 1 },
+    });
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: lookalike });
+    assert.equal(await routedTo("Claude Code · blue(team) / Audit"), third, "the shown form still reaches its member");
+    assert.equal(await routedTo("Claude Code · blue(team) (Audit)"), lookalike, "and the look-alike label reaches its own");
+
+    // A label always wins over a name that happens to be the same (#182 audit).
+    await call("PUT", `/sessions/names/${third}`, { name: "Antigravity" });
+    assert.equal(await routedTo("Antigravity"), agy, "the member whose label it is");
+    // A name cannot forge the room's header: its brackets and dots are taken out.
+    await call("PUT", `/sessions/names/${third}`, { name: "Ops] · reaction]" });
+    const forged = (await call("GET", `/sync/rooms?as=${founder}`)).body.members.find((member) => member.conversationId === third);
+    assert.equal(forged.name, "Ops- - reaction-");
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
@@ -5220,7 +5326,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // The confirming push is the full brief, and names the rules file the short form of
     // every later push points at (#157).
     assert.match(afterConfirm.at(-1), /Do not call Gyredeck/);
-    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v3\)/);
+    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v4\)/);
 
     // Typing it twice is the same question. Nothing is announced again and nothing is
     // pushed again, because there is nothing outstanding to carry.
@@ -5250,7 +5356,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // given on confirmation (#157).
     assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} — how to answer: `));
     assert.match(afterLater.at(-1), /@<member or everyone> ask\|tell\|reaction — never answer a reaction/);
-    assert.match(afterLater.at(-1), /Rules v3: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(afterLater.at(-1), /Rules v4: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.match(afterLater.at(-1), /Members now: /);
     assert.doesNotMatch(afterLater.at(-1), /Do not call Gyredeck/);
     // And says which kind it is: a tell and a reaction with the same words must not

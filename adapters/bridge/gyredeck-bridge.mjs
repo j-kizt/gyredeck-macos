@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 3;
+export const ROOM_RULES_VERSION = 4;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -239,7 +239,7 @@ Read this once per conversation, and again after a compaction or a resume. Every
 room names the version it expects; if it names a newer one than you read, read this file again.
 
 ## Who a message is for, and what it is for
-- \`to\` is a member's name or \`everyone\`. Answer the member who asked — that wakes one session, not the room.
+- \`to\` is a member or \`everyone\`. A member is shown as its room label, then \` / \` and the name the person gave it — \`Codex / Altrix Audit\`. Address it by the label, the whole form as shown, or the name alone when no other member has that name or that label — a label always wins. Answer the member who asked — that wakes one session, not the room.
 - \`kind\` is one of four:
   - **ask** wants an answer.
   - **tell** does not, but may draw a reaction.
@@ -1483,7 +1483,7 @@ function startBridge(config) {
       closeRoom(found.name, found.room, "the session that created it ended, and a room does not outlive its founder");
       return;
     }
-    const label = labelIn(found.room, conversationId);
+    const label = shownIn(found.room, conversationId);
     retireLabel(found.room, conversationId);
     found.room.touchedAt = Date.now();
     // A session that has ended cannot read the notice, but its stream is still open
@@ -1606,9 +1606,7 @@ function startBridge(config) {
       ? MAIL_EVERYONE
       : room.members.has(target)
         ? target
-        : [...room.members.keys()].find(
-            (id) => labelIn(room, id).toLowerCase() === target.toLowerCase(),
-          ) ?? null;
+        : memberByAddress(room, target);
     const to = named ?? MAIL_EVERYONE;
     // A line with nothing under it said everything it meant in the line. Falling back
     // to the whole text published `@everyone ack` as the message body, which is the
@@ -2827,7 +2825,7 @@ function startBridge(config) {
         : `${lead}\n\n[Gyredeck: ${held.length} message${held.length === 1 ? "" : "s"} arrived` +
           " here before you were let in. In order:]\n\n" +
           held
-            .map((message) => `[${labelIn(room, message.from)} · ${message.kind}] ${message.text}`)
+            .map((message) => `[${shownIn(room, message.from)} · ${message.kind}] ${message.text}`)
             .join("\n\n"),
       { full: true },
     );
@@ -2923,7 +2921,7 @@ function startBridge(config) {
     announceMembership(
       code,
       room,
-      `${labelIn(room, conversationId)} was confirmed by the room's owner and can now speak here.`,
+      `${shownIn(room, conversationId)} was confirmed by the room's owner and can now speak here.`,
       // The session being announced hears it in its own push below; announcing it again
       // is the second of the three that used to race.
       toCodex ? conversationId : null,
@@ -2972,6 +2970,45 @@ function startBridge(config) {
     room.members.get(conversationId)?.label ??
     room.formerLabels.get(conversationId) ??
     providerLabelFor(conversationId);
+
+  /**
+   * A member as the room shows it (#182): the routing label, then ` / ` and the name the
+   * person gave the session, if any. A slash is the one separator no label can hold — a
+   * label is a provider, a folder's last segment, or an id — so a shown form can never
+   * read as another member's label, which parentheses could (#182 audit). Addressing still matches the label alone — `to` takes the label —
+   * so a name two sessions share stays unambiguous and a name typed later changes nothing
+   * that routes.
+   */
+  const sessionNameOf = (conversationId) => {
+    // Stored already cleaned (cleanSessionName), so it is shown as it is: cutting it again
+    // by UTF-16 units could split an emoji in half (#182 audit).
+    // The brackets and the dot are what the room's headers are built from — `[from X ·
+    // tell]` — so a name holding them could forge a kind or a sender (#182 audit). They
+    // become a plain hyphen; what is left is the name as typed.
+    const name = sessionNames.get(conversationId);
+    if (typeof name !== "string" || !name) return null;
+    const safe = name.replace(/[[\]·]/g, "-").replace(/\s+/g, " ").trim();
+    return safe || null;
+  };
+  /**
+   * The member an address names: its routing label, the whole form the room shows
+   * (`Codex / Altrix Audit`), or the name alone when no other member has it. Accepting
+   * every form the room shows means an agent has nothing to cut (#182 audit).
+   */
+  const memberByAddress = (room, target) => {
+    const wanted = String(target).trim().toLowerCase();
+    const ids = [...room.members.keys()];
+    const exact = ids.find((id) => labelIn(room, id).toLowerCase() === wanted || shownIn(room, id).toLowerCase() === wanted);
+    if (exact) return exact;
+    // A label always wins, so the name alone answers only when no other member's label
+    // or name is the same (#182 audit).
+    const byName = ids.filter((id) => sessionNameOf(id)?.toLowerCase() === wanted);
+    return byName.length === 1 ? byName[0] : null;
+  };
+  const shownIn = (room, conversationId) => {
+    const name = sessionNameOf(conversationId);
+    return name ? `${labelIn(room, conversationId)} / ${name}` : labelIn(room, conversationId);
+  };
 
   const providerLabelFor = (conversationId) =>
     PROVIDER_LABELS[providerByConversation.get(conversationId)] ?? "Agent";
@@ -3694,6 +3731,7 @@ function startBridge(config) {
       return [...room.members].map(([conversationId, member]) => ({
         conversationId,
         provider: labelIn(room, conversationId),
+        name: sessionNameOf(conversationId),
         confirmed: member.confirmed === true,
         joinedAt: member.joinedAt,
         pending: Math.max(0, room.seq - member.readSeq),
@@ -3793,7 +3831,7 @@ function startBridge(config) {
     const confirmed = room.members.get(conversationId)?.confirmed === true;
     const others = [...room.members.keys()].filter((id) => id !== conversationId);
     const company = others.length > 0
-      ? ` Also here: ${others.map((id) => labelIn(room, id)).join(", ")}.`
+      ? ` Also here: ${others.map((id) => shownIn(room, id)).join(", ")}.`
       : " Nobody else is in it yet.";
     const text =
       `[Gyredeck: you are now in sync room ${name} — ${how}.${company}` +
@@ -3920,7 +3958,7 @@ function startBridge(config) {
   });
 
   const announceMembership = (name, room, note, except = null) => {
-    const present = [...room.members.keys()].map((id) => labelIn(room, id));
+    const present = [...room.members.keys()].map((id) => shownIn(room, id));
     const text = `${note} Members now: ${present.join(", ") || "nobody"}.`;
     const notice = publishMail(room, ROOM_SENDER, text, null);
     // A room notice is published and readable but wakes nobody: the roster it carries
@@ -3991,6 +4029,7 @@ function startBridge(config) {
             return [...sync.room.members].map(([conversationId, member]) => ({
               conversationId,
               provider: labelIn(sync.room, conversationId),
+              name: sessionNameOf(conversationId),
               confirmed: member.confirmed === true,
               you: conversationId === as,
             }));
@@ -4539,7 +4578,7 @@ function startBridge(config) {
    * in and has read nothing yet.
    */
   const codexRoomEnvelope = (roomName, room, recipient, text, { full = false } = {}) => {
-    const roster = [...room.members.keys()].map((id) => labelIn(room, id)).join(", ");
+    const roster = [...room.members.keys()].map((id) => shownIn(room, id)).join(", ");
     const wasPublished = publishedForCodex.get(recipient);
     const seqLine = wasPublished
       ? ` Your previous message reached the room as seq ${wasPublished}.`
@@ -4578,7 +4617,7 @@ function startBridge(config) {
       // ten seconds, because "is there anything else?" is not an acknowledgement in
       // its own reading. A label it writes is something it can get right.
       " Open your message with one line saying who it is for and what it is:" +
-      " @everyone ask, @Antigravity tell, @everyone reaction, or any member's name" +
+      " @everyone ask, @Antigravity tell, @everyone reaction, or any member as the room shows it" +
       " in place of everyone. The line is removed before the room sees it. ask wants" +
       " an answer; tell does not but may draw a reaction; a reaction is a short line" +
       " saying it landed and where that leaves you — send one for a tell or for a" +
@@ -4730,7 +4769,7 @@ function startBridge(config) {
           }
           const outgoing = from === ROOM_SENDER
             ? text
-            : `[Gyredeck · mailbox — a message to you alone, from ${codexEnvelopeLabel(labelIn(room, from))}.` +
+            : `[Gyredeck · mailbox — a message to you alone, from ${codexEnvelopeLabel(shownIn(room, from))}.` +
               " Answer it as ordinary text in this turn; the bridge reads your answer from" +
               (replyTo === null
                 ? " your own log and keeps it in your mailbox.]\n\n"
@@ -4744,7 +4783,7 @@ function startBridge(config) {
         // Who it is from and which kind it is, in the words the rules use: without the kind
         // a tell and a reaction with the same body arrived byte-identical, and "never answer
         // a reaction" could not be kept (#157).
-        const fromLabel = from === ROOM_SENDER ? "the room" : from === "gyredeck" ? "the user, via Gyredeck" : labelIn(room, from);
+        const fromLabel = from === ROOM_SENDER ? "the room" : from === "gyredeck" ? "the user, via Gyredeck" : shownIn(room, from);
         const kind = typeof routing?.kind === "string" ? routing.kind : MAIL_DEFAULT_KIND;
         const outgoing = codexRoomEnvelope(
           roomName,
@@ -5253,7 +5292,7 @@ function startBridge(config) {
             readSeq: room.seq,
             lastReadAt: null,
           });
-          announceMembership(code, room, `${labelIn(room, conversationId)} joined this room.`);
+          announceMembership(code, room, `${shownIn(room, conversationId)} joined this room.`);
           // The room's own announcement reaches everyone who can already read it; the
           // one being added usually cannot, and hears about it here instead.
           tellJoined(code, room, conversationId, "someone put you in it from the app");
@@ -5294,7 +5333,7 @@ function startBridge(config) {
           sendJson(200, { ok: true, room: code, closed: true, members: [] });
           return;
         }
-        const label = labelIn(room, conversationId);
+        const label = shownIn(room, conversationId);
         retireLabel(room, conversationId);
         room.touchedAt = Date.now();
         // The one leaving is told first, while the room object is still here to name.
@@ -5439,7 +5478,7 @@ function startBridge(config) {
               // Named, not raw ids: this list is read by a person in Settings, and a
       // conversation id tells them nothing.
       members: (() => {
-        return [...room.members.keys()].map((id) => labelIn(room, id));
+        return [...room.members.keys()].map((id) => shownIn(room, id));
       })(),
       // Named so a listing can tell which rooms the person may close from here.
       founder: room.createdBy ?? null,
@@ -5823,9 +5862,7 @@ function startBridge(config) {
         // address nobody will use.
         const addressed = routedTo === MAIL_EVERYONE || room.members.has(routedTo)
           ? routedTo
-          : [...room.members.keys()].find(
-              (id) => labelIn(room, id).toLowerCase() === routedTo.toLowerCase(),
-            ) ?? routedTo;
+          : memberByAddress(room, routedTo) ?? routedTo;
         if (
           heldWouldOverflow(room, { from, to: addressed, kind: routedKind, text })
         ) {
@@ -5836,7 +5873,7 @@ function startBridge(config) {
           // same as delivering them.
           const waiting = [...room.members]
             .filter(([, member]) => member.confirmed !== true)
-            .map(([id]) => labelIn(room, id));
+            .map(([id]) => shownIn(room, id));
           sendJson(409, {
             ok: false,
             error: "held_backlog_full",
@@ -5853,7 +5890,7 @@ function startBridge(config) {
           // taking a message from the session it was addressed to — which is what used to
           // happen, without a word to anyone. The sender is told instead, and told who to
           // wait for.
-          const waiting = slowestReaders(room).map((id) => labelIn(room, id));
+          const waiting = slowestReaders(room).map((id) => shownIn(room, id));
           sendJson(409, {
             ok: false,
             error: "room_full",

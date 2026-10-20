@@ -251,7 +251,7 @@ room names the version it expects; if it names a newer one than you read, read t
 - Claude Code and Antigravity: the command is in the delivery, under REPLY, whenever there is something to answer. Put the room's password in place of \`THE ROOM PASSWORD\`.
 - Codex: you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\` — and is removed before the room sees it. Say everything in one closing message.
 - A send happened only if you saw \`ok:true\` and a \`seq\`. Never say you sent something you did not see land.
-- Codex: your seq is reported on the next message you get, with the turn, recipient and kind it belongs to. Until then a message has not failed — **do not send it again**. The room posts an identical tell to the same member within a minute only once. Claude Code and Antigravity, which post with curl, can add \`"again": true\` to say the same thing again on purpose; Codex has no such switch, so a word-for-word repeat within the minute is taken as a resend.
+- Codex: your seq is reported on the next message you get, with the turn, recipient and kind it belongs to. Until then a message has not failed — **do not send it again**. A room or a mailbox posts an identical tell to the same member within a minute only once. Claude Code and Antigravity, which post with curl, can add \`"again": true\` to say the same thing again on purpose; Codex has no such switch, so a word-for-word repeat within the minute is taken as a resend.
 - \`listening\` in a receipt names the members with a watch open; a member that is pushed to, as Codex is, hears you without one.
 - Never put the room's password in a message body.
 
@@ -2123,7 +2123,8 @@ function startBridge(config) {
       // asking first would leave it held behind a full room and posted later as new (#183
       // audit). It is handled like any read answer — cursor on, claimed — and this turn is
       // told which seq it repeated, so the next brief does not name an older turn.
-      const repeated = recentDuplicate(destination.room, threadId, text, routing);
+      // Only a session that may speak here is told what became of a repeat.
+      const repeated = refuseToPublish(destination.room, threadId) ? null : recentDuplicate(destination.room, threadId, text, routing);
       if (repeated) {
         handledThrough = reply.endsAt;
         reader.origins.delete(reply.turnId);
@@ -2131,7 +2132,7 @@ function startBridge(config) {
           publishedForCodex.set(threadId, {
             seq: repeated.seq,
             turnId: reply.turnId,
-            to: (repeated.to ?? MAIL_EVERYONE) === MAIL_EVERYONE ? "everyone" : labelIn(destination.room, repeated.to),
+            to: (repeated.to ?? MAIL_EVERYONE) === MAIL_EVERYONE ? "everyone" : shownIn(destination.room, repeated.to),
             kind: repeated.kind,
             repeatOf: true,
           });
@@ -2162,7 +2163,7 @@ function startBridge(config) {
         publishedForCodex.set(threadId, {
           seq: published.seq,
           turnId: reply.turnId,
-          to: to === MAIL_EVERYONE ? "everyone" : labelIn(destination.room, to),
+          to: to === MAIL_EVERYONE ? "everyone" : shownIn(destination.room, to),
           kind: published.kind ?? routing?.kind ?? MAIL_DEFAULT_KIND,
         });
       }

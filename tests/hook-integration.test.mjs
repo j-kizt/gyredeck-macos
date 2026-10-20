@@ -2378,6 +2378,48 @@ test("a session the broker bound and then turned away is told its mail is held, 
   }
 });
 
+test("a message over the size limit is refused with the limit and its own length named (#184)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-too-long-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const send = async (body) => {
+      const response = await fetch(`http://127.0.0.1:${port}/mail/a1840000-0000-4000-8000-000000000001`, {
+        method: "POST", headers: { "content-type": "application/json", "x-gyredeck-token": token }, body: JSON.stringify(body),
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const tooLong = await send({ from: "gyredeck-app", text: "x".repeat(5_000) });
+    assert.equal(tooLong.status, 400);
+    assert.equal(tooLong.body.error, "message_too_long");
+    assert.equal(tooLong.body.limit, 4_096);
+    assert.equal(tooLong.body.length, 5_000);
+    assert.equal(tooLong.body.unit, "utf16");
+    assert.match(tooLong.body.message, /at most 4096 UTF-16 units and this one is 5000/);
+    // An emoji is two units, and the answer says so rather than calling it two characters.
+    const emoji = await send({ from: "gyredeck-app", text: "😀".repeat(2_100) });
+    assert.deepEqual([emoji.status, emoji.body.length], [400, 4_200]);
+    assert.match(emoji.body.message, /4200 \(most characters are one unit; an emoji is two\)/);
+    assert.equal((await send({ from: "gyredeck-app", text: "x".repeat(4_096) })).status, 202, "the limit itself is allowed");
+    const missing = await send({ from: "gyredeck-app" });
+    assert.deepEqual([missing.status, missing.body.error, missing.body.message], [400, "invalid_message", "text is missing."]);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("what an agent may act on depends on who sent it, in three tiers", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-tiers-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });

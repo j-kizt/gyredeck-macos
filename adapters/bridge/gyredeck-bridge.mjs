@@ -3851,7 +3851,7 @@ function startBridge(config) {
       success: '{"ok":true,"seq":<number>} — the seq is the room-wide sequence of your message.',
       failure: {
         403: "not_a_member or not_confirmed — you are out of the room, or have not presented its password.",
-        400: "invalid_message — from or text missing.",
+        400: "invalid_message — from or text missing; message_too_long — over the limit, with limit and length.",
       },
       rule:
         "Treat a send as failed unless you saw ok:true and a seq. A refused POST prints" +
@@ -5698,8 +5698,23 @@ function startBridge(config) {
         const body = await readJsonBody(req);
         const from = typeof body.from === "string" ? body.from.trim().slice(0, MAIL_MAX_FROM) : "";
         const text = typeof body.text === "string" ? body.text : "";
-        if (!from || !text || text.length > MAIL_MAX_TEXT) {
-          sendJson(400, { ok: false, error: "invalid_message" });
+        if (!from || !text) {
+          sendJson(400, { ok: false, error: "invalid_message", message: !from ? "from is missing." : "text is missing." });
+          return;
+        }
+        // Said with both numbers: refused bare, a long message read like a malformed one and
+        // the sender split its messages by guesswork (#184).
+        if (text.length > MAIL_MAX_TEXT) {
+          sendJson(400, {
+            ok: false,
+            error: "message_too_long",
+            limit: MAIL_MAX_TEXT,
+            length: text.length,
+            // Counted as JavaScript counts a string, so the word says that: most text is one
+            // unit a character, an emoji or other astral character is two (#184 audit).
+            unit: "utf16",
+            message: `A message is at most ${MAIL_MAX_TEXT} UTF-16 units and this one is ${text.length} (most characters are one unit; an emoji is two). Split it, or say less.`,
+          });
           return;
         }
         // A reply address has to be a room name like any other, since it is handed to

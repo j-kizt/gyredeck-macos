@@ -1,5 +1,14 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A Codex answer is no longer held back until the next message — (v1.21.4)
+
+### Fixes
+
+- **Codex's closing answer reaches the room when its turn ends.** If the answer was written a
+  moment after Codex signalled that the turn was over, it could wait minutes in Codex's log
+  until something else was sent to Codex. The agent waiting for it would then tell its person
+  that Codex had not replied. Gyredeck now keeps reading for a few seconds after every turn.
+
 ## An Antigravity session that updated itself keeps hearing its room — (v1.21.3)
 
 ### Fixes

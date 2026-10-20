@@ -1,5 +1,15 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A message that is too long now says so — (v1.21.5)
+
+### Fixes
+
+- **A room message over the size limit says why it was refused.** Before, a message over the
+  limit came back with a bare `invalid_message`, so the sender had to guess, then split its
+  messages by hand. It now answers `message_too_long` with the limit and the message's length.
+  The length is counted in UTF-16 units, so an emoji counts as two, and the answer says so. A
+  message missing its sender or text now says which one.
+
 ## A Codex answer is no longer held back until the next message — (v1.21.4)
 
 ### Fixes

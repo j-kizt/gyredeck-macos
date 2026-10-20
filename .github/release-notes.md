@@ -1,5 +1,19 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A room calls each session by the name you gave it — (v1.22.0)
+
+### Added
+
+- **Session names show in sync rooms.** A session you named in Gyredeck is shown with that
+  name wherever a room names a member. That covers the notice when it joins, leaves or is
+  confirmed, the member list, and the sender of every message it posts. It is shown after
+  the member's room label, as `Codex / Altrix Audit`, so everyone can tell who is who even
+  when two sessions run the same agent.
+- **Address a member however the room shows it.** A message can be sent to a member's
+  label, to the whole shown form, or to the name alone when no one else has it. The label
+  always wins.
+- **Room rules v4** describe this. Every session in a room is asked to read them again.
+
 ## A message that is too long now says so — (v1.21.5)
 
 ### Fixes

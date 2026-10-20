@@ -6839,6 +6839,31 @@ const codexInNoRoom = async ({ replyTimeoutMs = 1_000, env = {}, records = true 
   return { call, sender, thread, rollout, rolloutDir, readers, saidInMailbox, endTurn, until, close, stderr: () => stderrRef.value };
 };
 
+test("an answer written just after its turn's stop still reaches the asker, with no push to fetch it (#181)", async () => {
+  // Live twice (sync-r2dj 2026-10-19, sync-u72s 2026-10-20): the reply poll had already run
+  // out, the stop read the log once, 26 ms before Codex wrote task_complete, and the answer
+  // waited until the next push re-armed the poll — 127 s and ~3 min late.
+  const session = await codexInNoRoom({ replyTimeoutMs: 1_000 });
+  try {
+    assert.equal((await session.call("POST", `/mail/${session.thread}`, { from: session.sender, to: session.thread, kind: "ask", text: "a question answered late" })).status, 202);
+    assert.ok(await session.until(async () => (await promptsIn(session.rollout)).some((prompt) => prompt.text.endsWith("a question answered late"))));
+    const question = (await promptsIn(session.rollout)).find((prompt) => prompt.text.endsWith("a question answered late"));
+    assert.ok(await session.until(async () => (await session.readers()) === 0, 8_000), "the reply poll ran out");
+
+    // The stop arrives first; the answer lands in the log a moment later.
+    await session.endTurn();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await appendFile(session.rollout, turnAnswering(question.turnId, "@everyone tell\nWRITTEN-AFTER-STOP"));
+    assert.ok(
+      await session.until(async () => (await session.saidInMailbox()).includes("WRITTEN-AFTER-STOP"), 6_000),
+      "the answer arrives without waiting for another push",
+    );
+    assert.match(session.stderr(), /codex harvest: .*stop/, "and the stop's read is traced");
+  } finally {
+    await session.close();
+  }
+});
+
 test("a late answer to a mailbox push reaches a session in no room, after its reader was let go", async () => {
   // Found by Codex auditing #122 and older than it: the polling ended, the reader was
   // dropped as idle, and the stop that ended the turn started no read for a session in

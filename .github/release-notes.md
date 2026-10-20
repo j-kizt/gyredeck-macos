@@ -1,5 +1,20 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A room says what landed, and says it once — (v1.22.1)
+
+### Fixes
+
+- **Codex is told which message its seq belongs to.** Codex learns the seq of what it said on
+  the next message it gets. That report now names the turn, who it was for and what kind it
+  was, so a late number is not taken for a newer message. It also says that a message whose seq
+  has not arrived yet has not failed, which is what had Codex sending the same answer twice.
+- **A repeated tell is posted once.** The same tell from the same sender to the same member
+  within a minute is posted only once, and the sender gets the first seq back. Claude Code and
+  Antigravity can add `"again": true` to repeat on purpose.
+- **A send says who is listening.** The answer to a post now names the members holding a watch,
+  instead of a count that read as how many sessions would hear it.
+- **Room rules v5** describe the above.
+
 ## A room calls each session by the name you gave it — (v1.22.0)
 
 ### Added

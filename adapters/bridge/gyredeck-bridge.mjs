@@ -2190,7 +2190,14 @@ function startBridge(config) {
     // pushed to and parked comes back for this turn, and is parked again after.
     const reader = codexReaders.get(conversationId);
     if (!reader && !confirmed && !parkedCodexReader(conversationId)) return;
-    readCodexSession(reader ?? codexReaderFor(conversationId), { turnEnded: true });
+    const target = reader ?? codexReaderFor(conversationId);
+    // A stop can be read before the answer it ends is in the log: Codex writes
+    // task_complete a few ms after the hook fires (26 ms, measured live). Once a push's
+    // poll had run out, that one read was the last, and the answer waited for the next
+    // push (#181). A stop now keeps the poll going a little longer, whatever came before.
+    target.pollUntil = Math.max(target.pollUntil ?? 0, Date.now() + CODEX_STOP_GRACE_MS);
+    console.error(`gyredeck: codex harvest: stop for ${conversationId}, reading its log for ${CODEX_STOP_GRACE_MS / 1_000} s`);
+    readCodexSession(target, { turnEnded: true });
   };
   // One Codex turn ending can arrive twice: once from the full hooks and once from
   // notify. Random hookIds mean shouldEmitHookSignal cannot pair them, so they are
@@ -3291,6 +3298,9 @@ function startBridge(config) {
   // minutes it could not; nothing else sets it.
   const CODEX_REPLY_TIMEOUT_MS = Number(process.env.GYREDECK_CODEX_REPLY_TIMEOUT_MS) || 120_000;
   const CODEX_REPLY_POLL_MS = 1_000;
+  // How long a turn's stop keeps reading for its answer (#181). Seconds, not minutes: it
+  // covers the gap between the hook and Codex's own write, nothing more.
+  const CODEX_STOP_GRACE_MS = 5_000;
 
   /** Newest rollout log for a Codex thread, or null when the session is unknown. */
   const codexRolloutFor = (threadId) => {

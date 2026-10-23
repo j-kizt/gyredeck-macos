@@ -1,10 +1,15 @@
 import type { IUsageSettings, UsageTimeFormat } from "./types";
 
 const STORAGE_KEY = "gyredeck.usage-settings";
-const VALID_REFRESH_MINUTES = [5, 15, 30, 60];
+/**
+ * The same for every provider (#192). Three minutes is the floor because it is about the
+ * interval reported safe for Claude's usage endpoint; asked faster, it answers 429.
+ * A saved value no longer listed (5, 15) falls back to the default.
+ */
+export const REFRESH_MINUTES = [3, 10, 30, 60];
 
 export const DEFAULT_USAGE_SETTINGS: IUsageSettings = {
-  refreshMs: 15 * 60_000,
+  refreshMs: 3 * 60_000,
   usageMode: "left",
   resetMode: "relative",
   timeFormat: "auto",
@@ -23,7 +28,7 @@ export const readUsageSettings = (): IUsageSettings => {
     return {
       refreshMs:
         typeof parsed.refreshMs === "number" &&
-        VALID_REFRESH_MINUTES.includes(parsed.refreshMs / 60_000)
+        REFRESH_MINUTES.includes(parsed.refreshMs / 60_000)
           ? parsed.refreshMs
           : DEFAULT_USAGE_SETTINGS.refreshMs,
       usageMode: parsed.usageMode === "used" ? "used" : "left",

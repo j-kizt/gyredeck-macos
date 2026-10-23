@@ -1,5 +1,18 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A pasted room password always says which room — (v1.22.2)
+
+### Fixes
+
+- **A Claude Code session is always told which room its password opened.** Pasting a room's
+  password confirmed the session. But when the mail that should have followed could not be
+  collected that turn, the session heard nothing at all: not that the password worked, not
+  the room's name, not how to watch it. So it could not arm its watch, and the room could not
+  reach it. The mail is held back when the broker refuses the session, sends an answer that
+  cannot be read, or the bridge refuses a broker-bound session. Now a confirmed password always
+  names the room and gives the watch command, and says why the waiting mail did not come with
+  it. The mail itself still waits until it can be collected.
+
 ## A room says what landed, and says it once — (v1.22.1)
 
 ### Fixes

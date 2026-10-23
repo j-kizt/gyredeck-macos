@@ -1,5 +1,31 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Usage keeps up every 3 minutes, and a rate limit no longer goes quiet — (v1.23.0)
+
+### Changed
+
+- **Usage refreshes every 3 minutes by default.** The choices are now 3 min, 10 min, 30 min
+  and 1 hour, the same for every provider. A low-usage notice can therefore arrive up to 3
+  minutes after the limit is crossed, instead of up to 15. Three minutes is about the shortest
+  interval Claude's usage endpoint is reported to accept. A saved interval that is no longer
+  offered (5 or 15 min) moves to the new default.
+
+### Fixes
+
+- **A rate-limited Claude reading no longer freezes the numbers a room sees.** When Claude's
+  usage endpoint answered "too many requests", the app showed its last good reading, marked
+  outdated, which was right. But it also passed that reading to the bridge as if it were new.
+  So the room's numbers stopped moving, and a limit crossing 10 % while they were stuck was
+  never announced. Now only a fresh reading reaches the room.
+- **The app waits as long as Claude asks it to.** After "too many requests", the next refresh
+  asked again at once, which only earned another refusal. It now honours the wait the endpoint
+  names, in seconds or as a date. That holds across a sign-in token refresh, but not across a
+  switch to another account.
+- **A provider that is not online no longer leads the Usage tabs.** The order counted any kept
+  numbers as "in use", while the green dot asked whether the provider was online. So a provider
+  with no dot could sit first. Online providers now lead, then providers keeping an old reading,
+  then providers with none.
+
 ## A pasted room password always says which room — (v1.22.2)
 
 ### Fixes

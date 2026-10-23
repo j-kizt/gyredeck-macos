@@ -355,6 +355,13 @@ struct CcusageCacheEntry {
 static CLAUDE_LAST_GOOD_USAGE: OnceLock<Mutex<HashMap<String, CodexUsageSnapshot>>> =
     OnceLock::new();
 
+/// When Claude's usage endpoint said to come back, per account. A refresh before then asks
+/// nothing and answers from the last good reading: asking again inside Retry-After is what
+/// turns one 429 into a run of them (#192).
+static CLAUDE_RETRY_NOT_BEFORE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+/// Used when a 429 names no Retry-After: about the interval reported safe for this endpoint.
+const CLAUDE_RETRY_FALLBACK_SECONDS: u64 = 180;
+
 static CODEX_CCUSAGE_CACHE: OnceLock<Mutex<Option<CcusageCacheEntry>>> = OnceLock::new();
 static CODEX_CCUSAGE_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -1097,12 +1104,99 @@ fn agy_usage_blocking() -> Result<CodexUsageSnapshot, String> {
 
 #[tauri::command]
 async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(|| claude_usage_blocking().inspect(relay_usage))
-        .await
-        .map_err(|error| format!("Claude usage task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(|| {
+        claude_usage_blocking().map(|reading| relay_if_fresh(reading, relay_usage))
+    })
+    .await
+    .map_err(|error| format!("Claude usage task failed: {error}"))?
 }
 
-fn claude_usage_blocking() -> Result<CodexUsageSnapshot, String> {
+/// A Claude usage answer, and whether it was read just now or kept from before a 429.
+struct ClaudeUsageReading {
+    snapshot: CodexUsageSnapshot,
+    fresh: bool,
+}
+
+/// A reading kept from before a 429 is not news. Relayed, it reached the bridge as a fresh
+/// one, so the numbers froze there and a limit crossing 10 % while they were frozen was
+/// never announced (#192).
+fn relay_if_fresh(
+    reading: ClaudeUsageReading,
+    relay: impl FnOnce(&CodexUsageSnapshot),
+) -> CodexUsageSnapshot {
+    if reading.fresh {
+        relay(&reading.snapshot);
+    }
+    reading.snapshot
+}
+
+/// Refresh the token, and carry what is known about this account over to the new one. The
+/// wait and the last good reading are keyed by the token pair, which a refresh replaces. They
+/// move only when the refresh began from the very pair they belong to. A refresh re-reads the
+/// credential first, and a pair that changed underneath may be another account the person
+/// switched to; its numbers must not show up as theirs (#192 audit).
+fn refresh_claude_token_keeping_state(
+    client: &reqwest::blocking::Client,
+    auth: &mut ClaudeAuthState,
+) -> Result<(), String> {
+    let before = claude_auth_fingerprint(auth);
+    let refreshed_from = refresh_claude_token(client, auth)?;
+    carry_claude_state(&before, &refreshed_from, &claude_auth_fingerprint(auth));
+    Ok(())
+}
+
+fn carry_claude_state(before: &str, refreshed_from: &str, after: &str) {
+    if before != refreshed_from || before == after {
+        return;
+    }
+    if let Ok(mut guard) = CLAUDE_RETRY_NOT_BEFORE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        if let Some(not_before) = guard.remove(before) {
+            guard.insert(after.to_string(), not_before);
+        }
+    }
+    if let Ok(mut guard) = CLAUDE_LAST_GOOD_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        if let Some(snapshot) = guard.remove(before) {
+            guard.insert(after.to_string(), snapshot);
+        }
+    }
+}
+
+/// Seconds left before this account may be asked again, if it was told to wait.
+fn claude_retry_remaining(auth: &ClaudeAuthState, now: Instant) -> Option<u64> {
+    let guard = CLAUDE_RETRY_NOT_BEFORE.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
+    let not_before = *guard.get(&claude_auth_fingerprint(auth))?;
+    let left = not_before.checked_duration_since(now)?;
+    (!left.is_zero()).then(|| left.as_secs().max(1))
+}
+
+/// Remember a 429 and hand back the kept reading, which is never fresh.
+fn claude_rate_limited_reading(
+    auth: &ClaudeAuthState,
+    retry_after_seconds: Option<u64>,
+    now: Instant,
+) -> ClaudeUsageReading {
+    // Honoured as sent. Only a wait the clock cannot even represent (a u64 parse of a
+    // nonsense header) falls back, rather than overflowing (#192 audit).
+    let asked = retry_after_seconds.unwrap_or(CLAUDE_RETRY_FALLBACK_SECONDS);
+    let (wait, not_before) = match now.checked_add(Duration::from_secs(asked)) {
+        Some(not_before) => (asked, Some(not_before)),
+        None => (
+            CLAUDE_RETRY_FALLBACK_SECONDS,
+            now.checked_add(Duration::from_secs(CLAUDE_RETRY_FALLBACK_SECONDS)),
+        ),
+    };
+    if let Some(not_before) = not_before {
+        if let Ok(mut guard) = CLAUDE_RETRY_NOT_BEFORE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+            guard.insert(claude_auth_fingerprint(auth), not_before);
+        }
+    }
+    ClaudeUsageReading {
+        snapshot: claude_rate_limited_snapshot(auth, Some(wait)),
+        fresh: false,
+    }
+}
+
+fn claude_usage_blocking() -> Result<ClaudeUsageReading, String> {
     let candidates = load_claude_auth_candidates();
     if candidates.is_empty() {
         return Err("Claude Code auth not found. Run `claude` to log in.".to_string());
@@ -1117,8 +1211,16 @@ fn claude_usage_blocking() -> Result<CodexUsageSnapshot, String> {
             continue;
         }
 
+        // Before any refresh: a refresh is a call too, and waiting means asking nothing.
+        if let Some(wait) = claude_retry_remaining(&auth, Instant::now()) {
+            return Ok(ClaudeUsageReading {
+                snapshot: claude_rate_limited_snapshot(&auth, Some(wait)),
+                fresh: false,
+            });
+        }
+
         if claude_needs_refresh(&auth) {
-            if let Err(message) = refresh_claude_token(&client, &mut auth) {
+            if let Err(message) = refresh_claude_token_keeping_state(&client, &mut auth) {
                 last_error = Some(message);
                 continue;
             }
@@ -1126,22 +1228,25 @@ fn claude_usage_blocking() -> Result<CodexUsageSnapshot, String> {
 
         match fetch_claude_usage(&client, &auth) {
             Ok(usage) => {
-                return Ok(store_claude_last_good(
-                    &auth,
-                    build_claude_usage_snapshot(usage, &auth),
-                ))
+                return Ok(ClaudeUsageReading {
+                    snapshot: store_claude_last_good(&auth, build_claude_usage_snapshot(usage, &auth)),
+                    fresh: true,
+                })
             }
             Err(CodexUsageFetchError::Auth) => {
-                if let Err(message) = refresh_claude_token(&client, &mut auth) {
+                if let Err(message) = refresh_claude_token_keeping_state(&client, &mut auth) {
                     last_error = Some(message);
                     continue;
                 }
                 match fetch_claude_usage(&client, &auth) {
                     Ok(usage) => {
-                        return Ok(store_claude_last_good(
-                            &auth,
-                            build_claude_usage_snapshot(usage, &auth),
-                        ))
+                        return Ok(ClaudeUsageReading {
+                            snapshot: store_claude_last_good(
+                                &auth,
+                                build_claude_usage_snapshot(usage, &auth),
+                            ),
+                            fresh: true,
+                        })
                     }
                     Err(CodexUsageFetchError::Auth) => {
                         last_error = Some(
@@ -1150,13 +1255,13 @@ fn claude_usage_blocking() -> Result<CodexUsageSnapshot, String> {
                         );
                     }
                     Err(CodexUsageFetchError::RateLimited(retry_after)) => {
-                        return Ok(claude_rate_limited_snapshot(&auth, retry_after));
+                        return Ok(claude_rate_limited_reading(&auth, retry_after, Instant::now()));
                     }
                     Err(CodexUsageFetchError::Other(message)) => last_error = Some(message),
                 }
             }
             Err(CodexUsageFetchError::RateLimited(retry_after)) => {
-                return Ok(claude_rate_limited_snapshot(&auth, retry_after));
+                return Ok(claude_rate_limited_reading(&auth, retry_after, Instant::now()));
             }
             Err(CodexUsageFetchError::Other(message)) => last_error = Some(message),
         }
@@ -2997,13 +3102,74 @@ fn read_retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64>
     headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
+        .and_then(|value| parse_retry_after(value, time::OffsetDateTime::now_utc()))
 }
 
+/// Retry-After is either seconds or an HTTP date (RFC 9110 §10.2.3). Read as seconds only, a
+/// date fell to the 180-second fallback and asked again long before it said to (#192 audit).
+/// All three date forms a recipient must accept are read (§5.6.7). The wait is rounded up,
+/// since rounding down asks again just before the moment named. A date already past means
+/// asking is allowed now.
+fn parse_retry_after(value: &str, now: time::OffsetDateTime) -> Option<u64> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds);
+    }
+    let at = parse_http_date(value, now.year())?;
+    let left = at - now;
+    let seconds = left.whole_seconds() + i64::from(left.subsec_nanoseconds() > 0);
+    Some(u64::try_from(seconds).unwrap_or(0))
+}
+
+/// The three HTTP-date forms (RFC 9110 §5.6.7), always GMT:
+/// `Sun, 06 Nov 1994 08:49:37 GMT` (IMF-fixdate), `Sunday, 06-Nov-94 08:49:37 GMT` (RFC 850)
+/// and `Sun Nov  6 08:49:37 1994` (asctime). A two-digit year more than 50 years ahead is
+/// the most recent past year with those digits, as the RFC says.
+fn parse_http_date(value: &str, this_year: i32) -> Option<time::OffsetDateTime> {
+    let month_of = |name: &str| {
+        const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        let index = MONTHS.iter().position(|month| *month == name)?;
+        time::Month::try_from(u8::try_from(index + 1).ok()?).ok()
+    };
+    let clock = |text: &str| -> Option<time::Time> {
+        let mut parts = text.split(':').map(|part| part.parse::<u8>().ok());
+        let (hour, minute, second) = (parts.next()??, parts.next()??, parts.next()??);
+        if parts.next().is_some() {
+            return None;
+        }
+        time::Time::from_hms(hour, minute, second).ok()
+    };
+    let words: Vec<&str> = value.split_whitespace().collect();
+    let (year, month, day, at) = match words.as_slice() {
+        [weekday, day, month, year, at, "GMT"] if weekday.ends_with(',') && year.len() == 4 => {
+            (year.parse::<i32>().ok()?, month_of(month)?, day.parse::<u8>().ok()?, clock(at)?)
+        }
+        [weekday, date, at, "GMT"] if weekday.ends_with(',') => {
+            let mut parts = date.split('-');
+            let (day, month, short) = (parts.next()?, parts.next()?, parts.next()?);
+            if parts.next().is_some() || short.len() != 2 {
+                return None;
+            }
+            let mut year = 2000 + short.parse::<i32>().ok()?;
+            if year > this_year + 50 {
+                year -= 100;
+            }
+            (year, month_of(month)?, day.parse::<u8>().ok()?, clock(at)?)
+        }
+        [_weekday, month, day, at, year] if year.len() == 4 => {
+            (year.parse::<i32>().ok()?, month_of(month)?, day.parse::<u8>().ok()?, clock(at)?)
+        }
+        _ => return None,
+    };
+    let date = time::Date::from_calendar_date(year, month, day).ok()?;
+    Some(time::PrimitiveDateTime::new(date, at).assume_utc())
+}
+
+/// Returns the fingerprint of the credential the refresh started from, as re-read.
 fn refresh_claude_token(
     client: &reqwest::blocking::Client,
     auth: &mut ClaudeAuthState,
-) -> Result<(), String> {
+) -> Result<String, String> {
     *auth = reload_claude_auth_source(auth)?;
     let source_fingerprint = claude_auth_fingerprint(auth);
     let oauth = auth
@@ -3049,7 +3215,7 @@ fn refresh_claude_token(
             Some((time::OffsetDateTime::now_utc().unix_timestamp() + expires_in) * 1000);
     }
     save_claude_auth(auth, &source_fingerprint)?;
-    Ok(())
+    Ok(source_fingerprint)
 }
 
 fn reload_claude_auth_source(auth: &ClaudeAuthState) -> Result<ClaudeAuthState, String> {
@@ -6077,6 +6243,140 @@ mod display_selection_tests {
             .lines
             .iter()
             .any(|line| matches!(line, CodexMetricLine::Text { label, .. } if label == "Status")));
+    }
+
+    #[test]
+    fn a_claude_429_is_kept_out_of_the_relay_and_not_asked_again_inside_retry_after() {
+        // #192: the kept reading went to the bridge as a fresh one, and the next refresh
+        // asked again at once, whatever Retry-After said.
+        let auth = claude_auth("retry-after-access", "retry-after-refresh");
+        let now = Instant::now();
+        assert_eq!(claude_retry_remaining(&auth, now), None, "the premise: never told to wait");
+
+        let reading = claude_rate_limited_reading(&auth, Some(120), now);
+        assert!(!reading.fresh, "a kept reading is never relayed as news");
+        assert_eq!(claude_retry_remaining(&auth, now), Some(120));
+        assert_eq!(claude_retry_remaining(&auth, now + Duration::from_secs(119)), Some(1));
+        assert_eq!(claude_retry_remaining(&auth, now + Duration::from_secs(120)), None, "asked again once the wait is over");
+
+        let other = claude_auth("retry-after-other-access", "retry-after-other-refresh");
+        assert_eq!(claude_retry_remaining(&other, now), None, "the wait belongs to the account told to wait");
+
+        let long = claude_auth("retry-after-long-access", "retry-after-long-refresh");
+        claude_rate_limited_reading(&long, Some(90_000), now);
+        assert_eq!(claude_retry_remaining(&long, now), Some(90_000), "25 hours is honoured as sent");
+
+        let huge = claude_auth("retry-after-huge-access", "retry-after-huge-refresh");
+        claude_rate_limited_reading(&huge, Some(u64::MAX), now);
+        assert_eq!(
+            claude_retry_remaining(&huge, now),
+            Some(CLAUDE_RETRY_FALLBACK_SECONDS),
+            "a wait the clock cannot represent falls back instead of overflowing"
+        );
+
+        let silent = claude_auth("retry-after-silent-access", "retry-after-silent-refresh");
+        claude_rate_limited_reading(&silent, None, now);
+        assert_eq!(
+            claude_retry_remaining(&silent, now),
+            Some(CLAUDE_RETRY_FALLBACK_SECONDS),
+            "a 429 with no Retry-After still waits"
+        );
+    }
+
+    #[test]
+    fn a_refreshed_claude_token_keeps_its_wait_and_its_last_good_reading() {
+        // #192 audit: both are keyed by the token pair, which a refresh replaces. Without
+        // carrying them over, a token refreshed inside Retry-After asked again at once and
+        // had no reading to show.
+        let before = claude_auth("carry-before-access", "carry-before-refresh");
+        let after = claude_auth("carry-after-access", "carry-after-refresh");
+        let now = Instant::now();
+        store_claude_last_good(
+            &before,
+            CodexUsageSnapshot {
+                provider_id: "claude".to_string(),
+                display_name: "Claude Code".to_string(),
+                plan: None,
+                lines: vec![],
+                fetched_at: "2026-10-24T01:00:00Z".to_string(),
+            },
+        );
+        claude_rate_limited_reading(&before, Some(300), now);
+        assert_eq!(claude_retry_remaining(&after, now), None, "the premise: the new token knows nothing yet");
+
+        // Another account switched in underneath: the refresh began from a pair that is not
+        // the one the wait and the reading belong to, so nothing moves.
+        let switched = claude_auth("carry-switched-access", "carry-switched-refresh");
+        carry_claude_state(
+            &claude_auth_fingerprint(&before),
+            &claude_auth_fingerprint(&switched),
+            &claude_auth_fingerprint(&after),
+        );
+        assert_eq!(claude_retry_remaining(&after, now), None, "a switched account inherits no wait");
+        assert!(read_claude_last_good(&after).is_none(), "and no numbers");
+
+        carry_claude_state(
+            &claude_auth_fingerprint(&before),
+            &claude_auth_fingerprint(&before),
+            &claude_auth_fingerprint(&after),
+        );
+
+        assert_eq!(claude_retry_remaining(&after, now), Some(300), "the wait moved to the refreshed token");
+        assert_eq!(claude_retry_remaining(&before, now), None);
+        assert_eq!(
+            read_claude_last_good(&after).map(|snapshot| snapshot.fetched_at),
+            Some("2026-10-24T01:00:00Z".to_string()),
+            "and so did the last good reading"
+        );
+    }
+
+    #[test]
+    fn retry_after_is_read_as_seconds_or_as_an_http_date() {
+        let now = parse_http_date("Sat, 24 Oct 2026 01:00:00 GMT", 2026).unwrap();
+        assert_eq!(parse_retry_after("120", now), Some(120));
+        assert_eq!(parse_retry_after(" 120 ", now), Some(120));
+        assert_eq!(
+            parse_retry_after("Sat, 24 Oct 2026 02:00:00 GMT", now),
+            Some(3_600),
+            "an HTTP date an hour ahead is an hour"
+        );
+        assert_eq!(parse_retry_after("Sat, 24 Oct 2026 00:00:00 GMT", now), Some(0), "a date already past waits nothing");
+        assert_eq!(parse_retry_after("Saturday, 24-Oct-26 02:00:00 GMT", now), Some(3_600), "RFC 850");
+        assert_eq!(parse_retry_after("Sat Oct 24 02:00:00 2026", now), Some(3_600), "asctime");
+        assert_eq!(parse_retry_after("Sat Oct  4 01:00:00 2026", now), Some(0), "asctime pads its day with a space");
+        assert_eq!(
+            parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT", 2026).map(|at| at.year()),
+            Some(1994),
+            "a two-digit year more than 50 years ahead is the past one"
+        );
+        assert_eq!(
+            parse_http_date("Friday, 06-Nov-26 08:49:37 GMT", 2026).map(|at| at.year()),
+            Some(2026)
+        );
+        let a_moment_in = now + time::Duration::milliseconds(400);
+        assert_eq!(
+            parse_retry_after("Sat, 24 Oct 2026 02:00:00 GMT", a_moment_in),
+            Some(3_600),
+            "3599.6 s is rounded up, not down"
+        );
+        assert_eq!(parse_retry_after("soon", now), None, "nonsense is not a wait");
+        assert_eq!(parse_retry_after("Sat, 24 Oct 2026 25:00:00 GMT", now), None, "an impossible time is not a wait");
+    }
+
+    #[test]
+    fn only_a_fresh_claude_reading_is_relayed() {
+        let snapshot = || CodexUsageSnapshot {
+            provider_id: "claude".to_string(),
+            display_name: "Claude Code".to_string(),
+            plan: None,
+            lines: vec![],
+            fetched_at: "2026-10-24T01:00:00Z".to_string(),
+        };
+        let mut relayed = 0;
+        relay_if_fresh(ClaudeUsageReading { snapshot: snapshot(), fresh: true }, |_| relayed += 1);
+        assert_eq!(relayed, 1, "the premise: a fresh reading is relayed");
+        relay_if_fresh(ClaudeUsageReading { snapshot: snapshot(), fresh: false }, |_| relayed += 1);
+        assert_eq!(relayed, 1, "a kept reading is not");
     }
 
     #[test]

@@ -10,7 +10,7 @@ import {
 } from "react";
 import { createAgentUsageState } from "./adapters";
 import { USAGE_METRIC_GROUPS, USAGE_PROVIDERS } from "./providers";
-import { formatAbsoluteTime, formatResetLabel } from "./settings";
+import { REFRESH_MINUTES, formatAbsoluteTime, formatResetLabel } from "./settings";
 import type {
   IAgentUsageState,
   IUsageMetric,
@@ -472,7 +472,7 @@ const SettingsPanel = ({ settings, onChange }: ISettingsPanelProps) => {
         <Segment
           value={`${settings.refreshMs}`}
           onChange={(value) => set({ refreshMs: Number(value) })}
-          options={[5, 15, 30, 60].map((value) => ({
+          options={REFRESH_MINUTES.map((value) => ({
             label: value === 60 ? "1 hour" : `${value} min`,
             value: `${value * 60_000}`,
           }))}

@@ -2240,6 +2240,136 @@ test("mail a hook has collected still reaches the session when building the deli
   }
 });
 
+test("a password accepted in a turn whose mail is withheld still names the room and how to hear it (#196)", async () => {
+  // Live on 2026-10-23: the person pasted a room's password three times, the bridge confirmed
+  // the session each time, and the session heard nothing. The drain that follows the
+  // confirmation was withheld, and a withheld drain said nothing at all, so the session
+  // never learned the room's name and could not arm its watch.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-196-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  let broker = null;
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+      return response.json();
+    };
+    const paste = async (session, prompt) => {
+      const result = await runAdapter(
+        "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
+        { hook_event_name: "UserPromptSubmit", session_id: session, cwd: "/tmp/project", prompt },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return { context: result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "", stderr: result.stderr };
+    };
+    const openRoom = async (founder) => {
+      const code = (await call("POST", "/sync/rooms", { conversationId: founder })).room;
+      const { password } = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+      return { code, password };
+    };
+    const assertTold = (context, code, session, why) => {
+      assert.match(context, new RegExp(`Gyredeck sync room ${code}\\b`), `${why}: the room is named`);
+      assert.match(context, /the password you were just given was accepted/, `${why}: the confirmation is said`);
+      assert.ok(context.includes(`/mail/${code}/events?as=${session}&since=resume`), `${why}: the watch command is there`);
+    };
+
+    // 1. The broker refuses the bind (`conflict`), so the drain is withheld.
+    const first = "a1960000-0000-4000-8000-000000000001";
+    const one = await openRoom(first);
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "conflict", message: "two claims" }));
+    let told = await paste(first, `here it is ${one.password}`);
+    assert.match(told.stderr, /mail withheld this turn — conflict/, "the withholding itself is unchanged");
+    assertTold(told.context, one.code, first, "withheld by the broker");
+    assert.match(told.context, /could not be collected this turn \(conflict/, "and why nothing else came");
+    const listed = await call("GET", `/sync/rooms?as=${first}`);
+    assert.equal(listed.members.find((member) => member.conversationId === first)?.confirmed, true, "the premise: the bridge did confirm it");
+    await broker.close();
+
+    // 2. The broker hands over a batch that cannot be read: withheld, and never acknowledged.
+    const second = "a1960000-0000-4000-8000-000000000002";
+    const two = await openRoom(second);
+    broker = await fakeBroker(home, (request) =>
+      request.collect
+        ? { v: 1, ok: true, delivery: 9, boundTo: second, messages: "not a list" }
+        : request.ack ? { v: 1, ok: true } : { v: 1, ok: true, bound: { conversationId: second, pid: 1 } });
+    told = await paste(second, two.password);
+    assertTold(told.context, two.code, second, "an unreadable batch");
+    assert.ok(broker.requests.every((request) => !request.ack), "the unreadable batch is not acknowledged");
+    await broker.close();
+    broker = null;
+
+    // 3. Control: without a password, a withheld drain stays silent, as it always was.
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "conflict", message: "two claims" }));
+    told = await paste(first, "hi");
+    assert.equal(told.context, "", "no confirmation, nothing to say");
+  } finally {
+    if (broker) await broker.close();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a password accepted while the bridge refuses the session's TCP read still names the room (#196 audit)", async () => {
+  // The third way the drain after a confirmation could come back empty-handed: the broker
+  // declines (`ineligible`), the hook falls back to TCP, and the bridge refuses a bound
+  // session's TCP read with 403. That path returned its "holding mail" line straight away,
+  // so the session was told mail was held but never which room it had just been given.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-196-403-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const founder = "a1960000-0000-4000-8000-000000000003";
+  let broker = null;
+  try {
+    bridge.stdin.write(`broker-secret ${"cd".repeat(32)}\nbroker-bound ${founder}\nbroker-ready\n`);
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+      return response.json();
+    };
+    const code = (await call("POST", "/sync/rooms", { conversationId: founder })).room;
+    const { password } = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "ineligible", message: "not a CLI this broker binds" }));
+    const result = await runAdapter(
+      "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
+      { hook_event_name: "UserPromptSubmit", session_id: founder, cwd: "/tmp/project", prompt: password },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stderr, /mail withheld this turn — the broker said ineligible, the bridge said broker_required/, "the premise: the TCP read was refused");
+    const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+    assert.match(context, new RegExp(`Gyredeck sync room ${code}\\b`), "the room is named");
+    assert.match(context, /the password you were just given was accepted/);
+    assert.ok(context.includes(`/mail/${code}/events?as=${founder}&since=resume`), "the watch command is there");
+    assert.match(context, /could not be collected this turn \(the broker said "ineligible" and the bridge said "broker_required"/, "and the held mail is still said");
+  } finally {
+    if (broker) await broker.close();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("the bridge keeps only a hash of a room's password, and hands the plaintext over once (#124)", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-room-hash-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });

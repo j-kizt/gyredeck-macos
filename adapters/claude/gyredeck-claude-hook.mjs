@@ -522,8 +522,10 @@ const ROOM_PASSWORD = /\b[0-9a-f]{32}\b/;
  * the person copies the room's password from its owner and types it in here, where the
  * session lives. Joining happens in the app; consenting happens in the terminal.
  *
- * Returns the room it confirmed, or null. Failure is deliberately quiet — a prompt that
- * merely looks like a password is not worth an error in front of the person.
+ * Returns the room it confirmed and who is in it, or null. Failure is deliberately quiet — a
+ * prompt that merely looks like a password is not worth an error in front of the person.
+ * The members come back with the answer so the session can be told where it is even when
+ * the drain that follows reads nothing (#196).
  */
 const confirmRoomPassword = async (endpoint, token, room, prompt) => {
   if (!token || typeof prompt !== "string") return null;
@@ -536,7 +538,8 @@ const confirmRoomPassword = async (endpoint, token, room, prompt) => {
     conversationId: room,
     password: match[0],
   });
-  return answer?.ok === true ? code : null;
+  if (answer?.ok !== true) return null;
+  return { room: code, members: Array.isArray(answer.members) ? answer.members : [] };
 };
 
 /**
@@ -546,7 +549,7 @@ const confirmRoomPassword = async (endpoint, token, room, prompt) => {
  */
 const plainDelivery = async (taken) => {
   const accepted = taken?.justConfirmed
-    ? "NEW: the password you were just given was accepted — you may now read and post here."
+    ? `NEW: the password you were just given was accepted for sync room ${taken.justConfirmed.room} — you may now read and post here.`
     : null;
   // Through the broker nothing is lost: an unacknowledged batch comes back on the next
   // collect and is built properly then. Only a TCP collect has already moved on. A
@@ -571,6 +574,8 @@ const plainDelivery = async (taken) => {
 
 const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null, taken = null) => {
   if (!token || !MAIL_ROOM_NAME.test(room)) return null;
+  // Known before anything can fail, so a delivery that throws still says it (#196).
+  if (taken) taken.justConfirmed = justConfirmed;
 
   // One call answers everything: what is waiting, which room this session is in, and
   // who else is in it. The bridge keeps each reader's position with the room, so there
@@ -580,12 +585,19 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // without ever delivering it.
   const viaBroker = await collectThroughBroker(room, MAIL_MAX_MESSAGES);
   let result = null;
+  // Mail that cannot be handed over this turn stays where it is, and saying nothing about it
+  // is the rule — except right after a password was accepted. Then the session has been
+  // given a room it does not yet know the name of, and silence leaves it unable to arm its
+  // watch, so the room can never reach it (#196: three pastes, no word of the room).
+  let heldBack = null;
   if (viaBroker.result) {
     if (!brokerBatchReadable(viaBroker.result)) {
       process.stderr.write("gyredeck: mail withheld this turn — the broker's answer could not be read as a batch\n");
-      return null;
+      if (!justConfirmed) return null;
+      heldBack = "the broker's answer could not be read as a batch";
+    } else {
+      result = viaBroker.result;
     }
-    result = viaBroker.result;
   } else if (viaBroker.fallback) {
     const answer = await getJsonStatus(endpoint, token, `/mail/inbox?as=${room}&collect=1&limit=${MAIL_MAX_MESSAGES}`, 750);
     // The broker sent this hook to TCP and the bridge will only serve the broker: mail is
@@ -593,12 +605,16 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
     // like an empty mailbox (#178).
     if (answer.status === 403 && typeof answer.body?.error === "string") {
       process.stderr.write(`gyredeck: mail withheld this turn — the broker said ${viaBroker.fallback}, the bridge said ${answer.body.error}\n`);
-      return `Gyredeck is holding mail for this session that it cannot hand over: the broker said "${viaBroker.fallback}" and the bridge said "${answer.body.error}". Tell the person at this terminal; restarting this session usually clears it.`;
+      const held = `Gyredeck is holding mail for this session that it cannot hand over: the broker said "${viaBroker.fallback}" and the bridge said "${answer.body.error}". Tell the person at this terminal; restarting this session usually clears it.`;
+      if (!justConfirmed) return held;
+      heldBack = `the broker said "${viaBroker.fallback}" and the bridge said "${answer.body.error}"; tell the person at this terminal, restarting this session usually clears it`;
+    } else {
+      result = answer.status === 200 ? answer.body : null;
     }
-    result = answer.status === 200 ? answer.body : null;
   } else {
     process.stderr.write(`gyredeck: mail withheld this turn — ${viaBroker.withheld}\n`);
-    return null;
+    if (!justConfirmed) return null;
+    heldBack = viaBroker.withheld;
   }
   const messages = Array.isArray(result?.messages) ? result.messages : [];
   const delivered = messages
@@ -609,7 +625,6 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   if (taken) {
     taken.messages = delivered;
     taken.result = result;
-    taken.justConfirmed = justConfirmed;
   }
   // Tests only: the one way to make building a delivery throw now that no message shape does.
   if (process.env.GYREDECK_TEST_FAULT === "delivery") throw new Error("injected delivery fault");
@@ -633,8 +648,12 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // untrusted invites the agent to discount it. Calling a room-mate's request
   // unauthorised breaks the entire point of a room — "one implements, another tests"
   // means the tester has to actually run the tests when asked.
-  const room_ = typeof result?.room === "string" ? result.room : null;
-  const members = Array.isArray(result?.members) ? result.members : [];
+  // What the drain read wins; the confirmation's own answer stands in when the drain read
+  // nothing, so the session is told its room either way (#196).
+  const room_ = typeof result?.room === "string" ? result.room : (justConfirmed?.room ?? null);
+  const members = Array.isArray(result?.members)
+    ? result.members
+    : (justConfirmed?.members ?? []).map((member) => ({ ...member, you: member.conversationId === room }));
   const byId = new Map(members.map((member) => [member.conversationId, member]));
   const mine = byId.get(room);
 
@@ -703,6 +722,9 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
 
   if (justConfirmed) {
     standing.push(`NEW: the password you were just given was accepted — you may now read and post here.`);
+    if (heldBack) {
+      standing.push(`Mail waiting for you could not be collected this turn (${heldBack}); it is still waiting, and the watch below will bring it.`);
+    }
   }
 
   if (room_ && mine && !confirmed) {

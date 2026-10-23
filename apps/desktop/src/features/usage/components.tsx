@@ -553,6 +553,9 @@ export interface IAgentUsageListProps {
   usages: Record<UsageProviderId, IAgentUsageState>;
 }
 
+/** One test for "online", so the tab's dot and the tab order cannot disagree (#197). */
+const isUsageOnline = (usage: IAgentUsageState | undefined): boolean => usage?.status === "online";
+
 export const AgentUsageList = ({
   onRefresh,
   refreshing = false,
@@ -563,12 +566,16 @@ export const AgentUsageList = ({
   const [selectedId, setSelectedId] =
     useState<UsageSidebarSelection | null>(null);
   const providers = useMemo(() => {
-    const isInUse = (usage: IAgentUsageState | undefined): boolean =>
-      usage?.status === "online" ||
-      (usage?.metrics.some((metric) => metric.statusLevel !== "unavailable") ?? false);
+    // Online leads, by the same test as the tab's green dot: a reading kept from before a
+    // failure still has numbers, and counting those as "in use" let a provider with no dot
+    // lead two that had one (#197). Kept numbers still rank above no reading at all.
+    const rankOf = (usage: IAgentUsageState | undefined): number => {
+      if (isUsageOnline(usage)) return 2;
+      return usage?.metrics.some((metric) => metric.statusLevel !== "unavailable") ? 1 : 0;
+    };
     return USAGE_PROVIDERS.map((provider, index) => ({ provider, index }))
       .sort((a, b) => {
-        const rank = Number(isInUse(usages[b.provider.id])) - Number(isInUse(usages[a.provider.id]));
+        const rank = rankOf(usages[b.provider.id]) - rankOf(usages[a.provider.id]);
         return rank !== 0 ? rank : a.index - b.index;
       })
       .map((entry) => entry.provider);
@@ -676,7 +683,7 @@ export const AgentUsageList = ({
             >
               <ProviderIcon provider={provider} size={13} />
               <span>{provider.label}</span>
-              {usages[provider.id]?.status === "online" ? (
+              {isUsageOnline(usages[provider.id]) ? (
                 <><span className="usage-side-dot" aria-hidden="true" /><span className="sr-only">Online</span></>
               ) : usages[provider.id]?.stale ? (
                 <span className="sr-only">Outdated</span>

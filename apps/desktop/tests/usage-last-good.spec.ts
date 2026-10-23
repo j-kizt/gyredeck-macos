@@ -293,3 +293,44 @@ test("refreshing usage says so on the control while the numbers stay put", async
   await page.evaluate(() => (window as typeof window & { __releaseUsage: () => void }).__releaseUsage());
   await expect(page.getByRole("button", { name: "Refresh usage" })).toBeEnabled();
 });
+
+test("a provider whose reading went stale sinks behind the online ones in the Usage tabs (#197)", async ({ page }) => {
+  // Antigravity is declared first. Once its refresh fails it keeps its old numbers but loses
+  // its green dot, and it used to keep leading the tabs anyway, because the order counted kept
+  // numbers as "in use" while the dot asked whether the provider was online.
+  await page.addInitScript(() => {
+    let agyCalls = 0;
+    const snapshot = (providerId: string, displayName: string) => ({
+      providerId,
+      displayName,
+      plan: "Pro",
+      fetchedAt: "2026-10-24T01:00:00Z",
+      lines: [{ type: "progress", label: "Session", used: 30, limit: 100, resetsAt: "2026-10-24T05:00:00Z" }],
+    });
+    (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (command: string) => {
+        if (command === "set_keep_awake") return false;
+        if (command === "agy_usage") {
+          agyCalls += 1;
+          if (agyCalls > 1) throw new Error("Antigravity usage is unavailable right now.");
+          return snapshot("agy", "Antigravity");
+        }
+        if (command === "claude_usage") return snapshot("claude", "Claude Code");
+        if (command === "codex_usage") return snapshot("codex", "Codex");
+        throw new Error(`${command} unavailable`);
+      },
+    };
+  });
+
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Usage" }).click();
+  const tabs = page.locator("[id^='usage-tab-']:not(#usage-tab-settings)");
+  // The premise: all three online, so declaration order holds and Antigravity leads.
+  await expect(tabs).toHaveText([/Antigravity/, /Claude Code/, /Codex/]);
+  await expect(page.locator("#usage-tab-agy .usage-side-dot")).toHaveCount(1);
+
+  await page.getByRole("button", { name: "Refresh usage" }).click();
+
+  await expect(page.locator("#usage-tab-agy .usage-side-dot")).toHaveCount(0);
+  await expect(tabs).toHaveText([/Claude Code/, /Codex/, /Antigravity/]);
+});

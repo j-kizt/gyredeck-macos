@@ -355,6 +355,71 @@ const ackDelivery = async (result, deadlineMs = BROKER_DEADLINE_MS) => {
 /** A batch from the broker that can be read: messages a list, missed absent or a list. Anything else is withheld and never acknowledged. */
 const brokerBatchReadable = (result) =>
   Array.isArray(result?.messages) && (result.missed === undefined || Array.isArray(result.missed));
+/**
+ * `node <this file> wait <seconds> <conversationId>` — the HEAR an Antigravity session runs
+ * as a background task (#228). Antigravity wakes the agent only when a background task
+ * exits, so this ends with the first mail for the session rather than streaming. It asks
+ * the broker, which knows which process is asking, so no room password is on the command
+ * line; the id given only validates `boundTo`. TCP is used only where the drain would use
+ * it (no broker, `unsupported`, `ineligible`), and a `403` there is withheld mail, never an
+ * empty timeout. Exit 0 with the mail as JSON, 4 when the time ran out with nothing (the
+ * caller starts it again), 2 when the wait is refused (said on stderr), 3 for usage.
+ */
+const WAIT_POLL_MS = 2_000;
+const WAIT_MAX_SECONDS = 600;
+const WAIT_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const wellFormedCollect = (body) =>
+  Boolean(body) && typeof body === "object" && body.ok === true &&
+  Array.isArray(body.messages) &&
+  (body.missed === undefined || Array.isArray(body.missed));
+const waitForMail = async (secondsArg, expected) => {
+  const seconds = Number.parseInt(secondsArg ?? "", 10);
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > WAIT_MAX_SECONDS || !WAIT_ID.test(expected ?? "")) {
+    process.stderr.write(`usage: wait <seconds 1-${WAIT_MAX_SECONDS}> <conversationId>\n`);
+    return 3;
+  }
+  const refused = (reason) => {
+    process.stderr.write(`gyredeck: wait refused — ${reason}\n`);
+    return 2;
+  };
+  const deadline = Date.now() + seconds * 1_000;
+  const remainingMs = () => Math.max(0, deadline - Date.now());
+  // Nothing-arrived is said only on the strength of a collect that was served and empty;
+  // a wait that never got an answer is refused, not quiet.
+  let served = false;
+  for (;;) {
+    const judged = judgeBrokerAnswer(await askBroker({ collect: { limit: MAIL_MAX_STEPS } }));
+    if (judged.fallback) {
+      const remainingSeconds = Math.max(1, Math.floor(remainingMs() / 1_000));
+      const endpoint = await readEndpoint();
+      const token = await readIngestToken();
+      const reply = await getJsonStatus(endpoint, token, `/mail/wait?as=${expected}&timeout=${remainingSeconds}&collect=1`, remainingMs() + 2_000);
+      if (reply.status === 200 && wellFormedCollect(reply.body)) {
+        if (reply.body.messages.length === 0 && (reply.body.missed ?? []).length === 0) return 4;
+        process.stdout.write(`${JSON.stringify(reply.body)}\n`);
+        return 0;
+      }
+      if (reply.status === 403) return refused(`the bridge refused the read (${reply.body?.error ?? 403}): ${reply.body?.message ?? ""}`);
+      return refused(reply.status ? `the bridge answered ${reply.status}` : "the bridge did not answer");
+    }
+    if (!judged.result) return refused(judged.withheld);
+    const result = judged.result;
+    if (!wellFormedCollect(result)) return refused("the broker's answer is not a collect this hook can read");
+    if (result.boundTo !== expected) return refused(`the broker answered for ${JSON.stringify(result.boundTo)}, not ${expected}`);
+    served = true;
+    const messages = Array.isArray(result.messages) ? result.messages : [];
+    const missed = Array.isArray(result.missed) ? result.missed : [];
+    if (messages.length > 0 || missed.length > 0) {
+      // Printed before it is acknowledged: a wait cut short here hands the batch over
+      // again next time — a duplicate, never a loss.
+      process.stdout.write(`${JSON.stringify({ ok: true, timedOut: false, ...result })}\n`);
+      await ackDelivery(result, remainingMs() + BROKER_DEADLINE_MS);
+      return 0;
+    }
+    if (remainingMs() === 0) return served ? 4 : refused("the broker did not answer within the wait");
+    await new Promise((resolve) => setTimeout(resolve, Math.min(WAIT_POLL_MS, remainingMs())));
+  }
+};
 const MAIL_MAX_TEXT = 2_000;
 /** `from` the desktop app uses when the person sends a message themselves. */
 const APP_SENDER = "gyredeck";
@@ -741,18 +806,15 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
     parts.push(
       // Antigravity wakes the agent only when a background task exits, so a stream that
       // stays open delivers into a log nobody reads (#159, reproduced on agy 1.3.6). The
-      // room's own stream with once=1 ends with the first frame meant for this session;
-      // the drain on the next invocation then delivers it as usual, and the agent starts
-      // it again. Room-scoped and read-free — a session bound to the broker may not read
-      // its mailbox over TCP, and this does not.
+      // hook's own `wait` ends with the first mail for this session and prints it; it asks
+      // the broker, so the room's password never sits in a command line (#228).
       "HEAR — so a message reaches you without anyone typing, keep one wait running as a" +
-        " background task. It ends as soon as something is addressed to you, which is what" +
-        " wakes you; after you have answered, start it again. Run it with the room's" +
-        " password in place of THE ROOM PASSWORD:\n" +
-        `while :; do r=$(curl -sN --fail --max-time 330 "http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}/events?as=${room}&since=resume&once=1" -H "x-gyredeck-token: THE ROOM PASSWORD"); rc=$?; case "$r" in *'data: '*) echo "gyredeck: mail for you in ${syncRoom}"; break;; esac; case $rc in 22) echo "gyredeck: room ${syncRoom} is gone - wait ended"; break;; 7) echo "gyredeck: bridge unreachable - wait ended"; break;; esac; sleep 1; done\n` +
-        "  · Run it unmodified, and only one.\n" +
-        "  · After \"room … is gone\" or \"bridge unreachable\", do not start it again until a" +
-        " delivery here shows this HEAR line.",
+        " background task. It ends as soon as mail for you arrives, printing it, which is" +
+        " what wakes you; after you have answered, start it again:\n" +
+        `while :; do node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 300 ${room}; rc=$?; [ $rc -eq 4 ] || break; done\n` +
+        "  · It asks the Gyredeck broker, which knows this is you: no password goes on the line.\n" +
+        "  · \"wait refused\" on its error output means it could not hear the room; say so to the person rather than starting it again.\n" +
+        "  · Run it unmodified, and only one.",
     );
   }
   const header = { ephemeralMessage: parts.join(" ") };
@@ -945,4 +1007,8 @@ const main = async () => {
   }
 };
 
-main();
+if (process.argv[2] === "wait") {
+  waitForMail(process.argv[3], process.argv[4]).then((code) => process.exit(code));
+} else {
+  main();
+}

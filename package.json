@@ -25,8 +25,8 @@
     "test:hooks": "node --test tests/hook-integration.test.mjs && node --experimental-strip-types --test tests/git-changes.test.mjs && node --experimental-strip-types --test tests/usage-alerts.test.mjs && node --experimental-strip-types --test tests/room-inbox.test.mjs && node --experimental-strip-types --test tests/hook-status.test.mjs && node --test tests/sync-code.test.mjs && node --test tests/room-founder.test.mjs && node --test tests/event-log-mode.test.mjs && node --test tests/room-capacity.test.mjs && node --test tests/codex-log.test.mjs && node --test tests/session-names.test.mjs && node --experimental-strip-types --test tests/session-groups.test.mjs && node --experimental-strip-types --test tests/session-retirement.test.mjs && node --test tests/codex-hook-trust.test.mjs"
   },
   "devDependencies": {
-    "@playwright/test": "1.61.0",
-    "@types/node": "25.0.0",
-    "typescript": "5.9.3"
+    "@playwright/test": "1.64.1",
+    "@types/node": "26.6.5",
+    "typescript": "7.0.2"
   }
 }

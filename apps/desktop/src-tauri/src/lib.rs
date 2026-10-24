@@ -1691,7 +1691,7 @@ fn codex_auth_fingerprint(auth_state: &CodexAuthState) -> String {
             hasher.update([0]);
         }
     }
-    format!("{:x}", hasher.finalize())
+    hex_lower(hasher.finalize())
 }
 
 fn build_codex_usage_snapshot(
@@ -2989,13 +2989,23 @@ fn claude_keychain_service_candidates(oauth_config: &ClaudeOauthConfig) -> Vec<S
     );
     let mut candidates = Vec::new();
     if let Some(config_dir) = env_text("CLAUDE_CONFIG_DIR") {
-        let mut hasher = Sha256::new();
-        hasher.update(config_dir.as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
-        candidates.push(format!("{}-{}", base, &digest[..8]));
+        candidates.push(claude_keychain_service_for_config_dir(&base, &config_dir));
     }
     candidates.push(base);
     candidates
+}
+
+/// Claude Code names this Keychain service itself, so the suffix must match its
+/// spelling byte for byte: a different hex format finds no credentials at all.
+fn claude_keychain_service_for_config_dir(base: &str, config_dir: &str) -> String {
+    let digest = hex_lower(Sha256::digest(config_dir.as_bytes()));
+    format!("{}-{}", base, &digest[..8])
+}
+
+/// Lowercase hex of a digest, spelled out byte by byte rather than through the digest
+/// type's `LowerHex`, which sha2 0.11 no longer implements.
+fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+    bytes.as_ref().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn claude_credentials_path() -> Option<PathBuf> {
@@ -3310,7 +3320,7 @@ fn claude_credentials_fingerprint(credentials: &ClaudeCredentialsFile) -> String
             hasher.update([0]);
         }
     }
-    format!("{:x}", hasher.finalize())
+    hex_lower(hasher.finalize())
 }
 
 fn claude_auth_fingerprint(auth: &ClaudeAuthState) -> String {
@@ -6964,5 +6974,37 @@ mod hook_registration_tests {
             let hooks = malformed.as_object().unwrap().clone();
             assert!(!hook_entry_present(&hooks, "Stop", SCRIPT), "{malformed}");
         }
+    }
+}
+
+#[cfg(test)]
+mod hex_tests {
+    use super::*;
+
+    #[test]
+    fn digests_are_spelled_exactly_as_sha2_0_10_spelled_them() {
+        assert_eq!(
+            hex_lower(Sha256::digest(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(hex_lower([0x00u8, 0x0f, 0xa0]), "000fa0");
+    }
+
+    #[test]
+    fn a_claude_config_dir_names_the_keychain_service_claude_code_uses() {
+        assert_eq!(
+            claude_keychain_service_for_config_dir("Claude Code-credentials", "/Users/someone/.claude-work"),
+            "Claude Code-credentials-18cc900a"
+        );
+    }
+
+    #[test]
+    fn a_claude_token_pair_keeps_its_fingerprint() {
+        let credentials: ClaudeCredentialsFile =
+            serde_json::from_str(r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r"}}"#).unwrap();
+        assert_eq!(
+            claude_credentials_fingerprint(&credentials),
+            "30732cbc29a8eefb75f38c423997316c5e1ff923da5257739404b22913d42691"
+        );
     }
 }

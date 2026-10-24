@@ -4139,15 +4139,22 @@ function startBridge(config) {
   // Tests only: the reader-lifecycle fixtures count every push a Codex session gets, and
   // this one would be the first of them.
   const heavyCodexPushOff = process.env.GYREDECK_TEST_HEAVY_NO_CODEX_PUSH === "1";
+  const heavyCodexInFlight = new Set();
   const tellCodexOfHeavyRuns = (conversationId) => {
     if (heavyCodexPushOff) return;
     if (typeof conversationId !== "string" || !CODEX_PROVIDERS.has(providerByConversation.get(conversationId))) return;
-    if (!heavyToBeTold(conversationId)) return;
-    // Told only once the push is on its way; a push that could not start is tried again
-    // the next time the session is heard from.
-    if (deliverToCodex(conversationId, null, `${CODEX_NOTICE_MARKER} ${heavyHint(conversationId)}`, { harvest: false }) === "queued") {
-      markHeavyTold(conversationId);
-    }
+    if (heavyCodexInFlight.has(conversationId) || !heavyToBeTold(conversationId)) return;
+    // Told only once `codex queue` has taken it (exit 0). One push at a time per session;
+    // one that fails is tried again the next time the session is heard from.
+    heavyCodexInFlight.add(conversationId);
+    const started = deliverToCodex(conversationId, null, `${CODEX_NOTICE_MARKER} ${heavyHint(conversationId)}`, {
+      harvest: false,
+      settled: (ok) => {
+        heavyCodexInFlight.delete(conversationId);
+        if (ok) markHeavyTold(conversationId);
+      },
+    });
+    if (started !== "queued") heavyCodexInFlight.delete(conversationId);
   };
 
   /** Which room a session has been put into, if any. A session belongs to at most one. */
@@ -4994,7 +5001,7 @@ function startBridge(config) {
    * Fire-and-forget on purpose: the POST that triggered this has already been answered,
    * and a session that never replies must not leave a request hanging.
    */
-  const deliverToCodex = (threadId, room, text, { harvest = true } = {}) => {
+  const deliverToCodex = (threadId, room, text, { harvest = true, settled = null } = {}) => {
     const binary = findAgentBinary("codex");
     if (!binary) return "unavailable";
     // Answered before the spawn, because afterwards is too late to answer honestly: the
@@ -5008,9 +5015,23 @@ function startBridge(config) {
     }
 
     // A notice wants no answer, so nothing is set up to read one: no reader, no poll.
+    // `settled` hears whether `codex queue` took it: exit 0, or not.
     if (!harvest) {
-      spawn(binary, ["queue", "--thread", threadId, "--message", text], { stdio: ["ignore", "ignore", "ignore"] })
-        .on("error", (error) => console.error(`⚠ codex queue could not be started (${error?.code ?? error}): ${binary}`));
+      let done = false;
+      const settle = (ok) => {
+        if (done) return;
+        done = true;
+        settled?.(ok);
+      };
+      const child = spawn(binary, ["queue", "--thread", threadId, "--message", text], { stdio: ["ignore", "ignore", "ignore"] });
+      child.on("error", (error) => {
+        console.error(`⚠ codex queue could not be started (${error?.code ?? error}): ${binary}`);
+        settle(false);
+      });
+      child.on("exit", (code) => {
+        if (code !== 0) console.error(`⚠ codex queue exited ${code} for a notice to ${threadId}; it is tried again on the session's next event`);
+        settle(code === 0);
+      });
       return "queued";
     }
     const rolloutPath = codexRolloutFor(threadId);

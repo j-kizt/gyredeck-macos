@@ -10251,6 +10251,64 @@ test("heavy round 2 P1: telling Codex sessions makes no mailbox, so rooms can st
   }
 });
 
+test("heavy round 3: a Codex notice push that fails is not counted as told, is retried, and never runs twice at once", async () => {
+  const h = await heavyHarness("codex-retry");
+  const fakeBin = join(h.home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  const calls = join(h.home, "calls.log");
+  const release = join(h.home, "release-first");
+  // First call: logs, holds until released, then fails like a rejected thread. Later
+  // calls: log and succeed.
+  await writeFile(
+    join(fakeBin, "codex"),
+    `#!${process.execPath}\n` +
+      "const fs = require('node:fs');\n" +
+      `const calls = ${JSON.stringify(calls)}, release = ${JSON.stringify(release)};\n` +
+      "const n = fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').split('\\n').filter(Boolean).length : 0;\n" +
+      "const thread = process.argv[process.argv.indexOf('--thread') + 1];\n" +
+      "fs.appendFileSync(calls, thread + '\\n');\n" +
+      "if (n === 0) { const wait = () => fs.existsSync(release) ? process.exit(1) : setTimeout(wait, 20); wait(); }\n",
+  );
+  await chmod(join(fakeBin, "codex"), 0o755);
+  try {
+    await h.start({ GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin });
+    const callsFor = async (id) => (existsSync(calls) ? (await readFile(calls, "utf8")).split("\n").filter((line) => line === id).length : 0);
+    const me = "a2235000-0000-4000-8000-000000000001";
+    await heavyIngest(h, me, "codexCliHook");
+    await until(async () => (await callsFor(me)) === 1, "the first push started");
+    // Heard from again while that push is still running: no second push. A control
+    // session's push, made after these events, is the barrier that shows the bridge has
+    // handled them.
+    await heavyIngest(h, me, "codexCliHook");
+    await heavyIngest(h, me, "codexCliHook");
+    const control = "a2235000-0000-4000-8000-000000000002";
+    await heavyIngest(h, control, "codexCliHook");
+    await until(async () => (await callsFor(control)) === 1, "the control push");
+    assert.equal(await callsFor(me), 1, "no second push while the first is in flight");
+
+    // The first push fails: not told, so the next event pushes again, and that one lands.
+    await writeFile(release, "");
+    await until(async () => {
+      await heavyIngest(h, me, "codexCliHook");
+      return (await callsFor(me)) === 2;
+    }, "the retry");
+    // Once taken (exit 0), told for good: later events push nothing more.
+    const second = "a2235000-0000-4000-8000-000000000003";
+    await until(async () => {
+      await heavyIngest(h, me, "codexCliHook");
+      await heavyIngest(h, second, "codexCliHook");
+      return (await callsFor(second)) === 1;
+    }, "a later barrier");
+    for (let index = 0; index < 3; index += 1) await heavyIngest(h, me, "codexCliHook");
+    const third = "a2235000-0000-4000-8000-000000000004";
+    await heavyIngest(h, third, "codexCliHook");
+    await until(async () => (await callsFor(third)) === 1, "the last barrier");
+    assert.equal(await callsFor(me), 2, "told after the push that succeeded, and not again");
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test("heavy round 2 P2: the told set forgets its oldest rather than refusing new sessions", async () => {
   const h = await heavyHarness("told-cap");
   try {

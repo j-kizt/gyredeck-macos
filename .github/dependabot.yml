@@ -27,8 +27,18 @@ updates:
         patterns: ["@tauri-apps/plugin-updater"]
       tauri:
         patterns: ["@tauri-apps/*"]
+      # React 19.3 adds about 8.6 kB gzip and alone puts the bundle over its budget (#225),
+      # so the app holds 19.2.x until #233 decides. Its own group keeps that PR from failing
+      # the rest of the week's bumps. Not ignored: `ignore` would also stop a security PR.
+      react:
+        patterns: ["react", "react-dom", "@types/react", "@types/react-dom"]
       npm:
         patterns: ["*"]
+    ignore:
+      # A compiler major is a deliberate move, never a passenger in a weekly group: TS 7
+      # arrived inside #219 and was taken on its own decision (#225). TS 7.x still comes in.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: cargo
     directory: /apps/desktop/src-tauri

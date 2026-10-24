@@ -1,5 +1,31 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Antigravity hears a room again, and an old reading says how old — (v1.23.3)
+
+### Fixes
+
+- **Antigravity is told a way to hear the room that actually wakes it.** Antigravity wakes
+  only when a background command ends. The room's instructions gave it a stream that never
+  ends, so messages piled up in a log and the session never woke. It is now told to run the
+  Antigravity hook's own `wait`. The wait ends as soon as mail arrives, and asks Gyredeck's
+  broker who is asking, so no room password goes on the command line. Every session is asked
+  to read the room rules again once (v7).
+- **A message sent while a watch was reopening is no longer missed.** A session that had not
+  yet heard anything in a room, the founder of a new room included, reopened its watch from
+  nothing. So a message sent in the second between two connections woke nobody. A reopened
+  watch now picks up from where the session joined or was confirmed.
+- **An old usage reading says which day it is from.** "Outdated · 15:48" could be eight
+  days old and read as this afternoon. A reading from any other day now names its date, for
+  example `Outdated · 16 Oct 15:48`. "Reset at …" in absolute mode does the same, so a weekly
+  reset days away no longer looks like today.
+
+### Changed
+
+- **Hash formatting is spelled out byte by byte**, ready for sha2 0.11. Claude Code's
+  Keychain entry for a custom `CLAUDE_CONFIG_DIR` is still found under the same name.
+- **The app builds with TypeScript 7.** The week's other dependency bumps are in, except
+  React 19.3, which would grow the app by about 8.6 kB and is held at 19.2 for now.
+
 ## Only the app can open, join or close a room — (v1.23.2)
 
 ### Fixes

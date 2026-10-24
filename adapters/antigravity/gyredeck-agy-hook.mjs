@@ -605,6 +605,7 @@ const plainSteps = async (taken) => {
   }
   if (typeof taken.result.missedNote === "string") steps.push({ ephemeralMessage: taken.result.missedNote.slice(0, MAIL_MAX_TEXT) });
   if (typeof taken.result.usageNotice === "string") steps.push({ ephemeralMessage: taken.result.usageNotice.slice(0, MAIL_MAX_TEXT) });
+  if (typeof taken.result.heavyNotice === "string") steps.push({ ephemeralMessage: taken.result.heavyNotice.slice(0, MAIL_MAX_TEXT) });
   return steps;
 };
 
@@ -658,9 +659,13 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
   const usageStep = typeof result?.usageNotice === "string"
     ? { ephemeralMessage: result.usageNotice.slice(0, MAIL_MAX_TEXT) }
     : null;
+  // And about the machine's heavy-run queue, once (#223).
+  const heavyStep = typeof result?.heavyNotice === "string"
+    ? { ephemeralMessage: result.heavyNotice.slice(0, MAIL_MAX_TEXT) }
+    : null;
   if (delivered.length === 0) {
     await ackDelivery(result);
-    return usageStep ? [usageStep] : [];
+    return [usageStep, heavyStep].filter(Boolean);
   }
 
 
@@ -832,6 +837,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
       };
     }),
     ...(usageStep ? [usageStep] : []),
+    ...(heavyStep ? [heavyStep] : []),
     // Last, so the command is the freshest thing in context when the model acts.
     ...(reply ? [reply] : []),
   ];

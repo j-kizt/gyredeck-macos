@@ -797,8 +797,8 @@ One heavy run (a test suite, a native build) at a time on this machine, for ever
 - **The slot is held while the group lives** (`kill(-pgid, 0)` every 5 s and before every answer), whoever else has gone; `helperGone` says the heartbeat (60 s, lease 5 min) has stopped. `conversation_close` frees nothing. On SIGINT/SIGTERM the helper forwards the signal to the group, escalates to SIGKILL after 30 s, and releases only once the group is gone; a queued helper cancels its ticket.
 - **Grant:** the front of the line, when the 1-minute load is ≤ 5 — or after 10 minutes of waiting, marked `loadSkipped`. Monotonic clock throughout. A ticket not polled for 90 s leaves the line.
 - **Restart:** the holder survives through the record (a reservation gets a fresh minute; an active run is kept while its group lives, and its helper `adopt`s it on the next heartbeat). Tickets are memory-only: a restart resets the line, `wait` answers `404 ticket_unknown`, and the helper acquires again with the same pair, at the back.
-- **Fail-open:** a bridge that cannot be reached, or speaks another version, and the helper runs the command unqueued with a notice on stderr.
-- A Claude Code or Antigravity session in no room is told once, with the usage intro (#169).
+- **Fail-open, for two cases only:** a bridge that cannot be reached, or one that answers `409 version` — the helper runs the command unqueued with a notice on stderr. Any other refusal from a reachable bridge (at acquire, or at activate: `503 holder_unwritable`, `409 pgid_mismatch`, …) runs nothing: the gated group is killed and reaped, the helper says `gyredeck: heavy queue refused activation (<status> <error>) — not running` and exits 75.
+- **A session outside a room is told once**, independent of any usage reading: Claude Code and Antigravity in `heavyNotice` on their next collect (printed by both hooks), Codex by one push when it is first heard from. A confirmed room member has the rules and is counted as told.
 
 ## conversationId normalization
 

@@ -421,7 +421,7 @@ const heavyHelper = async (setup) => {
   }
   const heartbeatMs = Number(process.env.GYREDECK_TEST_HEAVY_HEARTBEAT_MS) || 60_000;
   const retries = Number(process.env.GYREDECK_TEST_HEAVY_RETRIES) || 40;
-  const killAfterMs = 30_000;
+  const killAfterMs = Number(process.env.GYREDECK_TEST_HEAVY_KILL_AFTER_MS) || 30_000;
   const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const signalNumber = { SIGINT: 2, SIGTERM: 15, SIGKILL: 9, SIGHUP: 1 };
   const exitFor = (code, signal) => (code ?? 128 + (signalNumber[signal] ?? 1));
@@ -481,13 +481,24 @@ const heavyHelper = async (setup) => {
       }
     }
   };
+  // The two cases that run the command unqueued, and the only two: no bridge, or one that
+  // speaks another version. A bridge that answers and refuses is a bridge saying no — the
+  // slot may be held by a run it cannot record, or by an earlier child still going.
   const unavailable = (answer) => {
     if (answer.status === 0) return `the bridge cannot be reached: ${answer.body.error}`;
     if (answer.status === 409 && answer.body.error === "version") return `the bridge speaks version ${answer.body.v}, this helper ${setup.v}`;
-    if (answer.status === 401) return "the bridge refused the machine token";
-    if (answer.status >= 500 && answer.body.error !== "queue_full" && answer.body.error !== "too_many_waits") return `the bridge answered ${answer.status} ${answer.body.error ?? ""}`.trim();
-    if (answer.status === 400 || answer.status === 413) return `the bridge refused the request: ${answer.body.error ?? answer.status}`;
     return null;
+  };
+  const refusal = (answer) => `${answer.status} ${answer.body.error ?? ""}`.trim();
+  const refuse = async (what, answer, gated) => {
+    state = "refused";
+    clearInterval(heartbeat);
+    if (gated) {
+      killGated();
+      await gated;
+    }
+    say(`heavy queue refused ${what} (${refusal(answer)}) — not running`);
+    process.exit(75);
   };
 
   const killGated = () => {
@@ -515,7 +526,7 @@ const heavyHelper = async (setup) => {
   };
 
   const onSignal = (name) => {
-    if (stopping || state === "unqueued") return;
+    if (stopping || state === "unqueued" || state === "refused") return;
     stopping = name;
     if (state === "active") {
       // The slot stays held until the group has gone: a command told to stop is still
@@ -538,7 +549,7 @@ const heavyHelper = async (setup) => {
       const why = unavailable(answer);
       if (why) { runUnqueued(why); return; }
       if (answer.status === 200 && answer.body.granted === true) break;
-      if (answer.status === 503) {
+      if (answer.status === 503 && (answer.body.error === "queue_full" || answer.body.error === "too_many_waits")) {
         say(`heavy queue busy (${answer.body.error}) — trying again`);
         await pause(5_000);
         answer = await call("acquire", { as, what, requestId, lease });
@@ -561,7 +572,7 @@ const heavyHelper = async (setup) => {
         answer = await call("wait", { ticket, lease });
         continue;
       }
-      runUnqueued(`the bridge answered ${answer.status} ${answer.body.error ?? ""}`.trim());
+      await refuse("the request", answer, null);
       return;
     }
     if (stopping) return;
@@ -580,11 +591,19 @@ const heavyHelper = async (setup) => {
       childExit = exited;
       break;
     }
-    killGated();
-    if (activated.status !== 404) {
-      runUnqueued(unavailable(activated) ?? `the bridge refused activation: ${activated.body.error ?? activated.status}`);
+    const why = unavailable(activated);
+    if (why) {
+      killGated();
+      await exited;
+      runUnqueued(why);
       return;
     }
+    if (activated.status !== 404) {
+      // The gated group has run nothing; it is killed and reaped before the exit.
+      await refuse("activation", activated, exited);
+      return;
+    }
+    killGated();
     // The reservation lapsed before it was activated; the gated child ran nothing.
     say(`the reservation was not activated (${activated.body.error ?? activated.status}) — asking again`);
     state = "acquiring";
@@ -1817,6 +1836,7 @@ function startBridge(config) {
   const emitLocal = (payload) => {
     tracker.rememberScope(payload);
     rememberProvider(payload);
+    tellCodexOfHeavyRuns(payload?.conversationId);
     if (payload.type === "conversation_close" && typeof payload.conversationId === "string") {
       releaseClosedSession(payload.conversationId);
     }
@@ -4054,12 +4074,7 @@ function startBridge(config) {
       return "USAGE: ask Gyredeck how much of your plan is left at any time: " +
         `curl -s "http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}/usage?as=${conversationId}" ` +
         '-H "x-gyredeck-token: $(cat ~/.config/gyredeck/gyredeck.ingest-token)"' +
-        (low.length > 0 ? ` — low now: ${low.map(describe).join("; ")}. Finish at a safe point.` : "") +
-        // The queue is machine-wide and a session in no room never reads the rules that
-        // describe it, so it is told here, once, with the intro (#223).
-        `\nHEAVY RUNS: one at a time on this machine. Run ${HEAVY_COMMANDS.join(", ")} through ` +
-        `\`node ${HEAVY_HELPER_DISPLAY_PATH} --as ${conversationId} --what "<what it runs>" -- <command…>\`; ` +
-        "it waits for the slot, runs the command and exits with its code. Advisory: without the bridge it runs unqueued.";
+        (low.length > 0 ? ` — low now: ${low.map(describe).join("; ")}. Finish at a safe point.` : "");
     }
     const changed = [];
     for (const line of reading.lines) {
@@ -4069,6 +4084,44 @@ function startBridge(config) {
       changed.push(lowNow(line) ? `${describe(line)} — finish at a safe point` : `${line.label} back to ${line.leftPct}% left`);
     }
     return changed.length > 0 ? `USAGE: your ${reading.displayName} limits — ${changed.join("; ")}.` : null;
+  };
+
+  /**
+   * The heavy-run queue, told once to each session outside a room (#223). The queue is
+   * machine-wide and a session in no room never reads the rules that describe it. A
+   * confirmed member has the rules (v8) and is counted as told. Claude Code and
+   * Antigravity hear it on their next collect, beside any mail; Codex has no read of its
+   * own, so it is pushed to when it is first heard from.
+   */
+  const heavyTold = new Set();
+  const HEAVY_TOLD_MAX = 10_000;
+  const heavyHint = (conversationId) =>
+    `HEAVY RUNS: one at a time on this machine. Run ${HEAVY_COMMANDS.join(", ")} through ` +
+    `\`node ${HEAVY_HELPER_DISPLAY_PATH} --as ${conversationId} --what "<what it runs>" -- <command…>\`; ` +
+    `it waits for the slot, runs the command and exits with its code. ${HEAVY_LIMIT_TEXT}`;
+  /** Whether this session is to be told now; asking marks it told. */
+  const takeHeavyNotice = (conversationId) => {
+    if (heavyTold.has(conversationId) || heavyTold.size >= HEAVY_TOLD_MAX) return false;
+    heavyTold.add(conversationId);
+    return !inConfirmedRoom(conversationId);
+  };
+  const heavyNoticeFor = (conversationId) => {
+    const provider = usageProviderFor(conversationId);
+    if (provider !== "claude" && provider !== "agy") return null;
+    return takeHeavyNotice(conversationId) ? heavyHint(conversationId) : null;
+  };
+  // Tests only: the reader-lifecycle fixtures count every push a Codex session gets, and
+  // this one would be the first of them.
+  const heavyCodexPushOff = process.env.GYREDECK_TEST_HEAVY_NO_CODEX_PUSH === "1";
+  const tellCodexOfHeavyRuns = (conversationId) => {
+    if (heavyCodexPushOff) return;
+    if (typeof conversationId !== "string" || !CODEX_PROVIDERS.has(providerByConversation.get(conversationId))) return;
+    if (!takeHeavyNotice(conversationId)) return;
+    const mailbox = mailRoomFor(conversationId, true);
+    if (!mailbox) return;
+    const text = `[Gyredeck: ${heavyHint(conversationId)}]`;
+    const told = publishMail(mailbox, ROOM_SENDER, text, null, false, { to: conversationId, kind: "tell" });
+    if (told) deliverMail(conversationId, mailbox, text, ROOM_SENDER, told);
   };
 
   /** Which room a session has been put into, if any. A session belongs to at most one. */
@@ -6650,7 +6703,8 @@ function startBridge(config) {
           ...(() => {
             if (collect && sync) noteUsageCollected(sync.name, collected.filter((message) => message.room === sync.name && message.from === ROOM_SENDER), as);
             const usageNotice = collect ? usageNoticeFor(as) : null;
-            return usageNotice ? { usageNotice } : {};
+            const heavyNotice = collect ? heavyNoticeFor(as) : null;
+            return { ...(usageNotice ? { usageNotice } : {}), ...(heavyNotice ? { heavyNotice } : {}) };
           })(),
         });
         return;

@@ -431,7 +431,15 @@ test("antigravity adapter answers each event with its documented response shape"
         },
       );
       assert.equal(result.code, 0, `${event}: ${result.stderr}`);
-      assert.deepEqual(JSON.parse(result.stdout), shape, `${event} response shape`);
+      const answer = JSON.parse(result.stdout);
+      // The first turn of a session outside a room carries the one-time heavy-runs notice
+      // (#223): the documented shape, with that one step in it.
+      if (event === "PreInvocation") {
+        assert.equal(answer.injectSteps.length, 1, JSON.stringify(answer));
+        assert.match(answer.injectSteps[0].ephemeralMessage, /^HEAVY RUNS: /);
+        answer.injectSteps = [];
+      }
+      assert.deepEqual(answer, shape, `${event} response shape`);
     }
 
     // PostInvocation is registered for a valid answer only — a turn can span
@@ -762,7 +770,11 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
         body: JSON.stringify({ from, text }),
       });
 
-    // An empty room must still answer with the documented shape.
+    // The first turn outside a room is told about heavy runs, once (#223); after that an
+    // empty room must still answer with the documented shape.
+    const toldOnce = await preInvocation(0);
+    assert.equal(toldOnce.length, 1);
+    assert.match(toldOnce[0].ephemeralMessage, /^HEAVY RUNS: /);
     assert.deepEqual(await preInvocation(0), []);
 
     await send("codex", "build is green");
@@ -1041,8 +1053,10 @@ test("claude UserPromptSubmit delivers mail as additional context exactly once",
         body: JSON.stringify({ from, text, replyTo }),
       });
 
-    // Nothing to say is silence: anything on stdout is read as a hook result, so an
-    // empty room must not produce one.
+    // The first turn outside a room is told about heavy runs, once (#223). After that,
+    // nothing to say is silence: anything on stdout is read as a hook result, so an empty
+    // room must not produce one.
+    assert.match(JSON.parse(await prompt()).hookSpecificOutput.additionalContext, /^HEAVY RUNS: /);
     assert.equal(await prompt(), "");
 
     await send("codex", "build is green", "codex-room");
@@ -2124,8 +2138,10 @@ test("an agent outside a room learns it can ask for its usage, and hears when it
     await post("/usage", reading("agy", 50));
     await post("/usage", reading("agy", 92));
     const steps = await agySteps();
-    assert.equal(steps.length, 1);
+    // Beside it, this session's first turn carries the one-time heavy-runs notice (#223).
+    assert.equal(steps.length, 2);
     assert.match(steps[0].ephemeralMessage, /USAGE: ask Gyredeck .* low now: Session 8% left/);
+    assert.match(steps[1].ephemeralMessage, /^HEAVY RUNS: /);
 
     // Codex cannot call; a live Codex session outside a room is pushed the crossing.
     await post("/usage", reading("codex", 50));
@@ -2133,7 +2149,9 @@ test("an agent outside a room learns it can ask for its usage, and hears when it
     let pushed = [];
     for (let tries = 0; tries < 40 && pushed.length === 0; tries += 1) {
       await new Promise((resolve) => { setTimeout(resolve, 50); });
-      pushed = existsSync(queued) ? (await readFile(queued, "utf8")).split("\n").filter(Boolean) : [];
+      // The heavy-runs push (#223) came when the session was first heard from; this is
+      // about the usage push.
+      pushed = existsSync(queued) ? (await readFile(queued, "utf8")).split("\n").filter((line) => line && !line.includes("HEAVY RUNS")) : [];
     }
     assert.equal(pushed.length, 1);
     assert.ok(pushed[0].includes(`--thread ${codex}`));
@@ -6854,6 +6872,9 @@ const codexInARoom = async ({ replyTimeoutMs = null } = {}) => {
       cwd: repoRoot,
       env: {
         ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin,
+        // These count every push the session gets; the one-time heavy-runs push (#223) is
+        // covered by its own test and would shift every count here.
+        GYREDECK_TEST_HEAVY_NO_CODEX_PUSH: "1",
         ...(replyTimeoutMs === null ? {} : { GYREDECK_CODEX_REPLY_TIMEOUT_MS: String(replyTimeoutMs) }),
       },
       stdio: ["pipe", "pipe", "pipe"],
@@ -7381,7 +7402,9 @@ const codexInNoRoom = async ({ replyTimeoutMs = 1_000, env = {}, records = true 
     ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     {
       cwd: repoRoot,
-      env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin, GYREDECK_CODEX_REPLY_TIMEOUT_MS: String(replyTimeoutMs), ...env },
+      // The one-time heavy-runs push (#223) would make "never pushed to" impossible here; it
+      // has its own test.
+      env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin, GYREDECK_CODEX_REPLY_TIMEOUT_MS: String(replyTimeoutMs), GYREDECK_TEST_HEAVY_NO_CODEX_PUSH: "1", ...env },
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
@@ -9383,6 +9406,7 @@ test("the Antigravity hook's wait asks the broker, ends on mail, and is refused 
 
 // ── Heavy runs (#223) ──
 
+const HEAVY_HELPER_DEADLINE_MS = 15_000;
 const heavyModule = () => import(new URL("../adapters/bridge/gyredeck-bridge.mjs", import.meta.url).href);
 const heavySecret = () => randomBytes(16).toString("hex");
 
@@ -9498,7 +9522,15 @@ const heavyHarness = async (tag) => {
     child.stdout.on("data", (chunk) => { out.stdout += chunk; });
     child.stderr.on("data", (chunk) => { out.stderr += chunk; });
     out.child = child;
-    out.exited = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
+    // Bounded: a helper that never exits fails the test, and the test's `finally` still
+    // runs and kills what it left. A test-level timeout alone abandons the body, cleanup
+    // included, and the orphaned group keeps the runner alive.
+    let deadline;
+    out.exited = Promise.race([
+      new Promise((resolve) => child.on("exit", (code, signal) => { clearTimeout(deadline); resolve({ code, signal }); })),
+      new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error(`helper did not exit within ${HEAVY_HELPER_DEADLINE_MS} ms: ${out.stderr}`)), HEAVY_HELPER_DEADLINE_MS); }),
+    ]);
+    out.exited.catch(() => {});
     helpers.add(child);
     return out;
   };
@@ -10050,7 +10082,7 @@ test("heavy C11: a helper that cannot reach the bridge, or meets another version
   }
 });
 
-test("heavy rules v8: the rules list the heavy commands and the limit, and a session in no room is told once", async () => {
+test("heavy rules v8: the rules list the heavy commands, the helper and the limit", async () => {
   const { roomRules, HEAVY_COMMANDS, HEAVY_LIMIT_TEXT } = await heavyModule();
   const rules = roomRules("http://127.0.0.1:47621");
   assert.match(rules, /^# Gyredeck room rules — v8\n/);
@@ -10061,30 +10093,170 @@ test("heavy rules v8: the rules list the heavy commands and the limit, and a ses
   assert.equal(HEAVY_COMMANDS.length, 9);
   assert.ok(rules.includes(HEAVY_LIMIT_TEXT));
   assert.match(rules, /node ~\/\.config\/gyredeck\/gyredeck-heavy\.mjs --as <your id> --what "<what it runs>" -- <command…>/);
+});
 
-  const h = await heavyHarness("notice");
+/** A turn start as each provider's hook reports one, so the bridge knows whose session it is. */
+const heavyIngest = (h, conversationId, sourceKind) =>
+  fetch(`${h.base}/ingest`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-gyredeck-token": h.token() },
+    body: JSON.stringify({
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+      data: { inputCount: 1 },
+    }),
+  });
+
+test("heavy P1-a: Claude Code outside a room, with no usage reading, is told about the queue once", async () => {
+  const h = await heavyHarness("tell-claude");
   try {
     await h.start();
-    const me = "5e5e5e5e-0000-4d8c-9b3a-aa11bb22cc33";
-    await fetch(`${h.base}/ingest`, {
+    const me = "a2230000-0000-4000-8000-000000000001";
+    const context = async () => {
+      const result = await runAdapter(
+        "adapters/claude/gyredeck-claude-hook.mjs",
+        ["--event", "UserPromptSubmit"],
+        h.home,
+        { hook_event_name: "UserPromptSubmit", session_id: me, cwd: "/tmp/project", prompt: "hi" },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
+    };
+    const first = await context();
+    assert.match(first, new RegExp(`^HEAVY RUNS: .*gyredeck-heavy\\.mjs --as ${me} --what`));
+    assert.doesNotMatch(first, /USAGE/, "no usage reading was ever given");
+    assert.equal(await context(), "", "once");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy P1-a: Antigravity outside a room, with no usage reading, is told about the queue once", async () => {
+  const h = await heavyHarness("tell-agy");
+  try {
+    await h.start();
+    const me = "a2230000-0000-4000-8000-000000000002";
+    const steps = async () => {
+      const result = await runAdapter(
+        "adapters/antigravity/gyredeck-agy-hook.mjs",
+        ["--event", "PreInvocation"],
+        h.home,
+        { hookEventName: "PreInvocation", conversationId: me, workspacePaths: ["/tmp/project"] },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return (JSON.parse(result.stdout).injectSteps ?? []).map((step) => step.ephemeralMessage);
+    };
+    const first = await steps();
+    assert.equal(first.length, 1, JSON.stringify(first));
+    assert.match(first[0], new RegExp(`^HEAVY RUNS: .*gyredeck-heavy\\.mjs --as ${me} --what`));
+    assert.deepEqual(await steps(), [], "once");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy P1-a: Codex outside a room is pushed the queue once, and a Codex member of a room is not", async () => {
+  const h = await heavyHarness("tell-codex");
+  // Where `findAgentBinary` looks before PATH, so the fake wins over a real codex.
+  const fakeBin = join(h.home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  const queued = join(h.home, "queued.log");
+  await writeFile(
+    join(fakeBin, "codex"),
+    `#!${process.execPath}\n` +
+      "require('node:fs').appendFileSync(" +
+      `${JSON.stringify(queued)}, JSON.stringify(process.argv.slice(2)) + "\\n");\n`,
+  );
+  await chmod(join(fakeBin, "codex"), 0o755);
+  try {
+    await h.start({ GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin });
+    const pushes = async () => (existsSync(queued) ? (await readFile(queued, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : []);
+    const outside = "a2230000-0000-4000-8000-000000000003";
+    await heavyIngest(h, outside, "codexCliHook");
+    const told = await until(async () => (await pushes()).length > 0 && (await pushes()), "the push");
+    assert.equal(told[0][0], "queue");
+    assert.equal(told[0][told[0].indexOf("--thread") + 1], outside);
+    assert.match(told[0][told[0].indexOf("--message") + 1], new RegExp(`HEAVY RUNS: .*gyredeck-heavy\\.mjs --as ${outside} --what`));
+    await heavyIngest(h, outside, "codexCliHook");
+    await heavyIngest(h, outside, "codexCliHook");
+
+    // A founder is a confirmed member: it has the rules, which say the same.
+    const member = "a2230000-0000-4000-8000-000000000004";
+    const created = await fetch(`${h.base}/sync/rooms`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": h.token() },
-      body: JSON.stringify({ version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: me, runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 0, sourceKind: "claudeCodeHook" }, data: {} }),
+      headers: { "content-type": "application/json", "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD },
+      body: JSON.stringify({ conversationId: member }),
     });
-    const collect = () => fetch(`${h.base}/mail/inbox?as=${me}&collect=1`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
-    // Told with the usage intro, the one out-of-room hint there is, so not before the app
-    // has read this provider's usage.
-    assert.equal((await collect()).usageNotice, undefined, "nothing waiting, nothing said");
-    await fetch(`${h.base}/usage`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": h.token() },
-      body: JSON.stringify({ providerId: "claude", displayName: "Claude Code", lines: [{ type: "progress", label: "Session", used: 20, limit: 100, resetsAt: "2026-10-16T05:00:00Z" }], fetchedAt: new Date().toISOString() }),
-    });
-    const first = await collect();
-    assert.match(first.usageNotice ?? "", /^USAGE: ask Gyredeck/);
-    assert.match(first.usageNotice ?? "", new RegExp(`\\nHEAVY RUNS: .*gyredeck-heavy\\.mjs --as ${me} --what`));
-    const second = await collect();
-    assert.doesNotMatch(second.usageNotice ?? "", /HEAVY RUNS/, "once");
+    assert.equal(created.status, 201);
+    await heavyIngest(h, member, "codexCliHook");
+    // A control after both, so "no second push" is read after the bridge had its chance.
+    const control = "a2230000-0000-4000-8000-000000000005";
+    await heavyIngest(h, control, "codexCliHook");
+    await until(async () => (await pushes()).some((argv) => argv.includes(control)), "the control push");
+    const all = await pushes();
+    assert.equal(all.filter((argv) => argv.includes(outside)).length, 1, "once");
+    assert.equal(all.filter((argv) => argv.includes(member)).length, 0, "not a room member");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+/** A stand-in bridge that grants, then refuses activation with `refusal`. */
+const refusingActivation = (home, refusal) =>
+  scriptedHeavyBridge(home, ({ path, body }) => {
+    if (path === "/heavy/acquire") return { status: 200, body: { ok: true, v: 1, granted: true, lease: body.lease, loadSkipped: false } };
+    if (path === "/heavy/activate") return refusal;
+    return { status: 200, body: { ok: true, v: 1 } };
+  });
+
+for (const [status, error] of [[503, "holder_unwritable"], [409, "pgid_mismatch"]]) {
+  test(`heavy P1-b: an activation refused with ${status} ${error} runs nothing and exits 75`, async () => {
+    const h = await heavyHarness(`refuse-${status}`);
+    const fake = await refusingActivation(h.home, { status, body: { ok: false, v: 1, error } });
+    try {
+      const marker = join(h.home, "marker");
+      const run = h.helper(["--as", "run-a", "--what", "touches", "--", "touch", marker], {}, fake.helperPath);
+      // Read when the refusal is said, before the helper exits: by then the gated group must
+      // already be gone. Its own exit would close fd 3 and end the group anyway, so looking
+      // only afterwards could not tell a reaped group from an abandoned one.
+      let aliveWhenRefused = null;
+      run.child.stderr.on("data", () => {
+        if (aliveWhenRefused !== null || !/refused activation/.test(run.stderr)) return;
+        const asked = fake.requests.find((entry) => entry.path === "/heavy/activate");
+        aliveWhenRefused = asked ? groupAliveInTest(asked.body.pgid) : null;
+      });
+      const { code } = await run.exited;
+      assert.equal(code, 75, run.stderr);
+      assert.equal(aliveWhenRefused, false, "the gated group was reaped before the refusal was said");
+      assert.equal(existsSync(marker), false, "the command never ran");
+      assert.match(run.stderr, new RegExp(`gyredeck: heavy queue refused activation \\(${status} ${error}\\) — not running`));
+      assert.doesNotMatch(run.stderr, /unqueued/);
+      const pgid = fake.requests.find((entry) => entry.path === "/heavy/activate").body.pgid;
+      assert.equal(groupAliveInTest(pgid), false, "and the gated group was reaped");
+    } finally {
+      await fake.close();
+      await h.cleanup();
+    }
+  });
+}
+
+test("heavy r2: a command that ignores SIGTERM is killed when the escalation runs out, then released", { timeout: 25_000 }, async () => {
+  const h = await heavyHarness("escalate");
+  try {
+    await h.start({ GYREDECK_TEST_HEAVY_TICK_MS: "600000" });
+    const started = join(h.home, "started");
+    const run = h.helper(
+      ["--as", "run-a", "--what", "ignores", "--", "sh", "-c", `trap '' TERM; echo $$ > ${started}; while :; do sleep 0.05; done`],
+      { GYREDECK_TEST_HEAVY_KILL_AFTER_MS: "500" },
+    );
+    const pgid = await until(async () => existsSync(started) && Number((await readFile(started, "utf8")).trim()), "the command started");
+    h.groups.add(pgid);
+    run.child.kill("SIGTERM");
+    const { code } = await run.exited;
+    assert.equal(code, 137, "the command's own end: SIGKILL");
+    assert.equal(groupAliveInTest(pgid), false);
+    assert.equal(existsSync(h.holderPath), false, "released once the group was gone");
   } finally {
     await h.cleanup();
   }

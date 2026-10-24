@@ -7,6 +7,7 @@ import type { IUseUpdater } from "../updater/useUpdater";
 import { ProviderIcon } from "../github/components";
 import type { GitProvider, IGhAccount } from "../github/types";
 import { useGitCredentialHelper } from "./useGitCredentialHelper";
+import { useHeavyRuns } from "./useHeavyRuns";
 import { codexTrustCopy, hookNeedsAttention, hookSettled, type IHookStatus } from "./hookStatus";
 
 type SetupCategory = "connection" | "display" | "git" | "notification" | "permission" | "plugins" | "update";
@@ -284,6 +285,62 @@ const SyncRoomList = ({
   );
 };
 
+/** "40s", "12 min", "1h 5m" — how long a run has held the slot or waited for it. */
+const heavyElapsed = (ms: number): string => {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+};
+
+const HEAVY_RELEASE_WARNING = "Frees the slot even if its command is still running — two heavy runs may then overlap.";
+
+/**
+ * The machine's one heavy-run slot (#223): who holds it, what it runs and for how long, and
+ * who is waiting. The app may free a stuck slot and nothing more — no reordering, no jumping
+ * the line.
+ */
+const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean }) => {
+  const heavy = useHeavyRuns(canUseNativeControls);
+  if (!canUseNativeControls) return null;
+  const holder = heavy.status?.holder ?? null;
+  const queue = heavy.status?.queue ?? [];
+  const detail = heavy.error
+    ? heavy.error
+    : !heavy.status
+      ? "Checking…"
+      : holder
+        ? `${holder.as} · ${holder.what} · ${heavyElapsed(holder.elapsedMs)}${holder.state === "reserved" ? " · starting" : ""}${holder.loadSkipped ? " · started under load" : ""}`
+        : "Free";
+  return (
+    <>
+      <div className="setup-subheading">Heavy runs</div>
+      <div className="setup-row" data-heavy-holder={holder?.as ?? ""}>
+        <span className="status-slot"><Gauge className="setup-icon" size={14} strokeWidth={2.3} /></span>
+        <span className="setup-copy">
+          <span className="setup-title">Heavy-run slot</span>
+          <span className="setup-detail">{detail}</span>
+          {holder?.helperGone ? <span className="setup-detail">Helper gone, command still running</span> : null}
+          {queue.map((entry) => (
+            <span className="setup-detail" key={`${entry.position}-${entry.as}`}>
+              {`Waiting ${entry.position} · ${entry.as} · ${entry.what} · ${heavyElapsed(entry.waitedMs)}`}
+            </span>
+          ))}
+          {heavy.status ? <span className="setup-detail">{heavy.status.limit}</span> : null}
+          {holder ? <span className="setup-detail">{HEAVY_RELEASE_WARNING}</span> : null}
+        </span>
+        {holder ? (
+          <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => void heavy.release()} data-tauri-drag-region="false" title={HEAVY_RELEASE_WARNING}>
+            {heavy.releasing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
+            {heavy.releasing ? "Releasing…" : "Release stuck slot"}
+          </button>
+        ) : null}
+      </div>
+    </>
+  );
+};
+
 const UPDATER_DETAIL: Record<IUseUpdater["status"], string> = {
   idle: "Check for the latest release",
   checking: "Checking for updates…",
@@ -414,6 +471,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
               <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{guidance.title}</span><span className="setup-detail">{guidance.detail}</span></span></div>
               {nativeAction.message ? <div className="notice-row" data-online={nativeAction.bridgeOnline === true} role="status" aria-live="polite">{nativeAction.message}</div> : null}
               <SyncRoomList rooms={mailRooms} canUseNativeControls={canUseNativeControls} onCloseRoom={onCloseRoom} />
+              <HeavyRunsRow canUseNativeControls={canUseNativeControls} />
             </>
           ) : null}
 

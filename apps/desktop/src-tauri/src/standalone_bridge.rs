@@ -1212,6 +1212,34 @@ pub(crate) fn sync_close(code: &str, conversation_id: &str, app_word: &str) -> R
     Ok(())
 }
 
+/// The heavy-run slot as the bridge reports it (#223): holder, queue and load, passed
+/// through whole because the Settings row reads it field by field and nothing native acts
+/// on it.
+pub(crate) fn heavy_status() -> Result<serde_json::Value, String> {
+    let (status, value) = bridge_request("GET", "/heavy", None)?;
+    match status {
+        200..=299 => Ok(value),
+        404 => Err("This bridge has no heavy-run queue yet. Quit and reopen Gyredeck".to_string()),
+        _ => Err(format!("The bridge refused the heavy-run status (HTTP {status})")),
+    }
+}
+
+/// Free the heavy-run slot whatever holds it — the app's "Release stuck slot" (#223). Only
+/// the app may: the bridge takes its word for it, as it does for closing a room.
+pub(crate) fn heavy_release(app_word: &str) -> Result<bool, String> {
+    let (status, value) = bridge_request_vouched("DELETE", "/heavy/holder", None, app_word)?;
+    if !(200..300).contains(&status) {
+        return Err(match (status, value.get("error").and_then(serde_json::Value::as_str).unwrap_or("")) {
+            (401, "app_only") => "Gyredeck could not vouch for itself to its own bridge. Quit and reopen Gyredeck".to_string(),
+            (401, _) => "Gyredeck could not authenticate to its own bridge".to_string(),
+            (503, "app_word_unavailable") => "The bridge was started without Gyredeck's word. Quit and reopen Gyredeck".to_string(),
+            (404, _) => "This bridge has no heavy-run queue yet. Quit and reopen Gyredeck".to_string(),
+            _ => format!("The bridge refused the request (HTTP {status})"),
+        });
+    }
+    Ok(value.get("released").and_then(serde_json::Value::as_bool).unwrap_or(false))
+}
+
 /// Join a room by code. Idempotent, so pressing Connect twice is not an error.
 pub(crate) fn sync_join(code: &str, conversation_id: &str, app_word: &str) -> Result<SyncRoom, String> {
     if !valid_room(conversation_id) {

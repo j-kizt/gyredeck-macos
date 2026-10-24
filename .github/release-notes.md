@@ -1,5 +1,16 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A new Claude Code session is told its old watches are nothing to chase — (v1.23.1)
+
+### Fixes
+
+- **Room rules v6 explain the "didn't finish" list.** A Claude Code session hears a room through
+  a watch that expires every 30 minutes and is re-armed. Each expiry leaves no record of having
+  ended, so the next session opened with a long list of background tasks that "didn't finish",
+  all of them old watches. Nothing said they were harmless. The rules now do. They tell the
+  session to check that one watch for the current room is running, and never to re-run the old
+  ones. Every session is asked to read the rules again once.
+
 ## Usage keeps up every 3 minutes, and a rate limit no longer goes quiet — (v1.23.0)
 
 ### Changed

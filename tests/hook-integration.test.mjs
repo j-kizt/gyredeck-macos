@@ -1543,8 +1543,12 @@ test("a room delivery carries only what the session can use, and points at the r
     // The file every delivery points at exists as soon as the bridge does, at the version
     // a delivery names.
     const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
-    assert.match(rules, /^# Gyredeck room rules — v5\n/);
+    assert.match(rules, /^# Gyredeck room rules — v6\n/);
     assert.match(rules, /Never answer a reaction/);
+    // #208: a new Claude Code session lists every expired watch as an unfinished task, and
+    // nothing said that was harmless.
+    assert.match(rules, /Claude Code: after a restart or a new session it may list expired watches as background tasks that "didn't finish"\. They are harmless/);
+    assert.match(rules, /never re-run the old ones/);
 
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
     const headers = { "content-type": "application/json", "x-gyredeck-token": token };
@@ -1586,7 +1590,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/sync/rooms/${code}/confirm`, { conversationId: agy, password: minted.password });
     await steps();
     const opening = await context();
-    assert.match(opening, /Rules v5: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
+    assert.match(opening, /Rules v6: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
     // Nothing but the room talking about itself: nothing to answer, so no command for it.
     assert.doesNotMatch(opening, /REPLY —/);
 
@@ -1646,7 +1650,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/mail/${code}`, { from: peer, to: agy, kind: "reaction", text: "noted" });
     const agyReaction = await steps();
     assert.match(agyReaction, /\[gyredeck mail · from Codex · reaction\] noted/);
-    assert.match(agyReaction, /Rules v5: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(agyReaction, /Rules v6: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.doesNotMatch(agyReaction, /answering is expected/);
     assert.match(agyReaction, /never answer a reaction/);
     assert.match(agyReaction, /ok:true and a seq/);
@@ -5543,7 +5547,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // The confirming push is the full brief, and names the rules file the short form of
     // every later push points at (#157).
     assert.match(afterConfirm.at(-1), /Do not call Gyredeck/);
-    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v5\)/);
+    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v6\)/);
 
     // Typing it twice is the same question. Nothing is announced again and nothing is
     // pushed again, because there is nothing outstanding to carry.
@@ -5573,7 +5577,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // given on confirmation (#157).
     assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} — how to answer: `));
     assert.match(afterLater.at(-1), /@<member or everyone> ask\|tell\|reaction — never answer a reaction/);
-    assert.match(afterLater.at(-1), /Rules v5: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(afterLater.at(-1), /Rules v6: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.match(afterLater.at(-1), /Members now: /);
     assert.doesNotMatch(afterLater.at(-1), /Do not call Gyredeck/);
     // And says which kind it is: a tell and a reaction with the same words must not

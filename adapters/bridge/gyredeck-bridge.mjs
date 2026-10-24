@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 5;
+export const ROOM_RULES_VERSION = 6;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -274,6 +274,7 @@ carries the command for as long as the room sees none of yours.
 - Run it unmodified. Every part of it is load-bearing.
 - It ends for three reasons only: the room closed, you were disconnected, or re-opening is refused because the bridge restarted. The loop stops itself in the third case; in the first two you are told — do not start another.
 - The stream closes every five minutes and says so first. That is routine: the loop re-opens and resumes where it stopped.
+- Claude Code: after a restart or a new session it may list expired watches as background tasks that "didn't finish". They are harmless — each re-armed watch leaves one behind. Check that exactly one watch for the current room is running, and never re-run the old ones.
 
 ## Your usage
 - When your provider's limit drops to 10% left or less, the room tells you, once; and again when it is

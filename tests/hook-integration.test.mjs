@@ -1565,7 +1565,7 @@ test("a room delivery carries only what the session can use, and points at the r
     // The file every delivery points at exists as soon as the bridge does, at the version
     // a delivery names.
     const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
-    assert.match(rules, /^# Gyredeck room rules — v6\n/);
+    assert.match(rules, /^# Gyredeck room rules — v7\n/);
     assert.match(rules, /Never answer a reaction/);
     // #208: a new Claude Code session lists every expired watch as an unfinished task, and
     // nothing said that was harmless.
@@ -1612,7 +1612,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/sync/rooms/${code}/confirm`, { conversationId: agy, password: minted.password });
     await steps();
     const opening = await context();
-    assert.match(opening, /Rules v6: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
+    assert.match(opening, /Rules v7: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
     // Nothing but the room talking about itself: nothing to answer, so no command for it.
     assert.doesNotMatch(opening, /REPLY —/);
 
@@ -1672,7 +1672,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/mail/${code}`, { from: peer, to: agy, kind: "reaction", text: "noted" });
     const agyReaction = await steps();
     assert.match(agyReaction, /\[gyredeck mail · from Codex · reaction\] noted/);
-    assert.match(agyReaction, /Rules v6: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(agyReaction, /Rules v7: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.doesNotMatch(agyReaction, /answering is expected/);
     assert.match(agyReaction, /never answer a reaction/);
     assert.match(agyReaction, /ok:true and a seq/);
@@ -1681,12 +1681,19 @@ test("a room delivery carries only what the session can use, and points at the r
     assert.match(agyTell, /answering is expected/);
     assert.match(agyTell, /"to":"Codex","kind":"reaction"/);
     assert.match(agyTell, /HEAR —/, "no watch of its own yet");
-    // Antigravity wakes only when a background task exits, so it is handed a watch that
-    // ends with its first frame, not a stream that never ends (#159) — the room's own
-    // stream, which reads no mailbox, so a session bound to the broker may use it.
-    assert.match(agyTell, new RegExp(`/mail/${code}/events\\?as=${agy}&since=resume&once=1`));
+    // Antigravity wakes only when a background task exits, so it is handed a wait that
+    // ends with its first mail, not a stream that never ends (#159) — the hook's own wait,
+    // through the broker, so no password sits on the command line (#228).
+    assert.match(agyTell, new RegExp(`gyredeck-agy-hook\\.mjs wait 300 ${agy}`));
+    assert.doesNotMatch(agyTell, /curl -sN/);
     assert.doesNotMatch(agyTell, /\/mail\/wait\?/);
     assert.match(agyTell, /start it again/);
+    // The first wake-only watch ends at once on the mail its stream never carried, even
+    // though the drain delivered it: a wake too many, never one too few (#228 audit).
+    const catchUp = await fetch(`${base}/mail/${code}/events?as=${agy}&since=resume&once=1`, {
+      headers: { "x-gyredeck-token": minted.password },
+    });
+    assert.match(await catchUp.text(), /deploy done/);
     const onceWatch = await fetch(`${base}/mail/${code}/events?as=${agy}&since=resume&once=1`, {
       headers: { "x-gyredeck-token": minted.password },
     });
@@ -5689,7 +5696,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // The confirming push is the full brief, and names the rules file the short form of
     // every later push points at (#157).
     assert.match(afterConfirm.at(-1), /Do not call Gyredeck/);
-    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v6\)/);
+    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v7\)/);
 
     // Typing it twice is the same question. Nothing is announced again and nothing is
     // pushed again, because there is nothing outstanding to carry.
@@ -5719,7 +5726,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // given on confirmation (#157).
     assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} — how to answer: `));
     assert.match(afterLater.at(-1), /@<member or everyone> ask\|tell\|reaction — never answer a reaction/);
-    assert.match(afterLater.at(-1), /Rules v6: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(afterLater.at(-1), /Rules v7: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.match(afterLater.at(-1), /Members now: /);
     assert.doesNotMatch(afterLater.at(-1), /Do not call Gyredeck/);
     // And says which kind it is: a tell and a reaction with the same words must not
@@ -8533,7 +8540,9 @@ test("the bridge refuses an old-path collect for a session the broker has bound,
       onceWatch.text(),
       new Promise((resolve) => setTimeout(() => resolve("STILL OPEN"), 3_000)),
     ]);
-    assert.match(woke, /^data: .*wake the bound one/m, "and ends with the frame that wakes it");
+    // It ends at once on the mail it had not yet heard: its cursor starts at its
+    // confirmation, so what came after is replayed rather than missed (#228).
+    assert.match(woke, /^data: .*room mail/m, "and ends with the frame that wakes it");
     assert.equal(roomCollect.body.error, "broker_required");
     const roomCollectVouched = await call("GET", `/mail/${code}?as=${bound}&collect=1`, { "x-gyredeck-token": password, "x-gyredeck-broker": secret });
     assert.equal(roomCollectVouched.status, 200);
@@ -9192,5 +9201,182 @@ test("a hook that gave up on a slow answer is handed the same batch next turn, a
       await new Promise((resolve) => broker.close(resolve));
       await rm(home, { recursive: true, force: true });
     }
+  }
+});
+
+test("a watch that has never carried a frame still hears what arrived while it was reopening (#228)", async () => {
+  // A member's resume point used to be set only by a frame it was handed, so a watch that
+  // had never carried one resumed from nothing and replayed nothing: a message sent in the
+  // second between a five-minute expiry and the reopen woke nobody.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-228-gap-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const founder = "a2280000-0000-4000-8000-000000000001";
+  const member = "a2280000-0000-4000-8000-000000000002";
+  const late = "a2280000-0000-4000-8000-000000000003";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+      return { status: response.status, body: await response.json() };
+    };
+    // What a wake-only watch opened now is handed at once: the seqs of the frames it gets
+    // before it ends, or [] if it gets none within a second.
+    const resumed = async (as, password) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 1_000);
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${as}&since=resume&once=1`, {
+          headers: { "x-gyredeck-token": password }, signal: controller.signal,
+        });
+        const text = await response.text();
+        return [...text.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1]));
+      } catch {
+        return [];
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    const password = created.body.password;
+    assert.equal((await joinConfirmed(call, code, founder, member)).status, 200);
+
+    // (1) A member that has never carried a frame: a message arrives while no watch is open.
+    const toMember = await call("POST", `/mail/${code}`, { from: founder, to: "everyone", kind: "ask", text: "are you there?" });
+    assert.equal(toMember.status, 202);
+    const memberFrames = await resumed(member, password);
+    assert.ok(memberFrames.includes(toMember.body.seq), "the member hears it on reopening");
+    assert.ok(memberFrames.every((seq) => seq >= toMember.body.seq), `and not what its confirmation already handed over: ${memberFrames}`);
+
+    // (1b) Collected but not yet delivered: a collect hands the batch to a reader before any
+    // hook has shown it to the agent, so it is no proof of a wake (#228 audit, P1).
+    const collected = await call("POST", `/mail/${code}`, { from: founder, to: "everyone", kind: "ask", text: "collected, not seen" });
+    const taken = await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${member}&collect=1`, { headers: { "x-gyredeck-token": password } });
+    assert.equal(taken.status, 200);
+    assert.ok((await taken.json()).messages.some((m) => m.seq === collected.body.seq), "the premise: the collect took it");
+    assert.ok((await resumed(member, password)).includes(collected.body.seq), "and the watch still wakes on it");
+
+    // (2) The founder, in a room whose first message is seq 1.
+    const toFounder = await call("POST", `/mail/${code}`, { from: member, to: "everyone", kind: "ask", text: "and you?" });
+    assert.ok((await resumed(founder, password)).includes(toFounder.body.seq), "the founder hears it on reopening");
+
+    // (3) A member let in afterwards is not handed what was said before it joined.
+    const before = await call("POST", `/mail/${code}`, { from: founder, to: "everyone", kind: "ask", text: "said before you came" });
+    assert.equal(before.status, 202);
+    assert.equal((await joinConfirmed(call, code, founder, late)).status, 200);
+    const lateFrames = await resumed(late, password);
+    assert.ok(lateFrames.every((seq) => seq > before.body.seq), `nothing from before it joined: ${lateFrames}`);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("an Antigravity member is told to hear the room with a wait that ends, never a stream (#228)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-228-howto-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const founder = "a2281000-0000-4000-8000-000000000001";
+  const agy = "a2281000-0000-4000-8000-000000000002";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+      return { status: response.status, body: await response.json() };
+    };
+    for (const [conversationId, sourceKind] of [[founder, "claudeCodeHook"], [agy, "agyHost"]]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const code = (await call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    const confirmed = await joinConfirmed(call, code, founder, agy);
+    assert.equal(confirmed.status, 200);
+    const { watch, wait } = confirmed.body.howTo;
+    assert.match(watch.command, /gyredeck-agy-hook\.mjs wait 300 a2281000-0000-4000-8000-000000000002/, "the wait that ends");
+    assert.doesNotMatch(JSON.stringify(confirmed.body.howTo), /curl -sN/, "no stream anywhere in what it is told");
+    assert.match(wait.command, /gyredeck-agy-hook\.mjs wait 60 /);
+
+    // A Claude Code member keeps the stream it can be notified line by line from.
+    const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+    const claudeSide = await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: founder, password: minted.body.password });
+    assert.match(claudeSide.body.howTo?.watch?.command ?? "", /curl -sN/, JSON.stringify(claudeSide.body).slice(0, 300));
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("the Antigravity hook's wait asks the broker, ends on mail, and is refused rather than quiet (#228)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-228-wait-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "ab".repeat(32));
+  const me = "7b7b7b7b-0000-4d8c-9b3a-aa11bb22cc33";
+  const waitBy = (args) => runAdapter("adapters/antigravity/gyredeck-agy-hook.mjs", ["wait", ...args], home, {});
+  try {
+    let broker = await fakeBroker(home, () => ({ v: 1, ok: true, boundTo: me, messages: [{ seq: 4, from: "codex", text: "for agy", kind: "ask" }] }));
+    let waited = await waitBy(["30", me]);
+    assert.equal(waited.code, 0, waited.stderr);
+    assert.deepEqual(broker.requests[0], { v: 1, collect: { limit: 10 } }, "a collect, never a bind");
+    assert.deepEqual(JSON.parse(waited.stdout).messages.map((m) => m.text), ["for agy"]);
+    await broker.close();
+
+    // Nothing arrives: exit 4, so the loop around it starts it again without waking agy.
+    broker = await fakeBroker(home, () => ({ v: 1, ok: true, boundTo: me, messages: [] }));
+    const started = Date.now();
+    waited = await waitBy(["1", me]);
+    assert.equal(waited.code, 4, waited.stderr);
+    assert.equal(waited.stdout.trim(), "", "and prints nothing that would read as mail");
+    assert.ok(Date.now() - started < 5_000);
+    await broker.close();
+
+    // Mail for another session is not this one's: refused.
+    broker = await fakeBroker(home, () => ({ v: 1, ok: true, boundTo: "someone-else", messages: [{ seq: 1, text: "x" }] }));
+    waited = await waitBy(["30", me]);
+    assert.equal(waited.code, 2);
+    assert.match(waited.stderr, /wait refused — the broker answered for "someone-else"/);
+    await broker.close();
+
+    // The broker refuses: said, and never a quiet timeout.
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" }));
+    waited = await waitBy(["30", me]);
+    assert.equal(waited.code, 2);
+    assert.match(waited.stderr, /wait refused — unbound — bind first/);
+    await broker.close();
+
+    assert.equal((await waitBy(["30"])).code, 3, "an id is required");
+    assert.equal((await waitBy(["0", me])).code, 3, "usage");
+  } finally {
+    await rm(home, { recursive: true, force: true });
   }
 });

@@ -1,19 +1,52 @@
-# Dependabot was enabled from the repository UI with no config file, so security
-# updates ran against every ecosystem in the lockfiles. That surfaced a glib advisory
-# that cannot be acted on and cannot affect this app, and every scan reported it as a
-# failed run.
+# Version updates, weekly and grouped (the user's choice, 2026-10-24). Before this, the file
+# only kept version-update PRs off (open-pull-requests-limit: 0) and silenced one glib
+# advisory, so dependencies drifted until an advisory forced a single bump (vite, #194).
 #
-# open-pull-requests-limit: 0 keeps version-update PRs off — the state before this file
-# existed. Security update PRs are explicitly not affected by that limit, so genuine
-# advisories still open one; only the ignore below is silenced.
+# One PR per group per week, Friday at noon in Bangkok, so a week's bumps are reviewed
+# together. Tauri and its updater get their own groups: the updater carries every installed
+# copy to the next release, so a regression there strands users, and it is merged only
+# after its own check. Security update PRs ignore the groups and the limit and still open
+# on their own.
 
 version: 2
 updates:
+  - package-ecosystem: npm
+    # The pnpm workspace root holds the one lockfile. A bump opened from /apps/desktop
+    # alone left pnpm-lock.yaml stale and failed CI (#195).
+    directory: /
+    schedule:
+      interval: weekly
+      day: friday
+      time: "12:00"
+      timezone: Asia/Bangkok
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      tauri-updater:
+        patterns: ["@tauri-apps/plugin-updater"]
+      tauri:
+        patterns: ["@tauri-apps/*"]
+      npm:
+        patterns: ["*"]
+
   - package-ecosystem: cargo
     directory: /apps/desktop/src-tauri
     schedule:
-      interval: monthly
-    open-pull-requests-limit: 0
+      interval: weekly
+      day: friday
+      time: "12:00"
+      timezone: Asia/Bangkok
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      tauri-updater:
+        patterns: ["tauri-plugin-updater"]
+      tauri:
+        patterns: ["tauri", "tauri-*"]
+      cargo:
+        patterns: ["*"]
     ignore:
       # glib reaches the lockfile five levels down, through Tauri's Linux GTK stack:
       #
@@ -32,3 +65,17 @@ updates:
       # Drop this entry once Tauri's dependency chain allows glib 0.20 — re-check with
       # `cargo tree -i glib --target all`.
       - dependency-name: glib
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: friday
+      time: "12:00"
+      timezone: Asia/Bangkok
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      actions:
+        patterns: ["*"]

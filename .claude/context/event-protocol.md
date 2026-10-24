@@ -164,7 +164,7 @@ Codes look like `sync-4f2a` — short enough to read off one screen and type int
 
 A session belongs to **at most one** room. Creating or joining while already in another answers `409 already_in_room` rather than moving silently, so the panel's buttons keep one meaning each. Joining a room you are already in is idempotent, so a second press of Connect is not an error. An unknown code answers `404`, which is what lets the join field show an error.
 
-**Create and join need no credential. Reading a room needs the room's own password and nothing else; sending needs that or the machine token, for the founder's sake.** Putting a session into a room grants it nothing, so gating that would only prove what every local caller can prove anyway. The room's password is created with the room, copied from the founder's key button, and typed by hand into the terminal of the session being let in. From then on that session presents it in the `x-gyredeck-token` header of every read and every send — which is where a credential already travels, so "attach it to every message" needs no second mechanism and no new field.
+**Create and join are the app's alone (#220): they take the machine token and the app's broker secret in `x-gyredeck-broker`. Reading a room needs the room's own password and nothing else; sending needs that or the machine token, for the founder's sake.** Both used to be open, on the grounds that being in a room grants nothing — but create returned the room's password to whoever named a session, so any local agent could found a room in another session's name and hold its key. The room's password is created with the room, copied from the founder's key button, and typed by hand into the terminal of the session being let in. From then on that session presents it in the `x-gyredeck-token` header of every read and every send — which is where a credential already travels, so "attach it to every message" needs no second mechanism and no new field.
 
 Two credentials reach `/mail` and they mean different things:
 
@@ -175,7 +175,7 @@ Two credentials reach `/mail` and they mean different things:
 
 A session already in a room may use that room's password for its own mailbox too — it is the credential it was handed, and asking it to hold a second one buys nothing.
 
-`GET /mail` — the whole table, every room and its roster — takes the machine token alone: it is the app's view, not a member's. Issuing a room's password, closing a room, and taking a member out take it too; those three change who may do what, and were authorised on `?as=` alone, which is a name a caller writes rather than something it holds. Creating and joining stay open, because being in a room grants nothing by itself.
+`GET /mail` — the whole table, every room and its roster — takes the machine token alone: it is the app's view, not a member's. Creating a room, joining one, issuing its password, taking a member out and closing it take the machine token **and** the app's word (`x-gyredeck-broker`, the per-run secret the app hands the bridge on stdin; #220, #221) — the machine token alone is something every local agent reads. Missing or wrong word → `401 app_only`; a bridge started with no secret refuses all five with `503 app_word_unavailable` rather than falling back to the machine token. Close takes no founder check (close contract A): the app may close any room, because only the app holds the word.
 
 ### Which pages may call the bridge at all
 

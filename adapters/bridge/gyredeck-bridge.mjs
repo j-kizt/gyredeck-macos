@@ -5094,27 +5094,47 @@ function startBridge(config) {
         res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
         res.end(JSON.stringify(body));
       };
-      // Create and join are deliberately open. Putting a session into a room lets it
-      // neither read nor say anything — the room's own token gates both — and asking
-      // for the machine token here would only prove what every local caller can prove.
       sweepMailRooms();
 
       const url = new URL(req.url, "http://127.0.0.1");
       const segments = url.pathname.split("/").filter(Boolean);
       const code = segments[2];
 
-      // The three that change who may do what are not like create and join: issuing the
-      // password, closing the room, and taking a member out. Each is pressed in the app
-      // and only ever called by it, and each was authorised on `?as=` alone — a session
-      // id, which is a name a caller writes, not something it holds. The machine token
-      // does not prove which session is asking, but it does keep the act inside the app
-      // that has the button, which `?as=` never did.
-      const changesAuthority =
-        (req.method === "POST" && segments.length === 4 && segments[3] === "passwords") ||
+      // Five acts the person performs in the app, and only there: creating a room, putting
+      // a session in one, issuing its password, taking a member out, and closing it. Each
+      // was authorised by something any local agent holds — a session id it can read from
+      // a member list or the event log, or the machine token every agent can read from
+      // disk — so any agent could found a room in another session's name and hold its
+      // password (#220), or end anyone's room (#221). The app's word is the one thing on
+      // this machine no agent can read: the broker secret the app mints at launch and
+      // hands this process on stdin, never on disk, in an environment or in argv. With no
+      // secret there is no word to accept, so the acts are refused rather than falling back
+      // to the machine token, which a release that failed to mint one would otherwise do.
+      const appOnly =
+        (req.method === "POST" && segments.length === 2) ||
+        (req.method === "POST" && segments.length === 4 && (segments[3] === "passwords" || segments[3] === "members")) ||
         (req.method === "DELETE" && segments.length >= 3);
-      if (changesAuthority && !holdsMachineToken(req.headers["x-gyredeck-token"])) {
-        sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
-        return;
+      if (appOnly) {
+        if (!holdsMachineToken(req.headers["x-gyredeck-token"])) {
+          sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+          return;
+        }
+        if (brokerSecret === null) {
+          sendJson(503, {
+            ok: false,
+            error: "app_word_unavailable",
+            message: "Rooms are opened, joined and closed from the Gyredeck app, and this bridge was started without the app's word, so it cannot tell the app from anyone else. Quit and reopen Gyredeck.",
+          });
+          return;
+        }
+        if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"])) {
+          sendJson(401, {
+            ok: false,
+            error: "app_only",
+            message: "Only the Gyredeck app can do this. Rooms are opened, joined and closed there; a session takes part by presenting the room's password to /confirm.",
+          });
+          return;
+        }
       }
 
       // GET /sync/rooms?as=<id> — which room this session is in, if any.
@@ -5192,15 +5212,10 @@ function startBridge(config) {
           sendJson(404, { ok: false, error: "no_such_room" });
           return;
         }
-        const closer = url.searchParams.get("as");
-        if (closer && room.createdBy !== closer) {
-          sendJson(403, {
-            ok: false,
-            error: "not_the_founder",
-            message: "Only the session that created this room can close it.",
-          });
-          return;
-        }
+        // The app's word has been checked above, and the app is the person, who may close
+        // any room they own the machine of (#221, close contract A). Asking `as` to match
+        // the founder as well would add nothing — a founder id is a session id, readable by
+        // any agent — and would only stop the person closing a room whose founder is gone.
         closeRoom(code, room, "the room was closed");
         sendJson(200, { ok: true, room: code, closed: true });
         return;

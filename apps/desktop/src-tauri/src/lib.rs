@@ -846,18 +846,18 @@ fn sync_room(conversation_id: String) -> Result<standalone_bridge::SyncRoom, Str
 }
 
 #[tauri::command]
-fn sync_create(conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
-    standalone_bridge::sync_create(&conversation_id)
+fn sync_create(broker: tauri::State<'_, broker::BrokerState>, conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
+    standalone_bridge::sync_create(&conversation_id, &broker.secret()?)
 }
 
 #[tauri::command]
-fn sync_close(code: String, conversation_id: String) -> Result<(), String> {
-    standalone_bridge::sync_close(&code, &conversation_id)
+fn sync_close(broker: tauri::State<'_, broker::BrokerState>, code: String, conversation_id: String) -> Result<(), String> {
+    standalone_bridge::sync_close(&code, &conversation_id, &broker.secret()?)
 }
 
 #[tauri::command]
-fn sync_issue_password(code: String, conversation_id: String) -> Result<String, String> {
-    standalone_bridge::sync_issue_password(&code, &conversation_id)
+fn sync_issue_password(broker: tauri::State<'_, broker::BrokerState>, code: String, conversation_id: String) -> Result<String, String> {
+    standalone_bridge::sync_issue_password(&code, &conversation_id, &broker.secret()?)
 }
 
 /// Every name the person has given a session, keyed by conversation id.
@@ -886,13 +886,13 @@ fn set_session_name(conversation_id: String, name: String) -> Result<Option<Stri
 }
 
 #[tauri::command]
-fn sync_join(code: String, conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
-    standalone_bridge::sync_join(&code, &conversation_id)
+fn sync_join(broker: tauri::State<'_, broker::BrokerState>, code: String, conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
+    standalone_bridge::sync_join(&code, &conversation_id, &broker.secret()?)
 }
 
 #[tauri::command]
-fn sync_leave(code: String, conversation_id: String) -> Result<(), String> {
-    standalone_bridge::sync_leave(&code, &conversation_id)
+fn sync_leave(broker: tauri::State<'_, broker::BrokerState>, code: String, conversation_id: String) -> Result<(), String> {
+    standalone_bridge::sync_leave(&code, &conversation_id, &broker.secret()?)
 }
 
 #[tauri::command]

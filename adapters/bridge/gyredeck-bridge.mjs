@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 6;
+export const ROOM_RULES_VERSION = 7;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -266,9 +266,10 @@ after you answer, show the words you sent — not that you replied — and the s
 ## Hear (Claude Code, Antigravity)
 Keep exactly one way of hearing the room open, so messages reach you without a keypress. The delivery
 carries the command for as long as the room sees none of yours.
-- Antigravity: the command is a wait that ends as soon as something is addressed to you — that ending
-  is what wakes you. After you have answered, start it again. After "bridge unreachable" or "wait
-  refused", wait for a delivery that shows the command before starting it again.
+- Antigravity: the command is \`node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait\` in a loop, run as a
+  background task. It ends as soon as mail for you arrives and prints it — that ending is what wakes
+  you. After you have answered, start it again. It needs no password. If it prints "wait refused",
+  tell the person you cannot hear the room instead of starting it again.
 - Claude Code: the command is a watch that keeps running; the rest of this section is about it.
 - Run it with something that turns each line into a notification while it keeps running. A plain background job is not that: the stream stays open, messages land in a file, and the room looks quiet. If that is all you have, say so instead.
 - Run it unmodified. Every part of it is load-bearing.
@@ -283,9 +284,10 @@ carries the command for as long as the room sees none of yours.
   \`curl -s "${origin}/usage?as=<your id>" -H "x-gyredeck-token: THE ROOM PASSWORD"\`
   — each limit's label, how much is left, and when it resets. Codex cannot call it; the room tells it.
 
-## Wait (Claude Code)
+## Wait (Claude Code, Antigravity)
 Only while an answer you need before you can carry on is outstanding:
-\`node ~/.config/gyredeck/gyredeck-claude-hook.mjs wait 60 <your id>\`.
+\`node ~/.config/gyredeck/gyredeck-claude-hook.mjs wait 60 <your id>\`
+(Antigravity: \`gyredeck-agy-hook.mjs\` in place of \`gyredeck-claude-hook.mjs\`; exit 4 means nothing arrived).
 It prints what arrived, or \`"timedOut": true\` with \`yourLastMessage\`. If that says your message was
 addressed correctly and delivered, the silence is theirs: say so and stop; do not send it again.
 Exit 2 means the mail is being withheld — do not work around it with curl.
@@ -2957,6 +2959,10 @@ function startBridge(config) {
       // is the second of the three that used to race.
       toCodex ? conversationId : null,
     );
+    // Moved past the confirmation and its own notice: what came before is handed over by
+    // the confirmation's drain, so a watch opened next resumes after it rather than waking
+    // on it a second time (#228).
+    member.streamSeq = Math.max(member.streamSeq ?? 0, room.seq);
     if (!toCodex) {
       tellConfirmed(code, room, conversationId);
       return { transitioned: true, delivered: true, held: 0 };
@@ -3900,7 +3906,47 @@ function startBridge(config) {
    * later, by which point the session has usually guessed. The commands come with the
    * password already in them: a session that just presented it plainly has it.
    */
-  const howToUseRoom = (name, password, conversationId, host, port) => ({
+  const howToUseRoom = (name, password, conversationId, host, port) =>
+    providerByConversation.get(conversationId) === "agyHost"
+      ? { ...howToUseRoomBase(name, password, conversationId, host, port), ...howAntigravityHears(conversationId) }
+      : howToUseRoomBase(name, password, conversationId, host, port);
+
+  /**
+   * Antigravity wakes the agent only when a background task exits (#159), so the stream
+   * below — which never exits — would deliver into a log nobody reads. This is the one
+   * place a session is certain to read how to hear, so an Antigravity member is shown only
+   * the wait that ends on its first mail (#228).
+   */
+  const howAntigravityHears = (conversationId) => {
+    const loop =
+      `while :; do node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 300 ${conversationId};` +
+      " rc=$?; [ $rc -eq 4 ] || break; done";
+    return {
+      watch: {
+        what: "Be woken when a message arrives, rather than waiting to be typed at.",
+        method: "command",
+        url: null,
+        command: loop,
+        runner:
+          "Run it as a background task. It ends as soon as mail for you arrives and prints" +
+          " it — that exit is what wakes you. After you have answered, start it again.",
+        lifetime: "Keep exactly one running for as long as you are in the room.",
+        stop:
+          "It prints \"wait refused\" on its error output when it cannot hear the room; say so" +
+          " to the person rather than starting it again.",
+      },
+      wait: {
+        what: "Block for an answer you need before you can carry on. It goes through the Gyredeck broker, which knows which process is asking, so no password is on the line.",
+        method: "command",
+        url: null,
+        command: `node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 60 ${conversationId}`,
+        success: '{"ok":true,"timedOut":false,"messages":[...]} on exit 0; exit 4 means nothing arrived in time.',
+        rule: "Only while an answer is genuinely outstanding; the watch above already covers hearing the room.",
+      },
+    };
+  };
+
+  const howToUseRoomBase = (name, password, conversationId, host, port) => ({
     credential: {
       header: "x-gyredeck-token",
       value: password,
@@ -3977,7 +4023,7 @@ function startBridge(config) {
         " or you were disconnected from it.",
     },
     wait: {
-      what: "Block inside this turn for an answer you need before you can carry on. Claude Code sessions only: the wait goes through the Gyredeck broker, which knows which process is asking; Antigravity has no wait.",
+      what: "Block inside this turn for an answer you need before you can carry on. Claude Code sessions: the wait goes through the Gyredeck broker, which knows which process is asking.",
       method: "command",
       url: null,
       command: `node ~/.config/gyredeck/gyredeck-claude-hook.mjs wait 60 ${conversationId}`,
@@ -5188,6 +5234,10 @@ function startBridge(config) {
           // Joining mid-conversation should not replay what was said before: a member
           // starts from where the room is now.
           readSeq: room.seq,
+          // Where `since=resume` picks up (#228). Unset, a watch that had never carried a
+          // frame resumed from nothing and replayed nothing, so a message sent while it
+          // was reopening woke nobody.
+          streamSeq: room.seq,
           lastReadAt: null,
         });
         startHarvestAtEnd(conversationId);
@@ -5362,6 +5412,7 @@ function startBridge(config) {
             // Announced after the member is added, so its own read position is behind
             // the notice and it learns who else is here too.
             readSeq: room.seq,
+            streamSeq: room.seq,
             lastReadAt: null,
           });
           announceMembership(code, room, `${shownIn(room, conversationId)} joined this room.`);
@@ -6176,7 +6227,12 @@ function startBridge(config) {
         // reaches the notifier and the room looks silent. Two sessions wrote that same
         // bug on the same day, one of them the author of the instruction.
         const asked = url.searchParams.get("since");
-        const streamed = watcher ? room.members.get(watcher)?.streamSeq : null;
+        // Past what it was pushed and past what it has read: mail its hook already handed
+        // over is not news, and waking on it again costs a wake for nothing (#228).
+        const watching = watcher ? room.members.get(watcher) : null;
+        const streamed = watching && typeof watching.streamSeq === "number"
+          ? Math.max(watching.streamSeq, watching.readSeq ?? 0)
+          : null;
         const resumeFrom =
           asked === "resume"
             ? (typeof streamed === "number" ? streamed : 0)
@@ -6186,7 +6242,10 @@ function startBridge(config) {
         // and the next invocation's drain delivers the mail as usual.
         const once = url.searchParams.get("once") === "1";
         let replayed = false;
-        if (Number.isInteger(resumeFrom) && resumeFrom > 0) {
+        // A member's own cursor is a starting point even at 0 — a room's first message
+        // arrives at seq 1, while its founder's watch may be between two connections.
+        const fromCursor = asked === "resume" && typeof streamed === "number";
+        if (Number.isInteger(resumeFrom) && (resumeFrom > 0 || fromCursor)) {
           const member = watcher ? room.members.get(watcher) : null;
           for (const message of room.messages) {
             if (message.seq <= resumeFrom) continue;

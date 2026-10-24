@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import test from "node:test";
 
 const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
@@ -1565,7 +1565,7 @@ test("a room delivery carries only what the session can use, and points at the r
     // The file every delivery points at exists as soon as the bridge does, at the version
     // a delivery names.
     const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
-    assert.match(rules, /^# Gyredeck room rules — v7\n/);
+    assert.match(rules, /^# Gyredeck room rules — v8\n/);
     assert.match(rules, /Never answer a reaction/);
     // #208: a new Claude Code session lists every expired watch as an unfinished task, and
     // nothing said that was harmless.
@@ -1612,7 +1612,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/sync/rooms/${code}/confirm`, { conversationId: agy, password: minted.password });
     await steps();
     const opening = await context();
-    assert.match(opening, /Rules v7: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
+    assert.match(opening, /Rules v8: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
     // Nothing but the room talking about itself: nothing to answer, so no command for it.
     assert.doesNotMatch(opening, /REPLY —/);
 
@@ -1672,7 +1672,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/mail/${code}`, { from: peer, to: agy, kind: "reaction", text: "noted" });
     const agyReaction = await steps();
     assert.match(agyReaction, /\[gyredeck mail · from Codex · reaction\] noted/);
-    assert.match(agyReaction, /Rules v7: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(agyReaction, /Rules v8: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.doesNotMatch(agyReaction, /answering is expected/);
     assert.match(agyReaction, /never answer a reaction/);
     assert.match(agyReaction, /ok:true and a seq/);
@@ -5696,7 +5696,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // The confirming push is the full brief, and names the rules file the short form of
     // every later push points at (#157).
     assert.match(afterConfirm.at(-1), /Do not call Gyredeck/);
-    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v7\)/);
+    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v8\)/);
 
     // Typing it twice is the same question. Nothing is announced again and nothing is
     // pushed again, because there is nothing outstanding to carry.
@@ -5726,7 +5726,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // given on confirmation (#157).
     assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} — how to answer: `));
     assert.match(afterLater.at(-1), /@<member or everyone> ask\|tell\|reaction — never answer a reaction/);
-    assert.match(afterLater.at(-1), /Rules v7: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(afterLater.at(-1), /Rules v8: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.match(afterLater.at(-1), /Members now: /);
     assert.doesNotMatch(afterLater.at(-1), /Do not call Gyredeck/);
     // And says which kind it is: a tell and a reaction with the same words must not
@@ -9378,5 +9378,714 @@ test("the Antigravity hook's wait asks the broker, ends on mail, and is refused 
     assert.equal((await waitBy(["0", me])).code, 3, "usage");
   } finally {
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+// ── Heavy runs (#223) ──
+
+const heavyModule = () => import(new URL("../adapters/bridge/gyredeck-bridge.mjs", import.meta.url).href);
+const heavySecret = () => randomBytes(16).toString("hex");
+
+/** Poll until `check` answers something truthy. A condition, never a fixed wait. */
+const until = async (check, label, limitMs = 15_000) => {
+  const started = Date.now();
+  for (;;) {
+    const value = await check();
+    if (value) return value;
+    if (Date.now() - started > limitMs) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+};
+
+/** A process group of its own that sleeps until killed: a stand-in for a helper's child. */
+const sleepingGroup = () => {
+  const child = spawn("sleep", ["300"], { detached: true, stdio: "ignore" });
+  child.unref();
+  return child.pid;
+};
+const groupAliveInTest = (pgid) => {
+  try { process.kill(-pgid, 0); return true; } catch (error) { return error.code === "EPERM"; }
+};
+const killGroup = (pgid) => { try { process.kill(-pgid, "SIGKILL"); } catch {} };
+
+/**
+ * One bridge home for the heavy-run tests: a fake load and a fake clock shift in files the
+ * bridge reads on every check, a short sweep, and helpers to speak the protocol by hand or
+ * through the real helper the bridge wrote.
+ */
+const heavyHarness = async (tag) => {
+  const home = await mkdtemp(join(tmpdir(), `gyredeck-heavy-${tag}-`));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const loadFile = join(home, "load");
+  const clockFile = join(home, "clock");
+  await writeFile(loadFile, "1");
+  await writeFile(clockFile, "0");
+  const base = `http://127.0.0.1:${port}`;
+  const holderPath = join(home, ...CONFIG_DIR, "heavy", "holder.json");
+  const helperPath = join(home, ...CONFIG_DIR, "gyredeck-heavy.mjs");
+  const bridges = new Set();
+  const groups = new Set();
+  const helpers = new Set();
+  let token = null;
+
+  const start = async (env = {}) => {
+    const stderrRef = { value: "" };
+    const bridge = spawn(
+      process.execPath,
+      ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          HOME: home,
+          GYREDECK_TEST_HEAVY_LOAD: loadFile,
+          GYREDECK_TEST_HEAVY_CLOCK: clockFile,
+          GYREDECK_TEST_HEAVY_TICK_MS: "100",
+          ...env,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+    bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+    bridge.exited = new Promise((resolve) => bridge.on("exit", (code) => resolve(code)));
+    bridges.add(bridge);
+    await waitForHealth(port, stderrRef);
+    token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    return bridge;
+  };
+  const stop = async (bridge) => {
+    bridge.stdin.end();
+    if (bridge.exitCode === null && bridge.signalCode === null) bridge.kill();
+    await bridge.exited;
+    bridges.delete(bridge);
+  };
+  const post = async (action, body, extraHeaders = {}) => {
+    const response = await fetch(`${base}/heavy/${action}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": token, ...extraHeaders },
+      body: typeof body === "string" ? body : JSON.stringify({ v: 1, ...body }),
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  const state = async () => fetch(`${base}/heavy`, { headers: { "x-gyredeck-token": token } }).then((r) => r.json());
+  const pair = () => ({ lease: heavySecret(), requestId: heavySecret() });
+  const acquire = (as, what, ids) => post("acquire", { as, what, ...ids });
+  const group = () => {
+    const pgid = sleepingGroup();
+    groups.add(pgid);
+    return pgid;
+  };
+  /** Take the slot by hand, active on a sleeping group of the test's own. */
+  const hold = async (as = "holder-a") => {
+    const ids = pair();
+    const granted = await acquire(as, `${as} runs`, ids);
+    assert.equal(granted.status, 200, JSON.stringify(granted.body));
+    const pgid = group();
+    const activated = await post("activate", { lease: ids.lease, pgid });
+    assert.equal(activated.status, 200, JSON.stringify(activated.body));
+    return { ...ids, pgid };
+  };
+  const helper = (args, env = {}, path = helperPath) => {
+    const child = spawn(process.execPath, [path, ...args], {
+      cwd: home,
+      env: { ...process.env, HOME: home, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const out = { stdout: "", stderr: "" };
+    child.stdout.on("data", (chunk) => { out.stdout += chunk; });
+    child.stderr.on("data", (chunk) => { out.stderr += chunk; });
+    out.child = child;
+    out.exited = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
+    helpers.add(child);
+    return out;
+  };
+  const cleanup = async () => {
+    // A command can outlive its helper, holding the helper's stdout open; without closing
+    // our end, and killing its group, the test process would wait on it forever.
+    try { groups.add(JSON.parse(await readFile(holderPath, "utf8")).pgid); } catch {}
+    for (const child of helpers) {
+      try { child.kill("SIGKILL"); } catch {}
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }
+    for (const pgid of groups) if (Number.isInteger(pgid) && pgid > 1) killGroup(pgid);
+    for (const bridge of bridges) await stop(bridge);
+    await rm(home, { recursive: true, force: true });
+  };
+  return { home, base, loadFile, clockFile, holderPath, helperPath, start, stop, post, state, pair, acquire, group, hold, helper, cleanup, token: () => token, groups };
+};
+
+test("heavy C1: only the lease releases the slot — not another lease, not a name", async () => {
+  const h = await heavyHarness("c1");
+  try {
+    await h.start();
+    const held = await h.hold("holder-a");
+    const before = await h.state();
+    assert.equal(before.holder.as, "holder-a");
+
+    const otherLease = await h.post("release", { lease: heavySecret() });
+    assert.equal(otherLease.status, 404);
+    assert.equal(otherLease.body.error, "lease_unknown");
+    const byName = await h.post("release", { as: "holder-a" });
+    assert.equal(byName.status, 400, "a name is not a lease");
+    const byRequestId = await h.post("release", { lease: held.requestId });
+    assert.equal(byRequestId.status, 404, "the request id is not the lease");
+    const { elapsedMs: _then, ...held0 } = before.holder;
+    const { elapsedMs: _now, ...held1 } = (await h.state()).holder;
+    assert.deepEqual(held1, held0, "the slot is unchanged");
+
+    const released = await h.post("release", { lease: held.lease });
+    assert.equal(released.status, 200);
+    assert.equal((await h.state()).holder, null);
+    assert.equal(existsSync(h.holderPath), false, "and the record goes with it");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy C2: the line is first come, first served", async () => {
+  const h = await heavyHarness("c2");
+  try {
+    await h.start();
+    const a = await h.hold("run-a");
+    const b = h.pair();
+    const c = h.pair();
+    const queuedB = await h.acquire("run-b", "b", b);
+    const queuedC = await h.acquire("run-c", "c", c);
+    assert.equal(queuedB.status, 202);
+    assert.deepEqual([queuedB.body.position, queuedC.body.position], [1, 2]);
+
+    const settled = { b: false, c: false };
+    const waitB = h.post("wait", { ticket: queuedB.body.ticket, lease: b.lease }).then((answer) => { settled.b = true; return answer; });
+    const waitC = h.post("wait", { ticket: queuedC.body.ticket, lease: c.lease }).then((answer) => { settled.c = true; return answer; });
+    // Both polls are held: the premise, before anything is released.
+    await until(async () => (await h.state()).queue.length === 2, "both queued");
+    assert.deepEqual(settled, { b: false, c: false }, "nobody is granted while A holds the slot");
+
+    await h.post("release", { lease: a.lease });
+    const grantedB = await waitB;
+    assert.equal(grantedB.body.granted, true);
+    assert.equal(grantedB.body.lease, b.lease, "the lease B made, echoed");
+    const afterB = await h.state();
+    assert.equal(afterB.holder.as, "run-b");
+    assert.deepEqual(afterB.queue.map((entry) => entry.as), ["run-c"]);
+    assert.equal(settled.c, false, "C is still waiting behind B");
+
+    await h.post("release", { lease: b.lease });
+    const grantedC = await waitC;
+    assert.equal(grantedC.body.granted, true);
+    assert.equal((await h.state()).holder.as, "run-c");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy C3: a helper killed with -9 leaves its group holding the slot", async () => {
+  const h = await heavyHarness("c3");
+  try {
+    await h.start();
+    const pidFile = join(h.home, "pid");
+    const run = h.helper(["--as", "run-a", "--what", "sleeps", "--", "sh", "-c", `echo $$ > ${pidFile}; exec sleep 300`]);
+    const pgid = await until(async () => existsSync(pidFile) && Number((await readFile(pidFile, "utf8")).trim()), "the command started");
+    h.groups.add(pgid);
+    await until(async () => (await h.state()).holder?.state === "active", "active");
+
+    run.child.kill("SIGKILL");
+    await run.exited;
+    assert.equal(groupAliveInTest(pgid), true, "premise: the command outlived its helper");
+    const held = await h.state();
+    assert.equal(held.holder?.as, "run-a", "the slot is still held");
+    assert.equal(held.holder.helperGone, false, "not yet called gone");
+    const queued = await h.acquire("run-b", "b", h.pair());
+    assert.equal(queued.status, 202, "a second run waits");
+
+    // Quiet for past the heartbeat lease: the panel can say the helper went.
+    await writeFile(h.clockFile, String(5 * 60_000 + 1_000));
+    const quiet = await h.state();
+    assert.equal(quiet.holder?.as, "run-a", "a silent helper does not free a live group");
+    assert.equal(quiet.holder.helperGone, true);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy C4: a dead process group frees the slot, heartbeat or not", async () => {
+  const h = await heavyHarness("c4");
+  try {
+    await h.start();
+    const held = await h.hold("run-a");
+    const b = h.pair();
+    const queued = await h.acquire("run-b", "b", b);
+    const waitB = h.post("wait", { ticket: queued.body.ticket, lease: b.lease });
+    await until(async () => (await h.state()).queue.length === 1, "B queued");
+    killGroup(held.pgid);
+    const granted = await waitB;
+    assert.equal(granted.body.granted, true, "the line moves on when the group dies");
+    assert.equal((await h.state()).holder.as, "run-b");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy C5: a queued command has not started, and the gate runs nothing but on GO", async () => {
+  const { HEAVY_GATE } = await heavyModule();
+  const h = await heavyHarness("c5");
+  try {
+    await h.start();
+    const a = await h.hold("run-a");
+    const marker = join(h.home, "marker");
+    const run = h.helper(["--as", "run-b", "--what", "touches", "--", "touch", marker]);
+    await until(async () => (await h.state()).queue.some((entry) => entry.as === "run-b"), "B queued");
+    assert.equal(existsSync(marker), false, "nothing ran while queued");
+    await h.post("release", { lease: a.lease });
+    assert.equal((await run.exited).code, 0, run.stderr);
+    assert.equal(existsSync(marker), true, "and it ran once granted");
+
+    // The gate itself: only `GO` and a newline let the command run.
+    const gated = async (feed) => {
+      const mark = join(h.home, `gate-${randomUUID()}`);
+      const child = spawn("sh", ["-c", HEAVY_GATE, "sh", "touch", mark], { stdio: ["ignore", "ignore", "ignore", "pipe"] });
+      const exited = new Promise((resolve) => child.on("exit", (code) => resolve(code)));
+      feed(child.stdio[3]);
+      return { code: await exited, ran: existsSync(mark) };
+    };
+    assert.deepEqual(await gated((fd) => fd.end("GO\n")), { code: 0, ran: true }, "GO");
+    assert.deepEqual(await gated((fd) => fd.end()), { code: 1, ran: false }, "EOF");
+    assert.deepEqual(await gated((fd) => fd.end("G")), { code: 1, ran: false }, "a partial token");
+    assert.deepEqual(await gated((fd) => fd.end("GO")), { code: 1, ran: false }, "GO without its newline");
+    assert.deepEqual(await gated((fd) => fd.end("NO\n")), { code: 1, ran: false }, "a wrong token");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+/** A stand-in bridge that answers the helper from a script, to stop it at a chosen step. */
+const scriptedHeavyBridge = async (home, answer) => {
+  const requests = [];
+  const server = createHttpServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const parsed = body ? JSON.parse(body) : {};
+    const entry = { path: req.url, body: parsed };
+    requests.push(entry);
+    const reply = await answer(entry, requests);
+    if (reply === null) return;
+    res.writeHead(reply.status, { "content-type": "application/json" });
+    res.end(JSON.stringify(reply.body));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const { heavyHelperSource } = await heavyModule();
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "ab".repeat(32));
+  const helperPath = join(home, `helper-${randomUUID()}.mjs`);
+  await writeFile(helperPath, heavyHelperSource(origin));
+  return { requests, helperPath, close: () => { server.closeAllConnections(); return new Promise((resolve) => server.close(resolve)); } };
+};
+
+test("heavy C5: a helper killed before GO leaves its gated child to exit having run nothing", async () => {
+  const h = await heavyHarness("c5-kill");
+  let activateSeen;
+  const activating = new Promise((resolve) => { activateSeen = resolve; });
+  const fake = await scriptedHeavyBridge(h.home, ({ path, body }) => {
+    if (path === "/heavy/acquire") return { status: 200, body: { ok: true, v: 1, granted: true, lease: body.lease, loadSkipped: false } };
+    if (path === "/heavy/activate") { activateSeen(body.pgid); return null; }
+    return { status: 200, body: { ok: true, v: 1 } };
+  });
+  try {
+    const marker = join(h.home, "marker");
+    const run = h.helper(["--as", "run-a", "--what", "touches", "--", "touch", marker], {}, fake.helperPath);
+    const pgid = await activating;
+    h.groups.add(pgid);
+    assert.equal(groupAliveInTest(pgid), true, "premise: the gated child is waiting");
+    run.child.kill("SIGKILL");
+    await run.exited;
+    await until(() => !groupAliveInTest(pgid), "the gated child exits");
+    assert.equal(existsSync(marker), false, "nothing ran");
+  } finally {
+    await fake.close();
+    await h.cleanup();
+  }
+});
+
+test("heavy r4: a reservation refused at activate kills the gated child and asks again", async () => {
+  const h = await heavyHarness("r4-lapse");
+  const pgids = [];
+  const fake = await scriptedHeavyBridge(h.home, ({ path, body }) => {
+    if (path === "/heavy/acquire") return { status: 200, body: { ok: true, v: 1, granted: true, lease: body.lease, loadSkipped: false } };
+    if (path === "/heavy/activate") {
+      pgids.push(body.pgid);
+      return pgids.length === 1
+        ? { status: 404, body: { ok: false, v: 1, error: "lease_unknown" } }
+        : { status: 200, body: { ok: true, v: 1, state: "active" } };
+    }
+    return { status: 200, body: { ok: true, v: 1 } };
+  });
+  try {
+    const marker = join(h.home, "marker");
+    const run = h.helper(["--as", "run-a", "--what", "appends", "--", "sh", "-c", `echo once >> ${marker}`], {}, fake.helperPath);
+    assert.equal((await run.exited).code, 0, run.stderr);
+    assert.equal(pgids.length, 2, "asked twice");
+    assert.notEqual(pgids[0], pgids[1]);
+    assert.equal(groupAliveInTest(pgids[0]), false, "the refused child is gone");
+    assert.equal(await readFile(marker, "utf8"), "once\n", "and the command ran once, after the grant");
+    assert.match(run.stderr, /was not activated \(lease_unknown\)/);
+  } finally {
+    await fake.close();
+    await h.cleanup();
+  }
+});
+
+test("heavy C6: a command that crashes still releases, and the helper exits with its code", async () => {
+  const h = await heavyHarness("c6");
+  try {
+    // No sweep in time to clean up after it: the release has to come from the helper.
+    await h.start({ GYREDECK_TEST_HEAVY_TICK_MS: "600000" });
+    const run = h.helper(["--as", "run-a", "--what", "crashes", "--", "sh", "-c", "exit 7"]);
+    assert.equal((await run.exited).code, 7, run.stderr);
+    assert.equal(existsSync(h.holderPath), false, "released by the helper before it exited");
+    assert.equal((await h.state()).holder, null);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy r2: SIGTERM is forwarded and the slot is held until the group has exited", async () => {
+  const h = await heavyHarness("term");
+  try {
+    await h.start({ GYREDECK_TEST_HEAVY_TICK_MS: "600000" });
+    const started = join(h.home, "started");
+    const termed = join(h.home, "termed");
+    const finish = join(h.home, "finish");
+    const script = `trap 'touch ${termed}; while [ ! -e ${finish} ]; do sleep 0.05; done; exit 5' TERM; echo $$ > ${started}; while :; do sleep 0.05; done`;
+    const run = h.helper(["--as", "run-a", "--what", "traps", "--", "sh", "-c", script]);
+    h.groups.add(await until(async () => existsSync(started) && Number((await readFile(started, "utf8")).trim()), "the command started"));
+    run.child.kill("SIGTERM");
+    await until(() => existsSync(termed), "the command was told");
+    assert.equal((await h.state()).holder?.as, "run-a", "still held while the command finishes");
+    assert.equal(existsSync(h.holderPath), true);
+    await writeFile(finish, "");
+    assert.equal((await run.exited).code, 5, run.stderr);
+    assert.equal(existsSync(h.holderPath), false, "released once the group was gone");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy C7: the load gate holds the grant, and ten minutes grant it anyway", async () => {
+  const h = await heavyHarness("c7");
+  try {
+    await writeFile(h.loadFile, "9");
+    await h.start();
+    const a = h.pair();
+    const queued = await h.acquire("run-a", "a", a);
+    assert.equal(queued.status, 202, "a free slot is still not granted under load");
+    const waitA = h.post("wait", { ticket: queued.body.ticket, lease: a.lease });
+    await until(async () => (await h.state()).waiting === 1, "A waiting");
+    assert.equal((await h.state()).holder, null, "held back by the load alone");
+    await writeFile(h.loadFile, "4.5");
+    const grantedA = await waitA;
+    assert.equal(grantedA.body.granted, true);
+    assert.equal(grantedA.body.loadSkipped, false);
+    await h.post("release", { lease: a.lease });
+
+    await writeFile(h.loadFile, "9");
+    const b = h.pair();
+    const queuedB = await h.acquire("run-b", "b", b);
+    assert.equal(queuedB.status, 202);
+    // Held open, as the helper holds it: a ticket nobody polls for 90 s leaves the line.
+    const waitB = h.post("wait", { ticket: queuedB.body.ticket, lease: b.lease });
+    await until(async () => (await h.state()).waiting === 1, "B waiting");
+    await writeFile(h.clockFile, String(10 * 60_000 - 1_000));
+    const justBefore = await h.state();
+    assert.equal(justBefore.holder, null, "a second short of ten minutes is still waiting");
+    assert.deepEqual(justBefore.queue.map((entry) => entry.as), ["run-b"]);
+    await writeFile(h.clockFile, String(10 * 60_000));
+    const grantedB = await waitB;
+    assert.equal(grantedB.body.granted, true);
+    assert.equal(grantedB.body.loadSkipped, true);
+    assert.equal((await h.state()).holder.loadSkipped, true);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy C8: releasing a stuck slot is the app's alone", async () => {
+  const h = await heavyHarness("c8");
+  try {
+    await h.start();
+    await h.hold("run-a");
+    const asAgent = await fetch(`${h.base}/heavy/holder`, { method: "DELETE", headers: { "x-gyredeck-token": h.token() } });
+    assert.equal(asAgent.status, 401);
+    assert.equal((await asAgent.json()).error, "app_only");
+    const wrongWord = await fetch(`${h.base}/heavy/holder`, { method: "DELETE", headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": "b6".repeat(32) } });
+    assert.equal(wrongWord.status, 401);
+    assert.equal((await h.state()).holder?.as, "run-a", "unchanged");
+    const asApp = await fetch(`${h.base}/heavy/holder`, { method: "DELETE", headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD } });
+    assert.equal(asApp.status, 200);
+    assert.equal((await asApp.json()).released, true);
+    assert.equal((await h.state()).holder, null);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy C9: a restart keeps a running holder, grants no second slot, and the helper re-adopts", async () => {
+  const h = await heavyHarness("c9");
+  try {
+    let bridge = await h.start();
+    const started = join(h.home, "started");
+    const finish = join(h.home, "finish");
+    const run = h.helper(
+      ["--as", "run-a", "--what", "waits", "--", "sh", "-c", `echo $$ > ${started}; while [ ! -e ${finish} ]; do sleep 0.05; done`],
+      { GYREDECK_TEST_HEAVY_HEARTBEAT_MS: "100" },
+    );
+    h.groups.add(await until(async () => existsSync(started) && Number((await readFile(started, "utf8")).trim()), "the command started"));
+    await h.stop(bridge);
+    bridge = await h.start();
+    const restored = await h.state();
+    assert.equal(restored.holder?.as, "run-a", "the record kept the slot across the restart");
+    assert.equal(restored.holder.state, "active");
+    const second = await h.acquire("run-b", "b", h.pair());
+    assert.equal(second.status, 202, "no second slot");
+    await until(async () => (await h.state()).holder?.adopted === true, "the helper re-adopted");
+    await writeFile(finish, "");
+    assert.equal((await run.exited).code, 0, run.stderr);
+    assert.doesNotMatch(run.stderr, /no longer knows this run/);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy r3: a restart resets the line, and a queued helper joins again", async () => {
+  const h = await heavyHarness("requeue");
+  try {
+    let bridge = await h.start();
+    const a = await h.hold("run-a");
+    const marker = join(h.home, "marker");
+    const b = h.pair();
+    const rawQueued = await h.acquire("run-raw", "raw", b);
+    const run = h.helper(["--as", "run-b", "--what", "touches", "--", "touch", marker]);
+    await until(async () => (await h.state()).queue.some((entry) => entry.as === "run-b"), "B queued");
+    await h.stop(bridge);
+    bridge = await h.start();
+    const unknown = await h.post("wait", { ticket: rawQueued.body.ticket, lease: b.lease });
+    assert.equal(unknown.status, 404);
+    assert.equal(unknown.body.error, "ticket_unknown");
+    await until(async () => (await h.state()).queue.some((entry) => entry.as === "run-b"), "B queued again");
+    assert.equal(existsSync(marker), false);
+    await h.post("release", { lease: a.lease });
+    assert.equal((await run.exited).code, 0, run.stderr);
+    assert.equal(existsSync(marker), true);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy C10: a lost grant is answered again, to the pair that asked, and cancel leaves the line", async () => {
+  const h = await heavyHarness("c10");
+  try {
+    await h.start();
+    const a = h.pair();
+    const first = await h.acquire("run-a", "a", a);
+    assert.equal(first.status, 200);
+    const again = await h.acquire("run-a", "a", a);
+    assert.equal(again.status, 200);
+    assert.equal(again.body.lease, a.lease, "the same grant, echoed");
+    const stolen = await h.acquire("run-a", "a", { requestId: a.requestId, lease: heavySecret() });
+    assert.equal(stolen.status, 403, "the request id alone is not the lease");
+
+    const b = h.pair();
+    const queuedB = await h.acquire("run-b", "b", b);
+    const retriedB = await h.acquire("run-b", "b", b);
+    assert.equal(retriedB.body.ticket, queuedB.body.ticket, "the same place");
+    const waitB = h.post("wait", { ticket: queuedB.body.ticket, lease: b.lease });
+    await until(async () => (await h.state()).queue.length === 1, "B waiting");
+    await h.post("release", { lease: a.lease });
+    assert.equal((await waitB).body.granted, true);
+    const lostAnswer = await h.post("wait", { ticket: queuedB.body.ticket, lease: b.lease });
+    assert.equal(lostAnswer.body.granted, true, "the grant is answered again");
+    assert.equal(lostAnswer.body.lease, b.lease);
+
+    const c = h.pair();
+    const queuedC = await h.acquire("run-c", "c", c);
+    const cancelled = await h.post("cancel", { ticket: queuedC.body.ticket, lease: c.lease });
+    assert.equal(cancelled.status, 200);
+    assert.deepEqual((await h.state()).queue, []);
+    assert.equal((await h.post("wait", { ticket: queuedC.body.ticket, lease: c.lease })).status, 404);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy C11: caps, the body limit and the version are each refused", async () => {
+  const h = await heavyHarness("c11");
+  try {
+    await h.start();
+    const version = await h.post("acquire", JSON.stringify({ v: 2, as: "a", what: "a", ...h.pair() }));
+    assert.equal(version.status, 409);
+    assert.equal(version.body.error, "version");
+    assert.equal((await h.acquire("a", "x".repeat(201), h.pair())).body.error, "invalid_what");
+    assert.equal((await h.acquire("a".repeat(65), "a", h.pair())).body.error, "invalid_as");
+    assert.equal((await h.post("acquire", JSON.stringify({ v: 1, as: "a", what: "y".repeat(5_000), ...h.pair() }))).status, 413);
+    const holder = await h.acquire("a", "x".repeat(200), h.pair());
+    assert.equal(holder.status, 200, "200 characters is within the cap");
+
+    const queued = [];
+    for (let index = 0; index < 32; index += 1) {
+      const ids = h.pair();
+      queued.push({ ids, answer: await h.acquire(`q${index}`, "q", ids) });
+    }
+    assert.ok(queued.every((entry) => entry.answer.status === 202));
+    const full = await h.acquire("q32", "q", h.pair());
+    assert.equal(full.status, 503);
+    assert.equal(full.body.error, "queue_full");
+
+    // Long polls are bounded too: the same ticket polled 33 times.
+    const front = queued[0];
+    for (let index = 0; index < 32; index += 1) h.post("wait", { ticket: front.answer.body.ticket, lease: front.ids.lease }).catch(() => null);
+    await until(async () => (await h.state()).waiting === 32, "32 polls held");
+    const tooMany = await h.post("wait", { ticket: front.answer.body.ticket, lease: front.ids.lease });
+    assert.equal(tooMany.status, 503);
+    assert.equal(tooMany.body.error, "too_many_waits");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy r4: a bridge killed after recording a reservation answers the same pair after restart", async () => {
+  const h = await heavyHarness("fault-reserve");
+  try {
+    let bridge = await h.start({ GYREDECK_TEST_HEAVY_FAULT: "reserve" });
+    const a = h.pair();
+    const lost = await h.acquire("run-a", "a", a).catch((error) => error);
+    assert.ok(lost instanceof Error, "the answer never came");
+    assert.equal(await bridge.exited, 86, "premise: the bridge died at the step");
+    const record = await readFile(h.holderPath, "utf8");
+    assert.equal(JSON.parse(record).state, "reserved", "recorded before the reply");
+    assert.equal(record.includes(a.lease), false, "the exact lease is not on disk");
+    assert.equal(record.includes(a.requestId), false, "nor the request id");
+
+    bridge = await h.start();
+    const wrong = await h.acquire("run-a", "a", { requestId: a.requestId, lease: heavySecret() });
+    assert.equal(wrong.status, 403, "the right request id with a wrong lease is refused");
+    const retried = await h.acquire("run-a", "a", a);
+    assert.equal(retried.status, 200, JSON.stringify(retried.body));
+    assert.equal(retried.body.lease, a.lease, "the caller's own lease, echoed");
+    const activated = await h.post("activate", { lease: a.lease, pgid: h.group() });
+    assert.equal(activated.status, 200, "and it activates");
+    const active = await readFile(h.holderPath, "utf8");
+    assert.equal(JSON.parse(active).state, "active");
+    assert.equal(active.includes(a.lease) || active.includes(a.requestId), false);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy r3: a restart between grant and activate keeps the reservation for its lease", async () => {
+  const h = await heavyHarness("restart-reserved");
+  try {
+    let bridge = await h.start();
+    const a = h.pair();
+    assert.equal((await h.acquire("run-a", "a", a)).status, 200);
+    await h.stop(bridge);
+    bridge = await h.start();
+    const queued = await h.acquire("run-b", "b", h.pair());
+    assert.equal(queued.status, 202, "the reservation still holds the slot");
+    assert.equal((await h.post("activate", { lease: heavySecret(), pgid: h.group() })).status, 404, "not for another lease");
+    assert.equal((await h.post("activate", { lease: a.lease, pgid: h.group() })).status, 200);
+
+    // Unactivated, a reservation lapses a minute after the bridge that found it started.
+    await h.stop(bridge);
+    await rm(h.holderPath, { force: true });
+    bridge = await h.start();
+    const c = h.pair();
+    assert.equal((await h.acquire("run-c", "c", c)).status, 200);
+    await writeFile(h.clockFile, String(60_001));
+    assert.equal((await h.state()).holder, null, "lapsed");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy r3: a bridge killed after recording activation lets the helper retry and run the command once", async () => {
+  const h = await heavyHarness("fault-activate");
+  try {
+    const bridge = await h.start({ GYREDECK_TEST_HEAVY_FAULT: "activate" });
+    const marker = join(h.home, "marker");
+    const run = h.helper(["--as", "run-a", "--what", "appends", "--", "sh", "-c", `echo once >> ${marker}`]);
+    assert.equal(await bridge.exited, 86, "premise: the bridge died at activate");
+    h.start();
+    assert.equal((await run.exited).code, 0, run.stderr);
+    assert.equal(await readFile(marker, "utf8"), "once\n", "the command ran exactly once");
+    assert.doesNotMatch(run.stderr, /unqueued/);
+    assert.equal((await h.state()).holder, null);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy C11: a helper that cannot reach the bridge, or meets another version, runs unqueued and says so", async () => {
+  const h = await heavyHarness("unqueued");
+  const fake = await scriptedHeavyBridge(h.home, () => ({ status: 409, body: { ok: false, v: 2, error: "version" } }));
+  try {
+    const marker = join(h.home, "marker");
+    const mismatched = h.helper(["--as", "run-a", "--what", "touches", "--", "touch", marker], {}, fake.helperPath);
+    assert.equal((await mismatched.exited).code, 0);
+    assert.match(mismatched.stderr, /heavy queue unavailable — running unqueued \(the bridge speaks version 2, this helper 1\)/);
+    assert.equal(existsSync(marker), true);
+
+    const { heavyHelperSource } = await heavyModule();
+    const nowhere = join(h.home, "nowhere.mjs");
+    await writeFile(nowhere, heavyHelperSource(`http://127.0.0.1:${await freePort()}`));
+    const unreachable = h.helper(["--as", "run-a", "--what", "exits", "--", "sh", "-c", "exit 4"], { GYREDECK_TEST_HEAVY_RETRIES: "1" }, nowhere);
+    assert.equal((await unreachable.exited).code, 4, "with the command's own code");
+    assert.match(unreachable.stderr, /running unqueued \(the bridge cannot be reached/);
+  } finally {
+    await fake.close();
+    await h.cleanup();
+  }
+});
+
+test("heavy rules v8: the rules list the heavy commands and the limit, and a session in no room is told once", async () => {
+  const { roomRules, HEAVY_COMMANDS, HEAVY_LIMIT_TEXT } = await heavyModule();
+  const rules = roomRules("http://127.0.0.1:47621");
+  assert.match(rules, /^# Gyredeck room rules — v8\n/);
+  assert.match(rules, /## Heavy runs/);
+  for (const name of ["test:demo", "test:hooks", "test:performance", "test:budget", "desktop:build", "desktop:install", "cargo test", "cargo build", "cargo check"]) {
+    assert.ok(rules.includes(`\`${name}\``), name);
+  }
+  assert.equal(HEAVY_COMMANDS.length, 9);
+  assert.ok(rules.includes(HEAVY_LIMIT_TEXT));
+  assert.match(rules, /node ~\/\.config\/gyredeck\/gyredeck-heavy\.mjs --as <your id> --what "<what it runs>" -- <command…>/);
+
+  const h = await heavyHarness("notice");
+  try {
+    await h.start();
+    const me = "5e5e5e5e-0000-4d8c-9b3a-aa11bb22cc33";
+    await fetch(`${h.base}/ingest`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": h.token() },
+      body: JSON.stringify({ version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: me, runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 0, sourceKind: "claudeCodeHook" }, data: {} }),
+    });
+    const collect = () => fetch(`${h.base}/mail/inbox?as=${me}&collect=1`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    // Told with the usage intro, the one out-of-room hint there is, so not before the app
+    // has read this provider's usage.
+    assert.equal((await collect()).usageNotice, undefined, "nothing waiting, nothing said");
+    await fetch(`${h.base}/usage`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": h.token() },
+      body: JSON.stringify({ providerId: "claude", displayName: "Claude Code", lines: [{ type: "progress", label: "Session", used: 20, limit: 100, resetsAt: "2026-10-16T05:00:00Z" }], fetchedAt: new Date().toISOString() }),
+    });
+    const first = await collect();
+    assert.match(first.usageNotice ?? "", /^USAGE: ask Gyredeck/);
+    assert.match(first.usageNotice ?? "", new RegExp(`\\nHEAVY RUNS: .*gyredeck-heavy\\.mjs --as ${me} --what`));
+    const second = await collect();
+    assert.doesNotMatch(second.usageNotice ?? "", /HEAVY RUNS/, "once");
+  } finally {
+    await h.cleanup();
   }
 });

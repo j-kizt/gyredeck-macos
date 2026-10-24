@@ -22,11 +22,11 @@
  *   POST /ingest    - Multi-provider event fan-in
  */
 
-import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { homedir } from "node:os";
+import { homedir, loadavg } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 7;
+export const ROOM_RULES_VERSION = 8;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -291,6 +291,15 @@ Only while an answer you need before you can carry on is outstanding:
 It prints what arrived, or \`"timedOut": true\` with \`yourLastMessage\`. If that says your message was
 addressed correctly and delivered, the silence is theirs: say so and stop; do not send it again.
 Exit 2 means the mail is being withheld — do not work around it with curl.
+
+## Heavy runs
+One heavy run at a time on this machine, for every session, in a room or not. These are heavy:
+${HEAVY_COMMANDS.map((name) => `\`${name}\``).join(", ")}. Run each one through the queue:
+\`node ${HEAVY_HELPER_DISPLAY_PATH} --as <your id> --what "<what it runs>" -- <command…>\`
+— for example \`-- pnpm test:demo --workers=3\`. It waits for the slot, and for the 1-minute load to
+be ${HEAVY_LOAD_LIMIT} or less (for at most 10 minutes), runs the command, and exits with its code. While it
+waits it prints its place in line: leave it running, and do not start the command another way.
+${HEAVY_LIMIT_TEXT}
 `;
 
 /** Written on every start, so the file always matches the bridge that refers to it. It is
@@ -308,6 +317,308 @@ export const writeRoomRules = (origin, path = ROOM_RULES_PATH) => {
   } catch (error) {
     try { unlinkSync(temp); } catch {}
     console.error(`gyredeck: room rules not written — ${error.message}`);
+    return false;
+  }
+};
+
+// ── Heavy runs (#223) ──
+
+/**
+ * One heavy run at a time on this machine — a test suite, a native build — because two at
+ * once drove the load past what either could finish in, and every session decided for
+ * itself whether the machine was busy. Advisory: nothing is enforced, and a command whose
+ * bridge cannot be reached, or speaks another version of this, runs unqueued.
+ *
+ * Every request and answer names the version, and a mismatch is a 409 rather than a guess
+ * at what an older helper meant.
+ */
+export const HEAVY_PROTOCOL_VERSION = 1;
+export const HEAVY_HELPER_DISPLAY_PATH = "~/.config/gyredeck/gyredeck-heavy.mjs";
+const HEAVY_HELPER_PATH = join(MOD_DIR, "gyredeck-heavy.mjs");
+const HEAVY_DIR = join(MOD_DIR, "heavy");
+const HEAVY_HOLDER_PATH = join(HEAVY_DIR, "holder.json");
+/** The 1-minute load at or below which the slot is granted. */
+export const HEAVY_LOAD_LIMIT = 5;
+/** The commands the rules call heavy. One list, so the rules and the test cannot drift. */
+export const HEAVY_COMMANDS = ["test:demo", "test:hooks", "test:performance", "test:budget", "desktop:build", "desktop:install", "cargo test", "cargo build", "cargo check"];
+export const HEAVY_LIMIT_TEXT =
+  "The queue is advisory. A command runs unqueued when the Gyredeck bridge cannot be reached or speaks another protocol version, even while Gyredeck is running, and a restart of Gyredeck resets the waiting line.";
+
+/**
+ * What the helper's child runs before the command: it waits on fd 3 for the word `GO`, and
+ * anything else — EOF from a helper that crashed, half a word, a wrong one — exits 1 with
+ * nothing run. The child exists, with its process group, before the bridge is told about
+ * it; the command runs only once the bridge has recorded that group (#223 r3, r4). The `;`
+ * form this replaced ran the command on EOF.
+ */
+export const HEAVY_GATE = 'IFS= read -r line <&3 || exit 1; [ "$line" = GO ] || exit 1; exec 3<&-; exec "$@"';
+
+/**
+ * Write a file whole or not at all, and never through a link: the directory and the file
+ * are each checked with `lstat`, and a symlink at either is refused. Temp, fsync, rename —
+ * a reader sees the old file or the new one, never half of either.
+ */
+export const writeFileAtomically = (path, content, mode) => {
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const dirStat = lstatSync(dir);
+  if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) throw new Error(`${dir} is not a plain directory`);
+  try {
+    const fileStat = lstatSync(path);
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) throw new Error(`${path} is not a plain file`);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const temp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  let fd = null;
+  try {
+    fd = openSync(temp, "wx", mode);
+    writeSync(fd, content);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(temp, path);
+  } catch (error) {
+    if (fd !== null) { try { closeSync(fd); } catch {} }
+    try { unlinkSync(temp); } catch {}
+    throw error;
+  }
+};
+
+/**
+ * The helper every agent runs a heavy command through:
+ * `node ~/.config/gyredeck/gyredeck-heavy.mjs --as <id> --what "<label>" -- <cmd…>`.
+ *
+ * Written from this function's own source on every start, so the three CLIs share one copy
+ * at the bridge's own version and it is checked like the rest of this file. It must stay
+ * self-contained: it runs in a process of its own, with only what it imports and `setup`.
+ *
+ * It makes the lease and the request id itself and keeps them in memory; the bridge keeps
+ * only their hashes, so a retry after a lost answer — even against a bridge that restarted —
+ * presents the same pair and is answered with it (#223 r4).
+ */
+const heavyHelper = async (setup) => {
+  const { spawn } = await import("node:child_process");
+  const { randomBytes } = await import("node:crypto");
+  const { readFileSync } = await import("node:fs");
+  const { homedir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const say = (line) => process.stderr.write(`gyredeck: ${line}\n`);
+  const argv = process.argv.slice(2);
+  const split = argv.indexOf("--");
+  const flags = split < 0 ? argv : argv.slice(0, split);
+  const command = split < 0 ? [] : argv.slice(split + 1);
+  const flag = (name) => {
+    const at = flags.indexOf(name);
+    return at >= 0 ? flags[at + 1] : undefined;
+  };
+  const as = flag("--as");
+  const what = flag("--what");
+  if (!as || !what || command.length === 0) {
+    say('usage: node ~/.config/gyredeck/gyredeck-heavy.mjs --as <your id> --what "<what it runs>" -- <command…>');
+    process.exit(64);
+  }
+  const heartbeatMs = Number(process.env.GYREDECK_TEST_HEAVY_HEARTBEAT_MS) || 60_000;
+  const retries = Number(process.env.GYREDECK_TEST_HEAVY_RETRIES) || 40;
+  const killAfterMs = 30_000;
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const signalNumber = { SIGINT: 2, SIGTERM: 15, SIGKILL: 9, SIGHUP: 1 };
+  const exitFor = (code, signal) => (code ?? 128 + (signalNumber[signal] ?? 1));
+  const groupAlive = (pgid) => {
+    try { process.kill(-pgid, 0); return true; } catch (error) { return error.code === "EPERM"; }
+  };
+
+  // queued → reserved → active → done. The lease is released only once the command's
+  // whole process group is gone; a queued ticket is cancelled on the way out.
+  let state = "acquiring";
+  let ticket = null;
+  let child = null;
+  let pgid = null;
+  let childExit = null;
+  let stopping = null;
+  let heartbeat = null;
+
+  const runUnqueued = (why) => {
+    state = "unqueued";
+    say(`heavy queue unavailable — running unqueued (${why})`);
+    const child = spawn(command[0], command.slice(1), { stdio: "inherit" });
+    for (const name of ["SIGINT", "SIGTERM"]) process.on(name, () => { try { child.kill(name); } catch {} });
+    child.on("error", (error) => { say(`${command[0]}: ${error.message}`); process.exit(127); });
+    child.on("exit", (code, signal) => process.exit(exitFor(code, signal)));
+  };
+
+  let token;
+  try {
+    token = readFileSync(join(homedir(), ".config", "gyredeck", "gyredeck.ingest-token"), "utf8").trim();
+  } catch {
+    runUnqueued("no machine token");
+    return;
+  }
+
+  const lease = randomBytes(16).toString("hex");
+  const requestId = randomBytes(16).toString("hex");
+  const post = async (path, body) => {
+    const response = await fetch(`${setup.origin}/heavy/${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      body: JSON.stringify({ v: setup.v, ...body }),
+      signal: AbortSignal.timeout(90_000),
+    });
+    let answer = null;
+    try { answer = await response.json(); } catch {}
+    return { status: response.status, body: answer ?? {} };
+  };
+  // A bridge that is restarting is gone for a second or two; one that is not there at all
+  // stays gone. Retried for long enough to tell the two apart, and no longer.
+  const call = async (path, body) => {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await post(path, body);
+      } catch (error) {
+        if (attempt >= retries) return { status: 0, body: { error: error.message } };
+        await pause(250);
+      }
+    }
+  };
+  const unavailable = (answer) => {
+    if (answer.status === 0) return `the bridge cannot be reached: ${answer.body.error}`;
+    if (answer.status === 409 && answer.body.error === "version") return `the bridge speaks version ${answer.body.v}, this helper ${setup.v}`;
+    if (answer.status === 401) return "the bridge refused the machine token";
+    if (answer.status >= 500 && answer.body.error !== "queue_full" && answer.body.error !== "too_many_waits") return `the bridge answered ${answer.status} ${answer.body.error ?? ""}`.trim();
+    if (answer.status === 400 || answer.status === 413) return `the bridge refused the request: ${answer.body.error ?? answer.status}`;
+    return null;
+  };
+
+  const killGated = () => {
+    if (!child) return;
+    try { child.stdio[3].destroy(); } catch {}
+    try { process.kill(-pgid, "SIGKILL"); } catch {}
+    child = null;
+  };
+  const waitForGroup = async () => {
+    let warned = Date.now();
+    while (groupAlive(pgid)) {
+      if (Date.now() - warned >= 60_000) {
+        warned = Date.now();
+        say("the command has exited; waiting for the rest of its process group before freeing the slot");
+      }
+      await pause(100);
+    }
+  };
+  const finish = async (code) => {
+    clearInterval(heartbeat);
+    if (state === "queued" && ticket) await call("cancel", { ticket, lease }).catch(() => {});
+    if (state === "reserved" || state === "active") await call("release", { lease }).catch(() => {});
+    state = "done";
+    process.exit(code);
+  };
+
+  const onSignal = (name) => {
+    if (stopping || state === "unqueued") return;
+    stopping = name;
+    if (state === "active") {
+      // The slot stays held until the group has gone: a command told to stop is still
+      // running until it has stopped.
+      try { process.kill(-pgid, name); } catch {}
+      setTimeout(() => { try { process.kill(-pgid, "SIGKILL"); } catch {} }, killAfterMs).unref();
+      return;
+    }
+    killGated();
+    void finish(128 + (signalNumber[name] ?? 1));
+  };
+  process.on("SIGINT", () => onSignal("SIGINT"));
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
+
+  for (;;) {
+    let answer = await call("acquire", { as, what, requestId, lease });
+    let lastSaid = 0;
+    for (;;) {
+      if (stopping) return;
+      const why = unavailable(answer);
+      if (why) { runUnqueued(why); return; }
+      if (answer.status === 200 && answer.body.granted === true) break;
+      if (answer.status === 503) {
+        say(`heavy queue busy (${answer.body.error}) — trying again`);
+        await pause(5_000);
+        answer = await call("acquire", { as, what, requestId, lease });
+        continue;
+      }
+      if (answer.status === 404 && answer.body.error === "ticket_unknown") {
+        // The bridge restarted and the line with it: join again, at the back.
+        state = "acquiring";
+        ticket = null;
+        answer = await call("acquire", { as, what, requestId, lease });
+        continue;
+      }
+      if (typeof answer.body.ticket === "string") {
+        ticket = answer.body.ticket;
+        state = "queued";
+        if (Date.now() - lastSaid >= 60_000) {
+          lastSaid = Date.now();
+          say(`waiting for the heavy-run slot — position ${answer.body.position ?? "?"}${answer.body.holder ? `, behind ${answer.body.holder}` : ""}`);
+        }
+        answer = await call("wait", { ticket, lease });
+        continue;
+      }
+      runUnqueued(`the bridge answered ${answer.status} ${answer.body.error ?? ""}`.trim());
+      return;
+    }
+    if (stopping) return;
+    state = "reserved";
+    if (answer.body.loadSkipped === true) say("the load stayed high for 10 minutes; running anyway");
+
+    child = spawn("sh", ["-c", setup.gate, "sh", ...command], { detached: true, stdio: ["inherit", "inherit", "inherit", "pipe"] });
+    pgid = child.pid;
+    const exited = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
+    child.on("error", () => {});
+    const activated = await call("activate", { lease, pgid });
+    if (stopping) return;
+    if (activated.status === 200 && activated.body.ok === true) {
+      state = "active";
+      child.stdio[3].end("GO\n");
+      childExit = exited;
+      break;
+    }
+    killGated();
+    if (activated.status !== 404) {
+      runUnqueued(unavailable(activated) ?? `the bridge refused activation: ${activated.body.error ?? activated.status}`);
+      return;
+    }
+    // The reservation lapsed before it was activated; the gated child ran nothing.
+    say(`the reservation was not activated (${activated.body.error ?? activated.status}) — asking again`);
+    state = "acquiring";
+  }
+
+  heartbeat = setInterval(async () => {
+    const beat = await call("heartbeat", { lease });
+    if (beat.status === 200) return;
+    // A bridge that restarted knows the run from its record and asks it to say so.
+    const adopted = await call("adopt", { lease, pgid });
+    if (adopted.status !== 200) {
+      clearInterval(heartbeat);
+      say("the heavy queue no longer knows this run; it carries on unqueued");
+    }
+  }, heartbeatMs);
+  heartbeat.unref();
+
+  const { code, signal } = await childExit;
+  await waitForGroup();
+  await finish(exitFor(code, signal));
+};
+
+/** The helper's source: a version line, then the function above, called with its setup. */
+export const heavyHelperSource = (origin) =>
+  `#!/usr/bin/env node\n// gyredeck-heavy protocol v${HEAVY_PROTOCOL_VERSION} — written by the Gyredeck bridge on every start; edits are overwritten.\n` +
+  `(${heavyHelper.toString()})(${JSON.stringify({ v: HEAVY_PROTOCOL_VERSION, origin, gate: HEAVY_GATE })});\n`;
+
+/** Written on every start beside the rules. Answers whether it is there to be run. */
+export const writeHeavyHelper = (origin, path = HEAVY_HELPER_PATH) => {
+  try {
+    writeFileAtomically(path, heavyHelperSource(origin), 0o755);
+    return true;
+  } catch (error) {
+    console.error(`gyredeck: heavy-run helper not written — ${error.message}`);
     return false;
   }
 };
@@ -1450,6 +1761,8 @@ export function openEventLog(logFile) {
 function startBridge(config) {
   // Written for the port this bridge serves on, since the rules carry a command that names it.
   const roomRulesReady = writeRoomRules(`http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}`);
+  // Beside the rules, for the same reason: the helper names the port it calls.
+  writeHeavyHelper(`http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}`);
   const eventLog = openEventLog(config.logFile);
   if (!eventLog.enabled) console.error(`gyredeck: event log disabled — ${eventLog.why}`);
 
@@ -3741,7 +4054,12 @@ function startBridge(config) {
       return "USAGE: ask Gyredeck how much of your plan is left at any time: " +
         `curl -s "http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}/usage?as=${conversationId}" ` +
         '-H "x-gyredeck-token: $(cat ~/.config/gyredeck/gyredeck.ingest-token)"' +
-        (low.length > 0 ? ` — low now: ${low.map(describe).join("; ")}. Finish at a safe point.` : "");
+        (low.length > 0 ? ` — low now: ${low.map(describe).join("; ")}. Finish at a safe point.` : "") +
+        // The queue is machine-wide and a session in no room never reads the rules that
+        // describe it, so it is told here, once, with the intro (#223).
+        `\nHEAVY RUNS: one at a time on this machine. Run ${HEAVY_COMMANDS.join(", ")} through ` +
+        `\`node ${HEAVY_HELPER_DISPLAY_PATH} --as ${conversationId} --what "<what it runs>" -- <command…>\`; ` +
+        "it waits for the slot, runs the command and exits with its code. Advisory: without the bridge it runs unqueued.";
     }
     const changed = [];
     for (const line of reading.lines) {
@@ -4911,6 +5229,249 @@ function startBridge(config) {
     return "unknown_recipient";
   };
 
+  // ── Heavy runs (#223) ──
+  //
+  // One slot and a line for it. The slot is `reserved` from the moment it is granted and
+  // `active` once the helper has a gated child and its process group is on record; it is
+  // held for as long as that group lives, whoever else has gone — a helper killed with -9
+  // leaves its command running, and the command is what loads the machine. The holder is
+  // on disk, as hashes only, so a restarted bridge never grants a second run beside one
+  // that is still going. The line is in memory: a restart resets it, and a ticket it no
+  // longer knows answers `ticket_unknown` so its helper joins again.
+  const HEAVY_RESERVATION_MS = 60_000;
+  const HEAVY_HELPER_QUIET_MS = 5 * 60_000;
+  const HEAVY_LOAD_OVERRIDE_MS = 10 * 60_000;
+  const HEAVY_TICKET_IDLE_MS = 90_000;
+  const HEAVY_WAIT_MS = 60_000;
+  const HEAVY_QUEUE_MAX = 32;
+  const HEAVY_POLLS_MAX = 32;
+  const HEAVY_WHAT_MAX = 200;
+  const HEAVY_BODY_MAX = 4_096;
+  const HEAVY_SECRET = /^[a-f0-9]{32}$/;
+  const HEAVY_TICK_MS = Number(process.env.GYREDECK_TEST_HEAVY_TICK_MS) || 5_000;
+  // Monotonic: a wall clock set back an hour must not stretch a lease or end a wait early.
+  // Tests move it forward through a file, and fake the load the same way.
+  const heavyNow = () => {
+    const shift = process.env.GYREDECK_TEST_HEAVY_CLOCK;
+    if (!shift) return performance.now();
+    try { return performance.now() + (Number(readFileSync(shift, "utf8")) || 0); } catch { return performance.now(); }
+  };
+  const heavyLoad = () => {
+    const fake = process.env.GYREDECK_TEST_HEAVY_LOAD;
+    if (!fake) return loadavg()[0];
+    try { return Number(readFileSync(fake, "utf8")); } catch { return loadavg()[0]; }
+  };
+  // Tests only: end this process at a named step, so a restart can be tested at each one.
+  const heavyFault = (step) => {
+    if (process.env.GYREDECK_TEST_HEAVY_FAULT !== step) return;
+    process.stderr.write(`gyredeck: injected heavy fault at ${step}\n`);
+    process.exit(86);
+  };
+  const hashOf = (value) => createHash("sha256").update(value).digest();
+  const sameHash = (a, b) => Buffer.isBuffer(a) && Buffer.isBuffer(b) && a.length === b.length && timingSafeEqual(a, b);
+  const groupAlive = (pgid) => {
+    try { process.kill(-pgid, 0); return true; } catch (error) { return error.code === "EPERM"; }
+  };
+
+  let heavyHolder = null;
+  const heavyQueue = [];
+  const heavyPolls = new Set();
+
+  /** The holder on disk, or the file gone. Answers whether the disk now says what memory does. */
+  const persistHeavyHolder = () => {
+    try {
+      if (!heavyHolder) {
+        try { unlinkSync(HEAVY_HOLDER_PATH); } catch (error) { if (error.code !== "ENOENT") throw error; }
+        return true;
+      }
+      const record = {
+        v: HEAVY_PROTOCOL_VERSION,
+        state: heavyHolder.state,
+        leaseHash: heavyHolder.leaseHash.toString("hex"),
+        requestIdHash: heavyHolder.requestIdHash.toString("hex"),
+        as: heavyHolder.as,
+        what: heavyHolder.what,
+        pgid: heavyHolder.pgid,
+        since: heavyHolder.since,
+        loadSkipped: heavyHolder.loadSkipped,
+      };
+      writeFileAtomically(HEAVY_HOLDER_PATH, `${JSON.stringify(record)}\n`, 0o600);
+      return true;
+    } catch (error) {
+      console.error(`gyredeck: heavy-run holder not recorded — ${error.message}`);
+      return false;
+    }
+  };
+
+  // Whatever the last bridge left: a reservation is given a fresh minute to be activated,
+  // an active run is kept while its group lives, and anything else is cleared.
+  (() => {
+    let record = null;
+    try {
+      const fileStat = lstatSync(HEAVY_HOLDER_PATH);
+      if (!fileStat.isSymbolicLink() && fileStat.isFile()) record = JSON.parse(readFileSync(HEAVY_HOLDER_PATH, "utf8"));
+    } catch {}
+    const valid = record
+      && record.v === HEAVY_PROTOCOL_VERSION
+      && /^[a-f0-9]{64}$/.test(record.leaseHash ?? "")
+      && /^[a-f0-9]{64}$/.test(record.requestIdHash ?? "")
+      && typeof record.as === "string" && typeof record.what === "string"
+      && (record.state === "reserved" || (record.state === "active" && Number.isInteger(record.pgid) && record.pgid > 1));
+    if (valid && (record.state === "reserved" || groupAlive(record.pgid))) {
+      const now = heavyNow();
+      const since = typeof record.since === "string" && !Number.isNaN(Date.parse(record.since)) ? record.since : new Date().toISOString();
+      heavyHolder = {
+        state: record.state,
+        leaseHash: Buffer.from(record.leaseHash, "hex"),
+        requestIdHash: Buffer.from(record.requestIdHash, "hex"),
+        as: record.as,
+        what: record.what,
+        pgid: record.state === "active" ? record.pgid : null,
+        since,
+        startedAt: now - Math.max(0, Date.now() - Date.parse(since)),
+        reservedAt: now,
+        heartbeatAt: now,
+        loadSkipped: record.loadSkipped === true,
+        // Known from the record, not yet from its helper: a heartbeat is answered
+        // `adopt_required` until the helper has shown the lease and the group.
+        adopted: false,
+        ticket: null,
+      };
+    } else {
+      try { unlinkSync(HEAVY_HOLDER_PATH); } catch {}
+    }
+  })();
+
+  const answerHeavyPoll = (ticket) => {
+    for (const poll of heavyPolls) if (poll.ticket === ticket) poll.finish();
+  };
+
+  /** Hand the slot to the front of the line, when it is free and the load allows. */
+  const promoteHeavy = () => {
+    if (heavyHolder || heavyQueue.length === 0) return;
+    const now = heavyNow();
+    const front = heavyQueue[0];
+    const load = heavyLoad();
+    const overdue = now - front.enqueuedAt >= HEAVY_LOAD_OVERRIDE_MS;
+    if (!(load <= HEAVY_LOAD_LIMIT) && !overdue) return;
+    if (!reserveHeavy(front, !(load <= HEAVY_LOAD_LIMIT), now)) return;
+    heavyQueue.shift();
+    answerHeavyPoll(front.ticket);
+  };
+
+  /** Make a request the holder, recorded on disk before anybody is told. */
+  const reserveHeavy = (request, loadSkipped, now) => {
+    heavyHolder = {
+      state: "reserved",
+      leaseHash: request.leaseHash,
+      requestIdHash: request.requestIdHash,
+      as: request.as,
+      what: request.what,
+      pgid: null,
+      since: new Date().toISOString(),
+      startedAt: now,
+      reservedAt: now,
+      heartbeatAt: now,
+      loadSkipped,
+      adopted: true,
+      ticket: request.ticket ?? null,
+    };
+    if (!persistHeavyHolder()) {
+      heavyHolder = null;
+      return false;
+    }
+    heavyFault("reserve");
+    return true;
+  };
+
+  const freeHeavy = () => {
+    heavyHolder = null;
+    persistHeavyHolder();
+    promoteHeavy();
+  };
+
+  /** Expire what has lapsed, then let the line move. Run before every answer and on a timer. */
+  const sweepHeavy = () => {
+    const now = heavyNow();
+    if (heavyHolder?.state === "reserved" && now - heavyHolder.reservedAt > HEAVY_RESERVATION_MS) {
+      // Never activated, so its command never ran: the gate holds it until it is.
+      heavyHolder = null;
+      persistHeavyHolder();
+    } else if (heavyHolder?.state === "active" && !groupAlive(heavyHolder.pgid)) {
+      heavyHolder = null;
+      persistHeavyHolder();
+    }
+    for (let index = heavyQueue.length - 1; index >= 0; index -= 1) {
+      const entry = heavyQueue[index];
+      const polling = [...heavyPolls].some((poll) => poll.ticket === entry.ticket);
+      if (!polling && now - entry.polledAt > HEAVY_TICKET_IDLE_MS) heavyQueue.splice(index, 1);
+    }
+    promoteHeavy();
+  };
+  setInterval(sweepHeavy, HEAVY_TICK_MS).unref();
+
+  const describeHeavy = () => {
+    const now = heavyNow();
+    const load = heavyLoad();
+    return {
+      ok: true,
+      v: HEAVY_PROTOCOL_VERSION,
+      load: Number.isFinite(load) ? Math.round(load * 100) / 100 : null,
+      loadLimit: HEAVY_LOAD_LIMIT,
+      holder: heavyHolder
+        ? {
+            as: heavyHolder.as,
+            what: heavyHolder.what,
+            state: heavyHolder.state,
+            since: heavyHolder.since,
+            elapsedMs: Math.max(0, Math.round(now - heavyHolder.startedAt)),
+            loadSkipped: heavyHolder.loadSkipped,
+            // The group still runs and nothing has spoken for it: the helper died and left
+            // its command going. The slot stays held; the panel says why.
+            helperGone: heavyHolder.state === "active" && now - heavyHolder.heartbeatAt > HEAVY_HELPER_QUIET_MS,
+            // Restored from the record and not yet claimed by its helper since this bridge started.
+            adopted: heavyHolder.adopted,
+          }
+        : null,
+      queue: heavyQueue.map((entry, index) => ({ position: index + 1, as: entry.as, what: entry.what, waitedMs: Math.round(now - entry.enqueuedAt) })),
+      waiting: heavyPolls.size,
+      limit: HEAVY_LIMIT_TEXT,
+    };
+  };
+
+  /** The request's body, or null past the cap: a cooperative scheduler still bounds what it reads. */
+  const readHeavyBody = (req) =>
+    new Promise((resolve) => {
+      let body = "";
+      let over = false;
+      req.setEncoding("utf8");
+      req.on("data", (chunk) => {
+        if (over) return;
+        body += chunk;
+        if (Buffer.byteLength(body) > HEAVY_BODY_MAX) { over = true; resolve(null); }
+      });
+      req.on("end", () => {
+        if (over) return;
+        try { resolve(JSON.parse(body)); } catch { resolve({}); }
+      });
+      req.on("error", () => resolve({}));
+    });
+
+  const heavyHolderMatches = (lease) => heavyHolder !== null && typeof lease === "string" && HEAVY_SECRET.test(lease) && sameHash(heavyHolder.leaseHash, hashOf(lease));
+  const heavyTicketAt = (ticket, lease) => {
+    if (typeof ticket !== "string" || typeof lease !== "string" || !HEAVY_SECRET.test(lease)) return -1;
+    return heavyQueue.findIndex((entry) => entry.ticket === ticket && sameHash(entry.leaseHash, hashOf(lease)));
+  };
+  const heavyGranted = (loadSkipped, lease) => ({ ok: true, v: HEAVY_PROTOCOL_VERSION, granted: true, lease, loadSkipped, state: heavyHolder.state });
+  const heavyQueued = (index) => ({
+    ok: true,
+    v: HEAVY_PROTOCOL_VERSION,
+    granted: false,
+    ticket: heavyQueue[index].ticket,
+    position: index + 1,
+    holder: heavyHolder?.as ?? null,
+  });
+
   const server = createServer(async (req, res) => {
     // Answered before anything is read or written, preflight included: a page that is not
     // allowed to be here must not get as far as the route, and a 403 on the preflight is
@@ -5127,6 +5688,249 @@ function startBridge(config) {
       res.write(`: gyredeck standalone bridge connected ${new Date().toISOString()}\n\n`);
       clients.add(res);
       req.on("close", () => clients.delete(res));
+      return;
+    }
+
+    // ── Heavy runs (#223) ──
+    // Every route takes the machine token: this is a cooperative scheduler for local agents,
+    // not a boundary between them. The one act that overrides it — freeing a slot whose
+    // command may still be running — is the app's alone and takes its word too.
+    if (req.url === "/heavy" || req.url.startsWith("/heavy/") || req.url.startsWith("/heavy?")) {
+      const sendJson = (status, body) => {
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+        res.end(JSON.stringify(body));
+      };
+      if (!holdsMachineToken(req.headers["x-gyredeck-token"])) {
+        sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+        return;
+      }
+      const { pathname } = new URL(req.url, "http://127.0.0.1");
+      sweepHeavy();
+
+      if (req.method === "GET" && pathname === "/heavy") {
+        sendJson(200, describeHeavy());
+        return;
+      }
+
+      // DELETE /heavy/holder — the app's "Release stuck slot".
+      if (req.method === "DELETE" && pathname === "/heavy/holder") {
+        if (brokerSecret === null) {
+          sendJson(503, { ok: false, error: "app_word_unavailable", message: "A stuck heavy-run slot is released from the Gyredeck app, and this bridge was started without the app's word. Quit and reopen Gyredeck." });
+          return;
+        }
+        if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"])) {
+          sendJson(401, { ok: false, error: "app_only", message: "Only the Gyredeck app can release a heavy-run slot; a run frees its own by finishing." });
+          return;
+        }
+        const released = heavyHolder !== null;
+        freeHeavy();
+        sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, released });
+        return;
+      }
+
+      const action = pathname.startsWith("/heavy/") ? pathname.slice("/heavy/".length) : "";
+      if (req.method !== "POST" || !["acquire", "wait", "activate", "heartbeat", "release", "cancel", "adopt"].includes(action)) {
+        sendJson(404, { ok: false, error: "not_found" });
+        return;
+      }
+      const body = await readHeavyBody(req);
+      if (body === null) {
+        sendJson(413, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "body_too_large", limit: HEAVY_BODY_MAX });
+        return;
+      }
+      if (!body || typeof body !== "object" || body.v !== HEAVY_PROTOCOL_VERSION) {
+        sendJson(409, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "version", message: `This bridge speaks heavy-run protocol v${HEAVY_PROTOCOL_VERSION}.` });
+        return;
+      }
+      const lease = typeof body.lease === "string" ? body.lease : "";
+      if (!HEAVY_SECRET.test(lease)) {
+        sendJson(400, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "invalid_lease" });
+        return;
+      }
+
+      if (action === "acquire") {
+        const as = typeof body.as === "string" ? body.as : "";
+        // eslint-disable-next-line no-control-regex
+        const what = typeof body.what === "string" ? body.what.replace(/[\u0000-\u001f\u007f]/g, " ").trim() : "";
+        const requestId = typeof body.requestId === "string" ? body.requestId : "";
+        if (!MAIL_ROOM_NAME.test(as)) {
+          sendJson(400, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "invalid_as", message: "`as` is your session id: letters, digits, _ and -, at most 64." });
+          return;
+        }
+        if (what.length === 0 || [...what].length > HEAVY_WHAT_MAX) {
+          sendJson(400, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "invalid_what", message: `\`what\` says what runs, in 1 to ${HEAVY_WHAT_MAX} characters.` });
+          return;
+        }
+        if (!HEAVY_SECRET.test(requestId)) {
+          sendJson(400, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "invalid_request_id" });
+          return;
+        }
+        const requestIdHash = hashOf(requestId);
+        const leaseHash = hashOf(lease);
+        // A retry of a request already answered: the same grant or the same place, and only
+        // for whoever presents both halves of the pair.
+        if (heavyHolder && sameHash(heavyHolder.requestIdHash, requestIdHash)) {
+          if (!sameHash(heavyHolder.leaseHash, leaseHash)) {
+            sendJson(403, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "lease_mismatch" });
+            return;
+          }
+          sendJson(200, heavyGranted(heavyHolder.loadSkipped, lease));
+          return;
+        }
+        const queuedAt = heavyQueue.findIndex((entry) => sameHash(entry.requestIdHash, requestIdHash));
+        if (queuedAt >= 0) {
+          if (!sameHash(heavyQueue[queuedAt].leaseHash, leaseHash)) {
+            sendJson(403, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "lease_mismatch" });
+            return;
+          }
+          heavyQueue[queuedAt].polledAt = heavyNow();
+          sendJson(202, heavyQueued(queuedAt));
+          return;
+        }
+        const now = heavyNow();
+        if (!heavyHolder && heavyQueue.length === 0 && heavyLoad() <= HEAVY_LOAD_LIMIT) {
+          if (!reserveHeavy({ leaseHash, requestIdHash, as, what }, false, now)) {
+            sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "holder_unwritable" });
+            return;
+          }
+          sendJson(200, heavyGranted(false, lease));
+          return;
+        }
+        if (heavyQueue.length >= HEAVY_QUEUE_MAX) {
+          sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "queue_full", limit: HEAVY_QUEUE_MAX });
+          return;
+        }
+        heavyQueue.push({ ticket: randomBytes(16).toString("hex"), leaseHash, requestIdHash, as, what, enqueuedAt: now, polledAt: now });
+        promoteHeavy();
+        if (heavyHolder && sameHash(heavyHolder.requestIdHash, requestIdHash)) {
+          sendJson(200, heavyGranted(heavyHolder.loadSkipped, lease));
+          return;
+        }
+        sendJson(202, heavyQueued(heavyQueue.length - 1));
+        return;
+      }
+
+      if (action === "wait" || action === "cancel") {
+        const ticket = typeof body.ticket === "string" ? body.ticket : "";
+        const granted = heavyHolder !== null && heavyHolder.ticket === ticket && heavyHolderMatches(lease);
+        if (action === "cancel") {
+          const at = heavyTicketAt(ticket, lease);
+          if (at < 0) {
+            sendJson(granted ? 409 : 404, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: granted ? "granted" : "ticket_unknown" });
+            return;
+          }
+          heavyQueue.splice(at, 1);
+          promoteHeavy();
+          sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, cancelled: true });
+          return;
+        }
+        // Idempotent: a granted ticket keeps answering with the grant, so an answer lost on
+        // the way is simply asked for again.
+        if (granted) {
+          sendJson(200, heavyGranted(heavyHolder.loadSkipped, lease));
+          return;
+        }
+        const at = heavyTicketAt(ticket, lease);
+        if (at < 0) {
+          sendJson(404, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "ticket_unknown", message: "This bridge does not know that ticket — it may have restarted. Acquire again with the same requestId." });
+          return;
+        }
+        if (heavyPolls.size >= HEAVY_POLLS_MAX) {
+          sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "too_many_waits", limit: HEAVY_POLLS_MAX });
+          return;
+        }
+        heavyQueue[at].polledAt = heavyNow();
+        let done = false;
+        const poll = {
+          ticket,
+          finish: () => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            heavyPolls.delete(poll);
+            const entry = heavyQueue.find((candidate) => candidate.ticket === ticket);
+            if (entry) entry.polledAt = heavyNow();
+            if (res.destroyed || res.writableEnded) return;
+            if (heavyHolder !== null && heavyHolder.ticket === ticket) sendJson(200, heavyGranted(heavyHolder.loadSkipped, lease));
+            else {
+              const index = heavyQueue.findIndex((candidate) => candidate.ticket === ticket);
+              if (index >= 0) sendJson(200, heavyQueued(index));
+              else sendJson(404, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "ticket_unknown" });
+            }
+          },
+        };
+        const timer = setTimeout(() => poll.finish(), HEAVY_WAIT_MS);
+        // The response, not the request: a POST's request has closed once its body is read.
+        res.on("close", () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          heavyPolls.delete(poll);
+        });
+        heavyPolls.add(poll);
+        promoteHeavy();
+        return;
+      }
+
+      // Everything below speaks for the holder, and only the lease does.
+      if (!heavyHolderMatches(lease)) {
+        sendJson(404, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "lease_unknown" });
+        return;
+      }
+
+      if (action === "activate" || action === "adopt") {
+        const pgid = body.pgid;
+        if (!Number.isInteger(pgid) || pgid <= 1) {
+          sendJson(400, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "invalid_pgid" });
+          return;
+        }
+        if (heavyHolder.state === "active") {
+          // A retried activate, or a helper showing a restarted bridge the run it holds.
+          if (heavyHolder.pgid !== pgid) {
+            sendJson(409, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "pgid_mismatch" });
+            return;
+          }
+          heavyHolder.adopted = true;
+          heavyHolder.heartbeatAt = heavyNow();
+          sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, state: "active" });
+          return;
+        }
+        if (action === "adopt") {
+          sendJson(409, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "not_active" });
+          return;
+        }
+        if (!groupAlive(pgid)) {
+          sendJson(400, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "group_gone" });
+          return;
+        }
+        heavyHolder.state = "active";
+        heavyHolder.pgid = pgid;
+        heavyHolder.adopted = true;
+        heavyHolder.heartbeatAt = heavyNow();
+        if (!persistHeavyHolder()) {
+          heavyHolder.state = "reserved";
+          heavyHolder.pgid = null;
+          sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "holder_unwritable" });
+          return;
+        }
+        heavyFault("activate");
+        sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, state: "active" });
+        return;
+      }
+
+      if (action === "heartbeat") {
+        if (!heavyHolder.adopted) {
+          sendJson(404, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "adopt_required" });
+          return;
+        }
+        heavyHolder.heartbeatAt = heavyNow();
+        sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, state: heavyHolder.state });
+        return;
+      }
+
+      // release
+      freeHeavy();
+      sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, released: true });
       return;
     }
 

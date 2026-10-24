@@ -866,6 +866,7 @@ export const codexEntryFromLine = (line, sinceMs) => {
  * (to a count, to a deadline, to a clear on leaving) and each loss turned an answer into one
  * nobody asked for. A prompt without the marker was typed by the session's own user: null.
  */
+export const CODEX_NOTICE_MARKER = "[Gyredeck · notice]";
 export const codexPushTarget = (text) => {
   const room = /^\[Gyredeck · room (sync-[a-z2-9]{4}) /.exec(text);
   if (room) return { kind: "room", name: room[1] };
@@ -880,6 +881,9 @@ export const codexPushTarget = (text) => {
   // A message envelope from before the marker existed: its answer has nowhere named to
   // go. A notice from the room itself (`[Gyredeck: …]`) names none either, by design.
   if (/^\[Gyredeck · mailbox — /.test(text)) return { kind: "mailbox", replyTo: null, legacy: true };
+  // A notice the bridge pushed with no room or mailbox behind it (#223): its answer goes
+  // nowhere, and must not make a mailbox to go to.
+  if (text.startsWith(CODEX_NOTICE_MARKER)) return { kind: "notice" };
   if (/^\[Gyredeck[ ·:]/.test(text)) return { kind: "mailbox", replyTo: null };
   return null;
 };
@@ -2238,6 +2242,7 @@ function startBridge(config) {
   const legacyEnvelopeSaid = new Set();
   const codexReplyDestination = (reader, origin, reply, confirmedIn) => {
     const { threadId } = reader;
+    if (origin?.kind === "notice") return null;
     if (origin?.kind === "room") {
       // The room that pushed, and only while it stands for this session: registered under
       // that name, with this session confirmed in it. A question has only its asker to be
@@ -4091,24 +4096,45 @@ function startBridge(config) {
    * machine-wide and a session in no room never reads the rules that describe it. A
    * confirmed member has the rules (v8) and is counted as told. Claude Code and
    * Antigravity hear it on their next collect, beside any mail; Codex has no read of its
-   * own, so it is pushed to when it is first heard from.
+   * own, so it is pushed to when it is first heard from — straight to its thread, with no
+   * mailbox made for it: mailboxes share the room table with sync rooms, and a notice to
+   * every new session would fill it.
+   *
+   * Remembered by recency, oldest forgotten first, so the set is bounded without ever
+   * refusing a new session; one forgotten and heard from again is told again.
    */
-  const heavyTold = new Set();
-  const HEAVY_TOLD_MAX = 10_000;
+  const heavyTold = new Map();
+  const HEAVY_TOLD_MAX = Number(process.env.GYREDECK_TEST_HEAVY_TOLD_MAX) || 10_000;
+  const heavyWasTold = (conversationId) => {
+    if (!heavyTold.has(conversationId)) return false;
+    heavyTold.delete(conversationId);
+    heavyTold.set(conversationId, true);
+    return true;
+  };
+  const markHeavyTold = (conversationId) => {
+    heavyTold.set(conversationId, true);
+    while (heavyTold.size > HEAVY_TOLD_MAX) heavyTold.delete(heavyTold.keys().next().value);
+  };
   const heavyHint = (conversationId) =>
     `HEAVY RUNS: one at a time on this machine. Run ${HEAVY_COMMANDS.join(", ")} through ` +
     `\`node ${HEAVY_HELPER_DISPLAY_PATH} --as ${conversationId} --what "<what it runs>" -- <command…>\`; ` +
     `it waits for the slot, runs the command and exits with its code. ${HEAVY_LIMIT_TEXT}`;
-  /** Whether this session is to be told now; asking marks it told. */
-  const takeHeavyNotice = (conversationId) => {
-    if (heavyTold.has(conversationId) || heavyTold.size >= HEAVY_TOLD_MAX) return false;
-    heavyTold.add(conversationId);
-    return !inConfirmedRoom(conversationId);
+  /** Whether this session is still to be told. A confirmed member has the rules and counts as told. */
+  const heavyToBeTold = (conversationId) => {
+    if (heavyWasTold(conversationId)) return false;
+    if (inConfirmedRoom(conversationId)) {
+      markHeavyTold(conversationId);
+      return false;
+    }
+    return true;
   };
   const heavyNoticeFor = (conversationId) => {
     const provider = usageProviderFor(conversationId);
     if (provider !== "claude" && provider !== "agy") return null;
-    return takeHeavyNotice(conversationId) ? heavyHint(conversationId) : null;
+    if (!heavyToBeTold(conversationId)) return null;
+    // Told by being in the answer this collect returns.
+    markHeavyTold(conversationId);
+    return heavyHint(conversationId);
   };
   // Tests only: the reader-lifecycle fixtures count every push a Codex session gets, and
   // this one would be the first of them.
@@ -4116,12 +4142,12 @@ function startBridge(config) {
   const tellCodexOfHeavyRuns = (conversationId) => {
     if (heavyCodexPushOff) return;
     if (typeof conversationId !== "string" || !CODEX_PROVIDERS.has(providerByConversation.get(conversationId))) return;
-    if (!takeHeavyNotice(conversationId)) return;
-    const mailbox = mailRoomFor(conversationId, true);
-    if (!mailbox) return;
-    const text = `[Gyredeck: ${heavyHint(conversationId)}]`;
-    const told = publishMail(mailbox, ROOM_SENDER, text, null, false, { to: conversationId, kind: "tell" });
-    if (told) deliverMail(conversationId, mailbox, text, ROOM_SENDER, told);
+    if (!heavyToBeTold(conversationId)) return;
+    // Told only once the push is on its way; a push that could not start is tried again
+    // the next time the session is heard from.
+    if (deliverToCodex(conversationId, null, `${CODEX_NOTICE_MARKER} ${heavyHint(conversationId)}`, { harvest: false }) === "queued") {
+      markHeavyTold(conversationId);
+    }
   };
 
   /** Which room a session has been put into, if any. A session belongs to at most one. */
@@ -4968,7 +4994,7 @@ function startBridge(config) {
    * Fire-and-forget on purpose: the POST that triggered this has already been answered,
    * and a session that never replies must not leave a request hanging.
    */
-  const deliverToCodex = (threadId, room, text) => {
+  const deliverToCodex = (threadId, room, text, { harvest = true } = {}) => {
     const binary = findAgentBinary("codex");
     if (!binary) return "unavailable";
     // Answered before the spawn, because afterwards is too late to answer honestly: the
@@ -4981,6 +5007,12 @@ function startBridge(config) {
       return "unavailable";
     }
 
+    // A notice wants no answer, so nothing is set up to read one: no reader, no poll.
+    if (!harvest) {
+      spawn(binary, ["queue", "--thread", threadId, "--message", text], { stdio: ["ignore", "ignore", "ignore"] })
+        .on("error", (error) => console.error(`⚠ codex queue could not be started (${error?.code ?? error}): ${binary}`));
+      return "queued";
+    }
     const rolloutPath = codexRolloutFor(threadId);
     const reader = codexReaderFor(threadId);
     const since = Date.now();

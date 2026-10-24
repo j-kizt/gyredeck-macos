@@ -10202,6 +10202,77 @@ test("heavy P1-a: Codex outside a room is pushed the queue once, and a Codex mem
   }
 });
 
+test("heavy round 2 P1: telling Codex sessions makes no mailbox, so rooms can still be made and a later session is still told", async () => {
+  const { codexPushTarget, CODEX_NOTICE_MARKER } = await heavyModule();
+  // The notice's answer goes nowhere — read as anything else, it would make a mailbox.
+  assert.deepEqual(codexPushTarget(`${CODEX_NOTICE_MARKER} HEAVY RUNS: …`), { kind: "notice" });
+
+  const h = await heavyHarness("codex-rooms");
+  const fakeBin = join(h.home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  const queued = join(h.home, "queued.log");
+  await writeFile(
+    join(fakeBin, "codex"),
+    `#!${process.execPath}\n` +
+      "require('node:fs').appendFileSync(" +
+      `${JSON.stringify(queued)}, JSON.stringify(process.argv.slice(2)) + "\\n");\n`,
+  );
+  await chmod(join(fakeBin, "codex"), 0o755);
+  try {
+    await h.start({ GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin });
+    const headers = { "content-type": "application/json", "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD };
+    const pushedTo = async () => (existsSync(queued) ? (await readFile(queued, "utf8")).trim().split("\n").filter(Boolean).map((line) => { const argv = JSON.parse(line); return argv[argv.indexOf("--thread") + 1]; }) : []);
+    const ephemeral = Array.from({ length: 40 }, (_, index) => `a2231000-0000-4000-8000-${String(index).padStart(12, "0")}`);
+    for (const id of ephemeral) await heavyIngest(h, id, "codexCliHook");
+    await until(async () => (await pushedTo()).length >= ephemeral.length, "every session pushed");
+    assert.deepEqual([...new Set(await pushedTo())].sort(), [...ephemeral].sort(), "each told once");
+    const listed = await (await fetch(`${h.base}/mail`, { headers })).json();
+    assert.deepEqual(listed.rooms.filter((room) => ephemeral.includes(room.room)), [], "no mailbox was made for any of them");
+
+    // The room table is the sync rooms' own: it fills only with rooms.
+    let made = 0;
+    for (; made < 40; made += 1) {
+      const created = await fetch(`${h.base}/sync/rooms`, { method: "POST", headers, body: JSON.stringify({ conversationId: `a2232000-0000-4000-8000-${String(made).padStart(12, "0")}` }) });
+      if (created.status !== 201) {
+        assert.equal(created.status, 429);
+        break;
+      }
+    }
+    // Each room also holds its founder's mailbox, so the table is full at half as many
+    // rooms; what matters is that none of it went to the sessions told about heavy runs.
+    assert.ok(made > 0, "rooms could still be made after 40 Codex sessions were told");
+    const later = "a2233000-0000-4000-8000-000000000001";
+    await heavyIngest(h, later, "codexCliHook");
+    await until(async () => (await pushedTo()).includes(later), "a later session told with the table full");
+    const full = await (await fetch(`${h.base}/mail`, { headers })).json();
+    assert.deepEqual(full.rooms.filter((room) => ephemeral.includes(room.room) || room.room === later), [], "still no mailbox for any told session");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy round 2 P2: the told set forgets its oldest rather than refusing new sessions", async () => {
+  const h = await heavyHarness("told-cap");
+  try {
+    await h.start({ GYREDECK_TEST_HEAVY_TOLD_MAX: "2" });
+    const told = async (id) => {
+      const answer = await fetch(`${h.base}/mail/inbox?as=${id}&collect=1`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+      return typeof answer.heavyNotice === "string";
+    };
+    const [a, b, c, d] = ["a", "b", "c", "d"].map((x) => `a2234000-0000-4000-8000-00000000000${x}`);
+    for (const id of [a, b, c, d]) await heavyIngest(h, id, "claudeCodeHook");
+    assert.equal(await told(a), true);
+    assert.equal(await told(b), true);
+    assert.equal(await told(a), false, "remembered, and now the most recent");
+    assert.equal(await told(c), true, "past the cap a new session is still told; b, the oldest, is forgotten");
+    assert.equal(await told(a), false, "a is still remembered");
+    assert.equal(await told(d), true, "and again: c is forgotten");
+    assert.equal(await told(b), true, "b was forgotten, so it is told again");
+  } finally {
+    await h.cleanup();
+  }
+});
+
 /** A stand-in bridge that grants, then refuses activation with `refusal`. */
 const refusingActivation = (home, refusal) =>
   scriptedHeavyBridge(home, ({ path, body }) => {

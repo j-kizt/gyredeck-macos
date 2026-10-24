@@ -107,6 +107,10 @@ const runAdapter = (adapterPath, args, home, payload) =>
     child.on("close", (code) => resolve({ code, stdout, stderr }));
   });
 
+// The app's word: the broker secret Gyredeck hands its bridge on stdin. Room create, join,
+// passwords, removal and close need it (#220, #221), so every bridge a test starts gets it.
+const TEST_APP_WORD = "a5".repeat(32);
+
 test("install-claude-hooks copies the adapter and merges settings idempotently", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-install-"));
   const settingsPath = join(home, ".claude", "settings.json");
@@ -185,9 +189,10 @@ test("claude adapter relays a Notification into the running bridge", async () =>
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   try {
@@ -231,9 +236,10 @@ test("claude adapter forwards a PreToolUse ingest event with trusted runtime", a
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   try {
@@ -277,9 +283,10 @@ test("antigravity adapter allows PreToolUse and relays a tool_start", async () =
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   try {
@@ -321,9 +328,10 @@ test("antigravity adapter raises attention when the model asks the user a questi
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   try {
@@ -393,9 +401,10 @@ test("antigravity adapter answers each event with its documented response shape"
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   try {
@@ -451,9 +460,10 @@ test("codex adapter reports a session id, a paired tool call, and approval atten
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   // Field names and shapes below are taken from payloads captured off a live Codex run.
@@ -526,9 +536,10 @@ test("standalone bridge appends relayed events to the ndjson log", async () => {
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   try {
@@ -563,9 +574,10 @@ test("bridge mail rooms push to subscribers and buffer for periodic readers", as
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -575,7 +587,7 @@ test("bridge mail rooms push to subscribers and buffer for periodic readers", as
     assert.equal(health.capabilities.endpoints.mail, true);
 
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const publish = (room, body) =>
       fetch(`${base}/mail/${room}`, { method: "POST", headers, body: JSON.stringify(body) });
 
@@ -722,9 +734,10 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const conversationId = "0313999f-b335-40b3-bc51-b8a9e65df5ce";
@@ -745,7 +758,7 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     const send = (from, text) =>
       fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-gyredeck-token": token },
+        headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
         body: JSON.stringify({ from, text }),
       });
 
@@ -783,7 +796,7 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     // that to an agent to run.
     const badReply = await fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
       body: JSON.stringify({ from: "claude-code", text: "x", replyTo: "has/slash" }),
     });
     assert.equal(badReply.status, 400);
@@ -793,7 +806,7 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     // run shell commands and needs nothing added on its side but the address.
     await fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
       body: JSON.stringify({ from: "claude-code", text: "please answer", replyTo: "claude-inbox" }),
     });
     const withReply = await preInvocation(7);
@@ -815,7 +828,7 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     // discount the user's own message.
     await fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
       body: JSON.stringify({ from: "gyredeck", text: "from the person" }),
     });
     const [appHeader] = await preInvocation(9);
@@ -879,9 +892,10 @@ test("a bridge restart cannot leave a reader stranded past its room", async () =
   const startBridge = async () => {
     const bridge = spawn(
       process.execPath,
-      ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+      ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
       { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
     );
+    bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
     bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
     await waitForHealth(port, stderrRef);
     return bridge;
@@ -914,7 +928,7 @@ test("a bridge restart cannot leave a reader stranded past its room", async () =
     const send = (text) =>
       fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-gyredeck-token": token },
+        headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
         body: JSON.stringify({ from: "claude-code", text }),
       });
 
@@ -947,16 +961,17 @@ test("mail delivery reports how a message will reach the session it is addressed
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
 
     // A room nobody has been seen on cannot be routed: mail is addressed to a
     // conversation, and the bridge only knows who owns one from the events it sends.
@@ -998,9 +1013,10 @@ test("claude UserPromptSubmit delivers mail as additional context exactly once",
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const conversationId = "9d8aca17-7367-447d-a0e8-02cb02558496";
@@ -1021,7 +1037,7 @@ test("claude UserPromptSubmit delivers mail as additional context exactly once",
     const send = (from, text, replyTo) =>
       fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-gyredeck-token": token },
+        headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
         body: JSON.stringify({ from, text, replyTo }),
       });
 
@@ -1103,9 +1119,10 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "pass-founder";
@@ -1114,7 +1131,7 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method,
@@ -1226,11 +1243,12 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
     // the member who gets told — closing an empty-but-for-the-founder room proves
     // nothing about telling anyone.
     await call("POST", `/sync/rooms/${code}/members`, { conversationId: stranger });
+    const { "x-gyredeck-broker": _word, ...agentHeaders } = headers;
     const outsiderClose = await fetch(`http://127.0.0.1:${port}/sync/rooms/${code}?as=${stranger}`, {
       method: "DELETE",
-      headers,
+      headers: agentHeaders,
     });
-    assert.equal(outsiderClose.status, 403, "only the founder ends a room others are in");
+    assert.equal(outsiderClose.status, 401, "only the app ends a room others are in (#221, close contract A)");
 
     const closed = await fetch(`http://127.0.0.1:${port}/sync/rooms/${code}?as=${founder}`, {
       method: "DELETE",
@@ -1260,9 +1278,10 @@ test("a sync room gives each member its own read position", async () => {
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -1273,7 +1292,7 @@ test("a sync room gives each member its own read position", async () => {
     assert.equal(health.capabilities.endpoints.syncRooms, true);
 
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(base + path, {
         method,
@@ -1362,9 +1381,10 @@ test("an inbox merges a session's mailbox with its sync room, and the cap cannot
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -1373,7 +1393,7 @@ test("an inbox merges a session's mailbox with its sync room, and the cap cannot
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const post = (path, body) =>
       fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
     const inbox = async (limit) =>
@@ -1445,9 +1465,10 @@ test("a session can wait inside its turn for an answer it needs", async () => {
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -1456,7 +1477,7 @@ test("a session can wait inside its turn for an answer it needs", async () => {
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(base + path, {
         method,
@@ -1528,9 +1549,10 @@ test("a room delivery carries only what the session can use, and points at the r
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -1551,7 +1573,7 @@ test("a room delivery carries only what the session can use, and points at the r
     assert.match(rules, /never re-run the old ones/);
 
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const post = (path, body) =>
       fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
     const context = async () => {
@@ -1703,9 +1725,10 @@ test("the founder's prompt that carries the room password still gets its mail (#
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "aaaaaaaa-1111-4111-8111-111111111167";
@@ -1716,7 +1739,7 @@ test("the founder's prompt that carries the room password still gets its mail (#
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method,
-        headers: { "content-type": "application/json", "x-gyredeck-token": token },
+        headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
         body: body ? JSON.stringify(body) : undefined,
       });
       return { status: response.status, body: await response.json() };
@@ -1756,9 +1779,10 @@ test("a room watch is sent a heartbeat, and with no rules file the rules go out 
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home, GYREDECK_SSE_HEARTBEAT_MS: "200" }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   const base = `http://127.0.0.1:${port}`;
   const me = "claude-session-1";
@@ -1768,7 +1792,7 @@ test("a room watch is sent a heartbeat, and with no rules file the rules go out 
     await waitForHealth(port, stderrRef);
     assert.match(stderrRef.value, /room rules not written/);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const post = (path, body) =>
       fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
     for (const [conversationId, sourceKind] of [[me, "claudeCodeHook"], [peer, "codexCliHook"]]) {
@@ -1838,9 +1862,10 @@ test("a room member hears when its own provider's limit runs low, and can ask fo
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   const base = `http://127.0.0.1:${port}`;
   const me = "claude-session-1";
@@ -1848,7 +1873,7 @@ test("a room member hears when its own provider's limit runs low, and can ask fo
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const post = (path, body) =>
       fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
     for (const [conversationId, sourceKind] of [[me, "claudeCodeHook"], [other, "agyHost"]]) {
@@ -1948,9 +1973,10 @@ test("an agent outside a room learns it can ask for its usage, and hears when it
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   const base = `http://127.0.0.1:${port}`;
   const claude = "a1690000-0000-4000-8000-000000000001";
@@ -1959,7 +1985,7 @@ test("an agent outside a room learns it can ask for its usage, and hears when it
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const post = (path, body) =>
       fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
     for (const [conversationId, sourceKind] of [[claude, "claudeCodeHook"], [agy, "agyHost"], [codex, "codexCliHook"]]) {
@@ -2004,7 +2030,7 @@ test("an agent outside a room learns it can ask for its usage, and hears when it
     assert.match(intro, /\$\(cat ~\/\.config\/gyredeck\/gyredeck\.ingest-token\)/);
     assert.ok(!intro.includes(token), "the machine token itself never reaches the session");
     assert.equal(await claudeContext(), "", "and not again");
-    const asked = await fetch(`${base}/usage?as=${claude}`, { headers: { "x-gyredeck-token": token } }).then((r) => r.json());
+    const asked = await fetch(`${base}/usage?as=${claude}`, { headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD } }).then((r) => r.json());
     assert.equal(asked.usage.lines[0].leftPct, 50, "the call the intro names answers outside a room");
 
     // Crossing 10% is told once, staying low says nothing, coming back says so.
@@ -2120,9 +2146,10 @@ test("mail a hook has collected still reaches the session when building the deli
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   const claude = "a1680000-0000-4000-8000-000000000001";
   const agy = "a1680000-0000-4000-8000-000000000002";
@@ -2131,7 +2158,7 @@ test("mail a hook has collected still reaches the session when building the deli
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
     const send = (to, text) => fetch(`http://127.0.0.1:${port}/mail/${to}`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
       body: JSON.stringify({ from: "gyredeck-app", text }),
     });
     const claudeContext = async () => {
@@ -2170,7 +2197,7 @@ test("mail a hook has collected still reaches the session when building the deli
     // a usage line with no mail at all, and a founder's password just accepted.
     const call = (method, path, body) => fetch(`http://127.0.0.1:${port}${path}`, {
       method,
-      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
       body: body ? JSON.stringify(body) : undefined,
     }).then((r) => r.json());
     await call("POST", "/ingest", {
@@ -2256,15 +2283,16 @@ test("a password accepted in a turn whose mail is withheld still names the room 
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   let broker = null;
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
       return response.json();
@@ -2344,10 +2372,10 @@ test("a password accepted while the bridge refuses the session's TCP read still 
   const founder = "a1960000-0000-4000-8000-000000000003";
   let broker = null;
   try {
-    bridge.stdin.write(`broker-secret ${"cd".repeat(32)}\nbroker-bound ${founder}\nbroker-ready\n`);
+    bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-bound ${founder}\nbroker-ready\n`);
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
       return response.json();
@@ -2374,6 +2402,93 @@ test("a password accepted while the bridge refuses the session's TCP read still 
   }
 });
 
+test("only the app's word opens, joins, invites into, empties and closes a room (#220, #221)", async () => {
+  // Every one of these was authorised by something any local agent holds: a session id
+  // (#220: founding a room in another session's name returned its password) or the
+  // machine token with `as` left out (#221: any room closed). The app's broker secret,
+  // handed to the bridge on stdin, is the one thing an agent cannot read.
+  const appWord = "e1".repeat(32);
+  const start = async (handshake) => {
+    const home = await mkdtemp(join(tmpdir(), "gyredeck-220-"));
+    await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+    const port = await freePort();
+    await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+    const stderrRef = { value: "" };
+    const args = ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"];
+    if (handshake) args.push("--broker-handshake");
+    const bridge = spawn(process.execPath, args, { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] });
+    bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+    if (handshake) bridge.stdin.write(`broker-secret ${appWord}\nbroker-ready\n`);
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const call = async (method, path, body, extra = {}) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+        headers: { "content-type": "application/json", "x-gyredeck-token": token, ...extra },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const stop = async () => { bridge.stdin.end(); if (bridge.exitCode === null) bridge.kill(); await rm(home, { recursive: true, force: true }); };
+    return { call, stop };
+  };
+  const app = { "x-gyredeck-broker": appWord };
+  const founder = "a2200000-0000-4000-8000-000000000001";
+  const other = "a2200000-0000-4000-8000-000000000002";
+
+  const live = await start(true);
+  try {
+    const { call } = live;
+    // (a) #220: founding a room in a session's name with no word, by an agent holding only the machine token.
+    let r = await call("POST", "/sync/rooms", { conversationId: founder });
+    assert.equal(r.status, 401, "create without the app's word is refused");
+    assert.equal(r.body.error, "app_only");
+    assert.equal(r.body.password, undefined, "and hands out no password");
+    r = await call("POST", "/sync/rooms", { conversationId: founder }, { "x-gyredeck-broker": "0f".repeat(32) });
+    assert.equal(r.status, 401, "a wrong word is no word");
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, null, "the session's room slot stays empty");
+
+    // (g) the app's word does all of it.
+    r = await call("POST", "/sync/rooms", { conversationId: founder }, app);
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    const code = r.body.room;
+
+    // (d) join without the word is refused, and leaves the session free.
+    r = await call("POST", `/sync/rooms/${code}/members`, { conversationId: other });
+    assert.equal(r.status, 401, "join without the app's word is refused");
+    assert.equal((await call("GET", `/sync/rooms?as=${other}`)).body.room, null);
+    assert.equal((await call("POST", `/sync/rooms/${code}/members`, { conversationId: other }, app)).status, 200);
+
+    // (e) passwords and removing a member need the word too.
+    assert.equal((await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder })).status, 401);
+    assert.equal((await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder }, app)).status, 200);
+    assert.equal((await call("DELETE", `/sync/rooms/${code}/members/${other}`)).status, 401, "taking a member out without the word is refused");
+
+    // (c) #221: close with the machine token and `as` left out is refused…
+    r = await call("DELETE", `/sync/rooms/${code}`);
+    assert.equal(r.status, 401, "close without the app's word is refused, `as` or not");
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, code, "the room is still open");
+    // …and the app may close it, whoever founded it (close contract A).
+    r = await call("DELETE", `/sync/rooms/${code}?as=${other}`, undefined, app);
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, null, "closed");
+  } finally {
+    await live.stop();
+  }
+
+  // (f) a bridge started without the app's word refuses every one of them, rather than
+  // falling back to the machine token.
+  const bare = await start(false);
+  try {
+    const r = await bare.call("POST", "/sync/rooms", { conversationId: founder }, app);
+    assert.equal(r.status, 503, "no handshake, no rooms");
+    assert.equal(r.body.error, "app_word_unavailable");
+    assert.equal((await bare.call("GET", `/sync/rooms?as=${founder}`)).body.room, null);
+  } finally {
+    await bare.stop();
+  }
+});
+
 test("the bridge keeps only a hash of a room's password, and hands the plaintext over once (#124)", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-room-hash-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
@@ -2382,9 +2497,10 @@ test("the bridge keeps only a hash of a room's password, and hands the plaintext
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   const founder = "a1240000-0000-4000-8000-000000000001";
   const joiner = "a1240000-0000-4000-8000-000000000002";
@@ -2394,7 +2510,7 @@ test("the bridge keeps only a hash of a room's password, and hands the plaintext
     const raw = async (method, path, body, credential = token) => {
       const response = await bridgeFetch(`http://127.0.0.1:${port}${path}`, {
         method,
-        headers: { "content-type": "application/json", "x-gyredeck-token": credential },
+        headers: { "content-type": "application/json", "x-gyredeck-token": credential, "x-gyredeck-broker": TEST_APP_WORD },
         body: body ? JSON.stringify(body) : undefined,
       });
       return { status: response.status, text: await response.text() };
@@ -2452,13 +2568,13 @@ test("a session the broker bound and then turned away is told its mail is held, 
   const agy = "a1780000-0000-4000-8000-000000000002";
   let broker = null;
   try {
-    bridge.stdin.write(`broker-secret ${"cd".repeat(32)}\nbroker-bound ${claude}\nbroker-bound ${agy}\nbroker-ready\n`);
+    bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-bound ${claude}\nbroker-bound ${agy}\nbroker-ready\n`);
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
     for (const to of [claude, agy]) {
       await fetch(`http://127.0.0.1:${port}/mail/${to}`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-gyredeck-token": token },
+        headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
         body: JSON.stringify({ from: "gyredeck-app", text: "you are in a room" }),
       });
     }
@@ -2520,16 +2636,17 @@ test("a message over the size limit is refused with the limit and its own length
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
     const send = async (body) => {
       const response = await fetch(`http://127.0.0.1:${port}/mail/a1840000-0000-4000-8000-000000000001`, {
-        method: "POST", headers: { "content-type": "application/json", "x-gyredeck-token": token }, body: JSON.stringify(body),
+        method: "POST", headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD }, body: JSON.stringify(body),
       });
       return { status: response.status, body: await response.json() };
     };
@@ -2562,9 +2679,10 @@ test("a session's assigned name shows wherever the room names it, and to still t
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   const founder = "a1820000-0000-4000-8000-000000000001";
   const agy = "a1820000-0000-4000-8000-000000000002";
@@ -2573,7 +2691,7 @@ test("a session's assigned name shows wherever the room names it, and to still t
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
     const call = async (method, path, body, credential = token) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
-        method, headers: { "content-type": "application/json", "x-gyredeck-token": credential }, body: body ? JSON.stringify(body) : undefined,
+        method, headers: { "content-type": "application/json", "x-gyredeck-token": credential, "x-gyredeck-broker": TEST_APP_WORD }, body: body ? JSON.stringify(body) : undefined,
       });
       return { status: response.status, body: await response.json() };
     };
@@ -2669,9 +2787,10 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -2680,7 +2799,7 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const post = (path, body) =>
       fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
     const context = async () => {
@@ -2776,9 +2895,10 @@ test("a session that ends is taken out of its sync room", async () => {
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -2787,7 +2907,7 @@ test("a session that ends is taken out of its sync room", async () => {
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const post = (path, body) =>
       fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
     const close = (conversationId) =>
@@ -2836,9 +2956,10 @@ test("a message says who it is for and what it is for, and the room routes on th
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "route-founder";
@@ -2846,7 +2967,7 @@ test("a message says who it is for and what it is for, and the room routes on th
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -3012,15 +3133,16 @@ test("a wait that times out says whether the message was the problem", async () 
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -3096,15 +3218,16 @@ test("a message to a room that is not there is refused, not delivered to a new o
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -3131,7 +3254,7 @@ test("a message to a room that is not there is refused, not delivered to a new o
     assert.equal(afterClosing.status, 404, "a closed room does not quietly come back");
     // The watcher side of the same truth, so the two halves cannot drift apart again.
     const stream = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=ghost-founder`, {
-      headers: { "x-gyredeck-token": token },
+      headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
     });
     assert.equal(stream.status, 404);
     assert.match(await stream.text(), /^event: error\ndata: /, "a refused watch answers in frames");
@@ -3161,16 +3284,17 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "harvest-founder";
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -3305,9 +3429,10 @@ test("the AGY adapter reports token usage when there is any, and never invents i
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const adapter = join(repoRoot, "adapters", "antigravity", "gyredeck-agy-hook.mjs");
@@ -3317,7 +3442,7 @@ test("the AGY adapter reports token usage when there is any, and never invents i
     const usageAfter = async (payload) => {
       await runAdapter(adapter, ["--event", "Stop"], home, { conversationId: randomUUID(), ...payload });
       const snapshot = await (await fetch(`http://127.0.0.1:${port}/snapshot`, {
-        headers: { "x-gyredeck-token": token },
+        headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
       })).json();
       const last = [...(snapshot.recent || [])].reverse().find((event) => event.type === "turn_complete");
       return last?.data?.usage ?? null;
@@ -3364,9 +3489,10 @@ test("a room message reaches the presence stream, but only when it asks somethin
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "roomevent-founder";
@@ -3374,7 +3500,7 @@ test("a room message reaches the presence stream, but only when it asks somethin
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -3390,7 +3516,7 @@ test("a room message reaches the presence stream, but only when it asks somethin
 
     // Mail and presence were separate streams, and the app only polls rooms while the
     // session list is on screen — never when a person most needs telling.
-    const stream = await fetch(`http://127.0.0.1:${port}/events`, { headers: { "x-gyredeck-token": token } });
+    const stream = await fetch(`http://127.0.0.1:${port}/events`, { headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD } });
     const reader = stream.body.getReader();
     let seen = "";
     const pump = (async () => {
@@ -3628,9 +3754,10 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const runHook = (event, sessionId, cwd, extra = {}) =>
@@ -3937,9 +4064,10 @@ test("every mutation and every room read needs a credential that verifies", asyn
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -3948,7 +4076,7 @@ test("every mutation and every room read needs a credential that verifies", asyn
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(base + path, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -4070,7 +4198,7 @@ test("every mutation and every room read needs a credential that verifies", asyn
     // refusals: the position must be exactly where it was.
     const peek = async () => {
       const response = await fetch(`${base}/mail/inbox?as=${peer}`, {
-        headers: { "x-gyredeck-token": token },
+        headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
       });
       return (await response.json()).messages.length;
     };
@@ -4155,7 +4283,7 @@ test("every mutation and every room read needs a credential that verifies", asyn
       body: JSON.stringify({ from: peer, text: "SHOULD-NOT-LAND" }),
     });
     assert.equal(refusedPost.status, 401, "nor can it post into one");
-    const rooms = (await (await fetch(`${base}/mail`, { headers: { "x-gyredeck-token": token } })).json()).rooms;
+    const rooms = (await (await fetch(`${base}/mail`, { headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD } })).json()).rooms;
     assert.ok(!rooms.some((room) => room.room === invented), "and neither call brought the name into being");
   } finally {
     bridge.stdin.end();
@@ -4173,9 +4301,10 @@ test("only the app's own pages may reach the bridge from a browser", async () =>
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -4254,7 +4383,7 @@ test("only the app's own pages may reach the bridge from a browser", async () =>
     // free, so it is the one worth pinning: the refusal has to come from the origin gate,
     // which sits in front of every route rather than inside the ones that ask for a
     // credential.
-    const rooms = async () => (await (await fetch(`${base}/mail`, { headers: { "x-gyredeck-token": token } })).json()).rooms.length;
+    const rooms = async () => (await (await fetch(`${base}/mail`, { headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD } })).json()).rooms.length;
     const roomsBefore = await rooms();
     const forgedRoom = await fetch(`${base}/sync/rooms`, {
       method: "POST",
@@ -4313,9 +4442,10 @@ test("a room does not outlive the founder that made it", async () => {
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -4324,7 +4454,7 @@ test("a room does not outlive the founder that made it", async () => {
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(base + path, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -4423,9 +4553,10 @@ test("a room's password is not handed to whoever asks for it", async () => {
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -4434,7 +4565,7 @@ test("a room's password is not handed to whoever asks for it", async () => {
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(base + path, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -4456,11 +4587,10 @@ test("a room's password is not handed to whoever asks for it", async () => {
       body: JSON.stringify(body),
     });
 
-    // Joining is idempotent and deliberately open — being put in a room grants nothing.
-    // It used to answer with the room's password whenever the *named* session was already
-    // confirmed, without once asking who was calling.
+    // Joining used to answer with the room's password whenever the *named* session was
+    // already confirmed, without once asking who was calling. It is the app's alone now (#220).
     const rejoined = await asStranger(`/sync/rooms/${code}/members`, { conversationId: peer });
-    assert.equal(rejoined.status, 200, "joining is still open");
+    assert.equal(rejoined.status, 401, "a stranger cannot join");
     const rejoinedBody = await rejoined.json();
     assert.equal(rejoinedBody.howTo, undefined, "and hands over nothing");
     assert.ok(!JSON.stringify(rejoinedBody).includes(password), "the password is not in the answer at all");
@@ -4512,9 +4642,10 @@ test("a bridge told not to launch agents does not go looking for one", async () 
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -4523,7 +4654,7 @@ test("a bridge told not to launch agents does not go looking for one", async () 
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(base + path, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -4584,9 +4715,10 @@ test("a bridge that starts on a world-readable event log narrows it before writi
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   try {
@@ -4597,7 +4729,7 @@ test("a bridge that starts on a world-readable event log narrows it before writi
     const conversationId = `log-mode-${randomUUID()}`;
     const posted = await fetch(`http://127.0.0.1:${port}/ingest`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
       body: JSON.stringify({
         version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
         conversationId, cwd: "/tmp/project", data: { inputCount: 1 },
@@ -4629,9 +4761,10 @@ test("a room full of unread mail refuses the next message instead of eating the 
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -4640,7 +4773,7 @@ test("a room full of unread mail refuses the next message instead of eating the 
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(base + path, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -4699,9 +4832,10 @@ test("a message the bridge accepted is a message that arrives", async () => {
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -4710,7 +4844,7 @@ test("a message the bridge accepted is a message that arrives", async () => {
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(base + path, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -4776,9 +4910,10 @@ test("speaking does not count as reading: a busy session keeps the mail it has n
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -4787,7 +4922,7 @@ test("speaking does not count as reading: a busy session keeps the mail it has n
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(base + path, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -4854,16 +4989,17 @@ test("a Codex repeat is settled before the room is full, so it is never held and
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin, GYREDECK_MAIL_DUPLICATE_WINDOW_MS: "2000" }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   const founder = "repeat-full-founder";
   const sink = "repeat-full-sink";
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
       return { status: response.status, body: await response.json() };
@@ -4945,16 +5081,17 @@ test("a Codex answer the room has no space for is kept, not stepped over", async
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "harvest-full-founder";
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -5085,9 +5222,10 @@ test("trimming the room's notices never carries a reader past mail it has not se
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -5096,7 +5234,7 @@ test("trimming the room's notices never carries a reader past mail it has not se
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(base + path, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -5161,9 +5299,10 @@ test("a room code that is not open reads as gone, not as quiet", async () => {
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const base = `http://127.0.0.1:${port}`;
@@ -5171,7 +5310,7 @@ test("a room code that is not open reads as gone, not as quiet", async () => {
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
 
     // A code that was never minted.
     const never = await fetch(`${base}/mail/sync-zzzz?since=0&as=${founder}`, { headers });
@@ -5229,16 +5368,17 @@ test("a batch re-read after the dedup window overflows still publishes each answ
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "dedup-founder";
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -5320,9 +5460,10 @@ test("a running bridge rotates its event log rather than growing forever", async
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   try {
@@ -5334,7 +5475,7 @@ test("a running bridge rotates its event log rather than growing forever", async
     for (let i = 0; i < 40; i += 1) {
       const posted = await fetch(`http://127.0.0.1:${port}/ingest`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-gyredeck-token": token },
+        headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
         body: JSON.stringify({
           version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
           conversationId, cwd: "/tmp/project", data: { inputCount: 1, filler: "y".repeat(200) },
@@ -5399,7 +5540,7 @@ test("a room password carried in by notify lets that session in, once", async ()
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     {
       cwd: repoRoot,
       env: {
@@ -5413,6 +5554,7 @@ test("a room password carried in by notify lets that session in, once", async ()
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "notify-founder";
@@ -5420,7 +5562,7 @@ test("a room password carried in by notify lets that session in, once", async ()
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method,
@@ -5794,9 +5936,10 @@ test("a confirmation that never reached Codex is retried, not reported as sent",
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "retry-founder";
@@ -5804,7 +5947,7 @@ test("a confirmation that never reached Codex is retried, not reported as sent",
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method,
@@ -5862,9 +6005,10 @@ test("reading a room's password out lets nobody in", async () => {
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "press-founder";
@@ -5872,7 +6016,7 @@ test("reading a room's password out lets nobody in", async () => {
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method,
@@ -5936,9 +6080,10 @@ test("a session can be given a name, and two unidentified ones are still told ap
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "names-founder";
@@ -5947,7 +6092,7 @@ test("a session can be given a name, and two unidentified ones are still told ap
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method,
@@ -6136,9 +6281,10 @@ test("what a notify says about a session survives the bridge that heard it", asy
     const stderrRef = { value: "" };
     const bridge = spawn(
       process.execPath,
-      ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+      ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
       { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
     );
+    bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
     bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
     await waitForHealth(port, stderrRef);
     return bridge;
@@ -6164,7 +6310,7 @@ test("what a notify says about a session survives the bridge that heard it", asy
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
     await fetch(`http://127.0.0.1:${port}/hook/stop`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
       body: JSON.stringify({
         hookId: randomUUID(),
         hookEventName: "Stop",
@@ -6248,20 +6394,21 @@ test("the reply poll reads only what Codex wrote after the push, not the whole l
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     {
       cwd: repoRoot,
       env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin },
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "poll-tail-founder";
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -6340,16 +6487,17 @@ test("a new member's harvest and the usage read stay off the log from before", a
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "harvest-tail-founder";
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -6426,16 +6574,17 @@ test("words written before a session may speak are never published, on a first j
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "harvest-confirm-founder";
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -6535,13 +6684,14 @@ test("the reply poll keeps an answer the room cannot take yet, and publishes eac
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     {
       cwd: repoRoot,
       env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin },
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
 
   const founder = "poll-full-founder";
@@ -6549,7 +6699,7 @@ test("the reply poll keeps an answer the room cannot take yet, and publishes eac
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -6692,7 +6842,7 @@ const codexInARoom = async ({ replyTimeoutMs = null } = {}) => {
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     {
       cwd: repoRoot,
       env: {
@@ -6702,10 +6852,11 @@ const codexInARoom = async ({ replyTimeoutMs = null } = {}) => {
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   await waitForHealth(port, stderrRef);
   const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-  const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+  const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
   const call = async (method, path, body) => {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
     return { status: response.status, body: await response.json() };
@@ -7220,17 +7371,18 @@ const codexInNoRoom = async ({ replyTimeoutMs = 1_000, env = {}, records = true 
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     {
       cwd: repoRoot,
       env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin, GYREDECK_CODEX_REPLY_TIMEOUT_MS: String(replyTimeoutMs), ...env },
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   await waitForHealth(port, stderrRef);
   const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-  const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+  const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
   const call = async (method, path, body) => {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
     return { status: response.status, body: await response.json() };
@@ -7520,9 +7672,10 @@ const bridgeWithCodexHome = async ({ log = null, kinds = null, codexHome = null,
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home, ...env }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   await waitForHealth(port, stderrRef);
   const kindsPath = join(home, ...CONFIG_DIR, "gyredeck.session-kinds.json");
@@ -7659,9 +7812,10 @@ test("a replayed notify-only thread that Codex keeps a rollout for is a session"
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   try {
     await waitForHealth(port, stderrRef);
@@ -7723,9 +7877,10 @@ test("hook evidence outlives the log it was in", async () => {
     const stderrRef = { value: "" };
     const bridge = spawn(
       process.execPath,
-      ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+      ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
       { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
     );
+    bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
     bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
     await waitForHealth(port, stderrRef);
     return bridge;
@@ -7747,7 +7902,7 @@ test("hook evidence outlives the log it was in", async () => {
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
     const posted = await fetch(`http://127.0.0.1:${port}/ingest`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": token },
+      headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
       body: JSON.stringify({
         version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
         conversationId: hooked, cwd: "/tmp/project", model: "gpt-5.6-luna",
@@ -7987,9 +8142,10 @@ test("a hook collects through the broker when it can, and falls back only when t
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   const conversationId = "1a4f2c3e-0000-4d8c-9b3a-aa11bb22cc33";
   const prompt = async () => {
@@ -8008,7 +8164,7 @@ test("a hook collects through the broker when it can, and falls back only when t
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const send = (text) => fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, { method: "POST", headers, body: JSON.stringify({ from: "codex", text, replyTo: "codex-room" }) });
     const unread = async () => {
       const response = await fetch(`http://127.0.0.1:${port}/mail/inbox?as=${conversationId}`, { headers });
@@ -8083,9 +8239,10 @@ test("the Antigravity hook takes the same path to the broker", async () => {
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   const conversationId = "agy-1a4f2c3e-0000-4d8c-9b3a-aa11bb22cc33";
   const invoke = async () => {
@@ -8103,7 +8260,7 @@ test("the Antigravity hook takes the same path to the broker", async () => {
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const unread = async () => {
       const response = await fetch(`http://127.0.0.1:${port}/mail/inbox?as=${conversationId}`, { headers });
       return ((await response.json()).messages ?? []).map((message) => message.text);
@@ -8151,9 +8308,10 @@ test("a hook believes the broker only when the answer is for it, and never colle
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   const conversationId = "2b5e3d4f-0000-4d8c-9b3a-aa11bb22cc33";
   const prompt = async () => {
@@ -8171,7 +8329,7 @@ test("a hook believes the broker only when the answer is for it, and never colle
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const headers = { "content-type": "application/json", "x-gyredeck-token": token };
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     await fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, { method: "POST", headers, body: JSON.stringify({ from: "codex", text: "ON-TCP", replyTo: "codex-room" }) });
     const unread = async () => {
       const response = await fetch(`http://127.0.0.1:${port}/mail/inbox?as=${conversationId}`, { headers });
@@ -8286,7 +8444,7 @@ test("the bridge refuses an old-path collect for a session the broker has bound,
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
-  const secret = "cd".repeat(32);
+  const secret = TEST_APP_WORD;
   const bound = "aaaa1111-0000-4d8c-9b3a-aa11bb22cc33";
   const remembered = "cccc3333-0000-4d8c-9b3a-aa11bb22cc33";
   const unbound = "bbbb2222-0000-4d8c-9b3a-aa11bb22cc33";
@@ -8353,10 +8511,10 @@ test("the bridge refuses an old-path collect for a session the broker has bound,
     assert.deepEqual(old.body.messages.map((m) => m.text), [`for ${unbound}`]);
     // A sync-room collect in the protected member's name moves the same cursor: refused
     // without the word, served with it; a peek of the room stays the room's.
-    const code = (await call("POST", "/sync/rooms", {}, { conversationId: unbound })).body.room;
-    await call("POST", `/sync/rooms/${code}/members`, {}, { conversationId: bound });
-    const password = (await call("POST", `/sync/rooms/${code}/passwords`, {}, { conversationId: unbound })).body.password;
-    await call("POST", `/sync/rooms/${code}/confirm`, {}, { conversationId: bound, password });
+    const code = (await call("POST", "/sync/rooms", { "x-gyredeck-broker": secret }, { conversationId: unbound })).body.room;
+    await call("POST", `/sync/rooms/${code}/members`, { "x-gyredeck-broker": secret }, { conversationId: bound });
+    const password = (await call("POST", `/sync/rooms/${code}/passwords`, { "x-gyredeck-broker": secret }, { conversationId: unbound })).body.password;
+    await call("POST", `/sync/rooms/${code}/confirm`, { "x-gyredeck-broker": secret }, { conversationId: bound, password });
     await call("POST", `/mail/${code}`, { "x-gyredeck-token": password }, { from: unbound, text: "room mail", to: bound, kind: "tell" });
     const roomPeek = await call("GET", `/mail/${code}?as=${bound}`, { "x-gyredeck-token": password });
     assert.equal(roomPeek.status, 200, "the room's backlog is the room's: password and membership");
@@ -8483,7 +8641,7 @@ test("a Codex session's mailbox has no reader at all, the broker's word included
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
-  const secret = "ab".repeat(32);
+  const secret = TEST_APP_WORD;
   bridge.stdin.write(`broker-secret ${secret}\nbroker-ready\n`);
   const codex = "019a5c2d-4e3f-7b21-9c44-000000c0de00";
   try {
@@ -8524,10 +8682,10 @@ test("a Codex session's mailbox has no reader at all, the broker's word included
     assert.deepEqual(seen.refusedReads, [], "a closed Codex mailbox is not an outdated hook, and is not counted as one");
     // A sync-room collect in the Codex member's name is closed the same way, the word included.
     const founder = "f0f0f0f0-0000-4d8c-9b3a-aa11bb22cc33";
-    const code = (await call("POST", "/sync/rooms", {}, { conversationId: founder })).body.room;
-    await call("POST", `/sync/rooms/${code}/members`, {}, { conversationId: codex });
-    const password = (await call("POST", `/sync/rooms/${code}/passwords`, {}, { conversationId: founder })).body.password;
-    await call("POST", `/sync/rooms/${code}/confirm`, {}, { conversationId: codex, password });
+    const code = (await call("POST", "/sync/rooms", { "x-gyredeck-broker": secret }, { conversationId: founder })).body.room;
+    await call("POST", `/sync/rooms/${code}/members`, { "x-gyredeck-broker": secret }, { conversationId: codex });
+    const password = (await call("POST", `/sync/rooms/${code}/passwords`, { "x-gyredeck-broker": secret }, { conversationId: founder })).body.password;
+    await call("POST", `/sync/rooms/${code}/confirm`, { "x-gyredeck-broker": secret }, { conversationId: codex, password });
     assert.equal((await call("GET", `/mail/${code}?as=${codex}`, { "x-gyredeck-token": password })).status, 200, "the room's backlog stays the room's");
     const asCodex = await call("GET", `/mail/${code}?as=${codex}&collect=1`, { "x-gyredeck-token": password, "x-gyredeck-broker": secret });
     assert.equal(asCodex.status, 403);
@@ -8549,9 +8707,10 @@ test("a session known as Codex's stays closed when a later event names another p
   const codex = "019a5c2d-4e3f-7b21-9c44-0000000c0de2";
   const start = async () => {
     const stderrRef = { value: "" };
-    const bridge = spawn(process.execPath, ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"], {
+    const bridge = spawn(process.execPath, ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"], {
       cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"],
     });
+    bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
     bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
     await waitForHealth(port, stderrRef);
     return bridge;
@@ -8615,9 +8774,10 @@ test("the record of closed Codex mailboxes is never evicted: past its cap the br
   const victim = "019a5c2d-4e3f-7b21-9c44-0000000c0de3";
   const start = async () => {
     const stderrRef = { value: "" };
-    const bridge = spawn(process.execPath, ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"], {
+    const bridge = spawn(process.execPath, ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"], {
       cwd: repoRoot, env: { ...process.env, HOME: home, GYREDECK_CODEX_CLOSED_MAX: "3" }, stdio: ["pipe", "pipe", "pipe"],
     });
+    bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
     bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
     await waitForHealth(port, stderrRef);
     return { bridge, stderrRef };
@@ -8678,9 +8838,10 @@ test("a record of closed Codex mailboxes that cannot be trusted at startup close
     const port = await freePort();
     await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
     const stderrRef = { value: "" };
-    const bridge = spawn(process.execPath, ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"], {
+    const bridge = spawn(process.execPath, ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"], {
       cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"],
     });
+    bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
     bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
     try {
       await waitForHealth(port, stderrRef);
@@ -8709,9 +8870,10 @@ test("the provider the bridge kept across a restart closes a Codex mailbox from 
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
-    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio"],
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   try {
     await waitForHealth(port, stderrRef);

@@ -151,8 +151,8 @@ Codes are short and typeable (`sync-4f2a`), not UUIDs, and they are **names rath
 than secrets**: knowing a code grants nothing on its own. **Reading** a room takes the
 room's own password, handed over by a person, and nothing else. **Sending** takes that
 or the machine token, because a founder is confirmed by pressing Create and holds no
-password until somebody reads one out. Creating and joining are deliberately open —
-being put in a room grants nothing.
+password until somebody reads one out. Creating, joining and closing are the app's
+alone: they take its broker secret, which no agent holds (#220, #221).
 
 Rooms end when the last member leaves, and also when the **founder** leaves: everything
 a room is for afterwards runs through the founder, so what was left behind was a code

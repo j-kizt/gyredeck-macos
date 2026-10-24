@@ -1,5 +1,26 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Only the app can open, join or close a room — (v1.23.2)
+
+### Fixes
+
+- **A local agent can no longer found a room in another session's name.** Creating a room
+  answered with its password to any caller that named a session and held the machine token —
+  a file every agent on this machine can read. So any agent could open a room "for" a session
+  it did not own and hold the key to it. Creating, joining, handing out a room's password,
+  taking a member out and closing a room now need a secret the app gives the bridge at launch,
+  which no agent ever sees. If the bridge started without that secret, it refuses all five
+  rather than falling back to the machine token.
+- **Closing a room is the app's call, not any caller's.** With `as` left out, the machine
+  token alone closed any room. Now only the app closes a room, and it may close any room,
+  whoever founded it.
+
+### Changed
+
+- The app's bundled Tauri runtime and its updater plugin are up to date. The updater that
+  installs this release is the one already on your Mac; the next release is the first one the
+  new updater installs.
+
 ## A new Claude Code session is told its old watches are nothing to chase — (v1.23.1)
 
 ### Fixes

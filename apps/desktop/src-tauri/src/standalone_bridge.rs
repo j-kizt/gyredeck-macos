@@ -1118,7 +1118,9 @@ fn sync_error(status: u16, value: &serde_json::Value) -> String {
         (409, _) => "This session is already in another room".to_string(),
         (429, "room_full") => "That room is full".to_string(),
         (429, _) => "Too many rooms are open".to_string(),
+        (401, "app_only") => "Gyredeck could not vouch for itself to its own bridge. Quit and reopen Gyredeck".to_string(),
         (401, _) => "Gyredeck could not authenticate to its own bridge".to_string(),
+        (503, "app_word_unavailable") => "Rooms are unavailable: the bridge was started without Gyredeck's word. Quit and reopen Gyredeck".to_string(),
         (400, _) => "That code is not a valid room name".to_string(),
         _ => format!("The bridge refused the request (HTTP {status})"),
     }
@@ -1138,12 +1140,12 @@ pub(crate) fn sync_room(conversation_id: &str) -> Result<SyncRoom, String> {
 
 /// Create a room and put this session in it. Creating without joining would leave a
 /// code nobody is in, which is never what the button means.
-pub(crate) fn sync_create(conversation_id: &str) -> Result<SyncRoom, String> {
+pub(crate) fn sync_create(conversation_id: &str, app_word: &str) -> Result<SyncRoom, String> {
     if !valid_room(conversation_id) {
         return Err("Not a valid session id".to_string());
     }
     let body = serde_json::json!({ "conversationId": conversation_id }).to_string();
-    let (status, value) = bridge_request("POST", "/sync/rooms", Some(body))?;
+    let (status, value) = bridge_request_vouched("POST", "/sync/rooms", Some(body), app_word)?;
     if !(200..300).contains(&status) {
         return Err(sync_error(status, &value));
     }
@@ -1163,12 +1165,12 @@ pub(crate) fn sync_create(conversation_id: &str) -> Result<SyncRoom, String> {
 /// session that holds it earns the right to speak by presenting it, and until then it is
 /// in the room and silent. Password and token are one thing said two ways — a password to
 /// the person copying it, a token to the header that carries it on every read and send.
-pub(crate) fn sync_issue_password(code: &str, conversation_id: &str) -> Result<String, String> {
+pub(crate) fn sync_issue_password(code: &str, conversation_id: &str, app_word: &str) -> Result<String, String> {
     if !valid_room(code) || !valid_room(conversation_id) {
         return Err("Not a valid room".to_string());
     }
     let body = serde_json::json!({ "conversationId": conversation_id }).to_string();
-    let (status, value) = bridge_request("POST", &format!("/sync/rooms/{code}/passwords"), Some(body))?;
+    let (status, value) = bridge_request_vouched("POST", &format!("/sync/rooms/{code}/passwords"), Some(body), app_word)?;
     if !(200..300).contains(&status) {
         return Err(match value.get("error").and_then(serde_json::Value::as_str) {
             Some("not_the_founder") => "Only the session that created this room can invite".to_string(),
@@ -1188,21 +1190,20 @@ pub(crate) fn sync_issue_password(code: &str, conversation_id: &str) -> Result<S
 /// Close a room for everyone in it.
 ///
 /// Different from leaving: every member is told, every stream is cut, and the room is
-/// gone. Only the founder may, for the same reason only the founder hands out the
-/// password — ending a room other people are working in is not a thing any member
-/// should be able to do to the others.
-pub(crate) fn sync_close(code: &str, conversation_id: &str) -> Result<(), String> {
+/// gone. Only the app may, whoever founded the room (#221, close contract A): the bridge
+/// takes the app's word for it, and no agent holds that word.
+pub(crate) fn sync_close(code: &str, conversation_id: &str, app_word: &str) -> Result<(), String> {
     if !valid_room(code) || !valid_room(conversation_id) {
         return Err("Not a valid room".to_string());
     }
-    let (status, value) = bridge_request(
+    let (status, value) = bridge_request_vouched(
         "DELETE",
         &format!("/sync/rooms/{code}?as={conversation_id}"),
         None,
+        app_word,
     )?;
     if !(200..300).contains(&status) {
         return Err(match value.get("error").and_then(serde_json::Value::as_str) {
-            Some("not_the_founder") => "Only the session that created this room can close it".to_string(),
             Some("no_such_room") => "That room is already closed".to_string(),
             _ => sync_error(status, &value),
         });
@@ -1212,7 +1213,7 @@ pub(crate) fn sync_close(code: &str, conversation_id: &str) -> Result<(), String
 }
 
 /// Join a room by code. Idempotent, so pressing Connect twice is not an error.
-pub(crate) fn sync_join(code: &str, conversation_id: &str) -> Result<SyncRoom, String> {
+pub(crate) fn sync_join(code: &str, conversation_id: &str, app_word: &str) -> Result<SyncRoom, String> {
     if !valid_room(conversation_id) {
         return Err("Not a valid session id".to_string());
     }
@@ -1220,19 +1221,19 @@ pub(crate) fn sync_join(code: &str, conversation_id: &str) -> Result<SyncRoom, S
         return Err("No room with that code".to_string());
     }
     let body = serde_json::json!({ "conversationId": conversation_id }).to_string();
-    let (status, value) = bridge_request("POST", &format!("/sync/rooms/{code}/members"), Some(body))?;
+    let (status, value) = bridge_request_vouched("POST", &format!("/sync/rooms/{code}/members"), Some(body), app_word)?;
     if !(200..300).contains(&status) {
         return Err(sync_error(status, &value));
     }
     Ok(parse_sync_room(&value, conversation_id))
 }
 
-pub(crate) fn sync_leave(code: &str, conversation_id: &str) -> Result<(), String> {
+pub(crate) fn sync_leave(code: &str, conversation_id: &str, app_word: &str) -> Result<(), String> {
     if !valid_room(code) || !valid_room(conversation_id) {
         return Err("Not a valid room".to_string());
     }
     let (status, value) =
-        bridge_request("DELETE", &format!("/sync/rooms/{code}/members/{conversation_id}"), None)?;
+        bridge_request_vouched("DELETE", &format!("/sync/rooms/{code}/members/{conversation_id}"), None, app_word)?;
     // Already gone is the state the caller wanted.
     if status == 404 || (200..300).contains(&status) {
         // The founder leaving ends the room, and so does the last member.

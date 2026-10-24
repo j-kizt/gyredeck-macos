@@ -1688,6 +1688,12 @@ test("a room delivery carries only what the session can use, and points at the r
     assert.doesNotMatch(agyTell, /curl -sN/);
     assert.doesNotMatch(agyTell, /\/mail\/wait\?/);
     assert.match(agyTell, /start it again/);
+    // The first wake-only watch ends at once on the mail its stream never carried, even
+    // though the drain delivered it: a wake too many, never one too few (#228 audit).
+    const catchUp = await fetch(`${base}/mail/${code}/events?as=${agy}&since=resume&once=1`, {
+      headers: { "x-gyredeck-token": minted.password },
+    });
+    assert.match(await catchUp.text(), /deploy done/);
     const onceWatch = await fetch(`${base}/mail/${code}/events?as=${agy}&since=resume&once=1`, {
       headers: { "x-gyredeck-token": minted.password },
     });
@@ -9253,6 +9259,14 @@ test("a watch that has never carried a frame still hears what arrived while it w
     const memberFrames = await resumed(member, password);
     assert.ok(memberFrames.includes(toMember.body.seq), "the member hears it on reopening");
     assert.ok(memberFrames.every((seq) => seq >= toMember.body.seq), `and not what its confirmation already handed over: ${memberFrames}`);
+
+    // (1b) Collected but not yet delivered: a collect hands the batch to a reader before any
+    // hook has shown it to the agent, so it is no proof of a wake (#228 audit, P1).
+    const collected = await call("POST", `/mail/${code}`, { from: founder, to: "everyone", kind: "ask", text: "collected, not seen" });
+    const taken = await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${member}&collect=1`, { headers: { "x-gyredeck-token": password } });
+    assert.equal(taken.status, 200);
+    assert.ok((await taken.json()).messages.some((m) => m.seq === collected.body.seq), "the premise: the collect took it");
+    assert.ok((await resumed(member, password)).includes(collected.body.seq), "and the watch still wakes on it");
 
     // (2) The founder, in a room whose first message is seq 1.
     const toFounder = await call("POST", `/mail/${code}`, { from: member, to: "everyone", kind: "ask", text: "and you?" });

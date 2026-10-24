@@ -6227,12 +6227,11 @@ function startBridge(config) {
         // reaches the notifier and the room looks silent. Two sessions wrote that same
         // bug on the same day, one of them the author of the instruction.
         const asked = url.searchParams.get("since");
-        // Past what it was pushed and past what it has read: mail its hook already handed
-        // over is not news, and waking on it again costs a wake for nothing (#228).
-        const watching = watcher ? room.members.get(watcher) : null;
-        const streamed = watching && typeof watching.streamSeq === "number"
-          ? Math.max(watching.streamSeq, watching.readSeq ?? 0)
-          : null;
+        // Only what it was pushed. `readSeq` is not proof the agent saw a message: it moves
+        // when a collect hands a batch to the broker, before any hook has delivered it, so
+        // resuming past it could skip the one wake left (#228 audit). Mail the drain already
+        // delivered may wake the watch once more; that costs a wake, never a message.
+        const streamed = watcher ? room.members.get(watcher)?.streamSeq : null;
         const resumeFrom =
           asked === "resume"
             ? (typeof streamed === "number" ? streamed : 0)

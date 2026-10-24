@@ -76,11 +76,23 @@ export const formatAbsoluteTime = (
     return null;
   }
 
-  return new Intl.DateTimeFormat(undefined, {
+  const time = new Intl.DateTimeFormat(undefined, {
     hour: "2-digit",
     minute: "2-digit",
     hour12: format === "auto" ? undefined : format === "12h",
   }).format(date);
+  // A time alone reads as today's (#227): an eight-day-old reading showed "Outdated ·
+  // 15:48", and a weekly reset five days out showed "Reset at 09:00". Any other day is named.
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) {
+    return time;
+  }
+  const day = new Intl.DateTimeFormat(undefined, {
+    day: "numeric",
+    month: "short",
+    year: date.getFullYear() === now.getFullYear() ? undefined : "numeric",
+  }).format(date);
+  return `${day} ${time}`;
 };
 
 export const formatResetLabel = (

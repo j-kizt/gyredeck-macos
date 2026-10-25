@@ -9497,20 +9497,46 @@ const heavyHarness = async (tag) => {
   const state = async () => fetch(`${base}/heavy`, { headers: { "x-gyredeck-token": token } }).then((r) => r.json());
   const pair = () => ({ lease: heavySecret(), requestId: heavySecret() });
   const acquire = (as, what, ids) => post("acquire", { as, what, ...ids });
-  const group = () => {
-    const pgid = sleepingGroup();
+  /**
+   * A group made the way the helper makes one (#243): by a live parent whose file name is
+   * `gyredeck-heavy.mjs`, which spawns the command detached. The bridge checks exactly that
+   * before it accepts a group, so a bare `sleep` of the test's own would be refused.
+   * `name` lets a test make the same parent under another name.
+   */
+  const parents = new Set();
+  const group = async (command = ["sleep", "300"], name = "fake-gyredeck-heavy.mjs") => {
+    const script = join(home, name);
+    if (!existsSync(script)) {
+      await writeFile(script, [
+        'import { spawn } from "node:child_process";',
+        "const argv = process.argv.slice(2);",
+        'const child = spawn(argv[0], argv.slice(1), { detached: true, stdio: "ignore" });',
+        "process.stdout.write(`${child.pid}\\n`);",
+        "setInterval(() => {}, 1 << 30);",
+      ].join("\n"));
+    }
+    const parent = spawn(process.execPath, [script, ...command], { stdio: ["ignore", "pipe", "ignore"] });
+    parents.add(parent);
+    const pgid = await new Promise((resolve, reject) => {
+      let out = "";
+      parent.stdout.on("data", (chunk) => {
+        out += chunk;
+        if (out.includes("\n")) resolve(Number(out.trim()));
+      });
+      parent.on("exit", () => reject(new Error("the group's parent exited before naming it")));
+    });
     groups.add(pgid);
-    return pgid;
+    return { pgid, helperPid: parent.pid };
   };
-  /** Take the slot by hand, active on a sleeping group of the test's own. */
-  const hold = async (as = "holder-a") => {
+  /** Take the slot by hand, active on a group of the test's own made as the helper makes one. */
+  const hold = async (as = "holder-a", command = undefined) => {
     const ids = pair();
     const granted = await acquire(as, `${as} runs`, ids);
     assert.equal(granted.status, 200, JSON.stringify(granted.body));
-    const pgid = group();
-    const activated = await post("activate", { lease: ids.lease, pgid });
+    const made = await group(command);
+    const activated = await post("activate", { lease: ids.lease, ...made });
     assert.equal(activated.status, 200, JSON.stringify(activated.body));
-    return { ...ids, pgid };
+    return { ...ids, ...made };
   };
   const helper = (args, env = {}, path = helperPath) => {
     const child = spawn(process.execPath, [path, ...args], {
@@ -9544,6 +9570,7 @@ const heavyHarness = async (tag) => {
       child.stderr.destroy();
     }
     for (const pgid of groups) if (Number.isInteger(pgid) && pgid > 1) killGroup(pgid);
+    for (const parent of parents) { try { parent.kill("SIGKILL"); } catch {} parent.stdout.destroy(); }
     for (const bridge of bridges) await stop(bridge);
     await rm(home, { recursive: true, force: true });
   };
@@ -9886,10 +9913,9 @@ test("heavy stop: a run that ignores SIGTERM is killed, and a reservation that r
     await h.start({ GYREDECK_TEST_HEAVY_STOP_KILL_MS: "1500" });
     const ids = h.pair();
     assert.equal((await h.acquire("stubborn", "ignores TERM", ids)).status, 200);
-    const child = spawn("sh", ["-c", "trap '' TERM; while :; do sleep 1; done"], { detached: true, stdio: "ignore" });
-    child.unref();
-    h.groups.add(child.pid);
-    assert.equal((await h.post("activate", { lease: ids.lease, pgid: child.pid })).status, 200);
+    const made = await h.group(["sh", "-c", "trap '' TERM; while :; do sleep 1; done"]);
+    const child = { pid: made.pgid };
+    assert.equal((await h.post("activate", { lease: ids.lease, ...made })).status, 200);
     const id = (await h.state()).holder.id;
     const stopped = await fetch(`${h.base}/heavy/holder?id=${id}`, { method: "DELETE", headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD } });
     assert.equal((await stopped.json()).result, "stopping");
@@ -9906,6 +9932,78 @@ test("heavy stop: a run that ignores SIGTERM is killed, and a reservation that r
     const dropped = await fetch(`${h.base}/heavy/holder?id=${rid}`, { method: "DELETE", headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD } });
     assert.equal((await dropped.json()).result, "freed");
     assert.equal((await h.state()).holder, null);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy D1: activate refuses a group the helper did not make, and leaves it alone (#243)", async () => {
+  const h = await heavyHarness("d1-verify");
+  try {
+    await h.start();
+    const ids = h.pair();
+    assert.equal((await h.acquire("run-a", "a", ids)).status, 200);
+    const refused = async (body, why) => {
+      const answer = await h.post("activate", { lease: ids.lease, ...body });
+      assert.equal(answer.status, 403, `${why}: ${JSON.stringify(answer.body)}`);
+      assert.equal(answer.body.error, "pgid_unverified", why);
+      assert.equal((await h.state()).holder.state, "reserved", `${why}: nothing was made active`);
+    };
+
+    // An unrelated live group: a sleep of the test's own, named with a genuine helper's pid.
+    const unrelated = sleepingGroup();
+    h.groups.add(unrelated);
+    const genuine = await h.group();
+    await refused({ pgid: unrelated, helperPid: genuine.helperPid }, "a group that helper did not start");
+    await refused({ pgid: unrelated, helperPid: process.pid }, "a parent that is not a helper at all");
+    await refused({ pgid: genuine.pgid }, "no helperPid");
+
+    // Started by its parent, but the parent is not the heavy-run helper.
+    const impostor = await h.group(["sleep", "300"], "spawner.mjs");
+    await refused(impostor, "a parent with another name");
+
+    assert.equal(groupAliveInTest(unrelated), true, "the unrelated group was not touched");
+    assert.equal(groupAliveInTest(impostor.pgid), true);
+    assert.equal((await h.post("activate", { lease: ids.lease, ...genuine })).status, 200, "the genuine one is accepted");
+    assert.match(JSON.parse(await readFile(h.holderPath, "utf8")).pgidStart, /\d{4}$/, "with its leader's start time on record");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+/** Hold a run, then restart the bridge with the record's start time replaced: a reused pid. */
+const reusedPidHolder = async (tag, env) => {
+  const h = await heavyHarness(tag);
+  let bridge = await h.start();
+  const held = await h.hold("run-a");
+  await h.stop(bridge);
+  const record = JSON.parse(await readFile(h.holderPath, "utf8"));
+  await writeFile(h.holderPath, JSON.stringify({ ...record, pgidStart: "Thu Jan 1 00:00:00 1970" }));
+  bridge = await h.start(env);
+  return { h, held };
+};
+
+test("heavy D1: Stop signals nothing when the recorded group's id now belongs to another process (#243)", async () => {
+  // No timer sweep to get there first: Stop itself has to tell.
+  const { h, held } = await reusedPidHolder("d1-stop", { GYREDECK_TEST_HEAVY_TICK_MS: "600000", GYREDECK_TEST_HEAVY_STOP_KILL_MS: "200" });
+  try {
+    const holder = (await h.state()).holder;
+    assert.equal(holder?.as, "run-a", "premise: the restart kept the record");
+    const stopped = await fetch(`${h.base}/heavy/holder?id=${holder.id}`, { method: "DELETE", headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD } });
+    assert.equal((await stopped.json()).result, "gone");
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(groupAliveInTest(held.pgid), true, "the process now behind that id was not signalled");
+    assert.equal((await h.state()).holder, null, "and the slot is free");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy D1: the sweep frees a slot whose group id now belongs to another process (#243)", async () => {
+  const { h, held } = await reusedPidHolder("d1-sweep", {});
+  try {
+    await until(async () => (await h.state()).holder === null, "the timer's check frees it");
+    assert.equal(groupAliveInTest(held.pgid), true, "without touching that process");
   } finally {
     await h.cleanup();
   }
@@ -10053,7 +10151,7 @@ test("heavy r4: a bridge killed after recording a reservation answers the same p
     const retried = await h.acquire("run-a", "a", a);
     assert.equal(retried.status, 200, JSON.stringify(retried.body));
     assert.equal(retried.body.lease, a.lease, "the caller's own lease, echoed");
-    const activated = await h.post("activate", { lease: a.lease, pgid: h.group() });
+    const activated = await h.post("activate", { lease: a.lease, ...(await h.group()) });
     assert.equal(activated.status, 200, "and it activates");
     const active = await readFile(h.holderPath, "utf8");
     assert.equal(JSON.parse(active).state, "active");
@@ -10073,8 +10171,8 @@ test("heavy r3: a restart between grant and activate keeps the reservation for i
     bridge = await h.start();
     const queued = await h.acquire("run-b", "b", h.pair());
     assert.equal(queued.status, 202, "the reservation still holds the slot");
-    assert.equal((await h.post("activate", { lease: heavySecret(), pgid: h.group() })).status, 404, "not for another lease");
-    assert.equal((await h.post("activate", { lease: a.lease, pgid: h.group() })).status, 200);
+    assert.equal((await h.post("activate", { lease: heavySecret(), ...(await h.group()) })).status, 404, "not for another lease");
+    assert.equal((await h.post("activate", { lease: a.lease, ...(await h.group()) })).status, 200);
 
     // Unactivated, a reservation lapses a minute after the bridge that found it started.
     await h.stop(bridge);

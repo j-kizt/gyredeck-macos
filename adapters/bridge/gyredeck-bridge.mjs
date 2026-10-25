@@ -23,7 +23,7 @@
  */
 
 import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir, loadavg } from "node:os";
@@ -583,7 +583,7 @@ const heavyHelper = async (setup) => {
     pgid = child.pid;
     const exited = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
     child.on("error", () => {});
-    const activated = await call("activate", { lease, pgid });
+    const activated = await call("activate", { lease, pgid, helperPid: process.pid });
     if (stopping) return;
     if (activated.status === 200 && activated.body.ok === true) {
       state = "active";
@@ -5378,6 +5378,51 @@ function startBridge(config) {
   const groupAlive = (pgid) => {
     try { process.kill(-pgid, 0); return true; } catch (error) { return error.code === "EPERM"; }
   };
+  /**
+   * What macOS says about one process: its parent, its group and when it started, or null
+   * when it does not exist. `ps`, without a shell, because Node exposes none of this.
+   */
+  const processFacts = (pid) => {
+    try {
+      const line = execFileSync("ps", ["-o", "ppid=,pgid=,lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+      const match = /^(\d+)\s+(\d+)\s+(.+)$/.exec(line);
+      return match ? { ppid: Number(match[1]), pgid: Number(match[2]), started: match[3].replace(/\s+/g, " ") } : null;
+    } catch {
+      return null;
+    }
+  };
+  const commandOf = (pid) => {
+    try {
+      return execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+    } catch {
+      return "";
+    }
+  };
+  /**
+   * Whether `pgid` is a group the heavy-run helper made (#243): its leader leads its own
+   * group, was started by `helperPid`, and that process is the helper. Answers the leader's
+   * start time, which is what tells this group from a later one given the same id, or null.
+   * Without it any machine-token client could name any live group, and Stop would signal it.
+   */
+  const verifiedGroupStart = (pgid, helperPid) => {
+    if (!Number.isInteger(helperPid) || helperPid <= 1) return null;
+    const leader = processFacts(pgid);
+    if (!leader || leader.pgid !== pgid || leader.ppid !== helperPid) return null;
+    return commandOf(helperPid).includes("gyredeck-heavy.mjs") ? leader.started : null;
+  };
+  /**
+   * Whether the holder's group is still the one that was verified. Gone when no process is
+   * in it; also gone when its leader is a different process — started at another time —
+   * since the id was then reused after the group had ended. A group whose leader exited
+   * while others in it still run is still the same group: macOS does not hand out a pid
+   * that is in use as a process group, so the id cannot have been reused meanwhile.
+   */
+  const heavyGroupIsOurs = (pgid, started) => {
+    if (!groupAlive(pgid)) return false;
+    const leader = processFacts(pgid);
+    if (!leader) return true;
+    return leader.pgid === pgid && leader.started === started;
+  };
 
   let heavyHolder = null;
   const heavyQueue = [];
@@ -5399,6 +5444,7 @@ function startBridge(config) {
         as: heavyHolder.as,
         what: heavyHolder.what,
         pgid: heavyHolder.pgid,
+        pgidStart: heavyHolder.pgidStart,
         since: heavyHolder.since,
         loadSkipped: heavyHolder.loadSkipped,
       };
@@ -5423,7 +5469,9 @@ function startBridge(config) {
       && /^[a-f0-9]{64}$/.test(record.leaseHash ?? "")
       && /^[a-f0-9]{64}$/.test(record.requestIdHash ?? "")
       && typeof record.as === "string" && typeof record.what === "string"
-      && (record.state === "reserved" || (record.state === "active" && Number.isInteger(record.pgid) && record.pgid > 1));
+      && (record.state === "reserved" || (record.state === "active" && Number.isInteger(record.pgid) && record.pgid > 1 && typeof record.pgidStart === "string"));
+    // A record from before #243 has no start time to check the group by, and is dropped.
+    // Whether the group is still the one recorded is the timer's to check, not the start's.
     if (valid && (record.state === "reserved" || groupAlive(record.pgid))) {
       const now = heavyNow();
       const since = typeof record.since === "string" && !Number.isNaN(Date.parse(record.since)) ? record.since : new Date().toISOString();
@@ -5435,6 +5483,7 @@ function startBridge(config) {
         as: record.as,
         what: record.what,
         pgid: record.state === "active" ? record.pgid : null,
+        pgidStart: record.state === "active" ? record.pgidStart : null,
         since,
         startedAt: now - Math.max(0, Date.now() - Date.parse(since)),
         reservedAt: now,
@@ -5480,6 +5529,7 @@ function startBridge(config) {
       as: request.as,
       what: request.what,
       pgid: null,
+      pgidStart: null,
       since: new Date().toISOString(),
       startedAt: now,
       reservedAt: now,
@@ -5516,23 +5566,31 @@ function startBridge(config) {
       freeHeavy();
       return "freed";
     }
-    const { pgid } = heavyHolder;
+    const { pgid, pgidStart } = heavyHolder;
+    // Checked before each signal: a group whose id now belongs to another process is not
+    // ours to signal, and counts as gone.
+    if (!heavyGroupIsOurs(pgid, pgidStart)) {
+      freeHeavy();
+      return "gone";
+    }
     try { process.kill(-pgid, "SIGTERM"); } catch {}
     setTimeout(() => {
-      if (groupAlive(pgid)) { try { process.kill(-pgid, "SIGKILL"); } catch {} }
-      sweepHeavy();
+      if (heavyGroupIsOurs(pgid, pgidStart)) { try { process.kill(-pgid, "SIGKILL"); } catch {} }
+      sweepHeavy({ verify: true });
     }, HEAVY_STOP_KILL_MS).unref();
     return "stopping";
   };
 
   /** Expire what has lapsed, then let the line move. Run before every answer and on a timer. */
-  const sweepHeavy = () => {
+  // `verify` adds the start-time check, which costs a `ps`; the timer asks for it, the
+  // routes (which sweep before every answer) do not.
+  const sweepHeavy = ({ verify = false } = {}) => {
     const now = heavyNow();
     if (heavyHolder?.state === "reserved" && now - heavyHolder.reservedAt > HEAVY_RESERVATION_MS) {
       // Never activated, so its command never ran: the gate holds it until it is.
       heavyHolder = null;
       persistHeavyHolder();
-    } else if (heavyHolder?.state === "active" && !groupAlive(heavyHolder.pgid)) {
+    } else if (heavyHolder?.state === "active" && !(verify ? heavyGroupIsOurs(heavyHolder.pgid, heavyHolder.pgidStart) : groupAlive(heavyHolder.pgid))) {
       heavyHolder = null;
       persistHeavyHolder();
     }
@@ -5543,7 +5601,7 @@ function startBridge(config) {
     }
     promoteHeavy();
   };
-  setInterval(sweepHeavy, HEAVY_TICK_MS).unref();
+  setInterval(() => sweepHeavy({ verify: true }), HEAVY_TICK_MS).unref();
 
   /** A run's holder named the way rooms name a member — provider and assigned name — not by id (#243). */
   const heavyLabelFor = (conversationId) => {
@@ -6054,13 +6112,20 @@ function startBridge(config) {
           sendJson(400, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "group_gone" });
           return;
         }
+        const pgidStart = verifiedGroupStart(pgid, body.helperPid);
+        if (pgidStart === null) {
+          sendJson(403, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "pgid_unverified", message: "That process group was not started by the heavy-run helper that holds this lease." });
+          return;
+        }
         heavyHolder.state = "active";
         heavyHolder.pgid = pgid;
+        heavyHolder.pgidStart = pgidStart;
         heavyHolder.adopted = true;
         heavyHolder.heartbeatAt = heavyNow();
         if (!persistHeavyHolder()) {
           heavyHolder.state = "reserved";
           heavyHolder.pgid = null;
+          heavyHolder.pgidStart = null;
           sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "holder_unwritable" });
           return;
         }

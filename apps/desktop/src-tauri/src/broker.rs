@@ -553,6 +553,14 @@ pub(crate) fn handle_request(
     refused("invalid", "A request is {\"v\":1,\"bind\":{\"conversationId\"}}, {\"v\":1,\"collect\":{\"limit\"}} or {\"v\":1,\"ack\":{\"delivery\"}}.".to_string())
 }
 
+/// The session the broker has bound to this live process, if any: how an observed heavy run
+/// (#245) is traced to the agent that started it. The key is read fresh, so a pid now used
+/// by another process names nobody.
+pub(crate) fn session_of_pid(bindings: &Mutex<Bindings>, pid: i32) -> Option<String> {
+    let key = platform::process_key(pid)?;
+    bindings.lock().ok()?.session_of(key).map(str::to_string)
+}
+
 /// A running broker: its socket, its thread, and the way to stop it.
 pub(crate) struct BrokerHandle {
     stop_tx: mpsc::Sender<()>,

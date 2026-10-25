@@ -1611,7 +1611,14 @@ function createScopeTracker() {
     return now - previous > legacySignalRetentionMs;
   };
 
-  return { rememberScope, hookScope, shouldEmitHookSignal, recentCompletionAtByCwd };
+  /** The conversations with recent activity in this cwd: how an observed heavy run (#245) is traced to a session the app could not name. */
+  const activeConversationsAt = (cwd) => {
+    if (typeof cwd !== "string" || cwd === "") return [];
+    cleanupRecentState(Date.now());
+    return [...(activeScopesByCwd.get(cwd)?.keys() ?? [])];
+  };
+
+  return { rememberScope, hookScope, shouldEmitHookSignal, recentCompletionAtByCwd, activeConversationsAt };
 }
 
 // ── Bridge server ──
@@ -4146,10 +4153,60 @@ function startBridge(config) {
   const heavyNoticeFor = (conversationId) => {
     const provider = usageProviderFor(conversationId);
     if (provider !== "claude" && provider !== "agy") return null;
-    if (!heavyToBeTold(conversationId)) return null;
+    const nudge = takeHeavyNudge(conversationId, provider);
+    if (!heavyToBeTold(conversationId)) return nudge;
     // Told by being in the answer this collect returns.
     markHeavyTold(conversationId);
-    return provider === "agy" ? heavyHintForAgy(conversationId) : heavyHint(conversationId);
+    const told = provider === "agy" ? heavyHintForAgy(conversationId) : heavyHint(conversationId);
+    return nudge ? `${told}\n\n${nudge}` : told;
+  };
+
+  /**
+   * A session caught running a heavy command outside the helper (#245) is told so, once:
+   * Claude Code and Antigravity on their next collect, beside any mail — read on their next
+   * turn, never woken for it — and Codex by one no-harvest push. A run with no agent above
+   * it (a person in a terminal) is observed and nobody is told. Remembered by recency, like
+   * the told set; the pending set is bounded the same way.
+   */
+  const heavyNudged = new Map();
+  const heavyNudgePending = new Map();
+  const heavyNudgeInFlight = new Set();
+  const HEAVY_NUDGED_MAX = Number(process.env.GYREDECK_TEST_HEAVY_TOLD_MAX) || 10_000;
+  const remember = (map, key, value) => {
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > HEAVY_NUDGED_MAX) map.delete(map.keys().next().value);
+  };
+  const heavyNudgeText = (conversationId, pattern, provider) =>
+    provider === "agy" && roomRulesReady
+      ? `HEAVY RUN SEEN: you ran \`${pattern}\` directly, outside the heavy-run queue, and others now wait for it. ` +
+        "Run this now; its output stays with you, this notice does not:\n" +
+        `  echo "your id: ${conversationId}"; sed -n '/^## Heavy runs/,$p' ${ROOM_RULES_DISPLAY_PATH}`
+      : `HEAVY RUN SEEN: you ran \`${pattern}\` directly, outside the heavy-run queue. Next time run it through ` +
+        `\`node ${HEAVY_HELPER_DISPLAY_PATH} --as ${conversationId} --what "<what it runs>" -- <command…>\` so others can queue behind it.`;
+  const takeHeavyNudge = (conversationId, provider) => {
+    const pattern = heavyNudgePending.get(conversationId);
+    if (pattern === undefined) return null;
+    heavyNudgePending.delete(conversationId);
+    remember(heavyNudged, conversationId, true);
+    return heavyNudgeText(conversationId, pattern, provider);
+  };
+  const nudgeHeavySession = (conversationId, pattern) => {
+    if (heavyNudged.has(conversationId) || heavyNudgePending.has(conversationId)) return;
+    if (!CODEX_PROVIDERS.has(providerByConversation.get(conversationId))) {
+      remember(heavyNudgePending, conversationId, pattern);
+      return;
+    }
+    if (heavyCodexPushOff || heavyNudgeInFlight.has(conversationId)) return;
+    heavyNudgeInFlight.add(conversationId);
+    const started = deliverToCodex(conversationId, null, `${CODEX_NOTICE_MARKER} ${heavyNudgeText(conversationId, pattern, "codex")}`, {
+      harvest: false,
+      settled: (ok) => {
+        heavyNudgeInFlight.delete(conversationId);
+        if (ok) remember(heavyNudged, conversationId, true);
+      },
+    });
+    if (started !== "queued") heavyNudgeInFlight.delete(conversationId);
   };
   // Tests only: the reader-lifecycle fixtures count every push a Codex session gets, and
   // this one would be the first of them.
@@ -5455,6 +5512,15 @@ function startBridge(config) {
   const heavyQueue = [];
   const heavyPolls = new Set();
 
+  // Heavy runs started outside the helper (#245), as the app last reported them from the
+  // process table. The report expires on its own, so an app that quit or hung cannot hold
+  // the slot: the line moves on at the TTL. Nothing here ever signals one of them.
+  const HEAVY_OBSERVED_TTL_MS = Number(process.env.GYREDECK_TEST_HEAVY_OBSERVED_TTL_MS) || 15_000;
+  const HEAVY_OBSERVED_MAX = 32;
+  const HEAVY_OBSERVED_BODY_MAX = 64 * 1024;
+  let heavyObserved = { runs: [], at: -Infinity };
+  const observedRuns = () => (heavyNow() - heavyObserved.at <= HEAVY_OBSERVED_TTL_MS ? heavyObserved.runs : []);
+
   /** The holder on disk, or the file gone. Answers whether the disk now says what memory does. */
   const persistHeavyHolder = () => {
     try {
@@ -5534,7 +5600,8 @@ function startBridge(config) {
 
   /** Hand the slot to the front of the line, when it is free and the load allows. */
   const promoteHeavy = () => {
-    if (heavyHolder || heavyQueue.length === 0) return;
+    // A run observed outside the helper holds the slot as a granted one does (Q12).
+    if (heavyHolder || heavyQueue.length === 0 || observedRuns().length > 0) return;
     const now = heavyNow();
     const front = heavyQueue[0];
     const load = heavyLoad();
@@ -5627,6 +5694,7 @@ function startBridge(config) {
       heavyHolder = null;
       persistHeavyHolder();
     }
+    if (heavyObserved.runs.length > 0 && observedRuns().length === 0) heavyObserved = { runs: [], at: -Infinity };
     for (let index = heavyQueue.length - 1; index >= 0; index -= 1) {
       const entry = heavyQueue[index];
       const polling = [...heavyPolls].some((poll) => poll.ticket === entry.ticket);
@@ -5643,6 +5711,11 @@ function startBridge(config) {
     if (provider && name) return `${provider} / ${name}`;
     return provider ?? name ?? null;
   };
+
+  const OBSERVED_KIND_LABELS = { claude: "Claude Code", agy: "Antigravity", codex: "Codex" };
+  /** Named as holders are (#243): the session that started it, its agent alone, or "Terminal" when no agent did. */
+  const observedLabelFor = (run) =>
+    (run.session ? heavyLabelFor(run.session) : null) ?? (run.kind ? OBSERVED_KIND_LABELS[run.kind] : "Terminal");
 
   const describeHeavy = () => {
     const now = heavyNow();
@@ -5671,14 +5744,23 @@ function startBridge(config) {
             adopted: heavyHolder.adopted,
           }
         : null,
-      queue: heavyQueue.map((entry, index) => ({ position: index + 1, as: entry.as, label: heavyLabelFor(entry.as), what: entry.what, waitedMs: Math.round(now - entry.enqueuedAt) })),
+      queue: heavyQueue.map((entry, index) => ({ id: entry.id, position: index + 1, as: entry.as, label: heavyLabelFor(entry.as), what: entry.what, waitedMs: Math.round(now - entry.enqueuedAt) })),
+      // What the pattern matched, never the command line (#245, Q16).
+      observed: observedRuns().map((run) => ({
+        pid: run.pid,
+        pattern: run.pattern,
+        exe: run.exe,
+        cwd: run.cwd,
+        label: observedLabelFor(run),
+        elapsedMs: Math.max(0, Date.now() - run.startedAtMs),
+      })),
       waiting: heavyPolls.size,
       limit: HEAVY_LIMIT_TEXT,
     };
   };
 
   /** The request's body, or null past the cap: a cooperative scheduler still bounds what it reads. */
-  const readHeavyBody = (req) =>
+  const readHeavyBody = (req, max = HEAVY_BODY_MAX) =>
     new Promise((resolve) => {
       let body = "";
       let over = false;
@@ -5686,7 +5768,7 @@ function startBridge(config) {
       req.on("data", (chunk) => {
         if (over) return;
         body += chunk;
-        if (Buffer.byteLength(body) > HEAVY_BODY_MAX) { over = true; resolve(null); }
+        if (Buffer.byteLength(body) > max) { over = true; resolve(null); }
       });
       req.on("end", () => {
         if (over) return;
@@ -5981,6 +6063,67 @@ function startBridge(config) {
         return;
       }
 
+      // PUT /heavy/observed — the app's report of heavy runs it sees in the process table
+      // outside the helper (#245). The app's word only: an agent able to report runs could
+      // hold the slot for everyone. Replaces the last report whole; expires at the TTL.
+      if (req.method === "PUT" && pathname === "/heavy/observed") {
+        if (brokerSecret === null) {
+          sendJson(503, { ok: false, error: "app_word_unavailable", message: "Observed heavy runs are reported by the Gyredeck app, and this bridge was started without the app's word." });
+          return;
+        }
+        if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"])) {
+          sendJson(401, { ok: false, error: "app_only", message: "Only the Gyredeck app reports observed heavy runs." });
+          return;
+        }
+        const body = await readHeavyBody(req, HEAVY_OBSERVED_BODY_MAX);
+        if (body === null) {
+          sendJson(413, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "body_too_large", limit: HEAVY_OBSERVED_BODY_MAX });
+          return;
+        }
+        if (!body || typeof body !== "object" || body.v !== HEAVY_PROTOCOL_VERSION) {
+          sendJson(409, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "version", message: `This bridge speaks heavy-run protocol v${HEAVY_PROTOCOL_VERSION}.` });
+          return;
+        }
+        // eslint-disable-next-line no-control-regex
+        const text = (value, max) => (typeof value === "string" ? value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max) : "");
+        const runs = Array.isArray(body.runs) ? body.runs : null;
+        const valid = runs !== null && runs.length <= HEAVY_OBSERVED_MAX && runs.every((run) =>
+          run && typeof run === "object"
+          && Number.isInteger(run.pid) && run.pid > 1
+          && text(run.pattern, 120) !== "" && text(run.exe, 64) !== ""
+          && Number.isFinite(run.startedAtMs)
+          && (run.agent === null || run.agent === undefined || (typeof run.agent === "object" && ["claude", "agy", "codex"].includes(run.agent.kind))));
+        if (!valid) {
+          sendJson(400, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "invalid_runs" });
+          return;
+        }
+        const reported = runs.map((run) => {
+          const kind = run.agent?.kind ?? null;
+          // The app names the session when the broker has it bound; otherwise the one
+          // session of that agent active in the agent's own folder, and nobody when that
+          // is not exactly one.
+          let session = typeof run.agent?.session === "string" && MAIL_ROOM_NAME.test(run.agent.session) ? run.agent.session : null;
+          if (kind && !session) {
+            const candidates = tracker.activeConversationsAt(run.agent.cwd).filter((id) => usageProviderFor(id) === kind);
+            session = candidates.length === 1 ? candidates[0] : null;
+          }
+          return {
+            pid: run.pid,
+            pattern: text(run.pattern, 120),
+            exe: text(run.exe, 64),
+            cwd: text(run.cwd, 1024) || null,
+            startedAtMs: run.startedAtMs,
+            kind,
+            session,
+          };
+        });
+        heavyObserved = { runs: reported, at: heavyNow() };
+        for (const run of reported) if (run.session) nudgeHeavySession(run.session, run.pattern);
+        promoteHeavy();
+        sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, observed: reported.length });
+        return;
+      }
+
       const action = pathname.startsWith("/heavy/") ? pathname.slice("/heavy/".length) : "";
       if (req.method !== "POST" || !["acquire", "wait", "activate", "heartbeat", "release", "cancel", "adopt"].includes(action)) {
         sendJson(404, { ok: false, error: "not_found" });
@@ -6041,7 +6184,7 @@ function startBridge(config) {
           return;
         }
         const now = heavyNow();
-        if (!heavyHolder && heavyQueue.length === 0 && heavyLoad() <= HEAVY_LOAD_LIMIT) {
+        if (!heavyHolder && heavyQueue.length === 0 && observedRuns().length === 0 && heavyLoad() <= HEAVY_LOAD_LIMIT) {
           if (!reserveHeavy({ leaseHash, requestIdHash, as, what }, false, now)) {
             sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "holder_unwritable" });
             return;
@@ -6053,7 +6196,7 @@ function startBridge(config) {
           sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "queue_full", limit: HEAVY_QUEUE_MAX });
           return;
         }
-        heavyQueue.push({ ticket: randomBytes(16).toString("hex"), leaseHash, requestIdHash, as, what, enqueuedAt: now, polledAt: now });
+        heavyQueue.push({ id: randomBytes(8).toString("hex"), ticket: randomBytes(16).toString("hex"), leaseHash, requestIdHash, as, what, enqueuedAt: now, polledAt: now });
         promoteHeavy();
         if (heavyHolder && sameHash(heavyHolder.requestIdHash, requestIdHash)) {
           sendJson(200, heavyGranted(heavyHolder.loadSkipped, lease));

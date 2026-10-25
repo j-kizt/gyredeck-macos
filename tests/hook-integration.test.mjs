@@ -11229,3 +11229,299 @@ for (const lookCase of boundedLookCases) {
     }
   });
 }
+
+// ── Observed heavy runs (#245) ──
+//
+// The app scans the process table and reports what runs outside the helper; the bridge only
+// keeps the report, refuses to grant while it holds a run, and tells the session that
+// started it, once. One invariant per test; every fixture shows its premise first.
+
+/** A run as the app reports it. `pid` is a live process of the test's own unless given. */
+const observedRun = (overrides = {}) => ({
+  pid: 4242, pattern: "cargo test|build|check", exe: "cargo", cwd: "/tmp/project", startedAtMs: Date.now() - 65_000, agent: null, ...overrides,
+});
+const reportObserved = (h, runs, word = TEST_APP_WORD) =>
+  fetch(`${h.base}/heavy/observed`, {
+    method: "PUT",
+    headers: { "content-type": "application/json", "x-gyredeck-token": h.token(), ...(word ? { "x-gyredeck-broker": word } : {}) },
+    body: JSON.stringify({ v: 1, runs }),
+  }).then(async (response) => ({ status: response.status, body: await response.json() }));
+const collectNotice = async (h, id) => {
+  const answer = await fetch(`${h.base}/mail/inbox?as=${id}&collect=1`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+  return answer.heavyNotice ?? null;
+};
+
+test("observed C3: only the app reports observed runs", async () => {
+  const h = await heavyHarness("obs-c3");
+  try {
+    await h.start();
+    assert.deepEqual((await h.state()).observed, [], "premise: nothing observed");
+    const asAgent = await reportObserved(h, [observedRun()], null);
+    assert.equal(asAgent.status, 401);
+    assert.equal(asAgent.body.error, "app_only");
+    assert.equal((await reportObserved(h, [observedRun()], "b6".repeat(32))).status, 401, "a wrong word is no word");
+    assert.deepEqual((await h.state()).observed, [], "a refused report holds nothing");
+    assert.equal((await reportObserved(h, [observedRun()])).status, 200);
+    assert.equal((await h.state()).observed.length, 1, "the app's report is kept");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("observed C5a: while a run is observed, acquire queues rather than grants", async () => {
+  const h = await heavyHarness("obs-c5a");
+  try {
+    await h.start();
+    // Premise: a free slot under the load limit grants at once.
+    const control = h.pair();
+    assert.equal((await h.acquire("control", "c", control)).status, 200);
+    await h.post("release", { lease: control.lease });
+    assert.equal((await h.state()).holder, null);
+
+    assert.equal((await reportObserved(h, [observedRun()])).status, 200);
+    const a = h.pair();
+    const queued = await h.acquire("run-a", "a", a);
+    assert.equal(queued.status, 202, JSON.stringify(queued.body));
+    assert.equal(queued.body.granted, false);
+    assert.equal((await h.state()).holder, null, "nobody holds the slot: the observed run does");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("observed C5b: a queued helper is not promoted while a run is observed, and is granted once it ends", async () => {
+  const h = await heavyHarness("obs-c5b");
+  try {
+    await h.start();
+    const held = await h.hold("run-a");
+    const b = h.pair();
+    const queued = await h.acquire("run-b", "b", b);
+    assert.equal(queued.status, 202);
+    // Premise: B is next in line and the load allows it, so releasing A alone would grant B.
+    assert.equal((await h.state()).queue[0].as, "run-b");
+    assert.ok((await h.state()).load <= (await h.state()).loadLimit);
+
+    assert.equal((await reportObserved(h, [observedRun()])).status, 200);
+    await h.post("release", { lease: held.lease });
+    const after = await h.state();
+    assert.equal(after.holder, null, "the observed run holds the slot");
+    assert.equal(after.queue.length, 1, "and B still waits");
+    // Several sweeps (100 ms each here) and still nobody is promoted. Not a long poll: that
+    // would be answered at the report's 15 s expiry, which is C4.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal((await h.state()).holder, null, "no sweep promoted B while observed");
+
+    // The app sees it end and says so: B is granted at once, not at the report's expiry.
+    assert.equal((await reportObserved(h, [])).status, 200);
+    const granted = await h.post("wait", { ticket: queued.body.ticket, lease: b.lease });
+    assert.equal(granted.body.granted, true, JSON.stringify(granted.body));
+    assert.equal((await h.state()).holder.as, "run-b");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("observed C4: an observed report expires at its TTL, and the line moves on", async () => {
+  const h = await heavyHarness("obs-c4");
+  try {
+    await h.start();
+    assert.equal((await reportObserved(h, [observedRun()])).status, 200);
+    const a = h.pair();
+    const queued = await h.acquire("run-a", "a", a);
+    assert.equal(queued.status, 202, "premise: held by the observed run");
+    // Not yet expired: three sweeps later it still holds.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal((await h.state()).observed.length, 1);
+    assert.equal((await h.state()).holder, null);
+    // The app went quiet: past 15 s the report is gone and the sweep grants the line.
+    await writeFile(h.clockFile, "16000");
+    await until(async () => (await h.state()).holder?.as === "run-a", "the line moves on at the TTL");
+    assert.deepEqual((await h.state()).observed, []);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("observed: GET /heavy shows what was matched and who started it, never the command line, and queue entries carry an id", async () => {
+  const h = await heavyHarness("obs-describe");
+  try {
+    await h.start();
+    const named = "a2450000-0000-4000-8000-000000000001";
+    await heavyIngest(h, named, "claudeCodeHook");
+    const naming = await fetch(`${h.base}/sessions/names/${named}`, {
+      method: "PUT", headers: { "content-type": "application/json", "x-gyredeck-token": h.token() }, body: JSON.stringify({ name: "Gyre Assistant" }),
+    });
+    assert.equal(naming.status, 200);
+    assert.equal((await reportObserved(h, [
+      observedRun({ pid: 5001, argv: ["cargo", "test", "--token=s3cret"] }),
+      observedRun({ pid: 5002, pattern: "pnpm test:*", exe: "pnpm", agent: { kind: "claude", session: named, cwd: "/tmp/project" } }),
+      observedRun({ pid: 5003, agent: { kind: "codex", session: null, cwd: "/nowhere" } }),
+    ])).status, 200);
+    const { observed } = await h.state();
+    assert.deepEqual(observed.map((run) => Object.keys(run).sort()), Array(3).fill(["cwd", "elapsedMs", "exe", "label", "pattern", "pid"]));
+    assert.ok(!JSON.stringify(observed).includes("s3cret"), "nothing but the named fields passes");
+    assert.deepEqual(observed.map((run) => run.label), ["Terminal", "Claude Code / Gyre Assistant", "Codex"]);
+    assert.ok(observed[0].elapsedMs >= 60_000 && observed[0].elapsedMs < 120_000, String(observed[0].elapsedMs));
+
+    await reportObserved(h, []);
+    await h.hold("run-a");
+    for (const as of ["run-b", "run-c"]) assert.equal((await h.acquire(as, as, h.pair())).status, 202);
+    const ids = (await h.state()).queue.map((entry) => entry.id);
+    assert.equal(ids.length, 2);
+    for (const id of ids) assert.match(id, /^[0-9a-f]{16}$/);
+    assert.notEqual(ids[0], ids[1]);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("observed: a malformed report is refused and the last good one stands", async () => {
+  const h = await heavyHarness("obs-invalid");
+  try {
+    await h.start();
+    assert.equal((await reportObserved(h, [observedRun()])).status, 200);
+    for (const runs of [[observedRun({ pid: 1 })], [observedRun({ pattern: "" })], [observedRun({ agent: { kind: "vim" } })], Array(33).fill(observedRun()), "x"]) {
+      assert.equal((await reportObserved(h, runs)).status, 400, JSON.stringify(runs).slice(0, 80));
+    }
+    const version = await fetch(`${h.base}/heavy/observed`, {
+      method: "PUT", headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD }, body: JSON.stringify({ v: 2, runs: [] }),
+    });
+    assert.equal(version.status, 409);
+    assert.equal((await h.state()).observed.length, 1);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("observed nudge: the Claude Code session that started a run is told once on its next collect, and a terminal run tells nobody", async () => {
+  const h = await heavyHarness("obs-nudge-claude");
+  try {
+    await h.start();
+    const me = "a2450000-0000-4000-8000-000000000011";
+    await heavyIngest(h, me, "claudeCodeHook");
+    // Premise: the one-time queue notice is spent first, so what follows is the nudge alone.
+    const told = await collectNotice(h, me);
+    assert.match(told, /^HEAVY RUNS: /);
+    assert.doesNotMatch(told, /HEAVY RUN SEEN/);
+    assert.equal(await collectNotice(h, me), null);
+
+    // A run in the same folder with no agent above it: observed, nobody told.
+    await reportObserved(h, [observedRun({ cwd: "/tmp/project", agent: null })]);
+    assert.equal(await collectNotice(h, me), null, "a terminal run is never a nudge");
+
+    // Started by the session: named by the app's broker binding.
+    await reportObserved(h, [observedRun({ agent: { kind: "claude", session: me, cwd: "/tmp/project" } })]);
+    const nudge = await collectNotice(h, me);
+    assert.match(nudge, /^HEAVY RUN SEEN: you ran `cargo test\|build\|check` directly/);
+    assert.ok(nudge.includes(`node ~/.config/gyredeck/gyredeck-heavy.mjs --as ${me} --what`), nudge);
+    await reportObserved(h, [observedRun({ agent: { kind: "claude", session: me, cwd: "/tmp/project" } })]);
+    assert.equal(await collectNotice(h, me), null, "once per session");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("observed nudge: a session the app could not name is found by its folder, only when it is the one there", async () => {
+  const h = await heavyHarness("obs-nudge-cwd");
+  try {
+    await h.start();
+    const me = "a2450000-0000-4000-8000-000000000021";
+    await heavyIngest(h, me, "claudeCodeHook");
+    assert.match(await collectNotice(h, me), /^HEAVY RUNS: /);
+    await reportObserved(h, [observedRun({ agent: { kind: "claude", session: null, cwd: "/tmp/project" } })]);
+    assert.match(await collectNotice(h, me), /^HEAVY RUN SEEN/);
+    // Two sessions of that agent in one folder: nobody is guessed at.
+    const [a, b] = ["a2450000-0000-4000-8000-000000000022", "a2450000-0000-4000-8000-000000000023"];
+    for (const id of [a, b]) {
+      await fetch(`${h.base}/ingest`, {
+        method: "POST", headers: { "content-type": "application/json", "x-gyredeck-token": h.token() },
+        body: JSON.stringify({ version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: id, cwd: "/tmp/two", runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 } }),
+      });
+      assert.match(await collectNotice(h, id), /^HEAVY RUNS: /);
+    }
+    await reportObserved(h, [observedRun({ agent: { kind: "claude", session: null, cwd: "/tmp/two" } })]);
+    assert.equal(await collectNotice(h, a), null);
+    assert.equal(await collectNotice(h, b), null);
+    assert.equal((await h.state()).observed[0].label, "Claude Code", "named by its agent alone");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("observed nudge: Antigravity is handed the command whose output outlives the turn (#251)", async () => {
+  const h = await heavyHarness("obs-nudge-agy");
+  try {
+    await h.start();
+    const me = "a2450000-0000-4000-8000-000000000031";
+    await heavyIngest(h, me, "agyHost");
+    assert.match(await collectNotice(h, me), /^HEAVY RUNS: /, "premise: the queue notice is spent first");
+    await reportObserved(h, [observedRun({ agent: { kind: "agy", session: me, cwd: "/tmp/project" } })]);
+    const nudge = await collectNotice(h, me);
+    assert.match(nudge, /^HEAVY RUN SEEN: /);
+    assert.ok(nudge.includes(`echo "your id: ${me}"; sed -n '/^## Heavy runs/,$p' ~/.config/gyredeck/room-rules.md`), nudge);
+    assert.equal(await collectNotice(h, me), null, "once");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("observed nudge: Codex is pushed once, as a notice, with no mailbox made", async () => {
+  const h = await heavyHarness("obs-nudge-codex");
+  const fakeBin = join(h.home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  const queued = join(h.home, "queued.log");
+  await writeFile(join(fakeBin, "codex"), `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(queued)}, JSON.stringify(process.argv.slice(2)) + "\\n");\n`);
+  await chmod(join(fakeBin, "codex"), 0o755);
+  try {
+    await h.start({ GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin });
+    const pushes = async () => (existsSync(queued) ? (await readFile(queued, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : []);
+    const me = "a2450000-0000-4000-8000-000000000041";
+    await heavyIngest(h, me, "codexCliHook");
+    // Premise: the one-time queue push has happened, so the next push is the nudge.
+    await until(async () => (await pushes()).length === 1, "the queue notice push");
+    const run = observedRun({ agent: { kind: "codex", session: me, cwd: "/tmp/project" } });
+    await reportObserved(h, [run]);
+    await until(async () => (await pushes()).length === 2, "the nudge push");
+    const nudge = (await pushes())[1];
+    assert.equal(nudge[nudge.indexOf("--thread") + 1], me);
+    assert.match(nudge[nudge.indexOf("--message") + 1], /^\[Gyredeck · notice\] HEAVY RUN SEEN: you ran `cargo test\|build\|check` directly/);
+    await reportObserved(h, [run]);
+    // A control after the second report, so "no third push" is read after the bridge had its chance.
+    const control = "a2450000-0000-4000-8000-000000000042";
+    await heavyIngest(h, control, "codexCliHook");
+    await until(async () => (await pushes()).some((argv) => argv.includes(control)), "the control push");
+    assert.equal((await pushes()).filter((argv) => argv.includes(me)).length, 2, "the queue notice and one nudge");
+    const rooms = await fetch(`${h.base}/mail/inbox?as=${me}`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    assert.deepEqual(rooms.rooms ?? [], [], "no mailbox was made for the nudge");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("observed C7: Stop never reaches an observed run", async () => {
+  const h = await heavyHarness("obs-c7");
+  try {
+    await h.start({ GYREDECK_TEST_HEAVY_STOP_KILL_MS: "300" });
+    const observed = sleepingGroup();
+    h.groups.add(observed);
+    await reportObserved(h, [observedRun({ pid: observed })]);
+    const stop = (id) => fetch(`${h.base}/heavy/holder?id=${id}`, { method: "DELETE", headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD } });
+    // No holder: whatever id is named — the observed pid included — nothing is stopped.
+    for (const id of [String(observed), "0000000000000000", ""]) {
+      const answer = await stop(id);
+      assert.equal(answer.status, 409, id);
+      assert.equal((await answer.json()).error, "holder_changed");
+    }
+    assert.equal(groupAliveInTest(observed), true);
+    // A granted run stopped beside it ends; the observed one runs on.
+    await reportObserved(h, []);
+    const held = await h.hold("run-a");
+    await reportObserved(h, [observedRun({ pid: observed })]);
+    const answer = await stop((await h.state()).holder.id);
+    assert.equal(answer.status, 200);
+    await until(() => !groupAliveInTest(held.pgid), "the granted run ends");
+    assert.equal(groupAliveInTest(observed), true, "the observed run was not signalled");
+  } finally {
+    await h.cleanup();
+  }
+});

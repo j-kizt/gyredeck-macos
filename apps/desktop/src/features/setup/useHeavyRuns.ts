@@ -15,7 +15,9 @@ export interface IHeavyStatus {
     /** False for a run recorded before #243: the app may not stop it. Absent from older bridges. */
     verified?: boolean;
   } | null;
-  queue: Array<{ position: number; as: string; label?: string | null; what: string; waitedMs: number }>;
+  queue: Array<{ id?: string; position: number; as: string; label?: string | null; what: string; waitedMs: number }>;
+  /** Heavy runs the app sees outside the helper (#245): what matched, never the command line. Absent from older bridges. */
+  observed?: Array<{ pid: number; pattern: string; exe: string; cwd: string | null; label: string; elapsedMs: number }>;
   load: number | null;
   loadLimit: number;
   limit: string;
@@ -75,3 +77,4 @@ export const useHeavyRuns = (canUseNativeControls: boolean): IUseHeavyRuns => {
 
   return { status, error, releasing, stop };
 };
+

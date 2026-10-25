@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 
 mod broker;
 mod github;
+mod heavy_watch;
 mod keep_awake;
 mod local_services;
 mod notification;
@@ -896,6 +897,19 @@ fn heavy_status() -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn heavy_stop(holder_id: String, broker: tauri::State<'_, broker::BrokerState>) -> Result<String, String> {
     standalone_bridge::heavy_stop(&holder_id, &broker.secret()?)
+}
+
+/// The heavy commands the app observes outside the helper (#245): the defaults, and the
+/// person's own.
+#[tauri::command]
+fn heavy_patterns(watch: tauri::State<'_, heavy_watch::HeavyWatchState>) -> serde_json::Value {
+    watch.listing()
+}
+
+/// Replace the person's own heavy patterns; answers the listing as it now stands.
+#[tauri::command]
+fn set_heavy_patterns(patterns: Vec<String>, watch: tauri::State<'_, heavy_watch::HeavyWatchState>) -> Result<serde_json::Value, String> {
+    watch.set(&patterns)
 }
 
 #[tauri::command]
@@ -5886,6 +5900,8 @@ pub fn run() {
             sync_leave,
             heavy_status,
             heavy_stop,
+            heavy_patterns,
+            set_heavy_patterns,
             set_bridge_port,
             claude_usage,
             codex_usage,
@@ -5944,6 +5960,7 @@ pub fn run() {
         .manage(LocalServicesControlState::default())
         .manage(StandaloneBridgeState::default())
         .manage(broker::BrokerState::default())
+        .manage(heavy_watch::HeavyWatchState::default())
         .invoke_handler(move |invoke| command_handler(invoke))
         .setup(|app| {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -6008,6 +6025,17 @@ pub fn run() {
                 });
                 if let Err(error) = app.state::<broker::BrokerState>().start_default(collect, report_bound) {
                     eprintln!("Gyredeck mailbox broker is unavailable: {error}");
+                }
+            }
+            // Heavy runs started outside the helper (#245): reported with the app's word, so
+            // without one there is nothing to report with and the watcher is not started.
+            if let Ok(secret) = app.state::<broker::BrokerState>().secret() {
+                let watch = app.state::<heavy_watch::HeavyWatchState>();
+                watch.load();
+                let bindings = std::sync::Arc::clone(&app.state::<broker::BrokerState>().bindings);
+                let session_of = std::sync::Arc::new(move |pid: i32| broker::session_of_pid(&bindings, pid));
+                if let Err(error) = heavy_watch::start(&watch, secret, session_of) {
+                    eprintln!("{error}");
                 }
             }
 

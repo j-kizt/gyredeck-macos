@@ -7,6 +7,7 @@ import type { IUseUpdater } from "../updater/useUpdater";
 import { ProviderIcon } from "../github/components";
 import type { GitProvider, IGhAccount } from "../github/types";
 import { useGitCredentialHelper } from "./useGitCredentialHelper";
+import HeavyPatternsRow from "./HeavyPatternsRow";
 import { useHeavyRuns } from "./useHeavyRuns";
 import { codexTrustCopy, hookNeedsAttention, hookSettled, type IHookStatus } from "./hookStatus";
 
@@ -312,13 +313,14 @@ const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean 
   const stoppable = holder !== null && holder.verified !== false;
   const confirming = holder !== null && stoppable && confirmingId === holder.id;
   const queue = heavy.status?.queue ?? [];
+  const observed = heavy.status?.observed ?? [];
   const detail = heavy.error
     ? heavy.error
     : !heavy.status
       ? "Checking…"
       : holder
         ? `${holder.label ?? holder.as} · ${holder.what} · ${heavyElapsed(holder.elapsedMs)}${holder.state === "reserved" ? " · starting" : ""}${holder.loadSkipped ? " · started under load" : ""}`
-        : "Free";
+        : observed.length > 0 ? "Held by a run outside the helper" : "Free";
   return (
     <>
       <div className="setup-subheading">Heavy runs</div>
@@ -334,7 +336,13 @@ const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean 
               {`Waiting ${entry.position} · ${entry.label ?? entry.as} · ${entry.what} · ${heavyElapsed(entry.waitedMs)}`}
             </span>
           ))}
-          {heavy.status ? <span className="setup-detail" title={heavy.status.limit}>Only queued runs show here.</span> : null}
+          {/* No Stop here: an observed run is never the app's to end (#245, Q18). */}
+          {observed.map((run) => (
+            <span className="setup-detail" key={`observed-${run.pid}`} data-heavy-observed={run.pid} title={run.cwd ?? undefined}>
+              {`Observed · ${run.label} · ${run.pattern} · ${run.exe} · pid ${run.pid}${run.cwd ? ` · ${shortenPath(run.cwd)}` : ""} · ${heavyElapsed(run.elapsedMs)}`}
+            </span>
+          ))}
+          {heavy.status ? <span className="setup-detail" title={heavy.status.limit}>Runs outside the helper show as observed.</span> : null}
           {holder && confirming ? <span className="setup-detail" role="alert">{`Stop ${holder.what} of ${holder.label ?? holder.as}? Its command will be ended.`}</span> : null}
         </span>
         {holder && confirming ? (
@@ -352,6 +360,7 @@ const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean 
           </button>
         ) : null}
       </div>
+      <HeavyPatternsRow canUseNativeControls={canUseNativeControls} />
     </>
   );
 };

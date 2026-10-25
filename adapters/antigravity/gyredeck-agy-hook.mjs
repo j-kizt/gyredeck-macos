@@ -669,9 +669,18 @@ const confirmPastedPassword = async (endpoint, token, room, input) => {
 };
 
 /** What this invocation says about a pasted password, before anything else. */
+/**
+ * Marks on the hook's own steps, saying what they carry (#250 audit). A step's text cannot
+ * be the test: delivered mail is text too, and a message that quotes the wait command would
+ * read as HEAR having been said. Symbols, so they never reach the JSON agy is handed.
+ */
+const SAYS_HEAR = Symbol("says HEAR");
+const SAYS_ACCEPTED = Symbol("says the paste was accepted");
+const hearStep = (room) => ({ ephemeralMessage: hearText(room), [SAYS_HEAR]: room });
+
 const confirmLead = (confirm) => {
   if (confirm?.accepted) {
-    return [{ ephemeralMessage: `NEW: the password you were just given was accepted for sync room ${confirm.accepted.room} — you may now read and post here.` }];
+    return [{ ephemeralMessage: `NEW: the password you were just given was accepted for sync room ${confirm.accepted.room} — you may now read and post here.`, [SAYS_ACCEPTED]: true }];
   }
   if (confirm?.refused) {
     return [{ ephemeralMessage: `The pasted room password was refused (${confirm.refused.error}) — you are still not in sync room ${confirm.refused.room}.` }];
@@ -686,25 +695,24 @@ const confirmLead = (confirm) => {
  * they arrive in — so it is said whatever happened to the mail.
  */
 const confirmOnlySteps = (endpoint, room, confirm) => {
-  if (confirm?.accepted) return [...confirmLead(confirm), { ephemeralMessage: hearText(room) }];
+  if (confirm?.accepted) return [...confirmLead(confirm), hearStep(room)];
   if (confirm?.refused) return [...confirmLead(confirm), { ephemeralMessage: blockedStepFor(endpoint, confirm.refused.room, room) }];
   return [];
 };
 
 /**
  * The last word on an accepted paste, whatever built the steps before it (#250 audit): the
- * acceptance and the way to hear the room are in this invocation's output, added when no
- * step already says them. One rule at the end rather than one per path, so a path that
- * builds its steps from an answer of some new shape cannot leave them out.
+ * acceptance and the way to hear the room are in this invocation's output, added when none
+ * of the hook's own steps carries them — known by their marks, never by their text. One rule
+ * at the end rather than one per path, so a path that builds its steps from an answer of
+ * some new shape cannot leave them out.
  */
 const withConfirmation = (steps, confirm, room) => {
   if (!confirm?.accepted) return steps;
-  const said = (needle) => steps.some((step) => typeof step?.ephemeralMessage === "string" && step.ephemeralMessage.includes(needle));
-  const lead = confirmLead(confirm);
   return [
-    ...(said(lead[0].ephemeralMessage) ? [] : lead),
+    ...(steps.some((step) => step?.[SAYS_ACCEPTED] === true) ? [] : confirmLead(confirm)),
     ...steps,
-    ...(said(`gyredeck-agy-hook.mjs wait 300 ${room}`) ? [] : [{ ephemeralMessage: hearText(room) }]),
+    ...(steps.some((step) => step?.[SAYS_HEAR] === room) ? [] : [hearStep(room)]),
   ];
 };
 
@@ -922,6 +930,8 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
         : "Gyredeck mail.",
   ];
   const confirmed = mine?.confirmed === true;
+  // Whether this delivery's own text carries HEAR, said by mark rather than found by search.
+  let heard = false;
 
   if (syncRoom && mine) {
     const others = members.filter((member) => !member.you);
@@ -971,8 +981,9 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
   // not say is answered as before.
   if (syncRoom && confirmed && result?.watching !== true) {
     parts.push(hearText(room));
+    heard = true;
   }
-  const header = { ephemeralMessage: parts.join(" ") };
+  const header = { ephemeralMessage: parts.join(" "), ...(heard ? { [SAYS_HEAR]: room } : {}) };
   const reply = replyInstruction(
     endpoint, room, replyRooms, answerable.at(-1), label,
     (id) => byId.has(id) && id !== room,

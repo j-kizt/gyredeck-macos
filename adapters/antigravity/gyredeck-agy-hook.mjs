@@ -592,17 +592,106 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
   };
 };
 
+/** A POST that keeps the status and the body, under one elapsed deadline like `getJsonStatus`. */
+const postJsonStatus = (endpoint, token, path, payload, deadlineMs = 750) =>
+  new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      resolve(value);
+    };
+    const body = JSON.stringify(payload);
+    const deadline = setTimeout(() => { req.destroy(); done({ status: 0, body: null }); }, deadlineMs);
+    const req = request(
+      {
+        hostname: endpoint.hostname,
+        port: endpoint.port,
+        path,
+        method: "POST",
+        headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body), accept: "application/json", "x-gyredeck-token": token },
+        timeout: deadlineMs,
+      },
+      (res) => {
+        let text = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          text += chunk;
+          if (text.length > 65_536) { req.destroy(); done({ status: 0, body: null }); }
+        });
+        res.on("end", () => {
+          let parsed = null;
+          try { parsed = JSON.parse(text); } catch {}
+          done({ status: res.statusCode ?? 0, body: parsed });
+        });
+      },
+    );
+    req.on("error", () => done({ status: 0, body: null }));
+    req.end(body);
+  });
+
+/**
+ * A room password pasted on its own (#250): the person's whole message, trimmed, is the 32
+ * hex characters the key button copies. Exact on purpose — a password inside prose is left
+ * to BLOCKED, where the agent presents it.
+ */
+const PASTED_PASSWORD = /^[0-9a-f]{32}$/i;
+
+/**
+ * Confirm a room password the person pasted into this session's terminal, as the Claude
+ * hook does (#250): agy's PreInvocation carries the person's message as `lastUserInput`.
+ * Only for a member of a room that has not confirmed yet, and only its own id in its own
+ * room. Answers `{ accepted: { room, members } }`, `{ refused: { room, error } }`, or null
+ * when there was nothing to do. The value goes to the bridge and nowhere else — never into
+ * a step, never onto stderr.
+ *
+ * PreInvocation fires on every invocation of a turn, so the same message comes back several
+ * times: once accepted the member is confirmed, and the next invocation sends nothing.
+ */
+const confirmPastedPassword = async (endpoint, token, room, input) => {
+  if (!token || !MAIL_ROOM_NAME.test(room) || typeof input?.lastUserInput !== "string") return null;
+  const pasted = input.lastUserInput.trim();
+  if (!PASTED_PASSWORD.test(pasted)) return null;
+  const membership = await getJsonStatus(endpoint, token, `/sync/rooms?as=${room}`);
+  const code = typeof membership.body?.room === "string" ? membership.body.room : null;
+  if (membership.status !== 200 || !code) return null;
+  const mine = Array.isArray(membership.body.members) ? membership.body.members.find((member) => member?.conversationId === room) : null;
+  if (!mine || mine.confirmed === true) return null;
+  const answer = await postJsonStatus(endpoint, token, `/sync/rooms/${code}/confirm`, { conversationId: room, password: pasted.toLowerCase() });
+  if (answer.status === 200 && answer.body?.ok === true) {
+    return { accepted: { room: code, members: Array.isArray(answer.body.members) ? answer.body.members : [] } };
+  }
+  const error = typeof answer.body?.error === "string" && /^[a-z_]{1,40}$/.test(answer.body.error)
+    ? answer.body.error
+    : answer.status === 0 ? "no_answer" : `http_${answer.status}`;
+  return { refused: { room: code, error } };
+};
+
+/** What this invocation says about a pasted password, before anything else. */
+const confirmLead = (confirm) => {
+  if (confirm?.accepted) {
+    return [{ ephemeralMessage: `NEW: the password you were just given was accepted for sync room ${confirm.accepted.room} — you may now read and post here.` }];
+  }
+  if (confirm?.refused) {
+    return [{ ephemeralMessage: `The pasted room password was refused (${confirm.refused.error}) — you are still not in sync room ${confirm.refused.room}.` }];
+  }
+  return [];
+};
+
 /**
  * The collected messages as plain steps, for when building the delivery threw (#168).
  * Collected mail has left the reader's position over TCP, so dropping it there loses it for
  * good; this is built from nothing that can fail on a message's shape.
  */
 const plainSteps = async (taken) => {
+  // A pasted password's result belongs to this invocation alone, so it is said either way.
+  const lead = confirmLead(taken?.confirm);
   // Through the broker nothing is lost: an unacknowledged batch comes back on the next
   // collect and is built properly then. Only a TCP collect has already moved on.
-  if (!taken?.result || Number.isInteger(taken.result.delivery)) return [];
+  if (!taken?.result || Number.isInteger(taken.result.delivery)) return lead;
   const messages = Array.isArray(taken.messages) ? taken.messages : [];
-  const steps = [];
+  const steps = [...lead];
   if (messages.length > 0) {
     steps.push(
       {
@@ -643,8 +732,30 @@ const blockedStepFor = (endpoint, syncRoom, room) =>
   " room, password included. Anything other than ok:true means you are still out —" +
   " say so rather than acting as though you are in.";
 
-const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
-  if (!token || !MAIL_ROOM_NAME.test(room)) return [];
+// Antigravity wakes the agent only when a background task exits, so a stream that stays
+// open delivers into a log nobody reads (#159, reproduced on agy 1.3.6). The hook's own
+// `wait` ends with the first mail for this session and prints it; it asks the broker, so
+// the room's password never sits in a command line (#228).
+const hearText = (room) =>
+  "HEAR — so a message reaches you without anyone typing, keep one wait running as a" +
+  " background task. It ends as soon as mail for you arrives, printing it, which is" +
+  " what wakes you; after you have answered, start it again:\n" +
+  `while :; do node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 300 ${room}; rc=$?; [ $rc -eq 4 ] || break; done\n` +
+  "  · It asks the Gyredeck broker, which knows this is you: no password goes on the line.\n" +
+  "  · \"wait refused\" on its error output means it could not hear the room; say so to the person rather than starting it again.\n" +
+  "  · Run it unmodified, and only one.";
+
+const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm = null) => {
+  if (!token || !MAIL_ROOM_NAME.test(room)) return confirmLead(confirm);
+  // Known before anything can fail, so a delivery that throws still says it (#250).
+  if (taken) taken.confirm = confirm;
+  // A pasted password's result belongs to this invocation alone — agy's steps are seen only
+  // in the invocation they arrive in — so it is said even when the mail is held back.
+  const confirmOnly = () => {
+    if (confirm?.accepted) return [...confirmLead(confirm), { ephemeralMessage: hearText(room) }];
+    if (confirm?.refused) return [...confirmLead(confirm), { ephemeralMessage: blockedStepFor(endpoint, confirm.refused.room, room) }];
+    return [];
+  };
 
   // One call answers everything: what is waiting, which room this session is in, and
   // who else is in it. The bridge keeps each reader's position with the room, so there
@@ -657,7 +768,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
   if (viaBroker.result) {
     if (!brokerBatchReadable(viaBroker.result)) {
       process.stderr.write("gyredeck: mail withheld this turn — the broker's answer could not be read as a batch\n");
-      return [];
+      return confirmOnly();
     }
     result = viaBroker.result;
   } else if (viaBroker.fallback) {
@@ -667,14 +778,14 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
     // like an empty mailbox (#178).
     if (answer.status === 403 && typeof answer.body?.error === "string") {
       process.stderr.write(`gyredeck: mail withheld this turn — the broker said ${viaBroker.fallback}, the bridge said ${answer.body.error}\n`);
-      return [{
+      return [...confirmOnly(), {
         ephemeralMessage: `Gyredeck is holding mail for this session that it cannot hand over: the broker said "${viaBroker.fallback}" and the bridge said "${answer.body.error}". Tell the person at this terminal; restarting this session usually clears it.`,
       }];
     }
     result = answer.status === 200 ? answer.body : null;
   } else {
     process.stderr.write(`gyredeck: mail withheld this turn — ${viaBroker.withheld}\n`);
-    return [];
+    return confirmOnly();
   }
   const messages = Array.isArray(result?.messages) ? result.messages : [];
   const delivered = messages
@@ -703,9 +814,11 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
   const members = Array.isArray(result?.members) ? result.members : [];
   const mine = members.find((member) => member?.conversationId === room) ?? null;
   const blocked = syncRoom && mine && mine.confirmed !== true ? blockedStepFor(endpoint, syncRoom, room) : null;
-  if (delivered.length === 0) {
+  // Just accepted: told so with the room in full — where, the rules, how to hear it — even
+  // with nothing waiting, which is when the old early answer said nothing at all.
+  if (delivered.length === 0 && !confirm?.accepted) {
     await ackDelivery(result);
-    return [usageStep, heavyStep, blocked ? { ephemeralMessage: blocked } : null].filter(Boolean);
+    return [...confirmLead(confirm), usageStep, heavyStep, blocked ? { ephemeralMessage: blocked } : null].filter(Boolean);
   }
 
 
@@ -830,19 +943,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
   // Left out once the room sees this session's watch (#157). An older bridge that does
   // not say is answered as before.
   if (syncRoom && confirmed && result?.watching !== true) {
-    parts.push(
-      // Antigravity wakes the agent only when a background task exits, so a stream that
-      // stays open delivers into a log nobody reads (#159, reproduced on agy 1.3.6). The
-      // hook's own `wait` ends with the first mail for this session and prints it; it asks
-      // the broker, so the room's password never sits in a command line (#228).
-      "HEAR — so a message reaches you without anyone typing, keep one wait running as a" +
-        " background task. It ends as soon as mail for you arrives, printing it, which is" +
-        " what wakes you; after you have answered, start it again:\n" +
-        `while :; do node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 300 ${room}; rc=$?; [ $rc -eq 4 ] || break; done\n` +
-        "  · It asks the Gyredeck broker, which knows this is you: no password goes on the line.\n" +
-        "  · \"wait refused\" on its error output means it could not hear the room; say so to the person rather than starting it again.\n" +
-        "  · Run it unmodified, and only one.",
-    );
+    parts.push(hearText(room));
   }
   const header = { ephemeralMessage: parts.join(" ") };
   const reply = replyInstruction(
@@ -851,6 +952,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
   );
 
   const steps = [
+    ...confirmLead(confirm),
     header,
     ...delivered.map((message) => {
       const from = shown(message);
@@ -1003,7 +1105,12 @@ const main = async () => {
       // process, the hook only names the session, and a broker that restarted has forgotten.
       if (conversationId) {
         const taken = {};
-        mailDrain = drainMailIntoSteps(endpoint, token, conversationId, taken).catch(() => plainSteps(taken));
+        // A pasted room password is presented first, so the drain after it sees the member
+        // confirmed and this invocation can say so (#250).
+        mailDrain = confirmPastedPassword(endpoint, token, conversationId, input)
+          .catch(() => null)
+          .then((confirm) => drainMailIntoSteps(endpoint, token, conversationId, taken, confirm))
+          .catch(() => plainSteps(taken));
       }
     } else if (eventType === "PostInvocation") {
       // Registered so AGY gets a valid `injectSteps` answer and Gyredeck stays a

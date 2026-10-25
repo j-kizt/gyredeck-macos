@@ -1,4 +1,4 @@
-import { createServer as createHttpServer } from "node:http";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { appendFile, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
@@ -10717,5 +10717,143 @@ test("the Antigravity payload-shape log records lengths, never values, and empti
     assert.equal(records[0].shape.lastUserInput, "string(32)");
   } finally {
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+// ── #250: the Antigravity hook confirms a pasted room password itself ──
+
+/**
+ * An unconfirmed Antigravity member of a room, with the hook reaching the bridge through a
+ * proxy that counts every confirm it carries — so "sent nothing" and "sent once" are
+ * counted, not inferred from what the bridge happens to say.
+ */
+const agyPasteFixture = async (tag) => {
+  const home = await mkdtemp(join(tmpdir(), `gyredeck-250-${tag}-`));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const bridgePort = await freePort();
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(bridgePort), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const confirms = [];
+  const proxy = createHttpServer((req, res) => {
+    if (req.method === "POST" && /^\/sync\/rooms\/[^/]+\/confirm$/.test(req.url)) confirms.push(req.url);
+    const upstream = httpRequest({ hostname: "127.0.0.1", port: bridgePort, path: req.url, method: req.method, headers: req.headers }, (answer) => {
+      res.writeHead(answer.statusCode ?? 502, answer.headers);
+      answer.pipe(res);
+    });
+    upstream.on("error", () => { res.writeHead(502); res.end(); });
+    req.pipe(upstream);
+  });
+  await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port: proxy.address().port }));
+  const founder = "a2500000-0000-4000-8000-000000000001";
+  const agy = "a2500000-0000-4000-8000-000000000002";
+  await waitForHealth(bridgePort, stderrRef);
+  const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+  const call = async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${bridgePort}${path}`, {
+      method, headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  await call("POST", "/ingest", {
+    version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+    conversationId: agy, cwd: "/tmp/project",
+    runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "agyHost" },
+    data: { inputCount: 1 },
+  });
+  const created = await call("POST", "/sync/rooms", { conversationId: founder });
+  const code = created.body.room;
+  const password = created.body.password;
+  assert.match(password, /^[0-9a-f]{32}$/, "premise: the room's password is 32 hex");
+  await call("POST", `/sync/rooms/${code}/members`, { conversationId: agy });
+  /** One PreInvocation with this `lastUserInput`: its steps as text, and its stderr. */
+  const invoke = async (lastUserInput) => {
+    const result = await runAdapter(
+      "adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], home,
+      { hookEventName: "PreInvocation", conversationId: agy, workspacePaths: ["/tmp/project"], ...(lastUserInput === undefined ? {} : { lastUserInput }) },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    return { text: (JSON.parse(result.stdout).injectSteps ?? []).map((step) => step.ephemeralMessage ?? "").join("\n"), stdout: result.stdout, stderr: result.stderr };
+  };
+  const confirmed = async () => (await call("GET", `/sync/rooms?as=${agy}`)).body.members.find((member) => member.conversationId === agy)?.confirmed === true;
+  const close = async () => {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await new Promise((resolve) => proxy.close(resolve));
+    await rm(home, { recursive: true, force: true });
+  };
+  return { home, agy, code, password, confirms, invoke, confirmed, close };
+};
+
+test("#250 C1 C3 C4: a pasted password confirms the member once, and the same invocation says so", async () => {
+  const f = await agyPasteFixture("accept");
+  try {
+    // Pasted with the whitespace a terminal adds, and in capitals: the trimmed input is what counts.
+    const first = await f.invoke(`  ${f.password.toUpperCase()}\n`);
+    assert.equal(await f.confirmed(), true, "the member's own id was confirmed in its own room");
+    assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`]);
+    assert.match(first.text, new RegExp(`NEW: the password you were just given was accepted for sync room ${f.code} — you may now read and post here\\.`));
+    assert.ok(first.text.includes(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`), "with the way to hear the room");
+    assert.doesNotMatch(first.text, /BLOCKED:/);
+    // PreInvocation fires on every invocation of the turn, with the same message: nothing more is sent.
+    const again = await f.invoke(f.password);
+    assert.equal(f.confirms.length, 1, "an already-confirmed member sends no confirm");
+    assert.doesNotMatch(again.text, /NEW: the password/);
+  } finally {
+    await f.close();
+  }
+});
+
+test("#250 C4: the acceptance is said in that invocation even when the broker withholds the mail", async () => {
+  const f = await agyPasteFixture("withheld");
+  const broker = await fakeBroker(f.home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" }));
+  try {
+    const result = await f.invoke(f.password);
+    assert.match(result.stderr, /mail withheld this turn/, "premise: the collect was withheld");
+    assert.equal(await f.confirmed(), true);
+    assert.match(result.text, new RegExp(`NEW: the password you were just given was accepted for sync room ${f.code}`));
+    assert.ok(result.text.includes(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`));
+    assert.doesNotMatch(result.text, /BLOCKED:/);
+  } finally {
+    await broker.close();
+    await f.close();
+  }
+});
+
+test("#250 C2: anything but an exact paste is never presented", async () => {
+  const f = await agyPasteFixture("exact");
+  try {
+    for (const input of [f.password.slice(0, 31), `${f.password}a`, `here it is: ${f.password}`, `${f.password} thanks`, [f.password], { text: f.password }, undefined]) {
+      const result = await f.invoke(input);
+      assert.match(result.text, /BLOCKED:/, JSON.stringify(input));
+    }
+    assert.deepEqual(f.confirms, [], "no confirm was sent");
+    assert.equal(await f.confirmed(), false);
+  } finally {
+    await f.close();
+  }
+});
+
+test("#250 C5: a refused password is said with its error code, then BLOCKED, and the value appears nowhere", async () => {
+  const f = await agyPasteFixture("refused");
+  try {
+    const wrong = f.password.replace(/^./, (c) => (c === "0" ? "1" : "0"));
+    const result = await f.invoke(wrong);
+    assert.equal(f.confirms.length, 1, "premise: it was presented");
+    assert.match(result.text, new RegExp(`The pasted room password was refused \\(bad_password\\) — you are still not in sync room ${f.code}\\.`));
+    assert.match(result.text, /BLOCKED:/);
+    assert.equal(result.text.toLowerCase().indexOf(wrong), -1, "not in any step");
+    assert.equal(result.stdout.toLowerCase().indexOf(wrong), -1);
+    assert.equal(result.stderr.toLowerCase().indexOf(wrong), -1, "nor on stderr");
+    assert.equal(await f.confirmed(), false);
+  } finally {
+    await f.close();
   }
 });

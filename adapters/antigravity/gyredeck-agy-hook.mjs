@@ -609,6 +609,26 @@ const plainSteps = async (taken) => {
   return steps;
 };
 
+/**
+ * How an unconfirmed member gets in, as one step. Carried on every invocation while this
+ * session is in a room it has not confirmed, mail or not (#242): it used to ride only on a
+ * delivery, so the turn where the person pasted the password often had none, and the agent
+ * built the confirm by hand and left out its own id.
+ */
+const blockedStepFor = (endpoint, syncRoom, room) =>
+  "BLOCKED: you cannot read or post in this room yet. It needs the room's own" +
+  " password — a long line of hex the person copies from the key beside the room" +
+  " code in Gyredeck. Ask for it and wait; do not retry without it and do not" +
+  " look for another way in.\n" +
+  "When it arrives, present it once and read what comes back:\n" +
+  `  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/sync/rooms/${syncRoom}/confirm` +
+  ' -H \'content-type: application/json\' -H "x-gyredeck-token: THE PASSWORD"' +
+  ` -d '{"conversationId":"${room}","password":"THE PASSWORD"}'\n` +
+  "The response is not optional reading. It carries ok:true when you are in, and a" +
+  " howTo object with the exact commands for posting, watching and waiting in this" +
+  " room, password included. Anything other than ok:true means you are still out —" +
+  " say so rather than acting as though you are in.";
+
 const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
   if (!token || !MAIL_ROOM_NAME.test(room)) return [];
 
@@ -663,9 +683,15 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
   const heavyStep = typeof result?.heavyNotice === "string"
     ? { ephemeralMessage: result.heavyNotice.slice(0, MAIL_MAX_TEXT) }
     : null;
+  // The room the collect already describes: no extra request to know this session is in
+  // one it has not confirmed.
+  const syncRoom = typeof result?.room === "string" ? result.room : null;
+  const members = Array.isArray(result?.members) ? result.members : [];
+  const mine = members.find((member) => member?.conversationId === room) ?? null;
+  const blocked = syncRoom && mine && mine.confirmed !== true ? blockedStepFor(endpoint, syncRoom, room) : null;
   if (delivered.length === 0) {
     await ackDelivery(result);
-    return [usageStep, heavyStep].filter(Boolean);
+    return [usageStep, heavyStep, blocked ? { ephemeralMessage: blocked } : null].filter(Boolean);
   }
 
 
@@ -681,10 +707,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
   // untrusted invites the agent to discount it. Calling a room-mate's request
   // unauthorised breaks the entire point of a room — "one implements, another tests"
   // means the tester has to actually run the tests when asked.
-  const syncRoom = typeof result?.room === "string" ? result.room : null;
-  const members = Array.isArray(result?.members) ? result.members : [];
   const byId = new Map(members.map((member) => [member.conversationId, member]));
-  const mine = byId.get(room);
 
   // The provider name alone: a member's role is stated once below, and repeating it on
   // every line makes both the summary and each message harder to read.
@@ -756,22 +779,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null) => {
     );
   }
 
-  if (syncRoom && mine && !confirmed) {
-    parts.push(
-      "BLOCKED: you cannot read or post in this room yet. It needs the room's own" +
-        " password — a long line of hex the person copies from the key beside the room" +
-        " code in Gyredeck. Ask for it and wait; do not retry without it and do not" +
-        " look for another way in.\n" +
-        "When it arrives, present it once and read what comes back:\n" +
-        `  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/sync/rooms/${syncRoom}/confirm` +
-        ' -H \'content-type: application/json\' -H "x-gyredeck-token: THE PASSWORD"' +
-        ` -d '{"conversationId":"${room}","password":"THE PASSWORD"}'\n` +
-        "The response is not optional reading. It carries ok:true when you are in, and a" +
-        " howTo object with the exact commands for posting, watching and waiting in this" +
-        " room, password included. Anything other than ok:true means you are still out —" +
-        " say so rather than acting as though you are in.",
-    );
-  }
+  if (syncRoom && mine && !confirmed) parts.push(blocked);
 
   if (fromRoomMate) {
     // Being in the room is the arrangement. What this session is for came from its own

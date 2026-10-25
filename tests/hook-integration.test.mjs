@@ -10390,3 +10390,77 @@ test("heavy r2: a command that ignores SIGTERM is killed when the escalation run
     await h.cleanup();
   }
 });
+
+test("an unconfirmed Antigravity member sees how to confirm on every invocation, and a confirm says what it is missing (#242)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-242-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const founder = "a2420000-0000-4000-8000-000000000001";
+  const agy = "a2420000-0000-4000-8000-000000000002";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const call = async (method, path, body, extra = {}) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD, ...extra },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: agy, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "agyHost" },
+      data: { inputCount: 1 },
+    });
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: agy });
+    const agySteps = async () => {
+      const result = await runAdapter(
+        "adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], home,
+        { hookEventName: "PreInvocation", conversationId: agy, workspacePaths: ["/tmp/project"] },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return (JSON.parse(result.stdout).injectSteps ?? []).map((step) => step.ephemeralMessage ?? "").join("\n");
+    };
+    const confirmLine = `/sync/rooms/${code}/confirm`;
+    const ownId = `"conversationId":"${agy}"`;
+    // First invocation: the join notice is delivered, with the way in.
+    const first = await agySteps();
+    assert.match(first, /BLOCKED:/);
+    // Second invocation, no mail at all: the way in is still there — the turn the person
+    // pastes the password into is usually this one.
+    const second = await agySteps();
+    assert.match(second, /BLOCKED:/, "BLOCKED rides on an invocation with no mail");
+    assert.ok(second.includes(confirmLine) && second.includes(ownId), "with the exact confirm and the session's own id");
+
+    // A confirm with no id, or no password, says what is missing — not "never invited".
+    const noId = await call("POST", `/sync/rooms/${code}/confirm`, { password: created.body.password });
+    assert.equal(noId.status, 400);
+    assert.equal(noId.body.error, "missing_conversation_id");
+    const noPassword = await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: agy });
+    assert.equal(noPassword.status, 400);
+    assert.equal(noPassword.body.error, "missing_password");
+    assert.equal((await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: "a2420000-0000-4000-8000-000000000999", password: created.body.password })).body.error, "not_a_member", "a well-formed stranger is still not a member");
+    assert.equal((await call("POST", "/sync/rooms/sync-zzzz/confirm", {})).body.error, "no_such_room", "and a room that is not there is said first");
+
+    // Once confirmed, the way in is no longer shown.
+    assert.equal((await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: agy, password: created.body.password })).status, 200);
+    await agySteps();
+    assert.doesNotMatch(await agySteps(), /BLOCKED:/);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});

@@ -6236,6 +6236,25 @@ function startBridge(config) {
           });
           return;
         }
+        // A malformed body is said as one, before membership is asked (#242): a confirm that
+        // left out its own id was told it had never been invited, and a session that was in
+        // the room told the person so.
+        if (!MAIL_ROOM_NAME.test(conversationId)) {
+          sendJson(400, {
+            ok: false,
+            error: "missing_conversation_id",
+            message: `conversationId is missing or not a session id. Send your own session id with the password: {"conversationId":"<your id>","password":"<the room's password>"} to POST /sync/rooms/${code}/confirm.`,
+          });
+          return;
+        }
+        if (!password) {
+          sendJson(400, {
+            ok: false,
+            error: "missing_password",
+            message: `password is missing. Send the room's password with your id: {"conversationId":"${conversationId}","password":"<the room's password>"}.`,
+          });
+          return;
+        }
         if (!room.members.has(conversationId)) {
           sendJson(404, {
             ok: false,

@@ -1,5 +1,25 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Heavy runs fit the window and stop safely, and Antigravity always sees how to join — (v1.24.1)
+
+### Fixes
+
+- **The Heavy runs row stays inside its card.** In Settings, while a run held the slot, the row's
+  text spilled over the section heading and the card above it. It now grows with its content.
+  The run is named the way rooms name a member ("Codex / Gyredesk Audit") rather than by a
+  session id, and the help text is one short line.
+- **"Stop this run" ends the run itself, and only the run you asked about.** The old "Release
+  stuck slot" freed the slot while its command kept running, so the next heavy run could start
+  on top of it. The new button asks in the row first, then ends that run's command. The slot
+  frees only once the command has really ended. If a different run has taken the slot in the
+  meantime, nothing is stopped. Gyredeck checks that the command belongs to a heavy-run helper
+  before it will ever stop it.
+- **Antigravity always sees how to join a room.** The exact command to confirm a room's password
+  reached Antigravity only on a turn that also carried mail, so the turn you pasted the password
+  into often lacked it, and the session reported that it had never been invited. It is now there on
+  every turn until the session is in. A confirm that leaves out the session id or the password now
+  says which is missing.
+
 ## Assistants take turns on heavy checks — (v1.24.0)
 
 ### Added

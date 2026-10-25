@@ -311,7 +311,7 @@ const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean 
     : !heavy.status
       ? "Checking…"
       : holder
-        ? `${holder.as} · ${holder.what} · ${heavyElapsed(holder.elapsedMs)}${holder.state === "reserved" ? " · starting" : ""}${holder.loadSkipped ? " · started under load" : ""}`
+        ? `${holder.label ?? holder.as} · ${holder.what} · ${heavyElapsed(holder.elapsedMs)}${holder.state === "reserved" ? " · starting" : ""}${holder.loadSkipped ? " · started under load" : ""}`
         : "Free";
   return (
     <>
@@ -324,14 +324,13 @@ const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean 
           {holder?.helperGone ? <span className="setup-detail">Helper gone, command still running</span> : null}
           {queue.map((entry) => (
             <span className="setup-detail" key={`${entry.position}-${entry.as}`}>
-              {`Waiting ${entry.position} · ${entry.as} · ${entry.what} · ${heavyElapsed(entry.waitedMs)}`}
+              {`Waiting ${entry.position} · ${entry.label ?? entry.as} · ${entry.what} · ${heavyElapsed(entry.waitedMs)}`}
             </span>
           ))}
-          {heavy.status ? <span className="setup-detail">{heavy.status.limit}</span> : null}
-          {holder ? <span className="setup-detail">{HEAVY_RELEASE_WARNING}</span> : null}
+          {heavy.status ? <span className="setup-detail" title={heavy.status.limit}>Advisory: runs started outside the queue are not seen.</span> : null}
         </span>
         {holder ? (
-          <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => void heavy.release()} data-tauri-drag-region="false" title={HEAVY_RELEASE_WARNING}>
+          <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => { if (window.confirm(HEAVY_RELEASE_WARNING)) void heavy.release(); }} data-tauri-drag-region="false" title={HEAVY_RELEASE_WARNING}>
             {heavy.releasing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
             {heavy.releasing ? "Releasing…" : "Release stuck slot"}
           </button>

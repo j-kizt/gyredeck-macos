@@ -92,6 +92,13 @@
   scrollbar-gutter: stable;
 }
 
+/* This column scrolls; its rows must never be squeezed to fit it. A row with an explicit
+   min-height loses flex's content-sized minimum, so a long one shrank and its text spilled
+   over the heading above it (#243). */
+.setup-category-panel > * {
+  flex-shrink: 0;
+}
+
 .setup-section-heading {
   display: flex;
   flex-direction: column;

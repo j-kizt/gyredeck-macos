@@ -5516,6 +5516,14 @@ function startBridge(config) {
   };
   setInterval(sweepHeavy, HEAVY_TICK_MS).unref();
 
+  /** A run's holder named the way rooms name a member — provider and assigned name — not by id (#243). */
+  const heavyLabelFor = (conversationId) => {
+    const name = sessionNameOf(conversationId);
+    const provider = providerByConversation.has(conversationId) ? providerLabelFor(conversationId) : null;
+    if (provider && name) return `${provider} / ${name}`;
+    return provider ?? name ?? null;
+  };
+
   const describeHeavy = () => {
     const now = heavyNow();
     const load = heavyLoad();
@@ -5527,6 +5535,7 @@ function startBridge(config) {
       holder: heavyHolder
         ? {
             as: heavyHolder.as,
+            label: heavyLabelFor(heavyHolder.as),
             what: heavyHolder.what,
             state: heavyHolder.state,
             since: heavyHolder.since,
@@ -5539,7 +5548,7 @@ function startBridge(config) {
             adopted: heavyHolder.adopted,
           }
         : null,
-      queue: heavyQueue.map((entry, index) => ({ position: index + 1, as: entry.as, what: entry.what, waitedMs: Math.round(now - entry.enqueuedAt) })),
+      queue: heavyQueue.map((entry, index) => ({ position: index + 1, as: entry.as, label: heavyLabelFor(entry.as), what: entry.what, waitedMs: Math.round(now - entry.enqueuedAt) })),
       waiting: heavyPolls.size,
       limit: HEAVY_LIMIT_TEXT,
     };

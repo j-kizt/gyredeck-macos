@@ -10462,5 +10462,32 @@ test("an unconfirmed Antigravity member sees how to confirm on every invocation,
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true });
+
+test("the heavy slot names its holder and its line the way rooms name members (#243)", async () => {
+  const h = await heavyHarness("label");
+  try {
+    await h.start();
+    const named = "a2430000-0000-4000-8000-000000000001";
+    const waiting = "a2430000-0000-4000-8000-000000000002";
+    const call = (method, path, body) => fetch(`${h.base}${path}`, {
+      method, headers: { "content-type": "application/json", "x-gyredeck-token": h.token() }, body: JSON.stringify(body),
+    });
+    for (const [conversationId, sourceKind] of [[named, "claudeCodeHook"], [waiting, "codexCliHook"]]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    await call("PUT", `/sessions/names/${named}`, { name: "Gyre Assistant" });
+    await h.hold(named);
+    await h.acquire(waiting, "cargo check", h.pair());
+    const state = await h.state();
+    assert.equal(state.holder.as, named, "the id is still there for whoever needs it");
+    assert.equal(state.holder.label, "Claude Code / Gyre Assistant");
+    assert.equal(state.queue[0].label, "Codex", "a session with no assigned name is its provider");
+  } finally {
+    await h.cleanup();
   }
 });

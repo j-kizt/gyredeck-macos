@@ -5,13 +5,14 @@ import { useCallback, useEffect, useState } from "react";
 export interface IHeavyStatus {
   holder: {
     as: string;
+    label?: string | null;
     what: string;
     state: "reserved" | "active";
     elapsedMs: number;
     loadSkipped: boolean;
     helperGone: boolean;
   } | null;
-  queue: Array<{ position: number; as: string; what: string; waitedMs: number }>;
+  queue: Array<{ position: number; as: string; label?: string | null; what: string; waitedMs: number }>;
   load: number | null;
   loadLimit: number;
   limit: string;

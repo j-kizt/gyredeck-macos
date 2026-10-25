@@ -51,12 +51,16 @@ test("the heavy-runs row shows the holder and the line, and releases a stuck slo
   await expect(row).toContainText("Advisory: runs started outside the queue are not seen.");
   await expect(row).not.toContainText("Frees the slot even if its command is still running");
 
-  // The overlap warning is asked where the button is pressed; declining releases nothing.
-  page.once("dialog", (dialog) => { expect(dialog.message()).toContain("two heavy runs may then overlap"); void dialog.dismiss(); });
+  // The overlap warning is asked in the app, where Release is pressed: the macOS webview has
+  // no window.confirm. A native dialog here would fail this test.
+  page.on("dialog", () => { throw new Error("no native dialog may be used"); });
   await row.getByRole("button", { name: "Release stuck slot" }).click();
+  await expect(row.getByRole("alert")).toContainText("two heavy runs may then overlap");
+  await row.getByRole("button", { name: "Cancel" }).click();
+  await expect(row.getByRole("alert")).toHaveCount(0);
   await expect(row).toContainText("Claude Code / Gyre Assistant");
-  page.once("dialog", (dialog) => void dialog.accept());
   await row.getByRole("button", { name: "Release stuck slot" }).click();
+  await row.getByRole("button", { name: "Confirm release" }).click();
   await expect(row.locator(".setup-detail").first()).toHaveText("Free");
   await expect(row.getByRole("button", { name: "Release stuck slot" })).toHaveCount(0);
   const calls = await page.evaluate(() => (window as typeof window & { __heavyCalls: string[] }).__heavyCalls);

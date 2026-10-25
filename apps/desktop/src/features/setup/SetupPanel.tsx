@@ -303,6 +303,9 @@ const HEAVY_RELEASE_WARNING = "Frees the slot even if its command is still runni
  */
 const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean }) => {
   const heavy = useHeavyRuns(canUseNativeControls);
+  // Asked here, in the app: the macOS webview implements no window.confirm, so a native
+  // confirm returned without asking and the slot was never released (#243 audit).
+  const [confirming, setConfirming] = useState(false);
   if (!canUseNativeControls) return null;
   const holder = heavy.status?.holder ?? null;
   const queue = heavy.status?.queue ?? [];
@@ -328,9 +331,18 @@ const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean 
             </span>
           ))}
           {heavy.status ? <span className="setup-detail" title={heavy.status.limit}>Advisory: runs started outside the queue are not seen.</span> : null}
+          {holder && confirming ? <span className="setup-detail" role="alert">{HEAVY_RELEASE_WARNING}</span> : null}
         </span>
-        {holder ? (
-          <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => { if (window.confirm(HEAVY_RELEASE_WARNING)) void heavy.release(); }} data-tauri-drag-region="false" title={HEAVY_RELEASE_WARNING}>
+        {holder && confirming ? (
+          <span className="setup-row-actions">
+            <button className="pill-btn" type="button" onClick={() => setConfirming(false)} data-tauri-drag-region="false">Cancel</button>
+            <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => { setConfirming(false); void heavy.release(); }} data-tauri-drag-region="false">
+              {heavy.releasing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
+              Confirm release
+            </button>
+          </span>
+        ) : holder ? (
+          <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => setConfirming(true)} data-tauri-drag-region="false">
             {heavy.releasing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
             {heavy.releasing ? "Releasing…" : "Release stuck slot"}
           </button>

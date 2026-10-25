@@ -6034,7 +6034,12 @@ pub fn run() {
                 watch.load();
                 let bindings = std::sync::Arc::clone(&app.state::<broker::BrokerState>().bindings);
                 let session_of = std::sync::Arc::new(move |pid: i32| broker::session_of_pid(&bindings, pid));
-                if let Err(error) = heavy_watch::start(&watch, secret, session_of) {
+                let handle = app.handle().clone();
+                let emit = std::sync::Arc::new(move |state: serde_json::Value| {
+                    use tauri::Emitter;
+                    let _ = handle.emit("heavy_state", state);
+                });
+                if let Err(error) = heavy_watch::start(&watch, secret, session_of, emit) {
                     eprintln!("{error}");
                 }
             }

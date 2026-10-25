@@ -9,6 +9,7 @@ export interface IHeavyStatus {
     label?: string | null;
     what: string;
     state: "reserved" | "active";
+    since?: string;
     elapsedMs: number;
     loadSkipped: boolean;
     helperGone: boolean;
@@ -17,7 +18,7 @@ export interface IHeavyStatus {
   } | null;
   queue: Array<{ id?: string; position: number; as: string; label?: string | null; what: string; waitedMs: number }>;
   /** Heavy runs the app sees outside the helper (#245): what matched, never the command line. Absent from older bridges. */
-  observed?: Array<{ pid: number; pattern: string; exe: string; cwd: string | null; label: string; elapsedMs: number }>;
+  observed?: Array<{ pid: number; pattern: string; exe: string; cwd: string | null; label: string; startedAtMs?: number; elapsedMs: number }>;
   load: number | null;
   loadLimit: number;
   limit: string;

@@ -563,6 +563,7 @@ pub(crate) fn start(
     state: &HeavyWatchState,
     app_word: String,
     session_of: Arc<dyn Fn(i32) -> Option<String> + Send + Sync>,
+    emit: Arc<dyn Fn(serde_json::Value) + Send + Sync>,
 ) -> Result<(), String> {
     let custom = Arc::clone(&state.custom);
     std::thread::Builder::new()
@@ -584,6 +585,12 @@ pub(crate) fn start(
                     let sent = crate::standalone_bridge::bridge_request_vouched("PUT", "/heavy/observed", Some(body), &app_word)
                         .is_ok_and(|(status, _)| status == 200);
                     reported = !runs.is_empty() || !sent;
+                }
+                // The slot as the bridge now sees it, every round, for the notifications
+                // (#244): helper runs start and end in the bridge, so it is asked rather
+                // than inferred. The window may be hidden; the webview still hears it.
+                if let Ok(state) = crate::standalone_bridge::heavy_status() {
+                    emit(state);
                 }
                 std::thread::sleep(SCAN_INTERVAL);
             }

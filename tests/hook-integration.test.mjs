@@ -1586,7 +1586,7 @@ test("a room delivery carries only what the session can use, and points at the r
     // The file every delivery points at exists as soon as the bridge does, at the version
     // a delivery names.
     const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
-    assert.match(rules, /^# Gyredeck room rules — v8\n/);
+    assert.match(rules, /^# Gyredeck room rules — v9\n/);
     assert.match(rules, /Never answer a reaction/);
     // #208: a new Claude Code session lists every expired watch as an unfinished task, and
     // nothing said that was harmless.
@@ -1633,7 +1633,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/sync/rooms/${code}/confirm`, { conversationId: agy, password: minted.password });
     await steps();
     const opening = await context();
-    assert.match(opening, /Rules v8: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
+    assert.match(opening, /Rules v9: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
     // Nothing but the room talking about itself: nothing to answer, so no command for it.
     assert.doesNotMatch(opening, /REPLY —/);
 
@@ -1693,7 +1693,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/mail/${code}`, { from: peer, to: agy, kind: "reaction", text: "noted" });
     const agyReaction = await steps();
     assert.match(agyReaction, /\[gyredeck mail · from Codex · reaction\] noted/);
-    assert.match(agyReaction, /Rules v8: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(agyReaction, /Rules v9: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.doesNotMatch(agyReaction, /answering is expected/);
     assert.match(agyReaction, /never answer a reaction/);
     assert.match(agyReaction, /ok:true and a seq/);
@@ -5721,7 +5721,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // The confirming push is the full brief, and names the rules file the short form of
     // every later push points at (#157).
     assert.match(afterConfirm.at(-1), /Do not call Gyredeck/);
-    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v8\)/);
+    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v9\)/);
 
     // Typing it twice is the same question. Nothing is announced again and nothing is
     // pushed again, because there is nothing outstanding to carry.
@@ -5751,7 +5751,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // given on confirmation (#157).
     assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} — how to answer: `));
     assert.match(afterLater.at(-1), /@<member or everyone> ask\|tell\|reaction — never answer a reaction/);
-    assert.match(afterLater.at(-1), /Rules v8: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(afterLater.at(-1), /Rules v9: ~\/\.config\/gyredeck\/room-rules\.md/);
     assert.match(afterLater.at(-1), /Members now: /);
     assert.doesNotMatch(afterLater.at(-1), /Do not call Gyredeck/);
     // And says which kind it is: a tell and a reaction with the same words must not
@@ -10287,10 +10287,10 @@ test("heavy C11: a helper that cannot reach the bridge, or meets another version
   }
 });
 
-test("heavy rules v8: the rules list the heavy commands, the helper and the limit", async () => {
+test("heavy rules v9: the rules list the heavy commands, the helper and the limit", async () => {
   const { roomRules, HEAVY_COMMANDS, HEAVY_LIMIT_TEXT } = await heavyModule();
   const rules = roomRules("http://127.0.0.1:47621");
-  assert.match(rules, /^# Gyredeck room rules — v8\n/);
+  assert.match(rules, /^# Gyredeck room rules — v9\n/);
   assert.match(rules, /## Heavy runs/);
   for (const name of ["test:demo", "test:hooks", "test:performance", "test:budget", "desktop:build", "desktop:install", "cargo test", "cargo build", "cargo check"]) {
     assert.ok(rules.includes(`\`${name}\``), name);
@@ -11020,6 +11020,29 @@ const rereadPaths = [
   },
   { name: "private-mailbox mail", tag: "ppriv", run: async (f) => { await f.confirm(); await f.invoke(); assert.equal((await f.call("POST", `/mail/${f.agy}`, { from: "gyredeck-app", to: f.agy, kind: "ask", text: "a private ask" })).body.ok, true); return { result: await f.invoke() }; }, expect: "note" },
   { name: "room mail the bridge did not tag", tag: "puntag", options: { inboxBody: (body) => ({ ...body, messages: (body.messages ?? []).map(({ room: _room, ...message }) => message) }) }, run: async (f) => { await f.confirm(); await f.invoke(); await f.say("untagged"); return { result: await f.invoke() }; }, expect: "note" },
+  {
+    name: "a heavy-run room notice alone (#244)", tag: "pheavy",
+    run: async (f) => {
+      await f.confirm();
+      await f.invoke();
+      const reported = await f.call("PUT", "/heavy/observed", { v: 1, runs: [{ pid: 4242, pattern: "cargo test|build|check", exe: "cargo", cwd: null, startedAtMs: Date.now(), agent: null }] });
+      assert.equal(reported.status, 200);
+      return { result: await f.invoke() };
+    },
+    expect: "none",
+    premise: (r) => assert.ok(r.steps.some((text) => text.includes("HEAVY RUN: Terminal started cargo test|build|check")), `premise: the notice was delivered: ${JSON.stringify(r.steps)}`),
+  },
+  {
+    name: "a heavy-run room notice beside room mail (#244)", tag: "pheavymail",
+    run: async (f) => {
+      await f.confirm();
+      await f.invoke();
+      await f.call("PUT", "/heavy/observed", { v: 1, runs: [{ pid: 4242, pattern: "cargo test|build|check", exe: "cargo", cwd: null, startedAtMs: Date.now(), agent: null }] });
+      return { seq: await f.say("after the notice"), result: await f.invoke() };
+    },
+    expect: "since", reply: true,
+    premise: (r) => assert.ok(r.steps.some((text) => text.includes("HEAVY RUN: Terminal started")), "premise: the notice was delivered too"),
+  },
   { name: "a message with no seq", tag: "pnoseq", options: { inboxBody: (body) => ({ ...body, messages: (body.messages ?? []).map(({ seq: _seq, ...message }) => message) }) }, run: async (f) => { await f.confirm(); await f.say("no seq"); return { result: await f.invoke() }; }, expect: "none" },
 ];
 
@@ -11358,7 +11381,7 @@ test("observed: GET /heavy shows what was matched and who started it, never the 
       observedRun({ pid: 5003, agent: { kind: "codex", session: null, cwd: "/nowhere" } }),
     ])).status, 200);
     const { observed } = await h.state();
-    assert.deepEqual(observed.map((run) => Object.keys(run).sort()), Array(3).fill(["cwd", "elapsedMs", "exe", "label", "pattern", "pid"]));
+    assert.deepEqual(observed.map((run) => Object.keys(run).sort()), Array(3).fill(["cwd", "elapsedMs", "exe", "label", "pattern", "pid", "startedAtMs"]));
     assert.ok(!JSON.stringify(observed).includes("s3cret"), "nothing but the named fields passes");
     assert.deepEqual(observed.map((run) => run.label), ["Terminal", "Claude Code / Gyre Assistant", "Codex"]);
     assert.ok(observed[0].elapsedMs >= 60_000 && observed[0].elapsedMs < 120_000, String(observed[0].elapsedMs));
@@ -11521,4 +11544,134 @@ test("observed C7: Stop never reaches an observed run", async () => {
   } finally {
     await h.cleanup();
   }
+});
+
+// ── Heavy-run room notices (#244) ──
+//
+// Invariants: every open room is told when a run starts, when someone waits, and when one
+// ends — helper and observed runs alike, named as Settings names them (proven identity
+// only) — and the notice wakes nobody: no stream frame to a member's watch, no end to a
+// held wait. It is read on the member's next collect.
+
+/** A room with one confirmed member (its founder), and that member's view of it. */
+const heavyRoom = async (h, founder) => {
+  await heavyIngest(h, founder, "claudeCodeHook");
+  const created = await fetch(`${h.base}/sync/rooms`, {
+    method: "POST", headers: { "content-type": "application/json", "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD }, body: JSON.stringify({ conversationId: founder }),
+  }).then(async (r) => ({ status: r.status, body: await r.json() }));
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const code = created.body.room;
+  const password = passwordsHeldByApp.get(code);
+  assert.ok(password, "premise: the app holds the room's password");
+  const notices = async () => {
+    const inbox = await fetch(`${h.base}/mail/inbox?as=${founder}`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    return (inbox.messages ?? []).filter((m) => m.text.startsWith("HEAVY RUN: ")).map((m) => m.text);
+  };
+  return { code, password, notices };
+};
+
+test("room notices: start, wait and end, for helper and observed runs, named as Settings names them", async () => {
+  const h = await heavyHarness("room-notices");
+  try {
+    await h.start();
+    const founder = "a2440000-0000-4000-8000-000000000001";
+    const room = await heavyRoom(h, founder);
+    assert.deepEqual(await room.notices(), [], "premise: nothing said yet");
+
+    const held = await h.hold(founder);
+    const b = h.pair();
+    assert.equal((await h.acquire("run-b", "b", b)).status, 202);
+    await h.post("release", { lease: held.lease });
+    assert.equal((await h.state()).holder?.state, "reserved", "premise: B was granted and has run nothing");
+    await h.post("release", { lease: b.lease });
+
+    await reportObserved(h, [observedRun({ startedAtMs: Date.now() - 65_000 })]);
+    const c = h.pair();
+    assert.equal((await h.acquire("run-c", "c", c)).status, 202);
+    await reportObserved(h, []);
+    await h.post("release", { lease: c.lease });
+
+    await writeFile(h.loadFile, "7");
+    const d = h.pair();
+    assert.equal((await h.acquire("run-d", "d", d)).status, 202);
+
+    const said = await room.notices();
+    const want = [
+      /^HEAVY RUN: Claude Code started a2440000-0000-4000-8000-000000000001 runs\.$/,
+      /^HEAVY RUN: run-b is waiting behind Claude Code to run b\.$/,
+      /^HEAVY RUN: Claude Code's a2440000-0000-4000-8000-000000000001 runs finished \(\d+s\)\.$/,
+      /^HEAVY RUN: Terminal started cargo test\|build\|check, outside the queue\.$/,
+      /^HEAVY RUN: run-c is waiting behind Terminal to run c\.$/,
+      /^HEAVY RUN: Terminal's cargo test\|build\|check finished \(1m \d+s\)\.$/,
+      /^HEAVY RUN: run-d is waiting for the load to drop \(7 > 5\) to run d\.$/,
+    ];
+    assert.equal(said.length, want.length, said.join("\n"));
+    want.forEach((pattern, index) => assert.match(said[index], pattern));
+    // A reservation that ran nothing (B was granted, then released before activating) is no run.
+    assert.ok(!said.some((text) => text.includes("run-b started")));
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("room notices C5: a heavy-run notice wakes nobody — no frame to a watch, no end to a wait — and is read on the next collect", async () => {
+  const h = await heavyHarness("room-quiet");
+  try {
+    await h.start();
+    const founder = "a2440000-0000-4000-8000-000000000011";
+    const room = await heavyRoom(h, founder);
+    const frames = [];
+    const controller = new AbortController();
+    const stream = await fetch(`${h.base}/mail/${room.code}/events?as=${founder}`, { headers: { "x-gyredeck-token": room.password }, signal: controller.signal });
+    assert.equal(stream.status, 200);
+    (async () => {
+      const decoder = new TextDecoder();
+      try { for await (const chunk of stream.body) frames.push(...decoder.decode(chunk).split("\n").filter((line) => line.startsWith("data: "))); } catch {}
+    })();
+    // Premise: nothing is waiting to be collected, so only something new could end a wait.
+    await fetch(`${h.base}/mail/inbox?as=${founder}&collect=1`, { headers: { "x-gyredeck-token": h.token() } });
+    const drained = await fetch(`${h.base}/mail/inbox?as=${founder}`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    assert.equal((drained.messages ?? []).length, 0, JSON.stringify(drained.messages));
+    const waited = fetch(`${h.base}/mail/wait?as=${founder}&timeout=2`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+
+    await reportObserved(h, [observedRun()]);
+    await reportObserved(h, []);
+    const wait = await waited;
+    assert.equal(wait.timedOut, true, "the held wait was not ended by the notices");
+    // Readable all the same, on the next collect.
+    const collected = await fetch(`${h.base}/mail/inbox?as=${founder}&collect=1`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    assert.ok((collected.messages ?? []).some((m) => m.text.startsWith("HEAVY RUN: Terminal started")), JSON.stringify(collected.messages));
+
+    // Control: a tell to the room does reach the same watch and ends a wait.
+    const appCall = (path, body) => fetch(`${h.base}${path}`, {
+      method: "POST", headers: { "content-type": "application/json", "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD }, body: JSON.stringify(body),
+    });
+    const peer = "a2440000-0000-4000-8000-000000000012";
+    await appCall(`/sync/rooms/${room.code}/members`, { conversationId: peer });
+    await appCall(`/sync/rooms/${room.code}/confirm`, { conversationId: peer, password: room.password });
+    // The join's roster notices are drained first, so only the tell below can end this wait.
+    await fetch(`${h.base}/mail/inbox?as=${founder}&collect=1`, { headers: { "x-gyredeck-token": h.token() } });
+    const wakes = fetch(`${h.base}/mail/wait?as=${founder}&timeout=10`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const told = await appCall(`/mail/${room.code}`, { from: peer, text: "control", kind: "tell", to: founder });
+    assert.equal(told.status, 202, await told.clone().text());
+    const woken = await wakes;
+    assert.equal(woken.timedOut, false, "premise: this wait can be woken");
+    assert.ok((woken.messages ?? []).some((m) => m.text === "control"), "and it was the tell that woke it");
+    await until(() => frames.some((frame) => frame.includes("control")), "premise: this watch receives frames");
+    assert.ok(!frames.some((frame) => frame.includes("HEAVY RUN")), frames.join("\n"));
+    controller.abort();
+
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("rules v9: the Heavy runs section asks for light work while a run holds the slot", async () => {
+  const { roomRules, ROOM_RULES_VERSION } = await heavyModule();
+  assert.equal(ROOM_RULES_VERSION, 9);
+  const rules = roomRules("http://127.0.0.1:1");
+  const section = rules.slice(rules.indexOf("## Heavy runs"));
+  assert.ok(section.startsWith("## Heavy runs"), "premise: the section agy is pointed at");
+  assert.match(section, /While a heavy run holds the slot — yours or anyone's — do light work only/);
 });

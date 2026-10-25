@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 8;
+export const ROOM_RULES_VERSION = 9;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -299,6 +299,8 @@ ${HEAVY_COMMANDS.map((name) => `\`${name}\``).join(", ")}. Run each one through 
 — for example \`-- pnpm test:demo --workers=3\`. It waits for the slot, and for the 1-minute load to
 be ${HEAVY_LOAD_LIMIT} or less (for at most 10 minutes), runs the command, and exits with its code. While it
 waits it prints its place in line: leave it running, and do not start the command another way.
+While a heavy run holds the slot — yours or anyone's — do light work only: read, edit, and run small
+commands, and start nothing heavy another way. The room says when a run starts, who waits, and when it ends.
 ${HEAVY_LIMIT_TEXT}
 `;
 
@@ -4952,6 +4954,8 @@ function startBridge(config) {
         // An acknowledgement or a room notice is still published and still readable; it
         // simply does not cost anyone a turn.
         if (res.gyredeckWatcher && !wakesMember(message, res.gyredeckWatcher)) continue;
+        // A quiet notice (#244) is read on the next collect and costs nobody a turn.
+        if (res.gyredeckWatcher && routing?.quiet === true) continue;
         res.write(frame);
         pushed = true;
         // A wake-only watch ends with the first frame it is sent (#159): ending is what
@@ -5039,7 +5043,7 @@ function startBridge(config) {
         });
       }
     }
-    wakeMailWaiters();
+    if (routing?.quiet !== true) wakeMailWaiters();
     return message;
   };
 
@@ -5623,7 +5627,42 @@ function startBridge(config) {
     return true;
   };
 
+  /**
+   * Heavy runs said to every open room (#244): when one starts, when someone has to wait,
+   * and when one ends — helper runs and observed runs alike, named as Settings names them.
+   * Informational and quiet: published to be read on each member's next collect, never
+   * streamed to a watcher, pushed into Codex, or used to end a wait.
+   */
+  const heavyDuration = (ms) => {
+    const seconds = Math.max(0, Math.round(ms / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+    return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  };
+  const tellRoomsOfHeavy = (text) => {
+    for (const room of mailRooms.values()) {
+      if (room.members.size === 0) continue;
+      publishMail(room, ROOM_SENDER, `HEAVY RUN: ${text}`, null, false, { kind: "notice", quiet: true });
+    }
+  };
+  const holderLabel = (holder) => heavyLabelFor(holder.as) ?? holder.as;
+  const heavyEnded = (holder) => {
+    if (holder?.state !== "active") return;
+    tellRoomsOfHeavy(`${holderLabel(holder)}'s ${holder.what} finished (${heavyDuration(heavyNow() - holder.startedAt)}).`);
+  };
+  const observedKey = (run) => `${run.pid}:${run.startedAtMs}`;
+  /** Who a newcomer waits behind: the holder, an observed run, or the load. */
+  const waitingBehind = () => {
+    if (heavyHolder) return `behind ${holderLabel(heavyHolder)}`;
+    const observed = observedRuns()[0];
+    if (observed) return `behind ${observedLabelFor(observed)}`;
+    const load = heavyLoad();
+    return `for the load to drop (${Math.round(load * 10) / 10} > ${HEAVY_LOAD_LIMIT})`;
+  };
+
   const freeHeavy = () => {
+    heavyEnded(heavyHolder);
     heavyHolder = null;
     persistHeavyHolder();
     promoteHeavy();
@@ -5672,10 +5711,15 @@ function startBridge(config) {
       heavyHolder = null;
       persistHeavyHolder();
     } else if (heavyHolder?.state === "active" && (verify && heavyHolder.pgidStart !== null ? heavyGroupState(heavyHolder.pgid, heavyHolder.pgidStart) === "gone" : !groupAlive(heavyHolder.pgid))) {
+      heavyEnded(heavyHolder);
       heavyHolder = null;
       persistHeavyHolder();
     }
-    if (heavyObserved.runs.length > 0 && observedRuns().length === 0) heavyObserved = { runs: [], at: -Infinity };
+    if (heavyObserved.runs.length > 0 && observedRuns().length === 0) {
+      // The app went quiet: its runs are over as far as anyone can tell.
+      for (const run of heavyObserved.runs) observedEnded(run);
+      heavyObserved = { runs: [], at: -Infinity };
+    }
     for (let index = heavyQueue.length - 1; index >= 0; index -= 1) {
       const entry = heavyQueue[index];
       const polling = [...heavyPolls].some((poll) => poll.ticket === entry.ticket);
@@ -5697,6 +5741,7 @@ function startBridge(config) {
   /** Named as holders are (#243): the session that started it, its agent alone, or "Terminal" when no agent did. */
   const observedLabelFor = (run) =>
     (run.session ? heavyLabelFor(run.session) : null) ?? (run.kind ? OBSERVED_KIND_LABELS[run.kind] : "Terminal");
+  const observedEnded = (run) => tellRoomsOfHeavy(`${observedLabelFor(run)}'s ${run.pattern} finished (${heavyDuration(Date.now() - run.startedAtMs)}).`);
 
   const describeHeavy = () => {
     const now = heavyNow();
@@ -5733,6 +5778,7 @@ function startBridge(config) {
         exe: run.exe,
         cwd: run.cwd,
         label: observedLabelFor(run),
+        startedAtMs: run.startedAtMs,
         elapsedMs: Math.max(0, Date.now() - run.startedAtMs),
       })),
       waiting: heavyPolls.size,
@@ -6097,6 +6143,10 @@ function startBridge(config) {
             session,
           };
         });
+        const before = new Set(observedRuns().map(observedKey));
+        const now = new Set(reported.map(observedKey));
+        for (const run of observedRuns()) if (!now.has(observedKey(run))) observedEnded(run);
+        for (const run of reported) if (!before.has(observedKey(run))) tellRoomsOfHeavy(`${observedLabelFor(run)} started ${run.pattern}, outside the queue.`);
         heavyObserved = { runs: reported, at: heavyNow() };
         for (const run of reported) if (run.session) nudgeHeavySession(run.session, run.pattern);
         promoteHeavy();
@@ -6182,6 +6232,7 @@ function startBridge(config) {
           sendJson(200, heavyGranted(heavyHolder.loadSkipped, lease));
           return;
         }
+        tellRoomsOfHeavy(`${heavyLabelFor(as) ?? as} is waiting ${waitingBehind()} to run ${what}.`);
         sendJson(202, heavyQueued(heavyQueue.length - 1));
         return;
       }
@@ -6297,6 +6348,7 @@ function startBridge(config) {
           return;
         }
         heavyFault("activate");
+        tellRoomsOfHeavy(`${holderLabel(heavyHolder)} started ${heavyHolder.what}.`);
         sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, state: "active" });
         return;
       }

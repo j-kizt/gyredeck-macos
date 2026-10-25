@@ -401,6 +401,13 @@ const waitForMail = async (secondsArg, expected) => {
   // Nothing-arrived is said only on the strength of a collect that was served and empty;
   // a wait that never got an answer is refused, not quiet.
   let served = false;
+  // Quiet messages (#244) collected along the way end no wait; they are printed with what
+  // does, or on their own when the wait runs out (still exit 4: nothing woke it).
+  const quiet = [];
+  const timedOut = () => {
+    if (quiet.length > 0) process.stdout.write(`${JSON.stringify({ ok: true, timedOut: true, messages: quiet })}\n`);
+    return 4;
+  };
   for (;;) {
     const judged = judgeBrokerAnswer(await askBroker({ collect: { limit: MAIL_MAX_STEPS } }));
     if (judged.fallback) {
@@ -423,14 +430,20 @@ const waitForMail = async (secondsArg, expected) => {
     served = true;
     const messages = Array.isArray(result.messages) ? result.messages : [];
     const missed = Array.isArray(result.missed) ? result.missed : [];
+    if (messages.length > 0 && missed.length === 0 && messages.every((message) => message?.quiet === true)) {
+      quiet.push(...messages);
+      await ackDelivery(result, remainingMs() + BROKER_DEADLINE_MS);
+      if (remainingMs() === 0) return timedOut();
+      continue;
+    }
     if (messages.length > 0 || missed.length > 0) {
       // Printed before it is acknowledged: a wait cut short here hands the batch over
       // again next time — a duplicate, never a loss.
-      process.stdout.write(`${JSON.stringify({ ok: true, timedOut: false, ...result })}\n`);
+      process.stdout.write(`${JSON.stringify({ ok: true, timedOut: false, ...result, messages: [...quiet, ...messages] })}\n`);
       await ackDelivery(result, remainingMs() + BROKER_DEADLINE_MS);
       return 0;
     }
-    if (remainingMs() === 0) return served ? 4 : refused("the broker did not answer within the wait");
+    if (remainingMs() === 0) return served ? timedOut() : refused("the broker did not answer within the wait");
     await new Promise((resolve) => setTimeout(resolve, Math.min(WAIT_POLL_MS, remainingMs())));
   }
 };

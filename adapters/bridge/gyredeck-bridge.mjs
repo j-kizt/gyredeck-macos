@@ -4860,7 +4860,10 @@ function startBridge(config) {
    * functions are kept apart because the distinction is real and may be wanted again;
    * today they agree.
    */
-  const wakesMember = (message, conversationId) => reachesMember(message, conversationId);
+  // A quiet message (#244: the room's heavy-run notices) wakes nobody, by any path — a live
+  // push, a resumed watch's replay, a held wait, a push into Codex. It is still collected.
+  // Decided here, once, on the message itself, so no path can forget it (#244 audit).
+  const wakesMember = (message, conversationId) => message.quiet !== true && reachesMember(message, conversationId);
 
   /**
    * The same tell from the same sender to the same address within a minute, if there is
@@ -4933,6 +4936,7 @@ function startBridge(config) {
       text,
       replyTo: replyTo ?? null,
       ts: new Date().toISOString(),
+      ...(routing?.quiet === true ? { quiet: true } : {}),
     };
     room.messages.push(message);
     // Notices first, against their own allowance, so the room's own voice can never cost
@@ -4954,8 +4958,6 @@ function startBridge(config) {
         // An acknowledgement or a room notice is still published and still readable; it
         // simply does not cost anyone a turn.
         if (res.gyredeckWatcher && !wakesMember(message, res.gyredeckWatcher)) continue;
-        // A quiet notice (#244) is read on the next collect and costs nobody a turn.
-        if (res.gyredeckWatcher && routing?.quiet === true) continue;
         res.write(frame);
         pushed = true;
         // A wake-only watch ends with the first frame it is sent (#159): ending is what
@@ -5043,7 +5045,7 @@ function startBridge(config) {
         });
       }
     }
-    if (routing?.quiet !== true) wakeMailWaiters();
+    wakeMailWaiters();
     return message;
   };
 
@@ -5240,7 +5242,7 @@ function startBridge(config) {
     // for it — the same choice every other member makes for itself at its watch.
     const carries = (recipient) =>
       !routing ||
-      wakesMember({ from, to: routing.to ?? MAIL_EVERYONE, kind: routing.kind ?? MAIL_DEFAULT_KIND }, recipient);
+      wakesMember({ from, to: routing.to ?? MAIL_EVERYONE, kind: routing.kind ?? MAIL_DEFAULT_KIND, quiet: routing.quiet }, recipient);
     const recipients = room.members.size > 0
       // Nobody is delivered their own message, and a notice from the room itself goes
       // to everyone.
@@ -6937,7 +6939,9 @@ function startBridge(config) {
           ? Math.min(requested, MAIL_MAX_MESSAGES)
           : MAIL_MAX_MESSAGES;
 
-        const collectInbox = () => {
+        // `wakingOnly`: a held wait takes nothing until something in it would wake this
+        // session — then the batch carries what came quietly before it too.
+        const collectInbox = ({ wakingOnly = false } = {}) => {
           const at = new Date().toISOString();
           const sync = syncRoomFor(as);
           // A session's own mailbox is always its own to read. Its room is not: reading
@@ -6991,6 +6995,10 @@ function startBridge(config) {
           // another's.
           fresh.sort((left, right) => (left.ord ?? 0) - (right.ord ?? 0));
           const collected = fresh.slice(0, limit);
+          const own = mailRoomFor(as, false);
+          if (wakingOnly && missed.length === 0 && !collected.some((message) => (message.room === as && own ? message.quiet !== true : wakesMember(message, as)))) {
+            return { collected: [], sync, missed: [] };
+          }
 
           if (collect) {
             for (const [roomName, room] of sources) {
@@ -7042,7 +7050,7 @@ function startBridge(config) {
             });
           };
 
-          const first = collectInbox();
+          const first = collectInbox({ wakingOnly: true });
           if (first.collected.length > 0) {
             answer(first.collected, first.sync, false, first.missed);
             return;
@@ -7079,7 +7087,7 @@ function startBridge(config) {
             // A request already gone must not have its position advanced: collect=1
             // would mark messages delivered into a socket nobody is reading.
             if (done || req.destroyed) return;
-            const next = collectInbox();
+            const next = collectInbox({ wakingOnly: true });
             if (next.collected.length > 0) finish(next.collected, next.sync, false, next.missed);
           };
           // A client that hangs up must not leave a timer and a closure behind, and

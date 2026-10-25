@@ -324,10 +324,13 @@ const waitForMail = async (secondsArg, expected) => {
   // `timedOut: true` is said only on the strength of at least one collect that was
   // served and found nothing; a wait that never got an answer is withheld, not empty.
   let last = null;
+  // Quiet messages (#244) collected along the way: they end no wait, and are handed over
+  // with whatever does, or with the timeout.
+  const quiet = [];
   for (;;) {
     if (remainingMs() === 0) {
       return last
-        ? deliver({ ok: true, timedOut: true, yourLastMessage: last.yourLastMessage ?? null, ...last, messages: [] })
+        ? deliver({ ok: true, timedOut: true, yourLastMessage: last.yourLastMessage ?? null, ...last, messages: quiet })
         : withheld("the broker did not answer within the wait");
     }
     const judged = judgeBrokerAnswer(await askBroker({ collect: { limit: MAIL_MAX_MESSAGES } }, Math.min(BROKER_DEADLINE_MS, Math.max(1, remainingMs()))));
@@ -355,18 +358,24 @@ const waitForMail = async (secondsArg, expected) => {
     // was dropped before it could be handed over — both are things to act on.
     const messages = Array.isArray(result.messages) ? result.messages : [];
     const missed = Array.isArray(result.missed) ? result.missed : [];
+    if (messages.length > 0 && missed.length === 0 && messages.every((message) => message?.quiet === true)) {
+      quiet.push(...messages);
+      await ackDelivery(result, remainingMs());
+      last = result;
+      continue;
+    }
     if (messages.length > 0 || missed.length > 0) {
       // The output is prepared before anything is acknowledged, and the acknowledgement
       // gets only what is left of the wait: if nothing is, the batch is printed
       // unacknowledged and comes again next time — a duplicate, never a loss.
-      const prepared = `${JSON.stringify({ ok: true, timedOut: false, ...result })}\n`;
+      const prepared = `${JSON.stringify({ ok: true, timedOut: false, ...result, messages: [...quiet, ...messages] })}\n`;
       await ackDelivery(result, remainingMs());
       process.stdout.write(prepared);
       return 0;
     }
     last = result;
     if (remainingMs() <= WAIT_POLL_MS) {
-      return deliver({ ok: true, timedOut: true, yourLastMessage: last.yourLastMessage ?? null, ...result, messages: [] });
+      return deliver({ ok: true, timedOut: true, yourLastMessage: last.yourLastMessage ?? null, ...result, messages: quiet });
     }
     await new Promise((resolve) => setTimeout(resolve, Math.min(WAIT_POLL_MS, remainingMs())));
   }

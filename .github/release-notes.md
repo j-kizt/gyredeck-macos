@@ -1,5 +1,20 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Antigravity keeps room passwords off disk, joins on its own, and remembers what it was asked — (v1.24.2)
+
+### Fixes
+
+- **The Antigravity diagnostic log no longer stores what you type.** With the payload-shape
+  diagnostic switched on, short text such as a pasted room password was written to its log as-is.
+  It now records only each value's length, and a log left by an older version is emptied the next
+  time it writes.
+- **Antigravity joins a room as soon as you paste its password.** The hook confirms the password
+  itself, as Claude's hook does, and tells the session in that same turn that it is in. A wrong
+  password is named as refused, and the password is never repeated back.
+- **Antigravity no longer forgets a request or the heavy-run helper after one turn.** What the hook
+  shows Antigravity lasts only one turn. Each delivery now ends with a command that re-reads the
+  room's messages. The heavy-run notice points at the rules file, so the answer stays with the session.
+
 ## Heavy runs fit the window and stop safely, and Antigravity always sees how to join — (v1.24.1)
 
 ### Fixes

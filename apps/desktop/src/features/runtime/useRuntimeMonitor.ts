@@ -30,7 +30,7 @@ export const useRuntimeMonitor = ({ canUseNativeControls, demoMode, registry, se
     if (servicesLoadingRef.current || servicesControlInFlightRef.current) return;
     const requestVersion = servicesRequestVersionRef.current + 1;
     servicesRequestVersionRef.current = requestVersion;
-    if (demoMode) {
+    if (import.meta.env.DEV && demoMode) {
       if (servicesRequestVersionRef.current === requestVersion) {
         setServices(createDemoLocalServices().filter((service) => !demoStoppedProcessKeysRef.current.has(localServiceProcessKey(service))));
         setServicesError(null);
@@ -62,7 +62,7 @@ export const useRuntimeMonitor = ({ canUseNativeControls, demoMode, registry, se
   }, [canUseNativeControls, demoMode]);
 
   const controlLocalService = useCallback(async (request: ILocalServiceControlRequest): Promise<ILocalServiceControlResult> => {
-    if (demoMode) {
+    if (import.meta.env.DEV && demoMode) {
       const result: ILocalServiceControlResult = {
         processId: request.processId,
         bindAddress: request.bindAddress,

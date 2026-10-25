@@ -67,7 +67,7 @@ export const useAgentUsageList = (
   const fetchProvider = async (
     provider: IUsageProviderConfig,
   ): Promise<void> => {
-    if (demoMode) {
+    if (import.meta.env.DEV && demoMode) {
       setUsages((current) => ({
         ...current,
         [provider.id]: createDemoAgentUsage(provider),

@@ -14,7 +14,6 @@ import {
   formatTime,
   getEventActivity,
   getEventDetail,
-  projectName,
   shortenPath,
 } from "./features/session/activity";
 import { DONE_SIGNAL_MS, STALE_AFTER_MS } from "./features/session/constants";
@@ -54,7 +53,10 @@ import "./styles.css";
 
 const KEEP_AWAKE_STORAGE_KEY = "gyredeck.keep-awake-while-working";
 const SEARCH_PARAMS = new URLSearchParams(window.location.search);
-const DEMO_MODE = SEARCH_PARAMS.has("demo");
+// The demo runs only on the vite dev server (test:demo, the session benchmark). Gated on
+// DEV here and again at each hook's demo branch, so the fixtures drop out of the
+// production bundle instead of shipping as dead code, about 2.8 kB gzip (#233).
+const DEMO_MODE = import.meta.env.DEV && SEARCH_PARAMS.has("demo");
 const DEMO_SCENARIO = SEARCH_PARAMS.get("demoScenario");
 const LocalServicesPanel = lazy(async () => {
   const module = await import("./features/runtime/components");
@@ -153,9 +155,6 @@ const App = () => {
   const updater = useUpdater();
   const isConnected = connection.status === "connected";
   const connectionTitle = DEMO_MODE ? "Demo mode" : (connection.message ?? connection.status);
-  const workspace = shortenPath(presence.cwd);
-  const project = projectName(presence.cwd);
-  const model = presence.model?.split("/").slice(-1)[0] ?? "Claude Code";
   const { names: sessionNames, rename: renameSession } = useSessionNames(canUseNativeControls);
   const allSessions = useMemo(
     () =>

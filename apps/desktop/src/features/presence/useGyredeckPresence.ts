@@ -608,7 +608,7 @@ export const useGyredeckPresence = ({
       setContextUsage((current) => collectContextUsage(current, events));
     };
 
-    if (demoMode) {
+    if (import.meta.env.DEV && demoMode) {
       setConnection({ status: "connected", message: "Demo mode" });
       setCapabilities({
         ...createDefaultBridgeCapabilities(),

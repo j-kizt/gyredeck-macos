@@ -22,11 +22,18 @@ const assetRoot = join(distRoot, "assets");
  *
  * Raising it again should mean the same thing it meant this time: a deliberate decision
  * with the reason written down, never a number edited to match whatever was measured.
+ *
+ * The total one was added on 2026-10-26 (#233). The ceiling above reads the largest chunk
+ * only, so moving code into a lazy chunk passes it while the app ships just as much: React
+ * 19.3 could have been paid for by splitting rather than by trimming. 115,075 is main's
+ * total that day, 114,874, plus the 201 bytes of headroom the largest-chunk ceiling had
+ * over main's 111,799 at the same moment, so the two leave the same room.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
   jsGzipBytes: 112_000,
+  jsTotalGzipBytes: 115_075,
 };
 
 const walk = async (directory) => {
@@ -59,6 +66,9 @@ const largestAsset = (extension) => assets
 const css = largestAsset(".css");
 const js = largestAsset(".js");
 if (!css || !js) throw new Error("desktop build is missing its primary CSS or JavaScript asset");
+const jsTotalGzipBytes = assets
+  .filter((asset) => asset.name.endsWith(".js"))
+  .reduce((sum, asset) => sum + asset.gzipBytes, 0);
 
 const dist = await walk(distRoot);
 const coreDistBytes = dist.bytes;
@@ -70,6 +80,7 @@ const payload = {
     coreDistBytes,
     distFiles: dist.files,
     jsGzipBytes: js.gzipBytes,
+    jsTotalGzipBytes,
   },
 };
 
@@ -77,4 +88,5 @@ console.log(JSON.stringify(payload, null, 2));
 
 if (css.gzipBytes > BUDGETS.cssGzipBytes) throw new Error(`CSS gzip budget exceeded: ${css.gzipBytes} > ${BUDGETS.cssGzipBytes}`);
 if (js.gzipBytes > BUDGETS.jsGzipBytes) throw new Error(`JavaScript gzip budget exceeded: ${js.gzipBytes} > ${BUDGETS.jsGzipBytes}`);
+if (jsTotalGzipBytes > BUDGETS.jsTotalGzipBytes) throw new Error(`JavaScript total gzip budget exceeded: ${jsTotalGzipBytes} > ${BUDGETS.jsTotalGzipBytes}`);
 if (coreDistBytes > BUDGETS.coreDistBytes) throw new Error(`desktop core dist budget exceeded: ${coreDistBytes} > ${BUDGETS.coreDistBytes}`);

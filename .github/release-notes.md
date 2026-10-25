@@ -1,5 +1,16 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A smaller app window, with a guard on its total size — (v1.24.3)
+
+### Changed
+
+- **The window's code is about 6 kB smaller.** The check for whether the window is showing, made
+  before each notification, no longer pulls in a whole window library. The demo data used for
+  development no longer ships inside the app.
+- **The size check now counts all of the window's code, not only its largest file.** Splitting code
+  into more files can no longer hide growth. The app stays on React 19.2 for now: React 19.3 would
+  add about 8.6 kB, more than this release saves.
+
 ## Antigravity keeps room passwords off disk, joins on its own, and remembers what it was asked — (v1.24.2)
 
 ### Fixes

@@ -5,7 +5,7 @@ import { appendFile, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeF
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { createServer } from "node:net";
+import { connect as netConnect, createServer } from "node:net";
 import { randomBytes, randomUUID } from "node:crypto";
 import test from "node:test";
 
@@ -796,6 +796,9 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     assert.deepEqual(body, [
       { ephemeralMessage: "[gyredeck mail · from codex · tell] build is green" },
       { ephemeralMessage: "[gyredeck mail · from claude-code · tell] ack" },
+      // Mail outside a room cannot be read again by a session the broker holds, and agy
+      // sees these steps in this invocation only, so it is told to note it now (#251).
+      { ephemeralMessage: "Ephemeral: the mail above from outside a room is shown in this invocation only and cannot be read again. If you cannot finish what it asks now, note it now." },
     ]);
 
     // The hook keeps no memory between runs. What stops the next invocation
@@ -864,12 +867,15 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     assert.match(singleHeader.ephemeralMessage, /1 new Gyredeck mail message from codex\./);
     assert.deepEqual(single, [
       { ephemeralMessage: "[gyredeck mail · from codex · tell] one more" },
+      // The note for mail outside a room, as above (#251).
+      { ephemeralMessage: "Ephemeral: the mail above from outside a room is shown in this invocation only and cannot be read again. If you cannot finish what it asks now, note it now." },
     ]);
 
     // A burst is capped per invocation; the remainder keeps its place in the room.
     for (let index = 0; index < 14; index += 1) await send("codex", `bulk-${index}`);
     const first = await preInvocation(4);
-    assert.equal(first.length, 11, "header plus ten messages");
+    // Header, ten messages, and the note for mail outside a room (#251).
+    assert.equal(first.length, 12, "header plus ten messages, then the note");
     assert.equal(first[1].ephemeralMessage, "[gyredeck mail · from codex · tell] bulk-0");
     const rest = (await preInvocation(5)).slice(1);
     assert.deepEqual(rest.map((step) => step.ephemeralMessage), [
@@ -877,6 +883,7 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
       "[gyredeck mail · from codex · tell] bulk-11",
       "[gyredeck mail · from codex · tell] bulk-12",
       "[gyredeck mail · from codex · tell] bulk-13",
+      "Ephemeral: the mail above from outside a room is shown in this invocation only and cannot be read again. If you cannot finish what it asks now, note it now.",
     ]);
 
     // With the bridge gone the hook must still answer, and quickly: this response
@@ -10347,7 +10354,10 @@ test("heavy P1-a: Antigravity outside a room, with no usage reading, is told abo
     };
     const first = await steps();
     assert.equal(first.length, 1, JSON.stringify(first));
-    assert.match(first[0], new RegExp(`^HEAVY RUNS: .*gyredeck-heavy\\.mjs --as ${me} --what`));
+    // agy is handed a command, not the usage: its steps last one invocation, and the
+    // command's output — the rules' Heavy runs section and its own id — stays (#251).
+    assert.match(first[0], /^HEAVY RUNS: /);
+    assert.ok(first[0].includes(`echo "your id: ${me}"; sed -n '/^## Heavy runs/,$p' ~/.config/gyredeck/room-rules.md`), first[0]);
     assert.deepEqual(await steps(), [], "once");
   } finally {
     await h.cleanup();
@@ -10727,17 +10737,21 @@ test("the Antigravity payload-shape log records lengths, never values, and empti
  * proxy that counts every confirm it carries — so "sent nothing" and "sent once" are
  * counted, not inferred from what the bridge happens to say.
  */
-const agyPasteFixture = async (tag, { breakInbox = false } = {}) => {
+const agyPasteFixture = async (tag, { breakInbox = false, inboxBody = null, bound = false, rulesBlocked = false } = {}) => {
   const home = await mkdtemp(join(tmpdir(), `gyredeck-250-${tag}-`));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const bridgePort = await freePort();
+  // A directory where the rules file goes: the bridge cannot write it (#251).
+  if (rulesBlocked) await mkdir(join(home, ...CONFIG_DIR, "room-rules.md"), { recursive: true });
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
     ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(bridgePort), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
     { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
   );
-  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  const founder = "a2500000-0000-4000-8000-000000000001";
+  const agy = "a2500000-0000-4000-8000-000000000002";
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\n${bound ? `broker-bound ${agy}\n` : ""}broker-ready\n`);
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   const confirms = [];
   const proxy = createHttpServer((req, res) => {
@@ -10754,17 +10768,36 @@ const agyPasteFixture = async (tag, { breakInbox = false } = {}) => {
       } else { res.writeHead(500); res.end(); }
       return;
     }
+    const rewrite = inboxBody && req.url.startsWith("/mail/inbox") ? inboxBody : null;
     const upstream = httpRequest({ hostname: "127.0.0.1", port: bridgePort, path: req.url, method: req.method, headers: req.headers }, (answer) => {
-      res.writeHead(answer.statusCode ?? 502, answer.headers);
-      answer.pipe(res);
+      if (!rewrite) {
+        res.writeHead(answer.statusCode ?? 502, answer.headers);
+        answer.pipe(res);
+        return;
+      }
+      let text = "";
+      answer.setEncoding("utf8");
+      answer.on("data", (chunk) => { text += chunk; });
+      answer.on("end", () => {
+        const body = JSON.stringify(rewrite(JSON.parse(text)));
+        res.writeHead(answer.statusCode ?? 502, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+        res.end(body);
+      });
     });
     upstream.on("error", () => { res.writeHead(502); res.end(); });
     req.pipe(upstream);
   });
   await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
   await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port: proxy.address().port }));
-  const founder = "a2500000-0000-4000-8000-000000000001";
-  const agy = "a2500000-0000-4000-8000-000000000002";
+  // Premise: with no broker running, the hook must see none (ENOENT) and fall back to TCP.
+  // A long temp path makes the same connect fail with ENOTSOCK, which the hook rightly reads
+  // as a broken broker, and every test here would then run the withheld path unawares.
+  const probe = await new Promise((resolve) => {
+    const socket = netConnect(join(home, ...CONFIG_DIR, "broker", "gyredeck.broker.sock"));
+    socket.on("error", (error) => resolve(error.code));
+    socket.on("connect", () => { socket.destroy(); resolve("connected"); });
+  });
+  assert.equal(probe, "ENOENT", `premise: no broker at this home (tag "${tag}" may be too long)`);
   await waitForHealth(bridgePort, stderrRef);
   const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
   const call = async (method, path, body) => {
@@ -10799,7 +10832,8 @@ const agyPasteFixture = async (tag, { breakInbox = false } = {}) => {
       child.on("close", (code) => resolve({ code, stdout, stderr }));
     });
     assert.equal(result.code, 0, result.stderr);
-    return { text: (JSON.parse(result.stdout).injectSteps ?? []).map((step) => step.ephemeralMessage ?? "").join("\n"), stdout: result.stdout, stderr: result.stderr };
+    const steps = (JSON.parse(result.stdout).injectSteps ?? []).map((step) => step.ephemeralMessage ?? "");
+    return { text: steps.join("\n"), steps, stdout: result.stdout, stderr: result.stderr };
   };
   const confirmed = async () => (await call("GET", `/sync/rooms?as=${agy}`)).body.members.find((member) => member.conversationId === agy)?.confirmed === true;
   const close = async () => {
@@ -10808,7 +10842,15 @@ const agyPasteFixture = async (tag, { breakInbox = false } = {}) => {
     await new Promise((resolve) => proxy.close(resolve));
     await rm(home, { recursive: true, force: true });
   };
-  return { home, agy, code, password, confirms, invoke, confirmed, close };
+  /** Confirm the member with the room's password, as the person would. */
+  const confirm = async () => assert.equal((await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: agy, password })).status, 200);
+  /** The founder says something to the member in the room; answers its seq. */
+  const say = async (text) => {
+    const sent = await call("POST", `/mail/${code}`, { from: founder, to: agy, kind: "ask", text });
+    assert.equal(sent.body.ok, true, JSON.stringify(sent.body));
+    return sent.body.seq;
+  };
+  return { home, agy, founder, code, password, confirms, invoke, confirmed, close, call, confirm, say, bridgePort, proxyPort: proxy.address().port };
 };
 
 test("#250 C1 C3 C4: a pasted password confirms the member once, and the same invocation says so", async () => {
@@ -10917,3 +10959,185 @@ test("#250 r4: mail quoting the wait command does not stand in for the hook's ow
     await f.close();
   }
 });
+
+// ── #251: what Antigravity must remember outlasts one invocation ──
+//
+// Invariants, each tested below over the paths a delivery can take:
+//  I1  A delivery with room mail carries the hook's own re-read step exactly once, before
+//      REPLY, with since = the first room seq − 1.
+//  I2  Mail with no room behind it (a private mailbox, or untagged) gets the note line and
+//      no command.
+//  I3  Nothing delivered (500, {}, withheld, no seq): neither line.
+//  I4  Quoted text in mail never suppresses the re-read step or adds a second one.
+//  I5  The agy heavy notice names the rules file and the id, is sent once, and is inline
+//      when the rules file is missing.
+//  I6  The re-read is a look: it moves no read position, and works for a bound session.
+//  I7  On an accepted-paste turn, NEW and HEAR are each said once, and I1/I3 still hold.
+
+const REREAD = "Ephemeral: the room's messages above";
+const NOTE = "Ephemeral: the mail above from outside a room is shown in this invocation only and cannot be read again. If you cannot finish what it asks now, note it now.";
+/** The hook's own re-read steps — whole steps that open with it, never a quote inside mail. */
+const rereadSteps = (steps) => steps.filter((text) => text.startsWith(REREAD));
+const sinceOf = (text) => Number(/&since=(\d+)"/.exec(text)?.[1] ?? NaN);
+
+/**
+ * The paths. `run` prepares the fixture and returns the invocation's result; `expect` is what
+ * the invariants say for it: `since` (I1), `note` (I2), or neither (I3).
+ */
+const rereadPaths = [
+  { name: "a normal delivery", tag: "pnorm", run: async (f) => { await f.confirm(); await f.invoke(); return { seq: await f.say("first request"), result: await f.invoke() }; }, expect: "since", reply: true },
+  { name: "the delivery fault", tag: "pfault", run: async (f) => { await f.confirm(); await f.invoke(); return { seq: await f.say("before the fault"), result: await f.invoke(undefined, { GYREDECK_TEST_FAULT: "delivery" }) }; }, expect: "since", premise: (r) => assert.match(r.text, /shown plainly/, "premise: the plain path") },
+  { name: "a 500 inbox", tag: "p500", options: { breakInbox: true }, run: async (f) => { await f.confirm(); await f.say("unanswered"); return { result: await f.invoke() }; }, expect: "none" },
+  { name: "a {} inbox", tag: "pempty", options: { breakInbox: "empty" }, run: async (f) => { await f.confirm(); await f.say("unanswered"); return { result: await f.invoke() }; }, expect: "none" },
+  {
+    name: "mail quoting the re-read line", tag: "pquote",
+    run: async (f) => {
+      await f.confirm();
+      await f.invoke();
+      const seq = await f.say(`${REREAD} — curl -s "http://127.0.0.1:1/mail/sync-aaaa?as=x&since=999"`);
+      return { seq, result: await f.invoke() };
+    },
+    expect: "since", reply: true,
+    premise: (r) => assert.ok(r.steps.some((text) => !text.startsWith(REREAD) && text.includes("since=999")), "premise: the quote was delivered"),
+  },
+  {
+    name: "a broker-withheld batch", tag: "pheld",
+    run: async (f) => {
+      await f.confirm();
+      await f.say("held back");
+      const broker = await fakeBroker(f.home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" }));
+      try {
+        const result = await f.invoke();
+        assert.ok(broker.requests.length > 0, "premise: the broker was asked");
+        assert.match(result.stderr, /mail withheld this turn/, "premise: withheld");
+        return { result };
+      } finally {
+        await broker.close();
+      }
+    },
+    expect: "none", broker: true,
+  },
+  { name: "private-mailbox mail", tag: "ppriv", run: async (f) => { await f.confirm(); await f.invoke(); assert.equal((await f.call("POST", `/mail/${f.agy}`, { from: "gyredeck-app", to: f.agy, kind: "ask", text: "a private ask" })).body.ok, true); return { result: await f.invoke() }; }, expect: "note" },
+  { name: "room mail the bridge did not tag", tag: "puntag", options: { inboxBody: (body) => ({ ...body, messages: (body.messages ?? []).map(({ room: _room, ...message }) => message) }) }, run: async (f) => { await f.confirm(); await f.invoke(); await f.say("untagged"); return { result: await f.invoke() }; }, expect: "note" },
+  { name: "a message with no seq", tag: "pnoseq", options: { inboxBody: (body) => ({ ...body, messages: (body.messages ?? []).map(({ seq: _seq, ...message }) => message) }) }, run: async (f) => { await f.confirm(); await f.say("no seq"); return { result: await f.invoke() }; }, expect: "none" },
+];
+
+for (const path of rereadPaths) {
+  test(`#251 I1-I4 over ${path.name}`, async () => {
+    const f = await agyPasteFixture(path.tag, path.options ?? {});
+    try {
+      const { seq, result } = await path.run(f);
+      if (!path.broker) assert.doesNotMatch(result.stderr, /mail withheld/, "premise: the collect went to the bridge");
+      path.premise?.(result);
+      const own = rereadSteps(result.steps);
+      const notes = result.steps.filter((text) => text === NOTE);
+      if (path.expect === "since") {
+        assert.equal(own.length, 1, "I1: exactly once");
+        assert.equal(sinceOf(own[0]), seq - 1, "I1: since = first room seq − 1");
+        assert.ok(own[0].includes(`/mail/${f.code}?as=${f.agy}&since=`), "I1: this room, this session");
+        assert.equal(notes.length, 0, "I2: no note with a room");
+        if (path.reply) {
+          const reply = result.steps.findIndex((text) => text.startsWith("The mail above is addressed to you"));
+          assert.ok(reply > result.steps.indexOf(own[0]), "I1: before REPLY");
+        }
+      } else if (path.expect === "note") {
+        assert.equal(own.length, 0, "I2: no command");
+        assert.equal(notes.length, 1, "I2: the note, once");
+      } else {
+        assert.equal(own.length + notes.length, 0, "I3: neither line when nothing was delivered");
+      }
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test("#251 I6: the re-read is a look, not a take", async () => {
+  const f = await agyPasteFixture("plook");
+  try {
+    await f.confirm();
+    await f.invoke();
+    await f.say("first request");
+    const [own] = rereadSteps((await f.invoke()).steps);
+    const url = /curl -s "([^"]+)"/.exec(own)[1];
+    assert.equal(new URL(url).port, String(f.proxyPort), "the port the hook knows the bridge by");
+    await f.say("second request");
+    const looked = await fetch(url, { headers: { "x-gyredeck-token": f.password } });
+    assert.equal(looked.status, 200);
+    assert.ok((await looked.json()).messages.some((message) => message.text === "first request"), "the message it was asked about comes back");
+    assert.ok((await f.invoke()).text.includes("second request"), "the look moved no read position");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#251 I6: the re-read works for a session the broker holds", async () => {
+  // The broker gate is on collect; a look over TCP is the room's password and membership alone.
+  const f = await agyPasteFixture("pbound", { bound: true });
+  try {
+    await f.confirm();
+    const seq = await f.say("asked while bound");
+    const roomCopy = (await (await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}?as=${f.founder}&since=${seq - 1}`, { headers: { "x-gyredeck-token": f.password } })).json()).messages;
+    const broker = await fakeBroker(f.home, () => ({ v: 1, ok: true, boundTo: f.agy, delivery: 1, room: f.code, members: [], messages: roomCopy.map((message) => ({ room: f.code, ...message })) }));
+    try {
+      const delivered = await f.invoke();
+      assert.ok(broker.requests.some((request) => request.collect), "premise: the broker was asked");
+      assert.ok(delivered.text.includes("asked while bound"), "premise: delivered through the broker");
+      const [own] = rereadSteps(delivered.steps);
+      const looked = await fetch(/curl -s "([^"]+)"/.exec(own)[1], { headers: { "x-gyredeck-token": f.password } });
+      assert.equal(looked.status, 200, "a bound session can still look");
+      assert.ok((await looked.json()).messages.some((message) => message.text === "asked while bound"));
+    } finally {
+      await broker.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+for (const [name, tag, options] of [["the rules written", "hvagy", {}], ["roomRulesReady false", "hvnorule", { rulesBlocked: true }]]) {
+  test(`#251 I5: the agy heavy notice with ${name}`, async () => {
+    const f = await agyPasteFixture(tag, options);
+    try {
+      // Out of the room it was put in, so it is a session in no room.
+      await f.call("DELETE", `/sync/rooms/${f.code}/members/${f.agy}`);
+      const first = await f.invoke();
+      const notices = first.steps.filter((text) => text.startsWith("HEAVY RUNS: "));
+      assert.equal(notices.length, 1, "told");
+      if (options.rulesBlocked) {
+        assert.match(notices[0], new RegExp(`gyredeck-heavy\\.mjs --as ${f.agy} --what`), "inline, as before");
+        assert.doesNotMatch(notices[0], /sed -n/, "no command pointing at a file that is not there");
+      } else {
+        assert.ok(notices[0].includes(`echo "your id: ${f.agy}"; sed -n '/^## Heavy runs/,$p' ~/.config/gyredeck/room-rules.md`), notices[0]);
+        assert.doesNotMatch(notices[0], /--as /, "the helper's usage lives in the rules it is pointed at");
+      }
+      assert.equal((await f.invoke()).steps.filter((text) => text.startsWith("HEAVY RUNS: ")).length, 0, "once");
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+for (const [label, tag, options, env] of [
+  ["normal", "pasteok", {}, {}],
+  ["delivery fault", "pastefl", {}, { GYREDECK_TEST_FAULT: "delivery" }],
+  ["{} inbox", "pasteem", { breakInbox: "empty" }, {}],
+]) {
+  test(`#251 I7: an accepted-paste turn, ${label}`, async () => {
+    const count = (text, needle) => text.split(needle).length - 1;
+    const f = await agyPasteFixture(tag, options);
+    try {
+      await f.say("asked before the paste");
+      const result = await f.invoke(f.password, env);
+      assert.doesNotMatch(result.stderr, /mail withheld/, "premise: the collect went to the bridge");
+      assert.equal(await f.confirmed(), true, "premise: accepted");
+      assert.equal(count(result.text, `while :; do node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 300 ${f.agy};`), 1, "HEAR once");
+      assert.equal(result.steps.filter((text) => text.startsWith("NEW: the password you were just given was accepted")).length, 1, "NEW once");
+      const delivered = result.text.includes("asked before the paste");
+      assert.equal(delivered, label !== "{} inbox", "premise: room mail came with the confirmation, except from {}");
+      assert.equal(rereadSteps(result.steps).length, delivered ? 1 : 0, "the re-read once with room mail, never without");
+    } finally {
+      await f.close();
+    }
+  });
+}

@@ -689,6 +689,37 @@ const confirmLead = (confirm) => {
 };
 
 /**
+ * What makes delivered mail outlast this invocation (#251): agy's steps are seen only in the
+ * invocation they arrive in, so a request it cannot finish now is gone by the next one.
+ * Room messages get one command that looks at them again — a look, not a take: no
+ * `collect`, so nobody's read position moves — from just before the first of them. Mail
+ * outside a room has no such look for a session the broker holds, so it gets a line to note
+ * it now. A message the bridge did not tag with its room counts as outside one.
+ */
+const rereadSteps = (endpoint, as, syncRoom, delivered) => {
+  const inRoom = syncRoom ? delivered.filter((message) => message.room === syncRoom && Number.isInteger(message.seq)) : [];
+  const outside = delivered.filter((message) => !inRoom.includes(message));
+  const steps = [];
+  if (inRoom.length > 0) {
+    const since = Math.min(...inRoom.map((message) => message.seq)) - 1;
+    steps.push({
+      ephemeralMessage:
+        "Ephemeral: the room's messages above are shown in this invocation only. If you cannot finish what they ask now," +
+        " note it, or read them again later — the room's password in place of THE ROOM PASSWORD:\n" +
+        `  curl -s "http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}?as=${as}&since=${since}" -H "x-gyredeck-token: THE ROOM PASSWORD"`,
+    });
+  }
+  if (outside.length > 0) {
+    steps.push({
+      ephemeralMessage:
+        "Ephemeral: the mail above from outside a room is shown in this invocation only and cannot be read again." +
+        " If you cannot finish what it asks now, note it now.",
+    });
+  }
+  return steps;
+};
+
+/**
  * A pasted password's result with what goes with it, for every path that cannot build the
  * full delivery: accepted carries the way to hear the room, refused carries BLOCKED. The
  * result belongs to this invocation alone — agy's steps are seen only in the invocation
@@ -747,6 +778,9 @@ const plainSteps = async (taken) => {
   if (typeof taken.result.missedNote === "string") steps.push({ ephemeralMessage: taken.result.missedNote.slice(0, MAIL_MAX_TEXT) });
   if (typeof taken.result.usageNotice === "string") steps.push({ ephemeralMessage: taken.result.usageNotice.slice(0, MAIL_MAX_TEXT) });
   if (typeof taken.result.heavyNotice === "string") steps.push({ ephemeralMessage: taken.result.heavyNotice.slice(0, MAIL_MAX_TEXT) });
+  if (taken.endpoint && messages.length > 0) {
+    steps.push(...rereadSteps(taken.endpoint, taken.as, typeof taken.result.room === "string" ? taken.result.room : null, messages));
+  }
   return steps;
 };
 
@@ -1000,6 +1034,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
     }),
     ...(usageStep ? [usageStep] : []),
     ...(heavyStep ? [heavyStep] : []),
+    ...rereadSteps(endpoint, room, syncRoom, delivered),
     // Last, so the command is the freshest thing in context when the model acts.
     ...(reply ? [reply] : []),
   ];

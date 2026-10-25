@@ -4119,6 +4119,19 @@ function startBridge(config) {
     `HEAVY RUNS: one at a time on this machine. Run ${HEAVY_COMMANDS.join(", ")} through ` +
     `\`node ${HEAVY_HELPER_DISPLAY_PATH} --as ${conversationId} --what "<what it runs>" -- <command…>\`; ` +
     `it waits for the slot, runs the command and exits with its code. ${HEAVY_LIMIT_TEXT}`;
+  /**
+   * The same, for Antigravity (#251): its injected steps last one invocation, so a notice it
+   * is told once is gone by the time it runs a heavy command. It is given a command instead,
+   * whose output is tool output and stays — the rules' Heavy runs section, and its own id,
+   * which the helper needs and which nothing else in its context will still say. Inline as
+   * before when the rules file could not be written.
+   */
+  const heavyHintForAgy = (conversationId) =>
+    roomRulesReady
+      ? `HEAVY RUNS: one at a time on this machine — ${HEAVY_COMMANDS.join(", ")} go through a helper that waits for the slot. ` +
+        "Run this now; its output stays with you, this notice does not:\n" +
+        `  echo "your id: ${conversationId}"; sed -n '/^## Heavy runs/,$p' ${ROOM_RULES_DISPLAY_PATH}`
+      : heavyHint(conversationId);
   /** Whether this session is still to be told. A confirmed member has the rules and counts as told. */
   const heavyToBeTold = (conversationId) => {
     if (heavyWasTold(conversationId)) return false;
@@ -4134,7 +4147,7 @@ function startBridge(config) {
     if (!heavyToBeTold(conversationId)) return null;
     // Told by being in the answer this collect returns.
     markHeavyTold(conversationId);
-    return heavyHint(conversationId);
+    return provider === "agy" ? heavyHintForAgy(conversationId) : heavyHint(conversationId);
   };
   // Tests only: the reader-lifecycle fixtures count every push a Codex session gets, and
   // this one would be the first of them.

@@ -569,6 +569,7 @@ const plainDelivery = async (taken) => {
   }
   if (typeof taken.result.missedNote === "string") lines.push(taken.result.missedNote.slice(0, MAIL_MAX_TEXT));
   if (typeof taken.result.usageNotice === "string") lines.push(taken.result.usageNotice.slice(0, MAIL_MAX_TEXT));
+  if (typeof taken.result.heavyNotice === "string") lines.push(taken.result.heavyNotice.slice(0, MAIL_MAX_TEXT));
   return lines.length > 0 ? lines.join("\n\n") : null;
 };
 
@@ -633,9 +634,11 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // grant the person just made goes unnoticed.
   // A session outside a room hears about its usage here and nowhere else (#169).
   const usageNotice = typeof result?.usageNotice === "string" ? result.usageNotice.slice(0, MAIL_MAX_TEXT) : null;
+  // And about the machine's heavy-run queue, once (#223).
+  const heavyNotice = typeof result?.heavyNotice === "string" ? result.heavyNotice.slice(0, MAIL_MAX_TEXT) : null;
   if (delivered.length === 0 && !justConfirmed) {
     await ackDelivery(result);
-    return usageNotice;
+    return [usageNotice, heavyNotice].filter(Boolean).join("\n\n") || null;
   }
 
 
@@ -903,6 +906,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   }
 
   if (usageNotice) lines.push(usageNotice);
+  if (heavyNotice) lines.push(heavyNotice);
   const text = lines.join("\n\n");
   await ackDelivery(result);
   return text;

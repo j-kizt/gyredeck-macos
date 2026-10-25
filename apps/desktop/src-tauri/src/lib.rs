@@ -885,6 +885,18 @@ fn set_session_name(conversation_id: String, name: String) -> Result<Option<Stri
     standalone_bridge::set_session_name(&conversation_id, &name)
 }
 
+/// The heavy-run slot and its queue, for the Settings row (#223).
+#[tauri::command]
+fn heavy_status() -> Result<serde_json::Value, String> {
+    standalone_bridge::heavy_status()
+}
+
+/// Free a stuck heavy-run slot. Answers whether anything held it.
+#[tauri::command]
+fn heavy_release(broker: tauri::State<'_, broker::BrokerState>) -> Result<bool, String> {
+    standalone_bridge::heavy_release(&broker.secret()?)
+}
+
 #[tauri::command]
 fn sync_join(broker: tauri::State<'_, broker::BrokerState>, code: String, conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
     standalone_bridge::sync_join(&code, &conversation_id, &broker.secret()?)
@@ -5871,6 +5883,8 @@ pub fn run() {
             set_session_name,
             sync_close,
             sync_leave,
+            heavy_status,
+            heavy_release,
             set_bridge_port,
             claude_usage,
             codex_usage,

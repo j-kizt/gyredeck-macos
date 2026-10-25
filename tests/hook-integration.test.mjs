@@ -10742,8 +10742,12 @@ const agyPasteFixture = async (tag, { breakInbox = false } = {}) => {
   const confirms = [];
   const proxy = createHttpServer((req, res) => {
     if (req.method === "POST" && /^\/sync\/rooms\/[^/]+\/confirm$/.test(req.url)) confirms.push(req.url);
-    // An inbox that answers nothing usable: the hook has no room metadata to build from.
-    if (breakInbox && req.url.startsWith("/mail/inbox")) { res.writeHead(500); res.end(); return; }
+    // An inbox that answers nothing usable: a 500, or a 200 whose body says nothing
+    // (`breakInbox: "empty"`). Either way the hook has no room metadata to build from.
+    if (breakInbox && req.url.startsWith("/mail/inbox")) {
+      if (breakInbox === "empty") { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); } else { res.writeHead(500); res.end(); }
+      return;
+    }
     const upstream = httpRequest({ hostname: "127.0.0.1", port: bridgePort, path: req.url, method: req.method, headers: req.headers }, (answer) => {
       res.writeHead(answer.statusCode ?? 502, answer.headers);
       answer.pipe(res);
@@ -10810,6 +10814,7 @@ test("#250 C1 C3 C4: a pasted password confirms the member once, and the same in
     assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`]);
     assert.match(first.text, new RegExp(`NEW: the password you were just given was accepted for sync room ${f.code} — you may now read and post here\\.`));
     assert.ok(first.text.includes(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`), "with the way to hear the room");
+    assert.equal(first.text.split(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`).length - 1, 1, "said once");
     assert.doesNotMatch(first.text, /BLOCKED:/);
     // PreInvocation fires on every invocation of the turn, with the same message: nothing more is sent.
     const again = await f.invoke(f.password);
@@ -10826,6 +10831,7 @@ test("#250 C4: the acceptance is said in that invocation even when the broker wi
   try {
     const result = await f.invoke(f.password);
     assert.match(result.stderr, /mail withheld this turn/, "premise: the collect was withheld");
+    assert.ok(broker.requests.length > 0, "premise: by the broker, not by a socket it could not reach");
     assert.equal(await f.confirmed(), true);
     assert.match(result.text, new RegExp(`NEW: the password you were just given was accepted for sync room ${f.code}`));
     assert.ok(result.text.includes(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`));
@@ -10867,14 +10873,22 @@ test("#250 C5: a refused password is said with its error code, then BLOCKED, and
   }
 });
 
-test("#250 r2: an accepted paste keeps its HEAR when the delivery cannot be built, and when the inbox answers nothing", async () => {
-  for (const [label, options, env] of [["delivery fault", {}, { GYREDECK_TEST_FAULT: "delivery" }], ["no inbox answer", { breakInbox: true }, {}]]) {
-    const f = await agyPasteFixture(label.replace(/ /g, "-"), options);
+test("#250 r2: an accepted paste keeps its HEAR when the delivery cannot be built, when the inbox answers nothing, and when it answers {}", async () => {
+  // Short tags: the broker's socket lives under the temp home, and a long path passes
+  // macOS's 104-byte limit for a socket, which the hook reads as a broken broker.
+  for (const [label, tag, options, env] of [
+    ["delivery fault", "fault", {}, { GYREDECK_TEST_FAULT: "delivery" }],
+    ["no inbox answer", "noinbox", { breakInbox: true }, {}],
+    ["an empty 200 inbox", "empty", { breakInbox: "empty" }, {}],
+  ]) {
+    const f = await agyPasteFixture(tag, options);
     try {
       const result = await f.invoke(f.password, env);
+      assert.doesNotMatch(result.stderr, /mail withheld/, `${label}: premise, the collect went to the bridge`);
       assert.equal(await f.confirmed(), true, `${label}: premise, the password was accepted`);
       assert.match(result.text, new RegExp(`NEW: the password you were just given was accepted for sync room ${f.code}`), label);
       assert.ok(result.text.includes(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`), `${label}: with the way to hear the room`);
+      assert.equal(result.text.split(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`).length - 1, 1, `${label}: once`);
     } finally {
       await f.close();
     }

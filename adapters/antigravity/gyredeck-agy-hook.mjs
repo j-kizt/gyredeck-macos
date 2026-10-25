@@ -692,6 +692,23 @@ const confirmOnlySteps = (endpoint, room, confirm) => {
 };
 
 /**
+ * The last word on an accepted paste, whatever built the steps before it (#250 audit): the
+ * acceptance and the way to hear the room are in this invocation's output, added when no
+ * step already says them. One rule at the end rather than one per path, so a path that
+ * builds its steps from an answer of some new shape cannot leave them out.
+ */
+const withConfirmation = (steps, confirm, room) => {
+  if (!confirm?.accepted) return steps;
+  const said = (needle) => steps.some((step) => typeof step?.ephemeralMessage === "string" && step.ephemeralMessage.includes(needle));
+  const lead = confirmLead(confirm);
+  return [
+    ...(said(lead[0].ephemeralMessage) ? [] : lead),
+    ...steps,
+    ...(said(`gyredeck-agy-hook.mjs wait 300 ${room}`) ? [] : [{ ephemeralMessage: hearText(room) }]),
+  ];
+};
+
+/**
  * The collected messages as plain steps, for when building the delivery threw (#168).
  * Collected mail has left the reader's position over TCP, so dropping it there loses it for
  * good; this is built from nothing that can fail on a message's shape.
@@ -1119,8 +1136,10 @@ const main = async () => {
         // confirmed and this invocation can say so (#250).
         mailDrain = confirmPastedPassword(endpoint, token, conversationId, input)
           .catch(() => null)
-          .then((confirm) => drainMailIntoSteps(endpoint, token, conversationId, taken, confirm))
-          .catch(() => plainSteps(taken));
+          .then((confirm) =>
+            drainMailIntoSteps(endpoint, token, conversationId, taken, confirm)
+              .catch(() => plainSteps(taken))
+              .then((steps) => withConfirmation(steps, confirm, conversationId)));
       }
     } else if (eventType === "PostInvocation") {
       // Registered so AGY gets a valid `injectSteps` answer and Gyredeck stays a

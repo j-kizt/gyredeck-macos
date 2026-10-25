@@ -10660,6 +10660,8 @@ test("an unconfirmed Antigravity member sees how to confirm on every invocation,
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true });
+  }
+});
 
 test("the heavy slot names its holder and its line the way rooms name members (#243)", async () => {
   const h = await heavyHarness("label");

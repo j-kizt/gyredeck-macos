@@ -11421,28 +11421,30 @@ test("observed nudge: the Claude Code session that started a run is told once on
   }
 });
 
-test("observed nudge: a session the app could not name is found by its folder, only when it is the one there", async () => {
-  const h = await heavyHarness("obs-nudge-cwd");
+test("observed nudge: an ancestor the app could not bind names no session — provider label only, no nudge, even when one session is alone in that folder", async () => {
+  const h = await heavyHarness("obs-nudge-unbound");
   try {
     await h.start();
     const me = "a2450000-0000-4000-8000-000000000021";
     await heavyIngest(h, me, "claudeCodeHook");
     assert.match(await collectNotice(h, me), /^HEAVY RUNS: /);
-    await reportObserved(h, [observedRun({ agent: { kind: "claude", session: null, cwd: "/tmp/project" } })]);
-    assert.match(await collectNotice(h, me), /^HEAVY RUN SEEN/);
-    // Two sessions of that agent in one folder: nobody is guessed at.
-    const [a, b] = ["a2450000-0000-4000-8000-000000000022", "a2450000-0000-4000-8000-000000000023"];
-    for (const id of [a, b]) {
-      await fetch(`${h.base}/ingest`, {
-        method: "POST", headers: { "content-type": "application/json", "x-gyredeck-token": h.token() },
-        body: JSON.stringify({ version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: id, cwd: "/tmp/two", runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 } }),
-      });
-      assert.match(await collectNotice(h, id), /^HEAVY RUNS: /);
-    }
-    await reportObserved(h, [observedRun({ agent: { kind: "claude", session: null, cwd: "/tmp/two" } })]);
-    assert.equal(await collectNotice(h, a), null);
-    assert.equal(await collectNotice(h, b), null);
+    // Premise: this session is the only Claude Code session working in /tmp/project, and a
+    // run its own binding names would tell it.
+    await reportObserved(h, [observedRun({ pid: 6001, agent: { kind: "claude", session: me } })]);
+    assert.match(await collectNotice(h, me), /^HEAVY RUN SEEN/, "premise: a proven run tells");
+    const other = "a2450000-0000-4000-8000-000000000022";
+    await heavyIngest(h, other, "claudeCodeHook");
+    assert.match(await collectNotice(h, other), /^HEAVY RUNS: /);
+    // Now a Claude Code process the broker never bound runs in that same folder: nobody is
+    // guessed at, though `other` is the one session there it could be taken for.
+    await reportObserved(h, [observedRun({ pid: 6002, cwd: "/tmp/project", agent: { kind: "claude", session: null } })]);
+    assert.equal(await collectNotice(h, other), null, "no nudge without proof");
     assert.equal((await h.state()).observed[0].label, "Claude Code", "named by its agent alone");
+    // A session the bridge knows as another agent is not this run's, whatever was claimed.
+    const codexSession = "a2450000-0000-4000-8000-000000000023";
+    await heavyIngest(h, codexSession, "codexCliHook");
+    await reportObserved(h, [observedRun({ pid: 6003, agent: { kind: "claude", session: codexSession } })]);
+    assert.equal((await h.state()).observed[0].label, "Claude Code");
   } finally {
     await h.cleanup();
   }
@@ -11465,7 +11467,7 @@ test("observed nudge: Antigravity is handed the command whose output outlives th
   }
 });
 
-test("observed nudge: Codex is pushed once, as a notice, with no mailbox made", async () => {
+test("observed nudge: a Codex run names nobody and pushes nothing, since Codex has no per-process identity yet", async () => {
   const h = await heavyHarness("obs-nudge-codex");
   const fakeBin = join(h.home, ".bun", "bin");
   await mkdir(fakeBin, { recursive: true });
@@ -11477,22 +11479,17 @@ test("observed nudge: Codex is pushed once, as a notice, with no mailbox made", 
     const pushes = async () => (existsSync(queued) ? (await readFile(queued, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : []);
     const me = "a2450000-0000-4000-8000-000000000041";
     await heavyIngest(h, me, "codexCliHook");
-    // Premise: the one-time queue push has happened, so the next push is the nudge.
+    // Premise: pushes to this session work — the one-time queue notice arrived.
     await until(async () => (await pushes()).length === 1, "the queue notice push");
-    const run = observedRun({ agent: { kind: "codex", session: me, cwd: "/tmp/project" } });
-    await reportObserved(h, [run]);
-    await until(async () => (await pushes()).length === 2, "the nudge push");
-    const nudge = (await pushes())[1];
-    assert.equal(nudge[nudge.indexOf("--thread") + 1], me);
-    assert.match(nudge[nudge.indexOf("--message") + 1], /^\[Gyredeck · notice\] HEAVY RUN SEEN: you ran `cargo test\|build\|check` directly/);
-    await reportObserved(h, [run]);
-    // A control after the second report, so "no third push" is read after the bridge had its chance.
+    // Even a report that names the session is not proof for Codex.
+    await reportObserved(h, [observedRun({ agent: { kind: "codex", session: me } })]);
+    assert.equal((await h.state()).observed[0].label, "Codex");
+    // A control after the report, so "no nudge push" is read after the bridge had its chance.
     const control = "a2450000-0000-4000-8000-000000000042";
     await heavyIngest(h, control, "codexCliHook");
     await until(async () => (await pushes()).some((argv) => argv.includes(control)), "the control push");
-    assert.equal((await pushes()).filter((argv) => argv.includes(me)).length, 2, "the queue notice and one nudge");
-    const rooms = await fetch(`${h.base}/mail/inbox?as=${me}`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
-    assert.deepEqual(rooms.rooms ?? [], [], "no mailbox was made for the nudge");
+    assert.equal((await pushes()).filter((argv) => argv.includes(me)).length, 1, "the queue notice only");
+    assert.ok(!(await pushes()).some((argv) => argv.join(" ").includes("HEAVY RUN SEEN")));
   } finally {
     await h.cleanup();
   }

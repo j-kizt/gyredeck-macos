@@ -277,7 +277,7 @@ pub(crate) fn observe(
         .collect();
     let helpers: HashSet<i32> = names
         .iter()
-        .filter(|(_, (names, _))| names.iter().any(|name| name == HELPER_NAME))
+        .filter(|(_, (names, _))| names.iter().any(|name| name == HELPER_NAME || stem(name) == HELPER_NAME))
         .map(|(pid, _)| *pid)
         .collect();
     // The granted run's group, only while it is the group that was verified: its leader
@@ -308,6 +308,9 @@ pub(crate) fn observe(
     let matched: HashMap<i32, (&Pattern, String)> = rows
         .iter()
         .filter(|row| row.uid == my_uid)
+        // Our own helper is never a heavy run, whatever the pattern list says: observing it
+        // would hold the slot it is queued for, and the line would never move (#245 audit).
+        .filter(|row| !helpers.contains(&row.pid))
         .filter_map(|row| {
             let (names, rest) = names.get(&row.pid)?;
             let args = &row.argv.as_ref()?[*rest..];
@@ -444,6 +447,9 @@ pub(crate) fn clean_custom(list: &[String]) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for entry in list {
         let pattern = Pattern::parse(entry)?;
+        if pattern.name.iter().any(|alternative| glob(alternative, HELPER_NAME)) {
+            return Err("That pattern would match Gyredeck's own heavy-run helper".to_string());
+        }
         if seen.insert(pattern.text().to_string()) {
             out.push(pattern.text().to_string());
         }
@@ -525,7 +531,6 @@ fn wire_run(run: &ObservedRun, session_of: &dyn Fn(i32) -> Option<String>) -> se
         "agent": run.agent.map(|(kind, pid)| serde_json::json!({
             "kind": kind.wire(),
             "session": session_of(pid),
-            "cwd": platform::cwd(pid),
         })),
     })
 }
@@ -803,6 +808,25 @@ mod tests {
         // Control: the same words as the command itself are observed.
         rows[2] = row(200, 101, 200, "cargo", "cargo test");
         assert_eq!(observed(&rows, None), vec![200]);
+    }
+
+    #[test]
+    fn custom_pattern_does_not_observe_the_helper_itself() {
+        // A queued helper, and patterns of the person's own that name it.
+        let mut rows = terminal();
+        rows.push(row(200, 101, 200, "node", "node /Users/me/.config/gyredeck/gyredeck-heavy.mjs --as s1 --what tests -- cargo test"));
+        let (names, rest) = command_names(rows[2].argv.as_ref().unwrap()).unwrap();
+        for text in ["gyredeck-heavy", "gyredeck-*", "gyredeck-heavy --as"] {
+            let pattern = Pattern::parse(text).unwrap();
+            // Premise: the pattern itself matches the helper's command.
+            assert!(pattern.matches(&names, &rows[2].argv.as_ref().unwrap()[rest..]).is_some(), "{text}");
+            assert_eq!(pids(&observe(&rows, &[pattern], ME, None, &fake_lstart)), Vec::<i32>::new(), "{text}");
+            // And Settings refuses to save it.
+            assert!(clean_custom(&[text.to_string()]).is_err(), "{text}");
+        }
+        // Control: the same pattern observes a process of that name that is not ours.
+        rows[2] = row(200, 101, 200, "gyredeck-heav", "gyredeck-heavyweight run");
+        assert_eq!(pids(&observe(&rows, &[Pattern::parse("gyredeck-*").unwrap()], ME, None, &fake_lstart)), vec![200]);
     }
 
     /// The granted run: helper 200, its gated group 300 (leader 300), a setsid child 310 in a

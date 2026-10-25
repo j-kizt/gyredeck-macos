@@ -1611,14 +1611,7 @@ function createScopeTracker() {
     return now - previous > legacySignalRetentionMs;
   };
 
-  /** The conversations with recent activity in this cwd: how an observed heavy run (#245) is traced to a session the app could not name. */
-  const activeConversationsAt = (cwd) => {
-    if (typeof cwd !== "string" || cwd === "") return [];
-    cleanupRecentState(Date.now());
-    return [...(activeScopesByCwd.get(cwd)?.keys() ?? [])];
-  };
-
-  return { rememberScope, hookScope, shouldEmitHookSignal, recentCompletionAtByCwd, activeConversationsAt };
+  return { rememberScope, hookScope, shouldEmitHookSignal, recentCompletionAtByCwd };
 }
 
 // ── Bridge server ──
@@ -4164,13 +4157,14 @@ function startBridge(config) {
   /**
    * A session caught running a heavy command outside the helper (#245) is told so, once:
    * Claude Code and Antigravity on their next collect, beside any mail — read on their next
-   * turn, never woken for it — and Codex by one no-harvest push. A run with no agent above
-   * it (a person in a terminal) is observed and nobody is told. Remembered by recency, like
-   * the told set; the pending set is bounded the same way.
+   * turn, never woken for it. Only a session proven to have started the run is told: one
+   * the app's broker has bound to the ancestor process. Codex has no such proof yet
+   * (openai/codex#52783), so a Codex run is labelled "Codex" and nobody is told; a run with
+   * no agent above it is "Terminal". Remembered by recency, like the told set; the pending
+   * set is bounded the same way.
    */
   const heavyNudged = new Map();
   const heavyNudgePending = new Map();
-  const heavyNudgeInFlight = new Set();
   const HEAVY_NUDGED_MAX = Number(process.env.GYREDECK_TEST_HEAVY_TOLD_MAX) || 10_000;
   const remember = (map, key, value) => {
     map.delete(key);
@@ -4193,20 +4187,7 @@ function startBridge(config) {
   };
   const nudgeHeavySession = (conversationId, pattern) => {
     if (heavyNudged.has(conversationId) || heavyNudgePending.has(conversationId)) return;
-    if (!CODEX_PROVIDERS.has(providerByConversation.get(conversationId))) {
-      remember(heavyNudgePending, conversationId, pattern);
-      return;
-    }
-    if (heavyCodexPushOff || heavyNudgeInFlight.has(conversationId)) return;
-    heavyNudgeInFlight.add(conversationId);
-    const started = deliverToCodex(conversationId, null, `${CODEX_NOTICE_MARKER} ${heavyNudgeText(conversationId, pattern, "codex")}`, {
-      harvest: false,
-      settled: (ok) => {
-        heavyNudgeInFlight.delete(conversationId);
-        if (ok) remember(heavyNudged, conversationId, true);
-      },
-    });
-    if (started !== "queued") heavyNudgeInFlight.delete(conversationId);
+    remember(heavyNudgePending, conversationId, pattern);
   };
   // Tests only: the reader-lifecycle fixtures count every push a Codex session gets, and
   // this one would be the first of them.
@@ -6099,14 +6080,13 @@ function startBridge(config) {
         }
         const reported = runs.map((run) => {
           const kind = run.agent?.kind ?? null;
-          // The app names the session when the broker has it bound; otherwise the one
-          // session of that agent active in the agent's own folder, and nobody when that
-          // is not exactly one.
-          let session = typeof run.agent?.session === "string" && MAIL_ROOM_NAME.test(run.agent.session) ? run.agent.session : null;
-          if (kind && !session) {
-            const candidates = tracker.activeConversationsAt(run.agent.cwd).filter((id) => usageProviderFor(id) === kind);
-            session = candidates.length === 1 ? candidates[0] : null;
-          }
+          // Named only on proof: the app's broker bound this session to the ancestor
+          // process, which it does for signed claude and agy alone. Nothing is inferred —
+          // not from a folder, not for Codex — so an unrelated session is never named or
+          // told (#245 audit). One the bridge knows as another agent is not this one.
+          const claimed = typeof run.agent?.session === "string" && MAIL_ROOM_NAME.test(run.agent.session) ? run.agent.session : null;
+          const known = claimed ? usageProviderFor(claimed) : null;
+          const session = claimed && (kind === "claude" || kind === "agy") && (known === null || known === kind) ? claimed : null;
           return {
             pid: run.pid,
             pattern: text(run.pattern, 120),

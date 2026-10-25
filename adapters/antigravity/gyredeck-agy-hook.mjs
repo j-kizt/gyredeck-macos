@@ -1,6 +1,6 @@
 import { request } from "node:http";
 import { connect } from "node:net";
-import { appendFileSync, existsSync, statSync, unlinkSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -70,8 +70,9 @@ const readIngestToken = async () => {
  * switch when it has enough.
  *
  * Shapes, not contents: key paths with types, numbers kept whole because numbers are the
- * point, strings cut to forty characters. A prompt is not needed to answer the question
- * and should not be sitting in a file because of it.
+ * point, and every string as its length alone (#249). Short strings used to be kept whole,
+ * and a room password the person pasted is short: it reached this file verbatim. Records
+ * carry `v: 2`; a log written before that is emptied the next time the switch is on.
  */
 const SHAPE_SWITCH = join(CONFIG_DIR, "agy-payload-shape.on");
 const SHAPE_LOG = join(CONFIG_DIR, "agy-payload-shape.ndjson");
@@ -89,14 +90,21 @@ const describeShape = (value, path = "", into = {}) => {
     }
   } else if (typeof value === "number") into[path || "."] = value;
   else if (typeof value === "string") {
-    into[path || "."] = value.length > 40 ? `string(${value.length})` : value;
+    into[path || "."] = `string(${value.length})`;
   } else into[path || "."] = typeof value;
   return into;
+};
+
+/** The first line of a file, or "" — a log's first record says which version wrote it. */
+const readFirstLine = (path) => {
+  try { return readFileSync(path, "utf8").split("\n", 1)[0]; } catch { return ""; }
 };
 
 const recordShape = (eventType, input) => {
   try {
     if (!existsSync(SHAPE_SWITCH)) return;
+    // A log from before #249 may hold values; it is not appended to, it is emptied.
+    if (existsSync(SHAPE_LOG) && !readFirstLine(SHAPE_LOG).includes('"v":2')) writeFileSync(SHAPE_LOG, "", { mode: 0o600 });
     // Enough is enough: the switch removes itself rather than waiting to be noticed.
     if (existsSync(SHAPE_LOG) && statSync(SHAPE_LOG).size > SHAPE_MAX_BYTES) {
       try { unlinkSync(SHAPE_SWITCH); } catch {}
@@ -104,7 +112,7 @@ const recordShape = (eventType, input) => {
     }
     appendFileSync(
       SHAPE_LOG,
-      JSON.stringify({ at: new Date().toISOString(), eventType, shape: describeShape(input) }) + "\n",
+      JSON.stringify({ v: 2, at: new Date().toISOString(), eventType, shape: describeShape(input) }) + "\n",
       { mode: 0o600 },
     );
   } catch {

@@ -10691,3 +10691,30 @@ test("the heavy slot names its holder and its line the way rooms name members (#
     await h.cleanup();
   }
 });
+
+test("the Antigravity payload-shape log records lengths, never values, and empties a log from before (#249)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-249-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const dir = join(home, ...CONFIG_DIR);
+  const secret = "c0ffee".repeat(5) + "ab";
+  const oldSecret = "deadbeef".repeat(4);
+  try {
+    await writeFile(join(dir, "agy-payload-shape.on"), "");
+    // What an older hook left: a short value written whole.
+    await writeFile(join(dir, "agy-payload-shape.ndjson"), `${JSON.stringify({ at: "2026-10-24T00:00:00Z", eventType: "PreInvocation", shape: { lastUserInput: oldSecret } })}\n`);
+    const result = await runAdapter(
+      "adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], home,
+      { hookEventName: "PreInvocation", conversationId: "a2490000-0000-4000-8000-000000000001", lastUserInput: secret, modelName: "m", workspacePaths: ["/tmp/project"] },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const log = await readFile(join(dir, "agy-payload-shape.ndjson"), "utf8");
+    assert.ok(!log.includes(secret), "the pasted value is not on disk");
+    assert.ok(!log.includes(oldSecret), "and what an older hook wrote is gone");
+    assert.ok(!log.includes("a2490000-0000-4000-8000-000000000001"), "no short value at all, ids included");
+    const records = log.trim().split("\n").map((line) => JSON.parse(line));
+    assert.ok(records.length >= 1 && records.every((record) => record.v === 2));
+    assert.equal(records[0].shape.lastUserInput, "string(32)");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});

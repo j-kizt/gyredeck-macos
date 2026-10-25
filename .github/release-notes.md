@@ -1,5 +1,29 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Assistants take turns on heavy checks — (v1.24.0)
+
+### Added
+
+- **A heavy-run queue for the whole Mac.** When several AI assistants share one machine,
+  each one used to start its heavy checks (full test suites, builds) whenever it liked. They
+  ran on top of each other, and everything slowed down. Gyredeck now keeps one heavy slot.
+  - **Running through it:** an assistant runs its command through
+    `node ~/.config/gyredeck/gyredeck-heavy.mjs --as <session> --what "<label>" -- <command>`.
+    The command starts when the slot is free and the machine's load is 5 or less, or after
+    ten minutes of waiting at most. Anyone else waits in line.
+  - **Release:** the slot is freed when the command ends, crashes or is stopped, and it
+    survives a Gyredeck restart while the command is still running.
+  - **Who is told:** the room rules (v8) tell every assistant in a room to use it. A session
+    outside a room is told once.
+  - **In the app:** Settings shows who holds the slot, what they are running, how long it
+    has taken, and who is waiting. A slot left behind by a command that should have stopped
+    can be released by hand.
+  - **It is advisory:** if Gyredeck is not running, commands simply run unqueued.
+
+### Changed
+
+- The Tauri command-line build tool is updated to 2.12.4.
+
 ## Antigravity hears a room again, and an old reading says how old — (v1.23.3)
 
 ### Fixes

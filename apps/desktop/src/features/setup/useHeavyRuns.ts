@@ -4,14 +4,18 @@ import { useCallback, useEffect, useState } from "react";
 /** `GET /heavy`, as the bridge answers it (#223). */
 export interface IHeavyStatus {
   holder: {
+    id: string;
     as: string;
+    label?: string | null;
     what: string;
     state: "reserved" | "active";
     elapsedMs: number;
     loadSkipped: boolean;
     helperGone: boolean;
+    /** False for a run recorded before #243: the app may not stop it. Absent from older bridges. */
+    verified?: boolean;
   } | null;
-  queue: Array<{ position: number; as: string; what: string; waitedMs: number }>;
+  queue: Array<{ position: number; as: string; label?: string | null; what: string; waitedMs: number }>;
   load: number | null;
   loadLimit: number;
   limit: string;
@@ -21,7 +25,7 @@ export interface IUseHeavyRuns {
   status: IHeavyStatus | null;
   error: string | null;
   releasing: boolean;
-  release: () => Promise<void>;
+  stop: (holderId: string) => Promise<void>;
 }
 
 const HEAVY_POLL_MS = 5_000;
@@ -56,17 +60,18 @@ export const useHeavyRuns = (canUseNativeControls: boolean): IUseHeavyRuns => {
     };
   }, [canUseNativeControls, read]);
 
-  const release = useCallback(async () => {
+  const stop = useCallback(async (holderId: string) => {
     setReleasing(true);
     try {
-      await invoke<boolean>("heavy_release");
+      await invoke<string>("heavy_stop", { holderId });
       await read();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      await read();
     } finally {
       setReleasing(false);
     }
   }, [read]);
 
-  return { status, error, releasing, release };
+  return { status, error, releasing, stop };
 };

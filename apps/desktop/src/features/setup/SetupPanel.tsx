@@ -294,7 +294,6 @@ const heavyElapsed = (ms: number): string => {
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 };
 
-const HEAVY_RELEASE_WARNING = "Frees the slot even if its command is still running — two heavy runs may then overlap.";
 
 /**
  * The machine's one heavy-run slot (#223): who holds it, what it runs and for how long, and
@@ -303,15 +302,22 @@ const HEAVY_RELEASE_WARNING = "Frees the slot even if its command is still runni
  */
 const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean }) => {
   const heavy = useHeavyRuns(canUseNativeControls);
+  // Asked here, in the row: the macOS webview implements no window.confirm (#243 audit). The
+  // confirmation names the run it was asked about, so a run that took the slot since is
+  // never the one stopped.
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
   if (!canUseNativeControls) return null;
   const holder = heavy.status?.holder ?? null;
+  // A run recorded before #243 was never verified as the helper's, so the app cannot stop it.
+  const stoppable = holder !== null && holder.verified !== false;
+  const confirming = holder !== null && stoppable && confirmingId === holder.id;
   const queue = heavy.status?.queue ?? [];
   const detail = heavy.error
     ? heavy.error
     : !heavy.status
       ? "Checking…"
       : holder
-        ? `${holder.as} · ${holder.what} · ${heavyElapsed(holder.elapsedMs)}${holder.state === "reserved" ? " · starting" : ""}${holder.loadSkipped ? " · started under load" : ""}`
+        ? `${holder.label ?? holder.as} · ${holder.what} · ${heavyElapsed(holder.elapsedMs)}${holder.state === "reserved" ? " · starting" : ""}${holder.loadSkipped ? " · started under load" : ""}`
         : "Free";
   return (
     <>
@@ -322,18 +328,27 @@ const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean 
           <span className="setup-title">Heavy-run slot</span>
           <span className="setup-detail">{detail}</span>
           {holder?.helperGone ? <span className="setup-detail">Helper gone, command still running</span> : null}
+          {holder && !stoppable ? <span className="setup-detail">Started before this version — stop it from its terminal.</span> : null}
           {queue.map((entry) => (
             <span className="setup-detail" key={`${entry.position}-${entry.as}`}>
-              {`Waiting ${entry.position} · ${entry.as} · ${entry.what} · ${heavyElapsed(entry.waitedMs)}`}
+              {`Waiting ${entry.position} · ${entry.label ?? entry.as} · ${entry.what} · ${heavyElapsed(entry.waitedMs)}`}
             </span>
           ))}
-          {heavy.status ? <span className="setup-detail">{heavy.status.limit}</span> : null}
-          {holder ? <span className="setup-detail">{HEAVY_RELEASE_WARNING}</span> : null}
+          {heavy.status ? <span className="setup-detail" title={heavy.status.limit}>Only queued runs show here.</span> : null}
+          {holder && confirming ? <span className="setup-detail" role="alert">{`Stop ${holder.what} of ${holder.label ?? holder.as}? Its command will be ended.`}</span> : null}
         </span>
-        {holder ? (
-          <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => void heavy.release()} data-tauri-drag-region="false" title={HEAVY_RELEASE_WARNING}>
+        {holder && confirming ? (
+          <span className="setup-row-actions">
+            <button className="pill-btn" type="button" onClick={() => setConfirmingId(null)} data-tauri-drag-region="false">Cancel</button>
+            <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => { setConfirmingId(null); void heavy.stop(holder.id); }} data-tauri-drag-region="false">
+              {heavy.releasing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
+              Stop
+            </button>
+          </span>
+        ) : holder && stoppable ? (
+          <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => setConfirmingId(holder.id)} data-tauri-drag-region="false">
             {heavy.releasing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
-            {heavy.releasing ? "Releasing…" : "Release stuck slot"}
+            {heavy.releasing ? "Stopping…" : "Stop this run"}
           </button>
         ) : null}
       </div>

@@ -1224,20 +1224,27 @@ pub(crate) fn heavy_status() -> Result<serde_json::Value, String> {
     }
 }
 
-/// Free the heavy-run slot whatever holds it — the app's "Release stuck slot" (#223). Only
-/// the app may: the bridge takes its word for it, as it does for closing a room.
-pub(crate) fn heavy_release(app_word: &str) -> Result<bool, String> {
-    let (status, value) = bridge_request_vouched("DELETE", "/heavy/holder", None, app_word)?;
+/// Stop the run that holds the heavy-run slot — the app's "Stop this run" (#243). Named by
+/// the holder id the person saw, so a run that took the slot since is never the one ended.
+/// Only the app may: the bridge takes its word for it, as it does for closing a room.
+pub(crate) fn heavy_stop(holder_id: &str, app_word: &str) -> Result<String, String> {
+    if holder_id.len() != 16 || !holder_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("Not a heavy-run holder id".to_string());
+    }
+    let (status, value) = bridge_request_vouched("DELETE", &format!("/heavy/holder?id={holder_id}"), None, app_word)?;
     if !(200..300).contains(&status) {
         return Err(match (status, value.get("error").and_then(serde_json::Value::as_str).unwrap_or("")) {
             (401, "app_only") => "Gyredeck could not vouch for itself to its own bridge. Quit and reopen Gyredeck".to_string(),
             (401, _) => "Gyredeck could not authenticate to its own bridge".to_string(),
             (503, "app_word_unavailable") => "The bridge was started without Gyredeck's word. Quit and reopen Gyredeck".to_string(),
             (404, _) => "This bridge has no heavy-run queue yet. Quit and reopen Gyredeck".to_string(),
+            (409, "holder_changed") => "That run no longer holds the slot; nothing was stopped".to_string(),
+            (409, "holder_unverified") => "That run started before this version; stop it from its terminal".to_string(),
+            (503, "cannot_verify") => "Could not check that run just now, so nothing was stopped. Try again".to_string(),
             _ => format!("The bridge refused the request (HTTP {status})"),
         });
     }
-    Ok(value.get("released").and_then(serde_json::Value::as_bool).unwrap_or(false))
+    Ok(value.get("result").and_then(serde_json::Value::as_str).unwrap_or("none").to_string())
 }
 
 /// Join a room by code. Idempotent, so pressing Connect twice is not an error.

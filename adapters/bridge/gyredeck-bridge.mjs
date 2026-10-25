@@ -23,7 +23,7 @@
  */
 
 import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir, loadavg } from "node:os";
@@ -583,7 +583,7 @@ const heavyHelper = async (setup) => {
     pgid = child.pid;
     const exited = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
     child.on("error", () => {});
-    const activated = await call("activate", { lease, pgid });
+    const activated = await call("activate", { lease, pgid, helperPid: process.pid });
     if (stopping) return;
     if (activated.status === 200 && activated.body.ok === true) {
       state = "active";
@@ -5378,6 +5378,63 @@ function startBridge(config) {
   const groupAlive = (pgid) => {
     try { process.kill(-pgid, 0); return true; } catch (error) { return error.code === "EPERM"; }
   };
+  // Tests only: where `ps` is, so a test can make the lookup fail. It breaks the lookup and
+  // nothing else; every check then fails closed.
+  const PS_BIN = process.env.GYREDECK_TEST_PS_BIN || "ps";
+  /**
+   * What macOS says about one process: `{ found, ppid, pgid, started }`; `{ absent }` when it
+   * does not exist; `{ unknown }` when the lookup itself failed or timed out. A lookup that
+   * failed proves nothing about the process, so it is never read as "absent" (#243 audit):
+   * absence is asked of the kernel directly.
+   */
+  const processFacts = (pid) => {
+    try {
+      const line = execFileSync(PS_BIN, ["-o", "ppid=,pgid=,lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+      const match = /^(\d+)\s+(\d+)\s+(.+)$/.exec(line);
+      if (match) return { status: "found", ppid: Number(match[1]), pgid: Number(match[2]), started: match[3].replace(/\s+/g, " ") };
+    } catch {}
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error.code === "ESRCH") return { status: "absent" };
+    }
+    return { status: "unknown" };
+  };
+  const commandOf = (pid) => {
+    try {
+      return execFileSync(PS_BIN, ["-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+    } catch {
+      return "";
+    }
+  };
+  /**
+   * Whether `pgid` is a group the heavy-run helper made (#243): its leader leads its own
+   * group, was started by `helperPid`, and that process is the helper. Answers the leader's
+   * start time, which is what tells this group from a later one given the same id, or null.
+   * Without it any machine-token client could name any live group, and Stop would signal it.
+   */
+  const verifiedGroupStart = (pgid, helperPid) => {
+    if (!Number.isInteger(helperPid) || helperPid <= 1) return null;
+    const leader = processFacts(pgid);
+    if (leader.status !== "found" || leader.pgid !== pgid || leader.ppid !== helperPid) return null;
+    return commandOf(helperPid).includes("gyredeck-heavy.mjs") ? leader.started : null;
+  };
+  /**
+   * Whether the holder's group is still the one that was verified. Gone when no process is
+   * in it; also gone when its leader is a different process — started at another time —
+   * since the id was then reused after the group had ended. A group whose leader exited
+   * while others in it still run is still the same group: macOS does not hand out a pid
+   * that is in use as a process group, so the id cannot have been reused meanwhile.
+   */
+  // "ours", "gone", or "unknown" when it cannot be told — which signals nothing and frees
+  // nothing.
+  const heavyGroupState = (pgid, started) => {
+    if (!groupAlive(pgid)) return "gone";
+    const leader = processFacts(pgid);
+    if (leader.status === "absent") return "ours";
+    if (leader.status === "unknown") return "unknown";
+    return leader.pgid === pgid && leader.started === started ? "ours" : "gone";
+  };
 
   let heavyHolder = null;
   const heavyQueue = [];
@@ -5395,9 +5452,11 @@ function startBridge(config) {
         state: heavyHolder.state,
         leaseHash: heavyHolder.leaseHash.toString("hex"),
         requestIdHash: heavyHolder.requestIdHash.toString("hex"),
+        id: heavyHolder.id,
         as: heavyHolder.as,
         what: heavyHolder.what,
         pgid: heavyHolder.pgid,
+        pgidStart: heavyHolder.pgidStart,
         since: heavyHolder.since,
         loadSkipped: heavyHolder.loadSkipped,
       };
@@ -5423,6 +5482,10 @@ function startBridge(config) {
       && /^[a-f0-9]{64}$/.test(record.requestIdHash ?? "")
       && typeof record.as === "string" && typeof record.what === "string"
       && (record.state === "reserved" || (record.state === "active" && Number.isInteger(record.pgid) && record.pgid > 1));
+    // A record from before #243 has no start time to check its group by. It is kept while
+    // the group lives — dropping it would grant a second run beside it — but unverified:
+    // the app may not stop it, and its slot frees only when the group is gone.
+    // Whether a verified group is still the one recorded is the timer's to check.
     if (valid && (record.state === "reserved" || groupAlive(record.pgid))) {
       const now = heavyNow();
       const since = typeof record.since === "string" && !Number.isNaN(Date.parse(record.since)) ? record.since : new Date().toISOString();
@@ -5430,9 +5493,11 @@ function startBridge(config) {
         state: record.state,
         leaseHash: Buffer.from(record.leaseHash, "hex"),
         requestIdHash: Buffer.from(record.requestIdHash, "hex"),
+        id: typeof record.id === "string" && /^[0-9a-f]{16}$/.test(record.id) ? record.id : randomBytes(8).toString("hex"),
         as: record.as,
         what: record.what,
         pgid: record.state === "active" ? record.pgid : null,
+        pgidStart: record.state === "active" && typeof record.pgidStart === "string" ? record.pgidStart : null,
         since,
         startedAt: now - Math.max(0, Date.now() - Date.parse(since)),
         reservedAt: now,
@@ -5471,9 +5536,14 @@ function startBridge(config) {
       state: "reserved",
       leaseHash: request.leaseHash,
       requestIdHash: request.requestIdHash,
+      // Names this run, and only this run, to the app: Release is confirmed against it, so a
+      // run that took the slot after the person pressed Release is never the one freed.
+      // Not a secret — it frees nothing on its own; the app's word does that.
+      id: randomBytes(8).toString("hex"),
       as: request.as,
       what: request.what,
       pgid: null,
+      pgidStart: null,
       since: new Date().toISOString(),
       startedAt: now,
       reservedAt: now,
@@ -5496,14 +5566,49 @@ function startBridge(config) {
     promoteHeavy();
   };
 
+  // How long a stopped run gets to end on SIGTERM before its group is killed (#243).
+  const HEAVY_STOP_KILL_MS = Number(process.env.GYREDECK_TEST_HEAVY_STOP_KILL_MS) || 10_000;
+  /**
+   * The app's "Stop this run" (#243): end the holder's command, and let the slot go the
+   * ordinary way — when its group is gone. Freeing the slot while the command still ran
+   * would let the next run start on top of it, the overlap this queue exists to prevent.
+   * A reservation has run nothing yet (the gate holds it), so it is simply dropped.
+   */
+  const stopHeavy = () => {
+    if (!heavyHolder) return "none";
+    if (heavyHolder.state !== "active") {
+      freeHeavy();
+      return "freed";
+    }
+    const { pgid, pgidStart } = heavyHolder;
+    // A run recorded before #243 was never verified: not the app's to signal.
+    if (pgidStart === null) return "unverified";
+    // Checked before each signal: a group whose id now belongs to another process is not
+    // ours to signal, and counts as gone; one that cannot be checked is left alone.
+    const now = heavyGroupState(pgid, pgidStart);
+    if (now === "unknown") return "cannot_verify";
+    if (now === "gone") {
+      freeHeavy();
+      return "gone";
+    }
+    try { process.kill(-pgid, "SIGTERM"); } catch {}
+    setTimeout(() => {
+      if (heavyGroupState(pgid, pgidStart) === "ours") { try { process.kill(-pgid, "SIGKILL"); } catch {} }
+      sweepHeavy({ verify: true });
+    }, HEAVY_STOP_KILL_MS).unref();
+    return "stopping";
+  };
+
   /** Expire what has lapsed, then let the line move. Run before every answer and on a timer. */
-  const sweepHeavy = () => {
+  // `verify` adds the start-time check, which costs a `ps`; the timer asks for it, the
+  // routes (which sweep before every answer) do not.
+  const sweepHeavy = ({ verify = false } = {}) => {
     const now = heavyNow();
     if (heavyHolder?.state === "reserved" && now - heavyHolder.reservedAt > HEAVY_RESERVATION_MS) {
       // Never activated, so its command never ran: the gate holds it until it is.
       heavyHolder = null;
       persistHeavyHolder();
-    } else if (heavyHolder?.state === "active" && !groupAlive(heavyHolder.pgid)) {
+    } else if (heavyHolder?.state === "active" && (verify && heavyHolder.pgidStart !== null ? heavyGroupState(heavyHolder.pgid, heavyHolder.pgidStart) === "gone" : !groupAlive(heavyHolder.pgid))) {
       heavyHolder = null;
       persistHeavyHolder();
     }
@@ -5514,7 +5619,15 @@ function startBridge(config) {
     }
     promoteHeavy();
   };
-  setInterval(sweepHeavy, HEAVY_TICK_MS).unref();
+  setInterval(() => sweepHeavy({ verify: true }), HEAVY_TICK_MS).unref();
+
+  /** A run's holder named the way rooms name a member — provider and assigned name — not by id (#243). */
+  const heavyLabelFor = (conversationId) => {
+    const name = sessionNameOf(conversationId);
+    const provider = providerByConversation.has(conversationId) ? providerLabelFor(conversationId) : null;
+    if (provider && name) return `${provider} / ${name}`;
+    return provider ?? name ?? null;
+  };
 
   const describeHeavy = () => {
     const now = heavyNow();
@@ -5526,7 +5639,9 @@ function startBridge(config) {
       loadLimit: HEAVY_LOAD_LIMIT,
       holder: heavyHolder
         ? {
+            id: heavyHolder.id,
             as: heavyHolder.as,
+            label: heavyLabelFor(heavyHolder.as),
             what: heavyHolder.what,
             state: heavyHolder.state,
             since: heavyHolder.since,
@@ -5535,11 +5650,13 @@ function startBridge(config) {
             // The group still runs and nothing has spoken for it: the helper died and left
             // its command going. The slot stays held; the panel says why.
             helperGone: heavyHolder.state === "active" && now - heavyHolder.heartbeatAt > HEAVY_HELPER_QUIET_MS,
+            // False for a run recorded before #243: held while its group lives, never stopped by the app.
+            verified: heavyHolder.state !== "active" || heavyHolder.pgidStart !== null,
             // Restored from the record and not yet claimed by its helper since this bridge started.
             adopted: heavyHolder.adopted,
           }
         : null,
-      queue: heavyQueue.map((entry, index) => ({ position: index + 1, as: entry.as, what: entry.what, waitedMs: Math.round(now - entry.enqueuedAt) })),
+      queue: heavyQueue.map((entry, index) => ({ position: index + 1, as: entry.as, label: heavyLabelFor(entry.as), what: entry.what, waitedMs: Math.round(now - entry.enqueuedAt) })),
       waiting: heavyPolls.size,
       limit: HEAVY_LIMIT_TEXT,
     };
@@ -5810,7 +5927,8 @@ function startBridge(config) {
         sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
         return;
       }
-      const { pathname } = new URL(req.url, "http://127.0.0.1");
+      const heavyUrl = new URL(req.url, "http://127.0.0.1");
+      const { pathname } = heavyUrl;
       sweepHeavy();
 
       if (req.method === "GET" && pathname === "/heavy") {
@@ -5818,19 +5936,33 @@ function startBridge(config) {
         return;
       }
 
-      // DELETE /heavy/holder — the app's "Release stuck slot".
+      // DELETE /heavy/holder?id=… — the app's "Stop this run".
       if (req.method === "DELETE" && pathname === "/heavy/holder") {
         if (brokerSecret === null) {
           sendJson(503, { ok: false, error: "app_word_unavailable", message: "A stuck heavy-run slot is released from the Gyredeck app, and this bridge was started without the app's word. Quit and reopen Gyredeck." });
           return;
         }
         if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"])) {
-          sendJson(401, { ok: false, error: "app_only", message: "Only the Gyredeck app can release a heavy-run slot; a run frees its own by finishing." });
+          sendJson(401, { ok: false, error: "app_only", message: "Only the Gyredeck app can stop a heavy run; a run frees the slot by finishing." });
           return;
         }
-        const released = heavyHolder !== null;
-        freeHeavy();
-        sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, released });
+        // Only the run the person confirmed (#243 audit): compared and acted on in one step, so
+        // a run that took the slot in between is left alone and the app is told it changed.
+        const expected = heavyUrl.searchParams.get("id");
+        if (!expected || heavyHolder?.id !== expected) {
+          sendJson(409, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "holder_changed", message: "That run no longer holds the slot; nothing was stopped." });
+          return;
+        }
+        const result = stopHeavy();
+        if (result === "unverified") {
+          sendJson(409, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "holder_unverified", message: "That run was started before this version and cannot be verified; stop it from its terminal. Nothing was signalled." });
+          return;
+        }
+        if (result === "cannot_verify") {
+          sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "cannot_verify", message: "The run's process group could not be checked just now, so nothing was signalled. Try again." });
+          return;
+        }
+        sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, result });
         return;
       }
 
@@ -6009,13 +6141,20 @@ function startBridge(config) {
           sendJson(400, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "group_gone" });
           return;
         }
+        const pgidStart = verifiedGroupStart(pgid, body.helperPid);
+        if (pgidStart === null) {
+          sendJson(403, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "pgid_unverified", message: "That process group was not started by the heavy-run helper that holds this lease." });
+          return;
+        }
         heavyHolder.state = "active";
         heavyHolder.pgid = pgid;
+        heavyHolder.pgidStart = pgidStart;
         heavyHolder.adopted = true;
         heavyHolder.heartbeatAt = heavyNow();
         if (!persistHeavyHolder()) {
           heavyHolder.state = "reserved";
           heavyHolder.pgid = null;
+          heavyHolder.pgidStart = null;
           sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "holder_unwritable" });
           return;
         }

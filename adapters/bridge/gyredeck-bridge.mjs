@@ -3812,6 +3812,8 @@ function startBridge(config) {
   const MAIL_ROOM_NAME = /^[A-Za-z0-9_-]{1,64}$/;
   const MAIL_MAX_ROOMS = 32;
   const MAIL_MAX_TEXT = 4_096;
+  /** The most a bounded look (`until=`) hands back: one delivery's worth, with room to spare. */
+  const MAIL_LOOK_MAX = 50;
   const MAIL_MAX_FROM = 64;
   const MAIL_ROOM_IDLE_MS = 3_600_000;
   const MAIL_MAX_MEMBERS = 8;
@@ -7205,14 +7207,33 @@ function startBridge(config) {
         }
         const parsed = Number.parseInt(url.searchParams.get("since") ?? "", 10);
         const since = Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
-        const messages = room ? room.messages.filter((message) => message.seq > since) : [];
+        // `until=<seq>` (#251 audit): a look back at what was delivered, not everything said
+        // since. Bounded above, only what reaches this member — by the collect's own rule,
+        // so a re-read and the delivery it repeats cannot disagree — and capped. Without it
+        // the read is what it always was. A look only: it is refused with `collect=1`.
+        const untilParam = url.searchParams.get("until");
+        let messages;
+        let truncated = false;
+        if (untilParam !== null) {
+          const until = /^\d{1,15}$/.test(untilParam) ? Number(untilParam) : null;
+          const as = url.searchParams.get("as") ?? "";
+          if (until === null || url.searchParams.get("collect") === "1" || !MAIL_ROOM_NAME.test(as)) {
+            sendJson(400, { ok: false, error: "invalid_look", message: "until=<seq> takes a whole number, the reader's own as=<id>, and no collect: it is a look back, and it moves nothing." });
+            return;
+          }
+          const reached = room ? room.messages.filter((message) => message.seq > since && message.seq <= until && reachesMember(message, as)) : [];
+          truncated = reached.length > MAIL_LOOK_MAX;
+          messages = reached.slice(0, MAIL_LOOK_MAX);
+        } else {
+          messages = room ? room.messages.filter((message) => message.seq > since) : [];
+        }
         if (room) {
           room.touchedAt = Date.now();
           if (url.searchParams.get("collect") === "1") {
             markRead(room, url.searchParams.get("as"), messages.at(-1)?.seq ?? since, new Date().toISOString());
           }
         }
-        sendJson(200, { ok: true, room: name, seq: room?.seq ?? 0, messages });
+        sendJson(200, { ok: true, room: name, seq: room?.seq ?? 0, messages, ...(truncated ? { truncated: true } : {}) });
         return;
       }
 

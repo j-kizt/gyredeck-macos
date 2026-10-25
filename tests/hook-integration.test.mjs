@@ -10978,7 +10978,8 @@ const REREAD = "Ephemeral: the room's messages above";
 const NOTE = "Ephemeral: the mail above from outside a room is shown in this invocation only and cannot be read again. If you cannot finish what it asks now, note it now.";
 /** The hook's own re-read steps — whole steps that open with it, never a quote inside mail. */
 const rereadSteps = (steps) => steps.filter((text) => text.startsWith(REREAD));
-const sinceOf = (text) => Number(/&since=(\d+)"/.exec(text)?.[1] ?? NaN);
+const sinceOf = (text) => Number(/&since=(\d+)&until=\d+"/.exec(text)?.[1] ?? NaN);
+const untilOf = (text) => Number(/&since=\d+&until=(\d+)"/.exec(text)?.[1] ?? NaN);
 
 /**
  * The paths. `run` prepares the fixture and returns the invocation's result; `expect` is what
@@ -11034,6 +11035,7 @@ for (const path of rereadPaths) {
       if (path.expect === "since") {
         assert.equal(own.length, 1, "I1: exactly once");
         assert.equal(sinceOf(own[0]), seq - 1, "I1: since = first room seq − 1");
+        assert.equal(untilOf(own[0]), seq, "L7: until = the last room seq delivered");
         assert.ok(own[0].includes(`/mail/${f.code}?as=${f.agy}&since=`), "I1: this room, this session");
         assert.equal(notes.length, 0, "I2: no note with a room");
         if (path.reply) {
@@ -11138,6 +11140,92 @@ for (const [label, tag, options, env] of [
       assert.equal(rereadSteps(result.steps).length, delivered ? 1 : 0, "the re-read once with room mail, never without");
     } finally {
       await f.close();
+    }
+  });
+}
+
+// ── #251 audit: the re-read is a bounded look ──
+//
+//  L1  With `until`, no message after `until` comes back.
+//  L2  With `until`, messages to other members are absent (the collect's own reachesMember).
+//  L3  With `until`, messages to everyone and to this member, in range, are present, oldest first.
+//  L4  With `until`, at most 50 come back, the oldest kept, marked truncated.
+//  L5  Without `until`, the read is exactly what it was: everything after `since`.
+//  L6  It stays a look: no read position moves, and `until` with `collect=1` is refused.
+
+/** A confirmed agy member and another confirmed member, and four messages around them. */
+const boundedLookFixture = async (tag) => {
+  const f = await agyPasteFixture(tag);
+  await f.confirm();
+  const other = "a2510000-0000-4000-8000-000000000003";
+  await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: other });
+  assert.equal((await f.call("POST", `/sync/rooms/${f.code}/confirm`, { conversationId: other, password: f.password })).status, 200);
+  const send = async (to, text) => {
+    const sent = await f.call("POST", `/mail/${f.code}`, { from: f.founder, to, kind: "tell", text });
+    assert.equal(sent.body.ok, true, JSON.stringify(sent.body));
+    return sent.body.seq;
+  };
+  const seqs = {
+    toMe: await send(f.agy, "to me"),
+    toOther: await send(other, "to the other member"),
+    toAll: await send("everyone", "to everyone"),
+  };
+  seqs.later = await send(f.agy, "said later");
+  const look = async (query) => {
+    const response = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}?${query}`, { headers: { "x-gyredeck-token": f.password } });
+    return { status: response.status, body: await response.json() };
+  };
+  const pending = async () => (await f.call("GET", `/sync/rooms?as=${f.agy}`)).body.members.find((member) => member.conversationId === f.agy).pending;
+  return { f, other, seqs, send, look, pending };
+};
+
+const boundedLookCases = [
+  { name: "L1 later messages are absent", run: async ({ f, seqs, look }) => {
+    const { body } = await look(`as=${f.agy}&since=${seqs.toMe - 1}&until=${seqs.toAll}`);
+    assert.ok(!body.messages.some((message) => message.seq > seqs.toAll), JSON.stringify(body.messages.map((m) => m.seq)));
+  } },
+  { name: "L2 messages to other members are absent", run: async ({ f, seqs, look }) => {
+    const { body } = await look(`as=${f.agy}&since=${seqs.toMe - 1}&until=${seqs.toAll}`);
+    assert.ok(!body.messages.some((message) => message.seq === seqs.toOther));
+  } },
+  { name: "L3 messages to everyone and to this member are present", run: async ({ f, seqs, look }) => {
+    const { body } = await look(`as=${f.agy}&since=${seqs.toMe - 1}&until=${seqs.toAll}`);
+    assert.deepEqual(body.messages.map((message) => message.seq), [seqs.toMe, seqs.toAll]);
+  } },
+  { name: "L4 the cap holds", run: async ({ f, send, look }) => {
+    const first = await send(f.agy, "bulk 0");
+    let last = first;
+    for (let index = 1; index < 55; index += 1) last = await send(f.agy, `bulk ${index}`);
+    const { body } = await look(`as=${f.agy}&since=${first - 1}&until=${last}`);
+    assert.equal(body.messages.length, 50);
+    assert.equal(body.messages[0].seq, first, "the oldest kept");
+    assert.equal(body.truncated, true);
+  } },
+  { name: "L5 an old caller gets the same output", run: async ({ f, seqs, look }) => {
+    const { status, body } = await look(`as=${f.agy}&since=${seqs.toMe - 1}`);
+    assert.equal(status, 200);
+    assert.deepEqual(body.messages.map((message) => message.seq), [seqs.toMe, seqs.toOther, seqs.toAll, seqs.later], "everything after since, as before");
+    assert.equal("truncated" in body, false);
+  } },
+  { name: "L6 the cursor is unmoved, and until refuses collect", run: async ({ f, seqs, look, pending }) => {
+    const before = await pending();
+    assert.ok(before > 0, "premise: there is unread mail");
+    assert.equal((await look(`as=${f.agy}&since=0&until=${seqs.later}`)).status, 200);
+    assert.equal(await pending(), before, "a bounded look moves nothing");
+    const taken = await look(`as=${f.agy}&since=0&until=${seqs.later}&collect=1`);
+    assert.equal(taken.status, 400);
+    assert.equal(taken.body.error, "invalid_look");
+    assert.equal(await pending(), before, "nor does a refused take");
+  } },
+];
+
+for (const lookCase of boundedLookCases) {
+  test(`#251 audit ${lookCase.name}`, async () => {
+    const ctx = await boundedLookFixture(`l${boundedLookCases.indexOf(lookCase)}`);
+    try {
+      await lookCase.run(ctx);
+    } finally {
+      await ctx.f.close();
     }
   });
 }

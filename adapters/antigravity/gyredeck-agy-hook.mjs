@@ -702,11 +702,14 @@ const rereadSteps = (endpoint, as, syncRoom, delivered) => {
   const steps = [];
   if (inRoom.length > 0) {
     const since = Math.min(...inRoom.map((message) => message.seq)) - 1;
+    // Bounded at the last one delivered: the bridge then hands back only what this
+    // delivery held for this session, not the room's traffic since (#251 audit).
+    const until = Math.max(...inRoom.map((message) => message.seq));
     steps.push({
       ephemeralMessage:
         "Ephemeral: the room's messages above are shown in this invocation only. If you cannot finish what they ask now," +
         " note it, or read them again later — the room's password in place of THE ROOM PASSWORD:\n" +
-        `  curl -s "http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}?as=${as}&since=${since}" -H "x-gyredeck-token: THE ROOM PASSWORD"`,
+        `  curl -s "http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}?as=${as}&since=${since}&until=${until}" -H "x-gyredeck-token: THE ROOM PASSWORD"`,
     });
   }
   if (outside.length > 0) {

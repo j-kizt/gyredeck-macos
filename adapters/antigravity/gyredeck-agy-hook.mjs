@@ -100,11 +100,17 @@ const readFirstLine = (path) => {
   try { return readFileSync(path, "utf8").split("\n", 1)[0]; } catch { return ""; }
 };
 
+/** Whether a log's first record is this version's: its own top-level `v`, not a `v` that a
+ * logged payload happened to carry (#249 audit). */
+const writtenByThisVersion = (line) => {
+  try { return JSON.parse(line)?.v === 2; } catch { return false; }
+};
+
 const recordShape = (eventType, input) => {
   try {
     if (!existsSync(SHAPE_SWITCH)) return;
     // A log from before #249 may hold values; it is not appended to, it is emptied.
-    if (existsSync(SHAPE_LOG) && !readFirstLine(SHAPE_LOG).includes('"v":2')) writeFileSync(SHAPE_LOG, "", { mode: 0o600 });
+    if (existsSync(SHAPE_LOG) && !writtenByThisVersion(readFirstLine(SHAPE_LOG))) writeFileSync(SHAPE_LOG, "", { mode: 0o600 });
     // Enough is enough: the switch removes itself rather than waiting to be noticed.
     if (existsSync(SHAPE_LOG) && statSync(SHAPE_LOG).size > SHAPE_MAX_BYTES) {
       try { unlinkSync(SHAPE_SWITCH); } catch {}

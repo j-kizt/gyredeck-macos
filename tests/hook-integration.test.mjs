@@ -10700,8 +10700,9 @@ test("the Antigravity payload-shape log records lengths, never values, and empti
   const oldSecret = "deadbeef".repeat(4);
   try {
     await writeFile(join(dir, "agy-payload-shape.on"), "");
-    // What an older hook left: a short value written whole.
-    await writeFile(join(dir, "agy-payload-shape.ndjson"), `${JSON.stringify({ at: "2026-10-24T00:00:00Z", eventType: "PreInvocation", shape: { lastUserInput: oldSecret } })}\n`);
+    // What an older hook left: a short value written whole — and a payload field named `v`,
+    // so the record carries "v":2 without being a v2 record (#249 audit).
+    await writeFile(join(dir, "agy-payload-shape.ndjson"), `${JSON.stringify({ at: "2026-10-24T00:00:00Z", eventType: "PreInvocation", shape: { v: 2, lastUserInput: oldSecret } })}\n`);
     const result = await runAdapter(
       "adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], home,
       { hookEventName: "PreInvocation", conversationId: "a2490000-0000-4000-8000-000000000001", lastUserInput: secret, modelName: "m", workspacePaths: ["/tmp/project"] },

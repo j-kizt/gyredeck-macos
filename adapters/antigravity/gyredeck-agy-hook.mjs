@@ -680,13 +680,26 @@ const confirmLead = (confirm) => {
 };
 
 /**
+ * A pasted password's result with what goes with it, for every path that cannot build the
+ * full delivery: accepted carries the way to hear the room, refused carries BLOCKED. The
+ * result belongs to this invocation alone — agy's steps are seen only in the invocation
+ * they arrive in — so it is said whatever happened to the mail.
+ */
+const confirmOnlySteps = (endpoint, room, confirm) => {
+  if (confirm?.accepted) return [...confirmLead(confirm), { ephemeralMessage: hearText(room) }];
+  if (confirm?.refused) return [...confirmLead(confirm), { ephemeralMessage: blockedStepFor(endpoint, confirm.refused.room, room) }];
+  return [];
+};
+
+/**
  * The collected messages as plain steps, for when building the delivery threw (#168).
  * Collected mail has left the reader's position over TCP, so dropping it there loses it for
  * good; this is built from nothing that can fail on a message's shape.
  */
 const plainSteps = async (taken) => {
-  // A pasted password's result belongs to this invocation alone, so it is said either way.
-  const lead = confirmLead(taken?.confirm);
+  // A pasted password's result belongs to this invocation alone, so it is said either way,
+  // with its HEAR or BLOCKED (#250 audit).
+  const lead = confirmOnlySteps(taken?.endpoint, taken?.as, taken?.confirm);
   // Through the broker nothing is lost: an unacknowledged batch comes back on the next
   // collect and is built properly then. Only a TCP collect has already moved on.
   if (!taken?.result || Number.isInteger(taken.result.delivery)) return lead;
@@ -748,14 +761,8 @@ const hearText = (room) =>
 const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm = null) => {
   if (!token || !MAIL_ROOM_NAME.test(room)) return confirmLead(confirm);
   // Known before anything can fail, so a delivery that throws still says it (#250).
-  if (taken) taken.confirm = confirm;
-  // A pasted password's result belongs to this invocation alone — agy's steps are seen only
-  // in the invocation they arrive in — so it is said even when the mail is held back.
-  const confirmOnly = () => {
-    if (confirm?.accepted) return [...confirmLead(confirm), { ephemeralMessage: hearText(room) }];
-    if (confirm?.refused) return [...confirmLead(confirm), { ephemeralMessage: blockedStepFor(endpoint, confirm.refused.room, room) }];
-    return [];
-  };
+  if (taken) Object.assign(taken, { confirm, endpoint, as: room });
+  const confirmOnly = () => confirmOnlySteps(endpoint, room, confirm);
 
   // One call answers everything: what is waiting, which room this session is in, and
   // who else is in it. The bridge keeps each reader's position with the room, so there
@@ -783,6 +790,9 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
       }];
     }
     result = answer.status === 200 ? answer.body : null;
+    // No usable answer: nothing to build a delivery from, and nothing to acknowledge — but a
+    // pasted password's result is still said, with its HEAR (#250 audit).
+    if (!result || typeof result !== "object") return confirmOnly();
   } else {
     process.stderr.write(`gyredeck: mail withheld this turn — ${viaBroker.withheld}\n`);
     return confirmOnly();

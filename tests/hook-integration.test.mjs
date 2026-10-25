@@ -10727,7 +10727,7 @@ test("the Antigravity payload-shape log records lengths, never values, and empti
  * proxy that counts every confirm it carries — so "sent nothing" and "sent once" are
  * counted, not inferred from what the bridge happens to say.
  */
-const agyPasteFixture = async (tag) => {
+const agyPasteFixture = async (tag, { breakInbox = false } = {}) => {
   const home = await mkdtemp(join(tmpdir(), `gyredeck-250-${tag}-`));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const bridgePort = await freePort();
@@ -10742,6 +10742,8 @@ const agyPasteFixture = async (tag) => {
   const confirms = [];
   const proxy = createHttpServer((req, res) => {
     if (req.method === "POST" && /^\/sync\/rooms\/[^/]+\/confirm$/.test(req.url)) confirms.push(req.url);
+    // An inbox that answers nothing usable: the hook has no room metadata to build from.
+    if (breakInbox && req.url.startsWith("/mail/inbox")) { res.writeHead(500); res.end(); return; }
     const upstream = httpRequest({ hostname: "127.0.0.1", port: bridgePort, path: req.url, method: req.method, headers: req.headers }, (answer) => {
       res.writeHead(answer.statusCode ?? 502, answer.headers);
       answer.pipe(res);
@@ -10774,11 +10776,18 @@ const agyPasteFixture = async (tag) => {
   assert.match(password, /^[0-9a-f]{32}$/, "premise: the room's password is 32 hex");
   await call("POST", `/sync/rooms/${code}/members`, { conversationId: agy });
   /** One PreInvocation with this `lastUserInput`: its steps as text, and its stderr. */
-  const invoke = async (lastUserInput) => {
-    const result = await runAdapter(
-      "adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], home,
-      { hookEventName: "PreInvocation", conversationId: agy, workspacePaths: ["/tmp/project"], ...(lastUserInput === undefined ? {} : { lastUserInput }) },
-    );
+  const invoke = async (lastUserInput, env = {}) => {
+    const result = await new Promise((resolve) => {
+      const child = spawn(process.execPath, ["adapters/antigravity/gyredeck-agy-hook.mjs", "--event", "PreInvocation"], {
+        cwd: repoRoot, env: { ...process.env, HOME: home, ...env }, stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.stdin.end(JSON.stringify({ hookEventName: "PreInvocation", conversationId: agy, workspacePaths: ["/tmp/project"], ...(lastUserInput === undefined ? {} : { lastUserInput }) }));
+      child.on("close", (code) => resolve({ code, stdout, stderr }));
+    });
     assert.equal(result.code, 0, result.stderr);
     return { text: (JSON.parse(result.stdout).injectSteps ?? []).map((step) => step.ephemeralMessage ?? "").join("\n"), stdout: result.stdout, stderr: result.stderr };
   };
@@ -10855,5 +10864,19 @@ test("#250 C5: a refused password is said with its error code, then BLOCKED, and
     assert.equal(await f.confirmed(), false);
   } finally {
     await f.close();
+  }
+});
+
+test("#250 r2: an accepted paste keeps its HEAR when the delivery cannot be built, and when the inbox answers nothing", async () => {
+  for (const [label, options, env] of [["delivery fault", {}, { GYREDECK_TEST_FAULT: "delivery" }], ["no inbox answer", { breakInbox: true }, {}]]) {
+    const f = await agyPasteFixture(label.replace(/ /g, "-"), options);
+    try {
+      const result = await f.invoke(f.password, env);
+      assert.equal(await f.confirmed(), true, `${label}: premise, the password was accepted`);
+      assert.match(result.text, new RegExp(`NEW: the password you were just given was accepted for sync room ${f.code}`), label);
+      assert.ok(result.text.includes(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`), `${label}: with the way to hear the room`);
+    } finally {
+      await f.close();
+    }
   }
 });

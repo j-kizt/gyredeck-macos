@@ -5378,22 +5378,31 @@ function startBridge(config) {
   const groupAlive = (pgid) => {
     try { process.kill(-pgid, 0); return true; } catch (error) { return error.code === "EPERM"; }
   };
+  // Tests only: where `ps` is, so a test can make the lookup fail. It breaks the lookup and
+  // nothing else; every check then fails closed.
+  const PS_BIN = process.env.GYREDECK_TEST_PS_BIN || "ps";
   /**
-   * What macOS says about one process: its parent, its group and when it started, or null
-   * when it does not exist. `ps`, without a shell, because Node exposes none of this.
+   * What macOS says about one process: `{ found, ppid, pgid, started }`; `{ absent }` when it
+   * does not exist; `{ unknown }` when the lookup itself failed or timed out. A lookup that
+   * failed proves nothing about the process, so it is never read as "absent" (#243 audit):
+   * absence is asked of the kernel directly.
    */
   const processFacts = (pid) => {
     try {
-      const line = execFileSync("ps", ["-o", "ppid=,pgid=,lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+      const line = execFileSync(PS_BIN, ["-o", "ppid=,pgid=,lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
       const match = /^(\d+)\s+(\d+)\s+(.+)$/.exec(line);
-      return match ? { ppid: Number(match[1]), pgid: Number(match[2]), started: match[3].replace(/\s+/g, " ") } : null;
-    } catch {
-      return null;
+      if (match) return { status: "found", ppid: Number(match[1]), pgid: Number(match[2]), started: match[3].replace(/\s+/g, " ") };
+    } catch {}
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error.code === "ESRCH") return { status: "absent" };
     }
+    return { status: "unknown" };
   };
   const commandOf = (pid) => {
     try {
-      return execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+      return execFileSync(PS_BIN, ["-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
     } catch {
       return "";
     }
@@ -5407,7 +5416,7 @@ function startBridge(config) {
   const verifiedGroupStart = (pgid, helperPid) => {
     if (!Number.isInteger(helperPid) || helperPid <= 1) return null;
     const leader = processFacts(pgid);
-    if (!leader || leader.pgid !== pgid || leader.ppid !== helperPid) return null;
+    if (leader.status !== "found" || leader.pgid !== pgid || leader.ppid !== helperPid) return null;
     return commandOf(helperPid).includes("gyredeck-heavy.mjs") ? leader.started : null;
   };
   /**
@@ -5417,11 +5426,14 @@ function startBridge(config) {
    * while others in it still run is still the same group: macOS does not hand out a pid
    * that is in use as a process group, so the id cannot have been reused meanwhile.
    */
-  const heavyGroupIsOurs = (pgid, started) => {
-    if (!groupAlive(pgid)) return false;
+  // "ours", "gone", or "unknown" when it cannot be told — which signals nothing and frees
+  // nothing.
+  const heavyGroupState = (pgid, started) => {
+    if (!groupAlive(pgid)) return "gone";
     const leader = processFacts(pgid);
-    if (!leader) return true;
-    return leader.pgid === pgid && leader.started === started;
+    if (leader.status === "absent") return "ours";
+    if (leader.status === "unknown") return "unknown";
+    return leader.pgid === pgid && leader.started === started ? "ours" : "gone";
   };
 
   let heavyHolder = null;
@@ -5469,9 +5481,11 @@ function startBridge(config) {
       && /^[a-f0-9]{64}$/.test(record.leaseHash ?? "")
       && /^[a-f0-9]{64}$/.test(record.requestIdHash ?? "")
       && typeof record.as === "string" && typeof record.what === "string"
-      && (record.state === "reserved" || (record.state === "active" && Number.isInteger(record.pgid) && record.pgid > 1 && typeof record.pgidStart === "string"));
-    // A record from before #243 has no start time to check the group by, and is dropped.
-    // Whether the group is still the one recorded is the timer's to check, not the start's.
+      && (record.state === "reserved" || (record.state === "active" && Number.isInteger(record.pgid) && record.pgid > 1));
+    // A record from before #243 has no start time to check its group by. It is kept while
+    // the group lives — dropping it would grant a second run beside it — but unverified:
+    // the app may not stop it, and its slot frees only when the group is gone.
+    // Whether a verified group is still the one recorded is the timer's to check.
     if (valid && (record.state === "reserved" || groupAlive(record.pgid))) {
       const now = heavyNow();
       const since = typeof record.since === "string" && !Number.isNaN(Date.parse(record.since)) ? record.since : new Date().toISOString();
@@ -5483,7 +5497,7 @@ function startBridge(config) {
         as: record.as,
         what: record.what,
         pgid: record.state === "active" ? record.pgid : null,
-        pgidStart: record.state === "active" ? record.pgidStart : null,
+        pgidStart: record.state === "active" && typeof record.pgidStart === "string" ? record.pgidStart : null,
         since,
         startedAt: now - Math.max(0, Date.now() - Date.parse(since)),
         reservedAt: now,
@@ -5567,15 +5581,19 @@ function startBridge(config) {
       return "freed";
     }
     const { pgid, pgidStart } = heavyHolder;
+    // A run recorded before #243 was never verified: not the app's to signal.
+    if (pgidStart === null) return "unverified";
     // Checked before each signal: a group whose id now belongs to another process is not
-    // ours to signal, and counts as gone.
-    if (!heavyGroupIsOurs(pgid, pgidStart)) {
+    // ours to signal, and counts as gone; one that cannot be checked is left alone.
+    const now = heavyGroupState(pgid, pgidStart);
+    if (now === "unknown") return "cannot_verify";
+    if (now === "gone") {
       freeHeavy();
       return "gone";
     }
     try { process.kill(-pgid, "SIGTERM"); } catch {}
     setTimeout(() => {
-      if (heavyGroupIsOurs(pgid, pgidStart)) { try { process.kill(-pgid, "SIGKILL"); } catch {} }
+      if (heavyGroupState(pgid, pgidStart) === "ours") { try { process.kill(-pgid, "SIGKILL"); } catch {} }
       sweepHeavy({ verify: true });
     }, HEAVY_STOP_KILL_MS).unref();
     return "stopping";
@@ -5590,7 +5608,7 @@ function startBridge(config) {
       // Never activated, so its command never ran: the gate holds it until it is.
       heavyHolder = null;
       persistHeavyHolder();
-    } else if (heavyHolder?.state === "active" && !(verify ? heavyGroupIsOurs(heavyHolder.pgid, heavyHolder.pgidStart) : groupAlive(heavyHolder.pgid))) {
+    } else if (heavyHolder?.state === "active" && (verify && heavyHolder.pgidStart !== null ? heavyGroupState(heavyHolder.pgid, heavyHolder.pgidStart) === "gone" : !groupAlive(heavyHolder.pgid))) {
       heavyHolder = null;
       persistHeavyHolder();
     }
@@ -5632,6 +5650,8 @@ function startBridge(config) {
             // The group still runs and nothing has spoken for it: the helper died and left
             // its command going. The slot stays held; the panel says why.
             helperGone: heavyHolder.state === "active" && now - heavyHolder.heartbeatAt > HEAVY_HELPER_QUIET_MS,
+            // False for a run recorded before #243: held while its group lives, never stopped by the app.
+            verified: heavyHolder.state !== "active" || heavyHolder.pgidStart !== null,
             // Restored from the record and not yet claimed by its helper since this bridge started.
             adopted: heavyHolder.adopted,
           }
@@ -5933,7 +5953,16 @@ function startBridge(config) {
           sendJson(409, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "holder_changed", message: "That run no longer holds the slot; nothing was stopped." });
           return;
         }
-        sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, result: stopHeavy() });
+        const result = stopHeavy();
+        if (result === "unverified") {
+          sendJson(409, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "holder_unverified", message: "That run was started before this version and cannot be verified; stop it from its terminal. Nothing was signalled." });
+          return;
+        }
+        if (result === "cannot_verify") {
+          sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "cannot_verify", message: "The run's process group could not be checked just now, so nothing was signalled. Try again." });
+          return;
+        }
+        sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, result });
         return;
       }
 

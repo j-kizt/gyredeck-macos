@@ -12,6 +12,8 @@ export interface IHeavyStatus {
     elapsedMs: number;
     loadSkipped: boolean;
     helperGone: boolean;
+    /** False for a run recorded before #243: the app may not stop it. Absent from older bridges. */
+    verified?: boolean;
   } | null;
   queue: Array<{ position: number; as: string; label?: string | null; what: string; waitedMs: number }>;
   load: number | null;

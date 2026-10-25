@@ -10009,6 +10009,60 @@ test("heavy D1: the sweep frees a slot whose group id now belongs to another pro
   }
 });
 
+test("heavy round 4 P1: a holder recorded before #243 is kept while its group lives, and the app cannot stop it", async () => {
+  const h = await heavyHarness("legacy");
+  try {
+    let bridge = await h.start();
+    const held = await h.hold("run-a");
+    await h.stop(bridge);
+    const { pgidStart: _dropped, ...legacy } = JSON.parse(await readFile(h.holderPath, "utf8"));
+    await writeFile(h.holderPath, JSON.stringify(legacy));
+    bridge = await h.start();
+    const holder = (await h.state()).holder;
+    assert.equal(holder?.as, "run-a", "kept, not dropped");
+    assert.equal(holder.verified, false);
+    assert.equal((await h.acquire("run-b", "b", h.pair())).status, 202, "so no second slot");
+    const stopped = await fetch(`${h.base}/heavy/holder?id=${holder.id}`, { method: "DELETE", headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD } });
+    assert.equal(stopped.status, 409);
+    assert.equal((await stopped.json()).error, "holder_unverified");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(groupAliveInTest(held.pgid), true, "nothing was signalled");
+    assert.equal((await h.state()).holder?.id, holder.id, "and the slot is still held");
+    killGroup(held.pgid);
+    await until(async () => (await h.state()).holder?.as !== "run-a", "the slot frees when the old group is gone");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy round 4 P2: with ps unavailable, nothing is signalled, the slot stays held, and activate refuses", async () => {
+  const missingPs = join(tmpdir(), `no-such-ps-${randomUUID()}`);
+  // A mismatched start time that a working ps would show; without ps it cannot be told.
+  const { h, held } = await reusedPidHolder("no-ps", { GYREDECK_TEST_PS_BIN: missingPs, GYREDECK_TEST_HEAVY_STOP_KILL_MS: "200" });
+  try {
+    const holder = (await h.state()).holder;
+    assert.equal(holder?.as, "run-a");
+    const stopped = await fetch(`${h.base}/heavy/holder?id=${holder.id}`, { method: "DELETE", headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD } });
+    assert.equal(stopped.status, 503);
+    assert.equal((await stopped.json()).error, "cannot_verify");
+    // The sweep runs every 100 ms here; several have run by now.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(groupAliveInTest(held.pgid), true, "not signalled");
+    assert.equal((await h.state()).holder?.id, holder.id, "and the sweep keeps the slot held");
+
+    // Activate fails closed too: a genuine helper group cannot be verified without ps.
+    killGroup(held.pgid);
+    await until(async () => (await h.state()).holder === null, "the old group gone");
+    const ids = h.pair();
+    assert.equal((await h.acquire("run-c", "c", ids)).status, 200);
+    const refused = await h.post("activate", { lease: ids.lease, ...(await h.group()) });
+    assert.equal(refused.status, 403);
+    assert.equal(refused.body.error, "pgid_unverified");
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test("heavy C9: a restart keeps a running holder, grants no second slot, and the helper re-adopts", async () => {
   const h = await heavyHarness("c9");
   try {

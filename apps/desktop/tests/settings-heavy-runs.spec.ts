@@ -115,6 +115,25 @@ test("the heavy-runs row says the slot is free when nothing holds it", async ({ 
   await expect(row.getByRole("button", { name: "Release stuck slot" })).toHaveCount(0);
 });
 
+test("a run recorded before this version shows how to stop it, and no Stop button (#243)", async ({ page }) => {
+  await page.addInitScript((held) => {
+    (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (command: string) => {
+        if (command === "set_keep_awake") return false;
+        if (command.endsWith("_hook_status")) return ["/Users/demo/.config/gyredeck/hook.mjs", true];
+        if (command === "heavy_status") return { ...held, holder: { ...held.holder, verified: false } };
+        throw new Error(`${command} unavailable`);
+      },
+    };
+  }, HELD);
+
+  await page.goto("/?demo=1");
+  await page.getByRole("button", { name: "Settings" }).click();
+  const row = page.locator(".setup-row").filter({ hasText: "Heavy-run slot" });
+  await expect(row).toContainText("Started before this version — stop it from its terminal.");
+  await expect(row.getByRole("button", { name: "Stop this run" })).toHaveCount(0);
+});
+
 test.describe("at the app's own window width", () => {
   test.use({ viewport: { width: 444, height: 560 } });
 

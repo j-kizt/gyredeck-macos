@@ -1239,6 +1239,8 @@ pub(crate) fn heavy_stop(holder_id: &str, app_word: &str) -> Result<String, Stri
             (503, "app_word_unavailable") => "The bridge was started without Gyredeck's word. Quit and reopen Gyredeck".to_string(),
             (404, _) => "This bridge has no heavy-run queue yet. Quit and reopen Gyredeck".to_string(),
             (409, "holder_changed") => "That run no longer holds the slot; nothing was stopped".to_string(),
+            (409, "holder_unverified") => "That run started before this version; stop it from its terminal".to_string(),
+            (503, "cannot_verify") => "Could not check that run just now, so nothing was stopped. Try again".to_string(),
             _ => format!("The bridge refused the request (HTTP {status})"),
         });
     }

@@ -308,7 +308,9 @@ const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean 
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   if (!canUseNativeControls) return null;
   const holder = heavy.status?.holder ?? null;
-  const confirming = holder !== null && confirmingId === holder.id;
+  // A run recorded before #243 was never verified as the helper's, so the app cannot stop it.
+  const stoppable = holder !== null && holder.verified !== false;
+  const confirming = holder !== null && stoppable && confirmingId === holder.id;
   const queue = heavy.status?.queue ?? [];
   const detail = heavy.error
     ? heavy.error
@@ -326,6 +328,7 @@ const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean 
           <span className="setup-title">Heavy-run slot</span>
           <span className="setup-detail">{detail}</span>
           {holder?.helperGone ? <span className="setup-detail">Helper gone, command still running</span> : null}
+          {holder && !stoppable ? <span className="setup-detail">Started before this version — stop it from its terminal.</span> : null}
           {queue.map((entry) => (
             <span className="setup-detail" key={`${entry.position}-${entry.as}`}>
               {`Waiting ${entry.position} · ${entry.label ?? entry.as} · ${entry.what} · ${heavyElapsed(entry.waitedMs)}`}
@@ -342,7 +345,7 @@ const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean 
               Stop
             </button>
           </span>
-        ) : holder ? (
+        ) : holder && stoppable ? (
           <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => setConfirmingId(holder.id)} data-tauri-drag-region="false">
             {heavy.releasing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
             {heavy.releasing ? "Stopping…" : "Stop this run"}

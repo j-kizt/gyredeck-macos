@@ -5395,6 +5395,7 @@ function startBridge(config) {
         state: heavyHolder.state,
         leaseHash: heavyHolder.leaseHash.toString("hex"),
         requestIdHash: heavyHolder.requestIdHash.toString("hex"),
+        id: heavyHolder.id,
         as: heavyHolder.as,
         what: heavyHolder.what,
         pgid: heavyHolder.pgid,
@@ -5430,6 +5431,7 @@ function startBridge(config) {
         state: record.state,
         leaseHash: Buffer.from(record.leaseHash, "hex"),
         requestIdHash: Buffer.from(record.requestIdHash, "hex"),
+        id: typeof record.id === "string" && /^[0-9a-f]{16}$/.test(record.id) ? record.id : randomBytes(8).toString("hex"),
         as: record.as,
         what: record.what,
         pgid: record.state === "active" ? record.pgid : null,
@@ -5471,6 +5473,10 @@ function startBridge(config) {
       state: "reserved",
       leaseHash: request.leaseHash,
       requestIdHash: request.requestIdHash,
+      // Names this run, and only this run, to the app: Release is confirmed against it, so a
+      // run that took the slot after the person pressed Release is never the one freed.
+      // Not a secret — it frees nothing on its own; the app's word does that.
+      id: randomBytes(8).toString("hex"),
       as: request.as,
       what: request.what,
       pgid: null,
@@ -5494,6 +5500,29 @@ function startBridge(config) {
     heavyHolder = null;
     persistHeavyHolder();
     promoteHeavy();
+  };
+
+  // How long a stopped run gets to end on SIGTERM before its group is killed (#243).
+  const HEAVY_STOP_KILL_MS = Number(process.env.GYREDECK_TEST_HEAVY_STOP_KILL_MS) || 10_000;
+  /**
+   * The app's "Stop this run" (#243): end the holder's command, and let the slot go the
+   * ordinary way — when its group is gone. Freeing the slot while the command still ran
+   * would let the next run start on top of it, the overlap this queue exists to prevent.
+   * A reservation has run nothing yet (the gate holds it), so it is simply dropped.
+   */
+  const stopHeavy = () => {
+    if (!heavyHolder) return "none";
+    if (heavyHolder.state !== "active") {
+      freeHeavy();
+      return "freed";
+    }
+    const { pgid } = heavyHolder;
+    try { process.kill(-pgid, "SIGTERM"); } catch {}
+    setTimeout(() => {
+      if (groupAlive(pgid)) { try { process.kill(-pgid, "SIGKILL"); } catch {} }
+      sweepHeavy();
+    }, HEAVY_STOP_KILL_MS).unref();
+    return "stopping";
   };
 
   /** Expire what has lapsed, then let the line move. Run before every answer and on a timer. */
@@ -5534,6 +5563,7 @@ function startBridge(config) {
       loadLimit: HEAVY_LOAD_LIMIT,
       holder: heavyHolder
         ? {
+            id: heavyHolder.id,
             as: heavyHolder.as,
             label: heavyLabelFor(heavyHolder.as),
             what: heavyHolder.what,
@@ -5819,7 +5849,8 @@ function startBridge(config) {
         sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
         return;
       }
-      const { pathname } = new URL(req.url, "http://127.0.0.1");
+      const heavyUrl = new URL(req.url, "http://127.0.0.1");
+      const { pathname } = heavyUrl;
       sweepHeavy();
 
       if (req.method === "GET" && pathname === "/heavy") {
@@ -5827,19 +5858,24 @@ function startBridge(config) {
         return;
       }
 
-      // DELETE /heavy/holder — the app's "Release stuck slot".
+      // DELETE /heavy/holder?id=… — the app's "Stop this run".
       if (req.method === "DELETE" && pathname === "/heavy/holder") {
         if (brokerSecret === null) {
           sendJson(503, { ok: false, error: "app_word_unavailable", message: "A stuck heavy-run slot is released from the Gyredeck app, and this bridge was started without the app's word. Quit and reopen Gyredeck." });
           return;
         }
         if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"])) {
-          sendJson(401, { ok: false, error: "app_only", message: "Only the Gyredeck app can release a heavy-run slot; a run frees its own by finishing." });
+          sendJson(401, { ok: false, error: "app_only", message: "Only the Gyredeck app can stop a heavy run; a run frees the slot by finishing." });
           return;
         }
-        const released = heavyHolder !== null;
-        freeHeavy();
-        sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, released });
+        // Only the run the person confirmed (#243 audit): compared and acted on in one step, so
+        // a run that took the slot in between is left alone and the app is told it changed.
+        const expected = heavyUrl.searchParams.get("id");
+        if (!expected || heavyHolder?.id !== expected) {
+          sendJson(409, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "holder_changed", message: "That run no longer holds the slot; nothing was stopped." });
+          return;
+        }
+        sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, result: stopHeavy() });
         return;
       }
 

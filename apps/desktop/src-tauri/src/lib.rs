@@ -891,10 +891,11 @@ fn heavy_status() -> Result<serde_json::Value, String> {
     standalone_bridge::heavy_status()
 }
 
-/// Free a stuck heavy-run slot. Answers whether anything held it.
+/// Stop the run holding the heavy-run slot, named by the holder id the person saw. Answers
+/// "stopping", "freed" (a reservation that had run nothing) or "none".
 #[tauri::command]
-fn heavy_release(broker: tauri::State<'_, broker::BrokerState>) -> Result<bool, String> {
-    standalone_bridge::heavy_release(&broker.secret()?)
+fn heavy_stop(holder_id: String, broker: tauri::State<'_, broker::BrokerState>) -> Result<String, String> {
+    standalone_bridge::heavy_stop(&holder_id, &broker.secret()?)
 }
 
 #[tauri::command]
@@ -5884,7 +5885,7 @@ pub fn run() {
             sync_close,
             sync_leave,
             heavy_status,
-            heavy_release,
+            heavy_stop,
             set_bridge_port,
             claude_usage,
             codex_usage,

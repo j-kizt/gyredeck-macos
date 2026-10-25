@@ -9845,20 +9845,66 @@ test("heavy C7: the load gate holds the grant, and ten minutes grant it anyway",
   }
 });
 
-test("heavy C8: releasing a stuck slot is the app's alone", async () => {
+test("heavy C8: stopping a run is the app's alone, and only the run it names", async () => {
   const h = await heavyHarness("c8");
   try {
-    await h.start();
-    await h.hold("run-a");
-    const asAgent = await fetch(`${h.base}/heavy/holder`, { method: "DELETE", headers: { "x-gyredeck-token": h.token() } });
+    await h.start({ GYREDECK_TEST_HEAVY_STOP_KILL_MS: "300" });
+    const held = await h.hold("run-a");
+    const id = (await h.state()).holder.id;
+    assert.match(id, /^[0-9a-f]{16}$/, "the holder carries a non-secret id");
+    const stop = (query, word) => fetch(`${h.base}/heavy/holder${query}`, {
+      method: "DELETE", headers: { "x-gyredeck-token": h.token(), ...(word ? { "x-gyredeck-broker": word } : {}) },
+    });
+    const asAgent = await stop(`?id=${id}`);
     assert.equal(asAgent.status, 401);
     assert.equal((await asAgent.json()).error, "app_only");
-    const wrongWord = await fetch(`${h.base}/heavy/holder`, { method: "DELETE", headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": "b6".repeat(32) } });
-    assert.equal(wrongWord.status, 401);
-    assert.equal((await h.state()).holder?.as, "run-a", "unchanged");
-    const asApp = await fetch(`${h.base}/heavy/holder`, { method: "DELETE", headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD } });
+    assert.equal((await stop(`?id=${id}`, "b6".repeat(32))).status, 401, "a wrong word is no word");
+
+    // The app's word without the run it means, or naming another run, stops nothing.
+    for (const query of ["", "?id=0000000000000000"]) {
+      const wrong = await stop(query, TEST_APP_WORD);
+      assert.equal(wrong.status, 409, query || "no id");
+      assert.equal((await wrong.json()).error, "holder_changed");
+    }
+    assert.equal(groupAliveInTest(held.pgid), true, "the command still runs");
+    assert.equal((await h.state()).holder?.id, id, "and still holds the slot");
+
+    // Named: the command is ended, and the slot goes only once its group is gone.
+    const asApp = await stop(`?id=${id}`, TEST_APP_WORD);
     assert.equal(asApp.status, 200);
-    assert.equal((await asApp.json()).released, true);
+    assert.equal((await asApp.json()).result, "stopping");
+    await until(() => !groupAliveInTest(held.pgid), "the group ends on SIGTERM");
+    await until(async () => (await h.state()).holder === null, "and the slot is free");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("heavy stop: a run that ignores SIGTERM is killed, and a reservation that ran nothing is dropped (#243)", async () => {
+  const h = await heavyHarness("stop");
+  try {
+    await h.start({ GYREDECK_TEST_HEAVY_STOP_KILL_MS: "1500" });
+    const ids = h.pair();
+    assert.equal((await h.acquire("stubborn", "ignores TERM", ids)).status, 200);
+    const child = spawn("sh", ["-c", "trap '' TERM; while :; do sleep 1; done"], { detached: true, stdio: "ignore" });
+    child.unref();
+    h.groups.add(child.pid);
+    assert.equal((await h.post("activate", { lease: ids.lease, pgid: child.pid })).status, 200);
+    const id = (await h.state()).holder.id;
+    const stopped = await fetch(`${h.base}/heavy/holder?id=${id}`, { method: "DELETE", headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD } });
+    assert.equal((await stopped.json()).result, "stopping");
+    // Still running, so still holding: freeing the slot now would let the next run start on top of it.
+    assert.equal(groupAliveInTest(child.pid), true, "premise: TERM was ignored");
+    assert.equal((await h.state()).holder?.id, id, "the slot stays held while the command runs");
+    await until(() => !groupAliveInTest(child.pid), "SIGKILL after the grace period");
+    await until(async () => (await h.state()).holder === null, "and the slot is free");
+
+    // A reservation's gated command has not started, so stopping it just drops it.
+    const reserved = h.pair();
+    assert.equal((await h.acquire("gated", "never started", reserved)).status, 200);
+    const rid = (await h.state()).holder.id;
+    const dropped = await fetch(`${h.base}/heavy/holder?id=${rid}`, { method: "DELETE", headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD } });
+    assert.equal((await dropped.json()).result, "freed");
     assert.equal((await h.state()).holder, null);
   } finally {
     await h.cleanup();

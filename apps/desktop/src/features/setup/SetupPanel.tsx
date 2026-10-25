@@ -294,7 +294,6 @@ const heavyElapsed = (ms: number): string => {
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 };
 
-const HEAVY_RELEASE_WARNING = "Frees the slot even if its command is still running — two heavy runs may then overlap.";
 
 /**
  * The machine's one heavy-run slot (#223): who holds it, what it runs and for how long, and
@@ -303,11 +302,13 @@ const HEAVY_RELEASE_WARNING = "Frees the slot even if its command is still runni
  */
 const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean }) => {
   const heavy = useHeavyRuns(canUseNativeControls);
-  // Asked here, in the app: the macOS webview implements no window.confirm, so a native
-  // confirm returned without asking and the slot was never released (#243 audit).
-  const [confirming, setConfirming] = useState(false);
+  // Asked here, in the row: the macOS webview implements no window.confirm (#243 audit). The
+  // confirmation names the run it was asked about, so a run that took the slot since is
+  // never the one stopped.
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
   if (!canUseNativeControls) return null;
   const holder = heavy.status?.holder ?? null;
+  const confirming = holder !== null && confirmingId === holder.id;
   const queue = heavy.status?.queue ?? [];
   const detail = heavy.error
     ? heavy.error
@@ -330,21 +331,21 @@ const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean 
               {`Waiting ${entry.position} · ${entry.label ?? entry.as} · ${entry.what} · ${heavyElapsed(entry.waitedMs)}`}
             </span>
           ))}
-          {heavy.status ? <span className="setup-detail" title={heavy.status.limit}>Advisory: runs started outside the queue are not seen.</span> : null}
-          {holder && confirming ? <span className="setup-detail" role="alert">{HEAVY_RELEASE_WARNING}</span> : null}
+          {heavy.status ? <span className="setup-detail" title={heavy.status.limit}>Only queued runs show here.</span> : null}
+          {holder && confirming ? <span className="setup-detail" role="alert">{`Stop ${holder.what} of ${holder.label ?? holder.as}? Its command will be ended.`}</span> : null}
         </span>
         {holder && confirming ? (
           <span className="setup-row-actions">
-            <button className="pill-btn" type="button" onClick={() => setConfirming(false)} data-tauri-drag-region="false">Cancel</button>
-            <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => { setConfirming(false); void heavy.release(); }} data-tauri-drag-region="false">
+            <button className="pill-btn" type="button" onClick={() => setConfirmingId(null)} data-tauri-drag-region="false">Cancel</button>
+            <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => { setConfirmingId(null); void heavy.stop(holder.id); }} data-tauri-drag-region="false">
               {heavy.releasing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
-              Confirm release
+              Stop
             </button>
           </span>
         ) : holder ? (
-          <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => setConfirming(true)} data-tauri-drag-region="false">
+          <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => setConfirmingId(holder.id)} data-tauri-drag-region="false">
             {heavy.releasing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
-            {heavy.releasing ? "Releasing…" : "Release stuck slot"}
+            {heavy.releasing ? "Stopping…" : "Stop this run"}
           </button>
         ) : null}
       </div>

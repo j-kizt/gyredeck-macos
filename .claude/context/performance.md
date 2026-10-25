@@ -21,12 +21,13 @@ pnpm desktop:web:build
 
 ## 1. Bundle budget — `scripts/check-performance-budget.mjs`
 
-Gzips the largest CSS and JavaScript assets in `apps/desktop/dist/assets/`, walks `dist/` for total size, and fails on any regression past these ceilings:
+Gzips the largest CSS and JavaScript assets in `apps/desktop/dist/assets/`, sums the gzip of every JavaScript asset (so a lazy chunk cannot hide growth from the largest-chunk ceiling, #233), walks `dist/` for total size, and fails on any regression past these ceilings:
 
 | Budget | Ceiling |
 | --- | ---: |
 | Largest CSS asset (gzip) | 13,650 bytes |
 | Largest JavaScript asset (gzip) | 112,000 bytes |
+| All JavaScript assets together (gzip, summed per file) | 115,075 bytes |
 | Core `dist/` (total, minus separately-budgeted asset trees) | 575,500 bytes |
 
 It also fails if any `dist/` path contains `session-cat` (a forbidden legacy asset tree).

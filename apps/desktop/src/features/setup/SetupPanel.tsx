@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowRight, Bell, Check, Coffee, Download, Focus, Gauge, KeyRound, Link2, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Power, Puzzle, RefreshCw, ShieldCheck, Trash2, X } from "lucide-react";
+import { ArrowRight, Bell, Check, Coffee, Download, Focus, Gauge, KeyRound, Link2, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Power, Puzzle, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import type { IGyredeckBridgeCapabilities } from "@gyredeck/protocol";
 import type { INotificationsState, NotificationPermission } from "../notifications/useNotifications";
 import { shortenPath } from "../session/activity";

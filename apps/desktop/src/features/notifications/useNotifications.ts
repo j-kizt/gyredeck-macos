@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { GyredeckEvent } from "@gyredeck/protocol";
 import type { IGithubRepoStatus } from "../github/types";
@@ -7,6 +6,13 @@ import { gitChangesBetween, markOf, type IGitMark } from "./gitChanges";
 import { markOf as quotaMarkOf, quotaAlertsBetween, type QuotaMark } from "./usageAlerts";
 import { USAGE_PROVIDERS } from "../usage/providers";
 import type { IAgentUsageState, UsageProviderId } from "../usage/types";
+
+// The same IPC call getCurrentWindow().isVisible() sends. Importing the window module for
+// this one question pulled its whole Window class, dpi and image into the bundle, about
+// 3 kB gzip (#233). A missing runtime throws here as it did there, and the callers catch it.
+const currentWindowIsVisible = () => invoke<boolean>("plugin:window|is_visible", {
+  label: (window.__TAURI_INTERNALS__ as { metadata: { currentWindow: { label: string } } }).metadata.currentWindow.label,
+});
 
 export type NotificationPermission =
   | "notDetermined"
@@ -211,7 +217,7 @@ export const useNotifications = ({
         // Asked at the moment of posting rather than tracked: focus changes without
         // telling this hook, and a stale answer here is a banner over the window the
         // person is already reading.
-        if (await getCurrentWindow().isVisible()) return;
+        if (await currentWindowIsVisible()) return;
       } catch {
         // Unable to tell — err towards notifying. A missed notification is the failure
         // nobody can see; a redundant one is merely annoying.
@@ -240,7 +246,7 @@ export const useNotifications = ({
 
     void (async () => {
       try {
-        if (await getCurrentWindow().isVisible()) return;
+        if (await currentWindowIsVisible()) return;
       } catch {
         // Unable to tell — err towards notifying.
       }
@@ -280,7 +286,7 @@ export const useNotifications = ({
 
     void (async () => {
       try {
-        if (await getCurrentWindow().isVisible()) return;
+        if (await currentWindowIsVisible()) return;
       } catch {
         // Unable to tell — err towards notifying.
       }

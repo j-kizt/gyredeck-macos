@@ -69,6 +69,9 @@ Bound to `127.0.0.1:47621`.
 | POST | `/sync/rooms/<code>/passwords` | Whether the caller is the founder: `{ ok, room }`, no password. The bridge keeps only a sha256 of it (#124) and hands the plaintext over once, in the `201` from `POST /sync/rooms`; the app holds it in memory and shows it from there. Reading it out lets nobody in. |
 | POST | `/sync/rooms/<code>/confirm` | A joined session presents it and may then speak. |
 | DELETE | `/sync/rooms/<code>?as=<id>` | The founder ends the room for everyone. |
+| GET | `/heavy` | The machine's heavy-run slot: holder, queue, 1-minute load (#223). |
+| POST | `/heavy/acquire` · `wait` · `activate` · `heartbeat` · `release` · `cancel` · `adopt` | The heavy-run queue, spoken by `~/.config/gyredeck/gyredeck-heavy.mjs`; see [Heavy runs](#heavy-runs-223). |
+| DELETE | `/heavy/holder` | The app frees a stuck slot (app's word only). |
 
 `GET /health` and `GET /snapshot` include capability metadata so viewers know which event streams and session actions are real:
 
@@ -783,6 +786,19 @@ Two cursors matter for that rule. A member joins at the room's current position 
 `droppedThroughSeq` records how far a room has lost, and a reader whose cursor sits below it is told so once, in `missed`. That report is unreachable while the refusal holds — a member joins at the room's current position and trimming never passes the slowest member — and it is kept so that weakening the invariant later cannot make the loss silent again.
 
 `POST /hook/stop` converts a `Stop` hook into `turn_complete`; the legacy `turn_stop` event remains readable. `POST /hook/attention` converts a `PermissionRequest`/`Notification` relay into `attention_requested`. A `Notification` immediately following a completion in the same cwd (within 15s) is suppressed so a "turn done" ping is not re-shown as a fresh user wait. Neither relay carries raw tool arguments or question text.
+
+## Heavy runs (#223)
+
+One heavy run (a test suite, a native build) at a time on this machine, for every session. Advisory: the rules (v8) tell agents to run heavy commands through the helper the bridge writes at start, `node ~/.config/gyredeck/gyredeck-heavy.mjs --as <id> --what "<label>" -- <cmd…>`; nothing is enforced.
+
+- Every route takes the machine token; every body carries `v: 1`, and another version is `409 version`. Bodies are capped at 4 KiB (`413`), `as` follows the room-name rule (≤ 64), `what` ≤ 200 characters, the queue ≤ 32 (`503 queue_full`), held long polls ≤ 32 (`503 too_many_waits`).
+- **The helper makes the lease and the requestId** (128-bit hex each) and keeps them in memory. The bridge keeps only their sha256, compared with `timingSafeEqual`. A retried `acquire` presents both and is answered with the same grant or the same ticket; the right requestId with another lease is `403`.
+- **reserved → active.** A grant is a reservation, written to `~/.config/gyredeck/heavy/holder.json` (temp, fsync, rename; a symlinked dir or file is refused; hashes only) before the reply. The helper then spawns the command behind a gate, `sh -c 'IFS= read -r line <&3 || exit 1; [ "$line" = GO ] || exit 1; exec 3<&-; exec "$@"'`, in its own process group, sends `activate {lease, pgid}`, and writes `GO` only after the `200`. Anything but `GO` — EOF from a crashed helper included — runs nothing. An unactivated reservation lapses after 60 s.
+- **The slot is held while the group lives** (`kill(-pgid, 0)` every 5 s and before every answer), whoever else has gone; `helperGone` says the heartbeat (60 s, lease 5 min) has stopped. `conversation_close` frees nothing. On SIGINT/SIGTERM the helper forwards the signal to the group, escalates to SIGKILL after 30 s, and releases only once the group is gone; a queued helper cancels its ticket.
+- **Grant:** the front of the line, when the 1-minute load is ≤ 5 — or after 10 minutes of waiting, marked `loadSkipped`. Monotonic clock throughout. A ticket not polled for 90 s leaves the line.
+- **Restart:** the holder survives through the record (a reservation gets a fresh minute; an active run is kept while its group lives, and its helper `adopt`s it on the next heartbeat). Tickets are memory-only: a restart resets the line, `wait` answers `404 ticket_unknown`, and the helper acquires again with the same pair, at the back.
+- **Fail-open, for two cases only:** a bridge that cannot be reached, or one that answers `409 version` — the helper runs the command unqueued with a notice on stderr. Any other refusal from a reachable bridge (at acquire, or at activate: `503 holder_unwritable`, `409 pgid_mismatch`, …) runs nothing: the gated group is killed and reaped, the helper says `gyredeck: heavy queue refused activation (<status> <error>) — not running` and exits 75.
+- **A session outside a room is told once**, independent of any usage reading: Claude Code and Antigravity in `heavyNotice` on their next collect (printed by both hooks), Codex by one `codex queue` push when it is first heard from — straight to its thread, marked `[Gyredeck · notice]` so its answer goes nowhere, with no mailbox made (mailboxes share the 32-entry table with sync rooms), and counted as told only once the push started. A confirmed room member has the rules and is counted as told. Who has been told is remembered by recency (10,000, oldest forgotten first); a forgotten session is told again.
 
 ## conversationId normalization
 

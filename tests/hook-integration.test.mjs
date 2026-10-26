@@ -11972,6 +11972,324 @@ for (const provider of ["claude", "agy"]) {
   });
 }
 
+// ── #259: being let in to a room tells every member about the heavy-run helper ──
+//
+//  C1  Every member that becomes confirmed is handed the heavy line exactly once: Claude and
+//      agy (the hook's paste /confirm, founder, implicit post with the password) and Codex
+//      (notify confirm, founder).
+//  C2  A later delivery does not carry it again.
+//  C3  agy gets the #251 command form, Claude and Codex `heavyHint`, each with its own id.
+//  C4  A session told outside a room earlier is still told on confirm.
+//  C5  A collect that does not reach the hook's output does not use it up: a broker that
+//      withholds, and a wait's poll — which the real broker treats as empty (no messages,
+//      so no delivery held) and the wait drops whole. It arrives on the next drain.
+//  C6  Leaving and rejoining is a new confirmation, told once more.
+//  C7  It costs no extra wake: no Codex push beyond the confirm itself.
+
+const heavyLineFor = (provider, id) => provider === "agy"
+  ? `echo "your id: ${id}"; sed -n '/^## Heavy runs/,$p' ~/.config/gyredeck/room-rules.md`
+  : `gyredeck-heavy.mjs --as ${id} --what "<what it runs>" -- <command…>`;
+const heavyCount = (text) => text.split("HEAVY RUNS: ").length - 1;
+
+/** A Claude Code or agy session of `agyPasteFixture`'s bridge: one drain, its text. */
+const drainAs = async (f, provider, id, prompt) => {
+  if (provider === "agy") return (await f.invoke(prompt, {}, id)).text;
+  const result = await runAdapter(
+    "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], f.home,
+    { hook_event_name: "UserPromptSubmit", session_id: id, cwd: "/tmp/project", prompt: prompt ?? "hi" },
+  );
+  assert.equal(result.code, 0, result.stderr);
+  return result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
+};
+const ingestAs = (f, id, provider) => f.call("POST", "/ingest", {
+  version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+  conversationId: id, cwd: "/tmp/project",
+  runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: provider === "agy" ? "agyHost" : "claudeCodeHook" },
+  data: { inputCount: 1 },
+});
+const confirmedIn = async (f, id) => (await f.call("GET", `/sync/rooms?as=${id}`)).body.members?.find((member) => member.conversationId === id)?.confirmed === true;
+
+/**
+ * Each path to confirmed, for one provider. `who` answers the session that is let in;
+ * `confirm` lets it in and answers the drain that carries the confirmation.
+ */
+const confirmPaths = [
+  {
+    name: "a pasted password (the hook's /confirm)",
+    who: async (f, provider) => {
+      if (provider === "agy") return f.agy;
+      const id = "a2590000-0000-4000-8000-0000000000c1";
+      await ingestAs(f, id, provider);
+      await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: id });
+      return id;
+    },
+    before: false,
+    confirm: (f, provider, id) => drainAs(f, provider, id, f.password),
+  },
+  {
+    name: "founding the room",
+    who: async (f, provider) => { await ingestAs(f, f.founder, provider); return f.founder; },
+    before: true,
+    confirm: (f, provider, id) => drainAs(f, provider, id),
+  },
+  {
+    name: "posting with the password in the header",
+    who: async (f, provider) => {
+      if (provider === "agy") return f.agy;
+      const id = "a2590000-0000-4000-8000-0000000000c2";
+      await ingestAs(f, id, provider);
+      await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: id });
+      return id;
+    },
+    before: false,
+    confirm: async (f, provider, id) => {
+      const posted = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-gyredeck-token": f.password },
+        body: JSON.stringify({ from: id, to: f.founder, kind: "tell", text: "in by posting" }),
+      });
+      assert.equal((await posted.json()).ok, true, "premise: the post was accepted");
+      return drainAs(f, provider, id);
+    },
+  },
+];
+
+for (const provider of ["claude", "agy"]) {
+  for (const [index, path] of confirmPaths.entries()) {
+    test(`#259 C1 C2 C3: ${provider}, ${path.name}`, async () => {
+      const f = await agyPasteFixture(`h${provider[0]}${index}`);
+      try {
+        const id = await path.who(f, provider);
+        assert.equal(await confirmedIn(f, id), path.before, "premise: confirmed as the path starts");
+        const told = await path.confirm(f, provider, id);
+        assert.equal(await confirmedIn(f, id), true, "premise: confirmed now");
+        assert.equal(heavyCount(told), 1, `C1: once, in the drain after it: ${told}`);
+        assert.ok(told.includes(heavyLineFor(provider, id)), "C3: the provider's form, with its own id");
+        if (provider === "claude") assert.ok(!told.includes("sed -n '/^## Heavy runs/"), "C3: not agy's form");
+        assert.equal(heavyCount(await drainAs(f, provider, id)), 0, "C2: not again");
+      } finally {
+        await f.close();
+      }
+    });
+  }
+}
+
+test("#259 C4: agy told outside a room is told again when it is let in", async () => {
+  const f = await agyPasteFixture("h4");
+  try {
+    assert.equal(await confirmedIn(f, f.agy), false, "premise: not yet in");
+    assert.equal(heavyCount(await drainAs(f, "agy", f.agy)), 1, "premise: told as a session in no confirmed room");
+    assert.equal(heavyCount(await drainAs(f, "agy", f.agy)), 0, "premise: and counted as told");
+    assert.equal(heavyCount(await drainAs(f, "agy", f.agy, f.password)), 1, "C4: told again on confirm");
+  } finally {
+    await f.close();
+  }
+});
+
+/**
+ * A broker that does what the app's does with a collect (broker.rs): one vouched bridge call
+ * for the bound session, the answer held under a delivery id only when it carries messages or
+ * missed — an answer with nothing else in it is "empty" and handed back unheld.
+ */
+const relayBroker = async (f, as) => {
+  const dir = join(f.home, ...CONFIG_DIR, "broker");
+  await mkdir(dir, { recursive: true });
+  const token = (await readFile(join(f.home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+  const requests = [];
+  let delivery = 0;
+  const server = createServer((socket) => {
+    let text = "";
+    socket.on("data", async (chunk) => {
+      text += chunk;
+      const end = text.indexOf("\n");
+      if (end < 0) return;
+      const request = JSON.parse(text.slice(0, end));
+      requests.push(request);
+      let answer = { v: 1, ok: true };
+      if (request.bind) answer = { v: 1, ok: true, bound: { conversationId: as, pid: 1, cli: "agy" } };
+      else if (request.collect) {
+        const waking = request.collect.wakingOnly ? "&waking=1" : "";
+        const response = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/inbox?as=${as}&collect=1&limit=10${waking}`, {
+          headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
+        });
+        answer = { ...(await response.json()), v: 1, boundTo: as };
+        const carries = (answer.messages ?? []).length > 0 || (answer.missed ?? []).length > 0;
+        if (carries) answer.delivery = ++delivery;
+      }
+      socket.end(`${JSON.stringify(answer)}\n`);
+    });
+  });
+  await new Promise((resolve) => server.listen(join(dir, "gyredeck.broker.sock"), resolve));
+  server.unref();
+  openFakeServers.add(server);
+  return { requests, close: () => new Promise((resolve) => { openFakeServers.delete(server); server.close(resolve); }) };
+};
+
+test("#259 C5: a wait's poll, an empty batch to the broker, does not use up the line", async () => {
+  const f = await agyPasteFixture("h5w");
+  let broker = null;
+  try {
+    // Confirmed with the hook's drain out of the way, so the next collects are waits'.
+    await f.confirm();
+    // A wait that wakes: the confirmation's own messages, taken as a wait takes them.
+    const woke = await f.call("GET", `/mail/inbox?as=${f.agy}&collect=1&waking=1&limit=10`);
+    assert.ok(woke.body.messages.length > 0, "premise: the waking poll took what woke it");
+    assert.equal(woke.body.heavyNotice, undefined, "C5: a wait's poll is not handed the line");
+    broker = await relayBroker(f, f.agy);
+    // Spawned, not spawnSync: the broker answering it lives in this process.
+    const waited = await new Promise((resolve) => {
+      const child = spawn(process.execPath, ["adapters/antigravity/gyredeck-agy-hook.mjs", "wait", "1", f.agy], {
+        cwd: repoRoot, env: { ...process.env, HOME: f.home }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.on("close", (status) => resolve({ status, stdout, stderr }));
+    });
+    const polls = broker.requests.filter((request) => request.collect?.wakingOnly === true);
+    assert.ok(polls.length >= 1, "premise: the wait polled through the broker");
+    assert.equal(waited.status, 4, `premise: nothing woke it, so it printed nothing: ${waited.stderr}`);
+    assert.equal(heavyCount(waited.stdout), 0, "premise: the wait printed no line");
+    const drained = await f.invoke();
+    assert.ok(broker.requests.some((request) => request.collect && !request.collect.wakingOnly), "premise: the drain went through the broker too");
+    assert.equal(heavyCount(drained.text), 1, "C5: the drain after the wait carries it");
+    assert.ok(drained.text.includes(heavyLineFor("agy", f.agy)));
+    assert.equal(heavyCount((await f.invoke()).text), 0, "C2: once");
+  } finally {
+    await broker?.close();
+    await f.close();
+  }
+});
+
+test("#259 C5: a broker that withholds the collect does not use up the line", async () => {
+  const f = await agyPasteFixture("h5h");
+  try {
+    const broker = await fakeBroker(f.home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" }));
+    let held;
+    try {
+      held = await f.invoke(f.password);
+      assert.ok(broker.requests.length > 0, "premise: the broker was asked");
+      assert.match(held.stderr, /mail withheld this turn/, "premise: withheld");
+    } finally {
+      await broker.close();
+    }
+    assert.equal(await confirmedIn(f, f.agy), true, "premise: the paste confirmed it");
+    assert.equal(heavyCount(held.text), 0, "premise: nothing of the collect reached this invocation");
+    const next = await f.invoke();
+    assert.doesNotMatch(next.stderr, /mail withheld/, "premise: this one reached the bridge");
+    assert.equal(heavyCount(next.text), 1, "C5: the next drain that delivers carries it");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#259 C6: leaving and rejoining is told once more, each phase read to a control first", async () => {
+  const f = await agyPasteFixture("h6");
+  try {
+    assert.equal(heavyCount((await f.invoke(f.password)).text), 1, "premise: told on the first confirm");
+    assert.equal(heavyCount((await f.invoke()).text), 0, "control: once");
+    assert.equal((await f.call("DELETE", `/sync/rooms/${f.code}/members/${f.agy}`)).status, 200);
+    await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: f.agy });
+    assert.equal(await confirmedIn(f, f.agy), false, "premise: rejoined, not yet confirmed");
+    assert.equal(heavyCount((await f.invoke(f.password)).text), 1, "C6: told again");
+    assert.equal(heavyCount((await f.invoke()).text), 0, "and once");
+  } finally {
+    await f.close();
+  }
+});
+
+/** A bridge with a fake `codex` that logs every push, and no out-of-room heavy push. */
+const codexHeavyFixture = async (tag) => {
+  const home = await mkdtemp(join(tmpdir(), `gyredeck-259-${tag}-`));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const fakeBin = join(home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  const queued = join(home, "queued.log");
+  await writeFile(join(fakeBin, "codex"), `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(queued)}, JSON.stringify(process.argv.slice(2)) + "\\n");\n`);
+  await chmod(join(fakeBin, "codex"), 0o755);
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin, GYREDECK_TEST_HEAVY_NO_CODEX_PUSH: "1" }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  await waitForHealth(port, stderrRef);
+  const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+  const call = async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method, headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  const pushes = async () => (existsSync(queued) ? (await readFile(queued, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : []);
+  const messagesTo = async (thread) => (await pushes()).filter((argv) => argv[argv.indexOf("--thread") + 1] === thread).map((argv) => argv[argv.indexOf("--message") + 1]);
+  const ingestCodex = (id) => call("POST", "/ingest", {
+    version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: id, cwd: "/tmp/project",
+    runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" }, data: { inputCount: 1 },
+  });
+  const close = async () => {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  };
+  return { home, call, pushes, messagesTo, ingestCodex, close };
+};
+
+test("#259 C1 C2 C3 C7: Codex confirmed through notify carries the line in its confirming push, and no other", async () => {
+  const f = await codexHeavyFixture("cnot");
+  try {
+    const founder = "a2590000-0000-4000-8000-0000000000f1";
+    const codex = "01a06082-8ef6-7900-ae39-44fe2e462591";
+    const code = (await f.call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    const { password } = (await f.call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder })).body;
+    await f.ingestCodex(codex);
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: codex });
+    const before = (await until(async () => { const m = await f.messagesTo(codex); return m.length > 0 && m; }, "the join push")).length;
+    const accepted = await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: "01a06082-8ef6-7900-ae39-44fe2e462592", password });
+    assert.equal(accepted.body.transitioned, true, "premise: this let it in");
+    const after = await until(async () => { const m = await f.messagesTo(codex); return m.length > before && m; }, "the confirming push");
+    assert.equal(after.length, before + 1, "C7: one push, the confirmation");
+    const confirming = after.at(-1);
+    assert.match(confirming, /you are confirmed in room/, "premise: the confirming push");
+    assert.equal(heavyCount(confirming), 1, "C1: the line, once");
+    assert.ok(confirming.includes(heavyLineFor("codex", codex)), "C3: heavyHint with its own id");
+    assert.equal(after.slice(0, before).filter((message) => message.includes("HEAVY RUNS: ")).length, 0, "premise: not before it was let in");
+    // A later message into the room is pushed without it.
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "later" })).body.ok, true);
+    const later = await until(async () => { const m = await f.messagesTo(codex); return m.length > after.length && m; }, "the later push");
+    assert.match(later.at(-1), /later/);
+    assert.equal(heavyCount(later.at(-1)), 0, "C2: not again");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#259 C1 C2 C3: a Codex founder carries the line in the push that says it is in the room", async () => {
+  const f = await codexHeavyFixture("cfnd");
+  try {
+    const founder = "01a06082-8ef6-7900-ae39-44fe2e462593";
+    await f.ingestCodex(founder);
+    const code = (await f.call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    const joined = await until(async () => (await f.messagesTo(founder)).find((message) => message.includes(`you are now in sync room ${code}`)), "the join push");
+    assert.match(joined, /you created it/, "premise: the founder's own push");
+    assert.equal(heavyCount(joined), 1, "C1: the line, once");
+    assert.ok(joined.includes(heavyLineFor("codex", founder)), "C3: heavyHint with its own id");
+    const other = "a2590000-0000-4000-8000-0000000000f2";
+    // Somebody joining is announced to the room, Codex included: a later push.
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: other });
+    const all = await until(async () => { const m = await f.messagesTo(founder); return m.length > 1 && m; }, "the roster push");
+    assert.equal(all.slice(1).filter((message) => message.includes("HEAVY RUNS: ")).length, 0, "C2: no later push carries it");
+  } finally {
+    await f.close();
+  }
+});
+
 // ── Quiet means quiet on every path (#244 audit r1) ──
 //
 // A quiet message is marked on the message itself, and the one waking rule (`wakesMember`)

@@ -7509,6 +7509,40 @@ mod agy_install_links {
         let _ = fs::remove_dir_all(&f.root);
     }
 
+    // `previous` is handed to `update` and returned: on a retry it must be the value agy
+    // wrote, not the first read's. No production caller reads the return value, so the
+    // argument is the half that matters.
+    #[test]
+    fn a_retried_merge_hands_update_the_value_agy_wrote() {
+        let f = fixture("retry-previous");
+        let path = f.paths.settings.clone();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, br#"{"permissions":{"allow":["theirs"]}}"#).unwrap();
+        let mut seen: Vec<Option<serde_json::Value>> = Vec::new();
+        let returned = agy_statusline::merge_json_key(&path, "permissions", |current| {
+            seen.push(current.cloned());
+            if seen.len() == 1 {
+                fs::write(&path, br#"{"permissions":{"allow":["theirs","added-by-agy"]}}"#).unwrap();
+            }
+            let mut object = current.and_then(serde_json::Value::as_object).cloned().unwrap_or_default();
+            let mut allow = object.get("allow").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+            allow.push(serde_json::Value::String("ours".into()));
+            object.insert("allow".into(), serde_json::Value::Array(allow));
+            Ok(Some(serde_json::Value::Object(object)))
+        })
+        .unwrap();
+        assert_eq!(seen.len(), 2, "premise: redone once");
+        assert_eq!(
+            seen[1],
+            Some(serde_json::json!({"allow":["theirs","added-by-agy"]})),
+            "the retry's update sees agy's value, not the first read's"
+        );
+        assert_eq!(returned, seen[1], "the previous value returned is the last attempt's");
+        let after: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["permissions"]["allow"], serde_json::json!(["theirs", "added-by-agy", "ours"]));
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
     #[test]
     fn the_old_brand_put_back_by_agy_during_registration_is_removed_again() {
         let f = fixture("hooks-rebrand-race");

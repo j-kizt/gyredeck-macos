@@ -325,6 +325,8 @@ mod macos {
     const CONTROL_REVALIDATION_BUDGET: Duration = Duration::from_millis(900);
     const STOP_GRACE_PERIOD: Duration = Duration::from_millis(1_200);
     const FORCE_KILL_GRACE_PERIOD: Duration = Duration::from_millis(800);
+    /// What one post-signal check of the listener is given to finish.
+    const EXIT_PROBE_BUDGET: Duration = Duration::from_millis(350);
 
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     struct HttpEvidence {
@@ -874,12 +876,19 @@ mod macos {
             if Instant::now() >= deadline {
                 return ControlTargetState::Ready;
             }
-            let probe_deadline = (Instant::now() + Duration::from_millis(350)).min(deadline);
-            let state = revalidate_control_target(request, state, probe_deadline);
+            let state = revalidate_control_target(request, state, exit_probe_deadline(Instant::now(), deadline));
             if state != ControlTargetState::Ready {
                 return state;
             }
         }
+    }
+
+    /// The grace period decides when to stop starting checks, never how long a check may
+    /// take. Cutting the last one to whatever was left of the grace period gave it 10–30 ms,
+    /// less than `lsof` needs, so it came back unavailable — "could not confirm" for a
+    /// listener that was simply still running, in more than half of the Stop attempts.
+    fn exit_probe_deadline(now: Instant, _grace_deadline: Instant) -> Instant {
+        now + EXIT_PROBE_BUDGET
     }
 
     pub(super) fn control(
@@ -1401,6 +1410,21 @@ mod macos {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn the_last_exit_check_gets_a_full_budget_however_little_grace_is_left() {
+            // Premise: lsof needs longer than the slivers the grace period used to leave.
+            assert!(super::EXIT_PROBE_BUDGET >= std::time::Duration::from_millis(100));
+            let now = std::time::Instant::now();
+            for left in [0, 5, 20, 349] {
+                let grace = now + std::time::Duration::from_millis(left);
+                assert_eq!(
+                    super::exit_probe_deadline(now, grace),
+                    now + super::EXIT_PROBE_BUDGET,
+                    "{left} ms of grace left still gets the whole check"
+                );
+            }
+        }
+
         use super::{
             control, control_unavailable_reason, endpoint_is_listening, inspect_http,
             is_next_dev_manifest_response, is_vite_dev_client_response,

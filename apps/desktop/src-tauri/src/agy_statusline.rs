@@ -444,42 +444,100 @@ fn rename_into_place(temp: &Path, path: &Path) -> Result<(), String> {
     })
 }
 
-fn write_atomically(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+/// The one writer for every file an agy install puts down (#230): a fresh private file
+/// renamed into place, so a symlink at `path` is replaced and its target never written.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     let temp = write_temp(path, bytes, mode)?;
     rename_into_place(&temp, path)
 }
 
-/// Run `body`, and put `files` back as they were if it fails: rewritten with their old bytes
-/// and mode, or removed if they did not exist. A file that cannot be read beforehand stops
-/// it before anything runs, since it could not be put back.
+/// Copy a bundled adapter into place through [`write_atomically`].
+pub(crate) fn copy_atomically(source: &Path, path: &Path, mode: u32) -> Result<(), String> {
+    let bytes = fs::read(source).map_err(|error| format!("Failed to read {}: {error}", source.display()))?;
+    write_atomically(path, &bytes, mode)
+}
+
+/// Refuse a config file that is present but not a regular file. Writing through a symlink
+/// would change a file somewhere else; replacing it would cut the link the person made.
+pub(crate) fn refuse_unless_regular(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Failed to read {}: {error}", path.display())),
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "Refusing to rewrite {}: it is a symlink or not a regular file. Point it at a plain file and install again.",
+            path.display()
+        )),
+    }
+}
+
+/// What a path held before an install, read without following a symlink.
+enum Saved {
+    File(Vec<u8>, u32),
+    Link(PathBuf),
+    Absent,
+}
+
+fn save(path: &Path) -> Result<Saved, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let fail = |error: std::io::Error| format!("Failed to read {}: {error}", path.display());
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Saved::Absent),
+        Err(error) => Err(fail(error)),
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(Saved::Link(fs::read_link(path).map_err(fail)?)),
+        Ok(metadata) if metadata.file_type().is_file() => {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+                .map_err(fail)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(fail)?;
+            Ok(Saved::File(bytes, metadata.permissions().mode() & 0o7777))
+        }
+        Ok(_) => Err(format!("Refusing to touch {}: it is not a regular file", path.display())),
+    }
+}
+
+fn restore(path: &Path, saved: &Saved) {
+    match saved {
+        Saved::File(bytes, mode) => {
+            let _ = write_atomically(path, bytes, *mode);
+        }
+        Saved::Link(target) => {
+            // The link itself goes back, made beside it and renamed over whatever is there.
+            let temp = path.with_file_name(format!(
+                ".{}.gyredeck-link-{}",
+                path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default(),
+                std::process::id()
+            ));
+            let _ = fs::remove_file(&temp);
+            if std::os::unix::fs::symlink(target, &temp).is_ok() && fs::rename(&temp, path).is_err() {
+                let _ = fs::remove_file(&temp);
+            }
+        }
+        Saved::Absent => {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Run `body`, and put `files` back as they were if it fails: a file with its old bytes and
+/// mode, a symlink as the same link (never its target), and a path that was empty removed.
+/// Each is read with `lstat`, so a link is never read through. A path that cannot be saved
+/// stops it before anything runs, since it could not be put back.
 pub(crate) fn with_rollback<T>(
     files: &[PathBuf],
     body: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut saved = Vec::new();
-    for path in files {
-        match fs::read(path) {
-            Ok(bytes) => {
-                let mode = fs::metadata(path)
-                    .map(|metadata| metadata.permissions().mode() & 0o7777)
-                    .unwrap_or(0o600);
-                saved.push((path.clone(), Some((bytes, mode))));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => saved.push((path.clone(), None)),
-            Err(error) => return Err(format!("Failed to read {}: {error}", path.display())),
-        }
-    }
+    let saved = files
+        .iter()
+        .map(|path| save(path).map(|before| (path.clone(), before)))
+        .collect::<Result<Vec<_>, String>>()?;
     body().inspect_err(|_| {
         for (path, before) in &saved {
-            match before {
-                Some((bytes, mode)) => {
-                    let _ = write_atomically(path, bytes, *mode);
-                }
-                None => {
-                    let _ = fs::remove_file(path);
-                }
-            }
+            restore(path, before);
         }
     })
 }

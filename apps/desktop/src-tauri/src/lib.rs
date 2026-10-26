@@ -4325,7 +4325,7 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
     };
     fs::create_dir_all(parent)
         .map_err(|error| format!("Failed to create config directory: {error}"))?;
-    fs::copy(&resource_path, &install_path)
+    agy_statusline::copy_atomically(&resource_path, &install_path, 0o644)
         .map_err(|error| format!("Failed to copy hook script: {error}"))?;
 
     let installed_path = install_path.to_string_lossy().to_string();
@@ -4500,14 +4500,51 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
         .path()
         .resolve(agy_statusline::SCRIPT_NAME, tauri::path::BaseDirectory::Resource)
         .map_err(|e| format!("Failed to resolve resource: {e}"))?;
-    // agy's settings.json is refused before anything is copied, not after (#230).
     let statusline_paths = agy_statusline::AgyStatusLinePaths::from_home()?;
-    agy_statusline::preflight(&statusline_paths)?;
+    install_agy_hook_at(
+        &resource_path,
+        &statusline_resource,
+        &install_path,
+        &hooks_json_path,
+        &statusline_paths,
+    )
+}
+
+/// `install_agy_hook` with every path given, so it can run against a scratch directory.
+/// Every file it writes goes through `agy_statusline::write_atomically`; none is written
+/// through a symlink (#230 audit).
+fn install_agy_hook_at(
+    resource_path: &Path,
+    statusline_resource: &Path,
+    install_path: &Path,
+    hooks_json_path: &Path,
+    statusline_paths: &agy_statusline::AgyStatusLinePaths,
+) -> Result<String, String> {
+    // Everything that can refuse, before anything is written: agy's settings.json, and a
+    // hooks.json that is a link or does not parse.
+    agy_statusline::preflight(statusline_paths)?;
+    agy_statusline::refuse_unless_regular(hooks_json_path)?;
+    let hooks_text = match fs::read_to_string(hooks_json_path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("Failed to read hooks.json: {error}")),
+    };
+    let mut hooks_root: serde_json::Value = match hooks_text.as_deref().map(str::trim) {
+        None | Some("") => serde_json::json!({}),
+        Some(content) => serde_json::from_str(content)
+            .map_err(|e| format!("Failed to parse hooks.json: {e}"))?,
+    };
+    let hooks_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(hooks_json_path)
+            .map(|metadata| metadata.permissions().mode() & 0o7777)
+            .unwrap_or(0o644)
+    };
     // A later step that fails puts back every file the install touched, so a refusal does
     // not leave the hook half-registered.
     let touched = [
-        install_path.clone(),
-        hooks_json_path.clone(),
+        install_path.to_path_buf(),
+        hooks_json_path.to_path_buf(),
         statusline_paths.script(),
         statusline_paths.chain(),
         statusline_paths.previous(),
@@ -4518,23 +4555,10 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
         };
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create config directory: {error}"))?;
-        fs::copy(&resource_path, &install_path)
+        agy_statusline::copy_atomically(resource_path, install_path, 0o644)
             .map_err(|error| format!("Failed to copy hook script: {error}"))?;
 
         let installed_path = install_path.to_string_lossy().to_string();
-
-        let mut hooks_root: serde_json::Value = if hooks_json_path.exists() {
-            let content = fs::read_to_string(&hooks_json_path)
-                .map_err(|e| format!("Failed to read hooks.json: {e}"))?;
-            if content.trim().is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_str(&content)
-                    .map_err(|e| format!("Failed to parse hooks.json: {e}"))?
-            }
-        } else {
-            serde_json::json!({})
-        };
 
         if !hooks_root.is_object() {
             hooks_root = serde_json::json!({});
@@ -4576,12 +4600,12 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
 
         let json_string = serde_json::to_string_pretty(&hooks_root)
             .map_err(|e| format!("Failed to stringify hooks.json: {e}"))?;
-        fs::write(&hooks_json_path, format!("{json_string}\n"))
+        agy_statusline::write_atomically(hooks_json_path, format!("{json_string}\n").as_bytes(), hooks_mode)
             .map_err(|error| format!("Failed to write hooks.json: {error}"))?;
 
         // Usage comes from agy's status-line payload, so the install also points agy's status
         // line at the script, keeping the person's own one chained behind it (#230).
-        agy_statusline::install(&statusline_paths, &statusline_resource)?;
+        agy_statusline::install(statusline_paths, statusline_resource)?;
 
         Ok(installed_path)
     })
@@ -4701,7 +4725,7 @@ fn install_codex_notify(app: tauri::AppHandle) -> Result<String, String> {
     };
     fs::create_dir_all(parent)
         .map_err(|error| format!("Failed to create config directory: {error}"))?;
-    fs::copy(&resource_path, &install_path)
+    agy_statusline::copy_atomically(&resource_path, &install_path, 0o644)
         .map_err(|error| format!("Failed to copy notify script: {error}"))?;
 
     // Already ours means the line is already right, and rewriting it would only risk
@@ -4759,7 +4783,7 @@ fn install_codex_hook(app: tauri::AppHandle) -> Result<String, String> {
     };
     fs::create_dir_all(parent)
         .map_err(|error| format!("Failed to create config directory: {error}"))?;
-    fs::copy(&resource_path, &install_path)
+    agy_statusline::copy_atomically(&resource_path, &install_path, 0o644)
         .map_err(|error| format!("Failed to copy hook script: {error}"))?;
 
     let installed_path = install_path.to_string_lossy().to_string();
@@ -7123,5 +7147,104 @@ mod hex_tests {
             claude_credentials_fingerprint(&credentials),
             "30732cbc29a8eefb75f38c423997316c5e1ff923da5257739404b22913d42691"
         );
+    }
+}
+
+#[cfg(test)]
+mod agy_install_links {
+    use super::*;
+
+    struct Fixture {
+        root: PathBuf,
+        hook_source: PathBuf,
+        statusline_source: PathBuf,
+        install_path: PathBuf,
+        hooks_json: PathBuf,
+        paths: agy_statusline::AgyStatusLinePaths,
+    }
+
+    fn fixture(name: &str) -> Fixture {
+        let root = std::env::temp_dir().join(format!("gyredeck-agy-install-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".config/gyredeck")).unwrap();
+        fs::create_dir_all(home.join(".gemini/config")).unwrap();
+        let hook_source = root.join("bundled-hook.mjs");
+        fs::write(&hook_source, b"// bundled adapter\n").unwrap();
+        Fixture {
+            hook_source,
+            statusline_source: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../adapters/antigravity")
+                .join(agy_statusline::SCRIPT_NAME),
+            install_path: home.join(".config/gyredeck/gyredeck-agy-hook.mjs"),
+            hooks_json: home.join(".gemini/config/hooks.json"),
+            paths: agy_statusline::AgyStatusLinePaths {
+                settings: home.join(".gemini/antigravity-cli/settings.json"),
+                dir: home.join(".config/gyredeck"),
+            },
+            root,
+        }
+    }
+
+    fn install(f: &Fixture, statusline_source: &Path) -> Result<String, String> {
+        install_agy_hook_at(&f.hook_source, statusline_source, &f.install_path, &f.hooks_json, &f.paths)
+    }
+
+    fn is_link(path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    }
+
+    fn link_to_victim(f: &Fixture, at: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let victim = f.root.join(name);
+        fs::write(&victim, bytes).unwrap();
+        std::os::unix::fs::symlink(&victim, at).unwrap();
+        assert!(is_link(at), "premise: {} is a link", at.display());
+        victim
+    }
+
+    #[test]
+    fn a_successful_install_replaces_a_linked_adapter_and_leaves_its_target_alone() {
+        let f = fixture("ok");
+        let victim = link_to_victim(&f, &f.install_path, "victim.mjs", b"VICTIM");
+        fs::write(&f.hooks_json, b"{\"theirs\":{}}").unwrap();
+
+        install(&f, &f.statusline_source).expect("premise: the install succeeds");
+        assert_eq!(fs::read(&victim).unwrap(), b"VICTIM", "the link's target is byte-identical");
+        assert!(!is_link(&f.install_path), "the link was replaced by the adapter");
+        assert_eq!(fs::read(&f.install_path).unwrap(), fs::read(&f.hook_source).unwrap());
+        let hooks: serde_json::Value = serde_json::from_str(&fs::read_to_string(&f.hooks_json).unwrap()).unwrap();
+        assert!(hooks.get("theirs").is_some() && hooks.get("gyredeck").is_some());
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn a_linked_hooks_json_is_refused_and_nothing_is_written() {
+        let f = fixture("hooks-link");
+        let victim_mjs = link_to_victim(&f, &f.install_path, "victim.mjs", b"VICTIM");
+        let victim_hooks = link_to_victim(&f, &f.hooks_json, "victim.json", b"{\"x\":1}");
+
+        assert!(install(&f, &f.statusline_source).is_err(), "a linked hooks.json is refused");
+        assert_eq!(fs::read(&victim_hooks).unwrap(), b"{\"x\":1}", "hooks.json's target is byte-identical");
+        assert_eq!(fs::read(&victim_mjs).unwrap(), b"VICTIM", "the adapter's target is byte-identical");
+        assert!(is_link(&f.hooks_json) && is_link(&f.install_path), "both links are left as they were");
+        assert!(!f.paths.script().exists(), "nothing else was put down");
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn a_failed_install_puts_the_links_back_and_their_targets_are_untouched() {
+        let f = fixture("late-failure");
+        let victim = link_to_victim(&f, &f.install_path, "victim.mjs", b"VICTIM");
+        let original_hooks = b"{\"theirs\":{}}";
+        fs::write(&f.hooks_json, original_hooks).unwrap();
+
+        // The status-line step fails, after the adapter and hooks.json were written.
+        let missing = f.root.join("no-such-statusline.sh");
+        assert!(install(&f, &missing).is_err(), "premise: a later step fails");
+        assert_eq!(fs::read(&victim).unwrap(), b"VICTIM", "the link's target is byte-identical");
+        assert!(is_link(&f.install_path), "the link itself is put back");
+        assert_eq!(fs::read_link(&f.install_path).unwrap(), victim);
+        assert_eq!(fs::read(&f.hooks_json).unwrap(), original_hooks, "hooks.json is put back");
+        let _ = fs::remove_dir_all(&f.root);
     }
 }

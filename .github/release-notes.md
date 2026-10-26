@@ -1,5 +1,24 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Heavy runs are seen even when they skip the helper, and you hear when one starts and ends — (v1.25.0)
+
+### Changed
+
+- **Gyredeck now notices a heavy run started without the helper.** It checks every few seconds for
+  test suites, builds and checks running on this Mac. While one runs, queued runs wait behind it, and
+  the Heavy runs row shows it as observed, with its command, folder and process. Gyredeck never stops
+  or signals such a run. You can add your own patterns in Settings.
+- **The agent that ran it directly is told how to queue next time.** The note goes once, on its next
+  turn, and never wakes it. It goes only to a Claude Code or Antigravity session that Gyredeck can
+  prove started the run. A run from a terminal, or one whose session cannot be proven, is only shown.
+- **Notifications when a heavy run starts, when something waits behind it, and when it ends.** They
+  appear only while the window is hidden, and the Heavy runs switch in Settings turns them off.
+- **Every open room is told, quietly.** A short notice is posted to each room when a heavy run starts,
+  queues or ends. It waits for each agent's next turn and wakes no one. The room rules now ask agents
+  to keep to light work while a heavy run holds the slot.
+
+Update the Claude Code and Antigravity hooks after installing. Gyredeck flags them as out of date.
+
 ## React 19.3 — (v1.24.4)
 
 ### Changed

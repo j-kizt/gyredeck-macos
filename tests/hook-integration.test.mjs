@@ -10361,6 +10361,18 @@ const statusCases = [
     err: [/cannot tell whether a heavy run is on — the bridge answered 500$/m], absent: [STATUS_TOKEN] },
   { name: "an answer that is not the shape cannot tell", code: 69, reply: () => ({ status: 200, body: { ok: true, v: 1, holder: null } }),
     err: [/the bridge's answer could not be read/] },
+  // r1 (Codex): every malformed 200 is "cannot tell", never a stack trace or a guess.
+  { name: "r1 a null in the line cannot tell", code: 69, reply: () => statusAnswer({ queue: [null] }), err: [/the bridge's answer could not be read/] },
+  { name: "r1 a null among the observed cannot tell", code: 69, reply: () => statusAnswer({ observed: [null] }), err: [/the bridge's answer could not be read/] },
+  // A primitive does not throw where a null does, so these show the element check on its own.
+  { name: "r1 a number in the line cannot tell", code: 69, reply: () => statusAnswer({ queue: [1] }), err: [/the bridge's answer could not be read/] },
+  { name: "r1 a string among the observed cannot tell", code: 69, reply: () => statusAnswer({ observed: ["x"] }), err: [/the bridge's answer could not be read/] },
+  { name: "r1 an array as the holder cannot tell", code: 69, reply: () => statusAnswer({ holder: [] }), err: [/the bridge's answer could not be read/] },
+  { name: "r1 no load fields cannot tell", code: 69, reply: () => ({ status: 200, body: { ok: true, v: 1, holder: null, queue: [], observed: [] } }),
+    err: [/the bridge's answer could not be read/] },
+  { name: "r1 a load that is not a number cannot tell", code: 69, reply: () => statusAnswer({ load: "1.2" }), err: [/the bridge's answer could not be read/] },
+  { name: "r1 an explicit null load is unknown, never free", code: 0, reply: () => statusAnswer({ load: null }),
+    out: [/^heavy-run slot: not held, but the load is unknown$/m, /^load: unknown \(the slot is granted at 5 or less\)$/m], notOut: [FREE_LINE] },
 ];
 
 for (const row of statusCases) {
@@ -10379,6 +10391,8 @@ for (const row of statusCases) {
       if (row.code !== 0) {
         assert.equal(run.stdout, "", "nothing on stdout that could read as the slot's state");
         assert.doesNotMatch(run.stderr, /\bfree\b/);
+        assert.equal(run.stderr.split("\n").filter(Boolean).length, 1, `one line on stderr: ${run.stderr}`);
+        assert.doesNotMatch(run.stderr, /\n\s+at |Error:/, "no stack trace");
       }
       for (const value of row.absent ?? []) assert.ok(!`${run.stdout}${run.stderr}`.includes(value), `${value} printed`);
     } finally {

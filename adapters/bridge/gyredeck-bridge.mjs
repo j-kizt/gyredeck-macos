@@ -464,44 +464,57 @@ const heavyHelper = async (setup) => {
       unknown(`the bridge speaks heavy protocol version ${Number.isInteger(body?.v) ? body.v : "unknown"}, this helper ${setup.v}`);
       return;
     }
-    const { holder, queue, observed } = body;
-    if (body.ok !== true || !Array.isArray(queue) || !Array.isArray(observed) || (holder !== null && typeof holder !== "object")) {
+    // The whole answer is checked before a line is written, and any surprise while writing it
+    // is "cannot tell" too: a half-printed state, or a stack trace, is not an answer.
+    const record = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+    const render = () => {
+      const { holder, queue, observed, load, loadLimit } = body;
+      if (body.ok !== true || (holder !== null && !record(holder))) return null;
+      if (!Array.isArray(queue) || !queue.every(record) || !Array.isArray(observed) || !observed.every(record)) return null;
+      // The bridge sends `load: null` when the OS gives no reading; a missing field is not that.
+      if (!Number.isFinite(loadLimit) || (load !== null && !Number.isFinite(load))) return null;
+      // Labels and what each run said it runs; never a session id or a path.
+      const text = (value, fallback) => (typeof value === "string" && value ? value.replace(/[\u0000-\u001f\u007f]/g, " ") : fallback);
+      const who = (entry) => text(entry.label, "an unnamed session");
+      const lasted = (ms) => {
+        const seconds = Math.max(0, Math.round(Number(ms) / 1000) || 0);
+        if (seconds < 60) return `${seconds}s`;
+        const minutes = Math.floor(seconds / 60);
+        if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+        return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+      };
+      const lines = [];
+      if (holder) {
+        const how = holder.state === "active" ? "running" : "starting";
+        lines.push(`heavy-run slot: held by ${who(holder)} — ${text(holder.what, "?")} (${how}, ${lasted(holder.elapsedMs)})`);
+        if (holder.helperGone === true) lines.push("  its helper has gone quiet; the command still runs and holds the slot");
+        if (holder.loadSkipped === true) lines.push("  granted after the load stayed high for 10 minutes");
+      } else if (observed.length > 0) {
+        lines.push("heavy-run slot: taken by a run outside the helper");
+      } else if (queue.length > 0) {
+        lines.push("heavy-run slot: not held, but the line is waiting");
+      } else if (load === null) {
+        lines.push("heavy-run slot: not held, but the load is unknown");
+      } else {
+        lines.push("heavy-run slot: free");
+      }
+      if (observed.length > 0) {
+        lines.push(`running outside the helper: ${observed.length}`);
+        for (const run of observed) lines.push(`  ${who(run)} — ${text(run.pattern, "?")}, ${lasted(run.elapsedMs)}`);
+      }
+      if (queue.length > 0) {
+        lines.push(`waiting: ${queue.length}`);
+        queue.forEach((entry, index) => lines.push(`  ${Number.isInteger(entry.position) ? entry.position : index + 1}. ${who(entry)} — ${text(entry.what, "?")}, waited ${lasted(entry.waitedMs)}`));
+      }
+      lines.push(`load: ${load ?? "unknown"} (the slot is granted at ${loadLimit} or less)`);
+      return lines;
+    };
+    let lines = null;
+    try { lines = render(); } catch {}
+    if (!lines) {
       unknown("the bridge's answer could not be read");
       return;
     }
-    // Labels and what each run said it runs; never a session id or a path.
-    const text = (value, fallback) => (typeof value === "string" && value ? value.replace(/[\u0000-\u001f\u007f]/g, " ") : fallback);
-    const who = (entry) => text(entry.label, "an unnamed session");
-    const lasted = (ms) => {
-      const seconds = Math.max(0, Math.round(Number(ms) / 1000) || 0);
-      if (seconds < 60) return `${seconds}s`;
-      const minutes = Math.floor(seconds / 60);
-      if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
-      return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
-    };
-    const lines = [];
-    if (holder) {
-      const how = holder.state === "active" ? "running" : "starting";
-      lines.push(`heavy-run slot: held by ${who(holder)} — ${text(holder.what, "?")} (${how}, ${lasted(holder.elapsedMs)})`);
-      if (holder.helperGone === true) lines.push("  its helper has gone quiet; the command still runs and holds the slot");
-      if (holder.loadSkipped === true) lines.push("  granted after the load stayed high for 10 minutes");
-    } else if (observed.length > 0) {
-      lines.push("heavy-run slot: taken by a run outside the helper");
-    } else if (queue.length > 0) {
-      lines.push("heavy-run slot: not held, but the line is waiting");
-    } else {
-      lines.push("heavy-run slot: free");
-    }
-    if (observed.length > 0) {
-      lines.push(`running outside the helper: ${observed.length}`);
-      for (const run of observed) lines.push(`  ${who(run)} — ${text(run.pattern, "?")}, ${lasted(run.elapsedMs)}`);
-    }
-    if (queue.length > 0) {
-      lines.push(`waiting: ${queue.length}`);
-      queue.forEach((entry, index) => lines.push(`  ${Number.isInteger(entry.position) ? entry.position : index + 1}. ${who(entry)} — ${text(entry.what, "?")}, waited ${lasted(entry.waitedMs)}`));
-    }
-    const load = Number.isFinite(body.load) ? body.load : "unknown";
-    lines.push(`load: ${load} (the slot is granted at ${Number.isFinite(body.loadLimit) ? body.loadLimit : "?"} or less)`);
     process.stdout.write(`${lines.join("\n")}\n`);
     process.exitCode = 0;
   };

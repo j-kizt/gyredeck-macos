@@ -5569,6 +5569,7 @@ function startBridge(config) {
         pgid: heavyHolder.pgid,
         pgidStart: heavyHolder.pgidStart,
         since: heavyHolder.since,
+        activeSince: heavyHolder.activeSince,
         loadSkipped: heavyHolder.loadSkipped,
       };
       writeFileAtomically(HEAVY_HOLDER_PATH, `${JSON.stringify(record)}\n`, 0o600);
@@ -5600,6 +5601,11 @@ function startBridge(config) {
     if (valid && (record.state === "reserved" || groupAlive(record.pgid))) {
       const now = heavyNow();
       const since = typeof record.since === "string" && !Number.isNaN(Date.parse(record.since)) ? record.since : new Date().toISOString();
+      // When the command began, which is not when the slot was reserved (#263 r1). A record
+      // from before it has no such time, and its reservation's is the nearest it has.
+      const activeSince = record.state !== "active"
+        ? null
+        : typeof record.activeSince === "string" && !Number.isNaN(Date.parse(record.activeSince)) ? record.activeSince : since;
       heavyHolder = {
         state: record.state,
         leaseHash: Buffer.from(record.leaseHash, "hex"),
@@ -5611,6 +5617,8 @@ function startBridge(config) {
         pgidStart: record.state === "active" && typeof record.pgidStart === "string" ? record.pgidStart : null,
         since,
         startedAt: now - Math.max(0, Date.now() - Date.parse(since)),
+        activeSince,
+        activeAt: activeSince === null ? null : now - Math.max(0, Date.now() - Date.parse(activeSince)),
         reservedAt: now,
         heartbeatAt: now,
         loadSkipped: record.loadSkipped === true,
@@ -5658,6 +5666,8 @@ function startBridge(config) {
       pgidStart: null,
       since: new Date().toISOString(),
       startedAt: now,
+      activeSince: null,
+      activeAt: null,
       reservedAt: now,
       heartbeatAt: now,
       loadSkipped,
@@ -5699,14 +5709,14 @@ function startBridge(config) {
   const holderLabel = (holder) => heavyLabelFor(holder.as) ?? holder.as;
   const heavyEnded = (holder) => {
     if (holder?.state !== "active" || holder.announced !== true) return;
-    tellRoomsOfHeavy(`${holderLabel(holder)}'s ${holder.what} finished (${heavyDuration(heavyNow() - holder.startedAt)}).`, holder.as);
+    tellRoomsOfHeavy(`${holderLabel(holder)}'s ${holder.what} finished (${heavyDuration(heavyNow() - holder.activeAt)}).`, holder.as);
   };
   const observedKey = (run) => `${run.pid}:${run.startedAtMs}`;
   // Observed runs whose start was said, by key; a run leaves it when its end is said.
   const observedAnnounced = new Set();
   /** Say each run that has now held the slot past the delay, once. */
   const announceHeavyStarts = () => {
-    if (heavyHolder?.state === "active" && heavyHolder.announced !== true && heavyNow() - heavyHolder.startedAt > HEAVY_NOTICE_DELAY_MS) {
+    if (heavyHolder?.state === "active" && heavyHolder.announced !== true && heavyNow() - heavyHolder.activeAt > HEAVY_NOTICE_DELAY_MS) {
       heavyHolder.announced = true;
       tellRoomsOfHeavy(`${holderLabel(heavyHolder)} started ${heavyHolder.what}.`, heavyHolder.as);
     }
@@ -5828,7 +5838,8 @@ function startBridge(config) {
             what: heavyHolder.what,
             state: heavyHolder.state,
             since: heavyHolder.since,
-            elapsedMs: Math.max(0, Math.round(now - heavyHolder.startedAt)),
+            // How long it has run once active, how long it has waited to start before (#263 r1).
+            elapsedMs: Math.max(0, Math.round(now - (heavyHolder.state === "active" ? heavyHolder.activeAt : heavyHolder.startedAt))),
             loadSkipped: heavyHolder.loadSkipped,
             // The group still runs and nothing has spoken for it: the helper died and left
             // its command going. The slot stays held; the panel says why.
@@ -6411,10 +6422,14 @@ function startBridge(config) {
         heavyHolder.pgidStart = pgidStart;
         heavyHolder.adopted = true;
         heavyHolder.heartbeatAt = heavyNow();
+        heavyHolder.activeAt = heavyHolder.heartbeatAt;
+        heavyHolder.activeSince = new Date().toISOString();
         if (!persistHeavyHolder()) {
           heavyHolder.state = "reserved";
           heavyHolder.pgid = null;
           heavyHolder.pgidStart = null;
+          heavyHolder.activeAt = null;
+          heavyHolder.activeSince = null;
           sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "holder_unwritable" });
           return;
         }

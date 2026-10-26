@@ -11948,6 +11948,40 @@ const N263_ROWS = [
     p: [/^Claude Code started a2630000-0000-4000-8000-000000000001 runs\.$/, /^Claude Code's a2630000-0000-4000-8000-000000000001 runs finished \(40s\)\.$/],
   },
   {
+    name: "N7 (r1) a reservation older than 30 s, then a one-second command, says nothing",
+    run: async (h, r) => {
+      const ids = h.pair();
+      assert.equal((await h.acquire(HEAVY_A, "brief command", ids)).status, 200, "premise: reserved");
+      await r.shift(31_000);
+      assert.equal((await h.state()).holder?.state, "reserved", "premise: still reserved, 31 s in");
+      assert.equal((await h.post("activate", { lease: ids.lease, ...(await h.group()) })).status, 200);
+      await r.shift(32_000);
+      await h.state();
+      assert.equal((await h.post("release", { lease: ids.lease })).status, 200);
+    },
+    a: [], p: [],
+  },
+  {
+    name: "N7 (r1) a long reservation, then a long run: announced 30 s after activation, timed from it",
+    run: async (h, r) => {
+      const ids = h.pair();
+      assert.equal((await h.acquire(HEAVY_A, "slow start", ids)).status, 200, "premise: reserved");
+      await r.shift(31_000);
+      assert.equal((await h.state()).holder?.state, "reserved", "premise: still reserved, 31 s in");
+      assert.equal((await h.post("activate", { lease: ids.lease, ...(await h.group()) })).status, 200);
+      await r.shift(60_000);
+      await h.state();
+      assert.deepEqual((await r.both()).p, [], "29 s after activation: not yet");
+      await r.shift(62_000);
+      await h.state();
+      assert.equal((await r.both()).p.length, 1, "31 s after activation: announced");
+      await r.shift(72_000);
+      assert.equal((await h.post("release", { lease: ids.lease })).status, 200);
+    },
+    a: [],
+    p: [/^Claude Code started slow start\.$/, /^Claude Code's slow start finished \(41s\)\.$/],
+  },
+  {
     name: "N4 self-wait behind its own helper run says nothing; another session's wait is heard",
     run: async (h) => {
       const held = await h.hold(HEAVY_A);
@@ -12055,6 +12089,41 @@ for (const row of N263_ROWS) {
     }
   });
 }
+
+// Unexpected fix (#263 r1): GET /heavy's `elapsedMs` — the Settings row and the macOS
+// "finished (…)" notification — counted an active run from its reservation, not its start.
+test("#263 r1 unexpected fix: an active holder's elapsedMs counts from activation, live and after a restart", async () => {
+  const h = await heavyHarness("n263-elapsed");
+  try {
+    let bridge = await h.start();
+    const ids = h.pair();
+    assert.equal((await h.acquire("run-a", "slow start", ids)).status, 200, "premise: reserved");
+    await writeFile(h.clockFile, "31000");
+    const reserved = (await h.state()).holder;
+    assert.equal(reserved.state, "reserved", "premise: still reserved");
+    assert.ok(reserved.elapsedMs >= 31_000, `a reservation shows how long it has waited: ${reserved.elapsedMs}`);
+    assert.equal((await h.post("activate", { lease: ids.lease, ...(await h.group()) })).status, 200);
+    await writeFile(h.clockFile, "32000");
+    const live = (await h.state()).holder;
+    assert.equal(live.state, "active", "premise: active");
+    assert.ok(live.elapsedMs >= 1_000 && live.elapsedMs < 10_000, `live: ${live.elapsedMs}`);
+
+    // Restart with a record whose reservation is a minute older than its start: the
+    // restored run is timed from its start.
+    await h.stop(bridge);
+    const record = JSON.parse(await readFile(h.holderPath, "utf8"));
+    assert.equal(typeof record.activeSince, "string", "premise: the start is on disk");
+    record.since = new Date(Date.parse(record.activeSince) - 60_000).toISOString();
+    await writeFile(h.holderPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    await writeFile(h.clockFile, "0");
+    bridge = await h.start();
+    const restored = (await h.state()).holder;
+    assert.equal(restored?.state, "active", "premise: restored active");
+    assert.ok(restored.elapsedMs < 30_000, `restored: ${restored.elapsedMs}`);
+  } finally {
+    await h.cleanup();
+  }
+});
 
 test("rules: the Heavy runs section asks for light work while a run holds the slot", async () => {
   const { roomRules } = await heavyModule();

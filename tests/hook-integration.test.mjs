@@ -10826,7 +10826,7 @@ const agyPasteFixture = async (tag, { breakInbox = false, inboxBody = null, boun
   assert.match(password, /^[0-9a-f]{32}$/, "premise: the room's password is 32 hex");
   await call("POST", `/sync/rooms/${code}/members`, { conversationId: agy });
   /** One PreInvocation with this `lastUserInput`: its steps as text, and its stderr. */
-  const invoke = async (lastUserInput, env = {}) => {
+  const invoke = async (lastUserInput, env = {}, as = agy) => {
     const result = await new Promise((resolve) => {
       const child = spawn(process.execPath, ["adapters/antigravity/gyredeck-agy-hook.mjs", "--event", "PreInvocation"], {
         cwd: repoRoot, env: { ...process.env, HOME: home, ...env }, stdio: ["pipe", "pipe", "pipe"],
@@ -10835,7 +10835,7 @@ const agyPasteFixture = async (tag, { breakInbox = false, inboxBody = null, boun
       let stderr = "";
       child.stdout.on("data", (chunk) => { stdout += chunk; });
       child.stderr.on("data", (chunk) => { stderr += chunk; });
-      child.stdin.end(JSON.stringify({ hookEventName: "PreInvocation", conversationId: agy, workspacePaths: ["/tmp/project"], ...(lastUserInput === undefined ? {} : { lastUserInput }) }));
+      child.stdin.end(JSON.stringify({ hookEventName: "PreInvocation", conversationId: as, workspacePaths: ["/tmp/project"], ...(lastUserInput === undefined ? {} : { lastUserInput }) }));
       child.on("close", (code) => resolve({ code, stdout, stderr }));
     });
     assert.equal(result.code, 0, result.stderr);
@@ -10918,6 +10918,7 @@ test("#250 C5: a refused password is said with its error code, then BLOCKED, and
     const result = await f.invoke(wrong);
     assert.equal(f.confirms.length, 1, "premise: it was presented");
     assert.match(result.text, new RegExp(`The pasted room password was refused \\(bad_password\\) — you are still not in sync room ${f.code}\\.`));
+    assert.equal(result.text.split(PASTE_REFUSED).length - 1, 1, "#255 C6: told not to repeat it, once");
     assert.match(result.text, /BLOCKED:/);
     assert.equal(result.text.toLowerCase().indexOf(wrong), -1, "not in any step");
     assert.equal(result.stdout.toLowerCase().indexOf(wrong), -1);
@@ -10966,6 +10967,151 @@ test("#250 r4: mail quoting the wait command does not stand in for the hook's ow
     await f.close();
   }
 });
+
+// ── #255: after a paste, the agent neither repeats the password nor asks about it ──
+//
+//  C1  agy: an accepted paste carries the no-repeat line exactly once, on every path.
+//  C2  agy: once, not twice, where `withConfirmation` would re-add the lead.
+//  C3  Claude: the same line, naming the room, on the normal path and the fallback.
+//  C4  Neither hook writes the password's value anywhere in its output.
+//  C5  A later invocation with no paste says neither line; the same paste again is
+//      answered as already in, not accepted.
+//  C6  agy: a refused paste says not to repeat it (in #250 C5 above).
+//  C7  agy, already confirmed (the founder, or the person confirmed it): one line, no
+//      confirm request sent.
+
+const PASTE_USED = "The hex you just pasted was this room's password and has been used: do not repeat it, and do not ask about it.";
+const PASTE_ALREADY = "The hex you just pasted is this room's password, and you are already in: do not repeat it, and do not ask about it.";
+const PASTE_REFUSED = "Do not repeat the value you pasted.";
+const timesIn = (text, needle) => text.split(needle).length - 1;
+const valueNowhere = (result, password, label) => {
+  for (const [where, text] of [["stdout", result.stdout], ["stderr", result.stderr]]) {
+    assert.equal(text.toLowerCase().indexOf(password.toLowerCase()), -1, `${label}: C4, the value is not on ${where}`);
+  }
+};
+
+const acceptedPastePaths = [
+  {
+    name: "a full delivery", tag: "c1full",
+    before: async (f) => { await f.say("waiting before the paste"); },
+    premise: (r) => assert.ok(r.text.includes("waiting before the paste"), "premise: mail was delivered with it"),
+  },
+  {
+    name: "nothing waiting", tag: "c1none",
+    // The room's own notices always come with a confirmation; nothing from a member does.
+    premise: (r) => assert.ok(!r.steps.some((text) => /^\[gyredeck mail · from (?!the room)/.test(text)), `premise: no member's mail was delivered: ${r.text}`),
+  },
+  {
+    name: "the broker withholding", tag: "c1held", broker: true,
+    premise: (r) => assert.match(r.stderr, /mail withheld this turn/, "premise: withheld"),
+  },
+  {
+    name: "the delivery fault", tag: "c1fault", env: { GYREDECK_TEST_FAULT: "delivery" },
+    before: async (f) => { await f.say("before the fault"); },
+    premise: (r) => assert.match(r.text, /shown plainly/, "premise: the plain path"),
+  },
+  { name: "a {} inbox", tag: "c1empty", options: { breakInbox: "empty" } },
+];
+
+for (const path of acceptedPastePaths) {
+  test(`#255 C1 C2 C4: an accepted agy paste, ${path.name}`, async () => {
+    const f = await agyPasteFixture(path.tag, path.options ?? {});
+    const broker = path.broker ? await fakeBroker(f.home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" })) : null;
+    try {
+      await path.before?.(f);
+      const result = await f.invoke(f.password, path.env ?? {});
+      if (broker) assert.ok(broker.requests.length > 0, "premise: the broker was asked");
+      else assert.doesNotMatch(result.stderr, /mail withheld/, "premise: the collect went to the bridge");
+      assert.equal(await f.confirmed(), true, "premise: accepted");
+      assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "premise: presented once");
+      path.premise?.(result);
+      assert.equal(timesIn(result.text, PASTE_USED), 1, "C1/C2: the no-repeat line, once");
+      assert.equal(result.steps.filter((text) => text.startsWith(`NEW: the password you were just given was accepted for sync room ${f.code}`)).length, 1, "C2: one lead");
+      assert.ok(result.steps.some((text) => text.startsWith("NEW: ") && text.includes(PASTE_USED)), "C1: on the NEW step itself");
+      valueNowhere(result, f.password, path.name);
+    } finally {
+      await broker?.close();
+      await f.close();
+    }
+  });
+}
+
+test("#255 C5: after the accepted paste, no paste says nothing, and the same paste is answered as already in", async () => {
+  const f = await agyPasteFixture("c5");
+  try {
+    assert.equal(timesIn((await f.invoke(f.password)).text, PASTE_USED), 1, "premise: accepted and said");
+    const quiet = await f.invoke();
+    assert.equal(timesIn(quiet.text, PASTE_USED) + timesIn(quiet.text, PASTE_ALREADY), 0, "no paste, neither line");
+    const again = await f.invoke(f.password);
+    assert.equal(timesIn(again.text, PASTE_USED), 0, "not said as accepted again");
+    assert.doesNotMatch(again.text, /NEW: the password/);
+    assert.equal(timesIn(again.text, PASTE_ALREADY), 1, "answered as already in");
+    assert.equal(f.confirms.length, 1, "and nothing more was sent");
+    valueNowhere(again, f.password, "the repeat");
+  } finally {
+    await f.close();
+  }
+});
+
+for (const [label, tag, env, who] of [
+  ["the founder pastes its own password", "c7found", {}, "founder"],
+  ["the person already confirmed it", "c7conf", {}, "agy"],
+  ["already confirmed, delivery fault", "c7fault", { GYREDECK_TEST_FAULT: "delivery" }, "agy"],
+]) {
+  test(`#255 C7: ${label}`, async () => {
+    const f = await agyPasteFixture(tag);
+    try {
+      if (who === "agy") await f.confirm();
+      const as = who === "founder" ? f.founder : f.agy;
+      const members = (await f.call("GET", `/sync/rooms?as=${as}`)).body.members;
+      assert.equal(members.find((member) => member.conversationId === as)?.confirmed, true, "premise: already confirmed");
+      const result = await f.invoke(f.password, env, as);
+      assert.deepEqual(f.confirms, [], "no confirm request is sent");
+      assert.equal(timesIn(result.text, PASTE_ALREADY), 1, "one line");
+      assert.ok(result.steps.some((text) => text === `You are already in sync room ${f.code}. ${PASTE_ALREADY}`), "naming the room");
+      assert.equal(timesIn(result.text, PASTE_USED), 0);
+      assert.doesNotMatch(result.text, /BLOCKED:/);
+      valueNowhere(result, f.password, label);
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+for (const [label, tag, fault] of [["normal", "c3norm", false], ["delivery fault", "c3fault", true]]) {
+  test(`#255 C3 C4: Claude's accepted paste, ${label}`, async () => {
+    const f = await agyPasteFixture(tag);
+    const claude = "a2550000-0000-4000-8000-000000000003";
+    try {
+      await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: claude });
+      const sent = await f.call("POST", `/mail/${f.code}`, { from: f.founder, to: claude, kind: "ask", text: "waiting for claude" });
+      assert.equal(sent.body.ok, true, "premise: mail is waiting");
+      if (fault) process.env.GYREDECK_TEST_FAULT = "delivery";
+      let result;
+      try {
+        result = await runAdapter(
+          "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], f.home,
+          { hook_event_name: "UserPromptSubmit", session_id: claude, cwd: "/tmp/project", prompt: `here it is ${f.password}` },
+        );
+      } finally {
+        delete process.env.GYREDECK_TEST_FAULT;
+      }
+      assert.equal(result.code, 0, result.stderr);
+      assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "premise: presented once");
+      const confirmed = (await f.call("GET", `/sync/rooms?as=${claude}`)).body.members.find((member) => member.conversationId === claude)?.confirmed;
+      assert.equal(confirmed, true, "premise: accepted");
+      const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+      if (fault) assert.match(context, /shown plainly/, "premise: the fallback path");
+      else assert.doesNotMatch(context, /shown plainly/, "premise: the normal path");
+      assert.ok(context.includes("waiting for claude"), "premise: the mail came with it");
+      assert.equal(timesIn(context, PASTE_USED), 1, "C3: the line, once");
+      assert.ok(context.includes(`NEW: the password you were just given was accepted for sync room ${f.code} — you may now read and post here. ${PASTE_USED}`), "C3: naming the room, on both paths");
+      valueNowhere(result, f.password, label);
+    } finally {
+      await f.close();
+    }
+  });
+}
 
 // ── #251: what Antigravity must remember outlasts one invocation ──
 //

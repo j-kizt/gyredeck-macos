@@ -644,12 +644,14 @@ const PASTED_PASSWORD = /^[0-9a-f]{32}$/i;
  * Confirm a room password the person pasted into this session's terminal, as the Claude
  * hook does (#250): agy's PreInvocation carries the person's message as `lastUserInput`.
  * Only for a member of a room that has not confirmed yet, and only its own id in its own
- * room. Answers `{ accepted: { room, members } }`, `{ refused: { room, error } }`, or null
+ * room. Answers `{ accepted: { room, members } }`, `{ refused: { room, error } }`,
+ * `{ already: { room } }` for a member already confirmed (nothing is sent), or null
  * when there was nothing to do. The value goes to the bridge and nowhere else — never into
  * a step, never onto stderr.
  *
  * PreInvocation fires on every invocation of a turn, so the same message comes back several
- * times: once accepted the member is confirmed, and the next invocation sends nothing.
+ * times: once accepted the member is confirmed, and the next invocation sends nothing and
+ * is answered as `already`.
  */
 const confirmPastedPassword = async (endpoint, token, room, input) => {
   if (!token || !MAIL_ROOM_NAME.test(room) || typeof input?.lastUserInput !== "string") return null;
@@ -659,7 +661,10 @@ const confirmPastedPassword = async (endpoint, token, room, input) => {
   const code = typeof membership.body?.room === "string" ? membership.body.room : null;
   if (membership.status !== 200 || !code) return null;
   const mine = Array.isArray(membership.body.members) ? membership.body.members.find((member) => member?.conversationId === room) : null;
-  if (!mine || mine.confirmed === true) return null;
+  if (!mine) return null;
+  // Already in (the founder, or a second paste): nothing to present, but the bare hex is
+  // still in front of the model and is answered (#255).
+  if (mine.confirmed === true) return { already: { room: code } };
   const answer = await postJsonStatus(endpoint, token, `/sync/rooms/${code}/confirm`, { conversationId: room, password: pasted.toLowerCase() });
   if (answer.status === 200 && answer.body?.ok === true) {
     return { accepted: { room: code, members: Array.isArray(answer.body.members) ? answer.body.members : [] } };
@@ -677,15 +682,25 @@ const confirmPastedPassword = async (endpoint, token, room, input) => {
  * read as HEAR having been said. Symbols, so they never reach the JSON agy is handed.
  */
 const SAYS_HEAR = Symbol("says HEAR");
-const SAYS_ACCEPTED = Symbol("says the paste was accepted");
+const SAYS_ACCEPTED = Symbol("says what became of an accepted or already-used paste");
 const hearStep = (room) => ({ ephemeralMessage: hearText(room), [SAYS_HEAR]: room });
+
+/**
+ * Said with every answer to a paste (#255): live, the model repeated an accepted password
+ * back in its reply and asked whether to join a room it was already in. Never the value.
+ */
+const PASTE_USED = "The hex you just pasted was this room's password and has been used: do not repeat it, and do not ask about it.";
+const PASTE_ALREADY = "The hex you just pasted is this room's password, and you are already in: do not repeat it, and do not ask about it.";
 
 const confirmLead = (confirm) => {
   if (confirm?.accepted) {
-    return [{ ephemeralMessage: `NEW: the password you were just given was accepted for sync room ${confirm.accepted.room} — you may now read and post here.`, [SAYS_ACCEPTED]: true }];
+    return [{ ephemeralMessage: `NEW: the password you were just given was accepted for sync room ${confirm.accepted.room} — you may now read and post here. ${PASTE_USED}`, [SAYS_ACCEPTED]: true }];
+  }
+  if (confirm?.already) {
+    return [{ ephemeralMessage: `You are already in sync room ${confirm.already.room}. ${PASTE_ALREADY}`, [SAYS_ACCEPTED]: true }];
   }
   if (confirm?.refused) {
-    return [{ ephemeralMessage: `The pasted room password was refused (${confirm.refused.error}) — you are still not in sync room ${confirm.refused.room}.` }];
+    return [{ ephemeralMessage: `The pasted room password was refused (${confirm.refused.error}) — you are still not in sync room ${confirm.refused.room}. Do not repeat the value you pasted.` }];
   }
   return [];
 };
@@ -735,6 +750,7 @@ const rereadSteps = (endpoint, as, syncRoom, all) => {
  */
 const confirmOnlySteps = (endpoint, room, confirm) => {
   if (confirm?.accepted) return [...confirmLead(confirm), hearStep(room)];
+  if (confirm?.already) return confirmLead(confirm);
   if (confirm?.refused) return [...confirmLead(confirm), { ephemeralMessage: blockedStepFor(endpoint, confirm.refused.room, room) }];
   return [];
 };
@@ -747,9 +763,11 @@ const confirmOnlySteps = (endpoint, room, confirm) => {
  * some new shape cannot leave them out.
  */
 const withConfirmation = (steps, confirm, room) => {
-  if (!confirm?.accepted) return steps;
+  if (!confirm?.accepted && !confirm?.already) return steps;
+  const lead = steps.some((step) => step?.[SAYS_ACCEPTED] === true) ? [] : confirmLead(confirm);
+  if (!confirm.accepted) return [...lead, ...steps];
   return [
-    ...(steps.some((step) => step?.[SAYS_ACCEPTED] === true) ? [] : confirmLead(confirm)),
+    ...lead,
     ...steps,
     ...(steps.some((step) => step?.[SAYS_HEAR] === room) ? [] : [hearStep(room)]),
   ];

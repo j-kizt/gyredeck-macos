@@ -517,6 +517,15 @@ backlog. Because notify fires when a turn *ends*, Codex has already answered the
 prompt by the time the bridge hears about it; that turn is taken out of the harvest's way
 so the room's first word from Codex is not it puzzling over a hex string.
 
+What the Claude and Antigravity hooks say about a paste (#255) tells the agent the hex was
+the room's password and not to repeat it or ask about it — live, an agy session read the
+password back in its reply and asked whether to join a room it was already in. Antigravity
+says it on an accepted paste, on a refused one, and when the member is already in (the
+founder, or the same paste on the turn's next invocation), with no confirm sent for the
+last. Claude says it only on an accepted paste, from one line shared by the normal and the
+fallback delivery; it finds a password anywhere in prose, so a refused match stays silent.
+Neither line ever carries the value.
+
 `POST /sync/rooms/<code>/confirm` answers with a **`howTo` object**: the credential and
 identity to use, the exact send/receive/watch/wait calls with the password already in
 them, the shape of a message frame, and what a failed send looks like. This is the one

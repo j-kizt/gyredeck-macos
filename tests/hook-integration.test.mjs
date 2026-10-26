@@ -12856,13 +12856,18 @@ test("#259 C1 C2 C3 C7: Codex confirmed through notify carries the line in its c
     const { password } = (await f.call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder })).body;
     await f.ingestCodex(codex);
     await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: codex });
-    const before = (await until(async () => { const m = await f.messagesTo(codex); return m.length > 0 && m; }, "the join push")).length;
+    // Wait for the join push by its words, not by a count: on a loaded CI runner the count
+    // could be taken before the join push landed, and the join push then read as the
+    // confirmation (seen 2026-10-27 on PR #273).
+    const joined = /you are now in sync room/;
+    const before = (await until(async () => { const m = await f.messagesTo(codex); return m.some((message) => joined.test(message)) && m; }, "the join push")).length;
     const accepted = await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: "01a06082-8ef6-7900-ae39-44fe2e462592", password });
     assert.equal(accepted.body.transitioned, true, "premise: this let it in");
-    const after = await until(async () => { const m = await f.messagesTo(codex); return m.length > before && m; }, "the confirming push");
+    const confirmed = /you are confirmed in room/;
+    const after = await until(async () => { const m = await f.messagesTo(codex); return m.some((message) => confirmed.test(message)) && m; }, "the confirming push");
     assert.equal(after.length, before + 1, "C7: one push, the confirmation");
     const confirming = after.at(-1);
-    assert.match(confirming, /you are confirmed in room/, "premise: the confirming push");
+    assert.match(confirming, confirmed, "premise: the confirming push");
     assert.equal(heavyCount(confirming), 1, "C1: the line, once");
     assert.ok(confirming.includes(heavyLineFor("codex", codex)), "C3: heavyHint with its own id");
     assert.equal(after.slice(0, before).filter((message) => message.includes("HEAVY RUNS: ")).length, 0, "premise: not before it was let in");

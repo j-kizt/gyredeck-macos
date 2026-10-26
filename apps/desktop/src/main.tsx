@@ -1424,7 +1424,7 @@ const App = () => {
                   </>
                 ) : (
                   <>
-                    <span className="footer-copyright">© 2026 Gyredeck · J-Kitz</span>
+                    <span className="footer-copyright">© 2026 Gyredeck · J-Kizt</span>
                     {/* A local run reports the same version as the installed app, since
                         both read it from tauri.conf.json — so the version cannot say
                         which one is on screen. Vite's dev flag can: `desktop:dev`

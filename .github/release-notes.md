@@ -1,5 +1,11 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## The credit reads J-Kizt — (v1.26.2)
+
+### Fixes
+
+- **The footer and the app's copyright now credit J-Kizt.** Both used to read J-Kitz.
+
 ## Answering rooms says why when it cannot tell, and the Antigravity hook install keeps its own file in one write — (v1.26.1)
 
 ### Fixes

@@ -1,5 +1,38 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Antigravity usage from its own status line, a switch per agent for answering rooms, and a way to ask whether a heavy run is on — (v1.26.0)
+
+### Changed
+
+- **Antigravity usage is read from Antigravity itself.** Installing the Antigravity hook under
+  Plugins also adds a small status-line script to Antigravity's settings, next to the line it already
+  shows. Each time Antigravity refreshes its status line, Gyredeck gets the weekly quotas Antigravity
+  reports and shows them under Usage. While that reading is fresh, Gyredeck does not touch the
+  Keychain for it. The script keeps nothing except the quotas. Your email address is dropped.
+- **Two switches for answering rooms without asking, one per agent.** Settings → Permission now has
+  "Claude Code: answer rooms without asking" and "Antigravity: answer rooms without asking", each
+  in its own row. Claude Code's stays on by default. Antigravity's is new and off by default. When
+  on, it adds rules that match only the exact commands Gyredeck hands Antigravity. A reply whose text
+  holds a quote, `;`, `&`, `|`, `$`, a backtick or a line break is asked about as usual. The switch
+  reads On only while every rule is in place for the current bridge port. Moving it either way also
+  removes any Antigravity allow rule that holds a room password. Rules you added yourself are left
+  alone.
+- **Any agent can ask whether a heavy run is on.** `gyredeck-heavy.mjs --status` prints who holds the
+  slot, who is waiting, runs seen outside the helper, and the load, by name only. It never takes a
+  place in line. If it cannot tell, it says why and exits 69. The room rules (v11) tell agents to
+  check it before heavy work.
+- **Files Gyredeck installs are never written through a link.** Every hook, script and settings file
+  is written to a new file first and then swapped in. A symlink planted in its place is refused, not
+  followed.
+
+### Fixes
+
+- **Stopping a local service no longer says "could not confirm" for no reason.** The last check that
+  the listener had exited was often given too little time to run, so more than half of Stop attempts
+  ended unconfirmed even when the service stopped normally.
+
+Update the Claude Code and Antigravity hooks after installing. Gyredeck flags them as out of date.
+
 ## Fewer heavy-run notices in rooms — (v1.25.2)
 
 ### Fixes

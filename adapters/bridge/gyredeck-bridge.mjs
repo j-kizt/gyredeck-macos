@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 10;
+export const ROOM_RULES_VERSION = 11;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -303,6 +303,9 @@ ${HEAVY_COMMANDS.map((name) => `\`${name}\``).join(", ")}. Run each one through 
 — for example \`-- pnpm test:demo --workers=3\`. It waits for the slot, and for the 1-minute load to
 be ${HEAVY_LOAD_LIMIT} or less (for at most 10 minutes), runs the command, and exits with its code. While it
 waits it prints its place in line: leave it running, and do not start the command another way.
+Before heavy work, or when deciding whether to wait, check with \`node ${HEAVY_HELPER_DISPLAY_PATH} --status\`:
+it prints who holds the slot, who waits, runs outside the helper and the load, and queues nothing.
+Exit 69 means it cannot tell, and the line says why.
 While a heavy run holds the slot — yours or anyone's — do light work only: read, edit, and run small
 commands, and start nothing heavy another way. The room says when a run starts, who waits, and when it ends.
 ${HEAVY_LIMIT_TEXT}
@@ -357,6 +360,17 @@ export const HEAVY_LIMIT_TEXT =
  * it; the command runs only once the bridge has recorded that group (#223 r3, r4). The `;`
  * form this replaced ran the command on EOF.
  */
+/**
+ * What `--status` needs of each record in `GET /heavy` to write its line (#260 r2), by type.
+ * `describeHeavy` sends all of these; a test holds the two together. `label` is the one
+ * field that may be null — a session nobody named — and anything else missing or of another
+ * type means the answer cannot be read, rather than a line made up from defaults.
+ */
+export const HEAVY_STATUS_FIELDS = {
+  holder: { state: "string", what: "string", elapsedMs: "number", helperGone: "boolean", loadSkipped: "boolean" },
+  queue: { position: "number", what: "string", waitedMs: "number" },
+  observed: { pattern: "string", elapsedMs: "number" },
+};
 export const HEAVY_GATE = 'IFS= read -r line <&3 || exit 1; [ "$line" = GO ] || exit 1; exec 3<&-; exec "$@"';
 
 /**
@@ -393,7 +407,8 @@ export const writeFileAtomically = (path, content, mode) => {
 
 /**
  * The helper every agent runs a heavy command through:
- * `node ~/.config/gyredeck/gyredeck-heavy.mjs --as <id> --what "<label>" -- <cmd…>`.
+ * `node ~/.config/gyredeck/gyredeck-heavy.mjs --as <id> --what "<label>" -- <cmd…>`, or
+ * `--status` alone to ask whether a run is on (#260).
  *
  * Written from this function's own source on every start, so the three CLIs share one copy
  * at the bridge's own version and it is checked like the rest of this file. It must stay
@@ -411,6 +426,115 @@ const heavyHelper = async (setup) => {
   const { join } = await import("node:path");
 
   const say = (line) => process.stderr.write(`gyredeck: ${line}\n`);
+
+  // --status (#260): one GET, printed, and nothing queued or run. It reports the slot only
+  // when the bridge answered for it; anything else is "cannot tell" (69), never "free".
+  // Exit codes go through exitCode: a pipe on macOS is written asynchronously, and an
+  // explicit exit could cut the answer short.
+  const heavyStatus = async () => {
+    const unknown = (why) => {
+      say(`cannot tell whether a heavy run is on — ${why}`);
+      process.exitCode = 69;
+    };
+    let token;
+    try {
+      token = readFileSync(join(homedir(), ".config", "gyredeck", "gyredeck.ingest-token"), "utf8").trim();
+    } catch {
+      unknown("no machine token in ~/.config/gyredeck (is Gyredeck installed and started?)");
+      return;
+    }
+    const deadline = Date.now() + (Number(process.env.GYREDECK_TEST_HEAVY_STATUS_MS) || 2_000);
+    let response;
+    for (;;) {
+      try {
+        response = await fetch(`${setup.origin}/heavy`, {
+          headers: { "x-gyredeck-token": token },
+          signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+        });
+        break;
+      } catch {
+        if (Date.now() + 250 >= deadline) {
+          unknown(`the Gyredeck bridge cannot be reached at ${setup.origin}`);
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+    let body = null;
+    try { body = await response.json(); } catch {}
+    if (response.status === 401) {
+      unknown("the bridge refused this machine's token (401)");
+      return;
+    }
+    const code = typeof body?.error === "string" && /^[a-z_]{1,40}$/.test(body.error) ? ` ${body.error}` : "";
+    if (response.status !== 200) {
+      unknown(`the bridge answered ${response.status}${code}`);
+      return;
+    }
+    if (body?.v !== setup.v) {
+      unknown(`the bridge speaks heavy protocol version ${Number.isInteger(body?.v) ? body.v : "unknown"}, this helper ${setup.v}`);
+      return;
+    }
+    // The whole answer is checked before a line is written, and any surprise while writing it
+    // is "cannot tell" too: a half-printed state, or a stack trace, is not an answer.
+    const record = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+    const fits = (kind) => (value) =>
+      record(value) &&
+      (value.label === undefined || value.label === null || typeof value.label === "string") &&
+      Object.entries(setup.needs[kind]).every(([field, type]) => (type === "number" ? Number.isFinite(value[field]) : typeof value[field] === type));
+    const render = () => {
+      const { holder, queue, observed, load, loadLimit } = body;
+      if (body.ok !== true || (holder !== null && !fits("holder")(holder))) return null;
+      if (!Array.isArray(queue) || !queue.every(fits("queue")) || !Array.isArray(observed) || !observed.every(fits("observed"))) return null;
+      // The bridge sends `load: null` when the OS gives no reading; a missing field is not that.
+      if (!Number.isFinite(loadLimit) || (load !== null && !Number.isFinite(load))) return null;
+      // Labels and what each run said it runs; never a session id or a path.
+      const text = (value, fallback) => (typeof value === "string" && value ? value.replace(/[\u0000-\u001f\u007f]/g, " ") : fallback);
+      const who = (entry) => text(entry.label, "an unnamed session");
+      const lasted = (ms) => {
+        const seconds = Math.max(0, Math.round(Number(ms) / 1000) || 0);
+        if (seconds < 60) return `${seconds}s`;
+        const minutes = Math.floor(seconds / 60);
+        if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+        return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+      };
+      const lines = [];
+      if (holder) {
+        const how = holder.state === "active" ? "running" : "starting";
+        lines.push(`heavy-run slot: held by ${who(holder)} — ${text(holder.what, "?")} (${how}, ${lasted(holder.elapsedMs)})`);
+        if (holder.helperGone === true) lines.push("  its helper has gone quiet; the command still runs and holds the slot");
+        if (holder.loadSkipped === true) lines.push("  granted after the load stayed high for 10 minutes");
+      } else if (observed.length > 0) {
+        lines.push("heavy-run slot: taken by a run outside the helper");
+      } else if (queue.length > 0) {
+        lines.push("heavy-run slot: not held, but the line is waiting");
+      } else if (load === null) {
+        lines.push("heavy-run slot: not held, but the load is unknown");
+      } else {
+        lines.push("heavy-run slot: free");
+      }
+      if (observed.length > 0) {
+        lines.push(`running outside the helper: ${observed.length}`);
+        for (const run of observed) lines.push(`  ${who(run)} — ${text(run.pattern, "?")}, ${lasted(run.elapsedMs)}`);
+      }
+      if (queue.length > 0) {
+        lines.push(`waiting: ${queue.length}`);
+        for (const entry of queue) lines.push(`  ${entry.position}. ${who(entry)} — ${text(entry.what, "?")}, waited ${lasted(entry.waitedMs)}`);
+      }
+      lines.push(`load: ${load ?? "unknown"} (the slot is granted at ${loadLimit} or less)`);
+      return lines;
+    };
+    let lines = null;
+    try { lines = render(); } catch {}
+    if (!lines) {
+      unknown("the bridge's answer could not be read");
+      return;
+    }
+    // A reader that closed the pipe has the answer cut short: that is "cannot tell" too, not a stack.
+    process.stdout.on("error", (error) => unknown(`its answer could not be written (${error.code ?? "stdout error"})`));
+    process.stdout.write(`${lines.join("\n")}\n`);
+    process.exitCode = 0;
+  };
   const argv = process.argv.slice(2);
   const split = argv.indexOf("--");
   const flags = split < 0 ? argv : argv.slice(0, split);
@@ -421,10 +545,17 @@ const heavyHelper = async (setup) => {
   };
   const as = flag("--as");
   const what = flag("--what");
-  if (!as || !what || command.length === 0) {
+  const usage = () => {
     say('usage: node ~/.config/gyredeck/gyredeck-heavy.mjs --as <your id> --what "<what it runs>" -- <command…>');
+    say("   or: node ~/.config/gyredeck/gyredeck-heavy.mjs --status");
     process.exit(64);
+  };
+  if (flags.includes("--status")) {
+    if (argv.length !== 1) usage();
+    await heavyStatus();
+    return;
   }
+  if (!as || !what || command.length === 0) usage();
   const heartbeatMs = Number(process.env.GYREDECK_TEST_HEAVY_HEARTBEAT_MS) || 60_000;
   const retries = Number(process.env.GYREDECK_TEST_HEAVY_RETRIES) || 40;
   const killAfterMs = Number(process.env.GYREDECK_TEST_HEAVY_KILL_AFTER_MS) || 30_000;
@@ -635,7 +766,7 @@ const heavyHelper = async (setup) => {
 /** The helper's source: a version line, then the function above, called with its setup. */
 export const heavyHelperSource = (origin) =>
   `#!/usr/bin/env node\n// gyredeck-heavy protocol v${HEAVY_PROTOCOL_VERSION} — written by the Gyredeck bridge on every start; edits are overwritten.\n` +
-  `(${heavyHelper.toString()})(${JSON.stringify({ v: HEAVY_PROTOCOL_VERSION, origin, gate: HEAVY_GATE })});\n`;
+  `(${heavyHelper.toString()})(${JSON.stringify({ v: HEAVY_PROTOCOL_VERSION, origin, gate: HEAVY_GATE, needs: HEAVY_STATUS_FIELDS })});\n`;
 
 /** Written on every start beside the rules. Answers whether it is there to be run. */
 export const writeHeavyHelper = (origin, path = HEAVY_HELPER_PATH) => {
@@ -4142,7 +4273,8 @@ function startBridge(config) {
   const heavyHint = (conversationId) =>
     `HEAVY RUNS: one at a time on this machine. Run ${HEAVY_COMMANDS.join(", ")} through ` +
     `\`node ${HEAVY_HELPER_DISPLAY_PATH} --as ${conversationId} --what "<what it runs>" -- <command…>\`; ` +
-    `it waits for the slot, runs the command and exits with its code. ${HEAVY_LIMIT_TEXT}`;
+    `it waits for the slot, runs the command and exits with its code. ` +
+    `Before heavy work, or when deciding whether to wait, check with \`node ${HEAVY_HELPER_DISPLAY_PATH} --status\`. ${HEAVY_LIMIT_TEXT}`;
   /**
    * The same, for Antigravity (#251): its injected steps last one invocation, so a notice it
    * is told once is gone by the time it runs a heavy command. It is given a command instead,

@@ -25,6 +25,10 @@ tauri-plugin-updater = "2"
 time = { version = "0.3", features = ["formatting", "local-offset", "parsing"] }
 toml_edit = "0.25.15"
 
+[dev-dependencies]
+# The agy permission rules are regexes; their tests compile them as agy would (#261).
+regex = "1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
 core-foundation = "0.10.1"

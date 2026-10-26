@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+mod agy_statusline;
 mod broker;
 mod github;
 mod heavy_watch;
@@ -552,16 +553,239 @@ fn write_sync_reply_rules(enabled: bool) -> Result<(), String> {
     write_claude_settings(&settings)
 }
 
+/// Antigravity's half of "answer rooms without asking" (#261): its own switch, off by
+/// default, writing `command(regex:…)` rules into `~/.gemini/antigravity-cli/settings.json`.
+///
+/// agy's plain `command(prefix)` is a literal word-prefix match, and `*` is a wildcard only
+/// as the whole target, so a printed command whose id, password and body differ every time
+/// can only be allowed by a `regex:` rule (Antigravity's permissions guide).
+///
+/// Invariants, each pinned by a test that was made to fail:
+/// - A1  On writes exactly [`agy_sync_reply_rules`]: regexes anchored at both ends, whose
+///       only variable parts are strict classes — the session id a UUID, the room
+///       `sync-` and four of its letters, the password 32 hex digits, and the body a JSON
+///       object of `{"from":"<id>",` and then no `'`, `;`, `&`, `|`, backtick, `$` or line
+///       break. Each one matches the command the hook or the bridge prints, read from their
+///       sources, and nothing in front of it, behind it, or smuggled into a slot.
+/// - A2  Off removes exactly our rules, for any port they were written with. Every other
+///       entry stays where it was: the person's own rules, broad ones included, are theirs.
+/// - A3  Either way, a rule that embeds a room password (a run of exactly 32 hex digits)
+///       is removed. Runs of any other length are not passwords and stay.
+/// - A4  Only `permissions.allow` changes. Every other key of the file and of
+///       `permissions` is kept, through [`agy_statusline::merge_json_key`] (atomic, mode
+///       kept, retried when agy writes meanwhile). A `permissions` that is not an object,
+///       or an `allow` that is not a list, is refused rather than replaced.
+/// - A5  Applying what is already there writes nothing.
+/// - A6  The switch is off until the person turns it on; Claude Code's stays on by default.
+/// - A7  The switch reads On only when the whole set for the current port is in the file.
+///       A missing rule, a stale port or a leftover password rule is repaired on reading
+///       when the intent is On (and the hook is in), and leftover rules are removed when
+///       it is Off. A write that fails is an error, never a state.
+/// - A8  Turning it on or off changes the intent only after the file did, so a failed
+///       write leaves both where they were.
+const AGY_SYNC_REPLIES_FLAG: &str = "allowAgySyncReplies";
+
+const AGY_ID: &str = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const AGY_BODY: &str = r#"\{"from":"$ID",[^'`;&|$\r\n]*\}"#;
+
+/// `$PORT` is the only part [`is_agy_sync_reply_rule`] lets vary.
+const AGY_SYNC_REPLY_TEMPLATES: [&str; 5] = [
+    // HEAR, as the hook and the bridge print it (#228).
+    r#"command(regex:^while :; do node ~/\.config/gyredeck/gyredeck-agy-hook\.mjs wait 300 $ID; rc=\$\?; \[ \$rc -eq 4 \] \|\| break; done$)"#,
+    // WAIT, as the bridge's howTo prints it.
+    r#"command(regex:^node ~/\.config/gyredeck/gyredeck-agy-hook\.mjs wait 60 $ID$)"#,
+    // REPLY, as the hook prints it.
+    r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H "x-gyredeck-token: $PW" -d '$BODY'$)"#,
+    // SEND, as the bridge's howTo prints it.
+    r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H 'x-gyredeck-token: $PW' -d '$BODY'$)"#,
+    // READ again, as the hook prints it.
+    r#"command(regex:^curl -s "http://$HOST:$PORT/mail/$ROOM\?as=$ID&since=[0-9]+&until=[0-9]+" -H "x-gyredeck-token: $PW"$)"#,
+];
+
+/// Every template with everything but the port filled in.
+fn agy_sync_reply_templates(host: &str) -> Vec<String> {
+    AGY_SYNC_REPLY_TEMPLATES
+        .iter()
+        .map(|template| {
+            template
+                .replace("$BODY", AGY_BODY)
+                .replace("$ID", AGY_ID)
+                .replace("$ROOM", "sync-[a-z2-9]{4}")
+                .replace("$PW", "[0-9a-f]{32}")
+                .replace("$HOST", &host.replace('.', r"\."))
+        })
+        .collect()
+}
+
+fn agy_sync_reply_rules(host: &str, port: u16) -> Vec<String> {
+    agy_sync_reply_templates(host)
+        .iter()
+        .map(|template| template.replace("$PORT", &port.to_string()))
+        .collect()
+}
+
+fn is_agy_sync_reply_rule(rule: &str) -> bool {
+    agy_sync_reply_templates(standalone_bridge::BRIDGE_HOST).iter().any(|template| {
+        match template.split_once("$PORT") {
+            None => rule == template,
+            Some((before, after)) => rule
+                .strip_prefix(before)
+                .and_then(|rest| rest.strip_suffix(after))
+                .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())),
+        }
+    })
+}
+
+fn embeds_room_password(rule: &str) -> bool {
+    rule.split(|c: char| !c.is_ascii_hexdigit()).any(|run| run.len() == 32)
+}
+
+/// The new `permissions` value, or the old one unchanged when there is nothing to do.
+fn apply_agy_sync_reply_rules(
+    permissions: Option<&serde_json::Value>,
+    enabled: bool,
+    host: &str,
+    port: u16,
+) -> Result<Option<serde_json::Value>, String> {
+    let mut permissions = match permissions {
+        None if !enabled => return Ok(None),
+        None => serde_json::Map::new(),
+        Some(serde_json::Value::Object(map)) => map.clone(),
+        Some(_) => return Err("Refusing to rewrite agy's permissions: it is not an object".to_string()),
+    };
+    let before = match permissions.get("allow") {
+        None => Vec::new(),
+        Some(serde_json::Value::Array(list)) => list.clone(),
+        Some(_) => return Err("Refusing to rewrite agy's permissions.allow: it is not a list".to_string()),
+    };
+    let ours = if enabled { agy_sync_reply_rules(host, port) } else { Vec::new() };
+    let mut kept = std::collections::HashSet::new();
+    let mut allow: Vec<serde_json::Value> = before
+        .iter()
+        .filter(|entry| {
+            !entry.as_str().is_some_and(|rule| {
+                embeds_room_password(rule)
+                    || (is_agy_sync_reply_rule(rule)
+                        && !(ours.iter().any(|own| own == rule) && kept.insert(rule.to_string())))
+            })
+        })
+        .cloned()
+        .collect();
+    for rule in ours {
+        if !allow.iter().any(|entry| entry.as_str() == Some(rule.as_str())) {
+            allow.push(serde_json::Value::String(rule));
+        }
+    }
+    if allow != before {
+        permissions.insert("allow".to_string(), serde_json::Value::Array(allow));
+    }
+    Ok(Some(serde_json::Value::Object(permissions)))
+}
+
+fn agy_settings_path() -> Result<PathBuf, String> {
+    Ok(agy_statusline::AgyStatusLinePaths::from_home()?.settings)
+}
+
+fn write_agy_sync_reply_rules_at(path: &Path, enabled: bool, port: u16) -> Result<(), String> {
+    agy_statusline::merge_json_key(path, "permissions", |permissions| {
+        apply_agy_sync_reply_rules(permissions, enabled, standalone_bridge::BRIDGE_HOST, port)
+    })
+    .map(drop)
+}
+
+fn agy_permissions_at(path: &Path) -> Result<Option<serde_json::Value>, String> {
+    Ok(agy_statusline::read_json_object(path)?.get("permissions").cloned())
+}
+
+/// What Antigravity's switch shows, after bringing the file in line with the intent (A7).
+///
+/// On only when every rule for the current port is in the file. When the file is not what
+/// the intent asks for, it is rewritten: towards On only once the hook is in (without it
+/// nothing sends a reply to permit), towards Off always, since removing our own rules
+/// reaches no further than the person asked. A failed rewrite is returned as the error.
+fn agy_sync_replies_state(path: &Path, wanted: bool, port: u16, hook_installed: bool) -> Result<bool, String> {
+    let permissions = agy_permissions_at(path)?;
+    let host = standalone_bridge::BRIDGE_HOST;
+    if apply_agy_sync_reply_rules(permissions.as_ref(), wanted, host, port)? != permissions
+        && (hook_installed || !wanted)
+    {
+        write_agy_sync_reply_rules_at(path, wanted, port)?;
+    }
+    let permissions = agy_permissions_at(path)?;
+    let allow = permissions
+        .as_ref()
+        .and_then(|value| value.get("allow"))
+        .and_then(serde_json::Value::as_array);
+    Ok(agy_sync_reply_rules(host, port)
+        .iter()
+        .all(|rule| allow.is_some_and(|list| list.iter().any(|entry| entry.as_str() == Some(rule.as_str()))))
+    )
+}
+
+/// The file first (A8): a failed write leaves the intent as it was, so the switch never
+/// reads Off while our rules are still in agy's file.
+fn set_agy_sync_replies_at(
+    path: &Path,
+    enabled: bool,
+    port: u16,
+    record_intent: impl FnOnce(bool) -> Result<(), String>,
+) -> Result<(), String> {
+    write_agy_sync_reply_rules_at(path, enabled, port)?;
+    record_intent(enabled)
+}
+
+/// Which agent's "answer rooms without asking" switch a call is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SyncReplyAgent {
+    Claude,
+    Agy,
+}
+
+impl SyncReplyAgent {
+    /// The preference's key and its default: Claude Code's is on, Antigravity's off (A6).
+    fn flag(self) -> (&'static str, bool) {
+        match self {
+            Self::Claude => (SYNC_REPLIES_FLAG, true),
+            Self::Agy => (AGY_SYNC_REPLIES_FLAG, false),
+        }
+    }
+
+    fn wanted(self) -> bool {
+        let (key, fallback) = self.flag();
+        standalone_bridge::config_flag(key, fallback)
+    }
+
+    fn write(self, enabled: bool) -> Result<(), String> {
+        match self {
+            Self::Claude => write_sync_reply_rules(enabled),
+            Self::Agy => write_agy_sync_reply_rules_at(
+                &agy_settings_path()?,
+                enabled,
+                standalone_bridge::configured_bridge_port(),
+            ),
+        }
+    }
+}
+
 /// The switch's state, reconciling the preference with what is actually in the file.
 ///
-/// The preference is the intent and defaults to on, so an install that predates this
-/// setting is opted in rather than silently left out. The rules are the effect, and
+/// The preference is the intent; Claude Code's defaults to on, so an install that predates
+/// this setting is opted in rather than silently left out. The rules are the effect, and
 /// they can be missing for reasons the preference knows nothing about — an older
 /// install, a hand-edited settings file, a port that moved. When intent and effect
 /// disagree and the hook is installed, the effect is brought back into line.
 #[tauri::command]
-fn sync_replies_allowed() -> Result<bool, String> {
-    let wanted = standalone_bridge::config_flag(SYNC_REPLIES_FLAG, true);
+fn sync_replies_allowed(agent: SyncReplyAgent) -> Result<bool, String> {
+    let wanted = agent.wanted();
+    if agent == SyncReplyAgent::Agy {
+        return agy_sync_replies_state(
+            &agy_settings_path()?,
+            wanted,
+            standalone_bridge::configured_bridge_port(),
+            agy_hook_state().is_ok_and(|(_, installed)| installed),
+        );
+    }
     let settings = read_claude_settings()?;
     if wanted && !rules_present(&settings) {
         // Only once the hook is in: without it nothing sends a reply to permit, and
@@ -576,11 +800,20 @@ fn sync_replies_allowed() -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn set_sync_replies_allowed(enabled: bool) -> Result<(), String> {
+fn set_sync_replies_allowed(agent: SyncReplyAgent, enabled: bool) -> Result<(), String> {
+    let (flag, _) = agent.flag();
+    if agent == SyncReplyAgent::Agy {
+        return set_agy_sync_replies_at(
+            &agy_settings_path()?,
+            enabled,
+            standalone_bridge::configured_bridge_port(),
+            |enabled| standalone_bridge::write_config_flag(flag, enabled),
+        );
+    }
     // Intent is recorded before the effect, so a failed write leaves a switch that
     // reports what the person chose and retries on the next read.
-    standalone_bridge::write_config_flag(SYNC_REPLIES_FLAG, enabled)?;
-    write_sync_reply_rules(enabled)
+    standalone_bridge::write_config_flag(flag, enabled)?;
+    agent.write(enabled)
 }
 
 fn agy_hook_install_path() -> Result<PathBuf, String> {
@@ -940,10 +1173,19 @@ fn set_bridge_port(
     }
     standalone_bridge::write_configured_port(port)?;
     // The rules name the endpoint, so leaving them behind would silently stop matching.
-    if standalone_bridge::config_flag(SYNC_REPLIES_FLAG, true) {
-        let _ = write_sync_reply_rules(true);
+    // The bridge still moves when one cannot be rewritten; the failure is reported rather
+    // than swallowed, and the next look at Settings tries again.
+    let failed: Vec<String> = [SyncReplyAgent::Claude, SyncReplyAgent::Agy]
+        .into_iter()
+        .filter(|agent| agent.wanted())
+        .filter_map(|agent| agent.write(true).err())
+        .collect();
+    state.restart()?;
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("Port {port} is set, but the rules that let agents answer rooms were not updated: {}", failed.join("; ")))
     }
-    state.restart()
 }
 
 /// Whether the app is set to start when the machine is unlocked.
@@ -1081,12 +1323,29 @@ fn format_codex_usage_error(error: CodexUsageFetchError) -> String {
 
 #[tauri::command]
 async fn agy_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(|| agy_usage_blocking().inspect(relay_usage))
-        .await
-        .map_err(|error| format!("Antigravity usage task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(|| {
+        let status = agy_statusline::AgyStatusLinePaths::from_home()
+            .ok()
+            .and_then(|paths| agy_statusline::read_reading(&paths.payload(), agy_statusline::unix_now()));
+        // The status line comes first: the fallback reads agy's token from the Keychain (#230).
+        match agy_statusline::choose_usage(status, agy_usage_fallback)? {
+            agy_statusline::AgyUsage::StatusLine(reading) => {
+                agy_statusline::relay_if_fresh(&reading, relay_usage);
+                Ok(reading.snapshot)
+            }
+            agy_statusline::AgyUsage::Fallback(snapshot) => {
+                relay_usage(&snapshot);
+                Ok(snapshot)
+            }
+        }
+    })
+    .await
+    .map_err(|error| format!("Antigravity usage task failed: {error}"))?
 }
 
-fn agy_usage_blocking() -> Result<CodexUsageSnapshot, String> {
+/// The language server and the cloud path, both of which need agy's credentials. Reached
+/// only when agy's status line has nothing fresh (#230).
+fn agy_usage_fallback() -> Result<CodexUsageSnapshot, String> {
     if let Some(snapshot) = probe_antigravity_ls_usage() {
         return Ok(snapshot);
     }
@@ -4079,20 +4338,20 @@ fn read_antigravity_user_status_plan(data: &Value) -> Option<String> {
         })
 }
 
+/// Antigravity's quota buckets by id, as the cloud summary and agy's status line both name
+/// them, in the order the panel shows them.
+const AGY_QUOTA_BUCKETS: [(&str, &str, u64); 4] = [
+    ("gemini-5h", "Gemini 5h", 5 * 60 * 60 * 1000),
+    ("gemini-weekly", "Gemini Weekly", 7 * 24 * 60 * 60 * 1000),
+    ("3p-5h", "Claude and GPT 5h", 5 * 60 * 60 * 1000),
+    ("3p-weekly", "Claude and GPT Weekly", 7 * 24 * 60 * 60 * 1000),
+];
+
 fn build_antigravity_quota_summary_lines(response: &Value) -> Option<Vec<CodexMetricLine>> {
     let response = response.get("response").unwrap_or(response);
     let groups = response.get("groups").and_then(Value::as_array)?;
 
-    const BUCKETS: [(&str, &str, u64); 4] = [
-        ("gemini-5h", "Gemini 5h", 5 * 60 * 60 * 1000),
-        ("gemini-weekly", "Gemini Weekly", 7 * 24 * 60 * 60 * 1000),
-        ("3p-5h", "Claude and GPT 5h", 5 * 60 * 60 * 1000),
-        (
-            "3p-weekly",
-            "Claude and GPT Weekly",
-            7 * 24 * 60 * 60 * 1000,
-        ),
-    ];
+    const BUCKETS: [(&str, &str, u64); 4] = AGY_QUOTA_BUCKETS;
     let mut resolved = BTreeMap::new();
 
     for bucket in groups
@@ -4307,7 +4566,7 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
     };
     fs::create_dir_all(parent)
         .map_err(|error| format!("Failed to create config directory: {error}"))?;
-    fs::copy(&resource_path, &install_path)
+    agy_statusline::copy_atomically(&resource_path, &install_path, 0o644)
         .map_err(|error| format!("Failed to copy hook script: {error}"))?;
 
     let installed_path = install_path.to_string_lossy().to_string();
@@ -4405,10 +4664,14 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
 ///
 /// Separated from the caller so the comparison itself can be tested without an app
 /// bundle to resolve resources against.
+/// `right` is the installed copy, read without following a link: a link or anything else
+/// that is not a plain file there is not this build's adapter, so it is stale.
 fn files_differ(left: &Path, right: &Path) -> Option<bool> {
-    match (fs::read(left), fs::read(right)) {
-        (Ok(a), Ok(b)) => Some(a != b),
-        _ => None,
+    let bundled = fs::read(left).ok()?;
+    match agy_statusline::read_regular_nofollow(right).ok()? {
+        agy_statusline::ReadNoFollow::Regular(installed) => Some(installed.bytes != bundled),
+        agy_statusline::ReadNoFollow::NotRegular => Some(true),
+        agy_statusline::ReadNoFollow::Absent => None,
     }
 }
 
@@ -4478,74 +4741,95 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
             tauri::path::BaseDirectory::Resource,
         )
         .map_err(|e| format!("Failed to resolve resource: {e}"))?;
+    let statusline_resource = app
+        .path()
+        .resolve(agy_statusline::SCRIPT_NAME, tauri::path::BaseDirectory::Resource)
+        .map_err(|e| format!("Failed to resolve resource: {e}"))?;
+    let statusline_paths = agy_statusline::AgyStatusLinePaths::from_home()?;
+    install_agy_hook_at(
+        &resource_path,
+        &statusline_resource,
+        &install_path,
+        &hooks_json_path,
+        &statusline_paths,
+    )
+}
 
-    let Some(parent) = install_path.parent() else {
-        return Err("Failed to resolve config directory".to_string());
-    };
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("Failed to create config directory: {error}"))?;
-    fs::copy(&resource_path, &install_path)
-        .map_err(|error| format!("Failed to copy hook script: {error}"))?;
+/// `install_agy_hook` with every path given, so it can run against a scratch directory.
+/// Every file it writes goes through `agy_statusline::write_atomically`; none is written
+/// through a symlink (#230 audit).
+fn install_agy_hook_at(
+    resource_path: &Path,
+    statusline_resource: &Path,
+    install_path: &Path,
+    hooks_json_path: &Path,
+    statusline_paths: &agy_statusline::AgyStatusLinePaths,
+) -> Result<String, String> {
+    // Everything that can refuse, before anything is written: agy's settings.json, and a
+    // hooks.json that is a link, does not parse or is not an object. The write re-reads it
+    // through the same no-follow reader (#230 audit).
+    agy_statusline::preflight(statusline_paths)?;
+    agy_statusline::read_json_object(hooks_json_path)?;
+    // A later step that fails puts back every file the install touched, so a refusal does
+    // not leave the hook half-registered.
+    let touched = [
+        install_path.to_path_buf(),
+        hooks_json_path.to_path_buf(),
+        statusline_paths.script(),
+        statusline_paths.chain(),
+        statusline_paths.previous(),
+    ];
+    agy_statusline::with_rollback(&touched, || {
+        let Some(parent) = install_path.parent() else {
+            return Err("Failed to resolve config directory".to_string());
+        };
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create config directory: {error}"))?;
+        agy_statusline::copy_atomically(resource_path, install_path, 0o644)
+            .map_err(|error| format!("Failed to copy hook script: {error}"))?;
 
-    let installed_path = install_path.to_string_lossy().to_string();
+        let installed_path = install_path.to_string_lossy().to_string();
 
-    let mut hooks_root: serde_json::Value = if hooks_json_path.exists() {
-        let content = fs::read_to_string(&hooks_json_path)
-            .map_err(|e| format!("Failed to read hooks.json: {e}"))?;
-        if content.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(&content)
-                .map_err(|e| format!("Failed to parse hooks.json: {e}"))?
-        }
-    } else {
-        serde_json::json!({})
-    };
+        let entry = || serde_json::json!({
+            "PreToolUse": [{
+                "matcher": ".*",
+                "hooks": [{"type": "command", "command": node_hook_command(&installed_path, "PreToolUse")}]
+            }],
+            "PostToolUse": [{
+                "matcher": ".*",
+                "hooks": [{"type": "command", "command": node_hook_command(&installed_path, "PostToolUse")}]
+            }],
+            "PreInvocation": [
+                {"type": "command", "command": node_hook_command(&installed_path, "PreInvocation")}
+            ],
+            "PostInvocation": [
+                {"type": "command", "command": node_hook_command(&installed_path, "PostInvocation")}
+            ],
+            // Antigravity reads the Stop hook's response as a decision about whether the
+            // turn may end, so the adapter must answer "allow" here. It once answered
+            // "continue" — meaning "keep going" — and the agent replied to every finished
+            // turn with "Stop hook blocked termination", looping forever.
+            "Stop": [
+                {"type": "command", "command": node_hook_command(&installed_path, "Stop")}
+            ],
+        });
+        // Drop the previous brand's namespace so it can't fire alongside Gyredeck.
+        register_agy_hooks(hooks_json_path, entry)
+            .map_err(|error| format!("Failed to write hooks.json: {error}"))?;
 
-    if !hooks_root.is_object() {
-        hooks_root = serde_json::json!({});
-    }
-    let root = hooks_root.as_object_mut().expect("hooks.json is object");
+        // Usage comes from agy's status-line payload, so the install also points agy's status
+        // line at the script, keeping the person's own one chained behind it (#230).
+        agy_statusline::install(statusline_paths, statusline_resource)?;
 
-    let entry = serde_json::json!({
-        "PreToolUse": [{
-            "matcher": ".*",
-            "hooks": [{"type": "command", "command": node_hook_command(&installed_path, "PreToolUse")}]
-        }],
-        "PostToolUse": [{
-            "matcher": ".*",
-            "hooks": [{"type": "command", "command": node_hook_command(&installed_path, "PostToolUse")}]
-        }],
-        "PreInvocation": [
-            {"type": "command", "command": node_hook_command(&installed_path, "PreInvocation")}
-        ],
-        "PostInvocation": [
-            {"type": "command", "command": node_hook_command(&installed_path, "PostInvocation")}
-        ],
-        // Antigravity reads the Stop hook's response as a decision about whether the
-        // turn may end, so the adapter must answer "allow" here. It once answered
-        // "continue" — meaning "keep going" — and the agent replied to every finished
-        // turn with "Stop hook blocked termination", looping forever.
-        "Stop": [
-            {"type": "command", "command": node_hook_command(&installed_path, "Stop")}
-        ],
-    });
-    // Drop the previous brand's namespace so it can't fire alongside Gyredeck.
-    root.remove("agent-activity");
-    root.insert("gyredeck".to_string(), entry);
+        Ok(installed_path)
+    })
+}
 
-    let Some(hooks_parent) = hooks_json_path.parent() else {
-        return Err("Failed to resolve Gemini config directory".to_string());
-    };
-    fs::create_dir_all(hooks_parent)
-        .map_err(|error| format!("Failed to create Gemini config directory: {error}"))?;
-
-    let json_string = serde_json::to_string_pretty(&hooks_root)
-        .map_err(|e| format!("Failed to stringify hooks.json: {e}"))?;
-    fs::write(&hooks_json_path, format!("{json_string}\n"))
-        .map_err(|error| format!("Failed to write hooks.json: {error}"))?;
-
-    Ok(installed_path)
+/// Put back the status line agy had before `install_agy_hook`, and remove the payload and
+/// the script (#230). Nothing in the panel calls it yet.
+#[tauri::command]
+fn uninstall_agy_statusline() -> Result<(), String> {
+    agy_statusline::uninstall(&agy_statusline::AgyStatusLinePaths::from_home()?)
 }
 
 fn codex_notify_install_path() -> Result<PathBuf, String> {
@@ -4655,7 +4939,7 @@ fn install_codex_notify(app: tauri::AppHandle) -> Result<String, String> {
     };
     fs::create_dir_all(parent)
         .map_err(|error| format!("Failed to create config directory: {error}"))?;
-    fs::copy(&resource_path, &install_path)
+    agy_statusline::copy_atomically(&resource_path, &install_path, 0o644)
         .map_err(|error| format!("Failed to copy notify script: {error}"))?;
 
     // Already ours means the line is already right, and rewriting it would only risk
@@ -4713,7 +4997,7 @@ fn install_codex_hook(app: tauri::AppHandle) -> Result<String, String> {
     };
     fs::create_dir_all(parent)
         .map_err(|error| format!("Failed to create config directory: {error}"))?;
-    fs::copy(&resource_path, &install_path)
+    agy_statusline::copy_atomically(&resource_path, &install_path, 0o644)
         .map_err(|error| format!("Failed to copy hook script: {error}"))?;
 
     let installed_path = install_path.to_string_lossy().to_string();
@@ -4851,8 +5135,28 @@ fn codex_hook_status(app: tauri::AppHandle) -> Result<(String, bool, Option<bool
     Ok((installed_path, installed, stale))
 }
 
-#[tauri::command]
-fn agy_hook_status(app: tauri::AppHandle) -> Result<(String, bool, Option<bool>), String> {
+/// Whether `hooks.json` registers this installation, read through the no-follow reader: a
+/// link or a file that does not parse registers nothing (#230 audit).
+fn agy_hooks_registered(hooks_json_path: &Path, installed_path: &str) -> bool {
+    agy_statusline::read_json_object(hooks_json_path)
+        .is_ok_and(|root| agy_registration_present(&serde_json::Value::Object(root), installed_path))
+}
+
+/// Put Gyredeck's namespace into `~/.gemini/config/hooks.json`, dropping the previous
+/// brand's, through `merge_json_key`: a link is refused, the mode is kept, and a write by
+/// agy while this runs is noticed and the merge redone rather than overwritten.
+/// `entry` is asked for the namespace inside the merge, each time it is (re)done.
+fn register_agy_hooks(
+    hooks_json_path: &Path,
+    mut entry: impl FnMut() -> serde_json::Value,
+) -> Result<(), String> {
+    agy_statusline::merge_json_key(hooks_json_path, "agent-activity", |_| Ok(None))?;
+    agy_statusline::merge_json_key(hooks_json_path, "gyredeck", |_| Ok(Some(entry())))?;
+    Ok(())
+}
+
+/// Where the Antigravity adapter is and whether it is wired in, without an app handle.
+fn agy_hook_state() -> Result<(String, bool), String> {
     let install_path = agy_hook_install_path()?;
     let hooks_json_path = agy_hooks_json_path()?;
     let installed_path = install_path.to_string_lossy().to_string();
@@ -4861,19 +5165,39 @@ fn agy_hook_status(app: tauri::AppHandle) -> Result<(String, bool, Option<bool>)
     // version too, whose commands point at its own path. Antigravity would keep running
     // that one while this panel called it installed and the staleness check compared the
     // copy nothing runs — so the red dot could never appear.
-    let mut in_hooks = false;
-    if hooks_json_path.exists() {
-        if let Ok(content) = fs::read_to_string(&hooks_json_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                in_hooks = agy_registration_present(&json, &installed_path);
-            }
-        }
-    }
+    let in_hooks = agy_hooks_registered(&hooks_json_path, &installed_path);
 
-    let installed = install_path.exists() && in_hooks;
+    Ok((installed_path, install_path.exists() && in_hooks))
+}
+
+#[tauri::command]
+fn agy_hook_status(app: tauri::AppHandle) -> Result<(String, bool, Option<bool>), String> {
+    let (installed_path, installed) = agy_hook_state()?;
+    let install_path = PathBuf::from(&installed_path);
     // Stale only matters once it is installed: an absent adapter is already reported
     // as missing, and calling it out of date as well says the same thing twice.
-    let stale = if installed { hook_is_stale(&app, "gyredeck-agy-hook.mjs", &install_path) } else { Some(false) };
+    // The status line is part of the install since #230: an install without it is out of
+    // date, and so is a script that differs from the one this build ships.
+    let stale = if installed {
+        let statusline = agy_statusline::AgyStatusLinePaths::from_home()?;
+        let parts = [
+            hook_is_stale(&app, "gyredeck-agy-hook.mjs", &install_path),
+            if agy_statusline::wired(&statusline) {
+                hook_is_stale(&app, agy_statusline::SCRIPT_NAME, &statusline.script())
+            } else {
+                Some(true)
+            },
+        ];
+        if parts.contains(&Some(true)) {
+            Some(true)
+        } else if parts.contains(&None) {
+            None
+        } else {
+            Some(false)
+        }
+    } else {
+        Some(false)
+    };
     Ok((installed_path, installed, stale))
 }
 
@@ -5912,6 +6236,7 @@ pub fn run() {
             sync_replies_allowed,
             set_sync_replies_allowed,
             install_agy_hook,
+            uninstall_agy_statusline,
             agy_hook_status,
             install_codex_hook,
             codex_hook_status,
@@ -7055,5 +7380,538 @@ mod hex_tests {
             claude_credentials_fingerprint(&credentials),
             "30732cbc29a8eefb75f38c423997316c5e1ff923da5257739404b22913d42691"
         );
+    }
+}
+
+#[cfg(test)]
+mod agy_install_links {
+    use super::*;
+
+    struct Fixture {
+        root: PathBuf,
+        hook_source: PathBuf,
+        statusline_source: PathBuf,
+        install_path: PathBuf,
+        hooks_json: PathBuf,
+        paths: agy_statusline::AgyStatusLinePaths,
+    }
+
+    fn fixture(name: &str) -> Fixture {
+        let root = std::env::temp_dir().join(format!("gyredeck-agy-install-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".config/gyredeck")).unwrap();
+        fs::create_dir_all(home.join(".gemini/config")).unwrap();
+        let hook_source = root.join("bundled-hook.mjs");
+        fs::write(&hook_source, b"// bundled adapter\n").unwrap();
+        Fixture {
+            hook_source,
+            statusline_source: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../adapters/antigravity")
+                .join(agy_statusline::SCRIPT_NAME),
+            install_path: home.join(".config/gyredeck/gyredeck-agy-hook.mjs"),
+            hooks_json: home.join(".gemini/config/hooks.json"),
+            paths: agy_statusline::AgyStatusLinePaths {
+                settings: home.join(".gemini/antigravity-cli/settings.json"),
+                dir: home.join(".config/gyredeck"),
+            },
+            root,
+        }
+    }
+
+    fn install(f: &Fixture, statusline_source: &Path) -> Result<String, String> {
+        install_agy_hook_at(&f.hook_source, statusline_source, &f.install_path, &f.hooks_json, &f.paths)
+    }
+
+    fn is_link(path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    }
+
+    fn link_to_victim(f: &Fixture, at: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let victim = f.root.join(name);
+        fs::write(&victim, bytes).unwrap();
+        std::os::unix::fs::symlink(&victim, at).unwrap();
+        assert!(is_link(at), "premise: {} is a link", at.display());
+        victim
+    }
+
+    #[test]
+    fn an_installed_adapter_that_is_a_link_is_stale_even_to_identical_bytes() {
+        let f = fixture("stale-link");
+        let same = f.root.join("same.mjs");
+        fs::copy(&f.hook_source, &same).unwrap();
+        std::os::unix::fs::symlink(&same, &f.install_path).unwrap();
+        // Premise: through the link, the bytes are the bundled ones.
+        assert_eq!(fs::read(&f.install_path).unwrap(), fs::read(&f.hook_source).unwrap());
+        assert_eq!(files_differ(&f.hook_source, &same), Some(false), "premise: a plain copy is current");
+        assert_eq!(files_differ(&f.hook_source, &f.install_path), Some(true), "a link is not this build's adapter");
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn a_hooks_json_link_registers_nothing() {
+        let f = fixture("status-link");
+        let installed = f.install_path.to_string_lossy().to_string();
+        let registered = serde_json::json!({ "gyredeck": {
+            "Stop": [{ "type": "command", "command": node_hook_command(&installed, "Stop") }]
+        } });
+        let target = f.root.join("registered.json");
+        fs::write(&target, registered.to_string()).unwrap();
+        fs::copy(&target, &f.hooks_json).unwrap();
+        assert!(agy_hooks_registered(&f.hooks_json, &installed), "premise: a plain file with it registers");
+        fs::remove_file(&f.hooks_json).unwrap();
+        std::os::unix::fs::symlink(&target, &f.hooks_json).unwrap();
+        assert!(!agy_hooks_registered(&f.hooks_json, &installed), "the same through a link does not");
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn a_hooks_json_write_by_agy_during_registration_is_kept() {
+        let f = fixture("hooks-race");
+        fs::write(&f.hooks_json, br#"{"theirs":{},"agent-activity":{}}"#).unwrap();
+        let mut asked = 0;
+        register_agy_hooks(&f.hooks_json, || {
+            asked += 1;
+            if asked == 1 {
+                // agy saves its hooks while ours are being put in.
+                fs::write(&f.hooks_json, br#"{"theirs":{},"saved-by-agy":true}"#).unwrap();
+            }
+            serde_json::json!({ "Stop": [] })
+        })
+        .unwrap();
+        assert_eq!(asked, 2, "premise: the change was seen and the merge redone");
+        let after: serde_json::Value = serde_json::from_str(&fs::read_to_string(&f.hooks_json).unwrap()).unwrap();
+        assert_eq!(after["saved-by-agy"], true, "agy's write survives");
+        assert!(after.get("theirs").is_some() && after.get("gyredeck").is_some());
+        assert!(after.get("agent-activity").is_none(), "the old brand is gone");
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn a_successful_install_replaces_a_linked_adapter_and_leaves_its_target_alone() {
+        let f = fixture("ok");
+        let victim = link_to_victim(&f, &f.install_path, "victim.mjs", b"VICTIM");
+        fs::write(&f.hooks_json, b"{\"theirs\":{}}").unwrap();
+
+        install(&f, &f.statusline_source).expect("premise: the install succeeds");
+        assert_eq!(fs::read(&victim).unwrap(), b"VICTIM", "the link's target is byte-identical");
+        assert!(!is_link(&f.install_path), "the link was replaced by the adapter");
+        assert_eq!(fs::read(&f.install_path).unwrap(), fs::read(&f.hook_source).unwrap());
+        let hooks: serde_json::Value = serde_json::from_str(&fs::read_to_string(&f.hooks_json).unwrap()).unwrap();
+        assert!(hooks.get("theirs").is_some() && hooks.get("gyredeck").is_some());
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn a_linked_hooks_json_is_refused_and_nothing_is_written() {
+        let f = fixture("hooks-link");
+        let victim_mjs = link_to_victim(&f, &f.install_path, "victim.mjs", b"VICTIM");
+        let victim_hooks = link_to_victim(&f, &f.hooks_json, "victim.json", b"{\"x\":1}");
+
+        assert!(install(&f, &f.statusline_source).is_err(), "a linked hooks.json is refused");
+        assert_eq!(fs::read(&victim_hooks).unwrap(), b"{\"x\":1}", "hooks.json's target is byte-identical");
+        assert_eq!(fs::read(&victim_mjs).unwrap(), b"VICTIM", "the adapter's target is byte-identical");
+        assert!(is_link(&f.hooks_json) && is_link(&f.install_path), "both links are left as they were");
+        assert!(!f.paths.script().exists(), "nothing else was put down");
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn a_failed_install_puts_the_links_back_and_their_targets_are_untouched() {
+        let f = fixture("late-failure");
+        let victim = link_to_victim(&f, &f.install_path, "victim.mjs", b"VICTIM");
+        let original_hooks = b"{\"theirs\":{}}";
+        fs::write(&f.hooks_json, original_hooks).unwrap();
+
+        // The status-line step fails, after the adapter and hooks.json were written.
+        let missing = f.root.join("no-such-statusline.sh");
+        assert!(install(&f, &missing).is_err(), "premise: a later step fails");
+        assert_eq!(fs::read(&victim).unwrap(), b"VICTIM", "the link's target is byte-identical");
+        assert!(is_link(&f.install_path), "the link itself is put back");
+        assert_eq!(fs::read_link(&f.install_path).unwrap(), victim);
+        assert_eq!(fs::read(&f.hooks_json).unwrap(), original_hooks, "hooks.json is put back");
+        let _ = fs::remove_dir_all(&f.root);
+    }
+}
+
+#[cfg(test)]
+mod agy_sync_reply_tests {
+    use super::*;
+    use serde_json::json;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    const HOOK: &str = include_str!("../../../../adapters/antigravity/gyredeck-agy-hook.mjs");
+    const BRIDGE: &str = include_str!("../../../../adapters/bridge/gyredeck-bridge.mjs");
+    const HOST: &str = standalone_bridge::BRIDGE_HOST;
+    const PASSWORD: &str = "0123456789abcdef0123456789abcdef";
+
+    /// agy's `command(regex:<pattern>)`, as its permissions guide describes it: the pattern
+    /// is matched as `^(?:pattern)$`. Go's RE2 and the `regex` crate agree on every construct
+    /// the rules use (classes, counted repetition, escapes, `^`/`$` at the text's ends).
+    fn agy_rule_matches(rule: &str, command: &str) -> bool {
+        let pattern = rule
+            .strip_prefix("command(regex:")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("{rule} is not a regex rule"));
+        regex::Regex::new(&format!("^(?:{pattern})$")).unwrap().is_match(command)
+    }
+
+    /// Each command as it reaches the agent, and the source text it is printed from — so a
+    /// change to what the hook or the bridge prints fails here, not in agy.
+    fn printed(port: u16) -> Vec<(&'static str, String, &'static str, Vec<&'static str>)> {
+        let id = "6f1c2d3e-aaaa-bbbb-cccc-0123456789ab";
+        vec![
+            (
+                "hear",
+                format!("while :; do node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 300 {id}; rc=$?; [ $rc -eq 4 ] || break; done"),
+                HOOK,
+                vec!["`while :; do node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 300 ${room}; rc=$?; [ $rc -eq 4 ] || break; done\\n`"],
+            ),
+            (
+                "hear (howTo)",
+                format!("while :; do node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 300 {id}; rc=$?; [ $rc -eq 4 ] || break; done"),
+                BRIDGE,
+                vec!["`while :; do node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 300 ${conversationId};` +\n      \" rc=$?; [ $rc -eq 4 ] || break; done\""],
+            ),
+            (
+                "wait (howTo)",
+                format!("node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 60 {id}"),
+                BRIDGE,
+                vec!["command: `node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 60 ${conversationId}`,"],
+            ),
+            (
+                "reply",
+                format!("curl -s -X POST http://{HOST}:{port}/mail/sync-ab2c -H 'content-type: application/json' -H \"x-gyredeck-token: {PASSWORD}\" -d '{{\"from\":\"{id}\",\"text\":\"Done, see #261\",\"replyTo\":\"{id}\",\"to\":\"Codex\",\"kind\":\"tell\"}}'"),
+                HOOK,
+                vec![
+                    "`  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${target}` +",
+                    "` -H 'content-type: application/json' -H \"x-gyredeck-token: THE ROOM PASSWORD\" -d '${body}'\\n`",
+                ],
+            ),
+            (
+                "send (howTo)",
+                format!("curl -s -X POST http://{HOST}:{port}/mail/sync-ab2c -H 'content-type: application/json' -H 'x-gyredeck-token: {PASSWORD}' -d '{{\"from\":\"{id}\",\"to\":\"everyone\",\"kind\":\"tell\",\"text\":\"hi\",\"replyTo\":\"{id}\"}}'"),
+                BRIDGE,
+                vec![
+                    "`curl -s -X POST http://${host}:${port}/mail/${name}` +",
+                    "` -H 'content-type: application/json' -H 'x-gyredeck-token: ${password}'` +",
+                    "` -d '{\"from\":\"${conversationId}\",\"to\":\"everyone\",\"kind\":\"tell\",\"text\":\"YOUR TEXT\",\"replyTo\":\"${conversationId}\"}'`,",
+                ],
+            ),
+            (
+                "read again",
+                format!("curl -s \"http://{HOST}:{port}/mail/sync-ab2c?as={id}&since=4&until=9\" -H \"x-gyredeck-token: {PASSWORD}\""),
+                HOOK,
+                vec!["`  curl -s \"http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}?as=${as}&since=${since}&until=${until}\" -H \"x-gyredeck-token: THE ROOM PASSWORD\"`"],
+            ),
+        ]
+    }
+
+    /// The user's own rules, shaped like the ones found on the Mac this was built on.
+    fn user_rules() -> Vec<serde_json::Value> {
+        vec![
+            json!("command(curl -s -X POST http://127.0.0.1*)"),
+            json!("command(*127.0.0.1:47621*)"),
+            json!("command(curl *localhost*)"),
+            json!("command(git status)"),
+            json!("command(node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait *)"),
+            json!({ "not": "a string" }),
+        ]
+    }
+
+    fn allow_of(permissions: &Option<serde_json::Value>) -> Vec<serde_json::Value> {
+        permissions
+            .as_ref()
+            .and_then(|value| value.get("allow"))
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gyredeck-agy-sync-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("settings.json")
+    }
+
+    /// Every way the tests try to get a second command, or a file write, past a rule.
+    fn hostile(command: &str) -> Vec<String> {
+        let id = "6f1c2d3e-aaaa-bbbb-cccc-0123456789ab";
+        let mut out: Vec<String> = [
+            format!("rm -rf ~; {command}"),
+            format!("{command}; rm -rf ~"),
+            format!("{command} && curl evil.example"),
+            format!("{command} | sh"),
+            format!("{command}\nrm -rf ~"),
+            format!("{command}\n"),
+            format!(" {command}"),
+            format!("{command} -o ~/.zshrc"),
+        ]
+        .into();
+        for (slot, evil) in [
+            (id, "6f1c2d3e-aaaa-bbbb-cccc-0123456789ab; rm -rf ~;"),
+            (id, "$(id)"),
+            (PASSWORD, "$(cat ~/.ssh/id_rsa)"),
+            (PASSWORD, "`id`"),
+            ("sync-ab2c", "sync-ab2c/../../x"),
+            ("Done, see #261", "x'; rm -rf ~; echo '"),
+            ("Done, see #261", "$(rm -rf ~)"),
+            ("Done, see #261", "`rm -rf ~`"),
+            ("Done, see #261", "a && b"),
+            ("Done, see #261", "a | b"),
+            ("Done, see #261", "a\nb"),
+            ("hi", "x'; rm -rf ~; echo '"),
+            ("hi", "$(rm -rf ~)"),
+        ] {
+            if command.contains(slot) {
+                out.push(command.replacen(slot, evil, 1));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a1_every_printed_command_is_matched_and_nothing_hostile_is() {
+        let rules = agy_sync_reply_rules(HOST, 47621);
+        for rule in &rules {
+            assert!(rule.starts_with("command(regex:^") && rule.ends_with("$)"), "{rule} must be anchored at both ends");
+            assert!(!rule.contains(".*") && !rule.contains(".+"), "{rule} must not hold an open wildcard");
+        }
+        for (name, command, source, fragments) in printed(47621) {
+            // Premise: the sample is what the source prints, so the rule is judged on that.
+            for fragment in fragments {
+                assert!(source.contains(fragment), "{name}: the source no longer prints {fragment}");
+            }
+            let matching: Vec<_> = rules.iter().filter(|rule| agy_rule_matches(rule, &command)).collect();
+            assert_eq!(matching.len(), 1, "{name}: {command} should match exactly one rule, matched {matching:?}");
+            let variants = hostile(&command);
+            // Premise: every slot this command has was attacked, not only its ends.
+            assert!(variants.len() > 8, "{name}: no slot of it was attacked");
+            for variant in variants {
+                assert!(!rules.iter().any(|rule| agy_rule_matches(rule, &variant)), "{name}: {variant:?} must not match");
+            }
+            let other = command.replace(":47621/", ":47622/");
+            if other != command {
+                assert!(!rules.iter().any(|rule| agy_rule_matches(rule, &other)), "{name}: another port must not match");
+            }
+        }
+    }
+
+    #[test]
+    fn a2_off_removes_ours_for_any_port_and_keeps_every_other_entry_in_place() {
+        let theirs = user_rules();
+        let mut mixed = theirs.clone();
+        let ours: Vec<_> = agy_sync_reply_rules(HOST, 47621)
+            .into_iter()
+            .chain(agy_sync_reply_rules(HOST, 50123))
+            .map(serde_json::Value::String)
+            .collect();
+        mixed.splice(2..2, ours.clone());
+        // Premise: the predicate says ours are ours and theirs are not.
+        assert!(ours.iter().all(|rule| is_agy_sync_reply_rule(rule.as_str().unwrap())));
+        assert!(theirs.iter().all(|rule| !rule.as_str().is_some_and(is_agy_sync_reply_rule)));
+
+        let cases: [(bool, Vec<serde_json::Value>); 2] = [
+            (false, theirs.clone()),
+            (true, theirs.iter().cloned().chain(agy_sync_reply_rules(HOST, 47621).into_iter().map(serde_json::Value::String)).collect()),
+        ];
+        for (enabled, want) in cases {
+            let before = json!({ "allow": mixed, "deny": ["command(rm)"] });
+            let after = apply_agy_sync_reply_rules(Some(&before), enabled, HOST, 47621).unwrap();
+            // The 47621 rules stay where they were when on; compare as sets of position-free
+            // rules for ours, in order for theirs.
+            let got = allow_of(&after);
+            let got_theirs: Vec<_> = got.iter().filter(|e| !e.as_str().is_some_and(is_agy_sync_reply_rule)).cloned().collect();
+            assert_eq!(got_theirs, theirs, "enabled={enabled}: their entries in their order");
+            let mut got_sorted: Vec<String> = got.iter().map(|e| e.to_string()).collect();
+            let mut want_sorted: Vec<String> = want.iter().map(|e| e.to_string()).collect();
+            got_sorted.sort();
+            want_sorted.sort();
+            assert_eq!(got_sorted, want_sorted, "enabled={enabled}");
+            assert_eq!(after.as_ref().unwrap()["deny"], json!(["command(rm)"]));
+        }
+    }
+
+    #[test]
+    fn a3_a_rule_holding_a_room_password_goes_either_way_and_other_hex_stays() {
+        let hex = |n: usize| "0123456789abcdef".repeat(8)[..n].to_string();
+        let cases = [
+            (format!("command(curl -s http://127.0.0.1:47621/mail/sync-ab2c -H 'x-gyredeck-token: {}')", hex(32)), true),
+            (format!("command(echo {})", hex(32).to_uppercase()), true),
+            (format!("command(echo {})", hex(31)), false),
+            (format!("command(echo {})", hex(33)), false),
+            (format!("command(git show {})", hex(40)), false),
+            (format!("command(echo {})", hex(64)), false),
+            ("command(echo 6f1c2d3e-aaaa-bbbb-cccc-0123456789ab)".to_string(), false),
+        ];
+        for (rule, removed) in &cases {
+            assert_eq!(embeds_room_password(rule), *removed, "premise: {rule}");
+            for enabled in [true, false] {
+                let before = json!({ "allow": [rule, "command(git status)"] });
+                let after = allow_of(&apply_agy_sync_reply_rules(Some(&before), enabled, HOST, 47621).unwrap());
+                assert_eq!(!after.contains(&json!(rule)), *removed, "enabled={enabled}: {rule}");
+                assert!(after.contains(&json!("command(git status)")));
+            }
+        }
+    }
+
+    #[test]
+    fn a4_only_permissions_allow_changes_in_the_file_and_its_mode_is_kept() {
+        let path = scratch("a4");
+        let file = json!({
+            "colorScheme": "dark",
+            "statusLine": { "type": "command", "command": "x" },
+            "permissions": { "allow": ["command(git status)"], "deny": ["command(rm)"], "ask": ["command(curl)"] },
+            "trustedWorkspaces": ["/Users/demo"],
+        });
+        fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        for enabled in [true, false] {
+            write_agy_sync_reply_rules_at(&path, enabled, 47621).unwrap();
+            let mut read: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let allow = read["permissions"]["allow"].take();
+            let mut want = file.clone();
+            want["permissions"]["allow"] = serde_json::Value::Null;
+            assert_eq!(read, want, "enabled={enabled}: everything but allow is as it was");
+            assert_eq!(allow.as_array().unwrap().len(), if enabled { 6 } else { 1 });
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o644);
+        }
+    }
+
+    #[test]
+    fn a4_a_permissions_or_allow_of_the_wrong_shape_is_refused_and_the_file_left_alone() {
+        for (name, permissions) in [("object", json!("x")), ("list", json!({ "allow": { "a": 1 } }))] {
+            let path = scratch(&format!("a4-refuse-{name}"));
+            let text = serde_json::to_string(&json!({ "permissions": permissions, "model": "m" })).unwrap();
+            fs::write(&path, &text).unwrap();
+            for enabled in [true, false] {
+                assert!(write_agy_sync_reply_rules_at(&path, enabled, 47621).is_err(), "{name}");
+                assert_eq!(fs::read_to_string(&path).unwrap(), text, "{name}: file unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn a4_a_symlinked_settings_file_is_refused_and_its_target_untouched() {
+        let path = scratch("a4-link");
+        let target = path.with_file_name("elsewhere.json");
+        fs::write(&target, "{\"model\":\"m\"}").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        // Premise: the settings path is the link, not a file.
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        for enabled in [true, false] {
+            assert!(write_agy_sync_reply_rules_at(&path, enabled, 47621).is_err());
+            assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read_to_string(&target).unwrap(), "{\"model\":\"m\"}");
+        }
+    }
+
+    #[test]
+    fn a5_applying_what_is_already_there_writes_nothing() {
+        let cases: [(&str, Option<serde_json::Value>, bool); 3] = [
+            ("on again", None, true),
+            ("off with ours absent", Some(json!({ "permissions": { "allow": ["command(git status)"] } })), false),
+            ("off with no file", None, false),
+        ];
+        for (name, seed, enabled) in cases {
+            let path = scratch(&format!("a5-{}", name.replace(' ', "-")));
+            if let Some(seed) = &seed {
+                fs::write(&path, serde_json::to_string_pretty(seed).unwrap()).unwrap();
+            } else if enabled {
+                write_agy_sync_reply_rules_at(&path, true, 47621).unwrap();
+            }
+            let stamp = |path: &Path| fs::symlink_metadata(path).ok().map(|m| (m.ino(), m.mtime(), m.mtime_nsec(), m.len()));
+            let before = stamp(&path);
+            // Premise: a file exists exactly where the case says one does.
+            assert_eq!(before.is_some(), seed.is_some() || enabled, "{name}");
+            write_agy_sync_reply_rules_at(&path, enabled, 47621).unwrap();
+            assert_eq!(stamp(&path), before, "{name}: not rewritten");
+        }
+    }
+
+    fn allow_at(path: &Path) -> Vec<serde_json::Value> {
+        allow_of(&agy_permissions_at(path).unwrap())
+    }
+
+    fn seed(path: &Path, allow: &[serde_json::Value]) {
+        fs::write(path, serde_json::to_string_pretty(&json!({ "model": "m", "permissions": { "allow": allow } })).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a7_the_switch_reads_on_only_with_the_whole_set_for_the_current_port_and_repairs_otherwise() {
+        let port = 50123;
+        let user = json!("command(git status)");
+        let password = json!(format!("command(echo {PASSWORD})"));
+        let set = |port: u16| agy_sync_reply_rules(HOST, port).into_iter().map(serde_json::Value::String).collect::<Vec<_>>();
+        let complete = [vec![user.clone()], set(port)].concat();
+        let four = [vec![user.clone()], set(port)[1..].to_vec()].concat();
+        let stale = [vec![user.clone()], set(47621)].concat();
+        let with_password = [complete.clone(), vec![password.clone()]].concat();
+        // (name, wanted, hook in, file before, state shown, file after)
+        let cases: Vec<(&str, bool, bool, Vec<serde_json::Value>, bool, Vec<serde_json::Value>)> = vec![
+            ("on, complete", true, true, complete.clone(), true, complete.clone()),
+            ("on, one missing", true, true, four.clone(), true, complete.clone()),
+            ("on, old port", true, true, stale.clone(), true, complete.clone()),
+            ("on, a password rule left", true, true, with_password.clone(), true, complete.clone()),
+            ("on, no hook, one missing", true, false, four.clone(), false, four.clone()),
+            ("off, complete", false, true, complete.clone(), false, vec![user.clone()]),
+            ("off, no hook, old port", false, false, stale.clone(), false, vec![user.clone()]),
+            ("off, nothing of ours", false, true, vec![user.clone()], false, vec![user.clone()]),
+        ];
+        for (name, wanted, hook, before, shown, after) in cases {
+            let path = scratch(&format!("a7-{}", name.replace([' ', ','], "-")));
+            seed(&path, &before);
+            // Premise: the fixture holds what the case says, judged by the same rules.
+            assert_eq!(allow_at(&path), before, "{name}");
+            assert_eq!(agy_sync_replies_state(&path, wanted, port, hook).unwrap(), shown, "{name}");
+            let mut got: Vec<String> = allow_at(&path).iter().map(|e| e.to_string()).collect();
+            let mut want: Vec<String> = after.iter().map(|e| e.to_string()).collect();
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "{name}: the file after reading");
+        }
+    }
+
+    #[test]
+    fn a8_a_failed_write_is_an_error_and_leaves_the_intent_where_it_was() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = scratch("a8");
+        let before = agy_sync_reply_rules(HOST, 47621).into_iter().map(serde_json::Value::String).collect::<Vec<_>>();
+        seed(&path, &before);
+        let dir = path.parent().unwrap().to_path_buf();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        // Premise: the directory really refuses the temporary file a write needs.
+        let probe = fs::File::create(dir.join("probe"));
+        let mut recorded = None;
+        let set = set_agy_sync_replies_at(&path, false, 47621, |enabled| {
+            recorded = Some(enabled);
+            Ok(())
+        });
+        let shown = agy_sync_replies_state(&path, false, 47621, true);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(probe.is_err(), "premise: the directory is not writable");
+        assert!(set.is_err(), "turning it off reports the failure");
+        assert_eq!(recorded, None, "the intent is not changed when the file was not");
+        assert!(shown.is_err(), "a reading that cannot remove the rules is an error, never Off");
+        assert_eq!(allow_at(&path), before, "the rules are untouched");
+        let mut recorded = None;
+        set_agy_sync_replies_at(&path, false, 47621, |enabled| {
+            recorded = Some(enabled);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(recorded, Some(false), "and once the file is written, the intent follows");
+        assert_eq!(allow_at(&path), Vec::<serde_json::Value>::new());
+    }
+
+    #[test]
+    fn a6_antigravity_is_off_until_turned_on_and_claude_code_stays_on() {
+        assert_eq!(SyncReplyAgent::Agy.flag(), (AGY_SYNC_REPLIES_FLAG, false));
+        assert_eq!(SyncReplyAgent::Claude.flag(), (SYNC_REPLIES_FLAG, true));
+        assert_ne!(AGY_SYNC_REPLIES_FLAG, SYNC_REPLIES_FLAG);
+        // The names the panel sends.
+        assert_eq!(serde_json::from_str::<SyncReplyAgent>("\"claude\"").unwrap(), SyncReplyAgent::Claude);
+        assert_eq!(serde_json::from_str::<SyncReplyAgent>("\"agy\"").unwrap(), SyncReplyAgent::Agy);
     }
 }

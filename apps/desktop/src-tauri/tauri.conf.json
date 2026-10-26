@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Gyredeck",
-  "version": "1.25.2",
+  "version": "1.26.0",
   "identifier": "com.j-kizt.gyredeck",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -48,6 +48,7 @@
     "resources": {
       "../../../adapters/claude/gyredeck-claude-hook.mjs": "gyredeck-claude-hook.mjs",
       "../../../adapters/antigravity/gyredeck-agy-hook.mjs": "gyredeck-agy-hook.mjs",
+      "../../../adapters/antigravity/gyredeck-agy-statusline.sh": "gyredeck-agy-statusline.sh",
       "../../../adapters/codex/gyredeck-codex-hook.mjs": "gyredeck-codex-hook.mjs",
       "../../../adapters/codex/gyredeck-codex-notify.mjs": "gyredeck-codex-notify.mjs",
       "../../../adapters/bridge/gyredeck-bridge.mjs": "gyredeck-bridge.mjs"

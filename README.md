@@ -64,6 +64,18 @@ than a description of one, because three sessions once wrote three broken loops 
 description in a single day. It stops itself when the room is gone. Disconnecting a
 session tells it so, closes its watch, and stops the room's password working for it.
 
+**Answering without a prompt each time** is a switch per agent under Settings →
+Permission. Claude Code's is on by default; its rules are prefix rules, and Claude Code
+checks each part of a chained command on its own. Antigravity's is **off** by default. Its
+rules are `command(regex:…)` patterns anchored at both ends, one for each command the hook
+prints. The only parts that vary are the session id (a UUID), the room code, the
+password (32 hex digits) and the message body. The body is a single-quoted JSON object
+that may not contain `'`, `;`, `&`, `|`, a backtick, `$` or a line break. A reply with
+one of those characters is asked about as usual. Nothing in front of or behind a printed
+command matches. Moving Antigravity's switch either way also removes any Antigravity allow
+rule that holds a room password. Rules you added yourself are left alone, broad ones
+included.
+
 **A message says who it is for and what it is for**, so being in a room does not mean
 being interrupted by everything said in it. Two sessions working something out address
 each other and leave the third alone. An `ask` wants an answer; a `tell` does not but may

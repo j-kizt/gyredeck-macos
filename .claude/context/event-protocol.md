@@ -594,7 +594,7 @@ A `conversation_close` takes that session out of its room. An ended session can 
 
 | Method | Path | Credential | What |
 |---|---|---|---|
-| POST | `/usage` | machine token (the app) | One provider's usage snapshot, as the Usage panel reads it — the app relays every successful `codex_usage`, a fresh `claude_usage` (`relay_if_fresh`, #192), and an `agy_usage` reading only when it is fresh and newer than the last one for that account (`relay_if_newer`, #230) — `relay_usage` in `lib.rs`. |
+| POST | `/usage` | machine token (the app) | One provider's usage snapshot, as the Usage panel reads it — the app relays every successful `codex_usage`, a fresh `claude_usage` (`relay_if_fresh`, #192), and every fresh `agy_usage` reading, repeats and same-second changes included (`agy_statusline::relay_if_fresh`, #230 r1: the bridge's notices are edge-triggered, so a repeat says nothing, while skipping one could lose a change) — `relay_usage` in `lib.rs`. |
 | GET | `/usage?as=<id>` | machine token, or the password of that session's room | That session's own provider: `{ provider, usage: { provider, displayName, lines: [{ label, leftPct, resetsAt }], fetchedAt } | null }`. |
 
 Left is computed as the panel computes it (`getProgressPercent`), so the two never disagree.

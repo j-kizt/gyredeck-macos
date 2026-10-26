@@ -110,7 +110,7 @@ all: the loud default, because a message nobody hears is the worse mistake.
 ## Credits
 
 - **Origin:** [agent-halo](https://github.com/mahirocoko/agent-halo) by Mahiro — the local bridge, presence protocol, and desktop shell this project is built on.
-- **This fork:** Letta-free rebuild by J-Kitz — Claude Code / Codex / Antigravity hook adapters, GitHub/GitLab repo/CI/PR monitor, menu-bar window, and signed auto-update.
+- **This fork:** Letta-free rebuild by J-Kizt — Claude Code / Codex / Antigravity hook adapters, GitHub/GitLab repo/CI/PR monitor, menu-bar window, and signed auto-update.
 - Local usage-provider research is informed by [OpenUsage](https://github.com/robinebers/openusage).
 
 ---

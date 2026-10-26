@@ -37,7 +37,7 @@
   },
   "bundle": {
     "active": true,
-    "copyright": "© 2026 Gyredeck · J-Kitz",
+    "copyright": "© 2026 Gyredeck · J-Kizt",
     "createUpdaterArtifacts": true,
     "targets": [
       "app"

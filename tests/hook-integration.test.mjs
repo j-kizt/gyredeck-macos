@@ -10981,7 +10981,7 @@ test("#250 r4: mail quoting the wait command does not stand in for the hook's ow
 //      confirm request sent.
 
 const PASTE_USED = "The hex you just pasted was this room's password and has been used: do not repeat it, and do not ask about it.";
-const PASTE_ALREADY = "The hex you just pasted is this room's password, and you are already in: do not repeat it, and do not ask about it.";
+const PASTE_ALREADY = "No confirmation was attempted for the hex you pasted; do not repeat it or ask about it.";
 const PASTE_REFUSED = "Do not repeat the value you pasted.";
 const timesIn = (text, needle) => text.split(needle).length - 1;
 const valueNowhere = (result, password, label) => {
@@ -11077,6 +11077,52 @@ for (const [label, tag, env, who] of [
     }
   });
 }
+
+// r1 (Codex): already in, any 32 hex is answered without being presented, so the answer
+// must not call it the room's password. A value that is not the password proves it.
+const NOT_THE_PASSWORD = /this room's password|password you were just given|was accepted/;
+const otherHex = (password) => password.replace(/^./, (c) => (c === "0" ? "1" : "0"));
+
+test("#255 r2: agy, already in, a 32-hex value that is not the password is never called it", async () => {
+  const f = await agyPasteFixture("r2agy");
+  try {
+    await f.confirm();
+    const value = otherHex(f.password);
+    assert.notEqual(value, f.password, "premise: the value is not the password");
+    assert.match(value, /^[0-9a-f]{32}$/, "premise: it is a paste the hook presents");
+    const result = await f.invoke(value);
+    assert.deepEqual(f.confirms, [], "premise: no confirm request is sent");
+    assert.equal(timesIn(result.text, PASTE_ALREADY), 1, "premise: the already line was said");
+    assert.doesNotMatch(result.text, NOT_THE_PASSWORD, "never claims it is this room's password");
+    valueNowhere(result, value, "r2 agy");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#255 r2: Claude, already in, a 32-hex value that is not the password is never called it", async () => {
+  // Claude never skips /confirm, and the bridge checks the password before answering an
+  // already-confirmed member — so a wrong value is refused, and a refusal stays silent.
+  const f = await agyPasteFixture("r2cl");
+  const claude = "a2550000-0000-4000-8000-000000000004";
+  try {
+    await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: claude });
+    assert.equal((await f.call("POST", `/sync/rooms/${f.code}/confirm`, { conversationId: claude, password: f.password })).status, 200, "premise: already in");
+    const value = otherHex(f.password);
+    assert.notEqual(value, f.password, "premise: the value is not the password");
+    const result = await runAdapter(
+      "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], f.home,
+      { hook_event_name: "UserPromptSubmit", session_id: claude, cwd: "/tmp/project", prompt: value },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "premise: it was presented, through /confirm");
+    const context = result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
+    assert.doesNotMatch(context, NOT_THE_PASSWORD, "never claims it is this room's password");
+    valueNowhere(result, value, "r2 claude");
+  } finally {
+    await f.close();
+  }
+});
 
 for (const [label, tag, fault] of [["normal", "c3norm", false], ["delivery fault", "c3fault", true]]) {
   test(`#255 C3 C4: Claude's accepted paste, ${label}`, async () => {

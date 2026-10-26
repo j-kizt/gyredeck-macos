@@ -690,7 +690,8 @@ const hearStep = (room) => ({ ephemeralMessage: hearText(room), [SAYS_HEAR]: roo
  * back in its reply and asked whether to join a room it was already in. Never the value.
  */
 const PASTE_USED = "The hex you just pasted was this room's password and has been used: do not repeat it, and do not ask about it.";
-const PASTE_ALREADY = "The hex you just pasted is this room's password, and you are already in: do not repeat it, and do not ask about it.";
+// Already in, the value is never presented, so nothing here may say what it is (#255 r1).
+const PASTE_ALREADY = "No confirmation was attempted for the hex you pasted; do not repeat it or ask about it.";
 
 const confirmLead = (confirm) => {
   if (confirm?.accepted) {

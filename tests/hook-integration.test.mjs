@@ -10325,6 +10325,12 @@ const statusAnswer = (overrides = {}) => ({
   body: { ok: true, v: 1, load: 1.25, loadLimit: 5, holder: null, queue: [], observed: [], waiting: 0, limit: "advisory", ...overrides },
 });
 const FREE_LINE = /^heavy-run slot: free$/m;
+/** Each record's fields `--status` cannot do without, written out: `HEAVY_STATUS_FIELDS` is held to it below. */
+const STATUS_REQUIRED = {
+  holder: ["state", "what", "elapsedMs", "helperGone", "loadSkipped"],
+  queue: ["position", "what", "waitedMs"],
+  observed: ["pattern", "elapsedMs"],
+};
 
 const statusCases = [
   { name: "C3 an empty slot is free", reply: () => statusAnswer(), code: 0,
@@ -10371,6 +10377,21 @@ const statusCases = [
   { name: "r1 no load fields cannot tell", code: 69, reply: () => ({ status: 200, body: { ok: true, v: 1, holder: null, queue: [], observed: [] } }),
     err: [/the bridge's answer could not be read/] },
   { name: "r1 a load that is not a number cannot tell", code: 69, reply: () => statusAnswer({ load: "1.2" }), err: [/the bridge's answer could not be read/] },
+  // r2 (Codex): an empty record is not a run; nothing is made up for a field the bridge did not send.
+  { name: "r2 an empty holder cannot tell", code: 69, reply: () => statusAnswer({ holder: {} }), err: [/the bridge's answer could not be read/] },
+  { name: "r2 an empty entry in the line cannot tell", code: 69, reply: () => statusAnswer({ queue: [{}] }), err: [/the bridge's answer could not be read/] },
+  { name: "r2 an empty observed run cannot tell", code: 69, reply: () => statusAnswer({ observed: [{}] }), err: [/the bridge's answer could not be read/] },
+  { name: "r2 a holder's elapsed time as text cannot tell", code: 69, reply: () => statusAnswer({ holder: statusHolder({ elapsedMs: "192000" }) }), err: [/could not be read/] },
+  { name: "r2 a position as text cannot tell", code: 69, reply: () => statusAnswer({ queue: [{ ...statusQueued, position: "1" }] }), err: [/could not be read/] },
+  { name: "r2 an observed pattern as a number cannot tell", code: 69, reply: () => statusAnswer({ observed: [{ ...statusObserved, pattern: 5 }] }), err: [/could not be read/] },
+  { name: "r2 a label that is not text cannot tell", code: 69, reply: () => statusAnswer({ holder: statusHolder({ label: 5 }) }), err: [/could not be read/] },
+  ...Object.entries(STATUS_REQUIRED).flatMap(([kind, fields]) => fields.map((field) => ({
+    name: `r2 a ${kind} record without ${field} cannot tell`, code: 69, err: [/could not be read/],
+    reply: () => {
+      const { [field]: _dropped, ...rest } = { holder: statusHolder(), queue: statusQueued, observed: statusObserved }[kind];
+      return statusAnswer(kind === "holder" ? { holder: rest } : { [kind]: [rest] });
+    },
+  }))),
   { name: "r1 an explicit null load is unknown, never free", code: 0, reply: () => statusAnswer({ load: null }),
     out: [/^heavy-run slot: not held, but the load is unknown$/m, /^load: unknown \(the slot is granted at 5 or less\)$/m], notOut: [FREE_LINE] },
 ];
@@ -10401,6 +10422,29 @@ for (const row of statusCases) {
     }
   });
 }
+
+test("#260 r2: the fields --status requires are the ones written out here", async () => {
+  const { HEAVY_STATUS_FIELDS } = await heavyModule();
+  assert.deepEqual(Object.fromEntries(Object.entries(HEAVY_STATUS_FIELDS).map(([kind, fields]) => [kind, Object.keys(fields)])), STATUS_REQUIRED);
+});
+
+test("#260 r2: a reader that closed stdout gets 69 and one stderr line, not a stack", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-status-pipe-"));
+  const fake = await scriptedHeavyBridge(home, () => statusAnswer());
+  try {
+    const child = spawn(process.execPath, [fake.helperPath, "--status"], { env: { ...process.env, HOME: home }, stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.stdout.destroy();
+    const code = await new Promise((resolve) => child.on("close", resolve));
+    assert.deepEqual(fake.requests.map((entry) => `${entry.method} ${entry.path}`), ["GET /heavy"], "premise: it had an answer to write");
+    assert.equal(code, 69, stderr);
+    assert.equal(stderr, "gyredeck: cannot tell whether a heavy run is on — its answer could not be written (EPIPE)\n");
+  } finally {
+    await fake.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 test("#260 --status C4/C6: no bridge, a silent bridge, or no token cannot tell within about 2 s, and queues nothing", async () => {
   const { heavyHelperSource } = await heavyModule();
@@ -10481,6 +10525,13 @@ test("#260 --status C1/C2/C10: against a real bridge it shows the holder, the li
     assert.equal(before.holder.label, "Claude Code / Gyre Assistant");
     assert.deepEqual(before.queue.map((entry) => entry.as), [waiterId]);
     assert.equal(before.observed.length, 1);
+    // r2: what the real bridge sends has every field --status requires, of the type it requires.
+    const { HEAVY_STATUS_FIELDS } = await heavyModule();
+    for (const [kind, value] of [["holder", before.holder], ["queue", before.queue[0]], ["observed", before.observed[0]]]) {
+      for (const [field, type] of Object.entries(HEAVY_STATUS_FIELDS[kind])) {
+        assert.equal(type === "number" ? Number.isFinite(value[field]) : typeof value[field] === type, true, `${kind}.${field} is a ${type}`);
+      }
+    }
 
     const run = h.helper(["--status"]);
     const { code } = await run.exited;

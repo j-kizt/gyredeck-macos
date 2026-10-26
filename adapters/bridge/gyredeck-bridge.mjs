@@ -360,6 +360,17 @@ export const HEAVY_LIMIT_TEXT =
  * it; the command runs only once the bridge has recorded that group (#223 r3, r4). The `;`
  * form this replaced ran the command on EOF.
  */
+/**
+ * What `--status` needs of each record in `GET /heavy` to write its line (#260 r2), by type.
+ * `describeHeavy` sends all of these; a test holds the two together. `label` is the one
+ * field that may be null — a session nobody named — and anything else missing or of another
+ * type means the answer cannot be read, rather than a line made up from defaults.
+ */
+export const HEAVY_STATUS_FIELDS = {
+  holder: { state: "string", what: "string", elapsedMs: "number", helperGone: "boolean", loadSkipped: "boolean" },
+  queue: { position: "number", what: "string", waitedMs: "number" },
+  observed: { pattern: "string", elapsedMs: "number" },
+};
 export const HEAVY_GATE = 'IFS= read -r line <&3 || exit 1; [ "$line" = GO ] || exit 1; exec 3<&-; exec "$@"';
 
 /**
@@ -467,10 +478,14 @@ const heavyHelper = async (setup) => {
     // The whole answer is checked before a line is written, and any surprise while writing it
     // is "cannot tell" too: a half-printed state, or a stack trace, is not an answer.
     const record = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+    const fits = (kind) => (value) =>
+      record(value) &&
+      (value.label === undefined || value.label === null || typeof value.label === "string") &&
+      Object.entries(setup.needs[kind]).every(([field, type]) => (type === "number" ? Number.isFinite(value[field]) : typeof value[field] === type));
     const render = () => {
       const { holder, queue, observed, load, loadLimit } = body;
-      if (body.ok !== true || (holder !== null && !record(holder))) return null;
-      if (!Array.isArray(queue) || !queue.every(record) || !Array.isArray(observed) || !observed.every(record)) return null;
+      if (body.ok !== true || (holder !== null && !fits("holder")(holder))) return null;
+      if (!Array.isArray(queue) || !queue.every(fits("queue")) || !Array.isArray(observed) || !observed.every(fits("observed"))) return null;
       // The bridge sends `load: null` when the OS gives no reading; a missing field is not that.
       if (!Number.isFinite(loadLimit) || (load !== null && !Number.isFinite(load))) return null;
       // Labels and what each run said it runs; never a session id or a path.
@@ -504,7 +519,7 @@ const heavyHelper = async (setup) => {
       }
       if (queue.length > 0) {
         lines.push(`waiting: ${queue.length}`);
-        queue.forEach((entry, index) => lines.push(`  ${Number.isInteger(entry.position) ? entry.position : index + 1}. ${who(entry)} — ${text(entry.what, "?")}, waited ${lasted(entry.waitedMs)}`));
+        for (const entry of queue) lines.push(`  ${entry.position}. ${who(entry)} — ${text(entry.what, "?")}, waited ${lasted(entry.waitedMs)}`);
       }
       lines.push(`load: ${load ?? "unknown"} (the slot is granted at ${loadLimit} or less)`);
       return lines;
@@ -515,6 +530,8 @@ const heavyHelper = async (setup) => {
       unknown("the bridge's answer could not be read");
       return;
     }
+    // A reader that closed the pipe has the answer cut short: that is "cannot tell" too, not a stack.
+    process.stdout.on("error", (error) => unknown(`its answer could not be written (${error.code ?? "stdout error"})`));
     process.stdout.write(`${lines.join("\n")}\n`);
     process.exitCode = 0;
   };
@@ -749,7 +766,7 @@ const heavyHelper = async (setup) => {
 /** The helper's source: a version line, then the function above, called with its setup. */
 export const heavyHelperSource = (origin) =>
   `#!/usr/bin/env node\n// gyredeck-heavy protocol v${HEAVY_PROTOCOL_VERSION} — written by the Gyredeck bridge on every start; edits are overwritten.\n` +
-  `(${heavyHelper.toString()})(${JSON.stringify({ v: HEAVY_PROTOCOL_VERSION, origin, gate: HEAVY_GATE })});\n`;
+  `(${heavyHelper.toString()})(${JSON.stringify({ v: HEAVY_PROTOCOL_VERSION, origin, gate: HEAVY_GATE, needs: HEAVY_STATUS_FIELDS })});\n`;
 
 /** Written on every start beside the rules. Answers whether it is there to be run. */
 export const writeHeavyHelper = (origin, path = HEAVY_HELPER_PATH) => {

@@ -123,7 +123,7 @@ const App = () => {
   const [hookStatus, setHookStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
   // Whether a session may answer its room without being approved each time. Null until
   // read, so the switch does not flicker through "off" on the way to its real state.
-  const [syncRepliesAllowed, setSyncRepliesAllowed] = useState<Partial<Record<SyncAgent, boolean | null>>>({});
+  const [syncRepliesAllowed, setSyncRepliesAllowed] = useState<Partial<Record<SyncAgent, boolean | string | null>>>({});
   const [syncRepliesBusy, setSyncRepliesBusy] = useState(false);
   const [agyStatus, setAgyStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
   const [codexStatus, setCodexStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
@@ -782,11 +782,12 @@ const App = () => {
   };
 
   const loadSyncReplies = async (agent: SyncAgent) => {
-    let allowed: boolean | null = null;
+    let allowed: boolean | string | null = null;
     try {
       if (canUseNativeControls) allowed = await invoke<boolean>("sync_replies_allowed", { agent });
-    } catch {
-      // Unknown stays unknown rather than reading as off.
+    } catch (error) {
+      // Unknown never reads as off; the reason is shown instead (#267).
+      allowed = String(error);
     }
     setSyncRepliesAllowed((all) => ({ ...all, [agent]: allowed }));
   };

@@ -5,7 +5,12 @@ import { expect, test, type Page } from "@playwright/test";
  * Claude Code's and Antigravity's, each in its own row, each governing only its own agent.
  */
 
-type State = "on" | "off" | "hook missing" | "checking";
+type State = "on" | "off" | "hook missing" | "checking" | "refused";
+
+// The longest reason the settings file can be refused with (`read_plain` in agy_statusline.rs),
+// under a long home folder with no hyphen to break at, so the path is one long unbroken word.
+const REFUSED =
+  "Refusing to rewrite /Users/a_rather_long_account_name_for_this_mac/.gemini/antigravity-cli/settings.json: it is a symlink or not a regular file. Point it at a plain file and install again.";
 
 const AGENTS = [
   { agent: "claude", name: "Claude Code" },
@@ -18,10 +23,11 @@ const detailFor = (state: State, name: string) =>
     off: "Off: it asks before every reply and every wait.",
     "hook missing": `Needs the ${name} hook — install it under Plugins`,
     checking: "Checking…",
+    refused: `Can't check ${name}'s settings: ${REFUSED}`,
   })[state];
 
 const openPermission = async (page: Page, state: State) => {
-  await page.addInitScript((state) => {
+  await page.addInitScript(([state, refused]) => {
     const calls: unknown[] = [];
     (window as typeof window & { __syncCalls: unknown[] }).__syncCalls = calls;
     (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
@@ -30,6 +36,7 @@ const openPermission = async (page: Page, state: State) => {
         if (command.endsWith("_hook_status")) return ["/Users/demo/.config/gyredeck/hook.mjs", state !== "hook missing"];
         if (command === "sync_replies_allowed") {
           calls.push({ command, args });
+          if (state === "refused") return Promise.reject(refused);
           return state === "checking" ? new Promise(() => {}) : state === "on";
         }
         if (command === "set_sync_replies_allowed") {
@@ -39,7 +46,7 @@ const openPermission = async (page: Page, state: State) => {
         throw new Error(`${command} unavailable`);
       },
     };
-  }, state);
+  }, [state, REFUSED] as const);
   await page.goto("/?demo=1");
   await page.getByRole("button", { name: "Settings" }).click();
   await page.getByRole("tab", { name: "Permission" }).click();
@@ -53,7 +60,7 @@ const openPermission = async (page: Page, state: State) => {
 for (const viewport of [{ width: 444, height: 560 }, { width: 444, height: 280 }]) test.describe(`at ${viewport.width} × ${viewport.height}`, () => {
   test.use({ viewport });
 
-  for (const state of ["on", "off", "hook missing", "checking"] as const) {
+  for (const state of ["on", "off", "hook missing", "checking", "refused"] as const) {
     test(`both rows stay inside their boxes, below the heading and apart: ${state}`, async ({ page }) => {
       await openPermission(page, state);
       const panel = page.getByRole("tabpanel", { name: "Permission" });
@@ -120,4 +127,15 @@ test("each switch moves only its own agent, and the Antigravity one starts off",
     ]),
   );
   expect(calls.filter((call) => (call as { command: string }).command === "set_sync_replies_allowed")).toHaveLength(1);
+});
+
+test("a settings file that cannot be read says why, and its switch stays locked", async ({ page }) => {
+  await openPermission(page, "refused");
+  for (const { agent, name } of AGENTS) {
+    const row = page.locator(`.setup-row[data-sync-agent='${agent}']`);
+    await expect(row.locator(".setup-detail")).toHaveText(detailFor("refused", name));
+    await expect(row.getByRole("switch")).toBeDisabled();
+    await expect(row.getByRole("switch")).toHaveAttribute("aria-checked", "false");
+    await expect(row.getByRole("switch")).toHaveAccessibleName(`Let ${name} answer rooms without asking`);
+  }
 });

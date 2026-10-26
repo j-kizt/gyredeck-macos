@@ -436,12 +436,11 @@ fn claude_settings_path() -> Result<PathBuf, String> {
 ///
 /// A file that will not parse is an error rather than something to replace: it holds
 /// the person's own hooks and permissions.
-fn read_claude_settings() -> Result<serde_json::Value, String> {
-    let path = claude_settings_path()?;
+fn read_claude_settings(path: &Path) -> Result<serde_json::Value, String> {
     if !path.exists() {
         return Ok(serde_json::json!({}));
     }
-    let content = fs::read_to_string(&path)
+    let content = fs::read_to_string(path)
         .map_err(|error| format!("Failed to read settings.json: {error}"))?;
     if content.trim().is_empty() {
         return Ok(serde_json::json!({}));
@@ -450,8 +449,7 @@ fn read_claude_settings() -> Result<serde_json::Value, String> {
         .map_err(|error| format!("Failed to parse settings.json: {error}"))
 }
 
-fn write_claude_settings(settings: &serde_json::Value) -> Result<(), String> {
-    let path = claude_settings_path()?;
+fn write_claude_settings(path: &Path, settings: &serde_json::Value) -> Result<(), String> {
     let Some(parent) = path.parent() else {
         return Err("Failed to resolve Claude settings directory".to_string());
     };
@@ -459,7 +457,7 @@ fn write_claude_settings(settings: &serde_json::Value) -> Result<(), String> {
         .map_err(|error| format!("Failed to create Claude settings directory: {error}"))?;
     let json = serde_json::to_string_pretty(settings)
         .map_err(|error| format!("Failed to stringify settings.json: {error}"))?;
-    fs::write(&path, format!("{json}\n"))
+    fs::write(path, format!("{json}\n"))
         .map_err(|error| format!("Failed to write settings.json: {error}"))
 }
 
@@ -542,15 +540,10 @@ fn rules_present(settings: &serde_json::Value) -> bool {
         })
 }
 
-fn write_sync_reply_rules(enabled: bool) -> Result<(), String> {
-    let mut settings = read_claude_settings()?;
-    apply_sync_reply_rules(
-        &mut settings,
-        enabled,
-        standalone_bridge::BRIDGE_HOST,
-        standalone_bridge::configured_bridge_port(),
-    );
-    write_claude_settings(&settings)
+fn write_sync_reply_rules_at(path: &Path, enabled: bool, port: u16) -> Result<(), String> {
+    let mut settings = read_claude_settings(path)?;
+    apply_sync_reply_rules(&mut settings, enabled, standalone_bridge::BRIDGE_HOST, port);
+    write_claude_settings(path, &settings)
 }
 
 /// Antigravity's half of "answer rooms without asking" (#261): its own switch, off by
@@ -722,18 +715,6 @@ fn agy_sync_replies_state(path: &Path, wanted: bool, port: u16, hook_installed: 
     )
 }
 
-/// The file first (A8): a failed write leaves the intent as it was, so the switch never
-/// reads Off while our rules are still in agy's file.
-fn set_agy_sync_replies_at(
-    path: &Path,
-    enabled: bool,
-    port: u16,
-    record_intent: impl FnOnce(bool) -> Result<(), String>,
-) -> Result<(), String> {
-    write_agy_sync_reply_rules_at(path, enabled, port)?;
-    record_intent(enabled)
-}
-
 /// Which agent's "answer rooms without asking" switch a call is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -756,15 +737,59 @@ impl SyncReplyAgent {
         standalone_bridge::config_flag(key, fallback)
     }
 
-    fn write(self, enabled: bool) -> Result<(), String> {
+    fn settings_path(self) -> Result<PathBuf, String> {
         match self {
-            Self::Claude => write_sync_reply_rules(enabled),
-            Self::Agy => write_agy_sync_reply_rules_at(
-                &agy_settings_path()?,
-                enabled,
-                standalone_bridge::configured_bridge_port(),
-            ),
+            Self::Claude => claude_settings_path(),
+            Self::Agy => agy_settings_path(),
         }
+    }
+
+    fn hook_installed(self) -> bool {
+        match self {
+            Self::Claude => claude_hook_state(),
+            Self::Agy => agy_hook_state(),
+        }
+        .is_ok_and(|(_, installed)| installed)
+    }
+
+    fn write_at(self, path: &Path, enabled: bool, port: u16) -> Result<(), String> {
+        match self {
+            Self::Claude => write_sync_reply_rules_at(path, enabled, port),
+            Self::Agy => write_agy_sync_reply_rules_at(path, enabled, port),
+        }
+    }
+
+    fn write(self, enabled: bool) -> Result<(), String> {
+        self.write_at(&self.settings_path()?, enabled, standalone_bridge::configured_bridge_port())
+    }
+
+    /// The file first (A8), for both agents (#267): a failed write leaves the intent as it
+    /// was, so the switch never reads Off while our rules are still in the file.
+    fn set_at(
+        self,
+        path: &Path,
+        enabled: bool,
+        port: u16,
+        record_intent: impl FnOnce(bool) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.write_at(path, enabled, port)?;
+        record_intent(enabled)
+    }
+
+    /// Whether a port change rewrites this agent's rules: only while it is on and its hook
+    /// is in, the same gate its read path has (A7). Claude Code's read path does not notice
+    /// a stale port, so rules already in its file follow the move even without the hook;
+    /// rules that are not there are never created by it (#267 stand-in).
+    fn rules_follow_port(self, wanted: bool, hook_installed: bool, rules_in_file: bool) -> bool {
+        wanted && (hook_installed || (self == Self::Claude && rules_in_file))
+    }
+
+    /// Whether this agent's settings file holds Gyredeck's rules, for any port.
+    fn rules_in_file(self) -> bool {
+        self == Self::Claude
+            && claude_settings_path()
+                .and_then(|path| read_claude_settings(&path))
+                .is_ok_and(|settings| rules_present(&settings))
     }
 }
 
@@ -783,16 +808,17 @@ fn sync_replies_allowed(agent: SyncReplyAgent) -> Result<bool, String> {
             &agy_settings_path()?,
             wanted,
             standalone_bridge::configured_bridge_port(),
-            agy_hook_state().is_ok_and(|(_, installed)| installed),
+            agent.hook_installed(),
         );
     }
-    let settings = read_claude_settings()?;
+    let path = claude_settings_path()?;
+    let settings = read_claude_settings(&path)?;
     if wanted && !rules_present(&settings) {
         // Only once the hook is in: without it nothing sends a reply to permit, and
         // writing permissions for a integration the person has not set up would be
         // reaching further than they asked.
-        if claude_hook_state().is_ok_and(|(_, installed)| installed) {
-            write_sync_reply_rules(true)?;
+        if agent.hook_installed() {
+            agent.write(true)?;
         }
         return Ok(wanted);
     }
@@ -802,18 +828,12 @@ fn sync_replies_allowed(agent: SyncReplyAgent) -> Result<bool, String> {
 #[tauri::command]
 fn set_sync_replies_allowed(agent: SyncReplyAgent, enabled: bool) -> Result<(), String> {
     let (flag, _) = agent.flag();
-    if agent == SyncReplyAgent::Agy {
-        return set_agy_sync_replies_at(
-            &agy_settings_path()?,
-            enabled,
-            standalone_bridge::configured_bridge_port(),
-            |enabled| standalone_bridge::write_config_flag(flag, enabled),
-        );
-    }
-    // Intent is recorded before the effect, so a failed write leaves a switch that
-    // reports what the person chose and retries on the next read.
-    standalone_bridge::write_config_flag(flag, enabled)?;
-    agent.write(enabled)
+    agent.set_at(
+        &agent.settings_path()?,
+        enabled,
+        standalone_bridge::configured_bridge_port(),
+        |enabled| standalone_bridge::write_config_flag(flag, enabled),
+    )
 }
 
 fn agy_hook_install_path() -> Result<PathBuf, String> {
@@ -1177,15 +1197,23 @@ fn set_bridge_port(
     // than swallowed, and the next look at Settings tries again.
     let failed: Vec<String> = [SyncReplyAgent::Claude, SyncReplyAgent::Agy]
         .into_iter()
-        .filter(|agent| agent.wanted())
+        .filter(|agent| agent.rules_follow_port(agent.wanted(), agent.hook_installed(), agent.rules_in_file()))
         .filter_map(|agent| agent.write(true).err())
         .collect();
-    state.restart()?;
+    port_change_result(port, state.restart(), failed)
+}
+
+/// Both failures are reported: a bridge that would not restart does not hide rules that
+/// were not rewritten (#267).
+fn port_change_result(port: u16, restarted: Result<(), String>, failed: Vec<String>) -> Result<(), String> {
     if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("Port {port} is set, but the rules that let agents answer rooms were not updated: {}", failed.join("; ")))
+        return restarted;
     }
+    let rules = format!("the rules that let agents answer rooms were not updated: {}", failed.join("; "));
+    Err(match restarted {
+        Ok(()) => format!("Port {port} is set, but {rules}"),
+        Err(error) => format!("{error}; and {rules}"),
+    })
 }
 
 /// Whether the app is set to start when the machine is unlocked.
@@ -5143,16 +5171,19 @@ fn agy_hooks_registered(hooks_json_path: &Path, installed_path: &str) -> bool {
 }
 
 /// Put Gyredeck's namespace into `~/.gemini/config/hooks.json`, dropping the previous
-/// brand's, through `merge_json_key`: a link is refused, the mode is kept, and a write by
-/// agy while this runs is noticed and the merge redone rather than overwritten.
+/// brand's, in one `merge_json_root`: a link is refused, the mode is kept, and a write by
+/// agy while this runs is noticed and both keys redone rather than overwritten (#266 — two
+/// merges let agy put the old brand back between them).
 /// `entry` is asked for the namespace inside the merge, each time it is (re)done.
 fn register_agy_hooks(
     hooks_json_path: &Path,
     mut entry: impl FnMut() -> serde_json::Value,
 ) -> Result<(), String> {
-    agy_statusline::merge_json_key(hooks_json_path, "agent-activity", |_| Ok(None))?;
-    agy_statusline::merge_json_key(hooks_json_path, "gyredeck", |_| Ok(Some(entry())))?;
-    Ok(())
+    agy_statusline::merge_json_root(hooks_json_path, |root| {
+        root.remove("agent-activity");
+        root.insert("gyredeck".to_string(), entry());
+        Ok(())
+    })
 }
 
 /// Where the Antigravity adapter is and whether it is wired in, without an app handle.
@@ -7487,6 +7518,62 @@ mod agy_install_links {
         let _ = fs::remove_dir_all(&f.root);
     }
 
+    // `previous` is handed to `update` and returned: on a retry it must be the value agy
+    // wrote, not the first read's. No production caller reads the return value, so the
+    // argument is the half that matters.
+    #[test]
+    fn a_retried_merge_hands_update_the_value_agy_wrote() {
+        let f = fixture("retry-previous");
+        let path = f.paths.settings.clone();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, br#"{"permissions":{"allow":["theirs"]}}"#).unwrap();
+        let mut seen: Vec<Option<serde_json::Value>> = Vec::new();
+        let returned = agy_statusline::merge_json_key(&path, "permissions", |current| {
+            seen.push(current.cloned());
+            if seen.len() == 1 {
+                fs::write(&path, br#"{"permissions":{"allow":["theirs","added-by-agy"]}}"#).unwrap();
+            }
+            let mut object = current.and_then(serde_json::Value::as_object).cloned().unwrap_or_default();
+            let mut allow = object.get("allow").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+            allow.push(serde_json::Value::String("ours".into()));
+            object.insert("allow".into(), serde_json::Value::Array(allow));
+            Ok(Some(serde_json::Value::Object(object)))
+        })
+        .unwrap();
+        assert_eq!(seen.len(), 2, "premise: redone once");
+        assert_eq!(
+            seen[1],
+            Some(serde_json::json!({"allow":["theirs","added-by-agy"]})),
+            "the retry's update sees agy's value, not the first read's"
+        );
+        assert_eq!(returned, seen[1], "the previous value returned is the last attempt's");
+        let after: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["permissions"]["allow"], serde_json::json!(["theirs", "added-by-agy", "ours"]));
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn the_old_brand_put_back_by_agy_during_registration_is_removed_again() {
+        let f = fixture("hooks-rebrand-race");
+        fs::write(&f.hooks_json, br#"{"theirs":{},"agent-activity":{}}"#).unwrap();
+        let mut asked = 0;
+        register_agy_hooks(&f.hooks_json, || {
+            asked += 1;
+            if asked == 1 {
+                // agy saves its hooks, the old brand's included, while ours are being put in.
+                fs::write(&f.hooks_json, br#"{"theirs":{},"agent-activity":{},"saved-by-agy":true}"#).unwrap();
+            }
+            serde_json::json!({ "Stop": [] })
+        })
+        .unwrap();
+        assert_eq!(asked, 2, "premise: the change was seen and the merge redone");
+        let after: serde_json::Value = serde_json::from_str(&fs::read_to_string(&f.hooks_json).unwrap()).unwrap();
+        assert_eq!(after["saved-by-agy"], true, "agy's write survives");
+        assert!(after.get("gyredeck").is_some());
+        assert!(after.get("agent-activity").is_none(), "the old brand agy put back is gone");
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
     #[test]
     fn a_successful_install_replaces_a_linked_adapter_and_leaves_its_target_alone() {
         let f = fixture("ok");
@@ -7884,7 +7971,7 @@ mod agy_sync_reply_tests {
         // Premise: the directory really refuses the temporary file a write needs.
         let probe = fs::File::create(dir.join("probe"));
         let mut recorded = None;
-        let set = set_agy_sync_replies_at(&path, false, 47621, |enabled| {
+        let set = SyncReplyAgent::Agy.set_at(&path, false, 47621, |enabled| {
             recorded = Some(enabled);
             Ok(())
         });
@@ -7896,13 +7983,80 @@ mod agy_sync_reply_tests {
         assert!(shown.is_err(), "a reading that cannot remove the rules is an error, never Off");
         assert_eq!(allow_at(&path), before, "the rules are untouched");
         let mut recorded = None;
-        set_agy_sync_replies_at(&path, false, 47621, |enabled| {
+        SyncReplyAgent::Agy.set_at(&path, false, 47621, |enabled| {
             recorded = Some(enabled);
             Ok(())
         })
         .unwrap();
         assert_eq!(recorded, Some(false), "and once the file is written, the intent follows");
         assert_eq!(allow_at(&path), Vec::<serde_json::Value>::new());
+    }
+
+    #[test]
+    fn c8_claude_codes_failed_write_is_an_error_and_leaves_the_intent_where_it_was() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = scratch("c8");
+        let rules = sync_reply_rules(HOST, 47621);
+        fs::write(&path, serde_json::to_string_pretty(&json!({ "permissions": { "allow": rules } })).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        // Premise: the file really refuses a write.
+        let probe = fs::OpenOptions::new().write(true).open(&path);
+        let mut recorded = None;
+        let set = SyncReplyAgent::Claude.set_at(&path, false, 47621, |enabled| {
+            recorded = Some(enabled);
+            Ok(())
+        });
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(probe.is_err(), "premise: the file is not writable");
+        assert!(set.is_err(), "turning it off reports the failure");
+        assert_eq!(recorded, None, "the intent is not changed when the file was not");
+        assert_eq!(fs::read(&path).unwrap(), before, "the rules are untouched");
+        let mut recorded = None;
+        SyncReplyAgent::Claude
+            .set_at(&path, false, 47621, |enabled| {
+                recorded = Some(enabled);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(recorded, Some(false), "and once the file is written, the intent follows");
+        assert!(!rules_present(&read_claude_settings(&path).unwrap()), "and the rules are gone");
+    }
+
+    #[test]
+    fn p1_a_port_change_rewrites_rules_only_once_the_hook_is_in_or_claudes_are_already_there() {
+        for (agent, wanted, hook, in_file, follows) in [
+            (SyncReplyAgent::Agy, true, true, false, true),
+            (SyncReplyAgent::Agy, true, false, false, false),
+            (SyncReplyAgent::Agy, true, false, true, false),
+            (SyncReplyAgent::Agy, false, true, true, false),
+            (SyncReplyAgent::Agy, false, false, false, false),
+            (SyncReplyAgent::Claude, true, true, false, true),
+            (SyncReplyAgent::Claude, true, false, true, true),
+            // No hook and no rules: a port change never creates Claude's settings file.
+            (SyncReplyAgent::Claude, true, false, false, false),
+            (SyncReplyAgent::Claude, false, true, true, false),
+            (SyncReplyAgent::Claude, false, false, false, false),
+        ] {
+            assert_eq!(
+                agent.rules_follow_port(wanted, hook, in_file),
+                follows,
+                "{agent:?} wanted={wanted} hook={hook} in_file={in_file}"
+            );
+        }
+    }
+
+    #[test]
+    fn p2_a_failed_restart_does_not_hide_rules_that_were_not_rewritten() {
+        assert_eq!(port_change_result(50123, Ok(()), Vec::new()), Ok(()));
+        assert_eq!(port_change_result(50123, Err("no restart".into()), Vec::new()), Err("no restart".into()));
+        let rules_only = port_change_result(50123, Ok(()), vec!["agy refused".into()]).unwrap_err();
+        assert!(rules_only.starts_with("Port 50123 is set, but"), "{rules_only}");
+        assert!(rules_only.contains("agy refused"), "{rules_only}");
+        let both = port_change_result(50123, Err("no restart".into()), vec!["agy refused".into(), "claude refused".into()]).unwrap_err();
+        for part in ["no restart", "agy refused", "claude refused"] {
+            assert!(both.contains(part), "{part} in {both}");
+        }
     }
 
     #[test]

@@ -1788,8 +1788,17 @@ mod tests {
         let mut line = String::new();
         assert!(std::io::BufRead::read_line(&mut std::io::BufReader::new(&first), &mut line).is_err(), "the hook's deadline expired before the broker answered");
         drop(first);
-        std::thread::sleep(Duration::from_millis(400));
-        let retried = roundtrip("{\"v\":1,\"collect\":{}}\n");
+        // The retry is the hook's "ask again in a moment": while the first collect is still
+        // in flight the broker answers busy, and on a loaded machine a fixed 400 ms was not
+        // always past it (seen 2026-10-26, #267). Ask until it is.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let retried = loop {
+            let answer = roundtrip("{\"v\":1,\"collect\":{}}\n");
+            if answer["error"] != "busy" || std::time::Instant::now() >= deadline {
+                break answer;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
         state.stop();
         let _ = std::fs::remove_dir_all(dir);
         assert_eq!(retried["messages"][0]["text"], "MAIL-THAT-MUST-SURVIVE", "after withholding the first response, retry must recover it: {retried}");

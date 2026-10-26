@@ -308,18 +308,83 @@ struct FileStamp {
     ctime: (i64, i64),
 }
 
-fn stamp(path: &Path) -> Result<Option<FileStamp>, String> {
-    use std::os::unix::fs::MetadataExt;
-    match fs::symlink_metadata(path) {
-        Ok(m) => Ok(Some(FileStamp {
+impl FileStamp {
+    fn of(m: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
             dev: m.dev(),
             ino: m.ino(),
             len: m.len(),
             mtime: (m.mtime(), m.mtime_nsec()),
             ctime: (m.ctime(), m.ctime_nsec()),
-        })),
+        }
+    }
+}
+
+/// What is at `path` now, without following a link: compared against the stamp of the
+/// descriptor that was read, so a file swapped or rewritten since is noticed.
+fn stamp(path: &Path) -> Result<Option<FileStamp>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(m) => Ok(Some(FileStamp::of(&m))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("Failed to read {}: {error}", path.display())),
+    }
+}
+
+/// A regular file as read through one descriptor: its bytes, its mode and its stamp all
+/// come from that descriptor, never from a second look at the path.
+pub(crate) struct Regular {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) mode: u32,
+    stamp: FileStamp,
+}
+
+pub(crate) enum ReadNoFollow {
+    Absent,
+    Regular(Regular),
+    /// A symlink, a FIFO, a directory: anything that is not a plain file.
+    NotRegular,
+}
+
+/// The one reader for every app-managed or agy file in the install path (#230 audit).
+/// Opened once with `O_NOFOLLOW` (a link fails with `ELOOP` instead of being followed) and
+/// `O_NONBLOCK` (a FIFO cannot hang it), then `fstat` on that same descriptor decides
+/// whether it is a regular file. There is no check-then-open pair to race.
+pub(crate) fn read_regular_nofollow(path: &Path) -> Result<ReadNoFollow, String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let fail = |error: std::io::Error| format!("Failed to read {}: {error}", path.display());
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ReadNoFollow::Absent),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(ReadNoFollow::NotRegular),
+        Err(error) => return Err(fail(error)),
+    };
+    let metadata = file.metadata().map_err(fail)?;
+    if !metadata.is_file() {
+        return Ok(ReadNoFollow::NotRegular);
+    }
+    let mut bytes = Vec::new();
+    (&file).read_to_end(&mut bytes).map_err(fail)?;
+    Ok(ReadNoFollow::Regular(Regular {
+        bytes,
+        mode: metadata.permissions().mode() & 0o7777,
+        stamp: FileStamp::of(&metadata),
+    }))
+}
+
+/// [`read_regular_nofollow`], refusing anything that is not a plain file.
+pub(crate) fn read_plain(path: &Path) -> Result<Option<Regular>, String> {
+    match read_regular_nofollow(path)? {
+        ReadNoFollow::Absent => Ok(None),
+        ReadNoFollow::Regular(regular) => Ok(Some(regular)),
+        ReadNoFollow::NotRegular => Err(format!(
+            "Refusing to rewrite {}: it is a symlink or not a regular file. Point it at a plain file and install again.",
+            path.display()
+        )),
     }
 }
 
@@ -327,22 +392,23 @@ fn stamp(path: &Path) -> Result<Option<FileStamp>, String> {
 /// an empty object; anything else that is not an object is refused, so it is never
 /// overwritten — a hand-edited file with one stray comma is still the person's settings.
 pub(crate) fn read_json_object(path: &Path) -> Result<Map<String, Value>, String> {
+    read_json_object_from(path).map(|(map, _)| map)
+}
+
+/// The object, and the descriptor's file (`None` when absent) it was read from.
+fn read_json_object_from(path: &Path) -> Result<(Map<String, Value>, Option<Regular>), String> {
     let name = path.display();
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
-        Err(error) => return Err(format!("Failed to read {name}: {error}")),
-        // Renaming over a symlink would replace the link, not the file it points at.
-        Ok(metadata) if !metadata.file_type().is_file() => {
-            return Err(format!("Refusing to rewrite {name}: it is not a regular file"))
-        }
-        Ok(_) => {}
-    }
-    let content = fs::read_to_string(path).map_err(|error| format!("Failed to read {name}: {error}"))?;
+    // Renaming over a symlink would replace the link, not the file it points at.
+    let Some(regular) = read_plain(path)? else {
+        return Ok((Map::new(), None));
+    };
+    let content = std::str::from_utf8(&regular.bytes)
+        .map_err(|error| format!("Refusing to overwrite unparsable {name}: {error}"))?;
     if content.trim().is_empty() {
-        return Ok(Map::new());
+        return Ok((Map::new(), Some(regular)));
     }
-    match serde_json::from_str::<Value>(&content) {
-        Ok(Value::Object(map)) => Ok(map),
+    match serde_json::from_str::<Value>(content) {
+        Ok(Value::Object(map)) => Ok((map, Some(regular))),
         Ok(_) => Err(format!("Refusing to rewrite {name}: its root is not an object")),
         Err(error) => Err(format!("Refusing to overwrite unparsable {name}: {error}")),
     }
@@ -356,7 +422,8 @@ pub(crate) fn read_json_object(path: &Path) -> Result<Map<String, Value>, String
 /// it, so a reader never sees half a file. Returns the previous value.
 ///
 /// The owner may write the file while this runs. The file's identity, size and times are
-/// taken before the read and compared again just before the rename; a change means the read
+/// taken from the descriptor that was read and compared with the path just before the
+/// rename; a change means the read
 /// is out of date, so the whole merge is redone (`update` runs again), and after
 /// [`MERGE_ATTEMPTS`] it gives up having changed nothing. What remains is a write by the
 /// owner between that last comparison and the rename itself.
@@ -366,8 +433,8 @@ pub(crate) fn merge_json_key(
     mut update: impl FnMut(Option<&Value>) -> Result<Option<Value>, String>,
 ) -> Result<Option<Value>, String> {
     for _ in 0..MERGE_ATTEMPTS {
-        let before = stamp(path)?;
-        let mut root = read_json_object(path)?;
+        let (mut root, read) = read_json_object_from(path)?;
+        let before = read.as_ref().map(|regular| regular.stamp);
         let previous = root.get(key).cloned();
         let next = update(previous.as_ref())?;
         if next == previous {
@@ -380,13 +447,7 @@ pub(crate) fn merge_json_key(
         let mut text = serde_json::to_string_pretty(&Value::Object(root))
             .map_err(|error| format!("Failed to encode {}: {error}", path.display()))?;
         text.push('\n');
-        let mode = match fs::metadata(path) {
-            Ok(metadata) => {
-                use std::os::unix::fs::PermissionsExt;
-                metadata.permissions().mode() & 0o7777
-            }
-            Err(_) => 0o600,
-        };
+        let mode = read.as_ref().map_or(0o600, |regular| regular.mode);
         let temp = write_temp(path, text.as_bytes(), mode)?;
         if stamp(path)? != before {
             let _ = fs::remove_file(&temp);
@@ -457,20 +518,6 @@ pub(crate) fn copy_atomically(source: &Path, path: &Path, mode: u32) -> Result<(
     write_atomically(path, &bytes, mode)
 }
 
-/// Refuse a config file that is present but not a regular file. Writing through a symlink
-/// would change a file somewhere else; replacing it would cut the link the person made.
-pub(crate) fn refuse_unless_regular(path: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("Failed to read {}: {error}", path.display())),
-        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
-        Ok(_) => Err(format!(
-            "Refusing to rewrite {}: it is a symlink or not a regular file. Point it at a plain file and install again.",
-            path.display()
-        )),
-    }
-}
-
 /// What a path held before an install, read without following a symlink.
 enum Saved {
     File(Vec<u8>, u32),
@@ -479,24 +526,15 @@ enum Saved {
 }
 
 fn save(path: &Path) -> Result<Saved, String> {
-    use std::os::unix::fs::PermissionsExt;
-    let fail = |error: std::io::Error| format!("Failed to read {}: {error}", path.display());
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Saved::Absent),
-        Err(error) => Err(fail(error)),
-        Ok(metadata) if metadata.file_type().is_symlink() => Ok(Saved::Link(fs::read_link(path).map_err(fail)?)),
-        Ok(metadata) if metadata.file_type().is_file() => {
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(path)
-                .map_err(fail)?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).map_err(fail)?;
-            Ok(Saved::File(bytes, metadata.permissions().mode() & 0o7777))
-        }
-        Ok(_) => Err(format!("Refusing to touch {}: it is not a regular file", path.display())),
+    match read_regular_nofollow(path)? {
+        ReadNoFollow::Absent => Ok(Saved::Absent),
+        ReadNoFollow::Regular(regular) => Ok(Saved::File(regular.bytes, regular.mode)),
+        // Not a plain file: only a link is saved, as the link itself; `readlink` reads the
+        // link and never what it points at.
+        ReadNoFollow::NotRegular => match fs::read_link(path) {
+            Ok(target) => Ok(Saved::Link(target)),
+            Err(_) => Err(format!("Refusing to touch {}: it is not a regular file", path.display())),
+        },
     }
 }
 
@@ -645,7 +683,7 @@ pub(crate) fn install(paths: &AgyStatusLinePaths, bundled_script: &Path) -> Resu
 /// has the hook but not this, and the panel names it out of date so the person installs again.
 pub(crate) fn wired(paths: &AgyStatusLinePaths) -> bool {
     let command = our_command(&paths.script());
-    fs::symlink_metadata(paths.script()).is_ok_and(|metadata| metadata.file_type().is_file())
+    matches!(read_regular_nofollow(&paths.script()), Ok(ReadNoFollow::Regular(_)))
         && read_json_object(&paths.settings).is_ok_and(|root| {
             root.get(STATUS_LINE_KEY).is_some_and(|line| {
                 line.get("type").and_then(Value::as_str) == Some("command")
@@ -657,7 +695,7 @@ pub(crate) fn wired(paths: &AgyStatusLinePaths) -> bool {
 
 /// What the install recorded: whether `statusLine` was there, and what it held.
 fn read_record(paths: &AgyStatusLinePaths) -> Option<(bool, Option<Map<String, Value>>)> {
-    let record: Value = serde_json::from_str(&fs::read_to_string(paths.previous()).ok()?).ok()?;
+    let record: Value = serde_json::from_slice(&read_plain(&paths.previous()).ok()??.bytes).ok()?;
     let present = record.get("present")?.as_bool()?;
     Some((present, record.get("previous").and_then(Value::as_object).cloned()))
 }
@@ -1099,6 +1137,49 @@ mod tests {
         assert!(fs::symlink_metadata(paths.script()).unwrap().file_type().is_file(), "the link was replaced");
         assert_eq!(fs::read(paths.script()).unwrap(), fs::read(script_source()).unwrap());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn c8_the_one_reader_never_follows_a_link_and_takes_the_mode_from_what_it_read() {
+        let dir = scratch("nofollow");
+        let file = dir.join("hooks.json");
+        fs::write(&file, b"{\"mine\":1}").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        let target = dir.join("target.json");
+        fs::write(&target, b"{\"secret\":1}").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // Premise: the link itself reports a wider mode than either file.
+        assert_ne!(fs::symlink_metadata(&link).unwrap().permissions().mode() & 0o777, 0o600);
+
+        match read_regular_nofollow(&file).unwrap() {
+            ReadNoFollow::Regular(regular) => {
+                assert_eq!(regular.bytes, b"{\"mine\":1}");
+                assert_eq!(regular.mode, 0o600, "the mode of the file read");
+            }
+            _ => panic!("a plain file reads"),
+        }
+        assert!(matches!(read_regular_nofollow(&link).unwrap(), ReadNoFollow::NotRegular), "a link is never read");
+        assert!(read_plain(&link).is_err(), "and is refused");
+        assert!(matches!(read_regular_nofollow(&dir.join("absent")).unwrap(), ReadNoFollow::Absent));
+
+        let fifo = dir.join("fifo");
+        let c_path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "premise: a FIFO");
+        assert!(matches!(read_regular_nofollow(&fifo).unwrap(), ReadNoFollow::NotRegular), "a FIFO is refused, not waited on");
+
+        // The swap the audit raced: a plain file at check time, a link at read time. With one
+        // descriptor there is no second look, so the read sees the link and refuses it.
+        let swapped = dir.join("swapped.json");
+        fs::write(&swapped, b"{}").unwrap();
+        assert!(read_plain(&swapped).unwrap().is_some(), "premise: plain at first");
+        fs::remove_file(&swapped).unwrap();
+        std::os::unix::fs::symlink(&target, &swapped).unwrap();
+        assert!(read_plain(&swapped).is_err(), "the swapped-in link is refused");
+        assert!(read_json_object(&swapped).is_err(), "by the settings reader too");
+        assert_eq!(fs::read(&target).unwrap(), b"{\"secret\":1}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // C9 -------------------------------------------------------------------------------

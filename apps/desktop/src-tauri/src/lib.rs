@@ -4523,23 +4523,20 @@ fn install_agy_hook_at(
     // Everything that can refuse, before anything is written: agy's settings.json, and a
     // hooks.json that is a link or does not parse.
     agy_statusline::preflight(statusline_paths)?;
-    agy_statusline::refuse_unless_regular(hooks_json_path)?;
-    let hooks_text = match fs::read_to_string(hooks_json_path) {
-        Ok(content) => Some(content),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("Failed to read hooks.json: {error}")),
-    };
+    // One descriptor gives the bytes and the mode, so a link swapped in after any earlier
+    // look can neither be read nor lend its mode to the new file (#230 audit).
+    let hooks_read = agy_statusline::read_plain(hooks_json_path)?;
+    let hooks_text = hooks_read
+        .as_ref()
+        .map(|regular| String::from_utf8(regular.bytes.clone()))
+        .transpose()
+        .map_err(|e| format!("Failed to read hooks.json: {e}"))?;
     let mut hooks_root: serde_json::Value = match hooks_text.as_deref().map(str::trim) {
         None | Some("") => serde_json::json!({}),
         Some(content) => serde_json::from_str(content)
             .map_err(|e| format!("Failed to parse hooks.json: {e}"))?,
     };
-    let hooks_mode = {
-        use std::os::unix::fs::PermissionsExt;
-        fs::symlink_metadata(hooks_json_path)
-            .map(|metadata| metadata.permissions().mode() & 0o7777)
-            .unwrap_or(0o644)
-    };
+    let hooks_mode = hooks_read.as_ref().map_or(0o644, |regular| regular.mode);
     // A later step that fails puts back every file the install touched, so a refusal does
     // not leave the hook half-registered.
     let touched = [

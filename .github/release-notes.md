@@ -1,5 +1,20 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Answering rooms says why when it cannot tell, and the Antigravity hook install keeps its own file in one write — (v1.26.1)
+
+### Fixes
+
+- **"Answer rooms without asking" says why it cannot tell.** If Antigravity's settings file cannot be
+  read, for example because it does not parse or is a link, the row now gives the reason. It used to
+  show "Checking…" for ever with the switch locked.
+- **Claude Code's switch changes only when its settings file does.** If the file could not be written,
+  the switch used to remember the new setting anyway. It now stays where it was.
+- **Changing the bridge port updates Antigravity's rules only when its hook is installed**, and a
+  failed rule update is reported even when the bridge restart fails as well.
+- **Installing the Antigravity hook removes the old Agent Activity entry in the same write that adds
+  Gyredeck's.** If Antigravity saved its hooks file between the two steps, the old entry could come
+  back beside the new one.
+
 ## Antigravity usage from its own status line, a switch per agent for answering rooms, and a way to ask whether a heavy run is on — (v1.26.0)
 
 ### Changed

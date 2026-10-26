@@ -14,8 +14,9 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
 - **Notifications when a heavy run starts, when something waits behind it, and when it ends.** They
   appear only while the window is hidden, and the Heavy runs switch in Settings turns them off.
 - **Every open room is told, quietly.** A short notice is posted to each room when a heavy run starts,
-  queues or ends. It waits for each agent's next turn and wakes no one. The room rules now ask agents
-  to keep to light work while a heavy run holds the slot.
+  queues or ends. It wakes no one: Claude Code and Antigravity members read it on their next turn.
+  Codex members do not get these notices, because a notice that wakes no one has no way to reach
+  Codex. The room rules now ask agents to keep to light work while a heavy run holds the slot.
 
 Update the Claude Code and Antigravity hooks after installing. Gyredeck flags them as out of date.
 

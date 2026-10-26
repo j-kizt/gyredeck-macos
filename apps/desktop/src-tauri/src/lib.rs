@@ -4423,10 +4423,14 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
 ///
 /// Separated from the caller so the comparison itself can be tested without an app
 /// bundle to resolve resources against.
+/// `right` is the installed copy, read without following a link: a link or anything else
+/// that is not a plain file there is not this build's adapter, so it is stale.
 fn files_differ(left: &Path, right: &Path) -> Option<bool> {
-    match (fs::read(left), fs::read(right)) {
-        (Ok(a), Ok(b)) => Some(a != b),
-        _ => None,
+    let bundled = fs::read(left).ok()?;
+    match agy_statusline::read_regular_nofollow(right).ok()? {
+        agy_statusline::ReadNoFollow::Regular(installed) => Some(installed.bytes != bundled),
+        agy_statusline::ReadNoFollow::NotRegular => Some(true),
+        agy_statusline::ReadNoFollow::Absent => None,
     }
 }
 
@@ -4521,22 +4525,10 @@ fn install_agy_hook_at(
     statusline_paths: &agy_statusline::AgyStatusLinePaths,
 ) -> Result<String, String> {
     // Everything that can refuse, before anything is written: agy's settings.json, and a
-    // hooks.json that is a link or does not parse.
+    // hooks.json that is a link, does not parse or is not an object. The write re-reads it
+    // through the same no-follow reader (#230 audit).
     agy_statusline::preflight(statusline_paths)?;
-    // One descriptor gives the bytes and the mode, so a link swapped in after any earlier
-    // look can neither be read nor lend its mode to the new file (#230 audit).
-    let hooks_read = agy_statusline::read_plain(hooks_json_path)?;
-    let hooks_text = hooks_read
-        .as_ref()
-        .map(|regular| String::from_utf8(regular.bytes.clone()))
-        .transpose()
-        .map_err(|e| format!("Failed to read hooks.json: {e}"))?;
-    let mut hooks_root: serde_json::Value = match hooks_text.as_deref().map(str::trim) {
-        None | Some("") => serde_json::json!({}),
-        Some(content) => serde_json::from_str(content)
-            .map_err(|e| format!("Failed to parse hooks.json: {e}"))?,
-    };
-    let hooks_mode = hooks_read.as_ref().map_or(0o644, |regular| regular.mode);
+    agy_statusline::read_json_object(hooks_json_path)?;
     // A later step that fails puts back every file the install touched, so a refusal does
     // not leave the hook half-registered.
     let touched = [
@@ -4557,12 +4549,7 @@ fn install_agy_hook_at(
 
         let installed_path = install_path.to_string_lossy().to_string();
 
-        if !hooks_root.is_object() {
-            hooks_root = serde_json::json!({});
-        }
-        let root = hooks_root.as_object_mut().expect("hooks.json is object");
-
-        let entry = serde_json::json!({
+        let entry = || serde_json::json!({
             "PreToolUse": [{
                 "matcher": ".*",
                 "hooks": [{"type": "command", "command": node_hook_command(&installed_path, "PreToolUse")}]
@@ -4586,18 +4573,7 @@ fn install_agy_hook_at(
             ],
         });
         // Drop the previous brand's namespace so it can't fire alongside Gyredeck.
-        root.remove("agent-activity");
-        root.insert("gyredeck".to_string(), entry);
-
-        let Some(hooks_parent) = hooks_json_path.parent() else {
-            return Err("Failed to resolve Gemini config directory".to_string());
-        };
-        fs::create_dir_all(hooks_parent)
-            .map_err(|error| format!("Failed to create Gemini config directory: {error}"))?;
-
-        let json_string = serde_json::to_string_pretty(&hooks_root)
-            .map_err(|e| format!("Failed to stringify hooks.json: {e}"))?;
-        agy_statusline::write_atomically(hooks_json_path, format!("{json_string}\n").as_bytes(), hooks_mode)
+        register_agy_hooks(hooks_json_path, entry)
             .map_err(|error| format!("Failed to write hooks.json: {error}"))?;
 
         // Usage comes from agy's status-line payload, so the install also points agy's status
@@ -4918,6 +4894,26 @@ fn codex_hook_status(app: tauri::AppHandle) -> Result<(String, bool, Option<bool
     Ok((installed_path, installed, stale))
 }
 
+/// Whether `hooks.json` registers this installation, read through the no-follow reader: a
+/// link or a file that does not parse registers nothing (#230 audit).
+fn agy_hooks_registered(hooks_json_path: &Path, installed_path: &str) -> bool {
+    agy_statusline::read_json_object(hooks_json_path)
+        .is_ok_and(|root| agy_registration_present(&serde_json::Value::Object(root), installed_path))
+}
+
+/// Put Gyredeck's namespace into `~/.gemini/config/hooks.json`, dropping the previous
+/// brand's, through `merge_json_key`: a link is refused, the mode is kept, and a write by
+/// agy while this runs is noticed and the merge redone rather than overwritten.
+/// `entry` is asked for the namespace inside the merge, each time it is (re)done.
+fn register_agy_hooks(
+    hooks_json_path: &Path,
+    mut entry: impl FnMut() -> serde_json::Value,
+) -> Result<(), String> {
+    agy_statusline::merge_json_key(hooks_json_path, "agent-activity", |_| Ok(None))?;
+    agy_statusline::merge_json_key(hooks_json_path, "gyredeck", |_| Ok(Some(entry())))?;
+    Ok(())
+}
+
 #[tauri::command]
 fn agy_hook_status(app: tauri::AppHandle) -> Result<(String, bool, Option<bool>), String> {
     let install_path = agy_hook_install_path()?;
@@ -4928,14 +4924,7 @@ fn agy_hook_status(app: tauri::AppHandle) -> Result<(String, bool, Option<bool>)
     // version too, whose commands point at its own path. Antigravity would keep running
     // that one while this panel called it installed and the staleness check compared the
     // copy nothing runs — so the red dot could never appear.
-    let mut in_hooks = false;
-    if hooks_json_path.exists() {
-        if let Ok(content) = fs::read_to_string(&hooks_json_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                in_hooks = agy_registration_present(&json, &installed_path);
-            }
-        }
-    }
+    let in_hooks = agy_hooks_registered(&hooks_json_path, &installed_path);
 
     let installed = install_path.exists() && in_hooks;
     // Stale only matters once it is installed: an absent adapter is already reported
@@ -7197,6 +7186,58 @@ mod agy_install_links {
         std::os::unix::fs::symlink(&victim, at).unwrap();
         assert!(is_link(at), "premise: {} is a link", at.display());
         victim
+    }
+
+    #[test]
+    fn an_installed_adapter_that_is_a_link_is_stale_even_to_identical_bytes() {
+        let f = fixture("stale-link");
+        let same = f.root.join("same.mjs");
+        fs::copy(&f.hook_source, &same).unwrap();
+        std::os::unix::fs::symlink(&same, &f.install_path).unwrap();
+        // Premise: through the link, the bytes are the bundled ones.
+        assert_eq!(fs::read(&f.install_path).unwrap(), fs::read(&f.hook_source).unwrap());
+        assert_eq!(files_differ(&f.hook_source, &same), Some(false), "premise: a plain copy is current");
+        assert_eq!(files_differ(&f.hook_source, &f.install_path), Some(true), "a link is not this build's adapter");
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn a_hooks_json_link_registers_nothing() {
+        let f = fixture("status-link");
+        let installed = f.install_path.to_string_lossy().to_string();
+        let registered = serde_json::json!({ "gyredeck": {
+            "Stop": [{ "type": "command", "command": node_hook_command(&installed, "Stop") }]
+        } });
+        let target = f.root.join("registered.json");
+        fs::write(&target, registered.to_string()).unwrap();
+        fs::copy(&target, &f.hooks_json).unwrap();
+        assert!(agy_hooks_registered(&f.hooks_json, &installed), "premise: a plain file with it registers");
+        fs::remove_file(&f.hooks_json).unwrap();
+        std::os::unix::fs::symlink(&target, &f.hooks_json).unwrap();
+        assert!(!agy_hooks_registered(&f.hooks_json, &installed), "the same through a link does not");
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn a_hooks_json_write_by_agy_during_registration_is_kept() {
+        let f = fixture("hooks-race");
+        fs::write(&f.hooks_json, br#"{"theirs":{},"agent-activity":{}}"#).unwrap();
+        let mut asked = 0;
+        register_agy_hooks(&f.hooks_json, || {
+            asked += 1;
+            if asked == 1 {
+                // agy saves its hooks while ours are being put in.
+                fs::write(&f.hooks_json, br#"{"theirs":{},"saved-by-agy":true}"#).unwrap();
+            }
+            serde_json::json!({ "Stop": [] })
+        })
+        .unwrap();
+        assert_eq!(asked, 2, "premise: the change was seen and the merge redone");
+        let after: serde_json::Value = serde_json::from_str(&fs::read_to_string(&f.hooks_json).unwrap()).unwrap();
+        assert_eq!(after["saved-by-agy"], true, "agy's write survives");
+        assert!(after.get("theirs").is_some() && after.get("gyredeck").is_some());
+        assert!(after.get("agent-activity").is_none(), "the old brand is gone");
+        let _ = fs::remove_dir_all(&f.root);
     }
 
     #[test]

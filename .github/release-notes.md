@@ -1,5 +1,23 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Agents stop repeating a room password, send to the right member, and learn about heavy runs when they join — (v1.25.1)
+
+### Fixes
+
+- **A room password you paste is never repeated back.** Once Claude Code or Antigravity has joined
+  with it, the session is told the value is used up, and that it need not mention or ask about it
+  again. A session already in the room is told so, without saying what the pasted value was.
+- **The room rules show exactly how to address a message.** They now give a complete example, with
+  who it is for and what it is for set in their own fields. They also say that writing them into the
+  text is something only Codex does. Following the send command Gyredeck hands out no longer reaches
+  the whole room by mistake.
+- **Every member hears about the heavy-run helper when it joins a room.** Before this, a session
+  that joined a room was assumed to know the rules file already, and was never told about the helper.
+  The note is now delivered once at the moment each member is confirmed, and it can no longer be lost
+  on the way.
+
+Update the Claude Code and Antigravity hooks after installing. Gyredeck flags them as out of date.
+
 ## Heavy runs are seen even when they skip the helper, and you hear when one starts and ends — (v1.25.0)
 
 ### Changed

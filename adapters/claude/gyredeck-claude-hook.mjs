@@ -545,14 +545,23 @@ const confirmRoomPassword = async (endpoint, token, room, prompt) => {
 };
 
 /**
+ * What a session is told when its password was just accepted, on the normal path and the
+ * fallback alike: one line, so the two cannot drift apart again (#255). Live, an agent
+ * repeated the accepted password back and asked whether to join; the line says not to,
+ * and never carries the value. Accepted only: a refused match may not have been a password
+ * at all, since this hook finds one anywhere in prose, so a refusal stays silent.
+ */
+const acceptedLine = (room) =>
+  `NEW: the password you were just given was accepted for sync room ${room} — you may now read and post here.` +
+  " The hex you just pasted was this room's password and has been used: do not repeat it, and do not ask about it.";
+
+/**
  * The collected messages as plain lines, for when building the delivery threw (#168).
  * Collected mail has left the reader's position over TCP, so dropping it there loses it for
  * good; this is built from nothing that can fail on a message's shape.
  */
 const plainDelivery = async (taken) => {
-  const accepted = taken?.justConfirmed
-    ? `NEW: the password you were just given was accepted for sync room ${taken.justConfirmed.room} — you may now read and post here.`
-    : null;
+  const accepted = taken?.justConfirmed ? acceptedLine(taken.justConfirmed.room) : null;
   // Through the broker nothing is lost: an unacknowledged batch comes back on the next
   // collect and is built properly then. Only a TCP collect has already moved on. A
   // confirmation belongs to this turn alone, so it is said now either way (#168 audit).
@@ -726,7 +735,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   }
 
   if (justConfirmed) {
-    standing.push(`NEW: the password you were just given was accepted — you may now read and post here.`);
+    standing.push(acceptedLine(justConfirmed.room));
     if (heldBack) {
       standing.push(`Mail waiting for you could not be collected this turn (${heldBack}); it is still waiting, and the watch below will bring it.`);
     }
@@ -774,8 +783,8 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // is exactly where "never answer a reaction" is needed.
   if (room_) {
     standing.push(
-      "RULES: set to (a member, as the room shows it, or everyone) and kind (ask, tell or reaction) on" +
-        " anything you send; never answer a reaction; a send happened only if you saw" +
+      "RULES: set to (a member, as the room shows it, or everyone) and kind (ask, tell or reaction) as" +
+        " the to and kind fields of anything you send, never in the text; never answer a reaction; a send happened only if you saw" +
         " ok:true and a seq.",
     );
   }

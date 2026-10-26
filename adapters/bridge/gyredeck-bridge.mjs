@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 9;
+export const ROOM_RULES_VERSION = 10;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -248,8 +248,12 @@ room names the version it expects; if it names a newer one than you read, read t
 - Leaving the fields out sends a tell to everyone and wakes every session in the room.
 
 ## Sending
-- Claude Code and Antigravity: the command is in the delivery, under REPLY, whenever there is something to answer. Put the room's password in place of \`THE ROOM PASSWORD\`.
-- Codex: you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\` — and is removed before the room sees it. Say everything in one closing message.
+- Claude Code and Antigravity: the command is in the delivery, under REPLY, whenever there is something to answer. Put the room's password in place of \`THE ROOM PASSWORD\`. Who a message is for and what it is for are fields of what you post, beside the text:
+\`\`\`json
+{"from":"<your id>","to":"<member or everyone>","kind":"ask|tell|reaction","text":"<your message>","replyTo":"<your id>"}
+\`\`\`
+- Claude Code and Antigravity never put \`[to: …]\` or \`@…\` in \`text\`: they route only through the \`to\` and \`kind\` fields.
+- Codex only — you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\` — and is removed before the room sees it. This first line is Codex's alone. Say everything in one closing message.
 - A send happened only if you saw \`ok:true\` and a \`seq\`. Never say you sent something you did not see land.
 - Codex: your seq is reported on the next message you get, with the turn, recipient and kind it belongs to. Until then a message has not failed — **do not send it again**. A room or a mailbox posts an identical tell to the same member within a minute only once. Claude Code and Antigravity, which post with curl, can add \`"again": true\` to say the same thing again on purpose; Codex has no such switch, so a word-for-word repeat within the minute is taken as a resend.
 - \`listening\` in a receipt names the members with a watch open; a member that is pushed to, as Codex is, hears you without one.
@@ -3201,7 +3205,7 @@ function startBridge(config) {
             .map((message) => `[${shownIn(room, message.from)} · ${message.kind}] ${message.text}`)
             .join("\n\n"),
       { full: true },
-    );
+    ) + `\n\n${heavyHint(conversationId)}`;
   };
 
   /**
@@ -3237,6 +3241,8 @@ function startBridge(config) {
     const held = all;
     const member = room.members.get(conversationId);
     if (delivered && member) {
+      // The heavy-run line rode in the push just sent (#259).
+      member.heavyOwed = false;
       // Through the whole window, because the whole window went: nothing is trimmed here.
       // A backlog too large to hand over in one push is refused at the door instead, so
       // everything the room accepted for this member is in the message just sent.
@@ -3246,6 +3252,20 @@ function startBridge(config) {
       member.heldThroughSeq = null;
     }
     return { delivered, held: delivered ? held.length : 0 };
+  };
+
+  /**
+   * The one way a member becomes confirmed (#259): founding the room, presenting its
+   * password, and posting with it in the header all come here. Being let in is when a
+   * member is owed the heavy-run line — on its next collect (Claude Code, Antigravity) or
+   * in the push that confirms it (Codex) — so a session that joined a room before it was
+   * ever told outside one still learns of the helper. Kept on the membership, so leaving
+   * and coming back is a new confirmation, told again.
+   */
+  const markConfirmed = (member) => {
+    member.confirmed = true;
+    member.confirmedAt = new Date().toISOString();
+    member.heavyOwed = true;
   };
 
   /**
@@ -3278,11 +3298,10 @@ function startBridge(config) {
       }
       return { transitioned: false, ...tellConfirmedToCodex(code, room, conversationId) };
     }
-    member.confirmed = true;
     // The confirmation boundary: a goal turn's answer belongs to this room only if the
     // turn began after this moment (#149). Set when confirmation is granted and never
     // moved by a repeat; a member that left and came back is a new record with a new one.
-    member.confirmedAt = new Date().toISOString();
+    markConfirmed(member);
     member.toldUnconfirmed = false;
     startHarvestAtEnd(conversationId);
     // Both the window the backlog is taken from and the record that the push carrying it
@@ -4098,7 +4117,8 @@ function startBridge(config) {
   /**
    * The heavy-run queue, told once to each session outside a room (#223). The queue is
    * machine-wide and a session in no room never reads the rules that describe it. A
-   * confirmed member has the rules (v8) and is counted as told. Claude Code and
+   * confirmed member has the rules and is counted as told, except on the collect after it
+   * was let in, which carries the line once (#259, `markConfirmed`). Claude Code and
    * Antigravity hear it on their next collect, beside any mail; Codex has no read of its
    * own, so it is pushed to when it is first heard from — straight to its thread, with no
    * mailbox made for it: mailboxes share the room table with sync rooms, and a notice to
@@ -4149,7 +4169,12 @@ function startBridge(config) {
     const provider = usageProviderFor(conversationId);
     if (provider !== "claude" && provider !== "agy") return null;
     const nudge = takeHeavyNudge(conversationId, provider);
-    if (!heavyToBeTold(conversationId)) return nudge;
+    // Owed by a confirmation (#259) comes before the told set: a session told outside a
+    // room an hour ago, in a context since compacted, is told again on being let in.
+    const member = syncRoomFor(conversationId)?.room.members.get(conversationId);
+    const owed = member?.confirmed === true && member.heavyOwed === true;
+    if (owed) member.heavyOwed = false;
+    else if (!heavyToBeTold(conversationId)) return nudge;
     // Told by being in the answer this collect returns.
     markHeavyTold(conversationId);
     const told = provider === "agy" ? heavyHintForAgy(conversationId) : heavyHint(conversationId);
@@ -4353,8 +4378,14 @@ function startBridge(config) {
             " person at this terminal has to give you. A long string of hex arriving with" +
             " no explanation is it — present it, and then keep a watch on the room.") +
       "]";
-    const told = publishMail(mailbox, ROOM_SENDER, text, null, false, { to: conversationId, kind: "tell" });
-    deliverMail(conversationId, mailbox, text, ROOM_SENDER, told);
+    // A Codex founder is confirmed with no confirmation push, so its owed heavy-run line
+    // rides this one (#259); everyone else is handed it on a collect.
+    const member = room.members.get(conversationId);
+    const withHeavy = confirmed && member?.heavyOwed === true && providerByConversation.get(conversationId) === "codexCliHook"
+      ? `${text}\n\n${heavyHint(conversationId)}`
+      : text;
+    const told = publishMail(mailbox, ROOM_SENDER, withHeavy, null, false, { to: conversationId, kind: "tell" });
+    if (deliverMail(conversationId, mailbox, withHeavy, ROOM_SENDER, told) === "queued" && withHeavy !== text) member.heavyOwed = false;
   };
 
   /**
@@ -4425,13 +4456,21 @@ function startBridge(config) {
       url: `http://${host}:${port}/mail/${name}`,
       body: {
         from: conversationId,
+        to: "everyone",
+        kind: "tell",
         text: "<your message, plain text>",
         replyTo: conversationId,
       },
+      // Routing is two fields of the body, never words in its text (#258): a send copied
+      // from here without them went to everyone as a tell and woke the whole room.
+      fields:
+        "to is a member, as the room shows it, or everyone; kind is ask, tell or reaction." +
+        " Set them as these fields, never in text. Answer the member who asked: a tell to" +
+        " everyone wakes every session in the room.",
       command:
         `curl -s -X POST http://${host}:${port}/mail/${name}` +
         ` -H 'content-type: application/json' -H 'x-gyredeck-token: ${password}'` +
-        ` -d '{"from":"${conversationId}","text":"YOUR TEXT","replyTo":"${conversationId}"}'`,
+        ` -d '{"from":"${conversationId}","to":"everyone","kind":"tell","text":"YOUR TEXT","replyTo":"${conversationId}"}'`,
       success: '{"ok":true,"seq":<number>} — the seq is the room-wide sequence of your message.',
       failure: {
         403: "not_a_member or not_confirmed — you are out of the room, or have not presented its password.",
@@ -6465,13 +6504,9 @@ function startBridge(config) {
         room.createdBy = conversationId;
         const password = newRoomPassword();
         room.passwordHash = hashRoomPassword(password);
-        room.members.set(conversationId, {
+        const founder = {
           label: allocateLabel(room, conversationId),
-          // Pressing Create in this session's own detail panel is the same act of
-          // intent the password exists to capture, so the founder needs no password.
-          confirmed: true,
           joinedAt: new Date().toISOString(),
-          confirmedAt: new Date().toISOString(),
           // Joining mid-conversation should not replay what was said before: a member
           // starts from where the room is now.
           readSeq: room.seq,
@@ -6480,7 +6515,11 @@ function startBridge(config) {
           // was reopening woke nobody.
           streamSeq: room.seq,
           lastReadAt: null,
-        });
+        };
+        // Pressing Create in this session's own detail panel is the same act of intent the
+        // password exists to capture, so the founder needs no password.
+        markConfirmed(founder);
+        room.members.set(conversationId, founder);
         startHarvestAtEnd(conversationId);
         room.touchedAt = Date.now();
         // Told after the room exists, so the notice can name it and say who is there.
@@ -7128,8 +7167,11 @@ function startBridge(config) {
           ...describeInbox(collected, sync, as, missed),
           ...(() => {
             if (collect && sync) noteUsageCollected(sync.name, collected.filter((message) => message.room === sync.name && message.from === ROOM_SENDER), as);
-            const usageNotice = collect ? usageNoticeFor(as) : null;
-            const heavyNotice = collect ? heavyNoticeFor(as) : null;
+            // Neither notice on a wait's poll (#259): a wait prints only what wakes it and
+            // drops an empty poll whole, so a line handed to one would be gone. The hook's
+            // own drain, which prints them on every path, is what takes them.
+            const usageNotice = collect && !wakingOnly ? usageNoticeFor(as) : null;
+            const heavyNotice = collect && !wakingOnly ? heavyNoticeFor(as) : null;
             return { ...(usageNotice ? { usageNotice } : {}), ...(heavyNotice ? { heavyNotice } : {}) };
           })(),
         });
@@ -7247,10 +7289,7 @@ function startBridge(config) {
         // behalf, with no header to carry anything.
         if (room.members.has(from) && holdsRoomPassword(room, headerToken)) {
           const member = room.members.get(from);
-          if (member.confirmed !== true) {
-            member.confirmed = true;
-            member.confirmedAt = new Date().toISOString();
-          }
+          if (member.confirmed !== true) markConfirmed(member);
         }
         const refusal = refuseToPublish(room, from);
         if (refusal) {

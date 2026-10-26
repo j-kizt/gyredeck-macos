@@ -365,6 +365,29 @@ fn refused(error: &str, message: String) -> Value {
 
 /// The bridge's own rule for a mailbox name (`MAIL_ROOM_NAME`): a bind the bridge would
 /// not serve must not succeed here either.
+/// The notices a collect answer may carry beside its mail: said once by the bridge, and
+/// gone from it once said (#259).
+const NOTICES: [&str; 2] = ["heavyNotice", "usageNotice"];
+
+fn listed(answer: &Value, key: &str) -> bool {
+    answer.get(key).and_then(Value::as_array).is_some_and(|list| !list.is_empty())
+}
+
+/// Whether a collect answer hands anything over, and so is kept until acknowledged. A notice
+/// counts like mail: the bridge has already marked it said, so an answer holding only a
+/// notice is the only copy, and a refusal after the collect must not discard it (#259).
+pub(crate) fn carries(answer: &Value) -> bool {
+    listed(answer, "messages")
+        || listed(answer, "missed")
+        || NOTICES.iter().any(|key| answer.get(*key).and_then(Value::as_str).is_some_and(|text| !text.is_empty()))
+}
+
+/// A held batch with notices and no mail. A wait is not handed one: it prints only what
+/// wakes it, so it would take the batch again on every poll and never reach new mail.
+fn notices_only(batch: &Value) -> bool {
+    carries(batch) && !listed(batch, "messages") && !listed(batch, "missed")
+}
+
 fn is_session_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -470,13 +493,16 @@ pub(crate) fn handle_request(
                 return refused("unbound", format!("Process {} ({}) is bound to no session; bind first, from a hook of the same process.", peer.ancestor.pid, cli.label()));
             };
             // What this session was handed and has not acknowledged comes first, and alone:
-            // the bridge is not asked for more until it has been taken.
+            // the bridge is not asked for more until it has been taken. Except notices alone,
+            // to a wait: it asks the bridge, and they ride with the mail that wakes it.
             if let Some((delivery, mut batch)) = table.outstanding_for(&session) {
-                if let Value::Object(map) = &mut batch {
-                    map.insert("delivery".to_string(), json!(delivery));
-                    map.insert("redelivered".to_string(), Value::Bool(true));
+                if !(waking_only && notices_only(&batch)) {
+                    if let Value::Object(map) = &mut batch {
+                        map.insert("delivery".to_string(), json!(delivery));
+                        map.insert("redelivered".to_string(), Value::Bool(true));
+                    }
+                    return batch;
                 }
-                return batch;
             }
             // Reserved before the bridge is asked: a retry while this collect runs is told
             // to come back, and is then handed what this one took.
@@ -502,10 +528,20 @@ pub(crate) fn handle_request(
                     map.insert("v".to_string(), json!(PROTOCOL_VERSION));
                     map.insert("boundTo".to_string(), Value::String(session.clone()));
                 }
+                // A wait passed over held notices: they go with what it collected, in the one
+                // batch that replaces them. With nothing collected they stay held as they were.
+                if carries(&answer) {
+                    if let (Some((_, held)), Value::Object(map)) = (table.outstanding_for(&session), &mut answer) {
+                        for key in NOTICES {
+                            if let Some(text) = held.get(key).filter(|_| !map.contains_key(key)) {
+                                map.insert(key.to_string(), text.clone());
+                            }
+                        }
+                    }
+                }
                 // Anything handed over is kept until acknowledged; an empty answer moved
                 // nothing and needs no acknowledgement.
-                let carries = answer.get("messages").and_then(Value::as_array).is_some_and(|list| !list.is_empty())
-                    || answer.get("missed").and_then(Value::as_array).is_some_and(|list| !list.is_empty());
+                let carries = carries(&answer);
                 // Kept for the session whatever happened to this process meanwhile: it is
                 // the session's mail, and only that session's binding can take it.
                 let delivery = carries.then(|| table.hold(&session, answer.clone()));
@@ -1486,6 +1522,100 @@ mod tests {
         assert_eq!(recovered["delivery"], held, "the resumed session recovers the batch");
         assert_eq!(recovered["redelivered"], true);
         assert_eq!(ask(json!({ "v": 1, "ack": { "delivery": held } }), Some(&resumed), &bindings, &policy)["ok"], true);
+    }
+
+    #[test]
+    fn a_notice_is_carried_like_mail() {
+        assert!(carries(&json!({ "messages": [], "heavyNotice": "HEAVY RUNS: x" })), "the heavy line alone");
+        assert!(carries(&json!({ "messages": [], "usageNotice": "USAGE: x" })), "the usage line alone");
+        assert!(carries(&json!({ "messages": [{ "seq": 1 }] })));
+        assert!(carries(&json!({ "messages": [], "missed": [{ "count": 1 }] })));
+        assert!(!carries(&json!({ "messages": [] })), "an empty answer moved nothing");
+        assert!(!carries(&json!({ "messages": [], "heavyNotice": "" })), "an empty notice is none");
+        assert!(!carries(&json!({ "messages": [], "heavyNotice": null })));
+    }
+
+    /// The bridge marks a notice said when it answers (#259 r1), so a refusal after the
+    /// collect must keep it as it keeps mail; a wait passes over it, and takes it with mail.
+    #[test]
+    fn a_notice_only_batch_survives_a_refusal_after_the_collect_and_a_wait_takes_it_only_with_mail() {
+        let bindings = Mutex::new(Bindings::default());
+        let chain = Arc::new(Mutex::new(true));
+        let round = Arc::new(Mutex::new(0u32));
+        let policy = Policy {
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Antigravity)),
+            alive: Arc::new(|_| true),
+            chain_holds: Arc::new({ let chain = Arc::clone(&chain); move |_| *chain.lock().unwrap() }),
+            collect: Arc::new({
+                let chain = Arc::clone(&chain);
+                let round = Arc::clone(&round);
+                move |_: &str, _, _| {
+                    let mut round = round.lock().unwrap();
+                    *round += 1;
+                    Ok(match *round {
+                        // The requester changes while the bridge answers with the line alone.
+                        1 => { *chain.lock().unwrap() = false; json!({ "ok": true, "messages": [], "heavyNotice": "HEAVY RUNS: once" }) }
+                        3 => json!({ "ok": true, "messages": [{ "seq": 7, "text": "wakes it" }] }),
+                        _ => json!({ "ok": true, "messages": [] }),
+                    })
+                }
+            }),
+            report_bound: Arc::new(|_| Ok(())),
+        };
+        let agy = peer(42, 40, "agy");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&agy), &bindings, &policy)["ok"], true);
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&agy), &bindings, &policy)["error"], "unattested", "premise: refused after the collect");
+        assert_eq!(*round.lock().unwrap(), 1, "premise: the bridge was asked");
+        assert!(bindings.lock().unwrap().outstanding_for("s1").is_some(), "the line alone is kept");
+        *chain.lock().unwrap() = true;
+        // A wait is not handed the notices alone, and they stay held.
+        let waited = ask(json!({ "v": 1, "collect": { "wakingOnly": true } }), Some(&agy), &bindings, &policy);
+        assert_eq!(*round.lock().unwrap(), 2, "the wait asked the bridge");
+        assert!(waited.get("heavyNotice").is_none() && waited.get("delivery").is_none(), "and got nothing to hold");
+        assert!(bindings.lock().unwrap().outstanding_for("s1").is_some(), "still kept");
+        // Mail that wakes it carries them, in the one batch that replaces them.
+        let woke = ask(json!({ "v": 1, "collect": { "wakingOnly": true } }), Some(&agy), &bindings, &policy);
+        assert_eq!(woke["heavyNotice"], "HEAVY RUNS: once");
+        assert_eq!(woke["messages"][0]["seq"], 7);
+        let delivery = woke["delivery"].clone();
+        assert!(delivery.is_u64());
+        assert_eq!(ask(json!({ "v": 1, "ack": { "delivery": delivery } }), Some(&agy), &bindings, &policy)["ok"], true);
+        assert!(bindings.lock().unwrap().outstanding_for("s1").is_none());
+        let after = ask(json!({ "v": 1, "collect": {} }), Some(&agy), &bindings, &policy);
+        assert!(after.get("heavyNotice").is_none(), "not again after the ack");
+    }
+
+    #[test]
+    fn a_notice_only_batch_refused_after_the_collect_is_redelivered_to_the_drain_once() {
+        let bindings = Mutex::new(Bindings::default());
+        let chain = Arc::new(Mutex::new(true));
+        let round = Arc::new(Mutex::new(0u32));
+        let policy = Policy {
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            alive: Arc::new(|_| true),
+            chain_holds: Arc::new({ let chain = Arc::clone(&chain); move |_| *chain.lock().unwrap() }),
+            collect: Arc::new({
+                let chain = Arc::clone(&chain);
+                let round = Arc::clone(&round);
+                move |_: &str, _, _| {
+                    let mut round = round.lock().unwrap();
+                    *round += 1;
+                    if *round == 1 { *chain.lock().unwrap() = false; }
+                    Ok(if *round == 1 { json!({ "ok": true, "messages": [], "heavyNotice": "HEAVY RUNS: once" }) } else { json!({ "ok": true, "messages": [] }) })
+                }
+            }),
+            report_bound: Arc::new(|_| Ok(())),
+        };
+        let claude = peer(42, 40, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&claude), &bindings, &policy)["ok"], true);
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy)["error"], "unattested", "premise: refused after the collect");
+        *chain.lock().unwrap() = true;
+        let again = ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy);
+        assert_eq!(*round.lock().unwrap(), 1, "redelivered, not collected again");
+        assert_eq!(again["heavyNotice"], "HEAVY RUNS: once");
+        assert_eq!(again["redelivered"], true);
+        assert_eq!(ask(json!({ "v": 1, "ack": { "delivery": again["delivery"].clone() } }), Some(&claude), &bindings, &policy)["ok"], true);
+        assert!(ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy).get("heavyNotice").is_none(), "not again after the ack");
     }
 
     #[test]

@@ -1089,7 +1089,7 @@ async fn agy_usage() -> Result<CodexUsageSnapshot, String> {
         // The status line comes first: the fallback reads agy's token from the Keychain (#230).
         match agy_statusline::choose_usage(status, agy_usage_fallback)? {
             agy_statusline::AgyUsage::StatusLine(reading) => {
-                agy_statusline::relay_if_newer(&reading, &agy_statusline::LAST_RELAYED, relay_usage);
+                agy_statusline::relay_if_fresh(&reading, relay_usage);
                 Ok(reading.snapshot)
             }
             agy_statusline::AgyUsage::Fallback(snapshot) => {
@@ -4502,79 +4502,89 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
         .map_err(|e| format!("Failed to resolve resource: {e}"))?;
     // agy's settings.json is refused before anything is copied, not after (#230).
     let statusline_paths = agy_statusline::AgyStatusLinePaths::from_home()?;
-    agy_statusline::read_json_object(&statusline_paths.settings)?;
+    agy_statusline::preflight(&statusline_paths)?;
+    // A later step that fails puts back every file the install touched, so a refusal does
+    // not leave the hook half-registered.
+    let touched = [
+        install_path.clone(),
+        hooks_json_path.clone(),
+        statusline_paths.script(),
+        statusline_paths.chain(),
+        statusline_paths.previous(),
+    ];
+    agy_statusline::with_rollback(&touched, || {
+        let Some(parent) = install_path.parent() else {
+            return Err("Failed to resolve config directory".to_string());
+        };
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create config directory: {error}"))?;
+        fs::copy(&resource_path, &install_path)
+            .map_err(|error| format!("Failed to copy hook script: {error}"))?;
 
-    let Some(parent) = install_path.parent() else {
-        return Err("Failed to resolve config directory".to_string());
-    };
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("Failed to create config directory: {error}"))?;
-    fs::copy(&resource_path, &install_path)
-        .map_err(|error| format!("Failed to copy hook script: {error}"))?;
+        let installed_path = install_path.to_string_lossy().to_string();
 
-    let installed_path = install_path.to_string_lossy().to_string();
-
-    let mut hooks_root: serde_json::Value = if hooks_json_path.exists() {
-        let content = fs::read_to_string(&hooks_json_path)
-            .map_err(|e| format!("Failed to read hooks.json: {e}"))?;
-        if content.trim().is_empty() {
-            serde_json::json!({})
+        let mut hooks_root: serde_json::Value = if hooks_json_path.exists() {
+            let content = fs::read_to_string(&hooks_json_path)
+                .map_err(|e| format!("Failed to read hooks.json: {e}"))?;
+            if content.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&content)
+                    .map_err(|e| format!("Failed to parse hooks.json: {e}"))?
+            }
         } else {
-            serde_json::from_str(&content)
-                .map_err(|e| format!("Failed to parse hooks.json: {e}"))?
+            serde_json::json!({})
+        };
+
+        if !hooks_root.is_object() {
+            hooks_root = serde_json::json!({});
         }
-    } else {
-        serde_json::json!({})
-    };
+        let root = hooks_root.as_object_mut().expect("hooks.json is object");
 
-    if !hooks_root.is_object() {
-        hooks_root = serde_json::json!({});
-    }
-    let root = hooks_root.as_object_mut().expect("hooks.json is object");
+        let entry = serde_json::json!({
+            "PreToolUse": [{
+                "matcher": ".*",
+                "hooks": [{"type": "command", "command": node_hook_command(&installed_path, "PreToolUse")}]
+            }],
+            "PostToolUse": [{
+                "matcher": ".*",
+                "hooks": [{"type": "command", "command": node_hook_command(&installed_path, "PostToolUse")}]
+            }],
+            "PreInvocation": [
+                {"type": "command", "command": node_hook_command(&installed_path, "PreInvocation")}
+            ],
+            "PostInvocation": [
+                {"type": "command", "command": node_hook_command(&installed_path, "PostInvocation")}
+            ],
+            // Antigravity reads the Stop hook's response as a decision about whether the
+            // turn may end, so the adapter must answer "allow" here. It once answered
+            // "continue" — meaning "keep going" — and the agent replied to every finished
+            // turn with "Stop hook blocked termination", looping forever.
+            "Stop": [
+                {"type": "command", "command": node_hook_command(&installed_path, "Stop")}
+            ],
+        });
+        // Drop the previous brand's namespace so it can't fire alongside Gyredeck.
+        root.remove("agent-activity");
+        root.insert("gyredeck".to_string(), entry);
 
-    let entry = serde_json::json!({
-        "PreToolUse": [{
-            "matcher": ".*",
-            "hooks": [{"type": "command", "command": node_hook_command(&installed_path, "PreToolUse")}]
-        }],
-        "PostToolUse": [{
-            "matcher": ".*",
-            "hooks": [{"type": "command", "command": node_hook_command(&installed_path, "PostToolUse")}]
-        }],
-        "PreInvocation": [
-            {"type": "command", "command": node_hook_command(&installed_path, "PreInvocation")}
-        ],
-        "PostInvocation": [
-            {"type": "command", "command": node_hook_command(&installed_path, "PostInvocation")}
-        ],
-        // Antigravity reads the Stop hook's response as a decision about whether the
-        // turn may end, so the adapter must answer "allow" here. It once answered
-        // "continue" — meaning "keep going" — and the agent replied to every finished
-        // turn with "Stop hook blocked termination", looping forever.
-        "Stop": [
-            {"type": "command", "command": node_hook_command(&installed_path, "Stop")}
-        ],
-    });
-    // Drop the previous brand's namespace so it can't fire alongside Gyredeck.
-    root.remove("agent-activity");
-    root.insert("gyredeck".to_string(), entry);
+        let Some(hooks_parent) = hooks_json_path.parent() else {
+            return Err("Failed to resolve Gemini config directory".to_string());
+        };
+        fs::create_dir_all(hooks_parent)
+            .map_err(|error| format!("Failed to create Gemini config directory: {error}"))?;
 
-    let Some(hooks_parent) = hooks_json_path.parent() else {
-        return Err("Failed to resolve Gemini config directory".to_string());
-    };
-    fs::create_dir_all(hooks_parent)
-        .map_err(|error| format!("Failed to create Gemini config directory: {error}"))?;
+        let json_string = serde_json::to_string_pretty(&hooks_root)
+            .map_err(|e| format!("Failed to stringify hooks.json: {e}"))?;
+        fs::write(&hooks_json_path, format!("{json_string}\n"))
+            .map_err(|error| format!("Failed to write hooks.json: {error}"))?;
 
-    let json_string = serde_json::to_string_pretty(&hooks_root)
-        .map_err(|e| format!("Failed to stringify hooks.json: {e}"))?;
-    fs::write(&hooks_json_path, format!("{json_string}\n"))
-        .map_err(|error| format!("Failed to write hooks.json: {error}"))?;
+        // Usage comes from agy's status-line payload, so the install also points agy's status
+        // line at the script, keeping the person's own one chained behind it (#230).
+        agy_statusline::install(&statusline_paths, &statusline_resource)?;
 
-    // Usage comes from agy's status-line payload, so the install also points agy's status
-    // line at the script, keeping the person's own one chained behind it (#230).
-    agy_statusline::install(&statusline_paths, &statusline_resource)?;
-
-    Ok(installed_path)
+        Ok(installed_path)
+    })
 }
 
 /// Put back the status line agy had before `install_agy_hook`, and remove the payload and

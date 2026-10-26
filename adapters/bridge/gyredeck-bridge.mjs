@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 9;
+export const ROOM_RULES_VERSION = 10;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -248,8 +248,12 @@ room names the version it expects; if it names a newer one than you read, read t
 - Leaving the fields out sends a tell to everyone and wakes every session in the room.
 
 ## Sending
-- Claude Code and Antigravity: the command is in the delivery, under REPLY, whenever there is something to answer. Put the room's password in place of \`THE ROOM PASSWORD\`.
-- Codex: you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\` — and is removed before the room sees it. Say everything in one closing message.
+- Claude Code and Antigravity: the command is in the delivery, under REPLY, whenever there is something to answer. Put the room's password in place of \`THE ROOM PASSWORD\`. Who a message is for and what it is for are fields of what you post, beside the text:
+\`\`\`json
+{"from":"<your id>","to":"<member or everyone>","kind":"ask|tell|reaction","text":"<your message>","replyTo":"<your id>"}
+\`\`\`
+- Claude Code and Antigravity never put \`[to: …]\` or \`@…\` in \`text\`: they route only through the \`to\` and \`kind\` fields.
+- Codex only — you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\` — and is removed before the room sees it. This first line is Codex's alone. Say everything in one closing message.
 - A send happened only if you saw \`ok:true\` and a \`seq\`. Never say you sent something you did not see land.
 - Codex: your seq is reported on the next message you get, with the turn, recipient and kind it belongs to. Until then a message has not failed — **do not send it again**. A room or a mailbox posts an identical tell to the same member within a minute only once. Claude Code and Antigravity, which post with curl, can add \`"again": true\` to say the same thing again on purpose; Codex has no such switch, so a word-for-word repeat within the minute is taken as a resend.
 - \`listening\` in a receipt names the members with a watch open; a member that is pushed to, as Codex is, hears you without one.
@@ -4425,13 +4429,21 @@ function startBridge(config) {
       url: `http://${host}:${port}/mail/${name}`,
       body: {
         from: conversationId,
+        to: "everyone",
+        kind: "tell",
         text: "<your message, plain text>",
         replyTo: conversationId,
       },
+      // Routing is two fields of the body, never words in its text (#258): a send copied
+      // from here without them went to everyone as a tell and woke the whole room.
+      fields:
+        "to is a member, as the room shows it, or everyone; kind is ask, tell or reaction." +
+        " Set them as these fields, never in text. Answer the member who asked: a tell to" +
+        " everyone wakes every session in the room.",
       command:
         `curl -s -X POST http://${host}:${port}/mail/${name}` +
         ` -H 'content-type: application/json' -H 'x-gyredeck-token: ${password}'` +
-        ` -d '{"from":"${conversationId}","text":"YOUR TEXT","replyTo":"${conversationId}"}'`,
+        ` -d '{"from":"${conversationId}","to":"everyone","kind":"tell","text":"YOUR TEXT","replyTo":"${conversationId}"}'`,
       success: '{"ok":true,"seq":<number>} — the seq is the room-wide sequence of your message.',
       failure: {
         403: "not_a_member or not_confirmed — you are out of the room, or have not presented its password.",

@@ -8,6 +8,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { connect as netConnect, createServer } from "node:net";
 import { randomBytes, randomUUID } from "node:crypto";
 import test, { after } from "node:test";
+import { ROOM_RULES_VERSION } from "../adapters/bridge/gyredeck-bridge.mjs";
 
 const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const CONFIG_DIR = [".config", "gyredeck"];
@@ -1586,7 +1587,7 @@ test("a room delivery carries only what the session can use, and points at the r
     // The file every delivery points at exists as soon as the bridge does, at the version
     // a delivery names.
     const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
-    assert.match(rules, /^# Gyredeck room rules — v9\n/);
+    assert.match(rules, new RegExp(`^# Gyredeck room rules — v${ROOM_RULES_VERSION}\n`));
     assert.match(rules, /Never answer a reaction/);
     // #208: a new Claude Code session lists every expired watch as an unfinished task, and
     // nothing said that was harmless.
@@ -1633,7 +1634,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/sync/rooms/${code}/confirm`, { conversationId: agy, password: minted.password });
     await steps();
     const opening = await context();
-    assert.match(opening, /Rules v9: ~\/\.config\/gyredeck\/room-rules\.md — read it once per conversation/);
+    assert.match(opening, new RegExp(`Rules v${ROOM_RULES_VERSION}: ~/\\.config/gyredeck/room-rules\\.md — read it once per conversation`));
     // Nothing but the room talking about itself: nothing to answer, so no command for it.
     assert.doesNotMatch(opening, /REPLY —/);
 
@@ -1693,7 +1694,7 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/mail/${code}`, { from: peer, to: agy, kind: "reaction", text: "noted" });
     const agyReaction = await steps();
     assert.match(agyReaction, /\[gyredeck mail · from Codex · reaction\] noted/);
-    assert.match(agyReaction, /Rules v9: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(agyReaction, new RegExp(`Rules v${ROOM_RULES_VERSION}: ~/\\.config/gyredeck/room-rules\\.md`));
     assert.doesNotMatch(agyReaction, /answering is expected/);
     assert.match(agyReaction, /never answer a reaction/);
     assert.match(agyReaction, /ok:true and a seq/);
@@ -5721,7 +5722,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // The confirming push is the full brief, and names the rules file the short form of
     // every later push points at (#157).
     assert.match(afterConfirm.at(-1), /Do not call Gyredeck/);
-    assert.match(afterConfirm.at(-1), /The full rules are in ~\/\.config\/gyredeck\/room-rules\.md \(v9\)/);
+    assert.match(afterConfirm.at(-1), new RegExp(`The full rules are in ~/\\.config/gyredeck/room-rules\\.md \\(v${ROOM_RULES_VERSION}\\)`));
 
     // Typing it twice is the same question. Nothing is announced again and nothing is
     // pushed again, because there is nothing outstanding to carry.
@@ -5751,7 +5752,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // given on confirmation (#157).
     assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} — how to answer: `));
     assert.match(afterLater.at(-1), /@<member or everyone> ask\|tell\|reaction — never answer a reaction/);
-    assert.match(afterLater.at(-1), /Rules v9: ~\/\.config\/gyredeck\/room-rules\.md/);
+    assert.match(afterLater.at(-1), new RegExp(`Rules v${ROOM_RULES_VERSION}: ~/\\.config/gyredeck/room-rules\\.md`));
     assert.match(afterLater.at(-1), /Members now: /);
     assert.doesNotMatch(afterLater.at(-1), /Do not call Gyredeck/);
     // And says which kind it is: a tell and a reaction with the same words must not
@@ -10294,10 +10295,10 @@ test("heavy C11: a helper that cannot reach the bridge, or meets another version
   }
 });
 
-test("heavy rules v9: the rules list the heavy commands, the helper and the limit", async () => {
+test("heavy rules: the rules list the heavy commands, the helper and the limit", async () => {
   const { roomRules, HEAVY_COMMANDS, HEAVY_LIMIT_TEXT } = await heavyModule();
   const rules = roomRules("http://127.0.0.1:47621");
-  assert.match(rules, /^# Gyredeck room rules — v9\n/);
+  assert.match(rules, new RegExp(`^# Gyredeck room rules — v${ROOM_RULES_VERSION}\n`));
   assert.match(rules, /## Heavy runs/);
   for (const name of ["test:demo", "test:hooks", "test:performance", "test:budget", "desktop:build", "desktop:install", "cargo test", "cargo build", "cargo check"]) {
     assert.ok(rules.includes(`\`${name}\``), name);
@@ -11866,14 +11867,110 @@ test("room notices C5: a heavy-run notice wakes nobody — no frame to a watch, 
   }
 });
 
-test("rules v9: the Heavy runs section asks for light work while a run holds the slot", async () => {
-  const { roomRules, ROOM_RULES_VERSION } = await heavyModule();
-  assert.equal(ROOM_RULES_VERSION, 9);
+test("rules: the Heavy runs section asks for light work while a run holds the slot", async () => {
+  const { roomRules } = await heavyModule();
   const rules = roomRules("http://127.0.0.1:1");
   const section = rules.slice(rules.indexOf("## Heavy runs"));
   assert.ok(section.startsWith("## Heavy runs"), "premise: the section agy is pointed at");
   assert.match(section, /While a heavy run holds the slot — yours or anyone's — do light work only/);
 });
+
+// ── #258: routing is fields of the payload, and the first-line syntax is Codex's alone ──
+//
+//  C1  `## Sending` holds a JSON example with `to`, `kind` and `text` as separate keys.
+//  C2  It says Claude Code and Antigravity never put `[to:` or `@` in `text`.
+//  C3  Every occurrence of the first-line `@<member …>` syntax sits on a Codex-only line.
+//  C4  The rules file and every delivery name ROOM_RULES_VERSION (the derived asserts above).
+//  C5  `/confirm`'s howTo.send carries `to` and `kind` in body and command, and the command
+//      posted as-is lands with exactly the to and kind it carries.
+//  C6  The inline RULES line says "fields" on every room delivery, Claude and agy.
+
+const sendingSection = (rules) => {
+  const start = rules.indexOf("## Sending");
+  assert.ok(start >= 0, "premise: the section is there");
+  const end = rules.indexOf("\n## ", start + 1);
+  return rules.slice(start, end < 0 ? undefined : end);
+};
+const RULES_FIELDS = "as the to and kind fields of anything you send, never in the text";
+
+test("#258 C1 C2 C3: the Sending section shows the payload and keeps the first line Codex's", async () => {
+  const { roomRules } = await heavyModule();
+  const rules = roomRules("http://127.0.0.1:1");
+  const section = sendingSection(rules);
+  const fenced = /```json\n([^`]+)\n```/.exec(section);
+  assert.ok(fenced, "C1: a fenced json example in the section");
+  const example = JSON.parse(fenced[1]);
+  for (const key of ["to", "kind", "text"]) assert.equal(typeof example[key], "string", `C1: ${key} is its own field`);
+  assert.doesNotMatch(example.text, /\[to:|@|kind/, "C1: no routing inside text");
+  assert.ok(section.includes("Claude Code and Antigravity never put `[to: …]` or `@…` in `text`: they route only through the `to` and `kind` fields."), "C2");
+  const syntaxLines = rules.split("\n").filter((line) => line.includes("`@<"));
+  assert.ok(syntaxLines.length >= 1, "premise: the first-line syntax is described");
+  for (const line of syntaxLines) assert.ok(line.startsWith("- Codex only"), `C3: on a Codex-only line: ${line}`);
+});
+
+test("#258 C5: the send /confirm hands back carries to and kind, and posting it lands them", async () => {
+  const f = await agyPasteFixture("c5send");
+  try {
+    const confirmed = await f.call("POST", `/sync/rooms/${f.code}/confirm`, { conversationId: f.agy, password: f.password });
+    assert.equal(confirmed.status, 200, "premise: confirmed");
+    const { send } = confirmed.body.howTo;
+    assert.equal(send.body.to, "everyone");
+    assert.equal(send.body.kind, "tell");
+    assert.ok(!/\[to:|@/.test(send.body.text), "no routing inside text");
+    assert.match(send.fields, /never in text/);
+    const post = (command) => {
+      const ran = spawnSync("sh", ["-c", command], { encoding: "utf8" });
+      assert.equal(ran.status, 0, ran.stderr);
+      const answer = JSON.parse(ran.stdout);
+      assert.equal(answer.ok, true, ran.stdout);
+      return answer.seq;
+    };
+    const landed = async (seq) => {
+      const read = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}?as=${f.founder}&since=${seq - 1}`, { headers: { "x-gyredeck-token": f.password } });
+      const message = (await read.json()).messages.find((m) => m.seq === seq);
+      assert.ok(message, `premise: seq ${seq} is in the room`);
+      return message;
+    };
+    // As handed out: the defaults are fields, and they land.
+    assert.ok(send.command.includes('"to":"everyone","kind":"tell"'), "the command carries both");
+    const asIs = await landed(post(send.command.replace("YOUR TEXT", "as handed out")));
+    assert.deepEqual([asIs.to, asIs.kind, asIs.text], ["everyone", "tell", "as handed out"]);
+    // Addressed: the same command with its fields filled reaches the one member, as an ask.
+    const addressed = send.command.replace("YOUR TEXT", "to the founder").replace('"to":"everyone"', `"to":"${f.founder}"`).replace('"kind":"tell"', '"kind":"ask"');
+    const one = await landed(post(addressed));
+    assert.deepEqual([one.to, one.kind, one.text], [f.founder, "ask", "to the founder"]);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const provider of ["claude", "agy"]) {
+  test(`#258 C6: the inline RULES line says fields, ${provider}`, async () => {
+    const f = await agyPasteFixture(`c6${provider}`);
+    try {
+      let text;
+      if (provider === "agy") {
+        await f.confirm();
+        text = (await f.invoke()).text;
+      } else {
+        const claude = "a2580000-0000-4000-8000-000000000003";
+        await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: claude });
+        assert.equal((await f.call("POST", `/sync/rooms/${f.code}/confirm`, { conversationId: claude, password: f.password })).status, 200);
+        const result = await runAdapter(
+          "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], f.home,
+          { hook_event_name: "UserPromptSubmit", session_id: claude, cwd: "/tmp/project", prompt: "hi" },
+        );
+        assert.equal(result.code, 0, result.stderr);
+        text = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+      }
+      assert.match(text, new RegExp(`Gyredeck sync room ${f.code}\\b`), "premise: a room delivery");
+      assert.ok(text.includes("RULES: "), "premise: the inline line is there");
+      assert.equal(text.split(RULES_FIELDS).length - 1, 1, `${provider}: says fields, once`);
+    } finally {
+      await f.close();
+    }
+  });
+}
 
 // ── Quiet means quiet on every path (#244 audit r1) ──
 //

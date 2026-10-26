@@ -783,8 +783,8 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // is exactly where "never answer a reaction" is needed.
   if (room_) {
     standing.push(
-      "RULES: set to (a member, as the room shows it, or everyone) and kind (ask, tell or reaction) on" +
-        " anything you send; never answer a reaction; a send happened only if you saw" +
+      "RULES: set to (a member, as the room shows it, or everyone) and kind (ask, tell or reaction) as" +
+        " the to and kind fields of anything you send, never in the text; never answer a reaction; a send happened only if you saw" +
         " ok:true and a seq.",
     );
   }

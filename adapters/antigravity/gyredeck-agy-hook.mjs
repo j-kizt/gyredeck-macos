@@ -1028,8 +1028,8 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
   // On every room delivery, answerable or not (#157 audit).
   if (syncRoom) {
     parts.push(
-      "RULES: set to (a member, as the room shows it, or everyone) and kind (ask, tell or reaction) on" +
-        " anything you send; never answer a reaction; a send happened only if you saw" +
+      "RULES: set to (a member, as the room shows it, or everyone) and kind (ask, tell or reaction) as" +
+        " the to and kind fields of anything you send, never in the text; never answer a reaction; a send happened only if you saw" +
         " ok:true and a seq.",
     );
     if (!rules) parts.push('A message says who it is for and what it is for. "to" is a member\'s name or "everyone"; "kind" is one of four. **ask** wants an answer. **tell** does not, but may draw a reaction. **reaction** is a short line saying it landed and where that leaves you — send one for a tell or for a notice about somebody joining or leaving, address it wherever you like since it asks for nothing back, and never answer one: that is where an exchange stops. **notice** is the room speaking about itself and interrupts nobody. Leave the fields out and the message goes to everyone as tell, waking every session in the room. When you answer someone, address it to them — that is what keeps one exchange costing one wake instead of waking the room.');

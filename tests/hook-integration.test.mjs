@@ -11962,3 +11962,130 @@ for (const hook of QUIET_HOOKS) {
     }
   });
 }
+
+// ── A waking message behind a pile of quiet ones (#244 r3) ──
+//
+// In a waiting collect, only what wakes counts toward `limit`; every quiet message before
+// it rides along. Over both ways a wait collects — the broker and TCP `/mail/wait` — for
+// both hooks. 12 quiet notices outnumber the 10 a batch holds.
+
+const QUIET_PILE = 12;
+/** A room whose founder has `quiet` quiet notices pending, then a tell if `tell`; a stateful broker when `broker`. */
+const quietPile = async (tag, { quiet = QUIET_PILE, tell = true, broker = true } = {}) => {
+  const h = await heavyHarness(`pl-${tag}`);
+  try {
+    await h.start();
+    const q = await quietRoom(h, tag);
+    await q.join();
+    await fetch(`${h.base}/mail/inbox?as=${q.founder}&collect=1`, { headers: { "x-gyredeck-token": h.token() } });
+    // Each new observed run says one start and one end of the run before it.
+    for (let index = 0; index * 2 < quiet - 1; index += 1) await reportObserved(h, [observedRun({ pid: 7000 + index })]);
+    if (quiet > 0 && quiet % 2 === 0) await reportObserved(h, []);
+    if (tell) await q.say("WAKE-BEHIND-QUIET");
+    const pending = async () => (await fetch(`${h.base}/mail/inbox?as=${q.founder}&limit=100`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json())).messages ?? [];
+    const now = await pending();
+    assert.equal(now.filter((m) => m.quiet === true).length, quiet, `premise: ${quiet} quiet notices pending`);
+    assert.equal(now.filter((m) => m.text === "WAKE-BEHIND-QUIET").length, tell ? 1 : 0, "premise: the tell, or none");
+    const fake = broker ? await statefulBroker(h, h.home, q.founder) : null;
+    if (!broker) {
+      const probe = await new Promise((resolve) => {
+        const socket = netConnect(join(h.home, ...CONFIG_DIR, "broker", "gyredeck.broker.sock"));
+        socket.on("error", (error) => resolve(error.code));
+        socket.on("connect", () => { socket.destroy(); resolve("connected"); });
+      });
+      assert.equal(probe, "ENOENT", "premise: no broker, so the hook waits over TCP");
+    }
+    const children = new Set();
+    const wait = (hook, seconds) => {
+      const child = spawn(process.execPath, [hook.path, "wait", String(seconds), q.founder], { cwd: repoRoot, env: { ...process.env, HOME: h.home }, stdio: ["ignore", "pipe", "pipe"] });
+      const out = { stdout: "", stderr: "", child };
+      child.stdout.on("data", (chunk) => { out.stdout += chunk; });
+      child.stderr.on("data", (chunk) => { out.stderr += chunk; });
+      out.exited = new Promise((resolve) => child.on("exit", (code) => resolve(code)));
+      children.add(child);
+      return out;
+    };
+    const cleanup = async () => {
+      for (const child of children) { try { child.kill("SIGKILL"); } catch {} child.stdout.destroy(); child.stderr.destroy(); }
+      await fake?.close();
+      await h.cleanup();
+    };
+    return { h, q, broker: fake, pending, wait, cleanup };
+  } catch (error) {
+    await h.cleanup();
+    throw error;
+  }
+};
+const shape = (messages) => messages.map((m) => (m.quiet === true ? "Q" : m.text)).join(",");
+const PILED = `${Array(QUIET_PILE).fill("Q").join(",")},WAKE-BEHIND-QUIET`;
+
+const pileRows = [
+  { row: "12 quiet + a tell: the wait wakes with all of them, in order", quiet: QUIET_PILE, tell: true, want: PILED },
+  { row: "0 quiet + a tell (control)", quiet: 0, tell: true, want: "WAKE-BEHIND-QUIET" },
+  { row: "12 quiet, no tell: nothing taken, no cursor moved", quiet: QUIET_PILE, tell: false, want: null },
+];
+let pileTag = 0;
+for (const hook of QUIET_HOOKS) {
+  for (const path of ["broker", "tcp"]) {
+    for (const { row, quiet, tell, want } of pileRows) {
+      test(`quiet r3 [${hook.name} · ${path}]: ${row}`, async () => {
+        pileTag += 1;
+        const f = await quietPile(`${pileTag}`, { quiet, tell, broker: path === "broker" });
+        try {
+          const waiting = f.wait(hook, want === null ? 2 : 10);
+          const code = await waiting.exited;
+          if (want === null) {
+            assert.equal(code, hook.timedOutCode, waiting.stderr);
+            assert.ok(!waiting.stdout.includes("HEAVY RUN"), "nothing quiet was handed over");
+            assert.equal((await f.pending()).filter((m) => m.quiet === true).length, QUIET_PILE, "and nothing was taken");
+          } else {
+            assert.equal(code, 0, waiting.stderr);
+            const answer = JSON.parse(waiting.stdout);
+            assert.equal(answer.timedOut, false);
+            assert.equal(shape(answer.messages), want);
+            if (path === "broker") await until(() => f.broker.outstanding() === null, "the hook acknowledged it");
+            assert.equal((await f.pending()).length, 0, "the cursor moved past all of them");
+          }
+        } finally {
+          await f.cleanup();
+        }
+      });
+    }
+    test(`quiet r3 [${hook.name} · ${path}]: a wait killed over 12 quiet, then a tell — nothing is lost`, async () => {
+      pileTag += 1;
+      const f = await quietPile(`${pileTag}`, { tell: false, broker: path === "broker" });
+      try {
+        const waiting = f.wait(hook, 10);
+        // Premise: it has looked at least once and found nothing that wakes it.
+        if (path === "broker") await until(() => waitingCollects(f.broker) >= 1, "a waiting collect");
+        else await settle(1_000);
+        assert.equal(waiting.stdout, "");
+        waiting.child.kill("SIGKILL");
+        await waiting.exited;
+        await f.q.say("WAKE-BEHIND-QUIET");
+        assert.equal(shape(await f.pending()), PILED, "all twelve and the tell are still there");
+      } finally {
+        await f.cleanup();
+      }
+    });
+  }
+}
+
+test("quiet r3: a foreground collect pages by the plain limit, quiet included — through the broker and over TCP", async () => {
+  for (const path of ["broker", "tcp"]) {
+    pileTag += 1;
+    const f = await quietPile(`${pileTag}`, { broker: path === "broker" });
+    try {
+      const page = async () => {
+        if (path === "tcp") return fetch(`${f.h.base}/mail/inbox?as=${f.q.founder}&collect=1&limit=10`, { headers: { "x-gyredeck-token": f.h.token() } }).then((r) => r.json());
+        const batch = await f.broker.ask({ v: 1, collect: { limit: 10 } });
+        if (batch.delivery) await f.broker.ask({ v: 1, ack: { delivery: batch.delivery } });
+        return batch;
+      };
+      assert.equal(shape((await page()).messages), Array(10).fill("Q").join(","), path);
+      assert.equal(shape((await page()).messages), "Q,Q,WAKE-BEHIND-QUIET", path);
+    } finally {
+      await f.cleanup();
+    }
+  }
+});

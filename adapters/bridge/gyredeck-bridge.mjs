@@ -6998,10 +6998,23 @@ function startBridge(config) {
           // publish order: within a millisecond, one room's seq says nothing about
           // another's.
           fresh.sort((left, right) => (left.ord ?? 0) - (right.ord ?? 0));
-          const collected = fresh.slice(0, limit);
           const own = mailRoomFor(as, false);
-          if (wakingOnly && missed.length === 0 && !collected.some((message) => (message.room === as && own ? message.quiet !== true : wakesMember(message, as)))) {
-            return { collected: [], sync, missed: [] };
+          const wakes = (message) => (message.room === as && own ? message.quiet !== true : wakesMember(message, as));
+          // A waiting collect counts only what wakes toward `limit`: everything quiet before
+          // the last message it takes rides along, so quiet mail can never fill a batch and
+          // hide what is waiting behind it (#244 r3). Bounded all the same — quiet messages
+          // are the room's own notices, kept to MAIL_MAX_NOTICES (32) per room.
+          let collected = fresh.slice(0, limit);
+          if (wakingOnly) {
+            let taken = 0;
+            let end = -1;
+            for (let index = 0; index < fresh.length && taken < limit; index += 1) {
+              if (!wakes(fresh[index])) continue;
+              taken += 1;
+              end = index;
+            }
+            if (end < 0 && missed.length === 0) return { collected: [], sync, missed: [] };
+            if (end >= 0) collected = fresh.slice(0, end + 1);
           }
 
           if (collect) {

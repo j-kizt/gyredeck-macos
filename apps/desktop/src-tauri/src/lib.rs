@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+mod agy_statusline;
 mod broker;
 mod github;
 mod heavy_watch;
@@ -1081,12 +1082,29 @@ fn format_codex_usage_error(error: CodexUsageFetchError) -> String {
 
 #[tauri::command]
 async fn agy_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(|| agy_usage_blocking().inspect(relay_usage))
-        .await
-        .map_err(|error| format!("Antigravity usage task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(|| {
+        let status = agy_statusline::AgyStatusLinePaths::from_home()
+            .ok()
+            .and_then(|paths| agy_statusline::read_reading(&paths.payload(), agy_statusline::unix_now()));
+        // The status line comes first: the fallback reads agy's token from the Keychain (#230).
+        match agy_statusline::choose_usage(status, agy_usage_fallback)? {
+            agy_statusline::AgyUsage::StatusLine(reading) => {
+                agy_statusline::relay_if_newer(&reading, &agy_statusline::LAST_RELAYED, relay_usage);
+                Ok(reading.snapshot)
+            }
+            agy_statusline::AgyUsage::Fallback(snapshot) => {
+                relay_usage(&snapshot);
+                Ok(snapshot)
+            }
+        }
+    })
+    .await
+    .map_err(|error| format!("Antigravity usage task failed: {error}"))?
 }
 
-fn agy_usage_blocking() -> Result<CodexUsageSnapshot, String> {
+/// The language server and the cloud path, both of which need agy's credentials. Reached
+/// only when agy's status line has nothing fresh (#230).
+fn agy_usage_fallback() -> Result<CodexUsageSnapshot, String> {
     if let Some(snapshot) = probe_antigravity_ls_usage() {
         return Ok(snapshot);
     }
@@ -4079,20 +4097,20 @@ fn read_antigravity_user_status_plan(data: &Value) -> Option<String> {
         })
 }
 
+/// Antigravity's quota buckets by id, as the cloud summary and agy's status line both name
+/// them, in the order the panel shows them.
+const AGY_QUOTA_BUCKETS: [(&str, &str, u64); 4] = [
+    ("gemini-5h", "Gemini 5h", 5 * 60 * 60 * 1000),
+    ("gemini-weekly", "Gemini Weekly", 7 * 24 * 60 * 60 * 1000),
+    ("3p-5h", "Claude and GPT 5h", 5 * 60 * 60 * 1000),
+    ("3p-weekly", "Claude and GPT Weekly", 7 * 24 * 60 * 60 * 1000),
+];
+
 fn build_antigravity_quota_summary_lines(response: &Value) -> Option<Vec<CodexMetricLine>> {
     let response = response.get("response").unwrap_or(response);
     let groups = response.get("groups").and_then(Value::as_array)?;
 
-    const BUCKETS: [(&str, &str, u64); 4] = [
-        ("gemini-5h", "Gemini 5h", 5 * 60 * 60 * 1000),
-        ("gemini-weekly", "Gemini Weekly", 7 * 24 * 60 * 60 * 1000),
-        ("3p-5h", "Claude and GPT 5h", 5 * 60 * 60 * 1000),
-        (
-            "3p-weekly",
-            "Claude and GPT Weekly",
-            7 * 24 * 60 * 60 * 1000,
-        ),
-    ];
+    const BUCKETS: [(&str, &str, u64); 4] = AGY_QUOTA_BUCKETS;
     let mut resolved = BTreeMap::new();
 
     for bucket in groups
@@ -4478,6 +4496,13 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
             tauri::path::BaseDirectory::Resource,
         )
         .map_err(|e| format!("Failed to resolve resource: {e}"))?;
+    let statusline_resource = app
+        .path()
+        .resolve(agy_statusline::SCRIPT_NAME, tauri::path::BaseDirectory::Resource)
+        .map_err(|e| format!("Failed to resolve resource: {e}"))?;
+    // agy's settings.json is refused before anything is copied, not after (#230).
+    let statusline_paths = agy_statusline::AgyStatusLinePaths::from_home()?;
+    agy_statusline::read_json_object(&statusline_paths.settings)?;
 
     let Some(parent) = install_path.parent() else {
         return Err("Failed to resolve config directory".to_string());
@@ -4545,7 +4570,18 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
     fs::write(&hooks_json_path, format!("{json_string}\n"))
         .map_err(|error| format!("Failed to write hooks.json: {error}"))?;
 
+    // Usage comes from agy's status-line payload, so the install also points agy's status
+    // line at the script, keeping the person's own one chained behind it (#230).
+    agy_statusline::install(&statusline_paths, &statusline_resource)?;
+
     Ok(installed_path)
+}
+
+/// Put back the status line agy had before `install_agy_hook`, and remove the payload and
+/// the script (#230). Nothing in the panel calls it yet.
+#[tauri::command]
+fn uninstall_agy_statusline() -> Result<(), String> {
+    agy_statusline::uninstall(&agy_statusline::AgyStatusLinePaths::from_home()?)
 }
 
 fn codex_notify_install_path() -> Result<PathBuf, String> {
@@ -4873,7 +4909,28 @@ fn agy_hook_status(app: tauri::AppHandle) -> Result<(String, bool, Option<bool>)
     let installed = install_path.exists() && in_hooks;
     // Stale only matters once it is installed: an absent adapter is already reported
     // as missing, and calling it out of date as well says the same thing twice.
-    let stale = if installed { hook_is_stale(&app, "gyredeck-agy-hook.mjs", &install_path) } else { Some(false) };
+    // The status line is part of the install since #230: an install without it is out of
+    // date, and so is a script that differs from the one this build ships.
+    let stale = if installed {
+        let statusline = agy_statusline::AgyStatusLinePaths::from_home()?;
+        let parts = [
+            hook_is_stale(&app, "gyredeck-agy-hook.mjs", &install_path),
+            if agy_statusline::wired(&statusline) {
+                hook_is_stale(&app, agy_statusline::SCRIPT_NAME, &statusline.script())
+            } else {
+                Some(true)
+            },
+        ];
+        if parts.contains(&Some(true)) {
+            Some(true)
+        } else if parts.contains(&None) {
+            None
+        } else {
+            Some(false)
+        }
+    } else {
+        Some(false)
+    };
     Ok((installed_path, installed, stale))
 }
 
@@ -5912,6 +5969,7 @@ pub fn run() {
             sync_replies_allowed,
             set_sync_replies_allowed,
             install_agy_hook,
+            uninstall_agy_statusline,
             agy_hook_status,
             install_codex_hook,
             codex_hook_status,

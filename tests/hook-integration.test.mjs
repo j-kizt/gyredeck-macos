@@ -9743,7 +9743,7 @@ const scriptedHeavyBridge = async (home, answer) => {
     let body = "";
     for await (const chunk of req) body += chunk;
     const parsed = body ? JSON.parse(body) : {};
-    const entry = { path: req.url, body: parsed };
+    const entry = { method: req.method, path: req.url, body: parsed };
     requests.push(entry);
     const reply = await answer(entry, requests);
     if (reply === null) return;
@@ -10295,6 +10295,199 @@ test("heavy C11: a helper that cannot reach the bridge, or meets another version
   }
 });
 
+// ── --status (#260) ──
+//
+// C1 never queues · C2 prints holder, line, observed and load · C3 "free" only when all three
+// are empty · C4 unreachable → 69 · C5 version mismatch → 69 · C6 no token / 401 → 69, no token
+// printed · C7 other arguments → usage 64 · C8 rules v11 · C9 the out-of-room notice · C10 labels
+// only. C8/C9 sit with the rules and notice tests above and below.
+
+/** The helper run as a separate process, asynchronously: the scripted bridge answers from this one. */
+const runHelper = (path, args, home, env = {}) => new Promise((resolve, reject) => {
+  const started = Date.now();
+  const child = spawn(process.execPath, [path, ...args], { env: { ...process.env, HOME: home, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const deadline = setTimeout(() => { child.kill("SIGKILL"); reject(new Error(`helper did not exit: ${stderr}`)); }, 10_000);
+  child.on("close", (code) => { clearTimeout(deadline); resolve({ status: code, stdout, stderr, tookMs: Date.now() - started }); });
+});
+const STATUS_TOKEN = "ab".repeat(32);
+const statusHolder = (overrides = {}) => ({
+  id: "0123456789abcdef", as: "a2600000-0000-4000-8000-0000000000aa", label: "Claude Code / Gyre Assistant", what: "pnpm test:demo",
+  state: "active", since: new Date().toISOString(), elapsedMs: 192_000, loadSkipped: false, helperGone: false, verified: true, adopted: false, ...overrides,
+});
+const statusQueued = { id: "fedcba9876543210", position: 1, as: "a2600000-0000-4000-8000-0000000000bb", label: "Codex / Altrix Audit", what: "cargo test", waitedMs: 40_000 };
+const statusObserved = { pid: 5001, pattern: "cargo test|build|check", exe: "/Users/someone/.cargo/bin/cargo", cwd: "/Users/someone/secret-project", label: "Terminal", startedAtMs: Date.now() - 65_000, elapsedMs: 65_000 };
+const statusAnswer = (overrides = {}) => ({
+  status: 200,
+  body: { ok: true, v: 1, load: 1.25, loadLimit: 5, holder: null, queue: [], observed: [], waiting: 0, limit: "advisory", ...overrides },
+});
+const FREE_LINE = /^heavy-run slot: free$/m;
+
+const statusCases = [
+  { name: "C3 an empty slot is free", reply: () => statusAnswer(), code: 0,
+    out: [FREE_LINE, /^load: 1\.25 \(the slot is granted at 5 or less\)$/m] },
+  { name: "C3 a run observed outside the helper is not free", reply: () => statusAnswer({ observed: [statusObserved] }), code: 0,
+    out: [/^heavy-run slot: taken by a run outside the helper$/m, /^ {2}Terminal — cargo test\|build\|check, 1m 5s$/m], notOut: [FREE_LINE] },
+  { name: "C3 a line with no holder is not free", reply: () => statusAnswer({ queue: [statusQueued] }), code: 0,
+    out: [/^heavy-run slot: not held, but the line is waiting$/m], notOut: [FREE_LINE] },
+  { name: "C3 a holder alone is not free", reply: () => statusAnswer({ holder: statusHolder() }), code: 0,
+    out: [/^heavy-run slot: held by Claude Code \/ Gyre Assistant — pnpm test:demo \(running, 3m 12s\)$/m], notOut: [FREE_LINE] },
+  { name: "C2/C10 holder, line, observed and load, by label only", code: 0,
+    reply: () => statusAnswer({ holder: statusHolder({ helperGone: true, loadSkipped: true }), queue: [statusQueued], observed: [statusObserved], load: 6.5 }),
+    out: [
+      /^heavy-run slot: held by Claude Code \/ Gyre Assistant — pnpm test:demo \(running, 3m 12s\)$/m,
+      /^ {2}its helper has gone quiet; the command still runs and holds the slot$/m,
+      /^ {2}granted after the load stayed high for 10 minutes$/m,
+      /^waiting: 1$/m, /^ {2}1\. Codex \/ Altrix Audit — cargo test, waited 40s$/m,
+      /^running outside the helper: 1$/m, /^ {2}Terminal — cargo test\|build\|check, 1m 5s$/m,
+      /^load: 6\.5 \(the slot is granted at 5 or less\)$/m,
+    ],
+    absent: [statusHolder().as, statusQueued.as, statusHolder().id, statusQueued.id, statusObserved.cwd, statusObserved.exe, String(statusObserved.pid)], notOut: [FREE_LINE] },
+  { name: "C10 a holder with no label is named without its id", code: 0,
+    reply: () => statusAnswer({ holder: statusHolder({ label: null, state: "reserved", elapsedMs: 3_000 }) }),
+    out: [/^heavy-run slot: held by an unnamed session — pnpm test:demo \(starting, 3s\)$/m], absent: [statusHolder().as] },
+  { name: "C5 another protocol version cannot tell", code: 69, reply: () => statusAnswer({ v: 2, holder: null }),
+    err: [/cannot tell whether a heavy run is on — the bridge speaks heavy protocol version 2, this helper 1/] },
+  { name: "C5 an answer with no version cannot tell", code: 69, reply: () => ({ status: 200, body: { ok: true, holder: null, queue: [], observed: [] } }),
+    err: [/heavy protocol version unknown, this helper 1/] },
+  { name: "C6 a refused token cannot tell, and the token is never printed", code: 69,
+    reply: () => ({ status: 401, body: { ok: false, error: "unauthorized", message: `token ${STATUS_TOKEN} is wrong` } }),
+    err: [/cannot tell whether a heavy run is on — the bridge refused this machine's token \(401\)/], absent: [STATUS_TOKEN] },
+  { name: "C6 another refusal names its code, never its body", code: 69,
+    reply: () => ({ status: 500, body: { ok: false, error: `boom ${STATUS_TOKEN}`, message: STATUS_TOKEN } }),
+    err: [/cannot tell whether a heavy run is on — the bridge answered 500$/m], absent: [STATUS_TOKEN] },
+  { name: "an answer that is not the shape cannot tell", code: 69, reply: () => ({ status: 200, body: { ok: true, v: 1, holder: null } }),
+    err: [/the bridge's answer could not be read/] },
+];
+
+for (const row of statusCases) {
+  test(`#260 --status ${row.name}`, async () => {
+    const home = await mkdtemp(join(tmpdir(), "gyredeck-status-"));
+    const fake = await scriptedHeavyBridge(home, () => row.reply());
+    try {
+      assert.equal((await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")), STATUS_TOKEN, "premise: the token the absent-check looks for");
+      const run = await runHelper(fake.helperPath, ["--status"], home);
+      assert.equal(run.status, row.code, `${run.stdout}\n${run.stderr}`);
+      // C1: one GET /heavy, and nothing else — never an acquire.
+      assert.deepEqual(fake.requests.map((entry) => `${entry.method} ${entry.path}`), ["GET /heavy"]);
+      for (const pattern of row.out ?? []) assert.match(run.stdout, pattern);
+      for (const pattern of row.err ?? []) assert.match(run.stderr, pattern);
+      for (const pattern of row.notOut ?? []) assert.doesNotMatch(`${run.stdout}${run.stderr}`, pattern);
+      if (row.code !== 0) {
+        assert.equal(run.stdout, "", "nothing on stdout that could read as the slot's state");
+        assert.doesNotMatch(run.stderr, /\bfree\b/);
+      }
+      for (const value of row.absent ?? []) assert.ok(!`${run.stdout}${run.stderr}`.includes(value), `${value} printed`);
+    } finally {
+      await fake.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+}
+
+test("#260 --status C4/C6: no bridge, a silent bridge, or no token cannot tell within about 2 s, and queues nothing", async () => {
+  const { heavyHelperSource } = await heavyModule();
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-status-down-"));
+  const silent = await scriptedHeavyBridge(home, () => null);
+  try {
+    const nowhere = join(home, "nowhere.mjs");
+    await writeFile(nowhere, heavyHelperSource(`http://127.0.0.1:${await freePort()}`));
+    const status = (path) => runHelper(path, ["--status"], home);
+    const unreachable = await status(nowhere);
+    assert.equal(unreachable.status, 69, unreachable.stderr);
+    assert.match(unreachable.stderr, /cannot tell whether a heavy run is on — the Gyredeck bridge cannot be reached at http:\/\/127\.0\.0\.1:\d+/);
+    assert.equal(unreachable.stdout, "");
+    assert.ok(unreachable.tookMs >= 1_500 && unreachable.tookMs < 5_000, `retried for about 2 s, took ${unreachable.tookMs}`);
+
+    const hung = await status(silent.helperPath);
+    assert.deepEqual(silent.requests.map((entry) => `${entry.method} ${entry.path}`).slice(0, 1), ["GET /heavy"], "premise: the bridge was asked and never answered");
+    assert.equal(hung.status, 69, hung.stderr);
+    assert.match(hung.stderr, /the Gyredeck bridge cannot be reached/);
+    assert.ok(hung.tookMs < 5_000, `bounded by the deadline, took ${hung.tookMs}`);
+    assert.ok(silent.requests.every((entry) => entry.method === "GET" && entry.path === "/heavy"), "nothing but GET /heavy");
+
+    await rm(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"));
+    const before = silent.requests.length;
+    const tokenless = await status(silent.helperPath);
+    assert.equal(tokenless.status, 69, tokenless.stderr);
+    assert.match(tokenless.stderr, /cannot tell whether a heavy run is on — no machine token in ~\/\.config\/gyredeck/);
+    assert.equal(silent.requests.length, before, "nothing is asked without a token");
+  } finally {
+    await silent.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("#260 --status C7: --status with anything else is usage, runs nothing and asks nothing", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-status-usage-"));
+  const fake = await scriptedHeavyBridge(home, () => ({ status: 200, body: { granted: true } }));
+  try {
+    const marker = join(home, "marker");
+    for (const args of [["--status", "--", "touch", marker], ["--as", "x", "--what", "y", "--status", "--", "touch", marker], ["--status", "--as", "x"]]) {
+      const run = await runHelper(fake.helperPath, args, home);
+      assert.equal(run.status, 64, `${args.join(" ")}: ${run.stderr}`);
+      assert.match(run.stderr, /usage: .*--as <your id> --what "<what it runs>" -- <command…>\n.*or: node ~\/\.config\/gyredeck\/gyredeck-heavy\.mjs --status/);
+    }
+    assert.equal(existsSync(marker), false, "no command ran");
+    assert.deepEqual(fake.requests, [], "and the bridge was never asked");
+  } finally {
+    await fake.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("#260 --status C1/C2/C10: against a real bridge it shows the holder, the line and an observed run, and changes none of them", async () => {
+  const h = await heavyHarness("status-real");
+  try {
+    await h.start();
+    const holderId = "a2600000-0000-4000-8000-000000000001";
+    const waiterId = "a2600000-0000-4000-8000-000000000002";
+    await heavyIngest(h, holderId, "claudeCodeHook");
+    const naming = await fetch(`${h.base}/sessions/names/${holderId}`, {
+      method: "PUT", headers: { "content-type": "application/json", "x-gyredeck-token": h.token() }, body: JSON.stringify({ name: "Gyre Assistant" }),
+    });
+    assert.equal(naming.status, 200);
+    const ids = h.pair();
+    assert.equal((await h.acquire(holderId, "pnpm test:demo", ids)).status, 200);
+    assert.equal((await h.post("activate", { lease: ids.lease, ...(await h.group()) })).status, 200);
+    assert.equal((await h.acquire(waiterId, "cargo test", h.pair())).status, 202);
+    assert.equal((await reportObserved(h, [observedRun({ pid: 5001, cwd: "/tmp/secret-project", exe: "/opt/secret/cargo" })])).status, 200);
+
+    const stable = (state) => ({
+      holder: state.holder && { ...state.holder, elapsedMs: 0 },
+      queue: state.queue.map((entry) => ({ ...entry, waitedMs: 0 })),
+      observed: state.observed.map((run) => ({ ...run, elapsedMs: 0 })),
+    });
+    const before = await h.state();
+    // Premise: all three are there before the call.
+    assert.equal(before.holder?.as, holderId);
+    assert.equal(before.holder.label, "Claude Code / Gyre Assistant");
+    assert.deepEqual(before.queue.map((entry) => entry.as), [waiterId]);
+    assert.equal(before.observed.length, 1);
+
+    const run = h.helper(["--status"]);
+    const { code } = await run.exited;
+    assert.equal(code, 0, run.stderr);
+    assert.match(run.stdout, new RegExp(`^heavy-run slot: held by Claude Code / Gyre Assistant — pnpm test:demo \\(running, \\d+s\\)$`, "m"));
+    assert.match(run.stdout, /^waiting: 1$/m);
+    assert.match(run.stdout, /^ {2}1\. an unnamed session — cargo test, waited \d+s$/m);
+    assert.match(run.stdout, /^running outside the helper: 1$/m);
+    assert.match(run.stdout, /^ {2}Terminal — cargo test\|build\|check, 1m \d+s$/m);
+    assert.match(run.stdout, /^load: 1 \(the slot is granted at 5 or less\)$/m);
+    assert.doesNotMatch(run.stdout, FREE_LINE);
+    for (const value of [holderId, waiterId, before.holder.id, before.queue[0].id, "/tmp/secret-project", "/opt/secret/cargo"]) {
+      assert.ok(!run.stdout.includes(value) && !run.stderr.includes(value), `${value} printed`);
+    }
+    // C1: the slot, the line and the report are as they were.
+    assert.deepEqual(stable(await h.state()), stable(before));
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test("heavy rules: the rules list the heavy commands, the helper and the limit", async () => {
   const { roomRules, HEAVY_COMMANDS, HEAVY_LIMIT_TEXT } = await heavyModule();
   const rules = roomRules("http://127.0.0.1:47621");
@@ -10306,6 +10499,12 @@ test("heavy rules: the rules list the heavy commands, the helper and the limit",
   assert.equal(HEAVY_COMMANDS.length, 9);
   assert.ok(rules.includes(HEAVY_LIMIT_TEXT));
   assert.match(rules, /node ~\/\.config\/gyredeck\/gyredeck-heavy\.mjs --as <your id> --what "<what it runs>" -- <command…>/);
+  // #260 C8: v11 tells every reader of the section how to look before heavy work.
+  assert.equal(ROOM_RULES_VERSION, 11);
+  const section = rules.slice(rules.indexOf("\n## Heavy runs\n"));
+  assert.ok(section.length < rules.length, "premise: the section is there");
+  assert.ok(section.includes("Before heavy work, or when deciding whether to wait, check with `node ~/.config/gyredeck/gyredeck-heavy.mjs --status`"), section);
+  assert.ok(section.includes("Exit 69 means it cannot tell"), section);
 });
 
 /** A turn start as each provider's hook reports one, so the bridge knows whose session it is. */
@@ -10338,6 +10537,7 @@ test("heavy P1-a: Claude Code outside a room, with no usage reading, is told abo
     };
     const first = await context();
     assert.match(first, new RegExp(`^HEAVY RUNS: .*gyredeck-heavy\\.mjs --as ${me} --what`));
+    assert.ok(first.includes("check with `node ~/.config/gyredeck/gyredeck-heavy.mjs --status`"), `#260 C9: ${first}`);
     assert.doesNotMatch(first, /USAGE/, "no usage reading was ever given");
     assert.equal(await context(), "", "once");
   } finally {
@@ -10366,6 +10566,11 @@ test("heavy P1-a: Antigravity outside a room, with no usage reading, is told abo
     // command's output — the rules' Heavy runs section and its own id — stays (#251).
     assert.match(first[0], /^HEAVY RUNS: /);
     assert.ok(first[0].includes(`echo "your id: ${me}"; sed -n '/^## Heavy runs/,$p' ~/.config/gyredeck/room-rules.md`), first[0]);
+    // #260 C9: what that command prints, from the file this bridge wrote, names --status.
+    const section = spawnSync("sed", ["-n", "/^## Heavy runs/,$p", join(h.home, ...CONFIG_DIR, "room-rules.md")], { encoding: "utf8" });
+    assert.equal(section.status, 0, section.stderr);
+    assert.match(section.stdout, /^## Heavy runs\n/, "premise: the range starts at the section");
+    assert.ok(section.stdout.includes("`node ~/.config/gyredeck/gyredeck-heavy.mjs --status`"), section.stdout);
     assert.deepEqual(await steps(), [], "once");
   } finally {
     await h.cleanup();
@@ -10394,6 +10599,7 @@ test("heavy P1-a: Codex outside a room is pushed the queue once, and a Codex mem
     assert.equal(told[0][0], "queue");
     assert.equal(told[0][told[0].indexOf("--thread") + 1], outside);
     assert.match(told[0][told[0].indexOf("--message") + 1], new RegExp(`HEAVY RUNS: .*gyredeck-heavy\\.mjs --as ${outside} --what`));
+    assert.ok(told[0][told[0].indexOf("--message") + 1].includes("gyredeck-heavy.mjs --status"), "#260 C9: Codex is told of --status");
     await heavyIngest(h, outside, "codexCliHook");
     await heavyIngest(h, outside, "codexCliHook");
 

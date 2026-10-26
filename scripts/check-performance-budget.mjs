@@ -28,12 +28,18 @@ const assetRoot = join(distRoot, "assets");
  * 19.3 could have been paid for by splitting rather than by trimming. 115,075 is main's
  * total that day, 114,874, plus the 201 bytes of headroom the largest-chunk ceiling had
  * over main's 111,799 at the same moment, so the two leave the same room.
+ *
+ * Both were raised on 2026-10-26 (#256), by the user's decision to take React 19.3, which
+ * adds about 8.6 kB. #233's trims cut 6.2 kB and fell 2.2 kB short, and nothing else could
+ * be trimmed without changing behaviour. 116,000 and 119,000 are sized to cover main plus
+ * v1.25.0 (#245/#244, about 1.1 kB more, not yet merged) plus React 19.3, with roughly the
+ * headroom the ceilings had before. They still stop a library arriving.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 112_000,
-  jsTotalGzipBytes: 115_075,
+  jsGzipBytes: 116_000,
+  jsTotalGzipBytes: 119_000,
 };
 
 const walk = async (directory) => {

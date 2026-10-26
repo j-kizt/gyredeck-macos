@@ -27,9 +27,9 @@ updates:
         patterns: ["@tauri-apps/plugin-updater"]
       tauri:
         patterns: ["@tauri-apps/*"]
-      # React 19.3 adds about 8.6 kB gzip and alone puts the bundle over its budget (#225),
-      # so the app holds 19.2.x until #233 decides. Its own group keeps that PR from failing
-      # the rest of the week's bumps. Not ignored: `ignore` would also stop a security PR.
+      # React has grown the bundle before (19.3 added about 8.6 kB gzip, taken in #256 under
+      # ceilings raised by decision). Its own group keeps a React PR that breaks the budget
+      # from failing the rest of the week's bumps. Not ignored: `ignore` would also stop a security PR.
       react:
         patterns: ["react", "react-dom", "@types/react", "@types/react-dom"]
       npm:

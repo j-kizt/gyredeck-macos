@@ -26,8 +26,8 @@ Gzips the largest CSS and JavaScript assets in `apps/desktop/dist/assets/`, sums
 | Budget | Ceiling |
 | --- | ---: |
 | Largest CSS asset (gzip) | 13,650 bytes |
-| Largest JavaScript asset (gzip) | 112,000 bytes |
-| All JavaScript assets together (gzip, summed per file) | 115,075 bytes |
+| Largest JavaScript asset (gzip) | 116,000 bytes |
+| All JavaScript assets together (gzip, summed per file) | 119,000 bytes |
 | Core `dist/` (total, minus separately-budgeted asset trees) | 575,500 bytes |
 
 It also fails if any `dist/` path contains `session-cat` (a forbidden legacy asset tree).

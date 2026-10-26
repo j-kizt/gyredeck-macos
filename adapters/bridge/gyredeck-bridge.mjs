@@ -4870,8 +4870,11 @@ function startBridge(config) {
    * Addressing only. Two sessions working something out between them are not writing to
    * a third, and handing it to them anyway is the noise the `to` field exists to stop.
    */
+  // `about` names the session a room notice is about (#263: its own heavy run), which is
+  // never told it — on any path, since every path asks this.
   const reachesMember = (message, conversationId) =>
     message.from !== conversationId &&
+    message.about !== conversationId &&
     (message.to === MAIL_EVERYONE || message.to === conversationId);
 
   /**
@@ -4976,6 +4979,7 @@ function startBridge(config) {
       replyTo: replyTo ?? null,
       ts: new Date().toISOString(),
       ...(routing?.quiet === true ? { quiet: true } : {}),
+      ...(from === ROOM_SENDER && typeof routing?.about === "string" ? { about: routing.about } : {}),
     };
     room.messages.push(message);
     // Notices first, against their own allowance, so the room's own voice can never cost
@@ -5565,6 +5569,7 @@ function startBridge(config) {
         pgid: heavyHolder.pgid,
         pgidStart: heavyHolder.pgidStart,
         since: heavyHolder.since,
+        activeSince: heavyHolder.activeSince,
         loadSkipped: heavyHolder.loadSkipped,
       };
       writeFileAtomically(HEAVY_HOLDER_PATH, `${JSON.stringify(record)}\n`, 0o600);
@@ -5596,6 +5601,11 @@ function startBridge(config) {
     if (valid && (record.state === "reserved" || groupAlive(record.pgid))) {
       const now = heavyNow();
       const since = typeof record.since === "string" && !Number.isNaN(Date.parse(record.since)) ? record.since : new Date().toISOString();
+      // When the command began, which is not when the slot was reserved (#263 r1). A record
+      // from before it has no such time, and its reservation's is the nearest it has.
+      const activeSince = record.state !== "active"
+        ? null
+        : typeof record.activeSince === "string" && !Number.isNaN(Date.parse(record.activeSince)) ? record.activeSince : since;
       heavyHolder = {
         state: record.state,
         leaseHash: Buffer.from(record.leaseHash, "hex"),
@@ -5607,6 +5617,8 @@ function startBridge(config) {
         pgidStart: record.state === "active" && typeof record.pgidStart === "string" ? record.pgidStart : null,
         since,
         startedAt: now - Math.max(0, Date.now() - Date.parse(since)),
+        activeSince,
+        activeAt: activeSince === null ? null : now - Math.max(0, Date.now() - Date.parse(activeSince)),
         reservedAt: now,
         heartbeatAt: now,
         loadSkipped: record.loadSkipped === true,
@@ -5654,6 +5666,8 @@ function startBridge(config) {
       pgidStart: null,
       since: new Date().toISOString(),
       startedAt: now,
+      activeSince: null,
+      activeAt: null,
       reservedAt: now,
       heartbeatAt: now,
       loadSkipped,
@@ -5673,7 +5687,12 @@ function startBridge(config) {
    * and when one ends — helper runs and observed runs alike, named as Settings names them.
    * Informational and quiet: published to be read on each member's next collect, never
    * streamed to a watcher, pushed into Codex, or used to end a wait.
+   *
+   * Only runs worth hearing about (#263): a start is said once the run has held the slot
+   * past HEAVY_NOTICE_DELAY_MS, and an end only for a run whose start was said, so a run
+   * shorter than that is never mentioned. The session a notice is about is never told it.
    */
+  const HEAVY_NOTICE_DELAY_MS = Number(process.env.GYREDECK_TEST_HEAVY_NOTICE_DELAY_MS) || 30_000;
   const heavyDuration = (ms) => {
     const seconds = Math.max(0, Math.round(ms / 1000));
     if (seconds < 60) return `${seconds}s`;
@@ -5681,25 +5700,40 @@ function startBridge(config) {
     if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
     return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
   };
-  const tellRoomsOfHeavy = (text) => {
+  const tellRoomsOfHeavy = (text, about) => {
     for (const room of mailRooms.values()) {
       if (room.members.size === 0) continue;
-      publishMail(room, ROOM_SENDER, `HEAVY RUN: ${text}`, null, false, { kind: "notice", quiet: true });
+      publishMail(room, ROOM_SENDER, `HEAVY RUN: ${text}`, null, false, { kind: "notice", quiet: true, about: about ?? undefined });
     }
   };
   const holderLabel = (holder) => heavyLabelFor(holder.as) ?? holder.as;
   const heavyEnded = (holder) => {
-    if (holder?.state !== "active") return;
-    tellRoomsOfHeavy(`${holderLabel(holder)}'s ${holder.what} finished (${heavyDuration(heavyNow() - holder.startedAt)}).`);
+    if (holder?.state !== "active" || holder.announced !== true) return;
+    tellRoomsOfHeavy(`${holderLabel(holder)}'s ${holder.what} finished (${heavyDuration(heavyNow() - holder.activeAt)}).`, holder.as);
   };
   const observedKey = (run) => `${run.pid}:${run.startedAtMs}`;
-  /** Who a newcomer waits behind: the holder, an observed run, or the load. */
+  // Observed runs whose start was said, by key; a run leaves it when its end is said.
+  const observedAnnounced = new Set();
+  /** Say each run that has now held the slot past the delay, once. */
+  const announceHeavyStarts = () => {
+    if (heavyHolder?.state === "active" && heavyHolder.announced !== true && heavyNow() - heavyHolder.activeAt > HEAVY_NOTICE_DELAY_MS) {
+      heavyHolder.announced = true;
+      tellRoomsOfHeavy(`${holderLabel(heavyHolder)} started ${heavyHolder.what}.`, heavyHolder.as);
+    }
+    for (const run of observedRuns()) {
+      const key = observedKey(run);
+      if (observedAnnounced.has(key) || Date.now() - run.startedAtMs <= HEAVY_NOTICE_DELAY_MS) continue;
+      observedAnnounced.add(key);
+      tellRoomsOfHeavy(`${observedLabelFor(run)} started ${run.pattern}, outside the queue.`, run.session);
+    }
+  };
+  /** Who a newcomer waits behind — the holder, an observed run, or the load — and whose run that is. */
   const waitingBehind = () => {
-    if (heavyHolder) return `behind ${holderLabel(heavyHolder)}`;
+    if (heavyHolder) return { text: `behind ${holderLabel(heavyHolder)}`, owner: heavyHolder.as };
     const observed = observedRuns()[0];
-    if (observed) return `behind ${observedLabelFor(observed)}`;
+    if (observed) return { text: `behind ${observedLabelFor(observed)}`, owner: observed.session };
     const load = heavyLoad();
-    return `for the load to drop (${Math.round(load * 10) / 10} > ${HEAVY_LOAD_LIMIT})`;
+    return { text: `for the load to drop (${Math.round(load * 10) / 10} > ${HEAVY_LOAD_LIMIT})`, owner: null };
   };
 
   const freeHeavy = () => {
@@ -5761,6 +5795,7 @@ function startBridge(config) {
       for (const run of heavyObserved.runs) observedEnded(run);
       heavyObserved = { runs: [], at: -Infinity };
     }
+    announceHeavyStarts();
     for (let index = heavyQueue.length - 1; index >= 0; index -= 1) {
       const entry = heavyQueue[index];
       const polling = [...heavyPolls].some((poll) => poll.ticket === entry.ticket);
@@ -5782,7 +5817,10 @@ function startBridge(config) {
   /** Named as holders are (#243): the session that started it, its agent alone, or "Terminal" when no agent did. */
   const observedLabelFor = (run) =>
     (run.session ? heavyLabelFor(run.session) : null) ?? (run.kind ? OBSERVED_KIND_LABELS[run.kind] : "Terminal");
-  const observedEnded = (run) => tellRoomsOfHeavy(`${observedLabelFor(run)}'s ${run.pattern} finished (${heavyDuration(Date.now() - run.startedAtMs)}).`);
+  const observedEnded = (run) => {
+    if (!observedAnnounced.delete(observedKey(run))) return;
+    tellRoomsOfHeavy(`${observedLabelFor(run)}'s ${run.pattern} finished (${heavyDuration(Date.now() - run.startedAtMs)}).`, run.session);
+  };
 
   const describeHeavy = () => {
     const now = heavyNow();
@@ -5800,7 +5838,8 @@ function startBridge(config) {
             what: heavyHolder.what,
             state: heavyHolder.state,
             since: heavyHolder.since,
-            elapsedMs: Math.max(0, Math.round(now - heavyHolder.startedAt)),
+            // How long it has run once active, how long it has waited to start before (#263 r1).
+            elapsedMs: Math.max(0, Math.round(now - (heavyHolder.state === "active" ? heavyHolder.activeAt : heavyHolder.startedAt))),
             loadSkipped: heavyHolder.loadSkipped,
             // The group still runs and nothing has spoken for it: the helper died and left
             // its command going. The slot stays held; the panel says why.
@@ -6184,11 +6223,11 @@ function startBridge(config) {
             session,
           };
         });
-        const before = new Set(observedRuns().map(observedKey));
         const now = new Set(reported.map(observedKey));
         for (const run of observedRuns()) if (!now.has(observedKey(run))) observedEnded(run);
-        for (const run of reported) if (!before.has(observedKey(run))) tellRoomsOfHeavy(`${observedLabelFor(run)} started ${run.pattern}, outside the queue.`);
+        for (const key of observedAnnounced) if (!now.has(key)) observedAnnounced.delete(key);
         heavyObserved = { runs: reported, at: heavyNow() };
+        announceHeavyStarts();
         for (const run of reported) if (run.session) nudgeHeavySession(run.session, run.pattern);
         promoteHeavy();
         sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, observed: reported.length });
@@ -6273,7 +6312,9 @@ function startBridge(config) {
           sendJson(200, heavyGranted(heavyHolder.loadSkipped, lease));
           return;
         }
-        tellRoomsOfHeavy(`${heavyLabelFor(as) ?? as} is waiting ${waitingBehind()} to run ${what}.`);
+        // A session queued behind its own run is not news, to it or anyone (#263).
+        const behind = waitingBehind();
+        if (behind.owner !== as) tellRoomsOfHeavy(`${heavyLabelFor(as) ?? as} is waiting ${behind.text} to run ${what}.`, as);
         sendJson(202, heavyQueued(heavyQueue.length - 1));
         return;
       }
@@ -6381,15 +6422,18 @@ function startBridge(config) {
         heavyHolder.pgidStart = pgidStart;
         heavyHolder.adopted = true;
         heavyHolder.heartbeatAt = heavyNow();
+        heavyHolder.activeAt = heavyHolder.heartbeatAt;
+        heavyHolder.activeSince = new Date().toISOString();
         if (!persistHeavyHolder()) {
           heavyHolder.state = "reserved";
           heavyHolder.pgid = null;
           heavyHolder.pgidStart = null;
+          heavyHolder.activeAt = null;
+          heavyHolder.activeSince = null;
           sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "holder_unwritable" });
           return;
         }
         heavyFault("activate");
-        tellRoomsOfHeavy(`${holderLabel(heavyHolder)} started ${heavyHolder.what}.`);
         sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, state: "active" });
         return;
       }

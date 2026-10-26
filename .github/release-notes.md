@@ -1,5 +1,16 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Fewer heavy-run notices in rooms — (v1.25.2)
+
+### Fixes
+
+- **Rooms are no longer flooded with heavy-run notices.** A run is announced only once it has run for
+  more than 30 seconds, and its end only if its start was announced. A session is never told about
+  its own run, and nobody is told that a session is waiting behind itself.
+- **Heavy-run times count from when the command really started.** Settings, the finished
+  notification and room notices used to count from the moment the slot was reserved, which could add
+  up to a minute on a busy Mac.
+
 ## Agents stop repeating a room password, send to the right member, and learn about heavy runs when they join — (v1.25.1)
 
 ### Fixes

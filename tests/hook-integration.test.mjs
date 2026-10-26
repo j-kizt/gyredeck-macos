@@ -11222,10 +11222,11 @@ const rereadPaths = [
   { name: "room mail the bridge did not tag", tag: "puntag", options: { inboxBody: (body) => ({ ...body, messages: (body.messages ?? []).map(({ room: _room, ...message }) => message) }) }, run: async (f) => { await f.confirm(); await f.invoke(); await f.say("untagged"); return { result: await f.invoke() }; }, expect: "note" },
   {
     name: "a heavy-run room notice alone (#244)", tag: "pheavy",
+    // Past the #263 delay, so its start is announced as soon as it is reported.
     run: async (f) => {
       await f.confirm();
       await f.invoke();
-      const reported = await f.call("PUT", "/heavy/observed", { v: 1, runs: [{ pid: 4242, pattern: "cargo test|build|check", exe: "cargo", cwd: null, startedAtMs: Date.now(), agent: null }] });
+      const reported = await f.call("PUT", "/heavy/observed", { v: 1, runs: [{ pid: 4242, pattern: "cargo test|build|check", exe: "cargo", cwd: null, startedAtMs: Date.now() - 65_000, agent: null }] });
       assert.equal(reported.status, 200);
       return { result: await f.invoke() };
     },
@@ -11237,7 +11238,7 @@ const rereadPaths = [
     run: async (f) => {
       await f.confirm();
       await f.invoke();
-      await f.call("PUT", "/heavy/observed", { v: 1, runs: [{ pid: 4242, pattern: "cargo test|build|check", exe: "cargo", cwd: null, startedAtMs: Date.now(), agent: null }] });
+      await f.call("PUT", "/heavy/observed", { v: 1, runs: [{ pid: 4242, pattern: "cargo test|build|check", exe: "cargo", cwd: null, startedAtMs: Date.now() - 65_000, agent: null }] });
       return { seq: await f.say("after the notice"), result: await f.invoke() };
     },
     expect: "since", reply: true,
@@ -11796,10 +11797,11 @@ test("room notices: start, wait and end, for helper and observed runs, named as 
     assert.equal((await h.acquire("run-d", "d", d)).status, 202);
 
     const said = await room.notices();
+    // Since #263 the founder's own helper run says nothing to it: the run is the founder's
+    // and was short. Its start and finish lines left this list for that reason alone; the
+    // helper start and finish are covered by the #263 table below.
     const want = [
-      /^HEAVY RUN: Claude Code started a2440000-0000-4000-8000-000000000001 runs\.$/,
       /^HEAVY RUN: run-b is waiting behind Claude Code to run b\.$/,
-      /^HEAVY RUN: Claude Code's a2440000-0000-4000-8000-000000000001 runs finished \(\d+s\)\.$/,
       /^HEAVY RUN: Terminal started cargo test\|build\|check, outside the queue\.$/,
       /^HEAVY RUN: run-c is waiting behind Terminal to run c\.$/,
       /^HEAVY RUN: Terminal's cargo test\|build\|check finished \(1m \d+s\)\.$/,
@@ -11862,6 +11864,262 @@ test("room notices C5: a heavy-run notice wakes nobody — no frame to a watch, 
     assert.ok(!frames.some((frame) => frame.includes("HEAVY RUN")), frames.join("\n"));
     controller.abort();
 
+  } finally {
+    await h.cleanup();
+  }
+});
+
+// ── #263: room notices only for runs worth hearing about, never to their own session ──
+//
+//  N1  A run that ends within the delay (30 s; GYREDECK_TEST_HEAVY_NOTICE_DELAY_MS) says
+//      nothing: no start, no finish — helper and observed runs alike.
+//  N2  A run that holds the slot past the delay is announced once, on the first sweep after
+//      it crosses, and its end is said once, for that announced run only.
+//  N3  The session a notice is about — the holder, an observed run's proven session, the
+//      waiter — never receives it; every other member does.
+//  N4  No wait notice when the waiter is the run's own session (holder or proven observed).
+//  N5  Observed runs follow the same delay, measured from their own start; one that crosses
+//      while reported is announced on the bridge's next sweep, not only on a report.
+//  N6  DECIDED BY SUBAGENT: a wait behind a run still inside its delay is announced to the
+//      others, and if that run then ends before the delay its end is not — a finish follows
+//      the start rule, never the wait. The waiter's own run is then judged on its own.
+//
+// Every row ends with a control the whole room must hear (a third session waiting for the
+// load), so an empty list means "nothing was said", not "nothing could be read".
+
+const HEAVY_A = "a2630000-0000-4000-8000-000000000001";
+const HEAVY_P = "a2630000-0000-4000-8000-000000000002";
+
+const heavyNoticeRoom = async (h) => {
+  const room = await heavyRoom(h, HEAVY_A);
+  const appCall = (path, body) => fetch(`${h.base}${path}`, {
+    method: "POST", headers: { "content-type": "application/json", "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD }, body: JSON.stringify(body),
+  });
+  await heavyIngest(h, HEAVY_P, "claudeCodeHook");
+  assert.equal((await appCall(`/sync/rooms/${room.code}/members`, { conversationId: HEAVY_P })).status, 200);
+  assert.equal((await appCall(`/sync/rooms/${room.code}/confirm`, { conversationId: HEAVY_P, password: room.password })).status, 200);
+  const noticesOf = async (id) => {
+    const inbox = await fetch(`${h.base}/mail/inbox?as=${id}`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    return (inbox.messages ?? []).filter((m) => m.text.startsWith("HEAVY RUN: ")).map((m) => m.text.slice("HEAVY RUN: ".length));
+  };
+  const both = async () => ({ a: await noticesOf(HEAVY_A), p: await noticesOf(HEAVY_P) });
+  const shift = (ms) => writeFile(h.clockFile, String(ms));
+  // The control: a session outside the room waits for the load; everyone hears it.
+  const control = async () => {
+    assert.equal((await h.state()).holder, null, "premise: the slot is free for the control");
+    await writeFile(h.loadFile, "7");
+    assert.equal((await h.acquire("ctl", "control", h.pair())).status, 202);
+    const heard = await both();
+    const line = "ctl is waiting for the load to drop (7 > 5) to run control.";
+    assert.equal(heard.a.at(-1), line, `premise: A reads room notices: ${heard.a.join(" | ")}`);
+    assert.equal(heard.p.at(-1), line, `premise: P reads room notices: ${heard.p.join(" | ")}`);
+    return { a: heard.a.slice(0, -1), p: heard.p.slice(0, -1) };
+  };
+  assert.deepEqual(await both(), { a: [], p: [] }, "premise: nothing said yet");
+  return { ...room, noticesOf, both, shift, control };
+};
+
+const N263_ROWS = [
+  {
+    name: "N1 a short helper run says nothing",
+    run: async (h, r) => {
+      const held = await h.hold(HEAVY_A);
+      await r.shift(20_000);
+      assert.equal((await h.state()).holder?.state, "active", "premise: the run is active, 20 s in");
+      assert.equal((await h.post("release", { lease: held.lease })).status, 200);
+    },
+    a: [], p: [],
+  },
+  {
+    name: "N2 N3 a long helper run: start and finish once each, to the other member only",
+    run: async (h, r) => {
+      const held = await h.hold(HEAVY_A);
+      await r.shift(29_000);
+      assert.deepEqual((await r.both()).p, [], "premise: not yet past the delay");
+      await r.shift(31_000);
+      await h.state();
+      assert.deepEqual((await r.both()).p, ["Claude Code started a2630000-0000-4000-8000-000000000001 runs."], "announced on the sweep after crossing");
+      await r.shift(40_000);
+      await h.state();
+      await h.state();
+      assert.equal((await h.post("release", { lease: held.lease })).status, 200);
+    },
+    a: [],
+    p: [/^Claude Code started a2630000-0000-4000-8000-000000000001 runs\.$/, /^Claude Code's a2630000-0000-4000-8000-000000000001 runs finished \(40s\)\.$/],
+  },
+  {
+    name: "N7 (r1) a reservation older than 30 s, then a one-second command, says nothing",
+    run: async (h, r) => {
+      const ids = h.pair();
+      assert.equal((await h.acquire(HEAVY_A, "brief command", ids)).status, 200, "premise: reserved");
+      await r.shift(31_000);
+      assert.equal((await h.state()).holder?.state, "reserved", "premise: still reserved, 31 s in");
+      assert.equal((await h.post("activate", { lease: ids.lease, ...(await h.group()) })).status, 200);
+      await r.shift(32_000);
+      await h.state();
+      assert.equal((await h.post("release", { lease: ids.lease })).status, 200);
+    },
+    a: [], p: [],
+  },
+  {
+    name: "N7 (r1) a long reservation, then a long run: announced 30 s after activation, timed from it",
+    run: async (h, r) => {
+      const ids = h.pair();
+      assert.equal((await h.acquire(HEAVY_A, "slow start", ids)).status, 200, "premise: reserved");
+      await r.shift(31_000);
+      assert.equal((await h.state()).holder?.state, "reserved", "premise: still reserved, 31 s in");
+      assert.equal((await h.post("activate", { lease: ids.lease, ...(await h.group()) })).status, 200);
+      await r.shift(60_000);
+      await h.state();
+      assert.deepEqual((await r.both()).p, [], "29 s after activation: not yet");
+      await r.shift(62_000);
+      await h.state();
+      assert.equal((await r.both()).p.length, 1, "31 s after activation: announced");
+      await r.shift(72_000);
+      assert.equal((await h.post("release", { lease: ids.lease })).status, 200);
+    },
+    a: [],
+    p: [/^Claude Code started slow start\.$/, /^Claude Code's slow start finished \(41s\)\.$/],
+  },
+  {
+    name: "N4 self-wait behind its own helper run says nothing; another session's wait is heard",
+    run: async (h) => {
+      const held = await h.hold(HEAVY_A);
+      const self = h.pair();
+      const queued = await h.acquire(HEAVY_A, "again", self);
+      assert.equal(queued.status, 202, "premise: A queued behind itself");
+      assert.equal((await h.state()).queue.length, 1, "premise: queued");
+      assert.equal((await h.post("cancel", { lease: self.lease, ticket: queued.body.ticket })).status, 200);
+      const other = h.pair();
+      const q = await h.acquire("run-q", "q", other);
+      assert.equal(q.status, 202);
+      assert.equal((await h.post("cancel", { lease: other.lease, ticket: q.body.ticket })).status, 200);
+      assert.equal((await h.post("release", { lease: held.lease })).status, 200);
+    },
+    a: [/^run-q is waiting behind Claude Code to run q\.$/],
+    p: [/^run-q is waiting behind Claude Code to run q\.$/],
+  },
+  {
+    name: "N4 self-wait behind its own observed run says nothing",
+    run: async (h) => {
+      await reportObserved(h, [observedRun({ startedAtMs: Date.now(), agent: { kind: "claude", session: HEAVY_A, cwd: "/tmp/project" } })]);
+      assert.equal((await h.state()).observed[0].label, "Claude Code", "premise: the run is proven A's");
+      const self = h.pair();
+      const queued = await h.acquire(HEAVY_A, "again", self);
+      assert.equal(queued.status, 202, "premise: A queued behind it");
+      assert.equal((await h.post("cancel", { lease: self.lease, ticket: queued.body.ticket })).status, 200);
+      await reportObserved(h, []);
+    },
+    a: [], p: [],
+  },
+  {
+    name: "N1 N5 a short observed run says nothing",
+    run: async (h) => {
+      await reportObserved(h, [observedRun({ startedAtMs: Date.now() - 20_000 })]);
+      assert.equal((await h.state()).observed.length, 1, "premise: observed, 20 s in");
+      await reportObserved(h, []);
+      assert.equal((await h.state()).observed.length, 0, "premise: ended");
+    },
+    a: [], p: [],
+  },
+  {
+    name: "N2 N3 N5 a long observed run of A's: start and finish once, to P only",
+    run: async (h) => {
+      const run = observedRun({ startedAtMs: Date.now() - 65_000, agent: { kind: "claude", session: HEAVY_A, cwd: "/tmp/project" } });
+      await reportObserved(h, [run]);
+      await reportObserved(h, [run]);
+      await h.state();
+      await reportObserved(h, []);
+    },
+    a: [],
+    p: [/^Claude Code started cargo test\|build\|check, outside the queue\.$/, /^Claude Code's cargo test\|build\|check finished \(1m \d+s\)\.$/],
+  },
+  {
+    name: "N2 N5 a long Terminal run is heard by both members",
+    run: async (h) => {
+      await reportObserved(h, [observedRun()]);
+      await reportObserved(h, []);
+    },
+    a: [/^Terminal started cargo test\|build\|check, outside the queue\.$/, /^Terminal's cargo test\|build\|check finished \(1m \d+s\)\.$/],
+    p: [/^Terminal started cargo test\|build\|check, outside the queue\.$/, /^Terminal's cargo test\|build\|check finished \(1m \d+s\)\.$/],
+  },
+  {
+    name: "N5 an observed run that crosses the delay while reported is announced by the sweep",
+    env: { GYREDECK_TEST_HEAVY_NOTICE_DELAY_MS: "1500" },
+    run: async (h, r) => {
+      await reportObserved(h, [observedRun({ startedAtMs: Date.now() })]);
+      assert.deepEqual((await r.both()).p, [], "premise: inside the delay at the report");
+      await until(async () => (await r.noticesOf(HEAVY_P)).length === 1, "the sweep's announcement");
+      await reportObserved(h, []);
+    },
+    a: [/^Terminal started cargo test\|build\|check, outside the queue\.$/, /^Terminal's cargo test\|build\|check finished \(\d+s\)\.$/],
+    p: [/^Terminal started cargo test\|build\|check, outside the queue\.$/, /^Terminal's cargo test\|build\|check finished \(\d+s\)\.$/],
+  },
+  {
+    name: "N6 DECIDED BY SUBAGENT: P waits behind A's run, which ends inside the delay — the wait is said to A, nothing else",
+    run: async (h, r) => {
+      const held = await h.hold(HEAVY_A);
+      const waiter = h.pair();
+      assert.equal((await h.acquire(HEAVY_P, "p runs", waiter)).status, 202, "premise: P queued behind A");
+      await r.shift(10_000);
+      assert.equal((await h.post("release", { lease: held.lease })).status, 200);
+      assert.equal((await h.state()).holder?.as, HEAVY_P, "premise: P was granted");
+      await h.post("release", { lease: waiter.lease });
+    },
+    a: [/^Claude Code is waiting behind Claude Code to run p runs\.$/],
+    p: [],
+  },
+];
+
+for (const row of N263_ROWS) {
+  test(`#263 room notices: ${row.name}`, async () => {
+    const h = await heavyHarness(`n263-${N263_ROWS.indexOf(row)}`);
+    try {
+      await h.start(row.env ?? {});
+      const r = await heavyNoticeRoom(h);
+      await row.run(h, r);
+      await writeFile(h.clockFile, "0");
+      const heard = await r.control();
+      for (const who of ["a", "p"]) {
+        assert.equal(heard[who].length, row[who].length, `${who}: ${heard[who].join(" | ")}`);
+        row[who].forEach((pattern, index) => assert.match(heard[who][index], pattern, who));
+      }
+    } finally {
+      await h.cleanup();
+    }
+  });
+}
+
+// Unexpected fix (#263 r1): GET /heavy's `elapsedMs` — the Settings row and the macOS
+// "finished (…)" notification — counted an active run from its reservation, not its start.
+test("#263 r1 unexpected fix: an active holder's elapsedMs counts from activation, live and after a restart", async () => {
+  const h = await heavyHarness("n263-elapsed");
+  try {
+    let bridge = await h.start();
+    const ids = h.pair();
+    assert.equal((await h.acquire("run-a", "slow start", ids)).status, 200, "premise: reserved");
+    await writeFile(h.clockFile, "31000");
+    const reserved = (await h.state()).holder;
+    assert.equal(reserved.state, "reserved", "premise: still reserved");
+    assert.ok(reserved.elapsedMs >= 31_000, `a reservation shows how long it has waited: ${reserved.elapsedMs}`);
+    assert.equal((await h.post("activate", { lease: ids.lease, ...(await h.group()) })).status, 200);
+    await writeFile(h.clockFile, "32000");
+    const live = (await h.state()).holder;
+    assert.equal(live.state, "active", "premise: active");
+    assert.ok(live.elapsedMs >= 1_000 && live.elapsedMs < 10_000, `live: ${live.elapsedMs}`);
+
+    // Restart with a record whose reservation is a minute older than its start: the
+    // restored run is timed from its start.
+    await h.stop(bridge);
+    const record = JSON.parse(await readFile(h.holderPath, "utf8"));
+    assert.equal(typeof record.activeSince, "string", "premise: the start is on disk");
+    record.since = new Date(Date.parse(record.activeSince) - 60_000).toISOString();
+    await writeFile(h.holderPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    await writeFile(h.clockFile, "0");
+    bridge = await h.start();
+    const restored = (await h.state()).holder;
+    assert.equal(restored?.state, "active", "premise: restored active");
+    assert.ok(restored.elapsedMs < 30_000, `restored: ${restored.elapsedMs}`);
   } finally {
     await h.cleanup();
   }

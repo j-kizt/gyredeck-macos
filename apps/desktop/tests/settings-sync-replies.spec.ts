@@ -121,4 +121,3 @@ test("each switch moves only its own agent, and the Antigravity one starts off",
   );
   expect(calls.filter((call) => (call as { command: string }).command === "set_sync_replies_allowed")).toHaveLength(1);
 });
-

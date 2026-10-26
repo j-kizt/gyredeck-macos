@@ -554,14 +554,19 @@ fn write_sync_reply_rules(enabled: bool) -> Result<(), String> {
 }
 
 /// Antigravity's half of "answer rooms without asking" (#261): its own switch, off by
-/// default, writing `command(…)` rules into `~/.gemini/antigravity-cli/settings.json`.
+/// default, writing `command(regex:…)` rules into `~/.gemini/antigravity-cli/settings.json`.
+///
+/// agy's plain `command(prefix)` is a literal word-prefix match, and `*` is a wildcard only
+/// as the whole target, so a printed command whose id, password and body differ every time
+/// can only be allowed by a `regex:` rule (Antigravity's permissions guide).
 ///
 /// Invariants, each pinned by a test that was made to fail:
-/// - A1  On writes exactly [`agy_sync_reply_rules`]. Each rule starts at the start of the
-///       command with fixed text, and `*` stands only where the id, the room's name, the
-///       password or the body goes — never first, so text in front of a printed command
-///       is never approved with it. Each one matches the command the hook or the bridge
-///       prints, read from their sources so the two cannot drift apart.
+/// - A1  On writes exactly [`agy_sync_reply_rules`]: regexes anchored at both ends, whose
+///       only variable parts are strict classes — the session id a UUID, the room
+///       `sync-` and four of its letters, the password 32 hex digits, and the body a JSON
+///       object of `{"from":"<id>",` and then no `'`, `;`, `&`, `|`, backtick, `$` or line
+///       break. Each one matches the command the hook or the bridge prints, read from their
+///       sources, and nothing in front of it, behind it, or smuggled into a slot.
 /// - A2  Off removes exactly our rules, for any port they were written with. Every other
 ///       entry stays where it was: the person's own rules, broad ones included, are theirs.
 /// - A3  Either way, a rule that embeds a room password (a run of exactly 32 hex digits)
@@ -572,36 +577,55 @@ fn write_sync_reply_rules(enabled: bool) -> Result<(), String> {
 ///       or an `allow` that is not a list, is refused rather than replaced.
 /// - A5  Applying what is already there writes nothing.
 /// - A6  The switch is off until the person turns it on; Claude Code's stays on by default.
-///
-/// The residual risk A1 cannot remove: agy's `*` crosses `;`, `&&` and `|`, and agy's
-/// rules have no narrower wildcard, so whatever stands in a `*` slot — the body above all —
-/// can carry `'; <any command>; '` and be approved with it. That is why it is off by default.
+/// - A7  The switch reads On only when the whole set for the current port is in the file.
+///       A missing rule, a stale port or a leftover password rule is repaired on reading
+///       when the intent is On (and the hook is in), and leftover rules are removed when
+///       it is Off. A write that fails is an error, never a state.
+/// - A8  Turning it on or off changes the intent only after the file did, so a failed
+///       write leaves both where they were.
 const AGY_SYNC_REPLIES_FLAG: &str = "allowAgySyncReplies";
 
-/// The `$PORT` in a template is the only part [`is_agy_sync_reply_rule`] lets vary.
+const AGY_ID: &str = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const AGY_BODY: &str = r#"\{"from":"$ID",[^'`;&|$\r\n]*\}"#;
+
+/// `$PORT` is the only part [`is_agy_sync_reply_rule`] lets vary.
 const AGY_SYNC_REPLY_TEMPLATES: [&str; 5] = [
     // HEAR, as the hook and the bridge print it (#228).
-    "command(while :; do node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 300 *; rc=$?; [ $rc -eq 4 ] || break; done)",
+    r#"command(regex:^while :; do node ~/\.config/gyredeck/gyredeck-agy-hook\.mjs wait 300 $ID; rc=\$\?; \[ \$rc -eq 4 \] \|\| break; done$)"#,
     // WAIT, as the bridge's howTo prints it.
-    "command(node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 60 *)",
+    r#"command(regex:^node ~/\.config/gyredeck/gyredeck-agy-hook\.mjs wait 60 $ID$)"#,
     // REPLY, as the hook prints it.
-    "command(curl -s -X POST http://$HOST:$PORT/mail/sync-* -H 'content-type: application/json' -H \"x-gyredeck-token: *\" -d '*')",
+    r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H "x-gyredeck-token: $PW" -d '$BODY'$)"#,
     // SEND, as the bridge's howTo prints it.
-    "command(curl -s -X POST http://$HOST:$PORT/mail/sync-* -H 'content-type: application/json' -H 'x-gyredeck-token: *' -d '*')",
+    r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H 'x-gyredeck-token: $PW' -d '$BODY'$)"#,
     // READ again, as the hook prints it.
-    "command(curl -s \"http://$HOST:$PORT/mail/sync-*?as=*\" -H \"x-gyredeck-token: *\")",
+    r#"command(regex:^curl -s "http://$HOST:$PORT/mail/$ROOM\?as=$ID&since=[0-9]+&until=[0-9]+" -H "x-gyredeck-token: $PW"$)"#,
 ];
 
-fn agy_sync_reply_rules(host: &str, port: u16) -> Vec<String> {
+/// Every template with everything but the port filled in.
+fn agy_sync_reply_templates(host: &str) -> Vec<String> {
     AGY_SYNC_REPLY_TEMPLATES
         .iter()
-        .map(|template| template.replace("$HOST", host).replace("$PORT", &port.to_string()))
+        .map(|template| {
+            template
+                .replace("$BODY", AGY_BODY)
+                .replace("$ID", AGY_ID)
+                .replace("$ROOM", "sync-[a-z2-9]{4}")
+                .replace("$PW", "[0-9a-f]{32}")
+                .replace("$HOST", &host.replace('.', r"\."))
+        })
+        .collect()
+}
+
+fn agy_sync_reply_rules(host: &str, port: u16) -> Vec<String> {
+    agy_sync_reply_templates(host)
+        .iter()
+        .map(|template| template.replace("$PORT", &port.to_string()))
         .collect()
 }
 
 fn is_agy_sync_reply_rule(rule: &str) -> bool {
-    AGY_SYNC_REPLY_TEMPLATES.iter().any(|template| {
-        let template = template.replace("$HOST", standalone_bridge::BRIDGE_HOST);
+    agy_sync_reply_templates(standalone_bridge::BRIDGE_HOST).iter().any(|template| {
         match template.split_once("$PORT") {
             None => rule == template,
             Some((before, after)) => rule
@@ -669,12 +693,45 @@ fn write_agy_sync_reply_rules_at(path: &Path, enabled: bool, port: u16) -> Resul
     .map(drop)
 }
 
-fn agy_rules_present_at(path: &Path) -> Result<bool, String> {
-    Ok(agy_statusline::read_json_object(path)?
-        .get("permissions")
+fn agy_permissions_at(path: &Path) -> Result<Option<serde_json::Value>, String> {
+    Ok(agy_statusline::read_json_object(path)?.get("permissions").cloned())
+}
+
+/// What Antigravity's switch shows, after bringing the file in line with the intent (A7).
+///
+/// On only when every rule for the current port is in the file. When the file is not what
+/// the intent asks for, it is rewritten: towards On only once the hook is in (without it
+/// nothing sends a reply to permit), towards Off always, since removing our own rules
+/// reaches no further than the person asked. A failed rewrite is returned as the error.
+fn agy_sync_replies_state(path: &Path, wanted: bool, port: u16, hook_installed: bool) -> Result<bool, String> {
+    let permissions = agy_permissions_at(path)?;
+    let host = standalone_bridge::BRIDGE_HOST;
+    if apply_agy_sync_reply_rules(permissions.as_ref(), wanted, host, port)? != permissions
+        && (hook_installed || !wanted)
+    {
+        write_agy_sync_reply_rules_at(path, wanted, port)?;
+    }
+    let permissions = agy_permissions_at(path)?;
+    let allow = permissions
+        .as_ref()
         .and_then(|value| value.get("allow"))
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|list| list.iter().any(|entry| entry.as_str().is_some_and(is_agy_sync_reply_rule))))
+        .and_then(serde_json::Value::as_array);
+    Ok(agy_sync_reply_rules(host, port)
+        .iter()
+        .all(|rule| allow.is_some_and(|list| list.iter().any(|entry| entry.as_str() == Some(rule.as_str()))))
+    )
+}
+
+/// The file first (A8): a failed write leaves the intent as it was, so the switch never
+/// reads Off while our rules are still in agy's file.
+fn set_agy_sync_replies_at(
+    path: &Path,
+    enabled: bool,
+    port: u16,
+    record_intent: impl FnOnce(bool) -> Result<(), String>,
+) -> Result<(), String> {
+    write_agy_sync_reply_rules_at(path, enabled, port)?;
+    record_intent(enabled)
 }
 
 /// Which agent's "answer rooms without asking" switch a call is about.
@@ -694,11 +751,9 @@ impl SyncReplyAgent {
         }
     }
 
-    fn rules_present(self) -> Result<bool, String> {
-        match self {
-            Self::Claude => Ok(rules_present(&read_claude_settings()?)),
-            Self::Agy => agy_rules_present_at(&agy_settings_path()?),
-        }
+    fn wanted(self) -> bool {
+        let (key, fallback) = self.flag();
+        standalone_bridge::config_flag(key, fallback)
     }
 
     fn write(self, enabled: bool) -> Result<(), String> {
@@ -710,18 +765,6 @@ impl SyncReplyAgent {
                 standalone_bridge::configured_bridge_port(),
             ),
         }
-    }
-
-    fn hook_installed(self) -> bool {
-        match self {
-            Self::Claude => claude_hook_state().is_ok_and(|(_, installed)| installed),
-            Self::Agy => agy_hook_state().is_ok_and(|(_, installed)| installed),
-        }
-    }
-
-    fn wanted(self) -> bool {
-        let (key, fallback) = self.flag();
-        standalone_bridge::config_flag(key, fallback)
     }
 }
 
@@ -735,24 +778,41 @@ impl SyncReplyAgent {
 #[tauri::command]
 fn sync_replies_allowed(agent: SyncReplyAgent) -> Result<bool, String> {
     let wanted = agent.wanted();
-    let present = agent.rules_present()?;
-    if wanted && !present {
+    if agent == SyncReplyAgent::Agy {
+        return agy_sync_replies_state(
+            &agy_settings_path()?,
+            wanted,
+            standalone_bridge::configured_bridge_port(),
+            agy_hook_state().is_ok_and(|(_, installed)| installed),
+        );
+    }
+    let settings = read_claude_settings()?;
+    if wanted && !rules_present(&settings) {
         // Only once the hook is in: without it nothing sends a reply to permit, and
         // writing permissions for a integration the person has not set up would be
         // reaching further than they asked.
-        if agent.hook_installed() {
-            agent.write(true)?;
+        if claude_hook_state().is_ok_and(|(_, installed)| installed) {
+            write_sync_reply_rules(true)?;
         }
         return Ok(wanted);
     }
-    Ok(wanted && present)
+    Ok(wanted && rules_present(&settings))
 }
 
 #[tauri::command]
 fn set_sync_replies_allowed(agent: SyncReplyAgent, enabled: bool) -> Result<(), String> {
+    let (flag, _) = agent.flag();
+    if agent == SyncReplyAgent::Agy {
+        return set_agy_sync_replies_at(
+            &agy_settings_path()?,
+            enabled,
+            standalone_bridge::configured_bridge_port(),
+            |enabled| standalone_bridge::write_config_flag(flag, enabled),
+        );
+    }
     // Intent is recorded before the effect, so a failed write leaves a switch that
     // reports what the person chose and retries on the next read.
-    standalone_bridge::write_config_flag(agent.flag().0, enabled)?;
+    standalone_bridge::write_config_flag(flag, enabled)?;
     agent.write(enabled)
 }
 
@@ -1113,12 +1173,19 @@ fn set_bridge_port(
     }
     standalone_bridge::write_configured_port(port)?;
     // The rules name the endpoint, so leaving them behind would silently stop matching.
-    for agent in [SyncReplyAgent::Claude, SyncReplyAgent::Agy] {
-        if agent.wanted() {
-            let _ = agent.write(true);
-        }
+    // The bridge still moves when one cannot be rewritten; the failure is reported rather
+    // than swallowed, and the next look at Settings tries again.
+    let failed: Vec<String> = [SyncReplyAgent::Claude, SyncReplyAgent::Agy]
+        .into_iter()
+        .filter(|agent| agent.wanted())
+        .filter_map(|agent| agent.write(true).err())
+        .collect();
+    state.restart()?;
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("Port {port} is set, but the rules that let agents answer rooms were not updated: {}", failed.join("; ")))
     }
-    state.restart()
 }
 
 /// Whether the app is set to start when the machine is unlocked.
@@ -7478,19 +7545,15 @@ mod agy_sync_reply_tests {
     const HOST: &str = standalone_bridge::BRIDGE_HOST;
     const PASSWORD: &str = "0123456789abcdef0123456789abcdef";
 
-    /// agy's `command(<glob>)`, as agy describes it: the whole line, `*` matching anything.
-    fn agy_glob_matches(rule: &str, command: &str) -> bool {
-        let Some(glob) = rule.strip_prefix("command(").and_then(|rest| rest.strip_suffix(')')) else {
-            return false;
-        };
-        fn go(glob: &[u8], text: &[u8]) -> bool {
-            match glob.split_first() {
-                None => text.is_empty(),
-                Some((b'*', rest)) => (0..=text.len()).any(|skip| go(rest, &text[skip..])),
-                Some((byte, rest)) => text.first() == Some(byte) && go(rest, &text[1..]),
-            }
-        }
-        go(glob.as_bytes(), command.as_bytes())
+    /// agy's `command(regex:<pattern>)`, as its permissions guide describes it: the pattern
+    /// is matched as `^(?:pattern)$`. Go's RE2 and the `regex` crate agree on every construct
+    /// the rules use (classes, counted repetition, escapes, `^`/`$` at the text's ends).
+    fn agy_rule_matches(rule: &str, command: &str) -> bool {
+        let pattern = rule
+            .strip_prefix("command(regex:")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("{rule} is not a regex rule"));
+        regex::Regex::new(&format!("^(?:{pattern})$")).unwrap().is_match(command)
     }
 
     /// Each command as it reaches the agent, and the source text it is printed from — so a
@@ -7572,38 +7635,67 @@ mod agy_sync_reply_tests {
         dir.join("settings.json")
     }
 
+    /// Every way the tests try to get a second command, or a file write, past a rule.
+    fn hostile(command: &str) -> Vec<String> {
+        let id = "6f1c2d3e-aaaa-bbbb-cccc-0123456789ab";
+        let mut out: Vec<String> = [
+            format!("rm -rf ~; {command}"),
+            format!("{command}; rm -rf ~"),
+            format!("{command} && curl evil.example"),
+            format!("{command} | sh"),
+            format!("{command}\nrm -rf ~"),
+            format!("{command}\n"),
+            format!(" {command}"),
+            format!("{command} -o ~/.zshrc"),
+        ]
+        .into();
+        for (slot, evil) in [
+            (id, "6f1c2d3e-aaaa-bbbb-cccc-0123456789ab; rm -rf ~;"),
+            (id, "$(id)"),
+            (PASSWORD, "$(cat ~/.ssh/id_rsa)"),
+            (PASSWORD, "`id`"),
+            ("sync-ab2c", "sync-ab2c/../../x"),
+            ("Done, see #261", "x'; rm -rf ~; echo '"),
+            ("Done, see #261", "$(rm -rf ~)"),
+            ("Done, see #261", "`rm -rf ~`"),
+            ("Done, see #261", "a && b"),
+            ("Done, see #261", "a | b"),
+            ("Done, see #261", "a\nb"),
+            ("hi", "x'; rm -rf ~; echo '"),
+            ("hi", "$(rm -rf ~)"),
+        ] {
+            if command.contains(slot) {
+                out.push(command.replacen(slot, evil, 1));
+            }
+        }
+        out
+    }
+
     #[test]
-    fn a1_every_printed_command_is_matched_and_nothing_in_front_of_it_is() {
+    fn a1_every_printed_command_is_matched_and_nothing_hostile_is() {
         let rules = agy_sync_reply_rules(HOST, 47621);
         for rule in &rules {
-            assert!(rule.starts_with("command(") && !rule.starts_with("command(*"), "{rule} must start with fixed text");
+            assert!(rule.starts_with("command(regex:^") && rule.ends_with("$)"), "{rule} must be anchored at both ends");
+            assert!(!rule.contains(".*") && !rule.contains(".+"), "{rule} must not hold an open wildcard");
         }
         for (name, command, source, fragments) in printed(47621) {
             // Premise: the sample is what the source prints, so the rule is judged on that.
             for fragment in fragments {
                 assert!(source.contains(fragment), "{name}: the source no longer prints {fragment}");
             }
-            let matching: Vec<_> = rules.iter().filter(|rule| agy_glob_matches(rule, &command)).collect();
+            let matching: Vec<_> = rules.iter().filter(|rule| agy_rule_matches(rule, &command)).collect();
             assert_eq!(matching.len(), 1, "{name}: {command} should match exactly one rule, matched {matching:?}");
-            for prefix in ["rm -rf ~; ", "rm -rf ~ && ", "true | ", " "] {
-                let smuggled = format!("{prefix}{command}");
-                assert!(!rules.iter().any(|rule| agy_glob_matches(rule, &smuggled)), "{name}: {smuggled} must not match");
+            let variants = hostile(&command);
+            // Premise: every slot this command has was attacked, not only its ends.
+            assert!(variants.len() > 8, "{name}: no slot of it was attacked");
+            for variant in variants {
+                assert!(!rules.iter().any(|rule| agy_rule_matches(rule, &variant)), "{name}: {variant:?} must not match");
             }
-            // The other port is someone else's endpoint.
             let other = command.replace(":47621/", ":47622/");
             if other != command {
-                assert!(!rules.iter().any(|rule| agy_glob_matches(rule, &other)), "{name}: another port must not match");
+                assert!(!rules.iter().any(|rule| agy_rule_matches(rule, &other)), "{name}: another port must not match");
             }
         }
-    }
-
-    /// Not a property we want: the risk the README names, pinned so nobody
-    /// believes the rules close it. agy's `*` crosses `;` and quotes.
-    #[test]
-    fn a1_residual_a_star_slot_can_still_carry_another_command() {
-        let rules = agy_sync_reply_rules(HOST, 47621);
-        let smuggled = format!("curl -s -X POST http://{HOST}:47621/mail/sync-ab2c -H 'content-type: application/json' -H \"x-gyredeck-token: x\" -d 'x'; rm -rf ~; echo 'x'");
-        assert!(rules.iter().any(|rule| agy_glob_matches(rule, &smuggled)));
     }
 
     #[test]
@@ -7736,6 +7828,81 @@ mod agy_sync_reply_tests {
             write_agy_sync_reply_rules_at(&path, enabled, 47621).unwrap();
             assert_eq!(stamp(&path), before, "{name}: not rewritten");
         }
+    }
+
+    fn allow_at(path: &Path) -> Vec<serde_json::Value> {
+        allow_of(&agy_permissions_at(path).unwrap())
+    }
+
+    fn seed(path: &Path, allow: &[serde_json::Value]) {
+        fs::write(path, serde_json::to_string_pretty(&json!({ "model": "m", "permissions": { "allow": allow } })).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a7_the_switch_reads_on_only_with_the_whole_set_for_the_current_port_and_repairs_otherwise() {
+        let port = 50123;
+        let user = json!("command(git status)");
+        let password = json!(format!("command(echo {PASSWORD})"));
+        let set = |port: u16| agy_sync_reply_rules(HOST, port).into_iter().map(serde_json::Value::String).collect::<Vec<_>>();
+        let complete = [vec![user.clone()], set(port)].concat();
+        let four = [vec![user.clone()], set(port)[1..].to_vec()].concat();
+        let stale = [vec![user.clone()], set(47621)].concat();
+        let with_password = [complete.clone(), vec![password.clone()]].concat();
+        // (name, wanted, hook in, file before, state shown, file after)
+        let cases: Vec<(&str, bool, bool, Vec<serde_json::Value>, bool, Vec<serde_json::Value>)> = vec![
+            ("on, complete", true, true, complete.clone(), true, complete.clone()),
+            ("on, one missing", true, true, four.clone(), true, complete.clone()),
+            ("on, old port", true, true, stale.clone(), true, complete.clone()),
+            ("on, a password rule left", true, true, with_password.clone(), true, complete.clone()),
+            ("on, no hook, one missing", true, false, four.clone(), false, four.clone()),
+            ("off, complete", false, true, complete.clone(), false, vec![user.clone()]),
+            ("off, no hook, old port", false, false, stale.clone(), false, vec![user.clone()]),
+            ("off, nothing of ours", false, true, vec![user.clone()], false, vec![user.clone()]),
+        ];
+        for (name, wanted, hook, before, shown, after) in cases {
+            let path = scratch(&format!("a7-{}", name.replace([' ', ','], "-")));
+            seed(&path, &before);
+            // Premise: the fixture holds what the case says, judged by the same rules.
+            assert_eq!(allow_at(&path), before, "{name}");
+            assert_eq!(agy_sync_replies_state(&path, wanted, port, hook).unwrap(), shown, "{name}");
+            let mut got: Vec<String> = allow_at(&path).iter().map(|e| e.to_string()).collect();
+            let mut want: Vec<String> = after.iter().map(|e| e.to_string()).collect();
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "{name}: the file after reading");
+        }
+    }
+
+    #[test]
+    fn a8_a_failed_write_is_an_error_and_leaves_the_intent_where_it_was() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = scratch("a8");
+        let before = agy_sync_reply_rules(HOST, 47621).into_iter().map(serde_json::Value::String).collect::<Vec<_>>();
+        seed(&path, &before);
+        let dir = path.parent().unwrap().to_path_buf();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        // Premise: the directory really refuses the temporary file a write needs.
+        let probe = fs::File::create(dir.join("probe"));
+        let mut recorded = None;
+        let set = set_agy_sync_replies_at(&path, false, 47621, |enabled| {
+            recorded = Some(enabled);
+            Ok(())
+        });
+        let shown = agy_sync_replies_state(&path, false, 47621, true);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(probe.is_err(), "premise: the directory is not writable");
+        assert!(set.is_err(), "turning it off reports the failure");
+        assert_eq!(recorded, None, "the intent is not changed when the file was not");
+        assert!(shown.is_err(), "a reading that cannot remove the rules is an error, never Off");
+        assert_eq!(allow_at(&path), before, "the rules are untouched");
+        let mut recorded = None;
+        set_agy_sync_replies_at(&path, false, 47621, |enabled| {
+            recorded = Some(enabled);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(recorded, Some(false), "and once the file is written, the intent follows");
+        assert_eq!(allow_at(&path), Vec::<serde_json::Value>::new());
     }
 
     #[test]

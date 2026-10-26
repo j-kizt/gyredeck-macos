@@ -66,13 +66,14 @@ session tells it so, closes its watch, and stops the room's password working for
 
 **Answering without a prompt each time** is a switch per agent under Settings →
 Permission. Claude Code's is on by default; its rules are prefix rules, and Claude Code
-checks each part of a chained command on its own. Antigravity's is **off** by default,
-because its rules cannot be made as tight. Gyredeck's rules start at the beginning of the
-command and pin everything the hook prints except the id, the room, the password and the
-message body. But agy's `*` also matches `;`, `&&` and `|`, and agy offers no narrower
-wildcard that we could find, so text that fills one of those slots can carry another
-command in with it. Moving Antigravity's switch either way also removes any Antigravity
-allow rule that holds a room password. Rules you added yourself are left alone, broad ones
+checks each part of a chained command on its own. Antigravity's is **off** by default. Its
+rules are `command(regex:…)` patterns anchored at both ends, one for each command the hook
+prints. The only parts that vary are the session id (a UUID), the room code, the
+password (32 hex digits) and the message body. The body is a single-quoted JSON object
+that may not contain `'`, `;`, `&`, `|`, a backtick, `$` or a line break. A reply with
+one of those characters is asked about as usual. Nothing in front of or behind a printed
+command matches. Moving Antigravity's switch either way also removes any Antigravity allow
+rule that holds a room password. Rules you added yourself are left alone, broad ones
 included.
 
 **A message says who it is for and what it is for**, so being in a room does not mean

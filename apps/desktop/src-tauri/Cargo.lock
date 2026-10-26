@@ -1317,6 +1317,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-user-notifications",
+ "regex",
  "reqwest 0.12.28",
  "security-framework",
  "serde",

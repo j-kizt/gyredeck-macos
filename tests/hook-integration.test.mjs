@@ -12088,15 +12088,42 @@ test("#259 C4: agy told outside a room is told again when it is let in", async (
 
 /**
  * A broker that does what the app's does with a collect (broker.rs): one vouched bridge call
- * for the bound session, the answer held under a delivery id only when it carries messages or
- * missed — an answer with nothing else in it is "empty" and handed back unheld.
+ * for the bound session, the answer held under a delivery id when it `carries` — mail,
+ * missed, or a notice (#259 r1) — and handed again until acknowledged, first and alone;
+ * except notices alone to a wait, which asks the bridge and takes them with what it
+ * collected. `refuseAfterCollect` refuses the next collect after the bridge call, as a
+ * binding lost meanwhile does, with the batch kept.
  */
+const NOTICE_KEYS = ["heavyNotice", "usageNotice"];
+const listedIn = (answer, key) => Array.isArray(answer?.[key]) && answer[key].length > 0;
+const carriesBatch = (answer) => listedIn(answer, "messages") || listedIn(answer, "missed")
+  || NOTICE_KEYS.some((key) => typeof answer?.[key] === "string" && answer[key] !== "");
 const relayBroker = async (f, as) => {
   const dir = join(f.home, ...CONFIG_DIR, "broker");
   await mkdir(dir, { recursive: true });
   const token = (await readFile(join(f.home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
   const requests = [];
-  let delivery = 0;
+  const bridgeCalls = [];
+  const acks = [];
+  const state = { outstanding: null, delivery: 0, refuseAfterCollect: false };
+  const collect = async (request) => {
+    const wakingOnly = request.collect.wakingOnly === true;
+    const held = state.outstanding;
+    const noticesOnly = held && carriesBatch(held.batch) && !listedIn(held.batch, "messages") && !listedIn(held.batch, "missed");
+    if (held && !(wakingOnly && noticesOnly)) return { ...held.batch, delivery: held.id, redelivered: true };
+    const response = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/inbox?as=${as}&collect=1&limit=10${wakingOnly ? "&waking=1" : ""}`, {
+      headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
+    });
+    const answer = { ...(await response.json()), v: 1, boundTo: as };
+    bridgeCalls.push({ wakingOnly, answer });
+    if (held && carriesBatch(answer)) for (const key of NOTICE_KEYS) if (held.batch[key] !== undefined && answer[key] === undefined) answer[key] = held.batch[key];
+    if (carriesBatch(answer)) state.outstanding = { id: ++state.delivery, batch: answer };
+    if (state.refuseAfterCollect) {
+      state.refuseAfterCollect = false;
+      return { v: 1, ok: false, error: "unattested", message: "The process that asked changed while its collect ran; the mail is kept for the session." };
+    }
+    return carriesBatch(answer) ? { ...answer, delivery: state.delivery } : answer;
+  };
   const server = createServer((socket) => {
     let text = "";
     socket.on("data", async (chunk) => {
@@ -12107,14 +12134,11 @@ const relayBroker = async (f, as) => {
       requests.push(request);
       let answer = { v: 1, ok: true };
       if (request.bind) answer = { v: 1, ok: true, bound: { conversationId: as, pid: 1, cli: "agy" } };
-      else if (request.collect) {
-        const waking = request.collect.wakingOnly ? "&waking=1" : "";
-        const response = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/inbox?as=${as}&collect=1&limit=10${waking}`, {
-          headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
-        });
-        answer = { ...(await response.json()), v: 1, boundTo: as };
-        const carries = (answer.messages ?? []).length > 0 || (answer.missed ?? []).length > 0;
-        if (carries) answer.delivery = ++delivery;
+      else if (request.collect) answer = await collect(request);
+      else if (request.ack) {
+        acks.push(request.ack.delivery);
+        if (state.outstanding?.id === request.ack.delivery) state.outstanding = null;
+        answer = { v: 1, ok: true, acked: request.ack.delivery };
       }
       socket.end(`${JSON.stringify(answer)}\n`);
     });
@@ -12122,8 +12146,40 @@ const relayBroker = async (f, as) => {
   await new Promise((resolve) => server.listen(join(dir, "gyredeck.broker.sock"), resolve));
   server.unref();
   openFakeServers.add(server);
-  return { requests, close: () => new Promise((resolve) => { openFakeServers.delete(server); server.close(resolve); }) };
+  return { requests, bridgeCalls, acks, state, close: () => new Promise((resolve) => { openFakeServers.delete(server); server.close(resolve); }) };
 };
+
+test("#259 r1: a notice-only batch refused after the collect is kept, arrives once, and not after its ack", async () => {
+  const f = await agyPasteFixture("r1nb");
+  let broker = null;
+  try {
+    await f.confirm();
+    // The confirmation's own messages taken first, so the next drain holds the line alone.
+    const woke = await f.call("GET", `/mail/inbox?as=${f.agy}&collect=1&waking=1&limit=10`);
+    assert.ok(woke.body.messages.length > 0, "premise: the room's messages are drained");
+    assert.equal(woke.body.heavyNotice, undefined, "premise: the waking poll took no line");
+    broker = await relayBroker(f, f.agy);
+    broker.state.refuseAfterCollect = true;
+    const refused = await f.invoke();
+    assert.match(refused.stderr, /mail withheld this turn/, "premise: refused");
+    assert.equal(broker.bridgeCalls.length, 1, "premise: after the bridge was asked");
+    const batch = broker.bridgeCalls[0].answer;
+    assert.deepEqual(batch.messages, [], "premise: no mail in it");
+    assert.equal(heavyCount(batch.heavyNotice ?? ""), 1, "premise: the line alone");
+    assert.equal(heavyCount(refused.text), 0, "premise: this invocation was not given it");
+    assert.ok(broker.state.outstanding, "r1: the notice-only batch is held");
+    const retried = await f.invoke();
+    assert.equal(broker.bridgeCalls.length, 1, "redelivered, not collected again");
+    assert.equal(heavyCount(retried.text), 1, "r1: it arrives, once");
+    assert.ok(retried.text.includes(heavyLineFor("agy", f.agy)));
+    assert.deepEqual(broker.acks, [broker.state.delivery], "r1: the hook acknowledged the notice-only delivery");
+    assert.equal(broker.state.outstanding, null);
+    assert.equal(heavyCount((await f.invoke()).text), 0, "r1: not after the ack");
+  } finally {
+    await broker?.close();
+    await f.close();
+  }
+});
 
 test("#259 C5: a wait's poll, an empty batch to the broker, does not use up the line", async () => {
   const f = await agyPasteFixture("h5w");
@@ -12194,6 +12250,27 @@ test("#259 C6: leaving and rejoining is told once more, each phase read to a con
     assert.equal(await confirmedIn(f, f.agy), false, "premise: rejoined, not yet confirmed");
     assert.equal(heavyCount((await f.invoke(f.password)).text), 1, "C6: told again");
     assert.equal(heavyCount((await f.invoke()).text), 0, "and once");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#259 r1: a wait's poll is handed neither notice; the next drain gets both", async () => {
+  const f = await agyPasteFixture("r1us");
+  try {
+    const claude = "a2590000-0000-4000-8000-0000000000u1";
+    await ingestAs(f, claude, "claude");
+    await f.call("POST", "/usage", {
+      providerId: "claude", displayName: "Claude Code", fetchedAt: new Date().toISOString(),
+      lines: [{ type: "progress", label: "Session", used: 40, limit: 100, resetsAt: null }],
+    });
+    const poll = await f.call("GET", `/mail/inbox?as=${claude}&collect=1&waking=1&limit=10`);
+    assert.equal(poll.status, 200, "premise: the poll was served");
+    assert.equal(poll.body.usageNotice, undefined, "a wait's poll: no usage line");
+    assert.equal(poll.body.heavyNotice, undefined, "a wait's poll: no heavy line");
+    const drain = await f.call("GET", `/mail/inbox?as=${claude}&collect=1&limit=10`);
+    assert.match(drain.body.usageNotice ?? "", /^USAGE: /m, "the drain gets the usage line");
+    assert.match(drain.body.heavyNotice ?? "", /^HEAVY RUNS: /, "and the heavy line");
   } finally {
     await f.close();
   }

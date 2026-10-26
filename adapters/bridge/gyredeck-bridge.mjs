@@ -7167,10 +7167,10 @@ function startBridge(config) {
           ...describeInbox(collected, sync, as, missed),
           ...(() => {
             if (collect && sync) noteUsageCollected(sync.name, collected.filter((message) => message.room === sync.name && message.from === ROOM_SENDER), as);
-            const usageNotice = collect ? usageNoticeFor(as) : null;
-            // Not on a wait's poll (#259): a wait prints only what wakes it and drops an
-            // empty poll whole, so a line handed to one would be gone. The hook's own drain,
-            // which prints it on every path, is what takes it.
+            // Neither notice on a wait's poll (#259): a wait prints only what wakes it and
+            // drops an empty poll whole, so a line handed to one would be gone. The hook's
+            // own drain, which prints them on every path, is what takes them.
+            const usageNotice = collect && !wakingOnly ? usageNoticeFor(as) : null;
             const heavyNotice = collect && !wakingOnly ? heavyNoticeFor(as) : null;
             return { ...(usageNotice ? { usageNotice } : {}), ...(heavyNotice ? { heavyNotice } : {}) };
           })(),

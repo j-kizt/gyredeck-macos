@@ -6012,8 +6012,9 @@ pub fn run() {
             if let Some(secret) = broker_secret {
                 let collect = {
                     let secret = secret.clone();
-                    std::sync::Arc::new(move |session: &str, limit: u64| {
-                        let path = format!("/mail/inbox?as={session}&collect=1&limit={limit}");
+                    std::sync::Arc::new(move |session: &str, limit: u64, waking_only: bool| {
+                        let waking = if waking_only { "&waking=1" } else { "" };
+                        let path = format!("/mail/inbox?as={session}&collect=1&limit={limit}{waking}");
                         standalone_bridge::bridge_request_vouched("GET", &path, None, &secret).map(|(_, body)| body)
                     })
                 };

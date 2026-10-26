@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { connect as netConnect, createServer } from "node:net";
 import { randomBytes, randomUUID } from "node:crypto";
-import test from "node:test";
+import test, { after } from "node:test";
 
 const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const CONFIG_DIR = [".config", "gyredeck"];
@@ -8147,6 +8147,10 @@ test("a goal turn that began before the session was confirmed, or that spans a r
  * watched choosing between it and TCP. `answer(request)` returns the JSON to send back;
  * every request is recorded.
  */
+/** Fake brokers still listening when the run ends: closed, whatever their tests did. */
+const openFakeServers = new Set();
+after(() => { for (const server of openFakeServers) server.close(); });
+
 const fakeBroker = async (home, answer) => {
   const dir = join(home, ...CONFIG_DIR, "broker");
   await mkdir(dir, { recursive: true });
@@ -8164,7 +8168,10 @@ const fakeBroker = async (home, answer) => {
     });
   });
   await new Promise((resolve) => server.listen(path, resolve));
-  return { requests, close: () => new Promise((resolve) => server.close(resolve)) };
+  // A test that fails before closing it must not keep the run alive (#244 r2).
+  server.unref();
+  openFakeServers.add(server);
+  return { requests, close: () => new Promise((resolve) => { openFakeServers.delete(server); server.close(resolve); }) };
 };
 
 test("a hook collects through the broker when it can, and falls back only when the broker is absent or declines", async () => {
@@ -8942,7 +8949,7 @@ test("the hook's wait goes through the broker: collect only, boundTo validated, 
     let broker = await fakeBroker(home, () => ({ v: 1, ok: true, boundTo: me, messages: [{ seq: 1, from: "codex", text: "here", kind: "tell" }] }));
     let waited = await waitBy(["30", me]);
     assert.equal(waited.code, 0, waited.stderr);
-    assert.deepEqual(broker.requests, [{ v: 1, collect: { limit: 10 } }], "a collect, never a bind");
+    assert.deepEqual(broker.requests, [{ v: 1, collect: { limit: 10, wakingOnly: true } }], "a waiting collect, never a bind");
     assert.deepEqual(JSON.parse(waited.stdout).messages.map((m) => m.text), ["here"]);
     assert.equal(JSON.parse(waited.stdout).timedOut, false);
     await broker.close();
@@ -9377,7 +9384,7 @@ test("the Antigravity hook's wait asks the broker, ends on mail, and is refused 
     let broker = await fakeBroker(home, () => ({ v: 1, ok: true, boundTo: me, messages: [{ seq: 4, from: "codex", text: "for agy", kind: "ask" }] }));
     let waited = await waitBy(["30", me]);
     assert.equal(waited.code, 0, waited.stderr);
-    assert.deepEqual(broker.requests[0], { v: 1, collect: { limit: 10 } }, "a collect, never a bind");
+    assert.deepEqual(broker.requests[0], { v: 1, collect: { limit: 10, wakingOnly: true } }, "a waiting collect, never a bind");
     assert.deepEqual(JSON.parse(waited.stdout).messages.map((m) => m.text), ["for agy"]);
     await broker.close();
 
@@ -11793,47 +11800,165 @@ test("quiet: a held wait does not return for quiet notices already waiting, and 
   }
 });
 
-for (const hook of [
-  { name: "Claude Code", path: "adapters/claude/gyredeck-claude-hook.mjs" },
-  { name: "Antigravity", path: "adapters/antigravity/gyredeck-agy-hook.mjs" },
-]) {
-  test(`quiet: ${hook.name}'s wait through the broker is not ended by a quiet batch, and hands it over`, async () => {
-    const quietMessage = { seq: 5, room: "sync-q", from: "gyredeck-room", to: "everyone", kind: "notice", quiet: true, text: "HEAVY RUN: Terminal started cargo test.", ts: new Date().toISOString() };
-    const wakeMessage = { seq: 6, room: "sync-q", from: "peer", to: "everyone", kind: "tell", text: "WAKE", ts: new Date().toISOString() };
-    const me = "a2441000-0000-4000-8000-000000000031";
-    const run = async (batches) => {
-      const home = await mkdtemp(join(tmpdir(), "gyredeck-qw-"));
-      await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
-      let delivery = 0;
-      const broker = await fakeBroker(home, (request) => {
-        if (request.ack) return { v: 1, ok: true, acked: request.ack.delivery };
-        if (request.bind) return { v: 1, ok: true, bound: { conversationId: me, pid: 1 } };
-        delivery += 1;
-        return { v: 1, ok: true, delivery, boundTo: me, messages: batches.shift() ?? [] };
-      });
-      try {
-        const started = Date.now();
-        const result = await runAdapter(hook.path, ["wait", "3", me], home, {});
-        return { ...result, ms: Date.now() - started, requests: broker.requests };
-      } finally {
-        await broker.close();
-        await rm(home, { recursive: true, force: true });
-      }
-    };
-    // Premise: a waking batch ends the wait at once.
-    const control = await run([[wakeMessage]]);
-    assert.equal(control.code, 0, control.stderr);
-    assert.ok(control.ms < 2_000, String(control.ms));
-    assert.equal(JSON.parse(control.stdout).timedOut, false);
+/**
+ * A broker that behaves as the native one does where it matters here (broker.rs): a collect
+ * is one bridge collect for the bound session, with `waking=1` when the hook asks
+ * `wakingOnly`; a batch with anything in it is held until its delivery is acknowledged and
+ * handed out again until then; an acknowledgement drops it for good.
+ */
+const statefulBroker = async (h, home, session) => {
+  const dir = join(home, ...CONFIG_DIR, "broker");
+  await mkdir(dir, { recursive: true });
+  const requests = [];
+  const sockets = new Set();
+  let outstanding = null;
+  let delivery = 0;
+  const answer = async (request) => {
+    if (request.bind) return { v: 1, ok: true, bound: { conversationId: session, pid: 1 } };
+    if (request.ack) {
+      if (outstanding?.delivery === request.ack.delivery) outstanding = null;
+      return { v: 1, ok: true, acked: request.ack.delivery };
+    }
+    if (outstanding) return { ...outstanding.batch, delivery: outstanding.delivery, redelivered: true };
+    const waking = request.collect?.wakingOnly === true ? "&waking=1" : "";
+    const body = await fetch(`${h.base}/mail/inbox?as=${session}&collect=1&limit=${request.collect?.limit ?? 100}${waking}`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    const batch = { ...body, v: 1, boundTo: session };
+    if ((body.messages ?? []).length === 0 && (body.missed ?? []).length === 0) return batch;
+    delivery += 1;
+    outstanding = { delivery, batch };
+    return { ...batch, delivery };
+  };
+  const server = createServer((socket) => {
+    let text = "";
+    // A hook killed mid-request leaves this end writing into nothing.
+    socket.on("error", () => {});
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("data", (chunk) => {
+      text += chunk;
+      const end = text.indexOf("\n");
+      if (end < 0) return;
+      const request = JSON.parse(text.slice(0, end));
+      requests.push(request);
+      answer(request).then((reply) => socket.end(`${JSON.stringify(reply)}\n`), () => socket.destroy());
+    });
+  });
+  await new Promise((resolve) => server.listen(join(dir, "gyredeck.broker.sock"), resolve));
+  server.unref();
+  openFakeServers.add(server);
+  const ask = (request) => new Promise((resolve, reject) => {
+    const socket = netConnect(join(dir, "gyredeck.broker.sock"));
+    let text = "";
+    socket.on("data", (chunk) => { text += chunk; });
+    socket.on("end", () => resolve(JSON.parse(text)));
+    socket.on("error", reject);
+    socket.write(`${JSON.stringify(request)}\n`);
+  });
+  // Bounded: open connections are cut, so a failing test still ends and its cleanup runs.
+  const close = async () => {
+    for (const socket of sockets) socket.destroy();
+    openFakeServers.delete(server);
+    server.close();
+  };
+  return { requests, ask, outstanding: () => outstanding, close };
+};
 
-    const quietOnly = await run([[quietMessage]]);
-    assert.ok(quietOnly.ms >= 2_500, `ran to its end: ${quietOnly.ms}`);
-    assert.equal(quietOnly.code, hook.name === "Antigravity" ? 4 : 0, quietOnly.stderr);
-    assert.ok(quietOnly.stdout.includes("HEAVY RUN: Terminal started"), "handed over all the same");
-    assert.ok(quietOnly.requests.some((request) => request.ack?.delivery === 1), "and acknowledged");
+const QUIET_HOOKS = [
+  { name: "Claude Code", path: "adapters/claude/gyredeck-claude-hook.mjs", timedOutCode: 0 },
+  { name: "Antigravity", path: "adapters/antigravity/gyredeck-agy-hook.mjs", timedOutCode: 4 },
+];
 
-    const both = await run([[quietMessage], [wakeMessage]]);
-    assert.equal(both.code, 0);
-    assert.deepEqual(JSON.parse(both.stdout).messages.map((m) => m.text), [quietMessage.text, "WAKE"]);
+/** A room whose founder `me` has one quiet notice pending and nothing else; a stateful broker for `me`. */
+const quietPending = async (tag) => {
+  const h = await heavyHarness(`qp-${tag}`);
+  // A premise that fails here must still end the bridge, or the run hangs on it.
+  try {
+    return await quietPendingIn(h, tag);
+  } catch (error) {
+    await h.cleanup();
+    throw error;
+  }
+};
+const quietPendingIn = async (h, tag) => {
+  await h.start();
+  const q = await quietRoom(h, tag);
+  await q.join();
+  await fetch(`${h.base}/mail/inbox?as=${q.founder}&collect=1`, { headers: { "x-gyredeck-token": h.token() } });
+  await reportObserved(h, [observedRun()]);
+  const pending = async () => (await fetch(`${h.base}/mail/inbox?as=${q.founder}`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json())).messages ?? [];
+  const before = await pending();
+  assert.equal(before.length, 1, "premise: one quiet notice pending");
+  assert.equal(before[0].quiet, true);
+  const broker = await statefulBroker(h, h.home, q.founder);
+  const children = new Set();
+  const wait = (hook, seconds) => {
+    const child = spawn(process.execPath, [hook.path, "wait", String(seconds), q.founder], { cwd: repoRoot, env: { ...process.env, HOME: h.home }, stdio: ["ignore", "pipe", "pipe"] });
+    const out = { stdout: "", stderr: "", child };
+    child.stdout.on("data", (chunk) => { out.stdout += chunk; });
+    child.stderr.on("data", (chunk) => { out.stderr += chunk; });
+    out.exited = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
+    children.add(child);
+    return out;
+  };
+  const cleanup = async () => {
+    for (const child of children) { try { child.kill("SIGKILL"); } catch {} child.stdout.destroy(); child.stderr.destroy(); }
+    await broker.close();
+    await h.cleanup();
+  };
+  return { h, q, broker, pending, wait, cleanup };
+};
+const waitingCollects = (broker) => broker.requests.filter((request) => request.collect?.wakingOnly === true).length;
+
+for (const hook of QUIET_HOOKS) {
+  test(`quiet r2: ${hook.name}'s wait killed while only quiet mail is pending loses nothing — the next collect returns it`, async () => {
+    const f = await quietPending(hook.name === "Antigravity" ? "a" : "c");
+    try {
+      const waiting = f.wait(hook, 10);
+      // Premise: the wait is in flight and has asked through the broker, and printed nothing.
+      await until(() => waitingCollects(f.broker) >= 2, "two waiting collects");
+      assert.equal(waiting.stdout, "");
+      waiting.child.kill("SIGKILL");
+      await waiting.exited;
+      assert.equal(waiting.stdout, "", "killed before it printed anything");
+      assert.equal(f.broker.outstanding(), null, "the broker holds nothing for it either");
+      // The next collect — a foreground one, through the same broker — still has it.
+      const next = await f.broker.ask({ v: 1, collect: { limit: 10 } });
+      assert.deepEqual((next.messages ?? []).map((m) => m.text.slice(0, 26)), ["HEAVY RUN: Terminal starte"]);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test(`quiet r2: during ${hook.name}'s held wait a foreground collect gets the quiet notice, and the wait runs to its end`, async () => {
+    const f = await quietPending(hook.name === "Antigravity" ? "b" : "d");
+    try {
+      const waiting = f.wait(hook, 3);
+      await until(() => waitingCollects(f.broker) >= 1, "premise: the wait is collecting");
+      const foreground = await f.broker.ask({ v: 1, collect: { limit: 10 } });
+      assert.equal((foreground.messages ?? []).length, 1, JSON.stringify(foreground));
+      assert.ok(foreground.messages[0].text.startsWith("HEAVY RUN: "));
+      await f.broker.ask({ v: 1, ack: { delivery: foreground.delivery } });
+      const { code } = await waiting.exited;
+      assert.equal(code, hook.timedOutCode, waiting.stderr);
+      assert.ok(!waiting.stdout.includes("HEAVY RUN"), "the wait was not woken by it");
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test(`quiet r2: ${hook.name}'s wait ends on mail and hands over the quiet notice with it`, async () => {
+    const f = await quietPending(hook.name === "Antigravity" ? "e" : "f");
+    try {
+      const waiting = f.wait(hook, 10);
+      await until(() => waitingCollects(f.broker) >= 1, "premise: the wait is collecting");
+      assert.equal(waiting.stdout, "", "premise: the quiet notice alone did not end it");
+      await f.q.say("WAKE-R2");
+      const { code } = await waiting.exited;
+      assert.equal(code, 0, waiting.stderr);
+      assert.deepEqual(JSON.parse(waiting.stdout).messages.map((m) => (m.text.startsWith("HEAVY RUN") ? "HEAVY" : m.text)), ["HEAVY", "WAKE-R2"]);
+      assert.equal((await f.pending()).length, 0, "and both were taken");
+    } finally {
+      await f.cleanup();
+    }
   });
 }

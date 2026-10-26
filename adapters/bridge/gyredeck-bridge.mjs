@@ -6926,6 +6926,10 @@ function startBridge(config) {
         };
 
         const collect = url.searchParams.get("collect") === "1";
+        // `waking=1`: a wait's collect (#244 r2). Nothing is taken, and no cursor moves,
+        // until something in it would wake this session — so quiet mail stays here, where a
+        // foreground collect still finds it, rather than in a waiting process's memory.
+        const wakingOnly = url.searchParams.get("waking") === "1";
         const closed = refuseMailboxRead(as, brokerHeader);
         if (closed) {
           sendJson(403, { ok: false, ...closed });
@@ -7102,7 +7106,7 @@ function startBridge(config) {
           return;
         }
 
-        const { collected, sync, missed } = collectInbox();
+        const { collected, sync, missed } = collectInbox({ wakingOnly });
         sendJson(200, {
           ok: true,
           // A collect that found nothing says why the last thing this session said drew

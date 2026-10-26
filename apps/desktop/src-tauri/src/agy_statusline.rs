@@ -432,18 +432,33 @@ pub(crate) fn merge_json_key(
     key: &str,
     mut update: impl FnMut(Option<&Value>) -> Result<Option<Value>, String>,
 ) -> Result<Option<Value>, String> {
-    for _ in 0..MERGE_ATTEMPTS {
-        let (mut root, read) = read_json_object_from(path)?;
-        let before = read.as_ref().map(|regular| regular.stamp);
-        let previous = root.get(key).cloned();
-        let next = update(previous.as_ref())?;
-        if next == previous {
-            return Ok(previous);
-        }
-        match next {
+    let mut previous = None;
+    merge_json_root(path, |root| {
+        previous = root.get(key).cloned();
+        match update(previous.as_ref())? {
             Some(value) => root.insert(key.to_string(), value),
             None => root.remove(key),
         };
+        Ok(())
+    })?;
+    Ok(previous)
+}
+
+/// [`merge_json_key`] over the whole root object, for a change to several keys that must land
+/// in one write (#266): `update` edits the root as read, and a write by the owner at any
+/// point redoes all of it. Nothing is written when the root does not change.
+pub(crate) fn merge_json_root(
+    path: &Path,
+    mut update: impl FnMut(&mut Map<String, Value>) -> Result<(), String>,
+) -> Result<(), String> {
+    for _ in 0..MERGE_ATTEMPTS {
+        let (mut root, read) = read_json_object_from(path)?;
+        let before = read.as_ref().map(|regular| regular.stamp);
+        let original = root.clone();
+        update(&mut root)?;
+        if root == original {
+            return Ok(());
+        }
         let mut text = serde_json::to_string_pretty(&Value::Object(root))
             .map_err(|error| format!("Failed to encode {}: {error}", path.display()))?;
         text.push('\n');
@@ -453,7 +468,7 @@ pub(crate) fn merge_json_key(
             let _ = fs::remove_file(&temp);
             continue;
         }
-        return rename_into_place(&temp, path).map(|()| previous);
+        return rename_into_place(&temp, path);
     }
     Err(format!(
         "{} kept changing while Gyredeck was updating it; nothing was changed. Try again.",

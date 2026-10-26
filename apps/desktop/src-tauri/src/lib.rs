@@ -5143,16 +5143,19 @@ fn agy_hooks_registered(hooks_json_path: &Path, installed_path: &str) -> bool {
 }
 
 /// Put Gyredeck's namespace into `~/.gemini/config/hooks.json`, dropping the previous
-/// brand's, through `merge_json_key`: a link is refused, the mode is kept, and a write by
-/// agy while this runs is noticed and the merge redone rather than overwritten.
+/// brand's, in one `merge_json_root`: a link is refused, the mode is kept, and a write by
+/// agy while this runs is noticed and both keys redone rather than overwritten (#266 — two
+/// merges let agy put the old brand back between them).
 /// `entry` is asked for the namespace inside the merge, each time it is (re)done.
 fn register_agy_hooks(
     hooks_json_path: &Path,
     mut entry: impl FnMut() -> serde_json::Value,
 ) -> Result<(), String> {
-    agy_statusline::merge_json_key(hooks_json_path, "agent-activity", |_| Ok(None))?;
-    agy_statusline::merge_json_key(hooks_json_path, "gyredeck", |_| Ok(Some(entry())))?;
-    Ok(())
+    agy_statusline::merge_json_root(hooks_json_path, |root| {
+        root.remove("agent-activity");
+        root.insert("gyredeck".to_string(), entry());
+        Ok(())
+    })
 }
 
 /// Where the Antigravity adapter is and whether it is wired in, without an app handle.
@@ -7484,6 +7487,28 @@ mod agy_install_links {
         assert_eq!(after["saved-by-agy"], true, "agy's write survives");
         assert!(after.get("theirs").is_some() && after.get("gyredeck").is_some());
         assert!(after.get("agent-activity").is_none(), "the old brand is gone");
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn the_old_brand_put_back_by_agy_during_registration_is_removed_again() {
+        let f = fixture("hooks-rebrand-race");
+        fs::write(&f.hooks_json, br#"{"theirs":{},"agent-activity":{}}"#).unwrap();
+        let mut asked = 0;
+        register_agy_hooks(&f.hooks_json, || {
+            asked += 1;
+            if asked == 1 {
+                // agy saves its hooks, the old brand's included, while ours are being put in.
+                fs::write(&f.hooks_json, br#"{"theirs":{},"agent-activity":{},"saved-by-agy":true}"#).unwrap();
+            }
+            serde_json::json!({ "Stop": [] })
+        })
+        .unwrap();
+        assert_eq!(asked, 2, "premise: the change was seen and the merge redone");
+        let after: serde_json::Value = serde_json::from_str(&fs::read_to_string(&f.hooks_json).unwrap()).unwrap();
+        assert_eq!(after["saved-by-agy"], true, "agy's write survives");
+        assert!(after.get("gyredeck").is_some());
+        assert!(after.get("agent-activity").is_none(), "the old brand agy put back is gone");
         let _ = fs::remove_dir_all(&f.root);
     }
 

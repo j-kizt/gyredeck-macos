@@ -11,6 +11,8 @@ import HeavyPatternsRow from "./HeavyPatternsRow";
 import { useHeavyRuns } from "./useHeavyRuns";
 import { codexTrustCopy, hookNeedsAttention, hookSettled, type IHookStatus } from "./hookStatus";
 
+export type SyncAgent = "claude" | "agy";
+
 type SetupCategory = "connection" | "display" | "git" | "notification" | "permission" | "plugins" | "update";
 // Alphabetical. Arrow-key order and the visible order are the same list, because a
 // roving tabstop that jumps somewhere else is a bug.
@@ -87,10 +89,10 @@ export interface ISetupPanelProps {
   mailRooms: Record<string, { room: string; members: string[]; pending: number; founder: string | null }>;
   notifications: INotificationsState;
   onCloseRoom: (room: string, founder: string) => Promise<void>;
-  /** Null while unknown, so the switch does not claim "off" before it has looked. */
-  syncRepliesAllowed: boolean | null;
+  /** Per agent; null or absent while unknown, so a switch does not claim "off" before it has looked. */
+  syncRepliesAllowed: Partial<Record<SyncAgent, boolean | null>>;
   syncRepliesBusy: boolean;
-  onSyncRepliesChange: (next: boolean) => Promise<void>;
+  onSyncRepliesChange: (agent: SyncAgent, next: boolean) => Promise<void>;
   agyStatus: IHookStatus;
   codexStatus: IHookStatus;
   codexNotifyStatus: IHookStatus;
@@ -529,14 +531,18 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
           {activeCategory === "permission" ? (
             <>
               <div className="setup-section-heading"><span>Permission</span><small>What an agent may do unprompted</small></div>
-              <div className="setup-row"><span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Allow sync replies without asking</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : !hookStatus.installed ? "Needs the Claude Code hook — install it under Plugins" : syncRepliesAllowed === null ? "Checking…" : syncRepliesAllowed ? "On · a session answers its room without a prompt each time" : "Off · Claude Code asks before every reply and every wait"}</span></span>{!hookStatus.installed ? (
-                // Shown but locked rather than hidden: the setting exists and its state
-                // is worth seeing. A padlock says why it cannot be moved, where a greyed
-                // switch would only say that it cannot.
-                <span className="setup-locked" title="Install the Claude Code hook first"><Lock size={12} strokeWidth={2.4} /></span>
-              ) : (
-                <button className="switch-toggle" type="button" role="switch" aria-checked={syncRepliesAllowed === true} data-on={syncRepliesAllowed === true} disabled={!canUseNativeControls || syncRepliesBusy || syncRepliesAllowed === null} onClick={() => void onSyncRepliesChange(!syncRepliesAllowed)} data-tauri-drag-region="false" aria-label={`${syncRepliesAllowed ? "Stop allowing" : "Allow"} sync replies without asking`}><span className="switch-thumb" /></button>
-              )}</div>
+              {/* One row per agent, from one markup (#261): each switch governs only its own agent. */}
+              {([["claude", "Claude Code", hookStatus], ["agy", "Antigravity", agyStatus]] as const).map(([agent, name, status]) => {
+                const allowed = syncRepliesAllowed[agent];
+                return <div className="setup-row" key={agent} data-sync-agent={agent}><span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{name}: answer rooms without asking</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : !status.installed ? `Needs the ${name} hook — install it under Plugins` : allowed == null ? "Checking…" : allowed ? `On: ${name} replies and listens in its room with no prompt each time.` : "Off: it asks before every reply and every wait."}</span></span>{!status.installed ? (
+                  // Shown but locked rather than hidden: the setting exists and its state
+                  // is worth seeing. A padlock says why it cannot be moved, where a greyed
+                  // switch would only say that it cannot.
+                  <span className="setup-locked" title={`Install the ${name} hook first`}><Lock size={12} strokeWidth={2.4} /></span>
+                ) : (
+                  <button className="switch-toggle" type="button" role="switch" aria-checked={allowed === true} data-on={allowed === true} disabled={!canUseNativeControls || syncRepliesBusy || allowed == null} onClick={() => void onSyncRepliesChange(agent, !allowed)} data-tauri-drag-region="false" aria-label={`${allowed ? "Stop letting" : "Let"} ${name} answer rooms without asking`}><span className="switch-thumb" /></button>
+                )}</div>;
+              })}
             </>
           ) : null}
 

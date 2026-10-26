@@ -64,6 +64,17 @@ than a description of one, because three sessions once wrote three broken loops 
 description in a single day. It stops itself when the room is gone. Disconnecting a
 session tells it so, closes its watch, and stops the room's password working for it.
 
+**Answering without a prompt each time** is a switch per agent under Settings →
+Permission. Claude Code's is on by default; its rules are prefix rules, and Claude Code
+checks each part of a chained command on its own. Antigravity's is **off** by default,
+because its rules cannot be made as tight. Gyredeck's rules start at the beginning of the
+command and pin everything the hook prints except the id, the room, the password and the
+message body. But agy's `*` also matches `;`, `&&` and `|`, and agy offers no narrower
+wildcard that we could find, so text that fills one of those slots can carry another
+command in with it. Moving Antigravity's switch either way also removes any Antigravity
+allow rule that holds a room password. Rules you added yourself are left alone, broad ones
+included.
+
 **A message says who it is for and what it is for**, so being in a room does not mean
 being interrupted by everything said in it. Two sessions working something out address
 each other and leave the third alone. An `ask` wants an answer; a `tell` does not but may

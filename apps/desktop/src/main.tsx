@@ -35,7 +35,7 @@ import {
 } from "./features/session/selectors";
 import type { DeletedSessionRegistry, DismissedSessionRegistry, ISessionDetail, ISessionSummary, IWorkspaceSessionGroup } from "./features/session/types";
 import { DEFAULT_BRIDGE_PORT, useGyredeckPresence } from "./features/presence/useGyredeckPresence";
-import { SetupPanel } from "./features/setup/SetupPanel";
+import { SetupPanel, type SyncAgent } from "./features/setup/SetupPanel";
 import { SessionNameField } from "./features/session/SessionNameField";
 import { useSessionNames } from "./features/session/useSessionNames";
 import { codexCanSync, hookNeedsAttention, type CodexHookTrust, type IHookStatus } from "./features/setup/hookStatus";
@@ -123,7 +123,7 @@ const App = () => {
   const [hookStatus, setHookStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
   // Whether a session may answer its room without being approved each time. Null until
   // read, so the switch does not flicker through "off" on the way to its real state.
-  const [syncRepliesAllowed, setSyncRepliesAllowed] = useState<boolean | null>(null);
+  const [syncRepliesAllowed, setSyncRepliesAllowed] = useState<Partial<Record<SyncAgent, boolean | null>>>({});
   const [syncRepliesBusy, setSyncRepliesBusy] = useState(false);
   const [agyStatus, setAgyStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
   const [codexStatus, setCodexStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
@@ -781,26 +781,24 @@ const App = () => {
     }
   };
 
-  const loadSyncReplies = async () => {
-    if (!canUseNativeControls) {
-      setSyncRepliesAllowed(null);
-      return;
-    }
+  const loadSyncReplies = async (agent: SyncAgent) => {
+    let allowed: boolean | null = null;
     try {
-      setSyncRepliesAllowed(await invoke<boolean>("sync_replies_allowed"));
+      if (canUseNativeControls) allowed = await invoke<boolean>("sync_replies_allowed", { agent });
     } catch {
-      setSyncRepliesAllowed(null);
+      // Unknown stays unknown rather than reading as off.
     }
+    setSyncRepliesAllowed((all) => ({ ...all, [agent]: allowed }));
   };
 
-  const changeSyncReplies = async (next: boolean) => {
+  const changeSyncReplies = async (agent: SyncAgent, next: boolean) => {
     setSyncRepliesBusy(true);
     try {
-      await invoke("set_sync_replies_allowed", { enabled: next });
-      setSyncRepliesAllowed(next);
+      await invoke("set_sync_replies_allowed", { agent, enabled: next });
+      setSyncRepliesAllowed((all) => ({ ...all, [agent]: next }));
     } catch {
       // The switch stays where it was; a failed write has not changed anything.
-      await loadSyncReplies();
+      await loadSyncReplies(agent);
     } finally {
       setSyncRepliesBusy(false);
     }
@@ -1051,7 +1049,8 @@ const App = () => {
       void loadAgyStatus();
       void recheckCodexTrust();
       void loadCodexNotifyStatus();
-      void loadSyncReplies();
+      void loadSyncReplies("claude");
+      void loadSyncReplies("agy");
       void checkBridge();
     }
   }, [setupOpen]);

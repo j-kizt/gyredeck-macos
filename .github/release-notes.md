@@ -9,8 +9,10 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   show "Checking…" for ever with the switch locked.
 - **Claude Code's switch changes only when its settings file does.** If the file could not be written,
   the switch used to remember the new setting anyway. It now stays where it was.
-- **Changing the bridge port updates Antigravity's rules only when its hook is installed**, and a
-  failed rule update is reported even when the bridge restart fails as well.
+- **Changing the bridge port no longer adds rules for an agent you have not set up.** Antigravity's
+  rules follow the new port only when its hook is installed. Claude Code's follow it when its hook is
+  installed or its rules are already in its settings, and are never created otherwise. A failed rule
+  update is now reported even when the bridge restart fails as well.
 - **Installing the Antigravity hook removes the old Agent Activity entry in the same write that adds
   Gyredeck's.** If Antigravity saved its hooks file between the two steps, the old entry could come
   back beside the new one.

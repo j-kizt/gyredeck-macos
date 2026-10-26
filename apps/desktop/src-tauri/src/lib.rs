@@ -776,11 +776,20 @@ impl SyncReplyAgent {
         record_intent(enabled)
     }
 
-    /// Whether a port change rewrites this agent's rules. Antigravity's only once its hook
-    /// is in, the same gate its read path has (A7). Claude Code's whenever it is on: its
-    /// read path does not notice a stale port, so the move is the only time they follow.
-    fn rules_follow_port(self, wanted: bool, hook_installed: bool) -> bool {
-        wanted && (self == Self::Claude || hook_installed)
+    /// Whether a port change rewrites this agent's rules: only while it is on and its hook
+    /// is in, the same gate its read path has (A7). Claude Code's read path does not notice
+    /// a stale port, so rules already in its file follow the move even without the hook;
+    /// rules that are not there are never created by it (#267 stand-in).
+    fn rules_follow_port(self, wanted: bool, hook_installed: bool, rules_in_file: bool) -> bool {
+        wanted && (hook_installed || (self == Self::Claude && rules_in_file))
+    }
+
+    /// Whether this agent's settings file holds Gyredeck's rules, for any port.
+    fn rules_in_file(self) -> bool {
+        self == Self::Claude
+            && claude_settings_path()
+                .and_then(|path| read_claude_settings(&path))
+                .is_ok_and(|settings| rules_present(&settings))
     }
 }
 
@@ -1188,7 +1197,7 @@ fn set_bridge_port(
     // than swallowed, and the next look at Settings tries again.
     let failed: Vec<String> = [SyncReplyAgent::Claude, SyncReplyAgent::Agy]
         .into_iter()
-        .filter(|agent| agent.rules_follow_port(agent.wanted(), agent.hook_installed()))
+        .filter(|agent| agent.rules_follow_port(agent.wanted(), agent.hook_installed(), agent.rules_in_file()))
         .filter_map(|agent| agent.write(true).err())
         .collect();
     port_change_result(port, state.restart(), failed)
@@ -8015,18 +8024,25 @@ mod agy_sync_reply_tests {
     }
 
     #[test]
-    fn p1_a_port_change_rewrites_antigravitys_rules_only_once_its_hook_is_in() {
-        for (agent, wanted, hook, follows) in [
-            (SyncReplyAgent::Agy, true, true, true),
-            (SyncReplyAgent::Agy, true, false, false),
-            (SyncReplyAgent::Agy, false, true, false),
-            (SyncReplyAgent::Agy, false, false, false),
-            (SyncReplyAgent::Claude, true, true, true),
-            (SyncReplyAgent::Claude, true, false, true),
-            (SyncReplyAgent::Claude, false, true, false),
-            (SyncReplyAgent::Claude, false, false, false),
+    fn p1_a_port_change_rewrites_rules_only_once_the_hook_is_in_or_claudes_are_already_there() {
+        for (agent, wanted, hook, in_file, follows) in [
+            (SyncReplyAgent::Agy, true, true, false, true),
+            (SyncReplyAgent::Agy, true, false, false, false),
+            (SyncReplyAgent::Agy, true, false, true, false),
+            (SyncReplyAgent::Agy, false, true, true, false),
+            (SyncReplyAgent::Agy, false, false, false, false),
+            (SyncReplyAgent::Claude, true, true, false, true),
+            (SyncReplyAgent::Claude, true, false, true, true),
+            // No hook and no rules: a port change never creates Claude's settings file.
+            (SyncReplyAgent::Claude, true, false, false, false),
+            (SyncReplyAgent::Claude, false, true, true, false),
+            (SyncReplyAgent::Claude, false, false, false, false),
         ] {
-            assert_eq!(agent.rules_follow_port(wanted, hook), follows, "{agent:?} wanted={wanted} hook={hook}");
+            assert_eq!(
+                agent.rules_follow_port(wanted, hook, in_file),
+                follows,
+                "{agent:?} wanted={wanted} hook={hook} in_file={in_file}"
+            );
         }
     }
 

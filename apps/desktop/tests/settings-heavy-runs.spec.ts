@@ -12,7 +12,8 @@ const HELD = {
   load: 6.2,
   loadLimit: 5,
   holder: { id: "a1a1a1a1a1a1a1a1", as: "claude-a", label: "Claude Code / Gyre Assistant", what: "pnpm test:demo --workers=3", state: "active", since: "2026-10-25T02:00:00Z", elapsedMs: 754_000, loadSkipped: true, helperGone: true },
-  queue: [{ position: 1, as: "codex-b", label: "Codex / Gyredesk Audit", what: "cargo check", waitedMs: 42_000 }],
+  queue: [{ id: "c3c3c3c3c3c3c3c3", position: 1, as: "codex-b", label: "Codex / Gyredesk Audit", what: "cargo check", waitedMs: 42_000 }],
+  observed: [{ pid: 48211, pattern: "cargo test|build|check", exe: "cargo", cwd: "/Users/demo/Workspace/altrix", label: "Terminal", elapsedMs: 185_000 }],
   waiting: 1,
   limit: "The queue is advisory. A command runs unqueued when the Gyredeck bridge cannot be reached or speaks another protocol version, even while Gyredeck is running, and a restart of Gyredeck resets the waiting line.",
 };
@@ -26,7 +27,7 @@ test("the heavy-runs row shows the holder and the line, and stops the run it nam
       invoke: async (command: string, args?: unknown) => {
         if (command === "set_keep_awake") return false;
         if (command.endsWith("_hook_status")) return ["/Users/demo/.config/gyredeck/hook.mjs", true];
-        if (command === "heavy_status") return stopped ? { ...held, holder: null, queue: [], waiting: 0 } : held;
+        if (command === "heavy_status") return stopped ? { ...held, holder: null, queue: [], waiting: 0, observed: [] } : held;
         if (command === "heavy_stop") {
           calls.push({ command, args });
           stopped = true;
@@ -45,7 +46,8 @@ test("the heavy-runs row shows the holder and the line, and stops the run it nam
   await expect(row).toContainText("Claude Code / Gyre Assistant · pnpm test:demo --workers=3 · 12 min · started under load");
   await expect(row).toContainText("Helper gone, command still running");
   await expect(row).toContainText("Waiting 1 · Codex / Gyredesk Audit · cargo check · 42s");
-  await expect(row).toContainText("Only queued runs show here.");
+  await expect(row).toContainText("Runs outside the helper show as observed.");
+  await expect(row).toContainText("Observed · Terminal · cargo test|build|check · cargo · pid 48211 · …/demo/Workspace/altrix · 3 min");
 
   // Asked in the row, where Stop is pressed: the macOS webview has no window.confirm, so a
   // native dialog here fails this test.
@@ -102,7 +104,7 @@ test("the heavy-runs row says the slot is free when nothing holds it", async ({ 
       invoke: async (command: string) => {
         if (command === "set_keep_awake") return false;
         if (command.endsWith("_hook_status")) return ["/Users/demo/.config/gyredeck/hook.mjs", true];
-        if (command === "heavy_status") return { ...held, holder: null, queue: [], waiting: 0 };
+        if (command === "heavy_status") return { ...held, holder: null, queue: [], waiting: 0, observed: [] };
         throw new Error(`${command} unavailable`);
       },
     };
@@ -161,4 +163,79 @@ test.describe("at the app's own window width", () => {
     expect(copyBox.y + copyBox.height).toBeLessThanOrEqual(rowBox.y + rowBox.height + 0.5);
     expect(rowBox.y).toBeGreaterThanOrEqual(headBox.y + headBox.height);
   });
+});
+
+test("an observed run shows what matched and who started it, holds the slot, and has no Stop (#245)", async ({ page }) => {
+  await page.addInitScript((held) => {
+    (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (command: string) => {
+        if (command === "set_keep_awake") return false;
+        if (command.endsWith("_hook_status")) return ["/Users/demo/.config/gyredeck/hook.mjs", true];
+        if (command === "heavy_status") {
+          return {
+            ...held,
+            holder: null,
+            observed: [
+              { pid: 48211, pattern: "cargo test|build|check", exe: "cargo", cwd: "/Users/demo/Workspace/altrix", label: "Terminal", elapsedMs: 185_000 },
+              { pid: 48300, pattern: "pnpm test:*", exe: "pnpm", cwd: null, label: "Codex / Gyredesk Audit", elapsedMs: 9_000 },
+            ],
+          };
+        }
+        if (command === "heavy_patterns") return { defaults: ["pnpm test:*"], custom: [] };
+        throw new Error(`${command} unavailable`);
+      },
+    };
+  }, HELD);
+  await page.goto("/?demo=1");
+  await page.getByRole("button", { name: "Settings" }).click();
+  const row = page.locator(".setup-row").filter({ hasText: "Heavy-run slot" });
+  // Premise: the observed runs are on screen, so "no Stop" is said of a row that shows them.
+  await expect(row.locator("[data-heavy-observed]")).toHaveCount(2);
+  await expect(row.locator("[data-heavy-observed='48300']")).toHaveText("Observed · Codex / Gyredesk Audit · pnpm test:* · pnpm · pid 48300 · 9s");
+  await expect(row.locator(".setup-detail").first()).toHaveText("Held by a run outside the helper");
+  await expect(row.getByRole("button")).toHaveCount(0);
+});
+
+test("the heavy commands list adds and removes the person's own patterns, and shows a refusal (#245)", async ({ page }) => {
+  await page.addInitScript((held) => {
+    const saved: string[][] = [];
+    let custom: string[] = ["make check"];
+    (window as typeof window & { __saved: string[][] }).__saved = saved;
+    (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (command: string, args?: { patterns?: string[] }) => {
+        if (command === "set_keep_awake") return false;
+        if (command.endsWith("_hook_status")) return ["/Users/demo/.config/gyredeck/hook.mjs", true];
+        if (command === "heavy_status") return { ...held, holder: null, queue: [], observed: [] };
+        if (command === "heavy_patterns") return { defaults: ["pnpm test:*", "cargo test|build|check"], custom };
+        if (command === "set_heavy_patterns") {
+          const next = args?.patterns ?? [];
+          saved.push(next);
+          if (next.includes("*")) throw new Error("Every word of a pattern says something besides *");
+          custom = next;
+          return { defaults: ["pnpm test:*", "cargo test|build|check"], custom };
+        }
+        throw new Error(`${command} unavailable`);
+      },
+    };
+  }, HELD);
+  await page.goto("/?demo=1");
+  await page.getByRole("button", { name: "Settings" }).click();
+  const row = page.locator("[data-heavy-patterns]");
+  await expect(row).toContainText("pnpm test:* · cargo test|build|check");
+  await expect(row.locator("[data-heavy-pattern]")).toHaveText(["make check"]);
+
+  await row.getByRole("textbox", { name: "Heavy command pattern" }).fill("node scripts/full-check.mjs");
+  await row.getByRole("button", { name: "Add" }).click();
+  await expect(row.locator("[data-heavy-pattern]")).toHaveText(["make check", "node scripts/full-check.mjs"]);
+  await expect(row.getByRole("textbox", { name: "Heavy command pattern" })).toHaveValue("");
+
+  await row.getByRole("button", { name: "Remove make check" }).click();
+  await expect(row.locator("[data-heavy-pattern]")).toHaveText(["node scripts/full-check.mjs"]);
+
+  await row.getByRole("textbox", { name: "Heavy command pattern" }).fill("*");
+  await row.getByRole("button", { name: "Add" }).click();
+  await expect(row).toContainText("Every word of a pattern says something besides *");
+  await expect(row.getByRole("textbox", { name: "Heavy command pattern" })).toHaveValue("*");
+  const saved = await page.evaluate(() => (window as typeof window & { __saved: string[][] }).__saved);
+  expect(saved).toEqual([["make check", "node scripts/full-check.mjs"], ["node scripts/full-check.mjs"], ["node scripts/full-check.mjs", "*"]]);
 });

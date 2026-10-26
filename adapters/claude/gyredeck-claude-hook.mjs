@@ -330,7 +330,9 @@ const waitForMail = async (secondsArg, expected) => {
         ? deliver({ ok: true, timedOut: true, yourLastMessage: last.yourLastMessage ?? null, ...last, messages: [] })
         : withheld("the broker did not answer within the wait");
     }
-    const judged = judgeBrokerAnswer(await askBroker({ collect: { limit: MAIL_MAX_MESSAGES } }, Math.min(BROKER_DEADLINE_MS, Math.max(1, remainingMs()))));
+    // `wakingOnly` (#244 r2): quiet mail stays pending at the bridge until something that
+    // wakes this session arrives with it, so a wait that dies holds nothing of anyone's.
+    const judged = judgeBrokerAnswer(await askBroker({ collect: { limit: MAIL_MAX_MESSAGES, wakingOnly: true } }, Math.min(BROKER_DEADLINE_MS, Math.max(1, remainingMs()))));
     if (judged.fallback) {
       if (!expected) return withheld(`${judged.fallback}, and no session id was given to wait as`);
       const remainingSeconds = Math.max(1, Math.floor(remainingMs() / 1_000));

@@ -402,7 +402,9 @@ const waitForMail = async (secondsArg, expected) => {
   // a wait that never got an answer is refused, not quiet.
   let served = false;
   for (;;) {
-    const judged = judgeBrokerAnswer(await askBroker({ collect: { limit: MAIL_MAX_STEPS } }));
+    // `wakingOnly` (#244 r2): quiet mail stays pending at the bridge until something that
+    // wakes this session arrives with it, so a wait that dies holds nothing of anyone's.
+    const judged = judgeBrokerAnswer(await askBroker({ collect: { limit: MAIL_MAX_STEPS, wakingOnly: true } }));
     if (judged.fallback) {
       const remainingSeconds = Math.max(1, Math.floor(remainingMs() / 1_000));
       const endpoint = await readEndpoint();
@@ -696,7 +698,10 @@ const confirmLead = (confirm) => {
  * outside a room has no such look for a session the broker holds, so it gets a line to note
  * it now. A message the bridge did not tag with its room counts as outside one.
  */
-const rereadSteps = (endpoint, as, syncRoom, delivered) => {
+const rereadSteps = (endpoint, as, syncRoom, all) => {
+  // The room's own notices are information, not something to finish, and carry no re-read
+  // line (#244): a heavy-run notice must not ask agy to look again.
+  const delivered = all.filter((message) => message?.kind !== "notice");
   const inRoom = syncRoom ? delivered.filter((message) => message.room === syncRoom && Number.isInteger(message.seq)) : [];
   const outside = delivered.filter((message) => !inRoom.includes(message));
   const steps = [];

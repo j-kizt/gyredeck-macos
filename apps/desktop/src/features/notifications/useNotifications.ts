@@ -1,8 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { GyredeckEvent } from "@gyredeck/protocol";
 import type { IGithubRepoStatus } from "../github/types";
+import type { IHeavyStatus } from "../setup/useHeavyRuns";
 import { gitChangesBetween, markOf, type IGitMark } from "./gitChanges";
+import { heavyChangesBetween, heavyMarkOf, type IHeavyMark } from "./heavyChanges";
 import { markOf as quotaMarkOf, quotaAlertsBetween, type QuotaMark } from "./usageAlerts";
 import { USAGE_PROVIDERS } from "../usage/providers";
 import type { IAgentUsageState, UsageProviderId } from "../usage/types";
@@ -31,6 +34,8 @@ export interface INotificationSettings {
   git: boolean;
   /** A provider's remaining quota crossed a threshold worth knowing about. */
   quota: boolean;
+  /** A heavy run started, somebody has to wait for one, or one ended (#244). */
+  heavy: boolean;
 }
 
 export interface INotificationsState extends INotificationSettings {
@@ -44,6 +49,7 @@ export interface INotificationsState extends INotificationSettings {
   setRoomMessage: (enabled: boolean) => void;
   setGit: (enabled: boolean) => void;
   setQuota: (enabled: boolean) => void;
+  setHeavy: (enabled: boolean) => void;
 }
 
 const STORAGE_KEY = "gyredeck.notifications";
@@ -51,16 +57,17 @@ const STORAGE_KEY = "gyredeck.notifications";
 const readSettings = (): INotificationSettings => {
   try {
     const stored = window.localStorage.getItem(STORAGE_KEY);
-    if (!stored) return { attention: true, roomMessage: true, git: true, quota: true };
+    if (!stored) return { attention: true, roomMessage: true, git: true, quota: true, heavy: true };
     const parsed = JSON.parse(stored) as Partial<INotificationSettings>;
     return {
       attention: parsed.attention !== false,
       roomMessage: parsed.roomMessage !== false,
       git: parsed.git !== false,
       quota: parsed.quota !== false,
+      heavy: parsed.heavy !== false,
     };
   } catch {
-    return { attention: true, roomMessage: true, git: true, quota: true };
+    return { attention: true, roomMessage: true, git: true, quota: true, heavy: true };
   }
 };
 
@@ -113,6 +120,7 @@ export const useNotifications = ({
   const deliveredRef = useRef<string | null>(null);
   const gitMarksRef = useRef<Map<string, IGitMark>>(new Map());
   const quotaMarksRef = useRef<Map<string, QuotaMark>>(new Map());
+  const heavyMarkRef = useRef<IHeavyMark | undefined>(undefined);
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -310,6 +318,44 @@ export const useNotifications = ({
     })();
   }, [canUseNativeControls, usages]);
 
+  // The slot as the native watcher reads it every five seconds (#244), whether or not the
+  // Settings row is on screen — which is exactly when these matter.
+  useEffect(() => {
+    if (!canUseNativeControls) return;
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    const onState = (state: IHeavyStatus) => {
+      if (!state || !Array.isArray(state.queue)) return;
+      const changes = heavyChangesBetween(heavyMarkRef.current, state);
+      // Recorded whether or not the toggle is on, so switching it back on releases no
+      // backlog of runs that came and went meanwhile.
+      heavyMarkRef.current = heavyMarkOf(state);
+      if (!settingsRef.current.heavy || changes.length === 0) return;
+      void (async () => {
+        try {
+          if (await currentWindowIsVisible()) return;
+        } catch {
+          // Unable to tell — err towards notifying.
+        }
+        for (const change of changes) {
+          try {
+            await invoke("deliver_notification", { identifier: `gyredeck.heavy.${change.kind}.${change.key}`, title: trim(change.title), body: trim(change.body) || change.title });
+          } catch (cause) {
+            setError(cause instanceof Error ? cause.message : String(cause));
+          }
+        }
+      })();
+    };
+    listen<IHeavyStatus>("heavy_state", (event) => onState(event.payload)).then(
+      (stop) => { if (cancelled) stop(); else unlisten = stop; },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [canUseNativeControls]);
+
   const update = useCallback((patch: Partial<INotificationSettings>) => {
     setSettings((previous) => {
       const next = { ...previous, ...patch };
@@ -328,5 +374,6 @@ export const useNotifications = ({
     setRoomMessage: (enabled: boolean) => update({ roomMessage: enabled }),
     setGit: (enabled: boolean) => update({ git: enabled }),
     setQuota: (enabled: boolean) => update({ quota: enabled }),
+    setHeavy: (enabled: boolean) => update({ heavy: enabled }),
   };
 };

@@ -166,7 +166,9 @@ pub(crate) type Liveness = Arc<dyn Fn(ProcessKey) -> bool + Send + Sync>;
 /// the same parent-child order, the peer's generation included.
 pub(crate) type ChainCheck = Arc<dyn Fn(&Peer) -> bool + Send + Sync>;
 /// What a collect does once the broker has decided whose mailbox it is: the bridge call.
-pub(crate) type Collector = Arc<dyn Fn(&str, u64) -> Result<Value, String> + Send + Sync>;
+/// The bool is `wakingOnly`: a wait's collect, which takes nothing until something in it
+/// would wake the session (#244 r2), so quiet mail stays pending at the bridge.
+pub(crate) type Collector = Arc<dyn Fn(&str, u64, bool) -> Result<Value, String> + Send + Sync>;
 /// What a bind tells the bridge: that this session now reads through the broker, so a
 /// collect for it that arrives the old way is an outdated hook (#136). A bind the bridge
 /// did not acknowledge is not answered `ok`: the hook withholds the mail for that turn and
@@ -449,6 +451,7 @@ pub(crate) fn handle_request(
             .and_then(Value::as_u64)
             .map(|limit| limit.clamp(1, MAX_COLLECT))
             .unwrap_or(100);
+        let waking_only = collect.get("wakingOnly").and_then(Value::as_bool).unwrap_or(false);
         let session = {
             let Ok(mut table) = bindings.lock() else {
                 return refused("busy", "The broker's table is unavailable.".to_string());
@@ -488,7 +491,7 @@ pub(crate) fn handle_request(
             table.collecting.insert(session.clone());
             session
         };
-        let collected = (policy.collect)(&session, limit);
+        let collected = (policy.collect)(&session, limit, waking_only);
         let Ok(mut table) = bindings.lock() else {
             return refused("busy", "The broker's table is unavailable.".to_string());
         };
@@ -551,6 +554,14 @@ pub(crate) fn handle_request(
     }
 
     refused("invalid", "A request is {\"v\":1,\"bind\":{\"conversationId\"}}, {\"v\":1,\"collect\":{\"limit\"}} or {\"v\":1,\"ack\":{\"delivery\"}}.".to_string())
+}
+
+/// The session the broker has bound to this live process, if any: how an observed heavy run
+/// (#245) is traced to the agent that started it. The key is read fresh, so a pid now used
+/// by another process names nobody.
+pub(crate) fn session_of_pid(bindings: &Mutex<Bindings>, pid: i32) -> Option<String> {
+    let key = platform::process_key(pid)?;
+    bindings.lock().ok()?.session_of(key).map(str::to_string)
 }
 
 /// A running broker: its socket, its thread, and the way to stop it.
@@ -1088,7 +1099,7 @@ mod tests {
             eligible: Arc::new(|p: &Peer| KnownCli::from_executable_name(&p.ancestor_name).ok_or_else(|| Ineligible::UnknownExecutable(p.ancestor_name.clone()))),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
-            collect: Arc::new(|session: &str, limit: u64| Ok(json!({ "ok": true, "messages": [], "askedFor": session, "limit": limit }))),
+            collect: Arc::new(|session: &str, limit: u64, waking_only: bool| Ok(json!({ "ok": true, "messages": [], "askedFor": session, "limit": limit, "wakingOnly": waking_only }))),
             report_bound: Arc::new(|_| Ok(())),
         }
     }
@@ -1225,6 +1236,11 @@ mod tests {
         assert_eq!(served["limit"], 7);
         assert_eq!(served["boundTo"], "sess-1");
         assert_eq!(served["v"], 1);
+        // A wait's collect asks the bridge to take nothing until something would wake the
+        // session (#244 r2); an ordinary collect does not.
+        assert_eq!(served["wakingOnly"], false);
+        let waiting = ask(json!({ "v": 1, "collect": { "limit": 7, "wakingOnly": true } }), Some(&claude), &bindings, &policy);
+        assert_eq!(waiting["wakingOnly"], true, "{waiting}");
         let huge = ask(json!({ "v": 1, "collect": { "limit": 1_000_000 } }), Some(&claude), &bindings, &policy);
         assert_eq!(huge["limit"], MAX_COLLECT, "the limit is clamped");
 
@@ -1249,7 +1265,7 @@ mod tests {
             // The chain broke while it was being looked at — the hook exited, or a shell in
             // the middle was replaced; the OS no longer describes what connected.
             chain_holds: Arc::new(|_| false),
-            collect: Arc::new(|_, _| Ok(json!({ "ok": true }))),
+            collect: Arc::new(|_, _, _| Ok(json!({ "ok": true }))),
             report_bound: Arc::new(|_| Ok(())),
         };
         let claude = peer(42, 40, "claude");
@@ -1266,7 +1282,7 @@ mod tests {
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
-            collect: Arc::new(|_, _| Ok(json!({ "ok": true }))),
+            collect: Arc::new(|_, _, _| Ok(json!({ "ok": true }))),
             report_bound: Arc::new({
                 let reported = Arc::clone(&reported);
                 let fail_next = Arc::clone(&fail_next);
@@ -1303,7 +1319,7 @@ mod tests {
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
-            collect: Arc::new(|_, _| Ok(json!({ "ok": true, "messages": [] }))),
+            collect: Arc::new(|_, _, _| Ok(json!({ "ok": true, "messages": [] }))),
             report_bound: Arc::new({
                 let bridge_up = Arc::clone(&bridge_up);
                 move |_: &str| if *bridge_up.lock().unwrap() { Ok(()) } else { Err("connection refused".into()) }
@@ -1330,7 +1346,7 @@ mod tests {
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
-            collect: Arc::new(|_, _| Ok(json!({ "ok": true, "messages": [] }))),
+            collect: Arc::new(|_, _, _| Ok(json!({ "ok": true, "messages": [] }))),
             report_bound: Arc::new({
                 let bridge = Arc::clone(&bridge);
                 let heard = Arc::clone(&heard);
@@ -1401,7 +1417,7 @@ mod tests {
             chain_holds: Arc::new(|_| true),
             collect: Arc::new({
                 let calls = Arc::clone(&calls);
-                move |_: &str, _| {
+                move |_: &str, _, _| {
                     let mut n = calls.lock().unwrap();
                     *n += 1;
                     Ok(json!({ "ok": true, "messages": [{ "seq": *n, "text": format!("message-{n}") }] }))
@@ -1448,7 +1464,7 @@ mod tests {
             chain_holds: Arc::new(|_| true),
             collect: Arc::new({
                 let full = Arc::clone(&full);
-                move |_: &str, _| Ok(if *full.lock().unwrap() { json!({ "ok": true, "messages": [{ "seq": 1, "text": "x" }] }) } else { json!({ "ok": true, "messages": [] }) })
+                move |_: &str, _, _| Ok(if *full.lock().unwrap() { json!({ "ok": true, "messages": [{ "seq": 1, "text": "x" }] }) } else { json!({ "ok": true, "messages": [] }) })
             }),
             report_bound: Arc::new(|_| Ok(())),
         };
@@ -1479,7 +1495,7 @@ mod tests {
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
-            collect: Arc::new(|_: &str, _| Ok(json!({ "ok": true, "messages": [{ "seq": 1, "text": "for-s1" }] }))),
+            collect: Arc::new(|_: &str, _, _| Ok(json!({ "ok": true, "messages": [{ "seq": 1, "text": "for-s1" }] }))),
             report_bound: Arc::new(|_| Ok(())),
         };
         let claude = peer(42, 40, "claude");
@@ -1507,7 +1523,7 @@ mod tests {
             collect: Arc::new({
                 let calls = Arc::clone(&calls);
                 let gate = Arc::clone(&gate);
-                move |_: &str, _| {
+                move |_: &str, _, _| {
                     *calls.lock().unwrap() += 1;
                     let (lock, cvar) = &*gate;
                     let mut open = lock.lock().unwrap();
@@ -1544,7 +1560,7 @@ mod tests {
             collect: Arc::new({
                 let started = Arc::clone(&started);
                 let gate = Arc::clone(&gate);
-                move |_: &str, _| {
+                move |_: &str, _, _| {
                     *started.lock().unwrap() = true;
                     let (lock, cvar) = &*gate;
                     let mut open = lock.lock().unwrap();
@@ -1587,7 +1603,7 @@ mod tests {
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
-            collect: Arc::new(|_: &str, _| panic!("the bridge must not be asked past the cap")),
+            collect: Arc::new(|_: &str, _, _| panic!("the bridge must not be asked past the cap")),
             report_bound: Arc::new(|_| Ok(())),
         };
         let claude = peer(42, 40, "claude");
@@ -1611,7 +1627,7 @@ mod tests {
             report_bound: Arc::new(|_| Ok(())),
             collect: Arc::new({
                 let drained = drained.clone();
-                move |_, _| {
+                move |_, _, _| {
                     let first = { let mut taken = drained.lock().unwrap(); let first = !*taken; *taken = true; first };
                     if first {
                         std::thread::sleep(Duration::from_millis(1800));
@@ -1660,7 +1676,7 @@ mod tests {
             }),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
-            collect: Arc::new(|_, _| Ok(json!({ "ok": true }))),
+            collect: Arc::new(|_, _, _| Ok(json!({ "ok": true }))),
             report_bound: Arc::new(|_| Ok(())),
         };
         let claude = peer(42, 40, "claude");
@@ -1688,7 +1704,7 @@ mod tests {
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|key: ProcessKey| platform::process_key(key.pid).is_some_and(|now| now == key)),
             chain_holds: Arc::new(platform::chain_holds),
-            collect: Arc::new(|session: &str, _| Ok(json!({ "ok": true, "messages": [], "askedFor": session }))),
+            collect: Arc::new(|session: &str, _, _| Ok(json!({ "ok": true, "messages": [], "askedFor": session }))),
             report_bound: Arc::new(|_| Ok(())),
         };
         state.start(path.clone(), policy).unwrap();
@@ -1842,7 +1858,7 @@ mod tests {
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
-            collect: Arc::new(|_, _| Ok(json!({ "ok": true }))),
+            collect: Arc::new(|_, _, _| Ok(json!({ "ok": true }))),
             report_bound: Arc::new(|_| Ok(())),
         };
 
@@ -1888,7 +1904,7 @@ mod tests {
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
-            collect: Arc::new(|_, _| Ok(json!({ "ok": true }))),
+            collect: Arc::new(|_, _, _| Ok(json!({ "ok": true }))),
             report_bound: Arc::new(|_| Ok(())),
         };
         let refused = state.start(dir.join("broker").join("broker.sock"), policy);

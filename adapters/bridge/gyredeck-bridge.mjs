@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 8;
+export const ROOM_RULES_VERSION = 9;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -299,6 +299,8 @@ ${HEAVY_COMMANDS.map((name) => `\`${name}\``).join(", ")}. Run each one through 
 — for example \`-- pnpm test:demo --workers=3\`. It waits for the slot, and for the 1-minute load to
 be ${HEAVY_LOAD_LIMIT} or less (for at most 10 minutes), runs the command, and exits with its code. While it
 waits it prints its place in line: leave it running, and do not start the command another way.
+While a heavy run holds the slot — yours or anyone's — do light work only: read, edit, and run small
+commands, and start nothing heavy another way. The room says when a run starts, who waits, and when it ends.
 ${HEAVY_LIMIT_TEXT}
 `;
 
@@ -4146,10 +4148,48 @@ function startBridge(config) {
   const heavyNoticeFor = (conversationId) => {
     const provider = usageProviderFor(conversationId);
     if (provider !== "claude" && provider !== "agy") return null;
-    if (!heavyToBeTold(conversationId)) return null;
+    const nudge = takeHeavyNudge(conversationId, provider);
+    if (!heavyToBeTold(conversationId)) return nudge;
     // Told by being in the answer this collect returns.
     markHeavyTold(conversationId);
-    return provider === "agy" ? heavyHintForAgy(conversationId) : heavyHint(conversationId);
+    const told = provider === "agy" ? heavyHintForAgy(conversationId) : heavyHint(conversationId);
+    return nudge ? `${told}\n\n${nudge}` : told;
+  };
+
+  /**
+   * A session caught running a heavy command outside the helper (#245) is told so, once:
+   * Claude Code and Antigravity on their next collect, beside any mail — read on their next
+   * turn, never woken for it. Only a session proven to have started the run is told: one
+   * the app's broker has bound to the ancestor process. Codex has no such proof yet
+   * (openai/codex#52783), so a Codex run is labelled "Codex" and nobody is told; a run with
+   * no agent above it is "Terminal". Remembered by recency, like the told set; the pending
+   * set is bounded the same way.
+   */
+  const heavyNudged = new Map();
+  const heavyNudgePending = new Map();
+  const HEAVY_NUDGED_MAX = Number(process.env.GYREDECK_TEST_HEAVY_TOLD_MAX) || 10_000;
+  const remember = (map, key, value) => {
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > HEAVY_NUDGED_MAX) map.delete(map.keys().next().value);
+  };
+  const heavyNudgeText = (conversationId, pattern, provider) =>
+    provider === "agy" && roomRulesReady
+      ? `HEAVY RUN SEEN: you ran \`${pattern}\` directly, outside the heavy-run queue, and others now wait for it. ` +
+        "Run this now; its output stays with you, this notice does not:\n" +
+        `  echo "your id: ${conversationId}"; sed -n '/^## Heavy runs/,$p' ${ROOM_RULES_DISPLAY_PATH}`
+      : `HEAVY RUN SEEN: you ran \`${pattern}\` directly, outside the heavy-run queue. Next time run it through ` +
+        `\`node ${HEAVY_HELPER_DISPLAY_PATH} --as ${conversationId} --what "<what it runs>" -- <command…>\` so others can queue behind it.`;
+  const takeHeavyNudge = (conversationId, provider) => {
+    const pattern = heavyNudgePending.get(conversationId);
+    if (pattern === undefined) return null;
+    heavyNudgePending.delete(conversationId);
+    remember(heavyNudged, conversationId, true);
+    return heavyNudgeText(conversationId, pattern, provider);
+  };
+  const nudgeHeavySession = (conversationId, pattern) => {
+    if (heavyNudged.has(conversationId) || heavyNudgePending.has(conversationId)) return;
+    remember(heavyNudgePending, conversationId, pattern);
   };
   // Tests only: the reader-lifecycle fixtures count every push a Codex session gets, and
   // this one would be the first of them.
@@ -4820,7 +4860,10 @@ function startBridge(config) {
    * functions are kept apart because the distinction is real and may be wanted again;
    * today they agree.
    */
-  const wakesMember = (message, conversationId) => reachesMember(message, conversationId);
+  // A quiet message (#244: the room's heavy-run notices) wakes nobody, by any path — a live
+  // push, a resumed watch's replay, a held wait, a push into Codex. It is still collected.
+  // Decided here, once, on the message itself, so no path can forget it (#244 audit).
+  const wakesMember = (message, conversationId) => message.quiet !== true && reachesMember(message, conversationId);
 
   /**
    * The same tell from the same sender to the same address within a minute, if there is
@@ -4893,6 +4936,7 @@ function startBridge(config) {
       text,
       replyTo: replyTo ?? null,
       ts: new Date().toISOString(),
+      ...(routing?.quiet === true ? { quiet: true } : {}),
     };
     room.messages.push(message);
     // Notices first, against their own allowance, so the room's own voice can never cost
@@ -5198,7 +5242,7 @@ function startBridge(config) {
     // for it — the same choice every other member makes for itself at its watch.
     const carries = (recipient) =>
       !routing ||
-      wakesMember({ from, to: routing.to ?? MAIL_EVERYONE, kind: routing.kind ?? MAIL_DEFAULT_KIND }, recipient);
+      wakesMember({ from, to: routing.to ?? MAIL_EVERYONE, kind: routing.kind ?? MAIL_DEFAULT_KIND, quiet: routing.quiet }, recipient);
     const recipients = room.members.size > 0
       // Nobody is delivered their own message, and a notice from the room itself goes
       // to everyone.
@@ -5455,6 +5499,15 @@ function startBridge(config) {
   const heavyQueue = [];
   const heavyPolls = new Set();
 
+  // Heavy runs started outside the helper (#245), as the app last reported them from the
+  // process table. The report expires on its own, so an app that quit or hung cannot hold
+  // the slot: the line moves on at the TTL. Nothing here ever signals one of them.
+  const HEAVY_OBSERVED_TTL_MS = Number(process.env.GYREDECK_TEST_HEAVY_OBSERVED_TTL_MS) || 15_000;
+  const HEAVY_OBSERVED_MAX = 32;
+  const HEAVY_OBSERVED_BODY_MAX = 64 * 1024;
+  let heavyObserved = { runs: [], at: -Infinity };
+  const observedRuns = () => (heavyNow() - heavyObserved.at <= HEAVY_OBSERVED_TTL_MS ? heavyObserved.runs : []);
+
   /** The holder on disk, or the file gone. Answers whether the disk now says what memory does. */
   const persistHeavyHolder = () => {
     try {
@@ -5534,7 +5587,8 @@ function startBridge(config) {
 
   /** Hand the slot to the front of the line, when it is free and the load allows. */
   const promoteHeavy = () => {
-    if (heavyHolder || heavyQueue.length === 0) return;
+    // A run observed outside the helper holds the slot as a granted one does (Q12).
+    if (heavyHolder || heavyQueue.length === 0 || observedRuns().length > 0) return;
     const now = heavyNow();
     const front = heavyQueue[0];
     const load = heavyLoad();
@@ -5575,7 +5629,42 @@ function startBridge(config) {
     return true;
   };
 
+  /**
+   * Heavy runs said to every open room (#244): when one starts, when someone has to wait,
+   * and when one ends — helper runs and observed runs alike, named as Settings names them.
+   * Informational and quiet: published to be read on each member's next collect, never
+   * streamed to a watcher, pushed into Codex, or used to end a wait.
+   */
+  const heavyDuration = (ms) => {
+    const seconds = Math.max(0, Math.round(ms / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+    return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  };
+  const tellRoomsOfHeavy = (text) => {
+    for (const room of mailRooms.values()) {
+      if (room.members.size === 0) continue;
+      publishMail(room, ROOM_SENDER, `HEAVY RUN: ${text}`, null, false, { kind: "notice", quiet: true });
+    }
+  };
+  const holderLabel = (holder) => heavyLabelFor(holder.as) ?? holder.as;
+  const heavyEnded = (holder) => {
+    if (holder?.state !== "active") return;
+    tellRoomsOfHeavy(`${holderLabel(holder)}'s ${holder.what} finished (${heavyDuration(heavyNow() - holder.startedAt)}).`);
+  };
+  const observedKey = (run) => `${run.pid}:${run.startedAtMs}`;
+  /** Who a newcomer waits behind: the holder, an observed run, or the load. */
+  const waitingBehind = () => {
+    if (heavyHolder) return `behind ${holderLabel(heavyHolder)}`;
+    const observed = observedRuns()[0];
+    if (observed) return `behind ${observedLabelFor(observed)}`;
+    const load = heavyLoad();
+    return `for the load to drop (${Math.round(load * 10) / 10} > ${HEAVY_LOAD_LIMIT})`;
+  };
+
   const freeHeavy = () => {
+    heavyEnded(heavyHolder);
     heavyHolder = null;
     persistHeavyHolder();
     promoteHeavy();
@@ -5624,8 +5713,14 @@ function startBridge(config) {
       heavyHolder = null;
       persistHeavyHolder();
     } else if (heavyHolder?.state === "active" && (verify && heavyHolder.pgidStart !== null ? heavyGroupState(heavyHolder.pgid, heavyHolder.pgidStart) === "gone" : !groupAlive(heavyHolder.pgid))) {
+      heavyEnded(heavyHolder);
       heavyHolder = null;
       persistHeavyHolder();
+    }
+    if (heavyObserved.runs.length > 0 && observedRuns().length === 0) {
+      // The app went quiet: its runs are over as far as anyone can tell.
+      for (const run of heavyObserved.runs) observedEnded(run);
+      heavyObserved = { runs: [], at: -Infinity };
     }
     for (let index = heavyQueue.length - 1; index >= 0; index -= 1) {
       const entry = heavyQueue[index];
@@ -5643,6 +5738,12 @@ function startBridge(config) {
     if (provider && name) return `${provider} / ${name}`;
     return provider ?? name ?? null;
   };
+
+  const OBSERVED_KIND_LABELS = { claude: "Claude Code", agy: "Antigravity", codex: "Codex" };
+  /** Named as holders are (#243): the session that started it, its agent alone, or "Terminal" when no agent did. */
+  const observedLabelFor = (run) =>
+    (run.session ? heavyLabelFor(run.session) : null) ?? (run.kind ? OBSERVED_KIND_LABELS[run.kind] : "Terminal");
+  const observedEnded = (run) => tellRoomsOfHeavy(`${observedLabelFor(run)}'s ${run.pattern} finished (${heavyDuration(Date.now() - run.startedAtMs)}).`);
 
   const describeHeavy = () => {
     const now = heavyNow();
@@ -5671,14 +5772,24 @@ function startBridge(config) {
             adopted: heavyHolder.adopted,
           }
         : null,
-      queue: heavyQueue.map((entry, index) => ({ position: index + 1, as: entry.as, label: heavyLabelFor(entry.as), what: entry.what, waitedMs: Math.round(now - entry.enqueuedAt) })),
+      queue: heavyQueue.map((entry, index) => ({ id: entry.id, position: index + 1, as: entry.as, label: heavyLabelFor(entry.as), what: entry.what, waitedMs: Math.round(now - entry.enqueuedAt) })),
+      // What the pattern matched, never the command line (#245, Q16).
+      observed: observedRuns().map((run) => ({
+        pid: run.pid,
+        pattern: run.pattern,
+        exe: run.exe,
+        cwd: run.cwd,
+        label: observedLabelFor(run),
+        startedAtMs: run.startedAtMs,
+        elapsedMs: Math.max(0, Date.now() - run.startedAtMs),
+      })),
       waiting: heavyPolls.size,
       limit: HEAVY_LIMIT_TEXT,
     };
   };
 
   /** The request's body, or null past the cap: a cooperative scheduler still bounds what it reads. */
-  const readHeavyBody = (req) =>
+  const readHeavyBody = (req, max = HEAVY_BODY_MAX) =>
     new Promise((resolve) => {
       let body = "";
       let over = false;
@@ -5686,7 +5797,7 @@ function startBridge(config) {
       req.on("data", (chunk) => {
         if (over) return;
         body += chunk;
-        if (Buffer.byteLength(body) > HEAVY_BODY_MAX) { over = true; resolve(null); }
+        if (Buffer.byteLength(body) > max) { over = true; resolve(null); }
       });
       req.on("end", () => {
         if (over) return;
@@ -5981,6 +6092,70 @@ function startBridge(config) {
         return;
       }
 
+      // PUT /heavy/observed — the app's report of heavy runs it sees in the process table
+      // outside the helper (#245). The app's word only: an agent able to report runs could
+      // hold the slot for everyone. Replaces the last report whole; expires at the TTL.
+      if (req.method === "PUT" && pathname === "/heavy/observed") {
+        if (brokerSecret === null) {
+          sendJson(503, { ok: false, error: "app_word_unavailable", message: "Observed heavy runs are reported by the Gyredeck app, and this bridge was started without the app's word." });
+          return;
+        }
+        if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"])) {
+          sendJson(401, { ok: false, error: "app_only", message: "Only the Gyredeck app reports observed heavy runs." });
+          return;
+        }
+        const body = await readHeavyBody(req, HEAVY_OBSERVED_BODY_MAX);
+        if (body === null) {
+          sendJson(413, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "body_too_large", limit: HEAVY_OBSERVED_BODY_MAX });
+          return;
+        }
+        if (!body || typeof body !== "object" || body.v !== HEAVY_PROTOCOL_VERSION) {
+          sendJson(409, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "version", message: `This bridge speaks heavy-run protocol v${HEAVY_PROTOCOL_VERSION}.` });
+          return;
+        }
+        // eslint-disable-next-line no-control-regex
+        const text = (value, max) => (typeof value === "string" ? value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max) : "");
+        const runs = Array.isArray(body.runs) ? body.runs : null;
+        const valid = runs !== null && runs.length <= HEAVY_OBSERVED_MAX && runs.every((run) =>
+          run && typeof run === "object"
+          && Number.isInteger(run.pid) && run.pid > 1
+          && text(run.pattern, 120) !== "" && text(run.exe, 64) !== ""
+          && Number.isFinite(run.startedAtMs)
+          && (run.agent === null || run.agent === undefined || (typeof run.agent === "object" && ["claude", "agy", "codex"].includes(run.agent.kind))));
+        if (!valid) {
+          sendJson(400, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "invalid_runs" });
+          return;
+        }
+        const reported = runs.map((run) => {
+          const kind = run.agent?.kind ?? null;
+          // Named only on proof: the app's broker bound this session to the ancestor
+          // process, which it does for signed claude and agy alone. Nothing is inferred —
+          // not from a folder, not for Codex — so an unrelated session is never named or
+          // told (#245 audit). One the bridge knows as another agent is not this one.
+          const claimed = typeof run.agent?.session === "string" && MAIL_ROOM_NAME.test(run.agent.session) ? run.agent.session : null;
+          const known = claimed ? usageProviderFor(claimed) : null;
+          const session = claimed && (kind === "claude" || kind === "agy") && (known === null || known === kind) ? claimed : null;
+          return {
+            pid: run.pid,
+            pattern: text(run.pattern, 120),
+            exe: text(run.exe, 64),
+            cwd: text(run.cwd, 1024) || null,
+            startedAtMs: run.startedAtMs,
+            kind,
+            session,
+          };
+        });
+        const before = new Set(observedRuns().map(observedKey));
+        const now = new Set(reported.map(observedKey));
+        for (const run of observedRuns()) if (!now.has(observedKey(run))) observedEnded(run);
+        for (const run of reported) if (!before.has(observedKey(run))) tellRoomsOfHeavy(`${observedLabelFor(run)} started ${run.pattern}, outside the queue.`);
+        heavyObserved = { runs: reported, at: heavyNow() };
+        for (const run of reported) if (run.session) nudgeHeavySession(run.session, run.pattern);
+        promoteHeavy();
+        sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, observed: reported.length });
+        return;
+      }
+
       const action = pathname.startsWith("/heavy/") ? pathname.slice("/heavy/".length) : "";
       if (req.method !== "POST" || !["acquire", "wait", "activate", "heartbeat", "release", "cancel", "adopt"].includes(action)) {
         sendJson(404, { ok: false, error: "not_found" });
@@ -6041,7 +6216,7 @@ function startBridge(config) {
           return;
         }
         const now = heavyNow();
-        if (!heavyHolder && heavyQueue.length === 0 && heavyLoad() <= HEAVY_LOAD_LIMIT) {
+        if (!heavyHolder && heavyQueue.length === 0 && observedRuns().length === 0 && heavyLoad() <= HEAVY_LOAD_LIMIT) {
           if (!reserveHeavy({ leaseHash, requestIdHash, as, what }, false, now)) {
             sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "holder_unwritable" });
             return;
@@ -6053,12 +6228,13 @@ function startBridge(config) {
           sendJson(503, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "queue_full", limit: HEAVY_QUEUE_MAX });
           return;
         }
-        heavyQueue.push({ ticket: randomBytes(16).toString("hex"), leaseHash, requestIdHash, as, what, enqueuedAt: now, polledAt: now });
+        heavyQueue.push({ id: randomBytes(8).toString("hex"), ticket: randomBytes(16).toString("hex"), leaseHash, requestIdHash, as, what, enqueuedAt: now, polledAt: now });
         promoteHeavy();
         if (heavyHolder && sameHash(heavyHolder.requestIdHash, requestIdHash)) {
           sendJson(200, heavyGranted(heavyHolder.loadSkipped, lease));
           return;
         }
+        tellRoomsOfHeavy(`${heavyLabelFor(as) ?? as} is waiting ${waitingBehind()} to run ${what}.`);
         sendJson(202, heavyQueued(heavyQueue.length - 1));
         return;
       }
@@ -6174,6 +6350,7 @@ function startBridge(config) {
           return;
         }
         heavyFault("activate");
+        tellRoomsOfHeavy(`${holderLabel(heavyHolder)} started ${heavyHolder.what}.`);
         sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, state: "active" });
         return;
       }
@@ -6749,6 +6926,10 @@ function startBridge(config) {
         };
 
         const collect = url.searchParams.get("collect") === "1";
+        // `waking=1`: a wait's collect (#244 r2). Nothing is taken, and no cursor moves,
+        // until something in it would wake this session — so quiet mail stays here, where a
+        // foreground collect still finds it, rather than in a waiting process's memory.
+        const wakingOnly = url.searchParams.get("waking") === "1";
         const closed = refuseMailboxRead(as, brokerHeader);
         if (closed) {
           sendJson(403, { ok: false, ...closed });
@@ -6762,7 +6943,9 @@ function startBridge(config) {
           ? Math.min(requested, MAIL_MAX_MESSAGES)
           : MAIL_MAX_MESSAGES;
 
-        const collectInbox = () => {
+        // `wakingOnly`: a held wait takes nothing until something in it would wake this
+        // session — then the batch carries what came quietly before it too.
+        const collectInbox = ({ wakingOnly = false } = {}) => {
           const at = new Date().toISOString();
           const sync = syncRoomFor(as);
           // A session's own mailbox is always its own to read. Its room is not: reading
@@ -6815,7 +6998,24 @@ function startBridge(config) {
           // publish order: within a millisecond, one room's seq says nothing about
           // another's.
           fresh.sort((left, right) => (left.ord ?? 0) - (right.ord ?? 0));
-          const collected = fresh.slice(0, limit);
+          const own = mailRoomFor(as, false);
+          const wakes = (message) => (message.room === as && own ? message.quiet !== true : wakesMember(message, as));
+          // A waiting collect counts only what wakes toward `limit`: everything quiet before
+          // the last message it takes rides along, so quiet mail can never fill a batch and
+          // hide what is waiting behind it (#244 r3). Bounded all the same — quiet messages
+          // are the room's own notices, kept to MAIL_MAX_NOTICES (32) per room.
+          let collected = fresh.slice(0, limit);
+          if (wakingOnly) {
+            let taken = 0;
+            let end = -1;
+            for (let index = 0; index < fresh.length && taken < limit; index += 1) {
+              if (!wakes(fresh[index])) continue;
+              taken += 1;
+              end = index;
+            }
+            if (end < 0 && missed.length === 0) return { collected: [], sync, missed: [] };
+            if (end >= 0) collected = fresh.slice(0, end + 1);
+          }
 
           if (collect) {
             for (const [roomName, room] of sources) {
@@ -6867,7 +7067,7 @@ function startBridge(config) {
             });
           };
 
-          const first = collectInbox();
+          const first = collectInbox({ wakingOnly: true });
           if (first.collected.length > 0) {
             answer(first.collected, first.sync, false, first.missed);
             return;
@@ -6904,7 +7104,7 @@ function startBridge(config) {
             // A request already gone must not have its position advanced: collect=1
             // would mark messages delivered into a socket nobody is reading.
             if (done || req.destroyed) return;
-            const next = collectInbox();
+            const next = collectInbox({ wakingOnly: true });
             if (next.collected.length > 0) finish(next.collected, next.sync, false, next.missed);
           };
           // A client that hangs up must not leave a timer and a closure behind, and
@@ -6919,7 +7119,7 @@ function startBridge(config) {
           return;
         }
 
-        const { collected, sync, missed } = collectInbox();
+        const { collected, sync, missed } = collectInbox({ wakingOnly });
         sendJson(200, {
           ok: true,
           // A collect that found nothing says why the last thing this session said drew

@@ -959,7 +959,10 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
   // What a reader is shown: the routing label, and the name the person gave that session
   // (#182). `label` stays the routing label alone, since that is what `to` takes.
   const named = (member) => (typeof member?.name === "string" && member.name ? `${member.provider} / ${member.name}` : member.provider);
-  const shown = (message) => (byId.has(message.from) ? named(byId.get(message.from)) : label(message));
+  // A message keeps the name its sender had when it spoke (fromShown); the roster is for an
+  // older bridge that does not record it.
+  const shown = (message) =>
+    typeof message.fromShown === "string" && message.fromShown ? message.fromShown : byId.has(message.from) ? named(byId.get(message.from)) : label(message);
 
   const senders = [...new Set(delivered.map(shown))];
   const fromRoomMate = delivered.some((message) => byId.has(message.from));

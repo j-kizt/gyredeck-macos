@@ -2643,10 +2643,9 @@ function startBridge(config) {
       // by answering — the next brief tells it no seq followed, which is the signal it
       // has for anything that did not arrive.
       if (routing.kind === "reaction" && reactionRunExhausted(destination.room)) continue;
-      const declared = destination.name !== threadId ? declareName(destination.room, threadId, offeredName) : null;
-      const published = publishMail(destination.room, threadId, text, null, true, routing);
-      // A name rides on a post that landed, or it was not declared.
-      if (declared && !published?.seq) destination.room.declaredNames.delete(threadId);
+      const declared = newlyDeclared(destination.room, threadId, () =>
+        publishMail(destination.room, threadId, text, null, true, routing, destination.name !== threadId ? offeredName : undefined));
+      const published = declared.published;
       if (published?.seq) {
         const to = published.to ?? MAIL_EVERYONE;
         publishedForCodex.set(threadId, {
@@ -2663,7 +2662,7 @@ function startBridge(config) {
       if (destination.name !== threadId) {
         deliverMail(destination.name, destination.room, text, threadId, published);
       }
-      if (declared && published?.seq) announceDeclaredName(destination.name, destination.room, threadId, declared);
+      if (declared.name) announceDeclaredName(destination.name, destination.room, threadId, declared.name);
     }
     // Everything the room took, and not one byte more.
     //
@@ -3345,7 +3344,7 @@ function startBridge(config) {
         : `${lead}\n\n[Gyredeck: ${held.length} message${held.length === 1 ? "" : "s"} arrived` +
           " here before you were let in. In order:]\n\n" +
           held
-            .map((message) => `[${shownIn(room, message.from)} · ${message.kind}] ${message.text}`)
+            .map((message) => `[${senderShown(room, message)} · ${message.kind}] ${message.text}`)
             .join("\n\n"),
       { full: true },
     ) + `\n\n${heavyHint(conversationId)}`;
@@ -3541,9 +3540,10 @@ function startBridge(config) {
    * Keep the name a session declared for itself in this room, once. The first declaration
    * wins and later ones are ignored, so a name cannot be swapped mid-conversation to read as
    * someone else's. Only a confirmed member of a sync room declares; a mailbox has no names.
-   * Answers the name kept now, or null when nothing was kept by this call.
+   * Answers the name a post may declare, or null; nothing is kept here — publishMail keeps it
+   * only once the post is admitted, so a refused post declares nothing.
    */
-  const declareName = (room, conversationId, raw) => {
+  const nameToDeclare = (room, conversationId, raw) => {
     if (raw === undefined || raw === null) return null;
     if (room.members.get(conversationId)?.confirmed !== true || !room.declaredNames) return null;
     if (room.declaredNames.has(conversationId)) return null;
@@ -3551,10 +3551,16 @@ function startBridge(config) {
     // The reply template's placeholder, sent unchanged, is not a name: kept, it would stand
     // for good, since the first declaration wins.
     if (!name || name.toLowerCase() === NAME_PLACEHOLDER.toLowerCase()) return null;
-    room.declaredNames.set(conversationId, name);
     return name;
   };
   const NAME_PLACEHOLDER = "YOUR NAME";
+  /** Publishes, and answers the name this publish declared — none when it was refused. */
+  const newlyDeclared = (room, conversationId, publish) => {
+    const before = room.declaredNames?.has(conversationId) === true;
+    const published = publish();
+    const name = !before && published?.seq && room.declaredNames?.has(conversationId) ? room.declaredNames.get(conversationId) : null;
+    return { published, name };
+  };
   const announceDeclaredName = (roomName, room, conversationId, name) =>
     announceMembership(roomName, room, `${labelIn(room, conversationId)} is called ${name}.`);
   /**
@@ -3572,10 +3578,10 @@ function startBridge(config) {
     const byName = ids.filter((id) => nameIn(room, id)?.toLowerCase() === wanted);
     return byName.length === 1 ? byName[0] : null;
   };
-  const shownIn = (room, conversationId) => {
-    const name = nameIn(room, conversationId);
-    return name ? `${labelIn(room, conversationId)} / ${name}` : labelIn(room, conversationId);
-  };
+  const shownAs = (room, conversationId, name) => (name ? `${labelIn(room, conversationId)} / ${name}` : labelIn(room, conversationId));
+  const shownIn = (room, conversationId) => shownAs(room, conversationId, nameIn(room, conversationId));
+  /** A message as the room showed its sender when it spoke, never as a later name would. */
+  const senderShown = (room, message) => message.fromShown ?? shownIn(room, message.from);
 
   const providerLabelFor = (conversationId) =>
     PROVIDER_LABELS[providerByConversation.get(conversationId)] ?? "Agent";
@@ -5106,7 +5112,7 @@ function startBridge(config) {
     return null;
   };
 
-  const publishMail = (room, from, text, replyTo, fromSession = false, routing = null) => {
+  const publishMail = (room, from, text, replyTo, fromSession = false, routing = null, offeredName = undefined) => {
     // Capacity is decided here, not at one caller. The HTTP route checks first so it can
     // answer with a sentence naming who has not read; every other way into a room — a
     // harvested Codex reply, a relayed hook message — arrives through this line, and
@@ -5115,11 +5121,16 @@ function startBridge(config) {
     // The room's own voice is exempt. A notice is how a session learns it was removed or
     // that somebody joined, and refusing one would be the same silent failure in a
     // different place; they are small, and the budget bounds what senders add.
+    // A name offered with the post is weighed as the post will be shown, and kept only once
+    // the post is admitted (#182): a refused post declares nothing.
+    const declaring = from !== ROOM_SENDER ? nameToDeclare(room, from, offeredName) : null;
+    const fromShown = room.members.has(from) ? (declaring ? shownAs(room, from, declaring) : shownIn(room, from)) : undefined;
     if (from !== ROOM_SENDER && roomIsFull(room, Buffer.byteLength(text, "utf8"))) return null;
     if (
       from !== ROOM_SENDER &&
       heldWouldOverflow(room, {
         from,
+        ...(fromShown ? { fromShown } : {}),
         to: routing?.to ?? MAIL_EVERYONE,
         kind: routing?.kind ?? MAIL_DEFAULT_KIND,
         text,
@@ -5127,6 +5138,7 @@ function startBridge(config) {
     ) {
       return null;
     }
+    if (declaring) room.declaredNames.set(from, declaring);
     room.seq += 1;
     mailOrdinal += 1;
     room.touchedAt = Date.now();
@@ -5152,7 +5164,7 @@ function startBridge(config) {
       from,
       // The sender as the room showed it when it spoke (#182): a reader that took the
       // roster before a name was declared still names this message rightly.
-      ...(room.members.has(from) ? { fromShown: shownIn(room, from) } : {}),
+      ...(fromShown ? { fromShown } : {}),
       // Addressed, so the room can route rather than broadcast. Anything unrecognised
       // becomes everyone: a sender who gets this wrong must be heard too loudly rather
       // than not at all, since silence is the failure nobody notices.
@@ -5591,7 +5603,7 @@ function startBridge(config) {
           }
           const outgoing = from === ROOM_SENDER
             ? text
-            : `[Gyredeck · mailbox — a message to you alone, from ${codexEnvelopeLabel(shownIn(room, from))}.` +
+            : `[Gyredeck · mailbox — a message to you alone, from ${codexEnvelopeLabel(routing?.fromShown ?? shownIn(room, from))}.` +
               " Answer it as ordinary text in this turn; the bridge reads your answer from" +
               (replyTo === null
                 ? " your own log and keeps it in your mailbox.]\n\n"
@@ -5605,7 +5617,7 @@ function startBridge(config) {
         // Who it is from and which kind it is, in the words the rules use: without the kind
         // a tell and a reaction with the same body arrived byte-identical, and "never answer
         // a reaction" could not be kept (#157).
-        const fromLabel = from === ROOM_SENDER ? "the room" : from === "gyredeck" ? "the user, via Gyredeck" : shownIn(room, from);
+        const fromLabel = from === ROOM_SENDER ? "the room" : from === "gyredeck" ? "the user, via Gyredeck" : routing?.fromShown ?? shownIn(room, from);
         const kind = typeof routing?.kind === "string" ? routing.kind : MAIL_DEFAULT_KIND;
         const outgoing = codexRoomEnvelope(
           roomName,
@@ -7606,9 +7618,20 @@ function startBridge(config) {
           });
           return;
         }
-        // Kept before publishing, so this very message already carries the name.
-        const declared = declareName(room, from, body.name);
-        const message = publishMail(room, from, text, replyTo, false, { to: addressed, kind: routedKind });
+        // The name is weighed and kept by publishMail, so this very message already carries it.
+        const declared = newlyDeclared(room, from, () =>
+          publishMail(room, from, text, replyTo, false, { to: addressed, kind: routedKind }, body.name));
+        const message = declared.published;
+        if (!message) {
+          // The checks above passed on the message without its name; with it, it no longer
+          // fits. Refused like any message that does not fit, and nothing was declared.
+          sendJson(409, {
+            ok: false,
+            error: "not_published",
+            message: "This message was not published: with the name it declares it no longer fits what the room can hold or hand over. Send it shorter, or without the name.",
+          });
+          return;
+        }
         // Delivery is per-agent and reported back so a caller can say what will happen
         // rather than guess: "queued" reaches an idle session, "on_next_turn" waits,
         // "not_notified" means it was published and deliberately woke nobody.
@@ -7620,7 +7643,7 @@ function startBridge(config) {
           room.readSeq = Math.max(room.readSeq, message.seq);
           room.lastReadAt = message.ts;
         }
-        if (declared) announceDeclaredName(name, room, from, declared);
+        if (declared.name) announceDeclaredName(name, room, from, declared.name);
         sendJson(202, {
           ok: true,
           room: name,

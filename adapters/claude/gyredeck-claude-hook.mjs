@@ -584,6 +584,21 @@ const plainDelivery = async (taken) => {
   return lines.length > 0 ? lines.join("\n\n") : null;
 };
 
+/**
+ * Asked until it is answered (#182): the name the app has on record for this session, and
+ * which name it wants the room to call it by. The agent states it — from its own CLAUDE.md /
+ * AGENTS.md — as a `name` field on its first post; nothing here reads those files. An older
+ * bridge that does not say whether a name was declared is not asked.
+ */
+const nameAsk = (mine) => {
+  if (mine?.confirmed !== true || mine?.declared !== false) return null;
+  const recorded = typeof mine.recordedName === "string" && mine.recordedName ? mine.recordedName : null;
+  return "NAME: " +
+    (recorded ? `the app has this session on record as "${recorded}".` : "the app has no name on record for this session.") +
+    " Which name do you want the room to call you by — the one your own instructions (CLAUDE.md / AGENTS.md) give you?" +
+    ' Send it once, as a "name" field beside to and kind on your first post; the room keeps the first name it is given.';
+};
+
 const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null, taken = null) => {
   if (!token || !MAIL_ROOM_NAME.test(room)) return null;
   // Known before anything can fail, so a delivery that throws still says it (#196).
@@ -683,7 +698,10 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // What a reader is shown: the routing label, and the name the person gave that session
   // (#182). `label` stays the routing label alone, since that is what `to` takes.
   const named = (member) => (typeof member?.name === "string" && member.name ? `${member.provider} / ${member.name}` : member.provider);
-  const shown = (message) => (byId.has(message.from) ? named(byId.get(message.from)) : label(message));
+  // A message keeps the name its sender had when it spoke (fromShown); the roster is for an
+  // older bridge that does not record it.
+  const shown = (message) =>
+    typeof message.fromShown === "string" && message.fromShown ? message.fromShown : byId.has(message.from) ? named(byId.get(message.from)) : label(message);
 
   const senders = [...new Set(delivered.map(shown))];
   const fromRoomMate = delivered.some((message) => byId.has(message.from));
@@ -740,6 +758,9 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
       standing.push(`Mail waiting for you could not be collected this turn (${heldBack}); it is still waiting, and the watch below will bring it.`);
     }
   }
+
+  const askName = room_ ? nameAsk(mine) : null;
+  if (askName) standing.push(askName);
 
   if (room_ && mine && !confirmed) {
     // The refusal is easy to misread as a bug, so say what is missing and who has it
@@ -830,7 +851,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
       "REPLY — run once, the room's password in place of THE ROOM PASSWORD:\n" +
         `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${replyTo} ` +
         `-H 'content-type: application/json' -H "x-gyredeck-token: THE ROOM PASSWORD" ` +
-        `-d '${JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind }).replace(/'/g, "'\\''")}'\n` +
+        `-d '${JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''")}'\n` +
         "It was sent only if you see ok:true and a seq.",
     );
   } else if (replyTo && !room_) {

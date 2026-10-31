@@ -2811,6 +2811,183 @@ test("a session's assigned name shows wherever the room names it, and to still t
   }
 });
 
+test("a session declares the name it is called by on its first post; the room announces it once and keeps the first (#182)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-declared-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const founder = "a1820000-0000-4000-8000-0000000000d1";
+  const agy = "a1820000-0000-4000-8000-0000000000d2";
+  const third = "a1820000-0000-4000-8000-0000000000d3";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const call = async (method, path, body, credential = token) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers: { "content-type": "application/json", "x-gyredeck-token": credential, "x-gyredeck-broker": TEST_APP_WORD }, body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    for (const [conversationId, sourceKind, cwd] of [[founder, "claudeCodeHook", "/tmp/project"], [agy, "agyHost", "/tmp/project"], [third, "claudeCodeHook", "/tmp/other"]]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd,
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    // The rule is written where every session reads the rules.
+    const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
+    assert.equal(ROOM_RULES_VERSION, 12);
+    assert.match(rules, /^# Gyredeck room rules — v12/);
+    assert.match(rules, /## Your name\n- The room calls you by the name you declare, on your \*\*first post\*\*/);
+    assert.match(rules, /`name="<Name>"` after the kind/);
+    // Only the founder has a name in the app.
+    await call("PUT", `/sessions/names/${founder}`, { name: "Altrix Assistant" });
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    const password = created.body.password;
+    for (const id of [agy, third]) {
+      await call("POST", `/sync/rooms/${code}/members`, { conversationId: id });
+      await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: id, password });
+    }
+    const roster = async () => Object.fromEntries((await call("GET", `/sync/rooms?as=${founder}`)).body.members.map((m) => [m.conversationId, m]));
+    const history = async () => (await call("GET", `/mail/${code}?as=${founder}&since=0`, null, password)).body.messages;
+    const calledNotices = async () => (await history()).filter((message) => / is called /.test(message.text));
+    const post = (from, body) => call("POST", `/mail/${code}`, { from, kind: "tell", ...body }, password);
+
+    // Phase 1, nothing declared: the app's name when there is one, the label alone when not.
+    let members = await roster();
+    assert.equal(members[founder].name, "Altrix Assistant", "the app's name stands in until one is declared");
+    assert.equal(members[agy].name, null, "no name anywhere: the label alone, as before");
+    assert.equal(members[founder].declared, false);
+    assert.equal(members[founder].recordedName, "Altrix Assistant");
+
+    // The delivery says what the app has on record and asks for the name, with the field in the reply.
+    await post(agy, { to: "Claude Code", text: "before anyone named themselves" });
+    const asked = await runAdapter(
+      "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
+      { hook_event_name: "UserPromptSubmit", session_id: founder, cwd: "/tmp/project", prompt: "hi" },
+    );
+    assert.equal(asked.code, 0, asked.stderr);
+    const askedContext = JSON.parse(asked.stdout).hookSpecificOutput.additionalContext;
+    assert.match(askedContext, /NAME: the app has this session on record as "Altrix Assistant"\. Which name do you want the room to call you by/);
+    assert.match(askedContext, /"to":"Antigravity","kind":"reaction","name":"YOUR NAME"/);
+    assert.match(askedContext, /\[from Antigravity · tell\] before anyone named themselves/);
+    await post(founder, { to: "Antigravity", text: "a question for agy", kind: "ask" });
+    const agyAsked = await runAdapter(
+      "adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], home,
+      { hookEventName: "PreInvocation", conversationId: agy, workspacePaths: ["/tmp/project"] },
+    );
+    assert.equal(agyAsked.code, 0, agyAsked.stderr);
+    const agySteps = (JSON.parse(agyAsked.stdout).injectSteps ?? []).map((step) => step.ephemeralMessage).join("\n");
+    assert.match(agySteps, /NAME: the app has no name on record for this session\. Which name do you want the room to call you by/);
+    assert.match(agySteps, /"name":"YOUR NAME"/);
+    assert.equal((await calledNotices()).length, 0, "premise: nobody has declared yet");
+
+    // A watch open before the declaration, as a relay's would be.
+    const stream = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${third}`, { headers: { "x-gyredeck-token": password } });
+    assert.equal(stream.status, 200);
+    // The template's placeholder sent unchanged is no declaration: nothing kept, no notice.
+    const placeholder = await post(founder, { to: "everyone", text: "sent with the placeholder", name: "  your\nNAME " });
+    assert.equal(placeholder.status, 202, JSON.stringify(placeholder.body));
+    assert.equal(placeholder.body.name, "Altrix Assistant", "the app's name still stands");
+    assert.equal((await calledNotices()).length, 0, "no notice for a placeholder");
+    assert.equal((await roster())[founder].declared, false, "and the session can still declare");
+    // Posted before Antigravity declares: it keeps the sender as shown then (#182 audit).
+    await post(agy, { to: "Claude Code", text: "BEFORE-THE-NAME" });
+
+    // Phase 2: the founder declares on its first post. One announcement; the name is used from then on.
+    const declared = await post(founder, { to: "everyone", text: "first post, with a name", name: "Gyre Assistant" });
+    assert.equal(declared.status, 202, JSON.stringify(declared.body));
+    assert.equal(declared.body.name, "Gyre Assistant");
+    let notices = await calledNotices();
+    assert.deepEqual(notices.map((message) => message.text.split(" Members now")[0]), ["Claude Code is called Gyre Assistant."]);
+    assert.equal(notices[0].kind, "notice");
+    members = await roster();
+    assert.equal(members[founder].name, "Gyre Assistant", "declared beats the app's name");
+    assert.equal(members[founder].recordedName, "Altrix Assistant");
+    assert.equal(members[founder].declared, true);
+    assert.deepEqual((await call("GET", "/sessions/names")).body.names, { [founder]: "Altrix Assistant" }, "the app's own name is never changed");
+    // Each message carries its sender as shown when it was posted: the declaring post already
+    // under the new name, the ones before it under what stood then.
+    const posted = await history();
+    assert.equal(posted.find((message) => message.text === "before anyone named themselves").fromShown, "Antigravity");
+    assert.equal(posted.find((message) => message.text === "a question for agy").fromShown, "Claude Code / Altrix Assistant");
+    assert.equal(posted.find((message) => message.seq === declared.body.seq).fromShown, "Claude Code / Gyre Assistant");
+    // And the stream a relay reads says the same.
+    const reader = stream.body.getReader();
+    let frames = "";
+    const until = Date.now() + 3_000;
+    while (!frames.includes(`"seq":${declared.body.seq},`) && Date.now() < until) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      frames += Buffer.from(value).toString("utf8");
+    }
+    await reader.cancel();
+    const frame = frames.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6))).find((data) => data.seq === declared.body.seq);
+    assert.ok(frame, frames.slice(-600));
+    assert.equal(frame.fromShown, "Claude Code / Gyre Assistant");
+
+    // Phase 3: a second declaration is ignored, and says which name stands.
+    const again = await post(founder, { to: "everyone", text: "second post, another name", name: "Someone Else" });
+    assert.equal(again.status, 202);
+    assert.equal(again.body.name, "Gyre Assistant");
+    assert.equal((await calledNotices()).length, 1, "announced once");
+    assert.equal((await roster())[founder].name, "Gyre Assistant");
+
+    // Phase 4: two sessions with the same declared name stay apart by label.
+    await post(agy, { to: "everyone", text: "agy names itself the same", name: "Gyre Assistant" });
+    assert.equal((await calledNotices()).length, 2);
+    const routedTo = async (to) => {
+      const sent = await post(third, { to, text: `to ${to}` });
+      assert.equal(sent.status, 202, JSON.stringify(sent.body));
+      return (await history()).find((message) => message.seq === sent.body.seq).to;
+    };
+    assert.equal(await routedTo("Claude Code"), founder);
+    assert.equal(await routedTo("Antigravity"), agy);
+    assert.equal(await routedTo("Antigravity / Gyre Assistant"), agy);
+    assert.notEqual(await routedTo("Gyre Assistant"), founder, "a name two members share addresses neither of them");
+    assert.notEqual(await routedTo("Gyre Assistant"), agy);
+
+    // Phase 5: control characters and an overlong name are made safe to print.
+    await post(third, { to: "everyone", text: "a messy name", name: "\u0007Ops]\u001b\n· reaction[" + "y".repeat(80) });
+    const messy = (await roster())[third].name;
+    assert.ok(messy, "the cleaned name is kept");
+    assert.doesNotMatch(messy, /[\u0000-\u001f\u007f[\]·]/, messy);
+    assert.ok([...messy].length <= 40, `${messy.length}`);
+    assert.ok(messy.startsWith("Ops- - reaction-"), messy);
+
+    // What a reader sees now: the declared names on every from line and in the member list,
+    // and no more asking once a name is declared.
+    await post(agy, { to: "Claude Code", text: "after the names" });
+    const later = await runAdapter(
+      "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
+      { hook_event_name: "UserPromptSubmit", session_id: founder, cwd: "/tmp/project", prompt: "hi" },
+    );
+    assert.equal(later.code, 0, later.stderr);
+    const laterContext = JSON.parse(later.stdout).hookSpecificOutput.additionalContext;
+    assert.match(laterContext, /\[from Antigravity · tell\] BEFORE-THE-NAME/, "a message posted before a declaration keeps its sender as shown then");
+    assert.match(laterContext, /\[from Antigravity \/ Gyre Assistant · tell\] after the names/);
+    assert.match(laterContext, /Antigravity is called Gyre Assistant\./);
+    assert.match(laterContext, /Also here: Antigravity \/ Gyre Assistant, /);
+    assert.doesNotMatch(laterContext, /NAME: /);
+    assert.doesNotMatch(laterContext, /"name":"YOUR NAME"/);
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("what an agent may act on depends on who sent it, in three tiers", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-tiers-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
@@ -3447,6 +3624,212 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     assert.ok(bare, "an unlabelled Codex turn is published rather than dropped");
     assert.equal(bare.kind, "tell");
     assert.equal(bare.to, "everyone");
+  } finally {
+    bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a name declared on a post near the held-mail limit is weighed before it is kept, and a post it no longer fits is refused, never a crash (#182 audit)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-auditor-name-cap-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "", stdout: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  bridge.stdout.on("data", (chunk) => { stderrRef.stdout += chunk; });
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
+    const call = async (method, path, body) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      const raw = await response.text();
+      let value = null;
+      try { value = JSON.parse(raw); } catch {}
+      return { status: response.status, value };
+    };
+    // Each probe is its own room, closed after unless kept, so the search stays under the room cap.
+    const probe = async (size, name, keep = false) => {
+      const founder = randomUUID();
+      const sender = randomUUID();
+      const waiting = randomUUID();
+      for (const [conversationId, sourceKind, cwd] of [
+        [founder, "claudeCodeHook", "/tmp/auditor-founder"],
+        [sender, "agyHost", "/tmp/auditor-sender"],
+        [waiting, "codexCliHook", "/tmp/auditor-waiting"],
+      ]) {
+        const ingested = await call("POST", "/ingest", {
+          version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+          conversationId, cwd, runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+          data: { inputCount: 1 },
+        });
+        assert.ok(ingested.status < 300, "session fixture ingested");
+      }
+      const created = await call("POST", "/sync/rooms", { conversationId: founder });
+      assert.ok(created.status >= 200 && created.status < 300, `room created: ${created.status} ${JSON.stringify(created.value)}`);
+      const code = created.value.room;
+      assert.ok((await call("POST", `/sync/rooms/${code}/members`, { conversationId: sender })).status < 300);
+      assert.ok((await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: sender, password: created.value.password })).status < 300);
+      assert.ok((await call("POST", `/sync/rooms/${code}/members`, { conversationId: waiting })).status < 300);
+      for (let i = 0; i < 22; i++) {
+        const fill = await call("POST", `/mail/${code}`, { from: sender, to: "everyone", kind: "tell", text: `${i}:` + "z".repeat(4000) });
+        assert.equal(fill.status, 202, `fill ${i} accepted: ${JSON.stringify(fill.value)}`);
+      }
+      let posted;
+      try {
+        posted = await call("POST", `/mail/${code}`, {
+          from: sender, to: "everyone", kind: "tell", text: "x".repeat(size),
+          ...(name ? { name } : {}),
+        });
+      } catch (error) {
+        posted = { status: 0, value: null, error: `${String(error)} cause=${String(error.cause)} bridgeExit=${bridge.exitCode} out=${stderrRef.value.slice(-500)} stdout=${stderrRef.stdout.slice(-500)}` };
+      }
+      if (!keep && bridge.exitCode === null && posted.status !== 0) await call("DELETE", `/sync/rooms/${code}`);
+      return { ...posted, code, sender };
+    };
+    // Found by Codex: the name grew the post past the limit between the route's check and
+    // publishMail's, which returned null to a route that read its seq and took the bridge down.
+    // The largest post the room still takes without a name: with one, it no longer fits.
+    let [fits, over] = [1, 4000];
+    assert.equal((await probe(fits, null)).status, 202, "the smallest post fits");
+    assert.equal((await probe(over, null)).status, 409, "the largest does not, so there is an edge to find");
+    while (over - fits > 1) {
+      const mid = Math.floor((fits + over) / 2);
+      if ((await probe(mid, null)).status === 202) fits = mid;
+      else over = mid;
+    }
+    const named = await probe(fits, "N".repeat(60), true);
+    assert.equal(named.status, 409, `named=${JSON.stringify(named)}`);
+    assert.equal(named.value?.error, "not_published");
+    assert.equal(bridge.exitCode, null, "the bridge is still running");
+    assert.equal((await call("GET", "/health")).status, 200, "and still answering");
+    const members = (await call("GET", `/sync/rooms?as=${named.sender}`)).value?.members ?? [];
+    assert.ok(members.length > 0, `members read: ${JSON.stringify(members)}`);
+    assert.ok(members.every((member) => member.declared !== true), "a refused post declares nothing");
+  } finally {
+    bridge.kill();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+
+test("Codex declares its name in its routing line, name=\"<Name>\" after the kind, and the room keeps the first (#182)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-codexname-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const thread = "01a0845e-eb31-76d3-a20e-dbebd733f182";
+  const rolloutDir = join(home, ".codex", "sessions", "2026", "11", "01");
+  await mkdir(rolloutDir, { recursive: true });
+  const fakeBin = join(home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  await writeFile(join(fakeBin, "codex"), recordingCodexBinary);
+  await chmod(join(fakeBin, "codex"), 0o755);
+  const rollout = join(rolloutDir, `rollout-2026-11-01T10-00-00-${thread}.jsonl`);
+  await writeFile(rollout, "");
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const founder = "codexname-founder";
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
+    const call = async (method, path, body, extra = {}) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { ...headers, ...extra }, body: body ? JSON.stringify(body) : undefined });
+      return { status: response.status, body: await response.json() };
+    };
+    for (const [conversationId, sourceKind] of [[founder, "claudeCodeHook"], [thread, "codexCliHook"]]) {
+      await call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    await call("PUT", `/sessions/names/${thread}`, { name: "Codex Audit" });
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: thread });
+    // Held for Codex while it waits to be let in: one line before the founder declares a
+    // name, one with it. The push that lets Codex in shows each as it was said (#182 audit).
+    const room = { "x-gyredeck-token": created.body.password };
+    const held1 = await call("POST", `/mail/${code}`, { from: founder, to: "everyone", kind: "tell", text: "HELD-BEFORE-THE-NAME" }, room);
+    assert.equal(held1.status, 202, JSON.stringify(held1.body));
+    const held2 = await call("POST", `/mail/${code}`, { from: founder, to: "everyone", kind: "tell", text: "HELD-WITH-THE-NAME", name: "Gyre Assistant" }, room);
+    assert.equal(held2.status, 202, JSON.stringify(held2.body));
+    assert.equal(held2.body.name, "Gyre Assistant", "an admitted post keeps its name");
+    const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
+    await call("POST", "/hook/sync/confirm", { conversationId: thread, turnId: "01a06082-8ef6-7900-ae39-44fe2e460182", password: minted.body.password });
+    const waitForPrompt = async (pattern) => {
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const found = (await promptsIn(rollout)).filter((prompt) => pattern.test(prompt.text));
+        if (found.length > 0) return found;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      return [];
+    };
+    const history = async () => (await call("GET", `/mail/${code}?as=${founder}&since=0`, null, { "x-gyredeck-token": created.body.password })).body.messages;
+    const notices = async () => (await history()).filter((message) => / is called /.test(message.text));
+    const endTurn = () => call("POST", "/hook/stop", { hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: thread });
+    const say = async (text) => {
+      await appendFile(rollout, finishedTurn(text));
+      await endTurn();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    };
+
+    // The push that lets it in says what the app has on record and how to declare a name.
+    const roomPushes = await waitForPrompt(new RegExp(`Gyredeck · room ${code}`));
+    assert.ok(roomPushes.length > 0, `premise: a room push reached Codex — ${stderrRef.value.slice(-400)}`);
+    const firstPush = roomPushes.map((prompt) => prompt.text).join("\n");
+    assert.match(firstPush, /The app has you on record as "Codex Audit"\. Which name do you want the room to call you by/);
+    assert.match(firstPush, /@everyone tell name="<Name>"/);
+    assert.match(firstPush, /\[Claude Code · tell\] HELD-BEFORE-THE-NAME/, "held mail keeps the sender as shown when it was said");
+    assert.match(firstPush, /\[Claude Code \/ Gyre Assistant · tell\] HELD-WITH-THE-NAME/);
+    assert.equal((await notices()).filter((message) => /^Codex /.test(message.text)).length, 0, "premise: Codex has declared nothing yet");
+
+    await say('@everyone tell name="Gyre Audit" — on it, reading the diff');
+    let messages = await history();
+    const first = messages.find((message) => message.from === thread);
+    assert.ok(first, `the reply was published — ${stderrRef.value.slice(-400)}`);
+    assert.equal(first.text, "on it, reading the diff", "the header, name and all, is taken off");
+    assert.equal(first.kind, "tell");
+    assert.equal(first.to, "everyone");
+    assert.equal(first.fromShown, "Codex / Gyre Audit");
+    assert.deepEqual((await notices()).map((message) => message.text.split(" Members now")[0]), ["Claude Code is called Gyre Assistant.", "Codex is called Gyre Audit."]);
+    const member = (await call("GET", `/sync/rooms?as=${founder}`)).body.members.find((m) => m.conversationId === thread);
+    assert.equal(member.name, "Gyre Audit");
+    assert.equal(member.recordedName, "Codex Audit");
+
+    // A second declaration is ignored; the message itself still goes through.
+    await say('@everyone tell name="Somebody Else" — second word');
+    messages = await history();
+    const second = messages.find((message) => message.text === "second word");
+    assert.ok(second, "the message with a second name still lands");
+    assert.equal(second.fromShown, "Codex / Gyre Audit");
+    assert.equal((await notices()).length, 2, "each announced once");
+
+    // Once declared, the next push no longer asks, and names it as declared.
+    const before = (await promptsIn(rollout)).length;
+    await call("POST", `/mail/${code}`, { from: founder, to: "Codex", kind: "ask", text: "NEXT-QUESTION" }, { "x-gyredeck-token": created.body.password });
+    const next = (await waitForPrompt(/NEXT-QUESTION/)).at(-1);
+    assert.ok(next && (await promptsIn(rollout)).length > before, "premise: a later push arrived");
+    assert.doesNotMatch(next.text, /name="<Name>"/);
+    assert.match(next.text, /Members now: Claude Code \/ Gyre Assistant, Codex \/ Gyre Audit\./);
   } finally {
     bridge.kill();
     await rm(home, { recursive: true, force: true });
@@ -10565,7 +10948,7 @@ test("heavy rules: the rules list the heavy commands, the helper and the limit",
   assert.ok(rules.includes(HEAVY_LIMIT_TEXT));
   assert.match(rules, /node ~\/\.config\/gyredeck\/gyredeck-heavy\.mjs --as <your id> --what "<what it runs>" -- <command…>/);
   // #260 C8: v11 tells every reader of the section how to look before heavy work.
-  assert.equal(ROOM_RULES_VERSION, 11);
+  assert.ok(ROOM_RULES_VERSION >= 11, "v11 or later");
   const section = rules.slice(rules.indexOf("\n## Heavy runs\n"));
   assert.ok(section.length < rules.length, "premise: the section is there");
   assert.ok(section.includes("Before heavy work, or when deciding whether to wait, check with `node ~/.config/gyredeck/gyredeck-heavy.mjs --status`"), section);

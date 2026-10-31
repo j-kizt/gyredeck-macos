@@ -1,5 +1,21 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A session in a sync room is called by the name its own instructions give it — (v1.27.0)
+
+### Added
+
+- **Sessions name themselves in a room.** On its first post after being let in, a session says the
+  name its own instructions give it — Claude Code and Antigravity in a `name` field, Codex as
+  `name="<Name>"` on its routing line. The room announces it once (`Claude Code is called Gyre
+  Assistant.`) and shows it beside the label in the member list and on every message from then on.
+  Until a session declares one, the room uses the name you gave it in Gyredeck, if any. The name is
+  only what to call it: messages are still addressed by the label, and the name you set in Gyredeck
+  is never changed by the room.
+- **Each message keeps its sender as the room showed it when it was said,** so a name declared later
+  never renames what came before.
+- Room rules v12 describe how to declare a name. A post that would no longer fit what the room can
+  hand over once its name is added is refused with a reason, and the name is not kept.
+
 ## The credit reads J-Kizt — (v1.26.2)
 
 ### Fixes

@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 11;
+export const ROOM_RULES_VERSION = 12;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -239,7 +239,7 @@ Read this once per conversation, and again after a compaction or a resume. Every
 room names the version it expects; if it names a newer one than you read, read this file again.
 
 ## Who a message is for, and what it is for
-- \`to\` is a member or \`everyone\`. A member is shown as its room label, then \` / \` and the name the person gave it — \`Codex / Altrix Audit\`. Address it by the label, the whole form as shown, or the name alone when no other member has that name or that label — a label always wins. Answer the member who asked — that wakes one session, not the room.
+- \`to\` is a member or \`everyone\`. A member is shown as its room label, then \` / \` and its name — \`Codex / Altrix Audit\`. Address it by the label, the whole form as shown, or the name alone when no other member has that name or that label — a label always wins. Answer the member who asked — that wakes one session, not the room.
 - \`kind\` is one of four:
   - **ask** wants an answer.
   - **tell** does not, but may draw a reaction.
@@ -247,13 +247,18 @@ room names the version it expects; if it names a newer one than you read, read t
   - **notice** is the room speaking about itself. It interrupts nobody and needs nothing back.
 - Leaving the fields out sends a tell to everyone and wakes every session in the room.
 
+## Your name
+- The room calls you by the name you declare, on your **first post** after you are confirmed — the name your own instructions (CLAUDE.md, AGENTS.md) give you. Until then it uses the name the person gave you in the app, if any; with neither, your label alone.
+- Claude Code and Antigravity: a \`name\` field beside \`to\` and \`kind\`. Codex: \`name="<Name>"\` after the kind on the first line — \`@everyone tell name="Gyre Audit" — on it\`.
+- The room announces it once and keeps the first name it is given; a later one is ignored. It is only what to call you: routing stays on your label, and the name alone addresses you only when no other member has that name or label. The app's own name for you is not changed.
+
 ## Sending
 - Claude Code and Antigravity: the command is in the delivery, under REPLY, whenever there is something to answer. Put the room's password in place of \`THE ROOM PASSWORD\`. Who a message is for and what it is for are fields of what you post, beside the text:
 \`\`\`json
-{"from":"<your id>","to":"<member or everyone>","kind":"ask|tell|reaction","text":"<your message>","replyTo":"<your id>"}
+{"from":"<your id>","to":"<member or everyone>","kind":"ask|tell|reaction","text":"<your message>","replyTo":"<your id>","name":"<your name — first post only>"}
 \`\`\`
 - Claude Code and Antigravity never put \`[to: …]\` or \`@…\` in \`text\`: they route only through the \`to\` and \`kind\` fields.
-- Codex only — you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\` — and is removed before the room sees it. This first line is Codex's alone. Say everything in one closing message.
+- Codex only — you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\`, with \`name="<Name>"\` after the kind on your first message — and is removed before the room sees it. This first line is Codex's alone. Say everything in one closing message.
 - A send happened only if you saw \`ok:true\` and a \`seq\`. Never say you sent something you did not see land.
 - Codex: your seq is reported on the next message you get, with the turn, recipient and kind it belongs to. Until then a message has not failed — **do not send it again**. A room or a mailbox posts an identical tell to the same member within a minute only once. Claude Code and Antigravity, which post with curl, can add \`"again": true\` to say the same thing again on purpose; Codex has no such switch, so a word-for-word repeat within the minute is taken as a resend.
 - \`listening\` in a receipt names the members with a watch open; a member that is pushed to, as Codex is, hears you without one.
@@ -2070,8 +2075,11 @@ function startBridge(config) {
   // tell. Silently, and with an ok and a seq, so nothing looked wrong from either end.
   // A separator is required rather than plain space, or `@Antigravity tell me about X`
   // would lose three words to the parser.
+  // An optional `name="<Name>"` after the kind is the name Codex declares for itself (#182):
+  // the one place it can say it, since it posts no fields. Quoted, so a name may hold spaces
+  // and dashes without being read as the separator. A line without it parses as it always did.
   const CODEX_ROUTING_LINE =
-    /^@(.+?)[ \t]+(ask|tell|reaction|ack)[ \t]*(?:[—–\-:|][ \t]*(.*))?$/i;
+    /^@(.+?)[ \t]+(ask|tell|reaction|ack)(?:[ \t]+name="([^"]*)")?[ \t]*(?:[—–\-:|][ \t]*(.*))?$/i;
   const routeCodexReply = (room, text) => {
     const [first, ...rest] = text.split("\n");
     const match = CODEX_ROUTING_LINE.exec(first.trim());
@@ -2079,7 +2087,7 @@ function startBridge(config) {
     // or label. A goal turn's answer is published on that and nothing else; a line that
     // named nobody, or somebody not here, is not a message to this room (#149).
     if (!match) return { text, routing: { to: MAIL_EVERYONE, kind: MAIL_DEFAULT_KIND }, explicit: false };
-    const inline = (match[3] ?? "").trim();
+    const inline = (match[4] ?? "").trim();
     const target = match[1].trim();
     const named = /^everyone$/i.test(target)
       ? MAIL_EVERYONE
@@ -2091,7 +2099,7 @@ function startBridge(config) {
     // to the whole text published `@everyone ack` as the message body, which is the
     // instruction wearing the costume of a reply.
     const body = [inline, rest.join("\n").trim()].filter(Boolean).join("\n");
-    return { text: body || "ok", routing: { to, kind: asKind(match[2].toLowerCase()) }, explicit: named !== null };
+    return { text: body || "ok", routing: { to, kind: asKind(match[2].toLowerCase()) }, explicit: named !== null, name: match[3] };
   };
 
   /**
@@ -2579,7 +2587,7 @@ function startBridge(config) {
         handledThrough = reply.endsAt;
         continue;
       }
-      const { text, routing, explicit } = routeCodexReply(destination.room, reply.text);
+      const { text, routing, explicit, name: offeredName } = routeCodexReply(destination.room, reply.text);
       // A goal turn's answer is a message to the room only when it says so — a first line
       // naming a member or everyone. Status Codex writes for its own terminal while working
       // a goal stays there; the room is not told, and stderr says so once per turn.
@@ -2635,7 +2643,10 @@ function startBridge(config) {
       // by answering — the next brief tells it no seq followed, which is the signal it
       // has for anything that did not arrive.
       if (routing.kind === "reaction" && reactionRunExhausted(destination.room)) continue;
+      const declared = destination.name !== threadId ? declareName(destination.room, threadId, offeredName) : null;
       const published = publishMail(destination.room, threadId, text, null, true, routing);
+      // A name rides on a post that landed, or it was not declared.
+      if (declared && !published?.seq) destination.room.declaredNames.delete(threadId);
       if (published?.seq) {
         const to = published.to ?? MAIL_EVERYONE;
         publishedForCodex.set(threadId, {
@@ -2652,6 +2663,7 @@ function startBridge(config) {
       if (destination.name !== threadId) {
         deliverMail(destination.name, destination.room, text, threadId, published);
       }
+      if (declared && published?.seq) announceDeclaredName(destination.name, destination.room, threadId, declared);
     }
     // Everything the room took, and not one byte more.
     //
@@ -3512,11 +3524,39 @@ function startBridge(config) {
     // The brackets and the dot are what the room's headers are built from — `[from X ·
     // tell]` — so a name holding them could forge a kind or a sender (#182 audit). They
     // become a plain hyphen; what is left is the name as typed.
-    const name = sessionNames.get(conversationId);
+    return headerSafe(sessionNames.get(conversationId));
+  };
+  const headerSafe = (name) => {
     if (typeof name !== "string" || !name) return null;
     const safe = name.replace(/[[\]·]/g, "-").replace(/\s+/g, " ").trim();
     return safe || null;
   };
+  /**
+   * What the room calls a member (#182, reopened): the name the session declared for itself
+   * on its first post, else the name the person gave it in the app, else nothing — and
+   * then the label alone, as before. The app's own record is never changed by the room.
+   */
+  const nameIn = (room, conversationId) => room.declaredNames?.get(conversationId) ?? sessionNameOf(conversationId);
+  /**
+   * Keep the name a session declared for itself in this room, once. The first declaration
+   * wins and later ones are ignored, so a name cannot be swapped mid-conversation to read as
+   * someone else's. Only a confirmed member of a sync room declares; a mailbox has no names.
+   * Answers the name kept now, or null when nothing was kept by this call.
+   */
+  const declareName = (room, conversationId, raw) => {
+    if (raw === undefined || raw === null) return null;
+    if (room.members.get(conversationId)?.confirmed !== true || !room.declaredNames) return null;
+    if (room.declaredNames.has(conversationId)) return null;
+    const name = headerSafe(cleanSessionName(raw));
+    // The reply template's placeholder, sent unchanged, is not a name: kept, it would stand
+    // for good, since the first declaration wins.
+    if (!name || name.toLowerCase() === NAME_PLACEHOLDER.toLowerCase()) return null;
+    room.declaredNames.set(conversationId, name);
+    return name;
+  };
+  const NAME_PLACEHOLDER = "YOUR NAME";
+  const announceDeclaredName = (roomName, room, conversationId, name) =>
+    announceMembership(roomName, room, `${labelIn(room, conversationId)} is called ${name}.`);
   /**
    * The member an address names: its routing label, the whole form the room shows
    * (`Codex / Altrix Audit`), or the name alone when no other member has it. Accepting
@@ -3529,11 +3569,11 @@ function startBridge(config) {
     if (exact) return exact;
     // A label always wins, so the name alone answers only when no other member's label
     // or name is the same (#182 audit).
-    const byName = ids.filter((id) => sessionNameOf(id)?.toLowerCase() === wanted);
+    const byName = ids.filter((id) => nameIn(room, id)?.toLowerCase() === wanted);
     return byName.length === 1 ? byName[0] : null;
   };
   const shownIn = (room, conversationId) => {
-    const name = sessionNameOf(conversationId);
+    const name = nameIn(room, conversationId);
     return name ? `${labelIn(room, conversationId)} / ${name}` : labelIn(room, conversationId);
   };
 
@@ -4031,6 +4071,9 @@ function startBridge(config) {
       // A session is resumable and keeps its id, so one that leaves and is put back
       // is the same session — and a stable name that changes on return is not stable.
       formerLabels: new Map(),
+      // The name each session declared for itself here (#182), kept past its membership
+      // as its label is, so the notice of its leaving still says it.
+      declaredNames: new Map(),
       touchedAt: Date.now(),
     };
     mailRooms.set(name, room);
@@ -4384,7 +4427,9 @@ function startBridge(config) {
       return [...room.members].map(([conversationId, member]) => ({
         conversationId,
         provider: labelIn(room, conversationId),
-        name: sessionNameOf(conversationId),
+        name: nameIn(room, conversationId),
+        recordedName: sessionNameOf(conversationId),
+        declared: room.declaredNames?.has(conversationId) === true,
         confirmed: member.confirmed === true,
         joinedAt: member.joinedAt,
         pending: Math.max(0, room.seq - member.readSeq),
@@ -4598,7 +4643,8 @@ function startBridge(config) {
       fields:
         "to is a member, as the room shows it, or everyone; kind is ask, tell or reaction." +
         " Set them as these fields, never in text. Answer the member who asked: a tell to" +
-        " everyone wakes every session in the room.",
+        " everyone wakes every session in the room. On your first post, add name — the" +
+        " name your own instructions give you; the room calls you by it and keeps the first one.",
       command:
         `curl -s -X POST http://${host}:${port}/mail/${name}` +
         ` -H 'content-type: application/json' -H 'x-gyredeck-token: ${password}'` +
@@ -4736,7 +4782,9 @@ function startBridge(config) {
             return [...sync.room.members].map(([conversationId, member]) => ({
               conversationId,
               provider: labelIn(sync.room, conversationId),
-              name: sessionNameOf(conversationId),
+              name: nameIn(sync.room, conversationId),
+              recordedName: sessionNameOf(conversationId),
+              declared: sync.room.declaredNames?.has(conversationId) === true,
               confirmed: member.confirmed === true,
               you: conversationId === as,
             }));
@@ -5102,6 +5150,9 @@ function startBridge(config) {
       seq: room.seq,
       ord: mailOrdinal,
       from,
+      // The sender as the room showed it when it spoke (#182): a reader that took the
+      // roster before a name was declared still names this message rightly.
+      ...(room.members.has(from) ? { fromShown: shownIn(room, from) } : {}),
       // Addressed, so the room can route rather than broadcast. Anything unrecognised
       // becomes everyone: a sender who gets this wrong must be heard too loudly rather
       // than not at all, since silence is the failure nobody notices.
@@ -5333,6 +5384,14 @@ function startBridge(config) {
    */
   const codexRoomEnvelope = (roomName, room, recipient, text, { full = false } = {}) => {
     const roster = [...room.members.keys()].map((id) => shownIn(room, id)).join(", ");
+    // Asked until it is answered (#182): what the app has on record, and the one place
+    // Codex can say what it wants to be called instead.
+    const recorded = sessionNameOf(recipient);
+    const nameAsk = room.declaredNames?.has(recipient) ? "" :
+      (recorded ? ` The app has you on record as "${recorded}".` : " The app has no name on record for you.") +
+      " Which name do you want the room to call you by — the one your own instructions" +
+      ' (AGENTS.md) give you? Say it once, in that first line after the kind:' +
+      ' @everyone tell name="<Name>" — the room keeps the first name it is given.';
     // Named by its turn, recipient and kind, so a late seq is matched to the message that
     // earned it and not to a newer one (#183: seq 63 was taken for 61). It comes on the
     // next push only — waking Codex to say a number would cost a turn (the user,
@@ -5354,6 +5413,7 @@ function startBridge(config) {
         `[Gyredeck · room ${roomName} — how to answer: the last thing you write this turn` +
         " is posted for you (no curl, no watch). Open it with one line: @<member or" +
         " everyone> ask|tell|reaction — never answer a reaction." +
+        nameAsk +
         ` Rules v${ROOM_RULES_VERSION}: ${ROOM_RULES_DISPLAY_PATH} — read it once per` +
         " conversation and again after a compaction." +
         ` Members now: ${roster || "nobody"}.` +
@@ -5386,6 +5446,7 @@ function startBridge(config) {
       " exchange stops. Leave the line out and it goes to everyone as tell, which" +
       " interrupts them all. When you answer someone, name them: that is what keeps" +
       " one exchange costing one wake instead of waking the room." +
+      nameAsk +
       // Its roster is memory of announcements it happened to receive: it cannot
       // read the room's state, so a push that failed once would leave it wrong
       // forever. Restating who is here on every message costs a line and closes it.
@@ -7545,6 +7606,8 @@ function startBridge(config) {
           });
           return;
         }
+        // Kept before publishing, so this very message already carries the name.
+        const declared = declareName(room, from, body.name);
         const message = publishMail(room, from, text, replyTo, false, { to: addressed, kind: routedKind });
         // Delivery is per-agent and reported back so a caller can say what will happen
         // rather than guess: "queued" reaches an idle session, "on_next_turn" waits,
@@ -7557,10 +7620,14 @@ function startBridge(config) {
           room.readSeq = Math.max(room.readSeq, message.seq);
           room.lastReadAt = message.ts;
         }
+        if (declared) announceDeclaredName(name, room, from, declared);
         sendJson(202, {
           ok: true,
           room: name,
           seq: message.seq,
+          // What the room calls the sender now, whenever it offered a name: a second one is
+          // ignored, and this is how the sender learns which one stands.
+          ...(body.name !== undefined && room.members.has(from) ? { name: nameIn(room, from) } : {}),
           // Who has a watch open, by name. A count read as "who will hear this" and was
           // wrong whenever a member is pushed to instead of watching, as Codex is (#183).
           listening: [...new Set([...room.clients].map((res) => res.gyredeckWatcher).filter((id) => room.members.has(id)))].map((id) => shownIn(room, id)),

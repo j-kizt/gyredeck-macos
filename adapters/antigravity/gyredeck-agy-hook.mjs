@@ -547,7 +547,22 @@ const getJson = (endpoint, token, path) =>
  * otherwise be written into the conversation store and sit in the transcript for as
  * long as the session is kept.
  */
-const replyInstruction = (endpoint, room, replyRooms, answering = null, label = null, isMember = null) => {
+/**
+ * Asked until it is answered (#182): the name the app has on record for this session, and
+ * which name it wants the room to call it by. The agent states it — from its own CLAUDE.md /
+ * AGENTS.md — as a `name` field on its first post; nothing here reads those files. An older
+ * bridge that does not say whether a name was declared is not asked.
+ */
+const nameAsk = (mine) => {
+  if (mine?.confirmed !== true || mine?.declared !== false) return null;
+  const recorded = typeof mine.recordedName === "string" && mine.recordedName ? mine.recordedName : null;
+  return "NAME: " +
+    (recorded ? `the app has this session on record as "${recorded}".` : "the app has no name on record for this session.") +
+    " Which name do you want the room to call you by — the one your own instructions (CLAUDE.md / AGENTS.md) give you?" +
+    ' Send it once, as a "name" field beside to and kind on your first post; the room keeps the first name it is given.';
+};
+
+const replyInstruction = (endpoint, room, replyRooms, answering = null, label = null, isMember = null, askName = false) => {
   if (replyRooms.length === 0) return null;
   const target = replyRooms[0];
   // A room refuses the machine token; only its own password opens it. The other
@@ -561,7 +576,7 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
     // answered in the room as a whole, or the reply would go to nobody.
     const to = answering && label && isMember?.(answering.from) ? label(answering) : "everyone";
     const kind = answering?.kind === "tell" ? "reaction" : "tell";
-    const body = JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind }).replace(/'/g, "'\\''");
+    const body = JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''");
     return {
       ephemeralMessage:
         "The mail above is addressed to you, and answering is expected — a reply on a" +
@@ -1004,6 +1019,9 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
     );
   }
 
+  const askName = syncRoom ? nameAsk(mine) : null;
+  if (askName) parts.push(askName);
+
   if (syncRoom && mine && !confirmed) parts.push(blocked);
 
   if (fromRoomMate) {
@@ -1048,6 +1066,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
   const reply = replyInstruction(
     endpoint, room, replyRooms, answerable.at(-1), label,
     (id) => byId.has(id) && id !== room,
+    askName !== null,
   );
 
   const steps = [

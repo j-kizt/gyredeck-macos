@@ -82,6 +82,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      # tauri-build fails on a missing resource, and gyredeck-discord.mjs is built, not
+      # committed (adapters/discord/build.mjs), so it must exist before cargo runs.
+      # tauri's beforeBuildCommand builds it too; this step makes a broken connector
+      # build fail here, before the signing steps.
+      - name: Build Discord connector
+        run: pnpm discord:build
+
       # Which private key signs a release decides whether every installed copy can accept
       # it, and a published release cannot be taken back. Until this existed, the only
       # thing standing behind that was the current value of a mutable secret.

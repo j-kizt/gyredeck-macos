@@ -34,12 +34,22 @@ const assetRoot = join(distRoot, "assets");
  * be trimmed without changing behaviour. 116,000 and 119,000 are sized to cover main plus
  * v1.25.0 (#245/#244, about 1.1 kB more, not yet merged) plus React 19.3, with roughly the
  * headroom the ceilings had before. They still stop a library arriving.
+ *
+ * Raised again on 2026-10-27 (#199), by the owner's decision to measure the Discord settings
+ * and room icon first and then raise by what they used: main was 115,901 / 118,978, the card
+ * measured 117,927 / 121,006 (+2.0 kB each). 118,100 and 121,200 keep about the same
+ * headroom as before.
+ *
+ * And again on 2026-10-27 (#199 audit r5), the same way: the rows that show a room the
+ * Discord member could not leave, what waits for Discord and what Remove could not send
+ * measured 118,137 / 121,213 (+210 / +207 bytes on 117,927 / 121,006). 118,310 and 121,407
+ * keep the 173 / 194 bytes of headroom the last raise left.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 116_000,
-  jsTotalGzipBytes: 119_000,
+  jsGzipBytes: 118_310,
+  jsTotalGzipBytes: 121_407,
 };
 
 const walk = async (directory) => {

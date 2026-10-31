@@ -12,6 +12,7 @@
     "icons:render": "node scripts/render-icons.mjs",
     "mod:tail": "tail -f ~/.config/gyredeck/gyredeck.events.ndjson",
     "viewer": "node apps/viewer/index.mjs",
+    "discord:build": "node adapters/discord/build.mjs",
     "desktop:dev": "pnpm --filter @gyredeck/desktop tauri:dev",
     "desktop:build": "pnpm --filter @gyredeck/desktop tauri:build",
     "desktop:install": "node scripts/install-desktop.mjs",
@@ -22,11 +23,14 @@
     "test:budget": "pnpm desktop:web:build && node scripts/check-performance-budget.mjs",
     "test:performance": "pnpm desktop:web:build && node scripts/check-performance-budget.mjs && node scripts/benchmark-session-model.mjs --assert && node scripts/benchmark-bridge.mjs --events=5000 --assert",
     "test:demo": "playwright test",
-    "test:hooks": "node --test tests/hook-integration.test.mjs && node --experimental-strip-types --test tests/git-changes.test.mjs && node --experimental-strip-types --test tests/usage-alerts.test.mjs && node --experimental-strip-types --test tests/heavy-changes.test.mjs && node --experimental-strip-types --test tests/room-inbox.test.mjs && node --experimental-strip-types --test tests/hook-status.test.mjs && node --test tests/sync-code.test.mjs && node --test tests/room-founder.test.mjs && node --test tests/event-log-mode.test.mjs && node --test tests/room-capacity.test.mjs && node --test tests/codex-log.test.mjs && node --test tests/session-names.test.mjs && node --experimental-strip-types --test tests/session-groups.test.mjs && node --experimental-strip-types --test tests/session-retirement.test.mjs && node --test tests/codex-hook-trust.test.mjs"
+    "test:discord": "pnpm discord:build && node --test tests/discord-connector.test.mjs",
+    "test:hooks": "node --test tests/hook-integration.test.mjs && node --experimental-strip-types --test tests/git-changes.test.mjs && node --experimental-strip-types --test tests/usage-alerts.test.mjs && node --experimental-strip-types --test tests/heavy-changes.test.mjs && node --experimental-strip-types --test tests/room-inbox.test.mjs && node --experimental-strip-types --test tests/hook-status.test.mjs && node --test tests/sync-code.test.mjs && node --test tests/room-founder.test.mjs && node --test tests/event-log-mode.test.mjs && node --test tests/room-capacity.test.mjs && node --test tests/codex-log.test.mjs && node --test tests/session-names.test.mjs && node --experimental-strip-types --test tests/session-groups.test.mjs && node --experimental-strip-types --test tests/session-retirement.test.mjs && node --test tests/codex-hook-trust.test.mjs && node --test tests/room-discord.test.mjs && node --test tests/bridge-shutdown.test.mjs && pnpm test:discord"
   },
   "devDependencies": {
     "@playwright/test": "1.64.1",
     "@types/node": "26.6.5",
+    "discord.js": "14.27.0",
+    "esbuild": "0.28.2",
     "typescript": "7.0.2"
   }
 }

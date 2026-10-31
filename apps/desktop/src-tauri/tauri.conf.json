@@ -4,8 +4,8 @@
   "version": "1.27.0",
   "identifier": "com.j-kizt.gyredeck",
   "build": {
-    "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build",
+    "beforeDevCommand": "pnpm -w discord:build && pnpm dev",
+    "beforeBuildCommand": "pnpm -w discord:build && pnpm build",
     "devUrl": "http://127.0.0.1:47622",
     "frontendDist": "../dist"
   },
@@ -51,7 +51,8 @@
       "../../../adapters/antigravity/gyredeck-agy-statusline.sh": "gyredeck-agy-statusline.sh",
       "../../../adapters/codex/gyredeck-codex-hook.mjs": "gyredeck-codex-hook.mjs",
       "../../../adapters/codex/gyredeck-codex-notify.mjs": "gyredeck-codex-notify.mjs",
-      "../../../adapters/bridge/gyredeck-bridge.mjs": "gyredeck-bridge.mjs"
+      "../../../adapters/bridge/gyredeck-bridge.mjs": "gyredeck-bridge.mjs",
+      "../../../adapters/discord/dist/gyredeck-discord.mjs": "gyredeck-discord.mjs"
     },
     "macOS": {
       "signingIdentity": "-"

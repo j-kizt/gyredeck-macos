@@ -2199,6 +2199,25 @@ fn append_claude_local_usage(snapshot: &mut CodexUsageSnapshot) {
 }
 
 fn append_local_usage(snapshot: &mut CodexUsageSnapshot, usage: &CcusageDailyUsage, note: &str, color: &str) {
+    // Only days that say something: a readable date and tokens or cost above zero. An answer
+    // with none of them is no history at all, so the card keeps its limits alone, and an
+    // unusable day never becomes a row, a bar or part of a total (#276 audit).
+    let usable = CcusageDailyUsage {
+        daily: usage
+            .daily
+            .iter()
+            .filter(|day| {
+                ccusage_day_key(&day.date).is_some()
+                    && (ccusage_day_tokens(day).is_some_and(|tokens| tokens > 0.0)
+                        || ccusage_day_cost(day).is_some_and(|cost| cost > 0.0))
+            })
+            .cloned()
+            .collect(),
+    };
+    if usable.daily.is_empty() {
+        return;
+    }
+    let usage = &usable;
 
     let (today_key, yesterday_key) = codex_history_day_keys(local_now());
     let today = usage
@@ -8450,6 +8469,48 @@ mod claude_usage_history_tests {
         let (claude, claude_in_flight) = claude_ccusage_cache();
         assert!(!std::ptr::eq(claude, CODEX_CCUSAGE_CACHE.get_or_init(|| Mutex::new(None))), "Claude reads its own cache");
         assert!(!std::ptr::eq(claude_in_flight, CODEX_CCUSAGE_IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))));
+    }
+
+    /// The whole way a card gets its history: a runner's stdout, read, then appended (#276 audit).
+    fn history_from(stdout: &str) -> Vec<CodexMetricLine> {
+        let script = format!("cat <<'JSON'\n{stdout}\nJSON");
+        let mut card = snapshot();
+        if let Some(usage) = run_ccusage_daily(&[sh(&script)], None, Duration::from_secs(5)) {
+            append_local_usage(&mut card, &usage, "note", "#000000");
+        }
+        card.lines
+    }
+
+    #[test]
+    fn an_answer_with_no_usable_day_adds_no_history_at_all() {
+        for stdout in [
+            r#"{"daily":[]}"#,
+            r#"{"daily":[{"date":"2026-10-30","totalTokens":0,"totalCost":0}]}"#,
+            r#"{"daily":[{"date":"2026-10-30"}]}"#,
+            r#"{"daily":[{"date":"2026-10-30","totalTokens":"lots"}]}"#,
+            r#"{"daily":[{"date":"not a day","totalTokens":500,"totalCost":2}]}"#,
+        ] {
+            assert!(history_from(stdout).is_empty(), "{stdout}");
+        }
+    }
+
+    #[test]
+    fn unusable_days_beside_a_usable_one_become_no_rows_points_or_zero_totals() {
+        let lines = history_from(
+            r#"{"daily":[{"date":"2026-10-30","totalTokens":500,"totalCost":2},{"date":"2026-10-29","totalTokens":0},{"date":"2026-10-28"},{"date":"junk","totalTokens":9}]}"#,
+        );
+        let daily = lines.iter().filter(|line| matches!(line, CodexMetricLine::Text { label, .. } if label.starts_with("Daily "))).count();
+        assert_eq!(daily, 1, "{lines:?}");
+        let points = lines.iter().find_map(|line| match line {
+            CodexMetricLine::BarChart { points, .. } => Some(points.len()),
+            _ => None,
+        });
+        assert_eq!(points, Some(1));
+        let total = lines.iter().find_map(|line| match line {
+            CodexMetricLine::Text { label, value } if label == "Last 30 Days" => Some(value.clone()),
+            _ => None,
+        });
+        assert!(total.expect("total").contains("500"), "only the usable day counts");
     }
 
     #[test]

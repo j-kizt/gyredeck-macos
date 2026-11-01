@@ -88,8 +88,10 @@
   gap: 8px;
   overflow-y: auto;
   padding-bottom: 12px;
-  padding-right: 2px;
-  scrollbar-gutter: stable;
+  /* Out to the window edge and padded back in, as .sheet-body does: the scrollbar sits at
+     the edge, as Usage's does, instead of inset beside the content (#277). */
+  margin-right: calc(-1 * var(--sheet-inline-padding));
+  padding-right: var(--sheet-inline-padding);
 }
 
 /* This column scrolls; its rows must never be squeezed to fit it. A row with an explicit
@@ -575,11 +577,30 @@
 
 .update-notes-body {
   max-height: 160px;
+  overflow-x: hidden;
   overflow-y: auto;
+  overflow-wrap: anywhere;
   color: var(--text-2);
   font-size: 11.5px;
   line-height: 1.45;
-  white-space: pre-wrap;
+}
+
+.update-notes-body :is(h4, h5, p, ul) {
+  margin: 0 0 6px;
+}
+
+.update-notes-body h4 {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.update-notes-body h5 {
+  color: var(--text);
+  font-size: 11.5px;
+}
+
+.update-notes-body ul {
+  padding-left: 16px;
 }
 
 .setup-select {

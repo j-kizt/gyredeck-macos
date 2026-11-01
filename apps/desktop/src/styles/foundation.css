@@ -79,33 +79,23 @@ button {
   cursor: pointer;
 }
 
-.usage-sidebar,
-.usage-detail-panel,
-.sheet-body,
-.action-list {
+/* Every scroll area, not a list of them: a list is how Settings and the Release notes box
+   came to wear the default macOS scrollbar (#277). */
+* {
   scrollbar-width: thin;
   scrollbar-color: var(--scrollbar-thumb) transparent;
 }
 
-.usage-sidebar::-webkit-scrollbar,
-.usage-detail-panel::-webkit-scrollbar,
-.sheet-body::-webkit-scrollbar,
-.action-list::-webkit-scrollbar {
+::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 
-.usage-sidebar::-webkit-scrollbar-track,
-.usage-detail-panel::-webkit-scrollbar-track,
-.sheet-body::-webkit-scrollbar-track,
-.action-list::-webkit-scrollbar-track {
+::-webkit-scrollbar-track {
   background: var(--scrollbar-track);
 }
 
-.usage-sidebar::-webkit-scrollbar-thumb,
-.usage-detail-panel::-webkit-scrollbar-thumb,
-.sheet-body::-webkit-scrollbar-thumb,
-.action-list::-webkit-scrollbar-thumb {
+::-webkit-scrollbar-thumb {
   min-height: 32px;
   border: 2px solid transparent;
   border-radius: 999px;
@@ -113,18 +103,12 @@ button {
   background-clip: content-box;
 }
 
-.usage-sidebar::-webkit-scrollbar-thumb:hover,
-.usage-detail-panel::-webkit-scrollbar-thumb:hover,
-.sheet-body::-webkit-scrollbar-thumb:hover,
-.action-list::-webkit-scrollbar-thumb:hover {
+::-webkit-scrollbar-thumb:hover {
   background: var(--scrollbar-thumb-hover);
   background-clip: content-box;
 }
 
-.usage-sidebar::-webkit-scrollbar-corner,
-.usage-detail-panel::-webkit-scrollbar-corner,
-.sheet-body::-webkit-scrollbar-corner,
-.action-list::-webkit-scrollbar-corner {
+::-webkit-scrollbar-corner {
   background: transparent;
 }
 

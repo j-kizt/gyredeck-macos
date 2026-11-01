@@ -1,5 +1,17 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Two dependencies moved to versions without their known security flaws — (v1.28.1)
+
+### Fixes
+
+- **The app's TLS library, `rustls`, is now 0.23.46.** The version shipped until now was named in four
+  published advisories (one medium, three low). Gyredeck uses it for its connections to GitHub and to
+  the update server.
+- **The updater plugin is now 2.14.1, which takes its `zip` library from 4 to 9.2.0.** `zip` 4 was named
+  in three advisories, one of them critical. On the Mac the updater unpacks `.tar.gz` and never
+  includes `zip`, so no Mac build ever contained the flawed code; the move matters for the Windows
+  version that is planned.
+
 ## Follow a sync room from Discord while you are away from the Mac — (v1.28.0)
 
 ### Added

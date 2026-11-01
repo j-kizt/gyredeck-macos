@@ -1,5 +1,25 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Claude Code's usage card shows its local history — (v1.29.0)
+
+### Added
+
+- **Local history for Claude Code**, the way Codex's card has it: today, yesterday, the last 30
+  days with a trend, the mix of models, and a day-by-day detail. It is estimated from Claude
+  Code's own logs on this Mac, across all projects, read by the same `ccusage` the Codex card
+  uses. Totals count input, output and cache reads and writes, as Codex's do. Use on other
+  machines and on claude.ai is not counted.
+
+### Fixes
+
+- **The usage reader cannot hang the app.** A month of logs could fill the pipe the reader was
+  waiting on, so the read ended at its timeout with nothing; a process it started could also
+  outlive the timeout. Both pipes are now read while it runs, everything it started is stopped
+  at the timeout, and an answer past 8 MiB is not used.
+- **A local log with nothing usable in it shows no history,** instead of rows that read "No
+  local token log" or "0 tokens". Days with an impossible date, a negative cost or unusable
+  numbers are left out of every row, bar and total — on the Codex card too.
+
 ## Settings and Release notes look like the rest of the app — (v1.28.3)
 
 ### Fixes

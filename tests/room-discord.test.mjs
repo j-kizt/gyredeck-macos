@@ -63,6 +63,10 @@ const startBridge = async () => {
 /** Read a room's watch until a frame with `seq` arrives, or fail after `ms`. */
 /** `credential` is a room password, or the headers the app reads with. */
 /** `frames` holds the mail; `frames.events` every data frame in order, with its event name. */
+// A member's own read key (#274), as the broker's collect hands it: the app's word, no collect.
+const keyOf = async (h, as) => (await h.call("GET", `/mail/inbox?as=${as}`)).body.memberKey;
+const asMember = async (h, as, password) => ({ "x-gyredeck-token": password, "x-gyredeck-member": await keyOf(h, as) });
+
 const watchUntil = async (base, code, as, credential, done, onOpen = async () => {}, ms = 3000, since = "0") => {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
@@ -113,21 +117,21 @@ test("an ordinary member's watch is as it was: resume from its stream cursor, a 
       body: JSON.stringify({ from: "founder-1", to: "peer-a", kind: "tell", text }),
     }).then((response) => response.json());
     let sent = null;
-    const first = await watchUntil(h.base, code, "peer-a", password, (seen) => sent && seen.some((f) => f.seq === sent.seq), async () => { sent = await post("hello a"); }, 3000, "resume");
+    const first = await watchUntil(h.base, code, "peer-a", await asMember(h, "peer-a", password), (seen) => sent && seen.some((f) => f.seq === sent.seq), async () => { sent = await post("hello a"); }, 3000, "resume");
     assert.ok(first.some((frame) => frame.seq === sent.seq), "premise: the push arrived");
     const pending = (await h.call("GET", `/sync/rooms?as=peer-a`)).body.members.find((m) => m.conversationId === "peer-a").pending;
     assert.ok(pending >= 1, "a push does not move an ordinary member's read position");
-    const reopened = await watchUntil(h.base, code, "peer-a", password, () => false, async () => {}, 300, "resume");
+    const reopened = await watchUntil(h.base, code, "peer-a", await asMember(h, "peer-a", password), () => false, async () => {}, 300, "resume");
     assert.deepEqual(reopened.filter((frame) => frame.seq === sent.seq), [], "resume starts after what was pushed");
   } finally {
     await h.stop();
   }
 });
 
-test("rules v13 tell every agent the Discord member only relays and never answers", () => {
-  assert.equal(ROOM_RULES_VERSION, 13);
+test("rules from v13 tell every agent the Discord member only relays and never answers", () => {
+  assert.ok(ROOM_RULES_VERSION >= 13);
   const rules = roomRules("http://127.0.0.1:47621");
-  assert.match(rules, /^# Gyredeck room rules — v13\n/);
+  assert.match(rules, new RegExp(`^# Gyredeck room rules — v${ROOM_RULES_VERSION}\n`));
   assert.ok(
     rules.includes("A member labelled `Discord` only relays the room to the owner's Discord. It never answers and cannot post, so do not address it, ask it anything, or wait on it."),
     rules,
@@ -328,7 +332,7 @@ test("T12b: the relay's stream opens with what the room dropped and where the re
     assert.equal(opened.events.filter((e) => e.event === "dropped").length, 1);
     assert.ok(opened.some((f) => f.seq === first.seq), "premise: the line after it arrived");
 
-    const member = await watchUntil(h.base, code, "peer-a", password, (seen) => seen.some((f) => f.seq === first.seq), async () => {}, 3000, "resume");
+    const member = await watchUntil(h.base, code, "peer-a", await asMember(h, "peer-a", password), (seen) => seen.some((f) => f.seq === first.seq), async () => {}, 3000, "resume");
     assert.ok(member.some((f) => f.seq === first.seq), "premise: the member's watch carried the line");
     assert.deepEqual(member.events.filter((e) => e.event === "dropped"), [], "never to a member");
 

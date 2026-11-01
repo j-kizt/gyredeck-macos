@@ -116,6 +116,126 @@ const runAdapter = (adapterPath, args, home, payload) =>
 // passwords, removal and close need it (#220, #221), so every bridge a test starts gets it.
 const TEST_APP_WORD = "a5".repeat(32);
 
+/**
+ * A room member's own read key (#274). The room's password is shared by every member, so a
+ * read in one member's name also takes that member's key. The bridge hands it only to a read
+ * the broker vouches for; a look with no collect takes nothing, so this is the app's word
+ * asking for it the way the broker's collect would. `token` is the password or the machine
+ * token — whatever opens that session's mailbox.
+ */
+const memberKeyAt = async (base, as, token) => {
+  const response = await bridgeFetch(`${base}/mail/inbox?as=${encodeURIComponent(as)}`, {
+    headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
+  });
+  const { memberKey } = await response.json();
+  assert.match(String(memberKey), /^[a-f0-9]{64}$/, `premise: ${as} is a confirmed member and holds a read key`);
+  return memberKey;
+};
+/** The headers a member reads its room with: the password (or `token`) and its own key. */
+const memberHeaders = async (base, as, token, password = token) => ({
+  "x-gyredeck-token": password,
+  "x-gyredeck-member": await memberKeyAt(base, as, token),
+});
+
+/**
+ * What a Claude delivery says in place of the watch command when it holds no key (#274): a
+ * watch in the session's name takes the key, and only a collect the broker made carries one.
+ */
+const NO_KEY_HEAR = "HEAR — this delivery carries no key for watching the room in this session's name";
+
+/** Fake brokers still listening when the run ends: closed, whatever their tests did. */
+const openFakeServers = new Set();
+after(() => { for (const server of openFakeServers) server.close(); });
+
+/**
+ * A broker that forwards to the bridge as the app's does where it matters here: a bind is
+ * answered for the session it names (or for `as`, when the fixture fixes one), and a collect
+ * is one bridge collect for the bound session with the app's word, `waking=1` when the hook
+ * asks `wakingOnly`. A batch with anything in it is held until its delivery is acknowledged
+ * and handed out again until then (per session). `refuseAfterCollect` refuses the next
+ * collect after the bridge call, as a binding lost meanwhile does, with the batch kept.
+ *
+ * With no `as`, the last bind decides whom a collect is for: these fixtures run one hook at a
+ * time, which is the only order a broker without process attestation can tell apart.
+ */
+const NOTICE_KEYS = ["heavyNotice", "usageNotice"];
+const listedIn = (answer, key) => Array.isArray(answer?.[key]) && answer[key].length > 0;
+const carriesBatch = (answer) => listedIn(answer, "messages") || listedIn(answer, "missed")
+  || NOTICE_KEYS.some((key) => typeof answer?.[key] === "string" && answer[key] !== "");
+const forwardingBroker = async (home, base, { as = null, cli = undefined } = {}) => {
+  const dir = join(home, ...CONFIG_DIR, "broker");
+  await mkdir(dir, { recursive: true });
+  const requests = [];
+  const bridgeCalls = [];
+  const acks = [];
+  const held = new Map();
+  const state = {
+    bound: as,
+    delivery: 0,
+    refuseAfterCollect: false,
+    get outstanding() { return held.get(as ?? state.bound) ?? null; },
+  };
+  const collect = async (request) => {
+    const session = as ?? state.bound;
+    if (!session) return { v: 1, ok: false, error: "unbound", message: "bind first" };
+    const wakingOnly = request.collect.wakingOnly === true;
+    const limit = Number.isInteger(request.collect.limit) ? request.collect.limit : 10;
+    const kept = held.get(session) ?? null;
+    const noticesOnly = kept && carriesBatch(kept.batch) && !listedIn(kept.batch, "messages") && !listedIn(kept.batch, "missed");
+    if (kept && !(wakingOnly && noticesOnly)) return { ...kept.batch, delivery: kept.id, redelivered: true };
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const response = await bridgeFetch(`${base}/mail/inbox?as=${encodeURIComponent(session)}&collect=1&limit=${limit}${wakingOnly ? "&waking=1" : ""}`, {
+      headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
+    });
+    let body;
+    try { body = await response.json(); } catch { return { v: 1, ok: false, error: "unreadable", message: `the bridge answered ${response.status} with no JSON` }; }
+    const answer = { ...body, v: 1, boundTo: session };
+    bridgeCalls.push({ session, wakingOnly, answer });
+    if (kept && carriesBatch(answer)) for (const key of NOTICE_KEYS) if (kept.batch[key] !== undefined && answer[key] === undefined) answer[key] = kept.batch[key];
+    if (carriesBatch(answer)) held.set(session, { id: ++state.delivery, batch: answer });
+    if (state.refuseAfterCollect) {
+      state.refuseAfterCollect = false;
+      return { v: 1, ok: false, error: "unattested", message: "The process that asked changed while its collect ran; the mail is kept for the session." };
+    }
+    return carriesBatch(answer) ? { ...answer, delivery: state.delivery } : answer;
+  };
+  const sockets = new Set();
+  const server = createServer((socket) => {
+    let text = "";
+    // A hook killed mid-request leaves this end writing into nothing.
+    socket.on("error", () => {});
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("data", async (chunk) => {
+      text += chunk;
+      const end = text.indexOf("\n");
+      if (end < 0) return;
+      const request = JSON.parse(text.slice(0, end));
+      requests.push(request);
+      let answer = { v: 1, ok: true };
+      if (request.bind) {
+        if (!as) state.bound = request.bind.conversationId;
+        answer = { v: 1, ok: true, bound: { conversationId: as ?? request.bind.conversationId, pid: 1, ...(cli ? { cli } : {}) } };
+      } else if (request.collect) answer = await collect(request);
+      else if (request.ack) {
+        acks.push(request.ack.delivery);
+        for (const [session, kept] of held) if (kept.id === request.ack.delivery) held.delete(session);
+        answer = { v: 1, ok: true, acked: request.ack.delivery };
+      }
+      socket.end(`${JSON.stringify(answer)}\n`);
+    });
+  });
+  await new Promise((resolve) => server.listen(join(dir, "gyredeck.broker.sock"), resolve));
+  server.unref();
+  openFakeServers.add(server);
+  const close = () => new Promise((resolve) => {
+    for (const socket of sockets) socket.destroy();
+    openFakeServers.delete(server);
+    server.close(resolve);
+  });
+  return { requests, bridgeCalls, acks, state, close };
+};
+
 test("install-claude-hooks copies the adapter and merges settings idempotently", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-install-"));
   const settingsPath = join(home, ".claude", "settings.json");
@@ -1243,17 +1363,23 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
     assert.match(refusal, /^event: error\ndata: /, "a refused watch answers in frames");
     assert.equal(JSON.parse(refusal.split("data: ")[1]).error, "not_a_member");
 
-    const allowed = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${joiner}`, {
+    // The password is every member's, so it does not say which member is reading: a watch
+    // in the joiner's name takes the joiner's own key as well (#274).
+    const passwordOnly = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${joiner}`, {
       headers: { "x-gyredeck-token": minted.body.password },
     });
-    assert.equal(allowed.status, 200, "a confirmed member with the room's password may watch");
+    assert.equal(passwordOnly.status, 403, "the password alone does not open a member's watch");
+    assert.equal(JSON.parse((await passwordOnly.text()).split("data: ")[1]).error, "not_your_key");
+    const joinerHeaders = await memberHeaders(`http://127.0.0.1:${port}`, joiner, minted.body.password);
+    const allowed = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${joiner}`, { headers: joinerHeaders });
+    assert.equal(allowed.status, 200, "a confirmed member with the room's password and its own key may watch");
     allowed.body?.cancel();
 
     // Disconnecting closes the door behind them: the password they still hold stops
     // working, and their own mailbox is told why.
     await call("DELETE", `/sync/rooms/${code}/members/${joiner}`);
     const afterLeaving = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${joiner}`, {
-      headers: { "x-gyredeck-token": minted.body.password },
+      headers: joinerHeaders,
     });
     assert.equal(afterLeaving.status, 403);
     const told = await call("GET", `/mail/inbox?as=${joiner}`);
@@ -1360,9 +1486,12 @@ test("a sync room gives each member its own read position", async () => {
     // The machine token is deliberately not accepted for a room's messages: every agent
     // can read that file, so it can never carry the person's decision to let one
     // particular session in.
-    const roomHeaders = { "x-gyredeck-token": created.body.password };
+    const roomHeaders = {
+      [first]: await memberHeaders(base, first, created.body.password),
+      [second]: await memberHeaders(base, second, created.body.password),
+    };
     for (const who of [first, second]) {
-      await fetch(`${base}/mail/${code}?since=0&collect=1&as=${who}`, { headers: roomHeaders });
+      assert.equal((await fetch(`${base}/mail/${code}?since=0&collect=1&as=${who}`, { headers: roomHeaders[who] })).status, 200);
     }
 
     // The point of the whole change: two members read at their own pace. Sharing one
@@ -1372,7 +1501,7 @@ test("a sync room gives each member its own read position", async () => {
     await send(first, "second");
     assert.deepEqual(await pendingByMember(), { [first]: 0, [second]: 2 }, "nobody waits for what they wrote");
 
-    await fetch(`${base}/mail/${code}?since=0&collect=1&as=${second}`, { headers: roomHeaders });
+    await fetch(`${base}/mail/${code}?since=0&collect=1&as=${second}`, { headers: roomHeaders[second] });
     assert.deepEqual(await pendingByMember(), { [first]: 0, [second]: 0 });
 
     await send(second, "reply");
@@ -1586,13 +1715,19 @@ test("a room delivery carries only what the session can use, and points at the r
   const peer = "codex-session-1";
   const agy = "0313999f-b335-40b3-bc51-b8a9e65df5ce";
   const watch = new AbortController();
+  // The hooks reach their mail through the broker (#274): the bridge serves a room
+  // member's mailbox to the broker's word or the member's own key, never the password alone.
+  let broker = null;
   try {
     await waitForHealth(port, stderrRef);
+    broker = await forwardingBroker(home, base);
     // The file every delivery points at exists as soon as the bridge does, at the version
     // a delivery names.
     const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
     assert.match(rules, new RegExp(`^# Gyredeck room rules — v${ROOM_RULES_VERSION}\n`));
     assert.match(rules, /Never answer a reaction/);
+    // #274: a read in a member's name takes its own key, which its deliveries write in.
+    assert.match(rules, /Reading the room in your name also takes your own key, `x-gyredeck-member`/);
     // #208: a new Claude Code session lists every expired watch as an unfinished task, and
     // nothing said that was harmless.
     assert.match(rules, /Claude Code: after a restart or a new session it may list expired watches as background tasks that "didn't finish"\. They are harmless/);
@@ -1662,12 +1797,15 @@ test("a room delivery carries only what the session can use, and points at the r
     await post(`/mail/${code}`, { from: peer, to: me, kind: "ask", text: "which branch?" });
     const ask = await context();
     assert.match(ask, /"to":"Codex","kind":"tell"/);
-    // No watch yet, so how to open one is part of the delivery.
+    // No watch yet, so how to open one is part of the delivery — with this session's own
+    // key, the one a watch in its name takes (#274).
     assert.match(ask, /HEAR —/);
+    const myKey = await memberKeyAt(base, me, token);
+    assert.ok(ask.includes(`-H "x-gyredeck-member: ${myKey}"`), ask);
 
     // With a watch of its own open, the session is not told again how to open one.
     const stream = await fetch(`${base}/mail/${code}/events?as=${me}&since=resume`, {
-      headers: { "x-gyredeck-token": minted.password },
+      headers: { "x-gyredeck-token": minted.password, "x-gyredeck-member": myKey },
       signal: watch.signal,
     });
     assert.equal(stream.status, 200);
@@ -1716,16 +1854,17 @@ test("a room delivery carries only what the session can use, and points at the r
     assert.match(agyTell, /start it again/);
     // The first wake-only watch ends at once on the mail its stream never carried, even
     // though the drain delivered it: a wake too many, never one too few (#228 audit).
+    const agyHeaders = await memberHeaders(base, agy, minted.password);
     const catchUp = await fetch(`${base}/mail/${code}/events?as=${agy}&since=resume&once=1`, {
-      headers: { "x-gyredeck-token": minted.password },
+      headers: agyHeaders,
     });
     assert.match(await catchUp.text(), /deploy done/);
     const onceWatch = await fetch(`${base}/mail/${code}/events?as=${agy}&since=resume&once=1`, {
-      headers: { "x-gyredeck-token": minted.password },
+      headers: agyHeaders,
     });
     assert.equal(onceWatch.status, 200);
     await new Promise((resolve) => setTimeout(resolve, 200));
-    const listening = await fetch(`${base}/mail/inbox?as=${agy}`, { headers: { "x-gyredeck-token": minted.password } }).then((r) => r.json());
+    const listening = await fetch(`${base}/mail/inbox?as=${agy}`, { headers: agyHeaders }).then((r) => r.json());
     assert.equal(listening.watching, true, "a held wake-only watch counts as listening");
     await post(`/mail/${code}`, { from: peer, to: agy, kind: "ask", text: "wake up" });
     // It ends by itself with that frame — the ending is the wake.
@@ -1743,6 +1882,7 @@ test("a room delivery carries only what the session can use, and points at the r
     assert.doesNotMatch(agyApp, /"to":"the user/);
   } finally {
     watch.abort();
+    await broker?.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
@@ -1766,8 +1906,10 @@ test("the founder's prompt that carries the room password still gets its mail (#
 
   const founder = "aaaaaaaa-1111-4111-8111-111111111167";
   const joiner = "bbbbbbbb-2222-4222-8222-222222222167";
+  let broker = null;
   try {
     await waitForHealth(port, stderrRef);
+    broker = await forwardingBroker(home, `http://127.0.0.1:${port}`);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
     const call = async (method, path, body) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
@@ -1797,6 +1939,7 @@ test("the founder's prompt that carries the room password still gets its mail (#
     assert.match(context, /the password you were just given was accepted/);
     assert.match(context, /"to":"everyone","kind":"tell"/);
   } finally {
+    await broker?.close();
     bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
@@ -1821,8 +1964,10 @@ test("a room watch is sent a heartbeat, and with no rules file the rules go out 
   const me = "claude-session-1";
   const peer = "codex-session-1";
   const watch = new AbortController();
+  let broker = null;
   try {
     await waitForHealth(port, stderrRef);
+    broker = await forwardingBroker(home, base);
     assert.match(stderrRef.value, /room rules not written/);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
     const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
@@ -1844,7 +1989,7 @@ test("a room watch is sent a heartbeat, and with no rules file the rules go out 
     // A watch hears from the room even when nothing is said, which is how one that has
     // gone gets noticed and dropped instead of counted.
     const stream = await fetch(`${base}/mail/${code}/events?as=${me}&since=resume`, {
-      headers: { "x-gyredeck-token": minted.password },
+      headers: await memberHeaders(base, me, minted.password),
       signal: watch.signal,
     });
     const reader = stream.body.getReader();
@@ -1881,6 +2026,7 @@ test("a room watch is sent a heartbeat, and with no rules file the rules go out 
     assert.match(context, /never answer a reaction/);
   } finally {
     watch.abort();
+    await broker?.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
@@ -1903,8 +2049,10 @@ test("a room member hears when its own provider's limit runs low, and can ask fo
   const base = `http://127.0.0.1:${port}`;
   const me = "claude-session-1";
   const other = "0313999f-b335-40b3-bc51-b8a9e65df5ce";
+  let broker = null;
   try {
     await waitForHealth(port, stderrRef);
+    broker = await forwardingBroker(home, base);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
     const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const post = (path, body) =>
@@ -1969,7 +2117,8 @@ test("a room member hears when its own provider's limit runs low, and can ask fo
     await post("/usage", reading("claude", 95));
     const low = await context();
     assert.match(low, /your Claude Code Session limit has 5% left\. It resets at 2026-10-16T05:00:00Z/);
-    const agyNow = await fetch(`${base}/mail/inbox?as=${other}`, { headers: { "x-gyredeck-token": minted.password } }).then((r) => r.json());
+    const otherHeaders = await memberHeaders(base, other, minted.password);
+    const agyNow = await fetch(`${base}/mail/inbox?as=${other}`, { headers: otherHeaders }).then((r) => r.json());
     assert.ok(agyNow.messages.every((message) => !message.text.includes("limit has")), "not told about someone else's limit");
     // Staying low says nothing more; coming back says so once.
     await post("/usage", reading("claude", 97));
@@ -1978,9 +2127,10 @@ test("a room member hears when its own provider's limit runs low, and can ask fo
     assert.match(await context(), /your Claude Code Session limit is back to 80% left/);
     // An Antigravity reading that starts low is a first look: nothing.
     await post("/usage", reading("agy", 99));
-    const agyAfter = await fetch(`${base}/mail/inbox?as=${other}`, { headers: { "x-gyredeck-token": minted.password } }).then((r) => r.json());
+    const agyAfter = await fetch(`${base}/mail/inbox?as=${other}`, { headers: otherHeaders }).then((r) => r.json());
     assert.ok(agyAfter.messages.every((message) => !message.text.includes("limit has")));
   } finally {
+    await broker?.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
@@ -2015,6 +2165,7 @@ test("an agent outside a room learns it can ask for its usage, and hears when it
   const claude = "a1690000-0000-4000-8000-000000000001";
   const agy = "a1690000-0000-4000-8000-000000000002";
   const codex = "a1690000-0000-4000-8000-000000000003";
+  let broker = null;
   try {
     await waitForHealth(port, stderrRef);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
@@ -2114,11 +2265,14 @@ test("an agent outside a room learns it can ask for its usage, and hears when it
     await post(`/sync/rooms/${code}/members`, { conversationId: unread });
     const { password } = await post(`/sync/rooms/${code}/passwords`, { conversationId: member });
     await post(`/sync/rooms/${code}/confirm`, { conversationId: unread, password });
+    // Room members read their mailbox through the broker (#274); the sessions above, in no
+    // room, read theirs over TCP with the machine token, and the ones below go back to it.
+    broker = await forwardingBroker(home, base);
     await memberContext();
     // Its private mailbox is brought level with the seq the room's warning will take, so a
     // collect of the private message with that number must not count as the warning read
     // (#169 audit — the case Gyre Audit reproduced).
-    const roomBefore = await fetch(`${base}/mail/${code}?as=${member}`, { headers: { "x-gyredeck-token": password } }).then((r) => r.json());
+    const roomBefore = await fetch(`${base}/mail/${code}?as=${member}`, { headers: await memberHeaders(base, member, password) }).then((r) => r.json());
     const warningSeq = Math.max(...roomBefore.messages.map((message) => message.seq)) + 2;
     const privateBefore = await fetch(`${base}/mail/${unread}`, { headers }).then((r) => r.json());
     for (let seq = Math.max(0, ...privateBefore.messages.map((message) => message.seq)); seq < warningSeq; seq += 1) {
@@ -2127,11 +2281,12 @@ test("an agent outside a room learns it can ask for its usage, and hears when it
     await post("/usage", reading("claude", 95));
     assert.match(await memberContext(), /your Claude Code Session limit has 5% left/);
     // A wait that only looks does not count as being told (#169 audit).
-    const peeked = await fetch(`${base}/mail/wait?as=${unread}&timeout=1`, { headers: { "x-gyredeck-token": password } }).then((r) => r.json());
+    const unreadHeaders = await memberHeaders(base, unread, password);
+    const peeked = await fetch(`${base}/mail/wait?as=${unread}&timeout=1`, { headers: unreadHeaders }).then((r) => r.json());
     assert.ok(peeked.messages.some((message) => message.text.includes("limit has 5% left")), "the peek saw the warning");
     let collidingCollected = false;
     for (let n = 0; n < 30 && !collidingCollected; n += 1) {
-      const one = await fetch(`${base}/mail/inbox?as=${unread}&collect=1&limit=1`, { headers: { "x-gyredeck-token": password } }).then((r) => r.json());
+      const one = await fetch(`${base}/mail/inbox?as=${unread}&collect=1&limit=1`, { headers: unreadHeaders }).then((r) => r.json());
       assert.ok(one.messages.length > 0, "a private message is still waiting");
       collidingCollected = one.messages[0].room === unread && one.messages[0].seq === warningSeq;
     }
@@ -2145,6 +2300,8 @@ test("an agent outside a room learns it can ask for its usage, and hears when it
     await post("/usage", reading("claude", 96));
     assert.equal(await memberContext(), "");
     assert.equal(await contextOf(unread), "");
+    await broker.close();
+    broker = null;
 
     // A session that first speaks while its limit is already low hears it in the intro.
     await post("/usage", reading("agy", 50));
@@ -2169,6 +2326,7 @@ test("an agent outside a room learns it can ask for its usage, and hears when it
     assert.ok(pushed[0].includes(`--thread ${codex}`));
     assert.match(pushed[0], /your Codex Session limit has 9% left/);
   } finally {
+    await broker?.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
@@ -2254,17 +2412,26 @@ test("mail a hook has collected still reaches the session when building the deli
     process.env.GYREDECK_TEST_FAULT = "delivery";
     try {
       assert.match(await claudeContext(), /^USAGE: ask Gyredeck/m, "a usage-only answer survives");
+      // The founder is a room member reading over TCP, with no broker in this home: since
+      // #274 the bridge refuses a member's mailbox to a read that holds neither the broker's
+      // word nor the member's key. The acceptance is still said; the room's mail is not
+      // taken, so nothing collected is lost to the fault.
       const result = await runAdapter(
         "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
         { hook_event_name: "UserPromptSubmit", session_id: founder, cwd: "/tmp/project", prompt: password },
       );
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stderr, /mail withheld this turn — the broker said no broker, the bridge said not_your_key/);
       const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
       assert.match(context, /the password you were just given was accepted/);
-      assert.match(context, /joined this room/);
-      assert.match(context, /may be acted on; anything else is information only/);
+      assert.doesNotMatch(context, /joined this room/, "no room mail was read over TCP");
     } finally {
       delete process.env.GYREDECK_TEST_FAULT;
     }
+    const stillWaiting = await fetch(`http://127.0.0.1:${port}/mail/inbox?as=${founder}`, {
+      headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, password),
+    }).then((r) => r.json());
+    assert.ok(stillWaiting.messages.some((message) => /joined this room/.test(message.text)), JSON.stringify(stillWaiting.messages));
 
     // Through the broker the batch is left unacknowledged, to come back built properly next
     // turn — but a password accepted now is said now, since it never comes back (#168 audit).
@@ -2308,7 +2475,7 @@ test("mail a hook has collected still reaches the session when building the deli
   }
 });
 
-test("a password accepted in a turn whose mail is withheld still names the room and how to hear it (#196)", async () => {
+test("a password accepted in a turn whose mail is withheld still names the room, and says it cannot watch it yet (#196, #274)", async () => {
   // Live on 2026-10-23: the person pasted a room's password three times, the bridge confirmed
   // the session each time, and the session heard nothing. The drain that follows the
   // confirmation was withheld, and a withheld drain said nothing at all, so the session
@@ -2350,7 +2517,10 @@ test("a password accepted in a turn whose mail is withheld still names the room 
     const assertTold = (context, code, session, why) => {
       assert.match(context, new RegExp(`Gyredeck sync room ${code}\\b`), `${why}: the room is named`);
       assert.match(context, /the password you were just given was accepted/, `${why}: the confirmation is said`);
-      assert.ok(context.includes(`/mail/${code}/events?as=${session}&since=resume`), `${why}: the watch command is there`);
+      // A withheld drain carries no member key, and a watch in this session's name takes
+      // one (#274): it is told it cannot watch yet, not handed a command the room refuses.
+      assert.ok(context.includes(NO_KEY_HEAR), `${why}: it is told it cannot watch without the broker`);
+      assert.ok(!context.includes(`/mail/${code}/events?as=${session}&since=resume`), `${why}: no watch command it could not run`);
     };
 
     // 1. The broker refuses the bind (`conflict`), so the drain is withheld.
@@ -2425,12 +2595,15 @@ test("a password accepted while the bridge refuses the session's TCP read still 
       { hook_event_name: "UserPromptSubmit", session_id: founder, cwd: "/tmp/project", prompt: password },
     );
     assert.equal(result.code, 0, result.stderr);
-    assert.match(result.stderr, /mail withheld this turn — the broker said ineligible, the bridge said broker_required/, "the premise: the TCP read was refused");
+    // A room member's TCP read without its key is refused before the broker's binding is
+    // weighed (#274), so the bridge names the key.
+    assert.match(result.stderr, /mail withheld this turn — the broker said ineligible, the bridge said not_your_key/, "the premise: the TCP read was refused");
     const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
     assert.match(context, new RegExp(`Gyredeck sync room ${code}\\b`), "the room is named");
     assert.match(context, /the password you were just given was accepted/);
-    assert.ok(context.includes(`/mail/${code}/events?as=${founder}&since=resume`), "the watch command is there");
-    assert.match(context, /could not be collected this turn \(the broker said "ineligible" and the bridge said "broker_required"/, "and the held mail is still said");
+    assert.ok(context.includes(NO_KEY_HEAR), "it is told it cannot watch without the broker (#274)");
+    assert.ok(!context.includes(`/mail/${code}/events?as=${founder}&since=resume`), "and handed no watch command the room would refuse");
+    assert.match(context, /could not be collected this turn \(the broker said "ineligible" and the bridge said "not_your_key"/, "and the held mail is still said");
   } finally {
     if (broker) await broker.close();
     bridge.stdin.end();
@@ -2723,12 +2896,14 @@ test("a session's assigned name shows wherever the room names it, and to still t
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   const founder = "a1820000-0000-4000-8000-000000000001";
   const agy = "a1820000-0000-4000-8000-000000000002";
+  let broker = null;
   try {
     await waitForHealth(port, stderrRef);
+    broker = await forwardingBroker(home, `http://127.0.0.1:${port}`);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const call = async (method, path, body, credential = token) => {
+    const call = async (method, path, body, credential = token, extra = {}) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
-        method, headers: { "content-type": "application/json", "x-gyredeck-token": credential, "x-gyredeck-broker": TEST_APP_WORD }, body: body ? JSON.stringify(body) : undefined,
+        method, headers: { "content-type": "application/json", "x-gyredeck-token": credential, "x-gyredeck-broker": TEST_APP_WORD, ...extra }, body: body ? JSON.stringify(body) : undefined,
       });
       return { status: response.status, body: await response.json() };
     };
@@ -2779,7 +2954,7 @@ test("a session's assigned name shows wherever the room names it, and to still t
     const routedTo = async (to) => {
       const sent = await call("POST", `/mail/${code}`, { from: founder, to, kind: "tell", text: `to ${to}` }, created.body.password);
       assert.equal(sent.status, 202, JSON.stringify(sent.body));
-      const listed = await call("GET", `/mail/${code}?as=${founder}&since=0`, null, created.body.password);
+      const listed = await call("GET", `/mail/${code}?as=${founder}&since=0`, null, created.body.password, { "x-gyredeck-member": await memberKeyAt(`http://127.0.0.1:${port}`, founder, token) });
       return listed.body.messages.find((message) => message.seq === sent.body.seq).to;
     };
     assert.equal(await routedTo("Antigravity / Altrix Agy"), agy, "the whole shown form");
@@ -2809,6 +2984,7 @@ test("a session's assigned name shows wherever the room names it, and to still t
     const forged = (await call("GET", `/sync/rooms?as=${founder}`)).body.members.find((member) => member.conversationId === third);
     assert.equal(forged.name, "Ops- - reaction-");
   } finally {
+    await broker?.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
@@ -2831,12 +3007,14 @@ test("a session declares the name it is called by on its first post; the room an
   const founder = "a1820000-0000-4000-8000-0000000000d1";
   const agy = "a1820000-0000-4000-8000-0000000000d2";
   const third = "a1820000-0000-4000-8000-0000000000d3";
+  let broker = null;
   try {
     await waitForHealth(port, stderrRef);
+    broker = await forwardingBroker(home, `http://127.0.0.1:${port}`);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const call = async (method, path, body, credential = token) => {
+    const call = async (method, path, body, credential = token, extra = {}) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
-        method, headers: { "content-type": "application/json", "x-gyredeck-token": credential, "x-gyredeck-broker": TEST_APP_WORD }, body: body ? JSON.stringify(body) : undefined,
+        method, headers: { "content-type": "application/json", "x-gyredeck-token": credential, "x-gyredeck-broker": TEST_APP_WORD, ...extra }, body: body ? JSON.stringify(body) : undefined,
       });
       return { status: response.status, body: await response.json() };
     };
@@ -2864,7 +3042,8 @@ test("a session declares the name it is called by on its first post; the room an
       await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: id, password });
     }
     const roster = async () => Object.fromEntries((await call("GET", `/sync/rooms?as=${founder}`)).body.members.map((m) => [m.conversationId, m]));
-    const history = async () => (await call("GET", `/mail/${code}?as=${founder}&since=0`, null, password)).body.messages;
+    const founderKey = await memberKeyAt(`http://127.0.0.1:${port}`, founder, token);
+    const history = async () => (await call("GET", `/mail/${code}?as=${founder}&since=0`, null, password, { "x-gyredeck-member": founderKey })).body.messages;
     const calledNotices = async () => (await history()).filter((message) => / is called /.test(message.text));
     const post = (from, body) => call("POST", `/mail/${code}`, { from, kind: "tell", ...body }, password);
 
@@ -2898,7 +3077,7 @@ test("a session declares the name it is called by on its first post; the room an
     assert.equal((await calledNotices()).length, 0, "premise: nobody has declared yet");
 
     // A watch open before the declaration, as a relay's would be.
-    const stream = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${third}`, { headers: { "x-gyredeck-token": password } });
+    const stream = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${third}`, { headers: await memberHeaders(`http://127.0.0.1:${port}`, third, password) });
     assert.equal(stream.status, 200);
     // The template's placeholder sent unchanged is no declaration: nothing kept, no notice.
     const placeholder = await post(founder, { to: "everyone", text: "sent with the placeholder", name: "  your\nNAME " });
@@ -2986,6 +3165,7 @@ test("a session declares the name it is called by on its first post; the room an
     assert.doesNotMatch(laterContext, /NAME: /);
     assert.doesNotMatch(laterContext, /"name":"YOUR NAME"/);
   } finally {
+    await broker?.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
@@ -3010,8 +3190,10 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
   const base = `http://127.0.0.1:${port}`;
   const me = "claude-session-1";
   const peer = "codex-session-1";
+  let broker = null;
   try {
     await waitForHealth(port, stderrRef);
+    broker = await forwardingBroker(home, base);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
     const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
     const post = (path, body) =>
@@ -3094,6 +3276,7 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
       assert.match(injected, /show what you sent — the words themselves, not that you replied — and the seq/);
     }
   } finally {
+    await broker?.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
@@ -3196,8 +3379,10 @@ test("a message says who it is for and what it is for, and the room routes on th
     await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password });
 
     // The founder watches; everything below is about what does and does not reach it.
+    // A watch in its name takes its own key beside the password (#274).
+    const founderHeaders = await memberHeaders(`http://127.0.0.1:${port}`, founder, password);
     const stream = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${founder}&since=resume`, {
-      headers: { "x-gyredeck-token": password },
+      headers: founderHeaders,
     });
     const reader = stream.body.getReader();
     let seen = "";
@@ -3242,7 +3427,7 @@ test("a message says who it is for and what it is for, and the room routes on th
     // were written apart and drifted: a watch reopened every five minutes was given
     // every acknowledgement and room notice it had already been kept from.
     const again = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${founder}&since=1`, {
-      headers: { "x-gyredeck-token": password },
+      headers: founderHeaders,
     });
     const catchUp = await new Promise((resolve) => {
       const reader2 = again.body.getReader();
@@ -3268,7 +3453,7 @@ test("a message says who it is for and what it is for, and the room routes on th
     // what it handed over, so every reconnect replayed the same backlog — which in a
     // quiet room means waking everyone in it every five minutes, for ever.
     const third = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${founder}&since=resume`, {
-      headers: { "x-gyredeck-token": password },
+      headers: founderHeaders,
     });
     const nothingLeft = await new Promise((resolve) => {
       const reader3 = third.body.getReader();
@@ -3315,7 +3500,7 @@ test("a message says who it is for and what it is for, and the room routes on th
     // particular session in.
     const readRoom = async (as) => {
       const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${as}`, {
-        headers: { "x-gyredeck-token": password },
+        headers: await memberHeaders(`http://127.0.0.1:${port}`, as, password),
       });
       return { status: response.status, body: await response.json() };
     };
@@ -3547,9 +3732,10 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     // The machine token is deliberately not accepted for a room's messages: every agent
     // can read that file, so it can never carry the person's decision to let one
     // particular session in.
+    const founderHeaders = await memberHeaders(`http://127.0.0.1:${port}`, founder, created.body.password);
     const readRoom = async () => {
       const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${founder}`, {
-        headers: { "x-gyredeck-token": created.body.password },
+        headers: founderHeaders,
       });
       return (await response.json()).messages;
     };
@@ -3787,7 +3973,8 @@ test("Codex declares its name in its routing line, name=\"<Name>\" after the kin
       }
       return [];
     };
-    const history = async () => (await call("GET", `/mail/${code}?as=${founder}&since=0`, null, { "x-gyredeck-token": created.body.password })).body.messages;
+    const founderHeaders = await memberHeaders(`http://127.0.0.1:${port}`, founder, created.body.password);
+    const history = async () => (await call("GET", `/mail/${code}?as=${founder}&since=0`, null, founderHeaders)).body.messages;
     const notices = async () => (await history()).filter((message) => / is called /.test(message.text));
     const endTurn = () => call("POST", "/hook/stop", { hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: thread });
     const say = async (text) => {
@@ -4550,10 +4737,10 @@ test("every mutation and every room read needs a credential that verifies", asyn
     assert.equal((await joinConfirmed(call, code, founder, peer)).status, 200);
     assert.equal((await call("POST", `/mail/${code}`, { from: peer, text: "IN-THE-ROOM" })).status, 202);
 
-    const readRoom = async (credential, as) => {
+    const readRoom = async (credential, as, key = null) => {
       const query = as ? `?since=0&as=${as}` : "?since=0";
       const response = await fetch(`${base}/mail/${code}${query}`, {
-        headers: credential ? { "x-gyredeck-token": credential } : {},
+        headers: { ...(credential ? { "x-gyredeck-token": credential } : {}), ...(key ? { "x-gyredeck-member": key } : {}) },
       });
       return { status: response.status, body: await response.json() };
     };
@@ -4584,8 +4771,22 @@ test("every mutation and every room read needs a credential that verifies", asyn
     assert.equal(stranger.status, 403, "and be in the room");
     assert.equal(stranger.body.error, "not_a_member");
 
-    const member = await readRoom(password, founder);
-    assert.equal(member.status, 200, "a confirmed member holding the password reads it");
+    // Nor is the password with the right name: every member holds the password, so it
+    // cannot say which member is reading. The reader's own key does (#274), and another
+    // member's key is not it.
+    const founderKey = await memberKeyAt(base, founder, token);
+    const peerKey = await memberKeyAt(base, peer, token);
+    assert.notEqual(founderKey, peerKey, "each member has a key of its own");
+    const passwordOnly = await readRoom(password, founder);
+    assert.equal(passwordOnly.status, 403, "the password alone does not read in a member's name");
+    assert.equal(passwordOnly.body.error, "not_your_key");
+    const othersKey = await readRoom(password, founder, peerKey);
+    assert.equal(othersKey.status, 403, "nor does another member's key");
+    assert.equal(othersKey.body.error, "not_your_key");
+    assert.equal((await readRoom(token, founder, founderKey)).status, 403, "and the key is no stand-in for the password");
+
+    const member = await readRoom(password, founder, founderKey);
+    assert.equal(member.status, 200, "a confirmed member holding the password and its own key reads it");
     assert.ok(member.body.messages.some((message) => message.text === "IN-THE-ROOM"));
 
     // Speaking in a room is refused before `from` is read, because `from` is a name the
@@ -4598,7 +4799,7 @@ test("every mutation and every room read needs a credential that verifies", asyn
     });
     assert.equal(forgedPost.status, 403, "a wrong token cannot speak as a confirmed member");
     assert.equal((await forgedPost.json()).error, "not_confirmed");
-    const after = await readRoom(password, founder);
+    const after = await readRoom(password, founder, founderKey);
     assert.ok(
       !after.body.messages.some((message) => message.text === "SHOULD-NOT-LAND"),
       "and nothing it tried to say was written down",
@@ -4608,9 +4809,9 @@ test("every mutation and every room read needs a credential that verifies", asyn
     // `as` says which mailbox to open and nothing about who is asking. With collect=1 a
     // refused reader that was let through would not merely read the mail, it would take
     // it: the cursor moves and the session it was addressed to never sees it.
-    const drain = async (credential, route = "inbox") => {
+    const drain = async (credential, route = "inbox", key = null) => {
       const response = await fetch(`${base}/mail/${route}?as=${peer}&collect=1&timeout=1`, {
-        headers: credential ? { "x-gyredeck-token": credential } : {},
+        headers: { ...(credential ? { "x-gyredeck-token": credential } : {}), ...(key ? { "x-gyredeck-member": key } : {}) },
       });
       return { status: response.status, body: await response.json() };
     };
@@ -4636,8 +4837,19 @@ test("every mutation and every room read needs a credential that verifies", asyn
     // would be gone and the session it was for would simply never hear of it.
     assert.equal(await peek(), waiting, "a refused collect left the cursor where it was");
 
-    const collected = await drain(token);
-    assert.equal(collected.status, 200, "the hook's own credential still opens it");
+    // The peer is a room member, so its mailbox carries the room: the machine token alone
+    // no longer opens it, on either door (#274) — and is refused without moving the cursor.
+    for (const route of ["inbox", "wait"]) {
+      const keyless = await drain(token, route);
+      assert.equal(keyless.status, 403, `the machine token alone does not open a member's /mail/${route}`);
+      assert.equal(keyless.body.error, "not_your_key");
+      const otherKey = await drain(token, route, founderKey);
+      assert.equal(otherKey.status, 403, `nor with another member's key on /mail/${route}`);
+      assert.equal(otherKey.body.error, "not_your_key");
+    }
+    assert.equal(await peek(), waiting, "the refused collects left the cursor where it was");
+    const collected = await drain(token, "inbox", peerKey);
+    assert.equal(collected.status, 200, "the hook's own credential with the member's own key opens it");
     assert.ok(
       collected.body.messages.some((message) => /you are now in sync room/.test(message.text)),
       "what the refused readers were reaching for is still there for the session it was sent to",
@@ -4645,10 +4857,15 @@ test("every mutation and every room read needs a credential that verifies", asyn
 
     // The room's password is what `howToUseRoom` hands a session for its own wait and
     // inbox, so it has to keep opening them — the machine token is not the only caller.
-    const byRoomPassword = await fetch(`${base}/mail/inbox?as=${peer}`, {
+    const passwordAlone = await fetch(`${base}/mail/inbox?as=${peer}`, {
       headers: { "x-gyredeck-token": password },
     });
-    assert.equal(byRoomPassword.status, 200, "a member's own room password opens its own inbox");
+    assert.equal(passwordAlone.status, 403, "the room's password alone is every member's, so it opens no member's inbox (#274)");
+    assert.equal((await passwordAlone.json()).error, "not_your_key");
+    const byRoomPassword = await fetch(`${base}/mail/inbox?as=${peer}`, {
+      headers: { "x-gyredeck-token": password, "x-gyredeck-member": peerKey },
+    });
+    assert.equal(byRoomPassword.status, 200, "a member's own room password and its own key open its own inbox");
 
     // ── The app's own listing ──
     // Every room and every roster, which is the app's view rather than a member's. The
@@ -4888,7 +5105,7 @@ test("a room does not outlive the founder that made it", async () => {
 
     // The peer is watching, the way a session in a room is meant to be.
     const stream = await fetch(`${base}/mail/${code}/events?as=${peer}`, {
-      headers: { "x-gyredeck-token": created.body.password },
+      headers: await memberHeaders(base, peer, created.body.password),
     });
     assert.equal(stream.status, 200);
     const reader = stream.body.getReader();
@@ -5437,7 +5654,7 @@ test("a Codex repeat is settled before the room is full, so it is never held and
     assert.equal((await joinConfirmed(call, code, founder, thread)).status, 200);
     assert.equal((await joinConfirmed(call, code, founder, sink)).status, 200);
     const said = async () => {
-      const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${founder}&since=0`, { headers: { "x-gyredeck-token": created.body.password } });
+      const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${founder}&since=0`, { headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, token, created.body.password) });
       return (await response.json()).messages.filter((message) => message.from === thread).map((message) => message.text);
     };
     const endTurn = () => call("POST", "/hook/stop", { hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: thread });
@@ -5539,7 +5756,7 @@ test("a Codex answer the room has no space for is kept, not stepped over", async
 
     const readRoom = async () => {
       const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${founder}`, {
-        headers: { "x-gyredeck-token": created.body.password },
+        headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, token, created.body.password),
       });
       return (await response.json()).messages;
     };
@@ -5847,7 +6064,7 @@ test("a batch re-read after the dedup window overflows still publishes each answ
     await new Promise((resolve) => setTimeout(resolve, 300));
 
     const history = await (await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${founder}`, {
-      headers: { "x-gyredeck-token": created.body.password },
+      headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, token, created.body.password),
     })).json();
     const fromCodex = history.messages.filter((message) => message.from === thread).map((message) => message.text);
 
@@ -6185,7 +6402,7 @@ test("a room password carried in by notify lets that session in, once", async ()
     // later. Waited for, then the room is read once for both halves.
     const roomTexts = async () => {
       const said = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
-        headers: { "x-gyredeck-token": minted.body.password },
+        headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, token, minted.body.password),
       });
       return (await said.json()).messages.map((message) => message.text);
     };
@@ -6855,7 +7072,7 @@ test("the reply poll reads only what Codex wrote after the push, not the whole l
 
     const roomText = async () => {
       const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
-        headers: { "x-gyredeck-token": created.body.password },
+        headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, token, created.body.password),
       });
       return (await response.json()).messages.map((message) => message.text).join("\n");
     };
@@ -6945,7 +7162,7 @@ test("a new member's harvest and the usage read stay off the log from before", a
 
     const roomText = async () => {
       const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
-        headers: { "x-gyredeck-token": created.body.password },
+        headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, token, created.body.password),
       });
       return (await response.json()).messages.map((message) => message.text).join("\n");
     };
@@ -7027,7 +7244,7 @@ test("words written before a session may speak are never published, on a first j
     });
     const roomText = async () => {
       const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
-        headers: { "x-gyredeck-token": created.body.password },
+        headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, token, created.body.password),
       });
       return (await response.json()).messages.map((message) => message.text).join("\n");
     };
@@ -7155,7 +7372,7 @@ test("the reply poll keeps an answer the room cannot take yet, and publishes eac
 
     const fromCodex = async () => {
       const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, {
-        headers: { "x-gyredeck-token": created.body.password },
+        headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, token, created.body.password),
       });
       return (await response.json()).messages.filter((message) => message.from === thread).map((message) => message.text);
     };
@@ -7297,7 +7514,9 @@ const codexInARoom = async ({ replyTimeoutMs = null } = {}) => {
   const code = created.body.room;
   assert.equal((await joinConfirmed(call, code, founder, thread)).status, 200);
   const saidInRoom = async () => {
-    const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, { headers: { "x-gyredeck-token": created.body.password } });
+    // Read as the founder, with its own key beside the password (#274); fetched each time,
+    // since a founder that leaves and comes back is handed a new one.
+    const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, { headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, token, created.body.password) });
     return (await response.json()).messages.filter((message) => message.from === thread).map((message) => message.text);
   };
   // What Codex answered to a private message is delivered where the sender listens — the
@@ -7631,7 +7850,7 @@ test("a turn left open when its session leaves is orphaned, and its answer later
     const second = await room.call("POST", "/sync/rooms", { conversationId: other });
     assert.equal((await joinConfirmed(room.call, second.body.room, other, room.thread)).status, 200);
     const saidInSecond = async () => {
-      const response = await fetch(`http://127.0.0.1:${room.port}/mail/${second.body.room}?since=0&as=${other}`, { headers: { "x-gyredeck-token": second.body.password } });
+      const response = await fetch(`http://127.0.0.1:${room.port}/mail/${second.body.room}?since=0&as=${other}`, { headers: await memberHeaders(`http://127.0.0.1:${room.port}`, other, second.body.password) });
       return (await response.json()).messages.filter((message) => message.from === room.thread).map((message) => message.text);
     };
     await appendFile(room.rollout, turnAnswering(question.turnId, "@everyone tell\nORPHANED-ANSWER") + userTurn("typed at the keyboard", "@everyone tell\nSAID-NOW"));
@@ -7668,7 +7887,7 @@ test("an answer to a room the session has since left goes nowhere, not into the 
     const second = await room.call("POST", "/sync/rooms", { conversationId: other });
     assert.equal((await joinConfirmed(room.call, second.body.room, other, room.thread)).status, 200);
     const saidInSecond = async () => {
-      const response = await fetch(`http://127.0.0.1:${room.port}/mail/${second.body.room}?since=0&as=${other}`, { headers: { "x-gyredeck-token": second.body.password } });
+      const response = await fetch(`http://127.0.0.1:${room.port}/mail/${second.body.room}?since=0&as=${other}`, { headers: await memberHeaders(`http://127.0.0.1:${room.port}`, other, second.body.password) });
       return (await response.json()).messages.filter((message) => message.from === room.thread).map((message) => message.text);
     };
 
@@ -7712,7 +7931,7 @@ test("an answer whose prompt the reader never saw is routed by looking the promp
     const second = await room.call("POST", "/sync/rooms", { conversationId: other });
     assert.equal((await joinConfirmed(room.call, second.body.room, other, room.thread)).status, 200);
     const saidInSecond = async () => {
-      const response = await fetch(`http://127.0.0.1:${room.port}/mail/${second.body.room}?since=0&as=${other}`, { headers: { "x-gyredeck-token": second.body.password } });
+      const response = await fetch(`http://127.0.0.1:${room.port}/mail/${second.body.room}?since=0&as=${other}`, { headers: await memberHeaders(`http://127.0.0.1:${room.port}`, other, second.body.password) });
       return (await response.json()).messages.filter((message) => message.from === room.thread).map((message) => message.text);
     };
     await appendFile(room.rollout, turnAnswering(turnId, "@everyone tell\nPRIVATE-LATE-ANSWER") + userTurn("typed at the keyboard", "@everyone tell\nSAID-IN-THE-NEW-ROOM"));
@@ -8535,10 +8754,6 @@ test("a goal turn that began before the session was confirmed, or that spans a r
  * watched choosing between it and TCP. `answer(request)` returns the JSON to send back;
  * every request is recorded.
  */
-/** Fake brokers still listening when the run ends: closed, whatever their tests did. */
-const openFakeServers = new Set();
-after(() => { for (const server of openFakeServers) server.close(); });
-
 const fakeBroker = async (home, answer) => {
   const dir = join(home, ...CONFIG_DIR, "broker");
   await mkdir(dir, { recursive: true });
@@ -8948,15 +9163,18 @@ test("the bridge refuses an old-path collect for a session the broker has bound,
     const password = (await call("POST", `/sync/rooms/${code}/passwords`, { "x-gyredeck-broker": secret }, { conversationId: unbound })).body.password;
     await call("POST", `/sync/rooms/${code}/confirm`, { "x-gyredeck-broker": secret }, { conversationId: bound, password });
     await call("POST", `/mail/${code}`, { "x-gyredeck-token": password }, { from: unbound, text: "room mail", to: bound, kind: "tell" });
-    const roomPeek = await call("GET", `/mail/${code}?as=${bound}`, { "x-gyredeck-token": password });
-    assert.equal(roomPeek.status, 200, "the room's backlog is the room's: password and membership");
-    const roomCollect = await call("GET", `/mail/${code}?as=${bound}&collect=1`, { "x-gyredeck-token": password });
-    assert.equal(roomCollect.status, 403, "but taken in the protected member's name only by its reader");
+    // Reading in a member's name takes that member's own key beside the password (#274).
+    const boundKey = await memberKeyAt(`http://127.0.0.1:${port}`, bound, token);
+    const asBound = { "x-gyredeck-token": password, "x-gyredeck-member": boundKey };
+    const roomPeek = await call("GET", `/mail/${code}?as=${bound}`, asBound);
+    assert.equal(roomPeek.status, 200, "the room's backlog is the room's: password, membership and the member's key");
+    const roomCollect = await call("GET", `/mail/${code}?as=${bound}&collect=1`, asBound);
+    assert.equal(roomCollect.status, 403, "but taken in the protected member's name only by its reader — its key is no broker's word");
     // How Antigravity is told to listen (#159) is the room's own stream with once=1, which
     // reads no mailbox: a session the broker has bound may use it, and it ends with the
     // first frame meant for that member.
     const onceWatch = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${bound}&since=resume&once=1`, {
-      headers: { "x-gyredeck-token": password },
+      headers: asBound,
     });
     assert.equal(onceWatch.status, 200, "not refused for a bound session");
     await new Promise((resolve) => setTimeout(resolve, 200));
@@ -8969,18 +9187,30 @@ test("the bridge refuses an old-path collect for a session the broker has bound,
     // confirmation, so what came after is replayed rather than missed (#228).
     assert.match(woke, /^data: .*room mail/m, "and ends with the frame that wakes it");
     assert.equal(roomCollect.body.error, "broker_required");
-    const roomCollectVouched = await call("GET", `/mail/${code}?as=${bound}&collect=1`, { "x-gyredeck-token": password, "x-gyredeck-broker": secret });
+    const roomCollectVouched = await call("GET", `/mail/${code}?as=${bound}&collect=1`, { ...asBound, "x-gyredeck-broker": secret });
     assert.equal(roomCollectVouched.status, 200);
     assert.ok(roomCollectVouched.body.messages.some((m) => m.text === "room mail"));
     // The WAIT an agent runs by hand goes through the broker; with no broker it falls back
     // to TCP, and the bridge's refusal there is withheld mail, never an empty timeout.
-    const waitedByHand = await runAdapter("adapters/claude/gyredeck-claude-hook.mjs", ["wait", "1", bound], home, {});
+    const waitedByHand = await runAdapter("adapters/claude/gyredeck-claude-hook.mjs", ["wait", "1", remembered], home, {});
     assert.equal(waitedByHand.code, 2, `withheld: ${waitedByHand.stderr}`);
     assert.match(waitedByHand.stderr, /wait withheld — the bridge refused the read \(broker_required\)/);
-    const waitedUnprotected = await runAdapter("adapters/claude/gyredeck-claude-hook.mjs", ["wait", "1", unbound], home, {});
+    // A protected session in a room is refused the same way, for the key it does not hold (#274).
+    const waitedInRoom = await runAdapter("adapters/claude/gyredeck-claude-hook.mjs", ["wait", "1", bound], home, {});
+    assert.equal(waitedInRoom.code, 2, `withheld: ${waitedInRoom.stderr}`);
+    assert.match(waitedInRoom.stderr, /wait withheld — the bridge refused the read \(not_your_key\)/);
+    // So is an unprotected one, now that it founded a room: its mailbox carries the room,
+    // and the machine token is not its key (#274).
+    const waitedFounder = await runAdapter("adapters/claude/gyredeck-claude-hook.mjs", ["wait", "1", unbound], home, {});
+    assert.equal(waitedFounder.code, 2, `withheld: ${waitedFounder.stderr}`);
+    assert.match(waitedFounder.stderr, /wait withheld — the bridge refused the read \(not_your_key\)/);
+    // An unprotected session in no room still waits over TCP as before.
+    const loner = "dddd4444-0000-4d8c-9b3a-aa11bb22cc33";
+    await call("POST", `/mail/${loner}`, {}, { from: "codex", text: `for ${loner}`, replyTo: "codex-room" });
+    const waitedUnprotected = await runAdapter("adapters/claude/gyredeck-claude-hook.mjs", ["wait", "1", loner], home, {});
     assert.equal(waitedUnprotected.code, 0, waitedUnprotected.stderr);
     const servedByHand = JSON.parse(waitedUnprotected.stdout);
-    assert.equal(servedByHand.ok, true, "an unprotected session with no broker waits over TCP as before");
+    assert.equal(servedByHand.ok, true, "an unprotected session in no room, with no broker, waits over TCP as before");
     assert.equal(typeof servedByHand.timedOut, "boolean");
   } finally {
     bridge.stdin.end();
@@ -9120,10 +9350,16 @@ test("a Codex session's mailbox has no reader at all, the broker's word included
     await call("POST", `/sync/rooms/${code}/members`, { "x-gyredeck-broker": secret }, { conversationId: codex });
     const password = (await call("POST", `/sync/rooms/${code}/passwords`, { "x-gyredeck-broker": secret }, { conversationId: founder })).body.password;
     await call("POST", `/sync/rooms/${code}/confirm`, { "x-gyredeck-broker": secret }, { conversationId: codex, password });
-    assert.equal((await call("GET", `/mail/${code}?as=${codex}`, { "x-gyredeck-token": password })).status, 200, "the room's backlog stays the room's");
+    // A look at the room in Codex's name is the room's rule, not the closed mailbox's: it is
+    // refused for the member key Codex is never handed (#274) — Codex hears the room by push.
+    const peekAsCodex = await call("GET", `/mail/${code}?as=${codex}`, { "x-gyredeck-token": password });
+    assert.equal(peekAsCodex.status, 403, "the room's backlog stays the room's: a read in a member's name takes its key");
+    assert.equal(peekAsCodex.body.error, "not_your_key");
+    // Taken in Codex's name, even on the broker's word: refused, and now first for the key
+    // Codex never holds (#274) — the broker's word is not a member's key.
     const asCodex = await call("GET", `/mail/${code}?as=${codex}&collect=1`, { "x-gyredeck-token": password, "x-gyredeck-broker": secret });
     assert.equal(asCodex.status, 403);
-    assert.equal(asCodex.body.error, "codex_mailbox_closed");
+    assert.equal(asCodex.body.error, "not_your_key");
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
@@ -9663,7 +9899,7 @@ test("a watch that has never carried a frame still hears what arrived while it w
       const timer = setTimeout(() => controller.abort(), 1_000);
       try {
         const response = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${as}&since=resume&once=1`, {
-          headers: { "x-gyredeck-token": password }, signal: controller.signal,
+          headers: await memberHeaders(`http://127.0.0.1:${port}`, as, token, password), signal: controller.signal,
         });
         const text = await response.text();
         return [...text.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1]));
@@ -9688,7 +9924,7 @@ test("a watch that has never carried a frame still hears what arrived while it w
     // (1b) Collected but not yet delivered: a collect hands the batch to a reader before any
     // hook has shown it to the agent, so it is no proof of a wake (#228 audit, P1).
     const collected = await call("POST", `/mail/${code}`, { from: founder, to: "everyone", kind: "ask", text: "collected, not seen" });
-    const taken = await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${member}&collect=1`, { headers: { "x-gyredeck-token": password } });
+    const taken = await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${member}&collect=1`, { headers: await memberHeaders(`http://127.0.0.1:${port}`, member, token, password) });
     assert.equal(taken.status, 200);
     assert.ok((await taken.json()).messages.some((m) => m.seq === collected.body.seq), "the premise: the collect took it");
     assert.ok((await resumed(member, password)).includes(collected.body.seq), "and the watch still wakes on it");
@@ -9976,7 +10212,9 @@ const heavyHarness = async (tag) => {
     for (const bridge of bridges) await stop(bridge);
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
-  return { home, base, loadFile, clockFile, holderPath, helperPath, start, stop, post, state, pair, acquire, group, hold, helper, cleanup, token: () => token, groups };
+  /** A room member's own read headers (#274): the machine token and that member's key. */
+  const member = async (as) => memberHeaders(base, as, token);
+  return { home, base, loadFile, clockFile, holderPath, helperPath, start, stop, post, state, pair, acquire, group, hold, helper, cleanup, token: () => token, member, groups };
 };
 
 test("heavy C1: only the lease releases the slot — not another lease, not a name", async () => {
@@ -11280,8 +11518,10 @@ test("an unconfirmed Antigravity member sees how to confirm on every invocation,
   bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
   const founder = "a2420000-0000-4000-8000-000000000001";
   const agy = "a2420000-0000-4000-8000-000000000002";
+  let broker = null;
   try {
     await waitForHealth(port, stderrRef);
+    broker = await forwardingBroker(home, `http://127.0.0.1:${port}`);
     const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
     const call = async (method, path, body, extra = {}) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
@@ -11333,6 +11573,7 @@ test("an unconfirmed Antigravity member sees how to confirm on every invocation,
     await agySteps();
     assert.doesNotMatch(await agySteps(), /BLOCKED:/);
   } finally {
+    await broker?.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
@@ -11403,7 +11644,14 @@ test("the Antigravity payload-shape log records lengths, never values, and empti
  * proxy that counts every confirm it carries — so "sent nothing" and "sent once" are
  * counted, not inferred from what the bridge happens to say.
  */
-const agyPasteFixture = async (tag, { breakInbox = false, inboxBody = null, bound = false, rulesBlocked = false } = {}) => {
+/**
+ * `withBroker` puts a forwarding broker in this home (#274): a room member's mailbox is the
+ * broker's word or the member's key, never the machine token alone, so a hook in a room that
+ * should be handed its mail needs one. It reaches the bridge through the same proxy the hook
+ * does, so `breakInbox` and `inboxBody` say what the inbox answers either way. Without it the
+ * hook falls back to TCP, which for a member is refused (or answered by the proxy).
+ */
+const agyPasteFixture = async (tag, { breakInbox = false, inboxBody = null, bound = false, rulesBlocked = false, withBroker = false } = {}) => {
   const home = await mkdtemp(join(tmpdir(), `gyredeck-250-${tag}-`));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const bridgePort = await freePort();
@@ -11465,6 +11713,7 @@ const agyPasteFixture = async (tag, { breakInbox = false, inboxBody = null, boun
   });
   assert.equal(probe, "ENOENT", `premise: no broker at this home (tag "${tag}" may be too long)`);
   await waitForHealth(bridgePort, stderrRef);
+  const broker = withBroker ? await forwardingBroker(home, `http://127.0.0.1:${proxy.address().port}`) : null;
   const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
   const call = async (method, path, body) => {
     const response = await fetch(`http://127.0.0.1:${bridgePort}${path}`, {
@@ -11503,6 +11752,7 @@ const agyPasteFixture = async (tag, { breakInbox = false, inboxBody = null, boun
   };
   const confirmed = async () => (await call("GET", `/sync/rooms?as=${agy}`)).body.members.find((member) => member.conversationId === agy)?.confirmed === true;
   const close = async () => {
+    await broker?.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await new Promise((resolve) => proxy.close(resolve));
@@ -11516,7 +11766,9 @@ const agyPasteFixture = async (tag, { breakInbox = false, inboxBody = null, boun
     assert.equal(sent.body.ok, true, JSON.stringify(sent.body));
     return sent.body.seq;
   };
-  return { home, agy, founder, code, password, confirms, invoke, confirmed, close, call, confirm, say, bridgePort, proxyPort: proxy.address().port };
+  /** The agy member's own read key (#274), once it is confirmed. */
+  const agyKey = () => memberKeyAt(`http://127.0.0.1:${bridgePort}`, agy, token);
+  return { home, agy, founder, code, password, confirms, invoke, confirmed, close, call, confirm, say, bridgePort, proxyPort: proxy.address().port, broker, token, agyKey };
 };
 
 test("#250 C1 C3 C4: a pasted password confirms the member once, and the same invocation says so", async () => {
@@ -11557,7 +11809,7 @@ test("#250 C4: the acceptance is said in that invocation even when the broker wi
 });
 
 test("#250 C2: anything but an exact paste is never presented", async () => {
-  const f = await agyPasteFixture("exact");
+  const f = await agyPasteFixture("exact", { withBroker: true });
   try {
     for (const input of [f.password.slice(0, 31), `${f.password}a`, `here it is: ${f.password}`, `${f.password} thanks`, [f.password], { text: f.password }, undefined]) {
       const result = await f.invoke(input);
@@ -11592,7 +11844,8 @@ test("#250 r2: an accepted paste keeps its HEAR when the delivery cannot be buil
   // Short tags: the broker's socket lives under the temp home, and a long path passes
   // macOS's 104-byte limit for a socket, which the hook reads as a broken broker.
   for (const [label, tag, options, env] of [
-    ["delivery fault", "fault", {}, { GYREDECK_TEST_FAULT: "delivery" }],
+    // A member's mail is the broker's to hand over (#274): the fault comes after its collect.
+    ["delivery fault", "fault", { withBroker: true }, { GYREDECK_TEST_FAULT: "delivery" }],
     ["no inbox answer", "noinbox", { breakInbox: true }, {}],
     ["an empty 200 inbox", "empty", { breakInbox: "empty" }, {}],
   ]) {
@@ -11651,12 +11904,12 @@ const valueNowhere = (result, password, label) => {
 
 const acceptedPastePaths = [
   {
-    name: "a full delivery", tag: "c1full",
+    name: "a full delivery", tag: "c1full", options: { withBroker: true },
     before: async (f) => { await f.say("waiting before the paste"); },
     premise: (r) => assert.ok(r.text.includes("waiting before the paste"), "premise: mail was delivered with it"),
   },
   {
-    name: "nothing waiting", tag: "c1none",
+    name: "nothing waiting", tag: "c1none", options: { withBroker: true },
     // The room's own notices always come with a confirmation; nothing from a member does.
     premise: (r) => assert.ok(!r.steps.some((text) => /^\[gyredeck mail · from (?!the room)/.test(text)), `premise: no member's mail was delivered: ${r.text}`),
   },
@@ -11665,9 +11918,11 @@ const acceptedPastePaths = [
     premise: (r) => assert.match(r.stderr, /mail withheld this turn/, "premise: withheld"),
   },
   {
-    name: "the delivery fault", tag: "c1fault", env: { GYREDECK_TEST_FAULT: "delivery" },
+    // Through the broker (#274), the only way a member's mail is handed over: the batch the
+    // fault interrupted is held for the next invocation, never shown half-built.
+    name: "the delivery fault", tag: "c1fault", env: { GYREDECK_TEST_FAULT: "delivery" }, options: { withBroker: true },
     before: async (f) => { await f.say("before the fault"); },
-    premise: (r) => assert.match(r.text, /shown plainly/, "premise: the plain path"),
+    premise: (r) => assert.ok(!r.text.includes("before the fault") && !/shown plainly/.test(r.text), `premise: the plain path, holding the batch back: ${r.text}`),
   },
   { name: "a {} inbox", tag: "c1empty", options: { breakInbox: "empty" } },
 ];
@@ -11785,7 +12040,8 @@ test("#255 r2: Claude, already in, a 32-hex value that is not the password is ne
 
 for (const [label, tag, fault] of [["normal", "c3norm", false], ["delivery fault", "c3fault", true]]) {
   test(`#255 C3 C4: Claude's accepted paste, ${label}`, async () => {
-    const f = await agyPasteFixture(tag);
+    // Through the broker (#274): a room member's mailbox is not the machine token's to open.
+    const f = await agyPasteFixture(tag, { withBroker: true });
     const claude = "a2550000-0000-4000-8000-000000000003";
     try {
       await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: claude });
@@ -11806,12 +12062,27 @@ for (const [label, tag, fault] of [["normal", "c3norm", false], ["delivery fault
       const confirmed = (await f.call("GET", `/sync/rooms?as=${claude}`)).body.members.find((member) => member.conversationId === claude)?.confirmed;
       assert.equal(confirmed, true, "premise: accepted");
       const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
-      if (fault) assert.match(context, /shown plainly/, "premise: the fallback path");
-      else assert.doesNotMatch(context, /shown plainly/, "premise: the normal path");
-      assert.ok(context.includes("waiting for claude"), "premise: the mail came with it");
+      if (fault) {
+        // The fallback path, through the broker: the batch the fault interrupted is held back
+        // unacknowledged rather than shown plainly, and the acceptance is said all the same.
+        assert.doesNotMatch(context, /shown plainly/, "premise: the fallback path holds a broker's batch back");
+        assert.ok(!context.includes("waiting for claude"), "premise: the mail is held for the next turn");
+      } else {
+        assert.doesNotMatch(context, /shown plainly/, "premise: the normal path");
+        assert.ok(context.includes("waiting for claude"), "premise: the mail came with it");
+        const key = await memberKeyAt(`http://127.0.0.1:${f.bridgePort}`, claude, f.token);
+        assert.ok(context.includes(`-H "x-gyredeck-member: ${key}"`), "the watch it is handed carries its own key (#274)");
+      }
       assert.equal(timesIn(context, PASTE_USED), 1, "C3: the line, once");
       assert.ok(context.includes(`NEW: the password you were just given was accepted for sync room ${f.code} — you may now read and post here. ${PASTE_USED}`), "C3: naming the room, on both paths");
       valueNowhere(result, f.password, label);
+      if (fault) {
+        const next = await runAdapter(
+          "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], f.home,
+          { hook_event_name: "UserPromptSubmit", session_id: claude, cwd: "/tmp/project", prompt: "hi" },
+        );
+        assert.ok(JSON.parse(next.stdout).hookSpecificOutput.additionalContext.includes("waiting for claude"), "the held mail comes on the next turn");
+      }
     } finally {
       await f.close();
     }
@@ -11844,12 +12115,31 @@ const untilOf = (text) => Number(/&since=\d+&until=(\d+)"/.exec(text)?.[1] ?? Na
  * the invariants say for it: `since` (I1), `note` (I2), or neither (I3).
  */
 const rereadPaths = [
-  { name: "a normal delivery", tag: "pnorm", run: async (f) => { await f.confirm(); await f.invoke(); return { seq: await f.say("first request"), result: await f.invoke() }; }, expect: "since", reply: true },
-  { name: "the delivery fault", tag: "pfault", run: async (f) => { await f.confirm(); await f.invoke(); return { seq: await f.say("before the fault"), result: await f.invoke(undefined, { GYREDECK_TEST_FAULT: "delivery" }) }; }, expect: "since", premise: (r) => assert.match(r.text, /shown plainly/, "premise: the plain path") },
+  { name: "a normal delivery", tag: "pnorm", options: { withBroker: true }, run: async (f) => { await f.confirm(); await f.invoke(); return { seq: await f.say("first request"), result: await f.invoke() }; }, expect: "since", reply: true },
+  // A member's mail comes only through the broker (#274), and a batch the fault interrupted
+  // is held for the next invocation rather than shown plainly: nothing delivered, neither
+  // line — and the next invocation delivers it with its one re-read.
+  {
+    name: "the delivery fault", tag: "pfault", options: { withBroker: true },
+    run: async (f) => {
+      await f.confirm();
+      await f.invoke();
+      const seq = await f.say("before the fault");
+      const result = await f.invoke(undefined, { GYREDECK_TEST_FAULT: "delivery" });
+      const next = await f.invoke();
+      assert.ok(next.text.includes("before the fault"), "the held batch comes on the next invocation");
+      const own = rereadSteps(next.steps);
+      assert.equal(own.length, 1, "with its re-read, once");
+      assert.equal(sinceOf(own[0]), seq - 1);
+      return { result };
+    },
+    expect: "none",
+    premise: (r) => assert.ok(!/shown plainly/.test(r.text) && !r.text.includes("before the fault"), `premise: the plain path held the batch back: ${r.text}`),
+  },
   { name: "a 500 inbox", tag: "p500", options: { breakInbox: true }, run: async (f) => { await f.confirm(); await f.say("unanswered"); return { result: await f.invoke() }; }, expect: "none" },
   { name: "a {} inbox", tag: "pempty", options: { breakInbox: "empty" }, run: async (f) => { await f.confirm(); await f.say("unanswered"); return { result: await f.invoke() }; }, expect: "none" },
   {
-    name: "mail quoting the re-read line", tag: "pquote",
+    name: "mail quoting the re-read line", tag: "pquote", options: { withBroker: true },
     run: async (f) => {
       await f.confirm();
       await f.invoke();
@@ -11876,10 +12166,10 @@ const rereadPaths = [
     },
     expect: "none", broker: true,
   },
-  { name: "private-mailbox mail", tag: "ppriv", run: async (f) => { await f.confirm(); await f.invoke(); assert.equal((await f.call("POST", `/mail/${f.agy}`, { from: "gyredeck-app", to: f.agy, kind: "ask", text: "a private ask" })).body.ok, true); return { result: await f.invoke() }; }, expect: "note" },
-  { name: "room mail the bridge did not tag", tag: "puntag", options: { inboxBody: (body) => ({ ...body, messages: (body.messages ?? []).map(({ room: _room, ...message }) => message) }) }, run: async (f) => { await f.confirm(); await f.invoke(); await f.say("untagged"); return { result: await f.invoke() }; }, expect: "note" },
+  { name: "private-mailbox mail", tag: "ppriv", options: { withBroker: true }, run: async (f) => { await f.confirm(); await f.invoke(); assert.equal((await f.call("POST", `/mail/${f.agy}`, { from: "gyredeck-app", to: f.agy, kind: "ask", text: "a private ask" })).body.ok, true); return { result: await f.invoke() }; }, expect: "note" },
+  { name: "room mail the bridge did not tag", tag: "puntag", options: { withBroker: true, inboxBody: (body) => ({ ...body, messages: (body.messages ?? []).map(({ room: _room, ...message }) => message) }) }, run: async (f) => { await f.confirm(); await f.invoke(); await f.say("untagged"); return { result: await f.invoke() }; }, expect: "note" },
   {
-    name: "a heavy-run room notice alone (#244)", tag: "pheavy",
+    name: "a heavy-run room notice alone (#244)", tag: "pheavy", options: { withBroker: true },
     // Past the #263 delay, so its start is announced as soon as it is reported.
     run: async (f) => {
       await f.confirm();
@@ -11892,7 +12182,7 @@ const rereadPaths = [
     premise: (r) => assert.ok(r.steps.some((text) => text.includes("HEAVY RUN: Terminal started cargo test|build|check")), `premise: the notice was delivered: ${JSON.stringify(r.steps)}`),
   },
   {
-    name: "a heavy-run room notice beside room mail (#244)", tag: "pheavymail",
+    name: "a heavy-run room notice beside room mail (#244)", tag: "pheavym", options: { withBroker: true },
     run: async (f) => {
       await f.confirm();
       await f.invoke();
@@ -11902,7 +12192,10 @@ const rereadPaths = [
     expect: "since", reply: true,
     premise: (r) => assert.ok(r.steps.some((text) => text.includes("HEAVY RUN: Terminal started")), "premise: the notice was delivered too"),
   },
-  { name: "a message with no seq", tag: "pnoseq", options: { inboxBody: (body) => ({ ...body, messages: (body.messages ?? []).map(({ seq: _seq, ...message }) => message) }) }, run: async (f) => { await f.confirm(); await f.say("no seq"); return { result: await f.invoke() }; }, expect: "none" },
+  { name: "a message with no seq", tag: "pnoseq", options: { withBroker: true, inboxBody: (body) => ({ ...body, messages: (body.messages ?? []).map(({ seq: _seq, ...message }) => message) }) }, run: async (f) => { await f.confirm(); await f.say("no seq"); return { result: await f.invoke() }; }, expect: "none" },
+  // Room mail handed over with no member key (#274): no command it could not run, and a line
+  // that says the messages cannot be read again.
+  { name: "room mail delivered without a key", tag: "pnokey", options: { withBroker: true, inboxBody: ({ memberKey: _key, ...body }) => body }, run: async (f) => { await f.confirm(); await f.invoke(); await f.say("no key"); return { result: await f.invoke() }; }, expect: "nokey", premise: (r) => assert.ok(r.text.includes("no key"), "premise: the room mail was delivered") },
 ];
 
 for (const path of rereadPaths) {
@@ -11919,6 +12212,7 @@ for (const path of rereadPaths) {
         assert.equal(sinceOf(own[0]), seq - 1, "I1: since = first room seq − 1");
         assert.equal(untilOf(own[0]), seq, "L7: until = the last room seq delivered");
         assert.ok(own[0].includes(`/mail/${f.code}?as=${f.agy}&since=`), "I1: this room, this session");
+        assert.ok(own[0].includes(`-H "x-gyredeck-member: ${await f.agyKey()}"`), "I1: with this member's own key (#274)");
         assert.equal(notes.length, 0, "I2: no note with a room");
         if (path.reply) {
           const reply = result.steps.findIndex((text) => text.startsWith("The mail above is addressed to you"));
@@ -11927,6 +12221,11 @@ for (const path of rereadPaths) {
       } else if (path.expect === "note") {
         assert.equal(own.length, 0, "I2: no command");
         assert.equal(notes.length, 1, "I2: the note, once");
+      } else if (path.expect === "nokey") {
+        assert.equal(own.filter((text) => text.includes("curl")).length, 0, "no re-read command without the key");
+        assert.ok(!result.text.includes("x-gyredeck-member"), "and no key header at all");
+        assert.equal(own.filter((text) => text.includes("there is no key to read them again")).length, 1, "the line that says it cannot be read again, once");
+        assert.equal(notes.length, 0, "not the outside-a-room note");
       } else {
         assert.equal(own.length + notes.length, 0, "I3: neither line when nothing was delivered");
       }
@@ -11937,7 +12236,7 @@ for (const path of rereadPaths) {
 }
 
 test("#251 I6: the re-read is a look, not a take", async () => {
-  const f = await agyPasteFixture("plook");
+  const f = await agyPasteFixture("plook", { withBroker: true });
   try {
     await f.confirm();
     await f.invoke();
@@ -11945,8 +12244,14 @@ test("#251 I6: the re-read is a look, not a take", async () => {
     const [own] = rereadSteps((await f.invoke()).steps);
     const url = /curl -s "([^"]+)"/.exec(own)[1];
     assert.equal(new URL(url).port, String(f.proxyPort), "the port the hook knows the bridge by");
+    // The command carries the member's own key (#274); the password alone is refused.
+    const key = /-H "x-gyredeck-member: ([a-f0-9]{64})"/.exec(own)?.[1];
+    assert.equal(key, await f.agyKey(), "the key in the command is this member's");
     await f.say("second request");
-    const looked = await fetch(url, { headers: { "x-gyredeck-token": f.password } });
+    const passwordOnly = await fetch(url, { headers: { "x-gyredeck-token": f.password } });
+    assert.equal(passwordOnly.status, 403, "the password alone does not look in a member's name");
+    assert.equal((await passwordOnly.json()).error, "not_your_key");
+    const looked = await fetch(url, { headers: { "x-gyredeck-token": f.password, "x-gyredeck-member": key } });
     assert.equal(looked.status, 200);
     assert.ok((await looked.json()).messages.some((message) => message.text === "first request"), "the message it was asked about comes back");
     assert.ok((await f.invoke()).text.includes("second request"), "the look moved no read position");
@@ -11961,14 +12266,17 @@ test("#251 I6: the re-read works for a session the broker holds", async () => {
   try {
     await f.confirm();
     const seq = await f.say("asked while bound");
-    const roomCopy = (await (await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}?as=${f.founder}&since=${seq - 1}`, { headers: { "x-gyredeck-token": f.password } })).json()).messages;
-    const broker = await fakeBroker(f.home, () => ({ v: 1, ok: true, boundTo: f.agy, delivery: 1, room: f.code, members: [], messages: roomCopy.map((message) => ({ room: f.code, ...message })) }));
+    const roomCopy = (await (await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}?as=${f.founder}&since=${seq - 1}`, { headers: await memberHeaders(`http://127.0.0.1:${f.bridgePort}`, f.founder, f.token, f.password) })).json()).messages;
+    // A broker's collect carries the member's key, as the bridge hands it to the broker (#274).
+    const memberKey = await f.agyKey();
+    const broker = await fakeBroker(f.home, () => ({ v: 1, ok: true, boundTo: f.agy, delivery: 1, room: f.code, members: [], memberKey, messages: roomCopy.map((message) => ({ room: f.code, ...message })) }));
     try {
       const delivered = await f.invoke();
       assert.ok(broker.requests.some((request) => request.collect), "premise: the broker was asked");
       assert.ok(delivered.text.includes("asked while bound"), "premise: delivered through the broker");
       const [own] = rereadSteps(delivered.steps);
-      const looked = await fetch(/curl -s "([^"]+)"/.exec(own)[1], { headers: { "x-gyredeck-token": f.password } });
+      assert.ok(own.includes(`-H "x-gyredeck-member: ${memberKey}"`), "the look carries the member's key");
+      const looked = await fetch(/curl -s "([^"]+)"/.exec(own)[1], { headers: { "x-gyredeck-token": f.password, "x-gyredeck-member": memberKey } });
       assert.equal(looked.status, 200, "a bound session can still look");
       assert.ok((await looked.json()).messages.some((message) => message.text === "asked while bound"));
     } finally {
@@ -12003,8 +12311,8 @@ for (const [name, tag, options] of [["the rules written", "hvagy", {}], ["roomRu
 }
 
 for (const [label, tag, options, env] of [
-  ["normal", "pasteok", {}, {}],
-  ["delivery fault", "pastefl", {}, { GYREDECK_TEST_FAULT: "delivery" }],
+  ["normal", "pasteok", { withBroker: true }, {}],
+  ["delivery fault", "pastefl", { withBroker: true }, { GYREDECK_TEST_FAULT: "delivery" }],
   ["{} inbox", "pasteem", { breakInbox: "empty" }, {}],
 ]) {
   test(`#251 I7: an accepted-paste turn, ${label}`, async () => {
@@ -12018,7 +12326,9 @@ for (const [label, tag, options, env] of [
       assert.equal(count(result.text, `while :; do node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 300 ${f.agy};`), 1, "HEAR once");
       assert.equal(result.steps.filter((text) => text.startsWith("NEW: the password you were just given was accepted")).length, 1, "NEW once");
       const delivered = result.text.includes("asked before the paste");
-      assert.equal(delivered, label !== "{} inbox", "premise: room mail came with the confirmation, except from {}");
+      // A member's mail comes through the broker (#274), which holds a batch the fault
+      // interrupted for the next invocation rather than letting it be shown plainly.
+      assert.equal(delivered, label === "normal", "premise: room mail came with the confirmation, except under the fault (held back) and from {}");
       assert.equal(rereadSteps(result.steps).length, delivered ? 1 : 0, "the re-read once with room mail, never without");
     } finally {
       await f.close();
@@ -12053,8 +12363,9 @@ const boundedLookFixture = async (tag) => {
     toAll: await send("everyone", "to everyone"),
   };
   seqs.later = await send(f.agy, "said later");
+  const agyHeaders = await memberHeaders(`http://127.0.0.1:${f.bridgePort}`, f.agy, f.token, f.password);
   const look = async (query) => {
-    const response = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}?${query}`, { headers: { "x-gyredeck-token": f.password } });
+    const response = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}?${query}`, { headers: agyHeaders });
     return { status: response.status, body: await response.json() };
   };
   const pending = async () => (await f.call("GET", `/sync/rooms?as=${f.agy}`)).body.members.find((member) => member.conversationId === f.agy).pending;
@@ -12423,7 +12734,7 @@ const heavyRoom = async (h, founder) => {
   const password = passwordsHeldByApp.get(code);
   assert.ok(password, "premise: the app holds the room's password");
   const notices = async () => {
-    const inbox = await fetch(`${h.base}/mail/inbox?as=${founder}`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    const inbox = await fetch(`${h.base}/mail/inbox?as=${founder}`, { headers: await h.member(founder) }).then((r) => r.json());
     return (inbox.messages ?? []).filter((m) => m.text.startsWith("HEAVY RUN: ")).map((m) => m.text);
   };
   return { code, password, notices };
@@ -12482,24 +12793,24 @@ test("room notices C5: a heavy-run notice wakes nobody — no frame to a watch, 
     const room = await heavyRoom(h, founder);
     const frames = [];
     const controller = new AbortController();
-    const stream = await fetch(`${h.base}/mail/${room.code}/events?as=${founder}`, { headers: { "x-gyredeck-token": room.password }, signal: controller.signal });
+    const stream = await fetch(`${h.base}/mail/${room.code}/events?as=${founder}`, { headers: { ...(await h.member(founder)), "x-gyredeck-token": room.password }, signal: controller.signal });
     assert.equal(stream.status, 200);
     (async () => {
       const decoder = new TextDecoder();
       try { for await (const chunk of stream.body) frames.push(...decoder.decode(chunk).split("\n").filter((line) => line.startsWith("data: "))); } catch {}
     })();
     // Premise: nothing is waiting to be collected, so only something new could end a wait.
-    await fetch(`${h.base}/mail/inbox?as=${founder}&collect=1`, { headers: { "x-gyredeck-token": h.token() } });
-    const drained = await fetch(`${h.base}/mail/inbox?as=${founder}`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    await fetch(`${h.base}/mail/inbox?as=${founder}&collect=1`, { headers: await h.member(founder) });
+    const drained = await fetch(`${h.base}/mail/inbox?as=${founder}`, { headers: await h.member(founder) }).then((r) => r.json());
     assert.equal((drained.messages ?? []).length, 0, JSON.stringify(drained.messages));
-    const waited = fetch(`${h.base}/mail/wait?as=${founder}&timeout=2`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    const waited = fetch(`${h.base}/mail/wait?as=${founder}&timeout=2`, { headers: await h.member(founder) }).then((r) => r.json());
 
     await reportObserved(h, [observedRun()]);
     await reportObserved(h, []);
     const wait = await waited;
     assert.equal(wait.timedOut, true, "the held wait was not ended by the notices");
     // Readable all the same, on the next collect.
-    const collected = await fetch(`${h.base}/mail/inbox?as=${founder}&collect=1`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    const collected = await fetch(`${h.base}/mail/inbox?as=${founder}&collect=1`, { headers: await h.member(founder) }).then((r) => r.json());
     assert.ok((collected.messages ?? []).some((m) => m.text.startsWith("HEAVY RUN: Terminal started")), JSON.stringify(collected.messages));
 
     // Control: a tell to the room does reach the same watch and ends a wait.
@@ -12510,8 +12821,8 @@ test("room notices C5: a heavy-run notice wakes nobody — no frame to a watch, 
     await appCall(`/sync/rooms/${room.code}/members`, { conversationId: peer });
     await appCall(`/sync/rooms/${room.code}/confirm`, { conversationId: peer, password: room.password });
     // The join's roster notices are drained first, so only the tell below can end this wait.
-    await fetch(`${h.base}/mail/inbox?as=${founder}&collect=1`, { headers: { "x-gyredeck-token": h.token() } });
-    const wakes = fetch(`${h.base}/mail/wait?as=${founder}&timeout=10`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    await fetch(`${h.base}/mail/inbox?as=${founder}&collect=1`, { headers: await h.member(founder) });
+    const wakes = fetch(`${h.base}/mail/wait?as=${founder}&timeout=10`, { headers: await h.member(founder) }).then((r) => r.json());
     await new Promise((resolve) => setTimeout(resolve, 200));
     const told = await appCall(`/mail/${room.code}`, { from: peer, text: "control", kind: "tell", to: founder });
     assert.equal(told.status, 202, await told.clone().text());
@@ -12557,7 +12868,7 @@ const heavyNoticeRoom = async (h) => {
   assert.equal((await appCall(`/sync/rooms/${room.code}/members`, { conversationId: HEAVY_P })).status, 200);
   assert.equal((await appCall(`/sync/rooms/${room.code}/confirm`, { conversationId: HEAVY_P, password: room.password })).status, 200);
   const noticesOf = async (id) => {
-    const inbox = await fetch(`${h.base}/mail/inbox?as=${id}`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    const inbox = await fetch(`${h.base}/mail/inbox?as=${id}`, { headers: await h.member(id) }).then((r) => r.json());
     return (inbox.messages ?? []).filter((m) => m.text.startsWith("HEAVY RUN: ")).map((m) => m.text.slice("HEAVY RUN: ".length));
   };
   const both = async () => ({ a: await noticesOf(HEAVY_A), p: await noticesOf(HEAVY_P) });
@@ -12842,7 +13153,7 @@ test("#258 C5: the send /confirm hands back carries to and kind, and posting it 
       return answer.seq;
     };
     const landed = async (seq) => {
-      const read = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}?as=${f.founder}&since=${seq - 1}`, { headers: { "x-gyredeck-token": f.password } });
+      const read = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}?as=${f.founder}&since=${seq - 1}`, { headers: await memberHeaders(`http://127.0.0.1:${f.bridgePort}`, f.founder, f.token, f.password) });
       const message = (await read.json()).messages.find((m) => m.seq === seq);
       assert.ok(message, `premise: seq ${seq} is in the room`);
       return message;
@@ -12862,7 +13173,7 @@ test("#258 C5: the send /confirm hands back carries to and kind, and posting it 
 
 for (const provider of ["claude", "agy"]) {
   test(`#258 C6: the inline RULES line says fields, ${provider}`, async () => {
-    const f = await agyPasteFixture(`c6${provider}`);
+    const f = await agyPasteFixture(`c6${provider}`, { withBroker: true });
     try {
       let text;
       if (provider === "agy") {
@@ -12973,7 +13284,7 @@ const confirmPaths = [
 for (const provider of ["claude", "agy"]) {
   for (const [index, path] of confirmPaths.entries()) {
     test(`#259 C1 C2 C3: ${provider}, ${path.name}`, async () => {
-      const f = await agyPasteFixture(`h${provider[0]}${index}`);
+      const f = await agyPasteFixture(`h${provider[0]}${index}`, { withBroker: true });
       try {
         const id = await path.who(f, provider);
         assert.equal(await confirmedIn(f, id), path.before, "premise: confirmed as the path starts");
@@ -12991,7 +13302,7 @@ for (const provider of ["claude", "agy"]) {
 }
 
 test("#259 C4: agy told outside a room is told again when it is let in", async () => {
-  const f = await agyPasteFixture("h4");
+  const f = await agyPasteFixture("h4", { withBroker: true });
   try {
     assert.equal(await confirmedIn(f, f.agy), false, "premise: not yet in");
     assert.equal(heavyCount(await drainAs(f, "agy", f.agy)), 1, "premise: told as a session in no confirmed room");
@@ -13003,67 +13314,13 @@ test("#259 C4: agy told outside a room is told again when it is let in", async (
 });
 
 /**
- * A broker that does what the app's does with a collect (broker.rs): one vouched bridge call
- * for the bound session, the answer held under a delivery id when it `carries` — mail,
- * missed, or a notice (#259 r1) — and handed again until acknowledged, first and alone;
- * except notices alone to a wait, which asks the bridge and takes them with what it
- * collected. `refuseAfterCollect` refuses the next collect after the bridge call, as a
- * binding lost meanwhile does, with the batch kept.
+ * A broker that does what the app's does with a collect (broker.rs), fixed to `as`: one
+ * vouched bridge call for the session, the answer held under a delivery id when it
+ * `carries` — mail, missed, or a notice (#259 r1) — and handed again until acknowledged,
+ * first and alone; except notices alone to a wait, which asks the bridge and takes them with
+ * what it collected (`forwardingBroker`).
  */
-const NOTICE_KEYS = ["heavyNotice", "usageNotice"];
-const listedIn = (answer, key) => Array.isArray(answer?.[key]) && answer[key].length > 0;
-const carriesBatch = (answer) => listedIn(answer, "messages") || listedIn(answer, "missed")
-  || NOTICE_KEYS.some((key) => typeof answer?.[key] === "string" && answer[key] !== "");
-const relayBroker = async (f, as) => {
-  const dir = join(f.home, ...CONFIG_DIR, "broker");
-  await mkdir(dir, { recursive: true });
-  const token = (await readFile(join(f.home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-  const requests = [];
-  const bridgeCalls = [];
-  const acks = [];
-  const state = { outstanding: null, delivery: 0, refuseAfterCollect: false };
-  const collect = async (request) => {
-    const wakingOnly = request.collect.wakingOnly === true;
-    const held = state.outstanding;
-    const noticesOnly = held && carriesBatch(held.batch) && !listedIn(held.batch, "messages") && !listedIn(held.batch, "missed");
-    if (held && !(wakingOnly && noticesOnly)) return { ...held.batch, delivery: held.id, redelivered: true };
-    const response = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/inbox?as=${as}&collect=1&limit=10${wakingOnly ? "&waking=1" : ""}`, {
-      headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
-    });
-    const answer = { ...(await response.json()), v: 1, boundTo: as };
-    bridgeCalls.push({ wakingOnly, answer });
-    if (held && carriesBatch(answer)) for (const key of NOTICE_KEYS) if (held.batch[key] !== undefined && answer[key] === undefined) answer[key] = held.batch[key];
-    if (carriesBatch(answer)) state.outstanding = { id: ++state.delivery, batch: answer };
-    if (state.refuseAfterCollect) {
-      state.refuseAfterCollect = false;
-      return { v: 1, ok: false, error: "unattested", message: "The process that asked changed while its collect ran; the mail is kept for the session." };
-    }
-    return carriesBatch(answer) ? { ...answer, delivery: state.delivery } : answer;
-  };
-  const server = createServer((socket) => {
-    let text = "";
-    socket.on("data", async (chunk) => {
-      text += chunk;
-      const end = text.indexOf("\n");
-      if (end < 0) return;
-      const request = JSON.parse(text.slice(0, end));
-      requests.push(request);
-      let answer = { v: 1, ok: true };
-      if (request.bind) answer = { v: 1, ok: true, bound: { conversationId: as, pid: 1, cli: "agy" } };
-      else if (request.collect) answer = await collect(request);
-      else if (request.ack) {
-        acks.push(request.ack.delivery);
-        if (state.outstanding?.id === request.ack.delivery) state.outstanding = null;
-        answer = { v: 1, ok: true, acked: request.ack.delivery };
-      }
-      socket.end(`${JSON.stringify(answer)}\n`);
-    });
-  });
-  await new Promise((resolve) => server.listen(join(dir, "gyredeck.broker.sock"), resolve));
-  server.unref();
-  openFakeServers.add(server);
-  return { requests, bridgeCalls, acks, state, close: () => new Promise((resolve) => { openFakeServers.delete(server); server.close(resolve); }) };
-};
+const relayBroker = (f, as) => forwardingBroker(f.home, `http://127.0.0.1:${f.bridgePort}`, { as, cli: "agy" });
 
 test("#259 r1: a notice-only batch refused after the collect is kept, arrives once, and not after its ack", async () => {
   const f = await agyPasteFixture("r1nb");
@@ -13148,7 +13405,15 @@ test("#259 C5: a broker that withholds the collect does not use up the line", as
     }
     assert.equal(await confirmedIn(f, f.agy), true, "premise: the paste confirmed it");
     assert.equal(heavyCount(held.text), 0, "premise: nothing of the collect reached this invocation");
-    const next = await f.invoke();
+    // The next drain goes through a broker that serves it: a member's mail is the broker's
+    // to hand over (#274), so with none at all it would be refused and deliver nothing.
+    const serving = await forwardingBroker(f.home, `http://127.0.0.1:${f.proxyPort}`);
+    let next;
+    try {
+      next = await f.invoke();
+    } finally {
+      await serving.close();
+    }
     assert.doesNotMatch(next.stderr, /mail withheld/, "premise: this one reached the bridge");
     assert.equal(heavyCount(next.text), 1, "C5: the next drain that delivers carries it");
   } finally {
@@ -13157,7 +13422,7 @@ test("#259 C5: a broker that withholds the collect does not use up the line", as
 });
 
 test("#259 C6: leaving and rejoining is told once more, each phase read to a control first", async () => {
-  const f = await agyPasteFixture("h6");
+  const f = await agyPasteFixture("h6", { withBroker: true });
   try {
     assert.equal(heavyCount((await f.invoke(f.password)).text), 1, "premise: told on the first confirm");
     assert.equal(heavyCount((await f.invoke()).text), 0, "control: once");
@@ -13313,7 +13578,7 @@ const quietRoom = async (h, tag) => {
   /** A watch as the founder; `frames` fills as data arrives, `ended` resolves when the server closes it. */
   const watch = async (query = "") => {
     const controller = new AbortController();
-    const response = await fetch(`${h.base}/mail/${room.code}/events?as=${founder}${query}`, { headers: { "x-gyredeck-token": room.password }, signal: controller.signal });
+    const response = await fetch(`${h.base}/mail/${room.code}/events?as=${founder}${query}`, { headers: { ...(await h.member(founder)), "x-gyredeck-token": room.password }, signal: controller.signal });
     assert.equal(response.status, 200);
     const frames = [];
     const ended = (async () => {
@@ -13372,7 +13637,7 @@ test("quiet: a resumed watch — once and plain — is not woken by a quiet noti
     again.close();
 
     // Collected all the same.
-    const collected = await fetch(`${h.base}/mail/inbox?as=${q.founder}&collect=1`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    const collected = await fetch(`${h.base}/mail/inbox?as=${q.founder}&collect=1`, { headers: await h.member(q.founder) }).then((r) => r.json());
     const heavy = (collected.messages ?? []).filter((m) => m.text.startsWith("HEAVY RUN: "));
     assert.equal(heavy.length, 2, JSON.stringify(collected.messages));
     assert.ok(heavy.every((m) => m.quiet === true), "marked on the message itself");
@@ -13387,14 +13652,14 @@ test("quiet: a held wait does not return for quiet notices already waiting, and 
     await h.start();
     const q = await quietRoom(h, "2");
     await q.join();
-    await fetch(`${h.base}/mail/inbox?as=${q.founder}&collect=1`, { headers: { "x-gyredeck-token": h.token() } });
+    await fetch(`${h.base}/mail/inbox?as=${q.founder}&collect=1`, { headers: await h.member(q.founder) });
     await reportObserved(h, [observedRun()]);
     // Premise: a quiet notice is waiting to be collected.
-    const pending = await fetch(`${h.base}/mail/inbox?as=${q.founder}`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    const pending = await fetch(`${h.base}/mail/inbox?as=${q.founder}`, { headers: await h.member(q.founder) }).then((r) => r.json());
     assert.equal(pending.messages.length, 1);
-    const timedOut = await fetch(`${h.base}/mail/wait?as=${q.founder}&timeout=1&collect=1`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    const timedOut = await fetch(`${h.base}/mail/wait?as=${q.founder}&timeout=1&collect=1`, { headers: await h.member(q.founder) }).then((r) => r.json());
     assert.equal(timedOut.timedOut, true, "the quiet notice did not end the wait");
-    const woken = fetch(`${h.base}/mail/wait?as=${q.founder}&timeout=10&collect=1`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    const woken = fetch(`${h.base}/mail/wait?as=${q.founder}&timeout=10&collect=1`, { headers: await h.member(q.founder) }).then((r) => r.json());
     await settle(200);
     await q.say("WAKE-WAIT");
     const answer = await woken;
@@ -13407,7 +13672,7 @@ test("quiet: a held wait does not return for quiet notices already waiting, and 
 
 /**
  * A broker that behaves as the native one does where it matters here (broker.rs): a collect
- * is one bridge collect for the bound session, with `waking=1` when the hook asks
+ * is one bridge collect for the bound session, on the app's word, with `waking=1` when the hook asks
  * `wakingOnly`; a batch with anything in it is held until its delivery is acknowledged and
  * handed out again until then; an acknowledgement drops it for good.
  */
@@ -13426,7 +13691,7 @@ const statefulBroker = async (h, home, session) => {
     }
     if (outstanding) return { ...outstanding.batch, delivery: outstanding.delivery, redelivered: true };
     const waking = request.collect?.wakingOnly === true ? "&waking=1" : "";
-    const body = await fetch(`${h.base}/mail/inbox?as=${session}&collect=1&limit=${request.collect?.limit ?? 100}${waking}`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json());
+    const body = await fetch(`${h.base}/mail/inbox?as=${session}&collect=1&limit=${request.collect?.limit ?? 100}${waking}`, { headers: { "x-gyredeck-token": h.token(), "x-gyredeck-broker": TEST_APP_WORD } }).then((r) => r.json());
     const batch = { ...body, v: 1, boundTo: session };
     if ((body.messages ?? []).length === 0 && (body.missed ?? []).length === 0) return batch;
     delivery += 1;
@@ -13488,9 +13753,9 @@ const quietPendingIn = async (h, tag) => {
   await h.start();
   const q = await quietRoom(h, tag);
   await q.join();
-  await fetch(`${h.base}/mail/inbox?as=${q.founder}&collect=1`, { headers: { "x-gyredeck-token": h.token() } });
+  await fetch(`${h.base}/mail/inbox?as=${q.founder}&collect=1`, { headers: await h.member(q.founder) });
   await reportObserved(h, [observedRun()]);
-  const pending = async () => (await fetch(`${h.base}/mail/inbox?as=${q.founder}`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json())).messages ?? [];
+  const pending = async () => (await fetch(`${h.base}/mail/inbox?as=${q.founder}`, { headers: await h.member(q.founder) }).then((r) => r.json())).messages ?? [];
   const before = await pending();
   assert.equal(before.length, 1, "premise: one quiet notice pending");
   assert.equal(before[0].quiet, true);
@@ -13582,12 +13847,12 @@ const quietPile = async (tag, { quiet = QUIET_PILE, tell = true, broker = true }
     await h.start();
     const q = await quietRoom(h, tag);
     await q.join();
-    await fetch(`${h.base}/mail/inbox?as=${q.founder}&collect=1`, { headers: { "x-gyredeck-token": h.token() } });
+    await fetch(`${h.base}/mail/inbox?as=${q.founder}&collect=1`, { headers: await h.member(q.founder) });
     // Each new observed run says one start and one end of the run before it.
     for (let index = 0; index * 2 < quiet - 1; index += 1) await reportObserved(h, [observedRun({ pid: 7000 + index })]);
     if (quiet > 0 && quiet % 2 === 0) await reportObserved(h, []);
     if (tell) await q.say("WAKE-BEHIND-QUIET");
-    const pending = async () => (await fetch(`${h.base}/mail/inbox?as=${q.founder}&limit=100`, { headers: { "x-gyredeck-token": h.token() } }).then((r) => r.json())).messages ?? [];
+    const pending = async () => (await fetch(`${h.base}/mail/inbox?as=${q.founder}&limit=100`, { headers: await h.member(q.founder) }).then((r) => r.json())).messages ?? [];
     const now = await pending();
     assert.equal(now.filter((m) => m.quiet === true).length, quiet, `premise: ${quiet} quiet notices pending`);
     assert.equal(now.filter((m) => m.text === "WAKE-BEHIND-QUIET").length, tell ? 1 : 0, "premise: the tell, or none");
@@ -13630,50 +13895,82 @@ const pileRows = [
   { row: "12 quiet, no tell: nothing taken, no cursor moved", quiet: QUIET_PILE, tell: false, want: null },
 ];
 let pileTag = 0;
+// Over TCP a hook's wait reads in the member's name with only the machine token, which since
+// #274 is refused for a room member: the TCP rows say that refusal takes nothing and moves
+// no cursor, whatever is piled up. The broker rows carry what the pile proves.
+const TCP_REFUSED = /the bridge refused the read \(not_your_key\)/;
 for (const hook of QUIET_HOOKS) {
-  for (const path of ["broker", "tcp"]) {
-    for (const { row, quiet, tell, want } of pileRows) {
-      test(`quiet r3 [${hook.name} · ${path}]: ${row}`, async () => {
-        pileTag += 1;
-        const f = await quietPile(`${pileTag}`, { quiet, tell, broker: path === "broker" });
-        try {
-          const waiting = f.wait(hook, want === null ? 2 : 10);
-          const code = await waiting.exited;
-          if (want === null) {
-            assert.equal(code, hook.timedOutCode, waiting.stderr);
-            assert.ok(!waiting.stdout.includes("HEAVY RUN"), "nothing quiet was handed over");
-            assert.equal((await f.pending()).filter((m) => m.quiet === true).length, QUIET_PILE, "and nothing was taken");
-          } else {
-            assert.equal(code, 0, waiting.stderr);
-            const answer = JSON.parse(waiting.stdout);
-            assert.equal(answer.timedOut, false);
-            assert.equal(shape(answer.messages), want);
-            if (path === "broker") await until(() => f.broker.outstanding() === null, "the hook acknowledged it");
-            assert.equal((await f.pending()).length, 0, "the cursor moved past all of them");
-          }
-        } finally {
-          await f.cleanup();
-        }
-      });
-    }
-    test(`quiet r3 [${hook.name} · ${path}]: a wait killed over 12 quiet, then a tell — nothing is lost`, async () => {
+  for (const { row, quiet, tell, want } of pileRows) {
+    test(`quiet r3 [${hook.name} · broker]: ${row}`, async () => {
       pileTag += 1;
-      const f = await quietPile(`${pileTag}`, { tell: false, broker: path === "broker" });
+      const f = await quietPile(`${pileTag}`, { quiet, tell, broker: true });
       try {
-        const waiting = f.wait(hook, 10);
-        // Premise: it has looked at least once and found nothing that wakes it.
-        if (path === "broker") await until(() => waitingCollects(f.broker) >= 1, "a waiting collect");
-        else await settle(1_000);
-        assert.equal(waiting.stdout, "");
-        waiting.child.kill("SIGKILL");
-        await waiting.exited;
-        await f.q.say("WAKE-BEHIND-QUIET");
-        assert.equal(shape(await f.pending()), PILED, "all twelve and the tell are still there");
+        const waiting = f.wait(hook, want === null ? 2 : 10);
+        const code = await waiting.exited;
+        if (want === null) {
+          assert.equal(code, hook.timedOutCode, waiting.stderr);
+          assert.ok(!waiting.stdout.includes("HEAVY RUN"), "nothing quiet was handed over");
+          assert.equal((await f.pending()).filter((m) => m.quiet === true).length, QUIET_PILE, "and nothing was taken");
+        } else {
+          assert.equal(code, 0, waiting.stderr);
+          const answer = JSON.parse(waiting.stdout);
+          assert.equal(answer.timedOut, false);
+          assert.equal(shape(answer.messages), want);
+          await until(() => f.broker.outstanding() === null, "the hook acknowledged it");
+          assert.equal((await f.pending()).length, 0, "the cursor moved past all of them");
+        }
+      } finally {
+        await f.cleanup();
+      }
+    });
+    test(`quiet r3 [${hook.name} · tcp]: ${row.split(":")[0]} — a room member's wait without its key is refused (#274): nothing taken, no cursor moved`, async () => {
+      pileTag += 1;
+      const f = await quietPile(`${pileTag}`, { quiet, tell, broker: false });
+      try {
+        const before = shape(await f.pending());
+        assert.equal(before, want ?? Array(QUIET_PILE).fill("Q").join(","), "premise: the pile is waiting");
+        const waiting = f.wait(hook, 2);
+        const code = await waiting.exited;
+        assert.equal(code, 2, `refused, not a timeout: ${waiting.stderr}`);
+        assert.match(waiting.stderr, TCP_REFUSED);
+        assert.equal(waiting.stdout, "", "nothing was handed over");
+        assert.equal(shape(await f.pending()), before, "nothing taken, no cursor moved");
       } finally {
         await f.cleanup();
       }
     });
   }
+  test(`quiet r3 [${hook.name} · broker]: a wait killed over 12 quiet, then a tell — nothing is lost`, async () => {
+    pileTag += 1;
+    const f = await quietPile(`${pileTag}`, { tell: false, broker: true });
+    try {
+      const waiting = f.wait(hook, 10);
+      // Premise: it has looked at least once and found nothing that wakes it.
+      await until(() => waitingCollects(f.broker) >= 1, "a waiting collect");
+      assert.equal(waiting.stdout, "");
+      waiting.child.kill("SIGKILL");
+      await waiting.exited;
+      await f.q.say("WAKE-BEHIND-QUIET");
+      assert.equal(shape(await f.pending()), PILED, "all twelve and the tell are still there");
+    } finally {
+      await f.cleanup();
+    }
+  });
+  test(`quiet r3 [${hook.name} · tcp]: a wait over 12 quiet is refused without its key, and a tell after it is not lost (#274)`, async () => {
+    pileTag += 1;
+    const f = await quietPile(`${pileTag}`, { tell: false, broker: false });
+    try {
+      const waiting = f.wait(hook, 10);
+      const code = await waiting.exited;
+      assert.equal(code, 2, `refused at once, not held: ${waiting.stderr}`);
+      assert.match(waiting.stderr, TCP_REFUSED);
+      assert.equal(waiting.stdout, "");
+      await f.q.say("WAKE-BEHIND-QUIET");
+      assert.equal(shape(await f.pending()), PILED, "all twelve and the tell are still there");
+    } finally {
+      await f.cleanup();
+    }
+  });
 }
 
 test("quiet r3: a foreground collect pages by the plain limit, quiet included — through the broker and over TCP", async () => {
@@ -13682,7 +13979,7 @@ test("quiet r3: a foreground collect pages by the plain limit, quiet included �
     const f = await quietPile(`${pileTag}`, { broker: path === "broker" });
     try {
       const page = async () => {
-        if (path === "tcp") return fetch(`${f.h.base}/mail/inbox?as=${f.q.founder}&collect=1&limit=10`, { headers: { "x-gyredeck-token": f.h.token() } }).then((r) => r.json());
+        if (path === "tcp") return fetch(`${f.h.base}/mail/inbox?as=${f.q.founder}&collect=1&limit=10`, { headers: await f.h.member(f.q.founder) }).then((r) => r.json());
         const batch = await f.broker.ask({ v: 1, collect: { limit: 10 } });
         if (batch.delivery) await f.broker.ask({ v: 1, ack: { delivery: batch.delivery } });
         return batch;

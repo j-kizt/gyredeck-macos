@@ -895,12 +895,22 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // Left out once the room sees a watch of this session's: it is the longest part of a
   // delivery and went to sessions already watching on every turn (#157). An older bridge
   // that does not say is answered as before.
-  if (room_ && confirmed && result?.watching !== true) {
+  // The watch reads in this session's name, which takes its own key (#274); the bridge
+  // hands it only to a collect the broker made, so without one there is no watch to offer.
+  const memberKey = typeof result?.memberKey === "string" && /^[a-f0-9]{64}$/.test(result.memberKey) ? result.memberKey : null;
+  if (room_ && confirmed && result?.watching !== true && !memberKey) {
+    lines.push(
+      "HEAR — this delivery carries no key for watching the room in this session's name: the room" +
+        " hands one only through the Gyredeck broker, and will not open a watch without it." +
+        " Tell the person you cannot hear the room until this session's hook reads through the broker.",
+    );
+  }
+  if (room_ && confirmed && result?.watching !== true && memberKey) {
     lines.push(
       `HEAR — so a message reaches you without waiting to be typed at, keep one watch on` +
         " this room. Run this, with the room's password in place of THE ROOM PASSWORD:\n" +
         `while :; do\n` +
-        `  { curl -sN --fail "http://${endpoint.hostname}:${endpoint.port}/mail/${room_}/events?as=${room}&since=resume" -H "x-gyredeck-token: THE ROOM PASSWORD"; echo $? > /tmp/gy-${room_}.st; } \\\n` +
+        `  { curl -sN --fail "http://${endpoint.hostname}:${endpoint.port}/mail/${room_}/events?as=${room}&since=resume" -H "x-gyredeck-token: THE ROOM PASSWORD" -H "x-gyredeck-member: ${memberKey}"; echo $? > /tmp/gy-${room_}.st; } \\\n` +
         `    | grep --line-buffered '^data: '\n` +
         `  [ "$(cat /tmp/gy-${room_}.st)" = "22" ] && { echo "gyredeck: room ${room_} is gone - watch ended"; break; }\n` +
         `  sleep 1\n` +

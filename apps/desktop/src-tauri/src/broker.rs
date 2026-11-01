@@ -94,6 +94,10 @@ impl KnownCli {
     pub(crate) fn from_executable_name(name: &str) -> Option<Self> {
         match name {
             "claude" => Some(Self::Claude),
+            // The npm package installs the same signed binary as `bin/claude.exe` (2.1.x,
+            // measured 2026-11-02): that name is what the OS reports, and the signature is
+            // still checked against Claude's requirement, so the name alone grants nothing.
+            "claude.exe" => Some(Self::Claude),
             "agy" => Some(Self::Antigravity),
             // agy updates itself in place: the running binary is renamed `agy.<digits>.old`
             // and a session that was bound as `agy` keeps running from it. Its signature is
@@ -1176,6 +1180,14 @@ mod tests {
     fn an_agy_that_updated_itself_is_still_agy_and_nothing_else_is() {
         assert_eq!(KnownCli::from_executable_name("agy.1792133654528639000.old"), Some(KnownCli::Antigravity));
         for name in ["agy.old", "agy..old", "agy.12x.old", "agy.123", "xagy.1.old", "agy.1.old.sh", "claude.1.old"] {
+            assert_eq!(KnownCli::from_executable_name(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_claude_installed_from_npm_is_claude_and_nothing_else_is() {
+        assert_eq!(KnownCli::from_executable_name("claude.exe"), Some(KnownCli::Claude));
+        for name in ["claude.exe.old", "xclaude.exe", "claude.EXE", "claude.ex", "agy.exe", "claude.exe "] {
             assert_eq!(KnownCli::from_executable_name(name), None, "{name}");
         }
     }

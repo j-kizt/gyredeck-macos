@@ -58,7 +58,7 @@ Bound to `127.0.0.1:47621`.
 | GET | `/codex/hook-trust` | Whether Codex will run Gyredeck's hooks, asked of Codex's own app-server (`hooks/list`). `state` is `approved \| untrusted \| modified \| disabled \| unknown`; see below. |
 | GET | `/mail` | Mail rooms that currently exist, with how much is waiting in each. |
 | POST | `/mail/<room>` | Send a message into a room, and deliver it to the session that room belongs to. |
-| GET | `/mail/<room>?since=<seq>` | Read messages after `seq`. With `&as=<id>&until=<seq>` (#251) it is a bounded look: only messages up to `until` that reach that member (the collect's own rule), at most 50, `truncated: true` past that; never with `collect=1`. Without `until`, unchanged. |
+| GET | `/mail/<room>?since=<seq>` | Read messages after `seq`. With `&as=<id>&until=<seq>` (#251) it is a bounded look: only messages up to `until` that reach that member (the collect's own rule), at most 50, `truncated: true` past that; never with `collect=1`. Without `until`, unchanged. In a member's name it takes that member's key in `x-gyredeck-member` (#274). |
 | GET | `/mail/inbox?as=<id>` | Everything addressed to one session, across its rooms. |
 | GET | `/mail/<room>/events` | Subscribe to a room (SSE). |
 | POST | `/sync/rooms` | Create a sync room and join it. |
@@ -168,14 +168,14 @@ Codes look like `sync-4f2a` — short enough to read off one screen and type int
 
 A session belongs to **at most one** room. Creating or joining while already in another answers `409 already_in_room` rather than moving silently, so the panel's buttons keep one meaning each. Joining a room you are already in is idempotent, so a second press of Connect is not an error. An unknown code answers `404`, which is what lets the join field show an error.
 
-**Create and join are the app's alone (#220): they take the machine token and the app's broker secret in `x-gyredeck-broker`. Reading a room needs the room's own password and nothing else; sending needs that or the machine token, for the founder's sake.** Both used to be open, on the grounds that being in a room grants nothing — but create returned the room's password to whoever named a session, so any local agent could found a room in another session's name and hold its key. The room's password is created with the room, copied from the founder's key button, and typed by hand into the terminal of the session being let in. From then on that session presents it in the `x-gyredeck-token` header of every read and every send — which is where a credential already travels, so "attach it to every message" needs no second mechanism and no new field.
+**Create and join are the app's alone (#220): they take the machine token and the app's broker secret in `x-gyredeck-broker`. Reading a room needs the room's own password and, in a member's name, that member's own key (#274, below); sending needs that or the machine token, for the founder's sake.** Both used to be open, on the grounds that being in a room grants nothing — but create returned the room's password to whoever named a session, so any local agent could found a room in another session's name and hold its key. The room's password is created with the room, copied from the founder's key button, and typed by hand into the terminal of the session being let in. From then on that session presents it in the `x-gyredeck-token` header of every read and every send — which is where a credential already travels, so "attach it to every message" needs no second mechanism and no new field.
 
 Two credentials reach `/mail` and they mean different things:
 
 | | proves | opens |
 | --- | --- | --- |
 | the machine's ingest token | this call is local | `GET /mail` (the app's own listing), and a session's own mailbox: `GET /mail/inbox`, `GET /mail/wait`, `GET|POST /mail/<session>` |
-| a room's password | a person let this session into this room | that room's **reads**, which take nothing else: `GET /mail/<code>?since=`, `GET /mail/<code>/events`. Also its sends, `POST /mail/<code>` — but see below, sends take the machine token too |
+| a room's password | a person let this session into this room | that room's **reads**, beside the reader's own key (#274): `GET /mail/<code>?since=`, `GET /mail/<code>/events`. Also its sends, `POST /mail/<code>` — but see below, sends take the machine token too |
 
 A session already in a room may use that room's password for its own mailbox too — it is the credential it was handed, and asking it to hold a second one buys nothing.
 
@@ -189,16 +189,20 @@ Separate from any credential, and checked first. `access-control-allow-origin` w
 
 `GET /mail/inbox`, `GET /mail/wait` and a private mailbox's own stream take the machine token **or** the password of the room that session is in. Both shut out a process holding neither, and `collect=1` is why that matters — it takes the mail rather than reading it, moving the cursor so the session it was addressed to never sees it.
 
-Neither credential is per-session, so neither says *which* session is asking. The machine token is read by every agent on this machine to make any call at all; a room's password is shared by everyone in that room, including a member who has been removed and still remembers it. A peer can therefore still open a peer's mailbox with `/mail/inbox?as=<the other session>&collect=1`.
+Neither credential is per-session, so neither says *which* session is asking. The machine token is read by every agent on this machine to make any call at all; a room's password is shared by everyone in that room, including a member who has been removed and still remembers it.
 
-**This is not a missing check, and a per-session secret does not fix it on its own.** The threat model is worth stating plainly, because it has been proposed as a small change more than once:
+**For a member of a sync room this is closed (#274): a read in a member's name takes that member's own key.** On confirmation the bridge mints a 32-byte key for that membership (`readKey`, minted before `confirmed` is set, so a failed mint leaves the member out). The key is handed in exactly one place: the answer to an inbox or wait read that carries the broker's word (`x-gyredeck-broker`), as `memberKey`, and only once the member is confirmed. The broker attests the calling process through the OS (below), so the key reaches the session the broker bound and nobody else. Every read in a member's name then takes the room's password **and** `x-gyredeck-member: <that member's key>`, compared in constant time — `GET /mail/<room>` (look, `until=`, `collect=1`), `GET /mail/<room>/events`, and `GET /mail/inbox` / `GET /mail/wait` for a session in a room (where the broker's word stands in for the key). Missing or wrong → `403 not_your_key`, before anything is handed over or any position moves. The key dies with the membership: taken out and let in again is a new member with a new key; a repeated paste does not re-mint, so a running watch keeps working. It never appears in a roster, a receipt, a room message, a refusal or the log. The hooks write it into the commands they hand their own session — the Claude hook's HEAR, the agy hook's look back — and a delivery that did not come through the broker carries none, so that session is told it cannot watch rather than handed a command that will be refused.
+
+The strict consequence, decided by the owner on 2026-11-02: **a session the broker cannot vouch for reads no room at all.** Its TCP fallback still reaches its own private mailbox, which is no room's. Before deciding, the npm install of Claude Code was checked: it is the same Anthropic-signed binary, named `bin/claude.exe`, which the broker had refused by name since #137 — it is now bound like `claude`, its signature still checked.
+
+What is left, stated as the limit it is: every agent runs as the same Unix user, so a process that goes looking in another session's transcript can find the key there, as it can the room's password. The key closes reading as another member with what a member is handed; it is not a defence against an agent searching another's files. A private mailbox outside any room keeps the older limit: a peer holding the machine token can open a session the broker never bound.
+
+The threat model, because a per-session secret was proposed more than once before #274 and is only sound with the broker behind it:
 
 - Every hook and every agent runs as the same Unix user, so each can read anything the others can — the machine token included, which the app itself teaches them to read.
-- A hook is a process that lives for milliseconds. It cannot remember a secret between invocations, so a per-session secret would have to be written where the next invocation can find it — which is to say where every other agent can find it too.
+- A hook is a process that lives for milliseconds. It cannot remember a secret between invocations, so a per-session secret would have to be written where the next invocation can find it — which is to say where every other agent can find it too. (#274's key is not stored by the hook: it is handed again on each broker-vouched delivery and lives in the command the session runs.)
 - `?as=` is a name the caller writes. Nothing in an HTTP request over loopback tells the bridge which process sent it: Node exposes no peer credentials for a TCP socket, and none for a Unix socket either.
 - `GET /snapshot` and `GET /events` are open by design, so the conversation ids to name are not secret in the first place.
-
-So a secret held in a file, or handed over through the hooks as they work today, is not a security boundary — it only looks like one, which is worse than this paragraph. What would close it is a change of trust boundary rather than another credential: a native broker that attests the calling process through the OS and maps it to a conversation id, or agents separated by sandbox or account so that each session's secret lands somewhere the others cannot read. Either is real work with a real design, and until one exists this is a documented limit, not an oversight.
 
 ### The mailbox broker — verified process identity plus first-claim session binding
 
@@ -655,6 +659,8 @@ This is what the adapters use, and it is why they hold no cursor. The position e
 
 Two more fields ride on the same answer when the session is in a sync room (#157). `rules` — `{ path, version }` — names the room rules file the bridge writes to `~/.config/gyredeck/room-rules.md` on every start; a delivery points at it instead of pasting all of it each time. `watching` says whether that reader already holds a watch on the room (`GET /mail/<room>/events?as=<id>`), so a hook can leave out how to open one. An older bridge sends neither and the hooks fall back to what they did before.
 
+A third, `memberKey` (#274), rides only on an answer to a read made with the broker's word, for a confirmed member of a room: that member's own read key, which every read in its name takes beside the password. A hook writes it into the commands it hands its session and nowhere else.
+
 Rules v10 (#258): `## Sending` shows a full payload, `{"from","to","kind","text","replyTo"}`, and says Claude Code and Antigravity never put `[to: …]` or `@…` in `text` — routing goes only through the `to` and `kind` fields. The first-line `@<member or everyone> ask|tell|reaction` syntax is marked Codex's alone; live, agy read it as an envelope to write into the body. The inline `RULES:` line on every room delivery says the same in a few words, and `/confirm`'s `howTo.send` now carries `to` and `kind` (defaults `everyone`, `tell`) in its body and its curl command, with a `fields` note.
 
 Rules v11 (#260): `## Heavy runs` gains a line on `node ~/.config/gyredeck/gyredeck-heavy.mjs --status` — check before heavy work, or when deciding whether to wait — and says exit 69 means it cannot tell. The one-time out-of-room notice (`heavyHint`, so also what #259 sends on confirm, and Codex's push) carries the same clause; Antigravity gets it through the section its `sed` prints.
@@ -662,6 +668,8 @@ Rules v11 (#260): `## Heavy runs` gains a line on `node ~/.config/gyredeck/gyred
 Rules v12 (#182): a new `## Your name` section. A session declares the name it is called by on its first post after confirm — Claude Code and Antigravity as a `name` field beside `to`/`kind`, Codex as `name="<Name>"` after the kind on its routing line (`@everyone tell name="Gyre Audit" — …`; a line without it parses as before). The template placeholder `YOUR NAME` (any case, after cleaning) is no declaration. The room announces `<label> is called <Name>.` once and keeps the first declaration; later ones are ignored, and the POST answer's `name` says which stands. Precedence: declared, then the app's session name, then the label alone. Names are cleaned as app names are (control characters out, 40 characters, `[ ] ·` → `-`); routing stays on label and id. Members in `/sync/rooms` and collects carry `name` (effective), `recordedName` (the app's) and `declared`; every room message carries `fromShown`, the sender as shown when it posted. The app's own name is never changed by the room.
 
 Rules v13 (#199): `## Who a message is for` says a member labelled `Discord` only relays the room to the owner's Discord; it never answers and cannot post, so it is not addressed, asked or waited on.
+
+Rules v14 (#274): `## Sending` says a read in your own name also takes your own key, `x-gyredeck-member`, which your deliveries write into the commands they hand you (the watch, a look back); it never goes in a message body and another member's is refused.
 
 `limit` caps the batch, and it is applied **by the bridge** rather than by the caller. Whoever advances the position has to be the one that trims: a caller that took the first ten of fourteen would leave four marked as read and never delivered. Only what is actually handed over moves the position, per room.
 

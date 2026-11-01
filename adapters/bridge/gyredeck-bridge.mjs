@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 13;
+export const ROOM_RULES_VERSION = 14;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -263,6 +263,7 @@ room names the version it expects; if it names a newer one than you read, read t
 - Codex: your seq is reported on the next message you get, with the turn, recipient and kind it belongs to. Until then a message has not failed — **do not send it again**. A room or a mailbox posts an identical tell to the same member within a minute only once. Claude Code and Antigravity, which post with curl, can add \`"again": true\` to say the same thing again on purpose; Codex has no such switch, so a word-for-word repeat within the minute is taken as a resend.
 - \`listening\` in a receipt names the members with a watch open; a member that is pushed to, as Codex is, hears you without one.
 - Never put the room's password in a message body.
+- Reading the room in your name also takes your own key, \`x-gyredeck-member\`. Your deliveries write it into the commands they hand you (the watch, a look back): run those as given. Never put it in a message body, and never use another member's — the room refuses a read whose key is not the reader's.
 
 ## Narrate
 The person at your terminal can follow the room only through you. Say what came in and who sent it;
@@ -3432,8 +3433,13 @@ function startBridge(config) {
    * in the push that confirms it (Codex) — so a session that joined a room before it was
    * ever told outside one still learns of the helper. Kept on the membership, so leaving
    * and coming back is a new confirmation, told again.
+   *
+   * It is also when the member's read key is minted (#274): the room's password is shared,
+   * so a read in a member's name takes this key as well, and the key is handed only to a
+   * read the broker vouches for. Minted first, so a failure leaves the member unconfirmed.
    */
   const markConfirmed = (member) => {
+    member.readKey = randomBytes(32).toString("hex");
     member.confirmed = true;
     member.confirmedAt = new Date().toISOString();
     member.heavyOwed = true;
@@ -4799,8 +4805,12 @@ function startBridge(config) {
    * sub-second budget and would otherwise need a second request to know who it is
    * talking to.
    */
-  const describeInbox = (messages, sync, as, missed = []) => ({
+  const describeInbox = (messages, sync, as, missed = [], vouched = false) => ({
     messages,
+    // Handed only to the read the broker vouched for, and only once the member is in (#274).
+    ...(vouched && sync?.room.members.get(as)?.confirmed === true && typeof sync.room.members.get(as)?.readKey === "string"
+      ? { memberKey: sync.room.members.get(as).readKey }
+      : {}),
     // Only when something was actually lost. An empty field on every answer is noise
     // that teaches readers to skip the one time it matters.
     ...(missed.length > 0
@@ -4982,12 +4992,12 @@ function startBridge(config) {
    * why that matters: it does not merely read the mail, it takes it, moving the cursor so
    * the session it was addressed to never sees it.
    *
-   * What this cannot do is say *which* session is asking, so it is not yet the rule the
-   * name `as` implies. Neither credential is per-session: the machine token is read by
-   * every agent on this machine to make any call at all, and a room's password is shared
-   * by everyone in that room, an ex-member who still remembers it included. So a peer can
-   * still open a peer's mailbox. Closing that needs a per-session credential, which does
-   * not exist yet — see `event-protocol.md`, "What a mailbox credential does not prove".
+   * What this cannot do is say *which* session is asking. Neither credential is
+   * per-session: the machine token is read by every agent on this machine to make any call
+   * at all, and a room's password is shared by everyone in that room, an ex-member who
+   * still remembers it included. For a room member the inbox and wait routes ask for its
+   * own key or the broker's word as well (#274); a mailbox outside any room keeps this
+   * limit — see `event-protocol.md`, "What a mailbox credential does not prove".
    */
   const holdsMailboxCredential = (mailboxName, headerValue) => {
     if (holdsMachineToken(headerValue)) return true;
@@ -5019,8 +5029,25 @@ function startBridge(config) {
         message: `Name yourself with ?as=<conversationId>; only a confirmed member of this room may ${verb} it.`,
       };
     }
+    // The password says a person let *someone* in; every member holds it. Only the key
+    // says the reader is the member it names (#274).
+    if (!holdsMemberKey(room.members.get(as), req)) return { error: "not_your_key", message: MEMBER_KEY_HINT };
     return null;
   };
+
+  /**
+   * A member's own read key (#274), in `x-gyredeck-member`. It reaches a session only in a
+   * collect the broker made for it, which is the one read that knows which process asks, so
+   * holding it is what tells one member's read from another's. A member with no key —
+   * unconfirmed, or the relay, which reads by the app's word — never matches.
+   */
+  const MEMBER_KEY_HEADER = "x-gyredeck-member";
+  const MEMBER_KEY_HINT =
+    "A read in a member's name takes that member's own key in x-gyredeck-member, beside the room's password." +
+    " The key arrives with this session's own deliveries, written into the commands they hand you; a session" +
+    " the Gyredeck broker cannot vouch for is never given one.";
+  const holdsMemberKey = (member, req) =>
+    typeof member?.readKey === "string" && matchesIngestToken(member.readKey, req?.headers?.[MEMBER_KEY_HEADER]);
 
   /**
    * The one door for every read made as a relay member (#199 r3) — the stream, the backlog,
@@ -7286,6 +7313,14 @@ function startBridge(config) {
           sendJson(403, { ok: false, ...relayRefusal });
           return;
         }
+        // A room member's mailbox carries its room, and the key that reads it: the broker's
+        // word, or the member's own key — never the shared password alone (#274).
+        const vouched = holdsBrokerSecret(brokerHeader);
+        const inRoom = syncRoomFor(as);
+        if (inRoom && !vouched && inRoom.room.members.get(as)?.relay !== true && !holdsMemberKey(inRoom.room.members.get(as), req)) {
+          sendJson(403, { ok: false, error: "not_your_key", message: MEMBER_KEY_HINT });
+          return;
+        }
         const diagnoseSilence = (sync) => {
           if (!sync) return null;
           const mine = [...sync.room.messages].reverse().find((message) => message.from === as);
@@ -7448,7 +7483,7 @@ function startBridge(config) {
               ok: true,
               timedOut,
               ...(timedOut ? { yourLastMessage: diagnoseSilence(sync) } : {}),
-              ...describeInbox(collected, sync, as, missed),
+              ...describeInbox(collected, sync, as, missed, vouched),
             });
           };
 
@@ -7510,7 +7545,7 @@ function startBridge(config) {
           // A collect that found nothing says why the last thing this session said drew
           // nothing, as a timed-out wait does: the hook's `wait` is built from collects.
           ...(collect && collected.length === 0 ? { yourLastMessage: diagnoseSilence(sync) } : {}),
-          ...describeInbox(collected, sync, as, missed),
+          ...describeInbox(collected, sync, as, missed, vouched),
           ...(() => {
             if (collect && sync) noteUsageCollected(sync.name, collected.filter((message) => message.room === sync.name && message.from === ROOM_SENDER), as);
             // Neither notice on a wait's poll (#259): a wait prints only what wakes it and
@@ -7830,8 +7865,8 @@ function startBridge(config) {
             return;
           }
         }
-        // A private mailbox is read by its one reader or by nobody; a sync room is read by
-        // anyone holding its password, but *taken* in a member's name only by that
+        // A private mailbox is read by its one reader or by nobody; a sync room is read in a
+        // member's name only with that member's key (#274), and *taken* in it only by that
         // member's reader — the cursor it moves is the same one the broker's collect moves.
         const closed = !SYNC_CODE.test(name)
           ? refuseMailboxRead(name, brokerHeader)
@@ -7901,11 +7936,9 @@ function startBridge(config) {
           return;
         }
         // The stream of a private mailbox is a read of it, and the same door applies.
-        // A sync room's stream is the room's: its password admits a watcher who names
-        // any confirmed member — it does not attest the caller, an ex-member still holds
-        // it, and the watch moves that member's resume cursor. That is the limit of a
-        // shared password, written down rather than dressed up; the founder's remedy is
-        // to rotate the password or close the room.
+        // A sync room's stream is the room's: its password and the watcher's own key
+        // (#274) — the password alone is every member's, and the watch moves the named
+        // member's resume cursor.
         if (!SYNC_CODE.test(name)) {
           const closed = refuseMailboxRead(name, brokerHeader);
           if (closed) {

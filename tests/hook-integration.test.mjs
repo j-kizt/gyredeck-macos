@@ -4663,9 +4663,9 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
 // peer's mailbox — see event-protocol.md, "What a mailbox credential does not prove".
 // Left as a todo rather than a passing assertion on purpose: writing down what the hole
 // currently does would make it the contract and stand in the way of closing it.
-test("a room credential cannot collect another member's private mailbox", {
-  todo: "needs a per-session credential; agreed with the user to be its own PR after PR2",
-}, () => {});
+// "A room credential cannot collect another member's private mailbox" was a todo here,
+// waiting on a per-session credential. #274 is that credential; the claim is proven in
+// tests/room-reader-key.test.mjs ("C1 table: …"), across every route named after the session.
 
 test("every mutation and every room read needs a credential that verifies", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-auth-"));

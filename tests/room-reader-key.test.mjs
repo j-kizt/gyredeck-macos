@@ -246,6 +246,66 @@ test("C3: a take moves its reader past everything it examined — another member
   }
 });
 
+// Every route that reads or moves a position in a session's name (#274 audit, round 4).
+// The room's GET and stream are walked by the tests above; this walks the ones named after
+// the session itself, where a room member's private mail lives.
+test("C1 table: every read in a room member's own name — inbox, wait, private mailbox and its stream — is refused without its key, and the member still gets its mail", async () => {
+  const h = await startBridge();
+  try {
+    const r = await twoMembers(h);
+    const keyA = await r.keyOf("member-a");
+    const sent = await h.call("POST", "/mail/member-b", { from: "member-a", text: "private to b", replyTo: "member-a" }, { "content-type": "application/json", "x-gyredeck-token": h.token });
+    assert.ok([200, 202].includes(sent.status), `premise: posted to b's own mailbox: ${JSON.stringify(sent.body)}`);
+    const routes = [
+      ["inbox", "/mail/inbox?as=member-b"],
+      ["inbox take", "/mail/inbox?as=member-b&collect=1"],
+      ["wait take", "/mail/wait?as=member-b&timeout=1&collect=1"],
+      ["mailbox look", "/mail/member-b?as=member-b&since=0"],
+      ["mailbox take", "/mail/member-b?as=member-b&since=0&collect=1"],
+      ["mailbox take, no as", "/mail/member-b?since=0&collect=1"],
+    ];
+    const credentials = [
+      ["password alone", r.pw],
+      ["machine token alone", { "x-gyredeck-token": h.token }],
+      ["password and a's key", { ...r.pw, "x-gyredeck-member": keyA }],
+      ["machine token and a's key", { "x-gyredeck-token": h.token, "x-gyredeck-member": keyA }],
+    ];
+    for (const [route, path] of routes) {
+      for (const [why, headers] of credentials) {
+        const answer = await h.raw(path, headers);
+        assert.equal(answer.status, 403, `${route}, ${why}: ${answer.text}`);
+        assert.doesNotMatch(answer.text, /private to b/, `${route}, ${why}`);
+      }
+    }
+    for (const [why, headers] of credentials) {
+      const stream = await watch(h, "member-b", "member-b", headers);
+      assert.equal(stream.status, 403, `mailbox stream, ${why}`);
+      assert.doesNotMatch(stream.text, /private to b/, `mailbox stream, ${why}`);
+    }
+    const own = await h.call("GET", "/mail/inbox?as=member-b&collect=1", null, { "x-gyredeck-token": r.password, "x-gyredeck-broker": APP_WORD });
+    assert.equal(own.status, 200);
+    assert.ok(own.body.messages.some((m) => m.text === "private to b"), "after every refusal, b's own collect still gets it");
+    const keyB = await r.keyOf("member-b");
+    assert.equal((await h.raw("/mail/member-b?as=member-b&since=0", { ...r.pw, "x-gyredeck-member": keyB })).status, 200, "b's own key opens b's mailbox");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("C1 control: a session in no room keeps its mailbox as it was", async () => {
+  const h = await startBridge();
+  try {
+    await h.call("POST", "/mail/loner-1", { from: "someone", text: "for the loner", replyTo: "someone" }, { "content-type": "application/json", "x-gyredeck-token": h.token });
+    const look = await h.raw("/mail/loner-1?since=0", { "x-gyredeck-token": h.token });
+    assert.equal(look.status, 200, look.text);
+    assert.match(look.text, /for the loner/);
+    const inbox = await h.raw("/mail/inbox?as=loner-1&collect=1", { "x-gyredeck-token": h.token });
+    assert.equal(inbox.status, 200, inbox.text);
+  } finally {
+    await h.stop();
+  }
+});
+
 test("C3: a member's own key reads its own view, and only its own", async () => {
   const h = await startBridge();
   try {

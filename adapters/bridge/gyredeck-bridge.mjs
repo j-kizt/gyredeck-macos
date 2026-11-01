@@ -5050,6 +5050,21 @@ function startBridge(config) {
     typeof member?.readKey === "string" && matchesIngestToken(member.readKey, req?.headers?.[MEMBER_KEY_HEADER]);
 
   /**
+   * The one door for a read made in the name of a session that is in a room (#274 audit):
+   * its inbox and wait, its private mailbox and that mailbox's stream. A member's mail is
+   * taken only by the broker's collect, which knows the process asking, or with the
+   * member's own key; the shared password and the machine token are every member's and
+   * every agent's. Asked before anything is read or any position moves. A session in no
+   * room, and the relay (the app's own door), are not this door's to judge.
+   */
+  const refuseMemberRead = (as, req) => {
+    const member = syncRoomFor(as)?.room.members.get(as);
+    if (!member || member.relay === true) return null;
+    if (holdsBrokerSecret(req?.headers?.["x-gyredeck-broker"]) || holdsMemberKey(member, req)) return null;
+    return { error: "not_your_key", message: MEMBER_KEY_HINT };
+  };
+
+  /**
    * The one door for every read made as a relay member (#199 r3) — the stream, the backlog,
    * the inbox and the wait. Such a read moves the relay's position, which is the room's trim
    * floor, so the room's password is not enough: any member holds that. It takes what the
@@ -7316,9 +7331,9 @@ function startBridge(config) {
         // A room member's mailbox carries its room, and the key that reads it: the broker's
         // word, or the member's own key — never the shared password alone (#274).
         const vouched = holdsBrokerSecret(brokerHeader);
-        const inRoom = syncRoomFor(as);
-        if (inRoom && !vouched && inRoom.room.members.get(as)?.relay !== true && !holdsMemberKey(inRoom.room.members.get(as), req)) {
-          sendJson(403, { ok: false, error: "not_your_key", message: MEMBER_KEY_HINT });
+        const notTheMember = refuseMemberRead(as, req);
+        if (notTheMember) {
+          sendJson(403, { ok: false, ...notTheMember });
           return;
         }
         const diagnoseSilence = (sync) => {
@@ -7865,6 +7880,12 @@ function startBridge(config) {
             return;
           }
         }
+        // A member's private mailbox is its own, by the same door as its inbox (#274 audit).
+        const notTheMember = SYNC_CODE.test(name) ? null : refuseMemberRead(name, req);
+        if (notTheMember) {
+          sendJson(403, { ok: false, ...notTheMember });
+          return;
+        }
         // A private mailbox is read by its one reader or by nobody; a sync room is read in a
         // member's name only with that member's key (#274), and *taken* in it only by that
         // member's reader — the cursor it moves is the same one the broker's collect moves.
@@ -7949,7 +7970,7 @@ function startBridge(config) {
         // (#274) — the password alone is every member's, and the watch moves the named
         // member's resume cursor.
         if (!SYNC_CODE.test(name)) {
-          const closed = refuseMailboxRead(name, brokerHeader);
+          const closed = refuseMailboxRead(name, brokerHeader) ?? refuseMemberRead(name, req);
           if (closed) {
             refuseStream(403, closed.error, closed.message);
             return;

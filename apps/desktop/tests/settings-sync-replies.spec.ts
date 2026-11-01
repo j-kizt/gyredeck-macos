@@ -20,7 +20,7 @@ const AGENTS = [
 const detailFor = (state: State, name: string) =>
   ({
     on: `On: ${name} replies and listens in its room with no prompt each time.`,
-    off: "Off: it asks before every reply and every wait.",
+    off: "Off: Gyredeck's rules are removed; rules you added yourself still apply.",
     "hook missing": `Needs the ${name} hook — install it under Plugins`,
     checking: "Checking…",
     refused: `Can't check ${name}'s settings: ${REFUSED}`,

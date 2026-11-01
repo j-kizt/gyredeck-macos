@@ -3133,7 +3133,9 @@ test("a session declares the name it is called by on its first post; the room an
     const routedTo = async (to) => {
       const sent = await post(third, { to, text: `to ${to}` });
       assert.equal(sent.status, 202, JSON.stringify(sent.body));
-      return (await history()).find((message) => message.seq === sent.body.seq).to;
+      // Read as the sender: since #274 a line to agy is in agy's view and its sender's, not the founder's.
+      const mine = await (await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${third}&since=0`, { headers: await memberHeaders(`http://127.0.0.1:${port}`, third, password) })).json();
+      return mine.messages.find((message) => message.seq === sent.body.seq).to;
     };
     assert.equal(await routedTo("Claude Code"), founder);
     assert.equal(await routedTo("Antigravity"), agy);
@@ -3504,8 +3506,11 @@ test("a message says who it is for and what it is for, and the room routes on th
       });
       return { status: response.status, body: await response.json() };
     };
-    const history = await readRoom(founder);
+    // Read as the one who said them: since #274 a member reads what reaches it and what it
+    // said, so a line to somebody outside the room is in its sender's history and nobody else's.
+    const history = await readRoom(peer);
     const texts = history.body.messages.map((message) => message.text);
+    assert.ok(!(await readRoom(founder)).body.messages.some((message) => message.text === "ASK-ELSEWHERE"), "a line to someone else is not in the founder's history");
     for (const text of ["ASK-EVERYONE", "ACK-EVERYONE", "ASK-DIRECT", "ASK-ELSEWHERE", "NO-FIELDS"]) {
       assert.ok(texts.includes(text), `${text} is in the room's history`);
     }
@@ -12342,7 +12347,7 @@ for (const [label, tag, options, env] of [
 //  L2  With `until`, messages to other members are absent (the collect's own reachesMember).
 //  L3  With `until`, messages to everyone and to this member, in range, are present, oldest first.
 //  L4  With `until`, at most 50 come back, the oldest kept, marked truncated.
-//  L5  Without `until`, the read is exactly what it was: everything after `since`.
+//  L5  Without `until`, the read is everything after `since` that reaches the reader (#274 audit), uncapped.
 //  L6  It stays a look: no read position moves, and `until` with `collect=1` is refused.
 
 /** A confirmed agy member and another confirmed member, and four messages around them. */
@@ -12394,10 +12399,10 @@ const boundedLookCases = [
     assert.equal(body.messages[0].seq, first, "the oldest kept");
     assert.equal(body.truncated, true);
   } },
-  { name: "L5 an old caller gets the same output", run: async ({ f, seqs, look }) => {
+  { name: "L5 a read without until is everything after since that reaches the reader", run: async ({ f, seqs, look }) => {
     const { status, body } = await look(`as=${f.agy}&since=${seqs.toMe - 1}`);
     assert.equal(status, 200);
-    assert.deepEqual(body.messages.map((message) => message.seq), [seqs.toMe, seqs.toOther, seqs.toAll, seqs.later], "everything after since, as before");
+    assert.deepEqual(body.messages.map((message) => message.seq), [seqs.toMe, seqs.toAll, seqs.later], "everything after since that reaches it — a line to another member is not its to read (#274 audit)");
     assert.equal("truncated" in body, false);
   } },
   { name: "L6 the cursor is unmoved, and until refuses collect", run: async ({ f, seqs, look, pending }) => {

@@ -58,7 +58,7 @@ Bound to `127.0.0.1:47621`.
 | GET | `/codex/hook-trust` | Whether Codex will run Gyredeck's hooks, asked of Codex's own app-server (`hooks/list`). `state` is `approved \| untrusted \| modified \| disabled \| unknown`; see below. |
 | GET | `/mail` | Mail rooms that currently exist, with how much is waiting in each. |
 | POST | `/mail/<room>` | Send a message into a room, and deliver it to the session that room belongs to. |
-| GET | `/mail/<room>?since=<seq>` | Read messages after `seq`. With `&as=<id>&until=<seq>` (#251) it is a bounded look: only messages up to `until` that reach that member (the collect's own rule), at most 50, `truncated: true` past that; never with `collect=1`. Without `until`, unchanged. In a member's name it takes that member's key in `x-gyredeck-member` (#274). |
+| GET | `/mail/<room>?since=<seq>` | Read messages after `seq`. With `&as=<id>&until=<seq>` (#251) it is a bounded look: only messages up to `until` that reach that member (the collect's own rule), at most 50, `truncated: true` past that; never with `collect=1`. Without `until`, everything after `since` that reaches the reader or that it said — never a line to another member; the relay alone reads the whole room (#274 audit). In a member's name it takes that member's key in `x-gyredeck-member` (#274). |
 | GET | `/mail/inbox?as=<id>` | Everything addressed to one session, across its rooms. |
 | GET | `/mail/<room>/events` | Subscribe to a room (SSE). |
 | POST | `/sync/rooms` | Create a sync room and join it. |

@@ -163,6 +163,41 @@ test("C1: every read and take in another member's name is refused before anythin
   }
 });
 
+test("C3: a member's own key reads only what reaches it — plain, bounded or taken — and the relay still reads the whole room", async () => {
+  const h = await startBridge();
+  try {
+    const r = await twoMembers(h);
+    const keyA = await r.keyOf("member-a");
+    const secret = (await r.post("member-b", "member-b", "b to b only")).body;
+    const toA = (await r.post("member-b", "member-a", "b to a")).body;
+    const toAll = (await h.call("POST", `/mail/${r.code}`, { from: "member-b", to: "everyone", kind: "tell", text: "b to everyone" }, { "content-type": "application/json", "x-gyredeck-token": r.password })).body;
+    assert.ok([secret, toA, toAll].every((sent) => typeof sent.seq === "number"), "premise: all three posted");
+    const asA = { ...r.pw, "x-gyredeck-member": keyA };
+    const bBefore = await pendingOf(h, "member-b");
+    for (const path of [
+      `/mail/${r.code}?as=member-a`,
+      `/mail/${r.code}?as=member-a&since=0`,
+      `/mail/${r.code}?as=member-a&since=0&until=${toAll.seq}`,
+      `/mail/${r.code}?as=member-a&since=0&collect=1`,
+    ]) {
+      const answer = await h.raw(path, asA);
+      assert.equal(answer.status, 200, `${path}: ${answer.text}`);
+      const seqs = JSON.parse(answer.text).messages.map((m) => m.seq);
+      assert.ok(!seqs.includes(secret.seq), `${path}: a message to b alone is not a's to read`);
+      assert.ok(seqs.includes(toA.seq) && seqs.includes(toAll.seq), `${path}: what reaches a is there`);
+    }
+    assert.equal(await pendingOf(h, "member-a"), 0, "a's take moved a's own position past what reached it");
+    assert.equal(await pendingOf(h, "member-b"), bBefore, "and b's not at all");
+    const relayId = "discord-relay-2";
+    assert.equal((await h.call("POST", `/sync/rooms/${r.code}/members`, { conversationId: relayId, relay: "discord" })).status, 200, "premise: the relay joined");
+    const relayRead = await h.call("GET", `/mail/${r.code}?as=${relayId}&since=0`);
+    assert.equal(relayRead.status, 200, JSON.stringify(relayRead.body));
+    assert.ok(relayRead.body.messages.some((m) => m.seq === secret.seq), "the relay hears the whole room");
+  } finally {
+    await h.stop();
+  }
+});
+
 test("C3: a member's own key reads its own view, and only its own", async () => {
   const h = await startBridge();
   try {

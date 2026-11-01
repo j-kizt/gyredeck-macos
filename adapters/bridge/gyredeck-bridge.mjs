@@ -7897,7 +7897,12 @@ function startBridge(config) {
           truncated = reached.length > MAIL_LOOK_MAX;
           messages = reached.slice(0, MAIL_LOOK_MAX);
         } else {
-          messages = room ? room.messages.filter((message) => message.seq > since) : [];
+          // A member reads what reaches it, as its collect and its stream do, and what it said
+          // itself; the room as a whole is the relay's alone (#274 audit). A room nobody was put
+          // into is read as before.
+          const reader = url.searchParams.get("as") ?? "";
+          const whole = !room || room.members.size === 0 || room.members.get(reader)?.relay === true;
+          messages = room ? room.messages.filter((message) => message.seq > since && (whole || message.from === reader || reachesMember(message, reader))) : [];
         }
         if (room) {
           room.touchedAt = Date.now();

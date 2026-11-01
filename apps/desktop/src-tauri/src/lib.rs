@@ -2720,18 +2720,26 @@ fn local_day_key(date: time::OffsetDateTime) -> String {
     )
 }
 
+/// A ccusage day as `YYYY-MM-DD`, from `YYYY-MM-DD…` or `YYYYMMDD` — only a day the
+/// calendar has: a shape alone let 2026-99-99 through as a date (#276 audit).
 fn ccusage_day_key(raw: &str) -> Option<String> {
     let value = raw.trim();
-    if value.len() >= 10
+    let (year, month, day) = if value.len() >= 10
         && value.as_bytes().get(4) == Some(&b'-')
         && value.as_bytes().get(7) == Some(&b'-')
     {
-        return Some(value[..10].to_string());
+        (value.get(..4)?, value.get(5..7)?, value.get(8..10)?)
+    } else if value.len() == 8 {
+        (value.get(..4)?, value.get(4..6)?, value.get(6..8)?)
+    } else {
+        return None;
+    };
+    if ![year, month, day].iter().all(|part| part.bytes().all(|byte| byte.is_ascii_digit())) {
+        return None;
     }
-    if value.len() == 8 && value.chars().all(|ch| ch.is_ascii_digit()) {
-        return Some(format!("{}-{}-{}", &value[..4], &value[4..6], &value[6..8]));
-    }
-    None
+    let month = time::Month::try_from(month.parse::<u8>().ok()?).ok()?;
+    let date = time::Date::from_calendar_date(year.parse().ok()?, month, day.parse().ok()?).ok()?;
+    Some(format!("{:04}-{:02}-{:02}", date.year(), u8::from(date.month()), date.day()))
 }
 
 fn ccusage_day_tokens(day: &CcusageDay) -> Option<f64> {
@@ -2741,7 +2749,7 @@ fn ccusage_day_tokens(day: &CcusageDay) -> Option<f64> {
 fn ccusage_day_cost(day: &CcusageDay) -> Option<f64> {
     value_to_f64(day.cost_usd.as_ref())
         .or_else(|| value_to_f64(day.total_cost.as_ref()))
-        .filter(|value| value.is_finite())
+        .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 fn format_ccusage_day(day: Option<&CcusageDay>) -> String {
@@ -2838,6 +2846,9 @@ fn ccusage_model_shares(days: &[CcusageDay]) -> Vec<(String, f64)> {
     for day in days {
         if let Some(models) = &day.models {
             for (name, usage) in models {
+                if name.trim().is_empty() {
+                    continue;
+                }
                 let tokens = ccusage_model_tokens(usage);
                 if tokens <= 0.0 {
                     continue;
@@ -2892,8 +2903,10 @@ fn ccusage_model_tokens(usage: &CcusageModelUsage) -> f64 {
         .into_iter()
         .flatten()
         .filter_map(|value| value_to_f64(Some(value)))
+        .filter(|tokens| *tokens >= 0.0)
         .sum()
     })
+    .max(0.0)
 }
 
 fn ccusage_model_tokens_from_value(value: &Value) -> f64 {
@@ -2908,8 +2921,10 @@ fn ccusage_model_tokens_from_value(value: &Value) -> f64 {
         ]
         .into_iter()
         .filter_map(|key| value_to_f64(value.get(key)))
+        .filter(|tokens| *tokens >= 0.0)
         .sum()
     })
+    .max(0.0)
 }
 
 fn format_percent_label(percent: f64) -> String {
@@ -8511,6 +8526,49 @@ mod claude_usage_history_tests {
             _ => None,
         });
         assert!(total.expect("total").contains("500"), "only the usable day counts");
+    }
+
+    /// Every field the card reads from ccusage, each walked with values it must not believe
+    /// (#276 audit, round 5): a usable day beside it shows what got through.
+    #[test]
+    fn every_field_the_card_reads_rejects_what_it_must_not_believe() {
+        // date, both forms: only days the calendar has.
+        for date in ["2026-99-99", "2026-02-30", "2026-13-01", "2026-00-10", "2026-10-00", "20269999", "20260230", "2026-1a-01", "abcd-ef-gh", "2026-10-3", ""] {
+            assert_eq!(ccusage_day_key(date), None, "{date}");
+            assert!(history_from(&format!(r#"{{"daily":[{{"date":"{date}","totalTokens":500,"totalCost":2}}]}}"#)).is_empty(), "{date}");
+        }
+        assert_eq!(ccusage_day_key("2028-02-29").as_deref(), Some("2028-02-29"), "a leap day is a day");
+        assert_eq!(ccusage_day_key("20261030").as_deref(), Some("2026-10-30"));
+        assert_eq!(ccusage_day_key("2026-10-30T23:00:00Z").as_deref(), Some("2026-10-30"));
+        // totalTokens and cost: finite and not below zero, or the day says nothing.
+        for (tokens, cost) in [("-5", "0"), ("\"NaN\"", "0"), ("\"inf\"", "0"), ("0", "-3"), ("null", "null"), ("{}", "[]")] {
+            let stdout = format!(r#"{{"daily":[{{"date":"2026-10-30","totalTokens":{tokens},"totalCost":{cost}}}]}}"#);
+            assert!(history_from(&stdout).is_empty(), "{stdout}");
+        }
+        // model names and token parts: no empty name, no negative part pulling a share.
+        let lines = history_from(
+            r#"{"daily":[{"date":"2026-10-30","totalTokens":100,"totalCost":1,
+                "models":{"":{"totalTokens":50},"  ":{"totalTokens":50},"good-model":{"inputTokens":60,"outputTokens":-1000}},
+                "modelBreakdowns":[{"modelName":"","inputTokens":10},{"modelName":"neg-model","inputTokens":-40},{"modelName":"other-model","inputTokens":40,"outputTokens":-500}]}]}"#,
+        );
+        let shares: Vec<_> = lines
+            .iter()
+            .filter_map(|line| match line {
+                CodexMetricLine::Text { label, value } if value.ends_with('%') => Some((label.clone(), value.clone())),
+                _ => None,
+            })
+            .collect();
+        let names: Vec<_> = shares.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["good-model", "other-model"], "{shares:?}");
+        assert_eq!(shares[0].1, format_percent_label(60.0), "a negative part is not counted against a model");
+        assert_eq!(shares[1].1, format_percent_label(40.0), "in either shape ccusage sends");
+        // A negative cost is no cost: it never shows, and never takes from the 30-day total.
+        let lines = history_from(r#"{"daily":[{"date":"2026-10-30","totalTokens":500,"totalCost":5},{"date":"2026-10-29","totalTokens":500,"totalCost":-3}]}"#);
+        let total = lines.iter().find_map(|line| match line {
+            CodexMetricLine::Text { label, value } if label == "Last 30 Days" => Some(value.clone()),
+            _ => None,
+        });
+        assert!(total.as_deref().is_some_and(|total| total.starts_with("$5.00")), "{total:?}");
     }
 
     #[test]

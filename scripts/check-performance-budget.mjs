@@ -44,12 +44,16 @@ const assetRoot = join(distRoot, "assets");
  * Discord member could not leave, what waits for Discord and what Remove could not send
  * measured 118,137 / 121,213 (+210 / +207 bytes on 117,927 / 121,006). 118,310 and 121,407
  * keep the 173 / 194 bytes of headroom the last raise left.
+ *
+ * And again on 2026-11-02 (#277), the same way: Release notes rendered as headings, bullets,
+ * bold and code (a few lines of our own, no library) measured 118,522 / 121,598 on main's
+ * 118,169 / 121,247 (+353 / +351). 118,663 and 121,758 keep the headroom main had.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 118_310,
-  jsTotalGzipBytes: 121_407,
+  jsGzipBytes: 118_663,
+  jsTotalGzipBytes: 121_758,
 };
 
 const walk = async (directory) => {

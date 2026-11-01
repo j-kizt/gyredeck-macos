@@ -12,6 +12,7 @@ import { useHeavyRuns } from "./useHeavyRuns";
 import { codexTrustCopy, hookNeedsAttention, hookSettled, type IHookStatus } from "./hookStatus";
 import { useDiscord, type IUseDiscord } from "./useDiscord";
 import { DiscordLogo, DiscordRows } from "./DiscordRows";
+import { ReleaseNotes } from "./ReleaseNotes";
 
 export type SyncAgent = "claude" | "agy";
 
@@ -602,7 +603,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
               {updater.status === "available" ? (
                 <div className="update-notes">
                   <div className="update-notes-head"><span>Release notes{updater.version ? ` · v${updater.version}` : ""}</span>{updater.date ? <span className="update-notes-date">{updater.date.slice(0, 10)}</span> : null}</div>
-                  <div className="update-notes-body">{updater.notes?.trim() ? updater.notes.trim() : "No release notes provided."}</div>
+                  <div className="update-notes-body">{updater.notes?.trim() ? <ReleaseNotes text={updater.notes.trim()} /> : "No release notes provided."}</div>
                 </div>
               ) : null}
             </>

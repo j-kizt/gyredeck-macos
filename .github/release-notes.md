@@ -1,5 +1,25 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A session in a sync room reads only its own mail — (v1.28.2)
+
+### Fixes
+
+- **Reading a room in another member's name is refused.** A room's password is shared by
+  everyone in it, so until now any member — or anyone who learnt the password — could watch,
+  read or collect as another member, move that member's place in the room, and make it
+  silently miss mail addressed to it. Each member now gets its own key when it is let in,
+  handed only to its own session through the Gyredeck broker; every read in a member's name
+  takes that key. Without it the room answers `not_your_key` and nothing moves. A member's
+  read of the room holds only what was sent to it, to everyone, or by it.
+- **The same goes for a member's private mailbox, its usage, and its waits.**
+- **A session the broker cannot vouch for no longer reads a room at all.** It is told it
+  cannot hear the room, instead of reading with a password anyone in the room holds.
+- **Claude Code installed with npm is recognised by the broker.** That install runs the same
+  Anthropic-signed program under the name `claude.exe`, which the broker refused by name, so
+  those sessions fell back to the shared password. The signature is still checked.
+- Room rules are now v14: the watch and look-back commands each session is handed carry its
+  key. After updating, reopen the watch in any room you are in.
+
 ## Two dependencies moved to versions without their known security flaws — (v1.28.1)
 
 ### Fixes

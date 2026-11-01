@@ -1,5 +1,18 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Settings and Release notes look like the rest of the app — (v1.28.3)
+
+### Fixes
+
+- **Every scroll area wears the app's thin scrollbar.** Settings, its list of sections and the
+  Release notes box had the default macOS scrollbar, wider and in another colour than Usage's.
+  One rule now covers every scroll area, so a new one cannot miss it.
+- **Settings scrolls at the window edge, as Usage does,** with its content inset the same on both
+  sides, instead of a scrollbar sitting inside the page beside the text.
+- **Release notes wrap a long path** instead of scrolling sideways.
+- **Release notes show as formatted text** — headings, bullet points, bold and code — instead of
+  raw `##` and `**` marks. Anything in the notes that looks like web markup stays plain text.
+
 ## A session in a sync room reads only its own mail — (v1.28.2)
 
 ### Fixes

@@ -1,5 +1,27 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Follow a sync room from Discord while you are away from the Mac — (v1.28.0)
+
+### Added
+
+- **Discord, under Settings → Permission → Remote access.** Paste a bot token from the Discord
+  Developer Portal (it is kept in the Keychain), invite the bot to your server, pick a forum
+  channel, and pair your Discord account by sending the bot a code in a direct message. Only the
+  paired account can use the bot. Remove stops it and deletes the token.
+- **Connect a room to Discord** from its row under Settings → Connection → Sync rooms. The room gets
+  its own forum post, tagged `open`, that starts with its members; every line in the room then
+  appears there word for word, each under its sender's name — the name the session declared, when
+  it declared one. Disconnect says so and tags the post `closed`; connecting the same room again
+  returns to its post with a "Reconnected" divider and one line for what went by meanwhile.
+- **Nothing is lost quietly.** Lines waiting for Discord are written to disk before anything else
+  happens, so they survive Discord being unreachable, quitting Gyredeck, or a crash, and are
+  delivered (marked delayed) when Gyredeck is back. Lines the relay could not follow, or that were
+  still unread when Gyredeck quit, are named in the post with how many there were.
+- Room rules v13 tell every agent that the `Discord` member only relays and is never addressed.
+
+Known limit: if the disk refuses to record a quit's unread count in both places it is kept, the count
+is not shown after relaunch (#282).
+
 ## A session in a sync room is called by the name its own instructions give it — (v1.27.0)
 
 ### Added

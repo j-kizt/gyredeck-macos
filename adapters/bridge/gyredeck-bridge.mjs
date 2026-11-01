@@ -292,7 +292,8 @@ carries the command for as long as the room sees none of yours.
 - When your provider's limit drops to 10% left or less, the room tells you, once; and again when it is
   back above. Finish at a safe point, then tell the room when you expect to be back.
 - Claude Code and Antigravity can look any time:
-  \`curl -s "${origin}/usage?as=<your id>" -H "x-gyredeck-token: THE ROOM PASSWORD"\`
+  \`curl -s "${origin}/usage?as=<your id>" -H "x-gyredeck-token: THE ROOM PASSWORD" -H "x-gyredeck-member: YOUR KEY"\`
+  — YOUR KEY is the \`x-gyredeck-member\` value in the watch command your deliveries hand you.
   — each limit's label, how much is left, and when it resets. Codex cannot call it; the room tells it.
 
 ## Wait (Claude Code, Antigravity)
@@ -4324,6 +4325,10 @@ function startBridge(config) {
       return "USAGE: ask Gyredeck how much of your plan is left at any time: " +
         `curl -s "http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}/usage?as=${conversationId}" ` +
         '-H "x-gyredeck-token: $(cat ~/.config/gyredeck/gyredeck.ingest-token)"' +
+        // Handed only on a read that already passed the member's door, so the key is its own.
+        (typeof syncRoomFor(conversationId)?.room.members.get(conversationId)?.readKey === "string"
+          ? ` -H "x-gyredeck-member: ${syncRoomFor(conversationId).room.members.get(conversationId).readKey}"`
+          : "") +
         (low.length > 0 ? ` — low now: ${low.map(describe).join("; ")}. Finish at a safe point.` : "");
     }
     const changed = [];
@@ -7181,7 +7186,8 @@ function startBridge(config) {
     // ── Usage (#158) ──
     // POST /usage — the app hands over each provider's usage as it reads it (machine token).
     // GET /usage?as=<id> — that session's own provider's usage (machine token, or the
-    // password of the room the session is in, the same door as its inbox).
+    // password of the room the session is in; a room member's own key too, the same door
+    // as its inbox).
     if (req.url === "/usage" || req.url.startsWith("/usage?")) {
       const sendJson = (status, body) => {
         res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
@@ -7215,6 +7221,12 @@ function startBridge(config) {
         }
         if (!holdsMailboxCredential(as, headerToken)) {
           sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+          return;
+        }
+        // A room member's usage is read in its name, so by its door (#274 audit).
+        const notTheMember = refuseMemberRead(as, req);
+        if (notTheMember) {
+          sendJson(403, { ok: false, ...notTheMember });
           return;
         }
         const provider = usageProviderFor(as);

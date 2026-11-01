@@ -2086,8 +2086,8 @@ test("a room member hears when its own provider's limit runs low, and can ask fo
       lines: [{ type: "progress", label: "Session", used, limit: 100, resetsAt: "2026-10-16T05:00:00Z" }],
       fetchedAt: new Date().toISOString(),
     });
-    const usage = (as, credential) =>
-      fetch(`${base}/usage?as=${as}`, { headers: { "x-gyredeck-token": credential } }).then(async (r) => ({ status: r.status, body: await r.json() }));
+    const usage = async (as, credential, keyed = true) =>
+      fetch(`${base}/usage?as=${as}`, { headers: keyed ? await memberHeaders(base, as, credential) : { "x-gyredeck-token": credential } }).then(async (r) => ({ status: r.status, body: await r.json() }));
 
     // The rules name this bridge, on whatever port it serves — not the default (#158 audit).
     const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
@@ -2104,12 +2104,14 @@ test("a room member hears when its own provider's limit runs low, and can ask fo
     assert.equal(refused.status, 401, "a room password is not the app");
     assert.deepEqual(await post("/usage", reading("claude", 50)), { ok: true });
 
-    // A member asks with the room's password and gets its own provider's figure.
+    // A member asks with the room's password and its own key (#274), and gets its own
+    // provider's figure; the password alone is every member's, so it opens nobody's.
+    assert.equal((await usage(me, minted.password, false)).status, 403, "the password alone is not this member");
     const asked = await usage(me, minted.password);
     assert.equal(asked.status, 200);
     assert.equal(asked.body.provider, "claude");
     assert.deepEqual(asked.body.usage.lines, [{ label: "Session", leftPct: 50, resetsAt: "2026-10-16T05:00:00Z" }]);
-    assert.equal((await usage(me, "ab".repeat(16))).status, 401, "and nobody else's word opens it");
+    assert.equal((await usage(me, "ab".repeat(16), false)).status, 401, "and nobody else's word opens it");
     assert.equal((await usage(other, minted.password)).body.usage, null, "Antigravity has no reading yet");
 
     // The first reading was not news. Crossing to 10% or less is, for that provider's members only.

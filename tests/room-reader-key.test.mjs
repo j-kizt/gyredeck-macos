@@ -292,6 +292,28 @@ test("C1 table: every read in a room member's own name — inbox, wait, private 
   }
 });
 
+test("C1 table: a room member's usage is read in its name, by the same door", async () => {
+  const h = await startBridge();
+  try {
+    const r = await twoMembers(h);
+    const keyA = await r.keyOf("member-a");
+    for (const [why, headers] of [
+      ["password alone", r.pw],
+      ["machine token alone", { "x-gyredeck-token": h.token }],
+      ["password and a's key", { ...r.pw, "x-gyredeck-member": keyA }],
+    ]) {
+      const answer = await h.raw("/usage?as=member-b", headers);
+      assert.equal(answer.status, 403, `${why}: ${answer.text}`);
+      assert.match(answer.text, /not_your_key/, why);
+    }
+    assert.equal((await h.raw("/usage?as=member-b", { ...r.pw, "x-gyredeck-member": await r.keyOf("member-b") })).status, 200, "b's own key");
+    assert.equal((await h.raw("/usage?as=member-b", { "x-gyredeck-token": h.token, "x-gyredeck-broker": APP_WORD })).status, 200, "the broker's word");
+    assert.equal((await h.raw("/usage?as=loner-2", { "x-gyredeck-token": h.token })).status, 200, "a session in no room, as before");
+  } finally {
+    await h.stop();
+  }
+});
+
 test("C1 control: a session in no room keeps its mailbox as it was", async () => {
   const h = await startBridge();
   try {

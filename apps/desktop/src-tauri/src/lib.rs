@@ -2416,14 +2416,36 @@ fn codex_home_for_ccusage(auth_state: &CodexAuthState) -> Option<String> {
     }
 }
 
+/// The most of a runner's output that is kept: a month of ccusage JSON is tens of KiB, so
+/// past this it is not an answer, and nothing more of it is held (#276 audit).
+const CCUSAGE_STDOUT_CAP: u64 = 8 * 1024 * 1024;
+const CCUSAGE_STDERR_CAP: u64 = 64 * 1024;
+
+/// Read a pipe to its end, keeping at most `cap` bytes; `None` when it held more. Past the cap
+/// the read end is dropped, so the writer meets a closed pipe and stops instead of blocking.
+fn drain_capped(pipe: Option<Box<dyn Read + Send>>, cap: u64) -> thread::JoinHandle<Option<String>> {
+    thread::spawn(move || {
+        let mut pipe = pipe?;
+        let mut kept = Vec::new();
+        let _ = (&mut pipe).take(cap + 1).read_to_end(&mut kept);
+        if kept.len() as u64 > cap {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&kept).into_owned())
+    })
+}
+
 /// Runs each runner in turn until one answers with ccusage JSON. Both pipes are drained while
 /// the process runs (#276 audit): read only after it exited, a month of logs is more than a
-/// pipe holds, the child blocks writing, and the wait ends in the timeout with nothing.
+/// pipe holds, the child blocks writing, and the wait ends in the timeout with nothing. Each
+/// runner is its own process group, and a timeout ends the group: a package manager's child
+/// that outlived it would hold the pipes open, and the readers with them.
 fn run_ccusage_daily(
     runners: &[CcusageRunnerCommand],
     env: Option<(&str, &str)>,
     timeout: Duration,
 ) -> Option<CcusageDailyUsage> {
+    use std::os::unix::process::CommandExt;
     for runner in runners {
         let child_result = Command::new(&runner.program)
             .args(&runner.args)
@@ -2431,34 +2453,28 @@ fn run_ccusage_daily(
             .envs(env)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .spawn();
         let Ok(mut child) = child_result else {
             continue;
         };
-        let drain = |pipe: Option<Box<dyn Read + Send>>| {
-            thread::spawn(move || {
-                let mut text = String::new();
-                if let Some(mut pipe) = pipe {
-                    let _ = pipe.read_to_string(&mut text);
-                }
-                text
-            })
-        };
-        let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>));
-        let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>));
+        let stdout = drain_capped(child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>), CCUSAGE_STDOUT_CAP);
+        let stderr = drain_capped(child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>), CCUSAGE_STDERR_CAP);
         let deadline = Instant::now() + timeout;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
                 _ => {
+                    // The group's id is the child's pid (process_group(0)).
+                    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
                     let _ = child.kill();
                     let _ = child.wait();
                     break None;
                 }
             }
         };
-        let stdout = stdout.join().unwrap_or_default();
+        let stdout = stdout.join().ok().flatten();
         let _ = stderr.join();
         let Some(status) = status else {
             return None;
@@ -2466,7 +2482,7 @@ fn run_ccusage_daily(
         if !status.success() {
             continue;
         }
-        if let Some(usage) = parse_ccusage_output(&stdout) {
+        if let Some(usage) = stdout.as_deref().and_then(parse_ccusage_output) {
             return Some(usage);
         }
     }
@@ -8344,6 +8360,25 @@ mod claude_usage_history_tests {
         let usage = run_ccusage_daily(&[sh(script)], None, Duration::from_secs(5)).expect("read");
         assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
         assert_eq!(usage.daily.iter().filter_map(ccusage_day_tokens).sum::<f64>(), 42.0);
+    }
+
+    #[test]
+    fn a_runner_whose_child_keeps_the_pipes_open_is_still_stopped_at_the_timeout() {
+        // The shell forks and waits: killing the shell alone leaves `sleep` holding both
+        // pipes, and a reader waiting for their end waits for the sleep (#276 audit).
+        let started = Instant::now();
+        assert!(run_ccusage_daily(&[sh("sleep 3 & wait")], None, Duration::from_millis(100)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn an_answer_past_the_cap_is_no_answer_and_does_not_hang_the_child() {
+        // 9 MiB of otherwise valid JSON: past the 8 MiB cap, so it is dropped, and the child
+        // meets a closed pipe and ends rather than being left blocked on a full one.
+        let script = r#"printf '{"daily":[{"date":"2026-10-30","totalTokens":1}],"pad":"'; head -c 9437184 /dev/zero | tr '\0' a; printf '"}'"#;
+        let started = Instant::now();
+        assert!(run_ccusage_daily(&[sh(script)], None, Duration::from_secs(10)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
     }
 
     #[test]

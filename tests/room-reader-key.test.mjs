@@ -198,6 +198,54 @@ test("C3: a member's own key reads only what reaches it — plain, bounded or ta
   }
 });
 
+test("C3: a take moves its reader past everything it examined — another member's line last, or nothing to hand — and nobody else", async () => {
+  const h = await startBridge();
+  try {
+    const r = await twoMembers(h);
+    const asA = { ...r.pw, "x-gyredeck-member": await r.keyOf("member-a") };
+    // A reader's position, as the room keeps it: pending is the room's seq less it.
+    const readSeqOf = async (as) => {
+      const listed = (await h.call("GET", `/sync/rooms?as=${as}`)).body;
+      return listed.seq - listed.members.find((m) => m.conversationId === as).pending;
+    };
+    let since = 0;
+    // Each take is checked to leave b where b was: a sender's own post moves its own
+    // position, a's take never does.
+    const take = async () => {
+      const bAt = await readSeqOf("member-b");
+      const body = JSON.parse((await h.raw(`/mail/${r.code}?as=member-a&since=${since}&collect=1`, asA)).text);
+      since = body.seq;
+      assert.equal(await readSeqOf("member-b"), bAt, "b's position is never a's take's business");
+      return body.messages.map((m) => m.text);
+    };
+    await take();
+    assert.equal(await pendingOf(h, "member-a"), 0, "premise: a starts with nothing unread");
+    await r.post("member-b", "member-a", "for a");
+    await r.post("member-b", "member-b", "b's own, last");
+    assert.deepEqual(await take(), ["for a"], "a is handed its line and not b's");
+    assert.equal(await pendingOf(h, "member-a"), 0, "a is past b's line too: it examined it");
+    assert.deepEqual(await take(), [], "a repeat hands nothing");
+    assert.equal(await pendingOf(h, "member-a"), 0);
+    await r.post("member-b", "member-b", "only b's after this");
+    assert.deepEqual(await take(), [], "nothing reaches a");
+    assert.equal(await pendingOf(h, "member-a"), 0, "a take that hands nothing still moves a past what it examined");
+    await r.post("member-b", "member-a", "a's next");
+    assert.deepEqual(await take(), ["a's next"], "and the next line for a is not skipped");
+    assert.equal(await pendingOf(h, "member-a"), 0);
+    // A since past the room's end moves the position only to the end: what is said after it
+    // is still owed to a, and still counted.
+    const end = since;
+    since = end + 1000;
+    assert.deepEqual(await take(), []);
+    since = end;
+    await r.post("member-b", "member-a", "after a far since");
+    assert.equal(await pendingOf(h, "member-a"), 1, "never past the room's end");
+    assert.deepEqual(await take(), ["after a far since"]);
+  } finally {
+    await h.stop();
+  }
+});
+
 test("C3: a member's own key reads its own view, and only its own", async () => {
   const h = await startBridge();
   try {

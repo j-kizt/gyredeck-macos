@@ -7886,6 +7886,9 @@ function startBridge(config) {
         const untilParam = url.searchParams.get("until");
         let messages;
         let truncated = false;
+        // How far a take has looked: everything after `since`, handed or not, since the plain
+        // read hands all of what reaches its reader. Never past the room's end (#274 audit).
+        let examined = since;
         if (untilParam !== null) {
           const until = /^\d{1,15}$/.test(untilParam) ? Number(untilParam) : null;
           const as = url.searchParams.get("as") ?? "";
@@ -7903,11 +7906,12 @@ function startBridge(config) {
           const reader = url.searchParams.get("as") ?? "";
           const whole = !room || room.members.size === 0 || room.members.get(reader)?.relay === true;
           messages = room ? room.messages.filter((message) => message.seq > since && (whole || message.from === reader || reachesMember(message, reader))) : [];
+          examined = Math.min(room?.seq ?? since, Math.max(since, room?.messages.at(-1)?.seq ?? since));
         }
         if (room) {
           room.touchedAt = Date.now();
           if (url.searchParams.get("collect") === "1") {
-            markRead(room, url.searchParams.get("as"), messages.at(-1)?.seq ?? since, new Date().toISOString());
+            markRead(room, url.searchParams.get("as"), examined, new Date().toISOString());
           }
         }
         sendJson(200, { ok: true, room: name, seq: room?.seq ?? 0, messages, ...(truncated ? { truncated: true } : {}) });

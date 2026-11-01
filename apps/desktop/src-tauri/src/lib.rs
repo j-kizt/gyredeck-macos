@@ -367,6 +367,10 @@ const CLAUDE_RETRY_FALLBACK_SECONDS: u64 = 180;
 
 static CODEX_CCUSAGE_CACHE: OnceLock<Mutex<Option<CcusageCacheEntry>>> = OnceLock::new();
 static CODEX_CCUSAGE_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+// Claude Code's local history (#276): its own cache, so a Claude read never serves Codex's
+// days or the reverse.
+static CLAUDE_CCUSAGE_CACHE: OnceLock<Mutex<Option<CcusageCacheEntry>>> = OnceLock::new();
+static CLAUDE_CCUSAGE_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 struct CodexRefreshResponse {
@@ -1506,7 +1510,10 @@ fn agy_usage_fallback() -> Result<CodexUsageSnapshot, String> {
 #[tauri::command]
 async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
     tauri::async_runtime::spawn_blocking(|| {
-        claude_usage_blocking().map(|reading| relay_if_fresh(reading, relay_usage))
+        claude_usage_blocking().map(|mut reading| {
+            append_claude_local_usage(&mut reading.snapshot);
+            relay_if_fresh(reading, relay_usage)
+        })
     })
     .await
     .map_err(|error| format!("Claude usage task failed: {error}"))?
@@ -2172,9 +2179,26 @@ fn build_codex_usage_snapshot(
 }
 
 fn append_codex_local_usage(snapshot: &mut CodexUsageSnapshot, auth_state: &CodexAuthState) {
-    let Some(usage) = codex_ccusage_daily(auth_state) else {
-        return;
-    };
+    if let Some(usage) = codex_ccusage_daily(auth_state) {
+        append_local_usage(snapshot, &usage, "Estimated from local Codex logs for this home.", "#74AA9C");
+    }
+}
+
+/// Claude Code's history beside its limits (#276), the way Codex's is. Totals are ccusage's:
+/// input, output, cache writes and cache reads, which is what Codex's card counts too.
+/// Without a runner, or with an answer that cannot be read, the card keeps its limits only.
+fn append_claude_local_usage(snapshot: &mut CodexUsageSnapshot) {
+    if let Some(usage) = claude_ccusage_daily() {
+        append_local_usage(
+            snapshot,
+            &usage,
+            "Estimated from local Claude Code logs for this home, cache reads and writes included.",
+            "#D97757",
+        );
+    }
+}
+
+fn append_local_usage(snapshot: &mut CodexUsageSnapshot, usage: &CcusageDailyUsage, note: &str, color: &str) {
 
     let (today_key, yesterday_key) = codex_history_day_keys(local_now());
     let today = usage
@@ -2231,8 +2255,8 @@ fn append_codex_local_usage(snapshot: &mut CodexUsageSnapshot, auth_state: &Code
         snapshot.lines.push(CodexMetricLine::BarChart {
             label: "Usage Trend".to_string(),
             points: chart_points,
-            note: Some("Estimated from local Codex logs for this home.".to_string()),
-            color: Some("#74AA9C".to_string()),
+            note: Some(note.to_string()),
+            color: Some(color.to_string()),
         });
     }
 
@@ -2245,13 +2269,60 @@ fn append_codex_local_usage(snapshot: &mut CodexUsageSnapshot, auth_state: &Code
 }
 
 fn codex_ccusage_daily(auth_state: &CodexAuthState) -> Option<CcusageDailyUsage> {
-    let key = codex_ccusage_cache_key(auth_state);
-    let cache = CODEX_CCUSAGE_CACHE.get_or_init(|| Mutex::new(None));
+    ccusage_daily_cached(
+        CODEX_CCUSAGE_CACHE.get_or_init(|| Mutex::new(None)),
+        CODEX_CCUSAGE_IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new())),
+        codex_ccusage_cache_key(auth_state),
+        &|| {
+            let home_path = codex_home_for_ccusage(auth_state);
+            run_ccusage_daily(
+                &ccusage_runners(&codex_ccusage_since_string(30), CcusageTarget::Codex),
+                home_path.as_deref().map(|home| ("CODEX_HOME", home)),
+                CCUSAGE_TIMEOUT,
+            )
+        },
+    )
+}
+
+fn claude_ccusage_cache() -> (&'static Mutex<Option<CcusageCacheEntry>>, &'static Mutex<HashSet<String>>) {
+    (
+        CLAUDE_CCUSAGE_CACHE.get_or_init(|| Mutex::new(None)),
+        CLAUDE_CCUSAGE_IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new())),
+    )
+}
+
+fn claude_ccusage_daily() -> Option<CcusageDailyUsage> {
+    let (cache, in_flight) = claude_ccusage_cache();
+    ccusage_daily_cached(
+        cache,
+        in_flight,
+        claude_ccusage_cache_key(),
+        &|| {
+            run_ccusage_daily(
+                &ccusage_runners(&codex_ccusage_since_string(30), CcusageTarget::Claude),
+                None,
+                CCUSAGE_TIMEOUT,
+            )
+        },
+    )
+}
+
+/// The logs are per home, not per account: one ~/.claude holds every account that used it,
+/// so the home is the key. ccusage reads CLAUDE_CONFIG_DIR from the environment it inherits.
+fn claude_ccusage_cache_key() -> String {
+    format!("claude\u{0}{}", env_text("CLAUDE_CONFIG_DIR").unwrap_or_else(|| "default".to_string()))
+}
+
+fn ccusage_daily_cached(
+    cache: &Mutex<Option<CcusageCacheEntry>>,
+    in_flight: &Mutex<HashSet<String>>,
+    key: String,
+    fetch: &dyn Fn() -> Option<CcusageDailyUsage>,
+) -> Option<CcusageDailyUsage> {
     if let Some(usage) = cached_codex_ccusage_usage(cache, &key) {
         return Some(usage);
     }
 
-    let in_flight = CODEX_CCUSAGE_IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()));
     let is_leader = in_flight.lock().ok()?.insert(key.clone());
     if !is_leader {
         let deadline = Instant::now() + CCUSAGE_TIMEOUT;
@@ -2264,7 +2335,7 @@ fn codex_ccusage_daily(auth_state: &CodexAuthState) -> Option<CcusageDailyUsage>
                 .ok()
                 .is_some_and(|guard| guard.contains(&key));
             if !still_running {
-                return codex_ccusage_daily(auth_state);
+                return ccusage_daily_cached(cache, in_flight, key, fetch);
             }
             if Instant::now() >= deadline {
                 return None;
@@ -2273,11 +2344,7 @@ fn codex_ccusage_daily(auth_state: &CodexAuthState) -> Option<CcusageDailyUsage>
         }
     }
 
-    let usage = (|| {
-        let since = codex_ccusage_since_string(30);
-        let home_path = codex_home_for_ccusage(auth_state);
-        run_ccusage_codex_daily(&since, home_path.as_deref())
-    })();
+    let usage = fetch();
 
     let Some(usage) = usage else {
         if let Ok(mut guard) = in_flight.lock() {
@@ -2349,44 +2416,54 @@ fn codex_home_for_ccusage(auth_state: &CodexAuthState) -> Option<String> {
     }
 }
 
-fn run_ccusage_codex_daily(since: &str, codex_home: Option<&str>) -> Option<CcusageDailyUsage> {
-    for runner in ccusage_runners(since) {
+/// Runs each runner in turn until one answers with ccusage JSON. Both pipes are drained while
+/// the process runs (#276 audit): read only after it exited, a month of logs is more than a
+/// pipe holds, the child blocks writing, and the wait ends in the timeout with nothing.
+fn run_ccusage_daily(
+    runners: &[CcusageRunnerCommand],
+    env: Option<(&str, &str)>,
+    timeout: Duration,
+) -> Option<CcusageDailyUsage> {
+    for runner in runners {
         let child_result = Command::new(&runner.program)
             .args(&runner.args)
             .env("PATH", enriched_cli_path())
-            .envs(codex_home.map(|home| ("CODEX_HOME", home)))
+            .envs(env)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();
         let Ok(mut child) = child_result else {
             continue;
         };
-        let deadline = Instant::now() + CCUSAGE_TIMEOUT;
-        loop {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                break;
+        let drain = |pipe: Option<Box<dyn Read + Send>>| {
+            thread::spawn(move || {
+                let mut text = String::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_string(&mut text);
+                }
+                text
+            })
+        };
+        let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>));
+        let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>));
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
             }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        if let Some(mut pipe) = child.stdout.take() {
-            let _ = pipe.read_to_string(&mut stdout);
-        }
-        if let Some(mut pipe) = child.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
-        }
-        let Ok(status) = child.wait() else {
-            continue;
+        };
+        let stdout = stdout.join().unwrap_or_default();
+        let _ = stderr.join();
+        let Some(status) = status else {
+            return None;
         };
         if !status.success() {
-            let _ = stderr;
             continue;
         }
         if let Some(usage) = parse_ccusage_output(&stdout) {
@@ -2396,14 +2473,26 @@ fn run_ccusage_codex_daily(since: &str, codex_home: Option<&str>) -> Option<Ccus
     None
 }
 
+/// Which agent's logs ccusage reads. Its bare `daily` sums every agent it finds, Codex
+/// included, so Claude Code is named as Codex is.
+#[derive(Clone, Copy)]
+enum CcusageTarget {
+    Codex,
+    Claude,
+}
+
 struct CcusageRunnerCommand {
     program: String,
     args: Vec<String>,
 }
 
-fn ccusage_runners(since: &str) -> Vec<CcusageRunnerCommand> {
+fn ccusage_runners(since: &str, target: CcusageTarget) -> Vec<CcusageRunnerCommand> {
     let suffix = vec![
-        "codex".to_string(),
+        match target {
+            CcusageTarget::Codex => "codex",
+            CcusageTarget::Claude => "claude",
+        }
+        .to_string(),
         "daily".to_string(),
         "--json".to_string(),
         "--order".to_string(),
@@ -8201,5 +8290,134 @@ mod agy_sync_reply_tests {
         // The names the panel sends.
         assert_eq!(serde_json::from_str::<SyncReplyAgent>("\"claude\"").unwrap(), SyncReplyAgent::Claude);
         assert_eq!(serde_json::from_str::<SyncReplyAgent>("\"agy\"").unwrap(), SyncReplyAgent::Agy);
+    }
+}
+
+#[cfg(test)]
+mod claude_usage_history_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn sh(script: &str) -> CcusageRunnerCommand {
+        CcusageRunnerCommand { program: "/bin/sh".to_string(), args: vec!["-c".to_string(), script.to_string()] }
+    }
+
+    fn snapshot() -> CodexUsageSnapshot {
+        CodexUsageSnapshot {
+            provider_id: "claude".to_string(),
+            display_name: "Claude Code".to_string(),
+            plan: None,
+            lines: Vec::new(),
+            fetched_at: String::new(),
+        }
+    }
+
+    fn day(date: &str, tokens: u64, model: &str) -> serde_json::Value {
+        json!({
+            "date": date, "totalTokens": tokens, "totalCost": 1.5,
+            "modelBreakdowns": [{ "modelName": model, "inputTokens": tokens / 2, "outputTokens": tokens / 2,
+                                  "cacheCreationTokens": 0, "cacheReadTokens": 0, "cost": 1.5 }]
+        })
+    }
+
+    #[test]
+    fn claude_reads_claude_logs_and_codex_still_reads_codex() {
+        for (target, wanted, other) in [(CcusageTarget::Claude, "claude", "codex"), (CcusageTarget::Codex, "codex", "claude")] {
+            let runners = ccusage_runners("20261001", target);
+            for runner in &runners {
+                let at = runner.args.iter().position(|arg| arg == "daily").expect("daily");
+                assert_eq!(runner.args[at - 1], wanted, "{:?}", runner.args);
+                assert!(!runner.args.iter().any(|arg| arg == other), "{:?}", runner.args);
+                assert!(runner.args.windows(2).any(|pair| pair == ["--since", "20261001"]));
+            }
+        }
+    }
+
+    #[test]
+    fn a_month_of_output_larger_than_a_pipe_is_read_not_timed_out() {
+        // 1 MB of JSON: well past a pipe's 64 KiB, so a reader that waits for the exit first
+        // deadlocks until the timeout.
+        let script = r#"printf '{"daily":[{"date":"2026-10-30","totalTokens":42}],"pad":"'; head -c 1048576 /dev/zero | tr '\0' a; printf '"}'"#;
+        let started = Instant::now();
+        let usage = run_ccusage_daily(&[sh(script)], None, Duration::from_secs(5)).expect("read");
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+        assert_eq!(usage.daily.iter().filter_map(ccusage_day_tokens).sum::<f64>(), 42.0);
+    }
+
+    #[test]
+    fn a_runner_that_hangs_fails_or_answers_nonsense_gives_no_history() {
+        let started = Instant::now();
+        assert!(run_ccusage_daily(&[sh("sleep 10")], None, Duration::from_millis(300)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(3), "the timeout holds: {:?}", started.elapsed());
+        assert!(run_ccusage_daily(&[sh("echo not json")], None, Duration::from_secs(5)).is_none());
+        assert!(run_ccusage_daily(&[sh("echo '{\"daily\":[]}'; exit 3")], None, Duration::from_secs(5)).is_none());
+        assert!(run_ccusage_daily(&[], None, Duration::from_secs(5)).is_none(), "no runner at all");
+        let next = run_ccusage_daily(
+            &[sh("echo not json"), sh("echo '{\"daily\":[{\"date\":\"2026-10-30\",\"totalTokens\":7}]}'")],
+            None,
+            Duration::from_secs(5),
+        );
+        assert_eq!(next.map(|usage| usage.daily.len()), Some(1), "a bad runner falls through to the next");
+    }
+
+    #[test]
+    fn claude_and_codex_caches_never_cross_and_one_read_serves_concurrent_askers() {
+        let codex_cache = Mutex::new(None);
+        let codex_flight = Mutex::new(HashSet::new());
+        let codex: CcusageDailyUsage = serde_json::from_value(json!({ "daily": [day("2026-10-30", 100, "gpt-6")] })).unwrap();
+        publish_codex_ccusage_usage(&codex_cache, &codex_flight, "same-key".to_string(), &codex);
+
+        let claude_cache = Arc::new(Mutex::new(None));
+        let claude_flight = Arc::new(Mutex::new(HashSet::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let askers: Vec<_> = (0..4)
+            .map(|_| {
+                let (cache, flight, calls) = (Arc::clone(&claude_cache), Arc::clone(&claude_flight), Arc::clone(&calls));
+                thread::spawn(move || {
+                    ccusage_daily_cached(&cache, &flight, "same-key".to_string(), &|| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(200));
+                        serde_json::from_value(json!({ "daily": [day("2026-10-30", 9, "claude-opus-5-5")] })).ok()
+                    })
+                })
+            })
+            .collect();
+        for asker in askers {
+            let usage = asker.join().unwrap().expect("served");
+            assert_eq!(usage.daily.iter().filter_map(ccusage_day_tokens).sum::<f64>(), 9.0, "Claude's days, never Codex's");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one run for four askers");
+        assert_eq!(cached_codex_ccusage_usage(&codex_cache, "same-key").unwrap().daily.iter().filter_map(ccusage_day_tokens).sum::<f64>(), 100.0);
+        assert!(claude_ccusage_cache_key().starts_with("claude\u{0}"), "Claude's key names its home, not an account");
+        let (claude, claude_in_flight) = claude_ccusage_cache();
+        assert!(!std::ptr::eq(claude, CODEX_CCUSAGE_CACHE.get_or_init(|| Mutex::new(None))), "Claude reads its own cache");
+        assert!(!std::ptr::eq(claude_in_flight, CODEX_CCUSAGE_IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))));
+    }
+
+    #[test]
+    fn known_days_become_the_same_history_rows_codex_shows_with_claudes_note() {
+        let (today, yesterday) = codex_history_day_keys(local_now());
+        let usage: CcusageDailyUsage = serde_json::from_value(json!({
+            "daily": [day(&today, 300, "claude-opus-5-5"), day(&yesterday, 100, "claude-sonnet-5-5")]
+        }))
+        .unwrap();
+        let mut card = snapshot();
+        append_local_usage(&mut card, &usage, "Estimated from local Claude Code logs for this home, cache reads and writes included.", "#D97757");
+        let text = |label: &str| card.lines.iter().find_map(|line| match line {
+            CodexMetricLine::Text { label: l, value } if l == label => Some(value.clone()),
+            _ => None,
+        });
+        assert!(text("Today").expect("today").contains("300"), "{:?}", text("Today"));
+        assert!(text("Yesterday").expect("yesterday").contains("100"));
+        assert!(text("Last 30 Days").expect("30 days").contains("400"));
+        assert_eq!(text("claude-opus-5-5").as_deref(), Some(format_percent_label(75.0).as_str()));
+        assert_eq!(text("claude-sonnet-5-5").as_deref(), Some(format_percent_label(25.0).as_str()));
+        let note = card.lines.iter().find_map(|line| match line {
+            CodexMetricLine::BarChart { note, .. } => note.clone(),
+            _ => None,
+        });
+        assert_eq!(note.as_deref(), Some("Estimated from local Claude Code logs for this home, cache reads and writes included."));
     }
 }

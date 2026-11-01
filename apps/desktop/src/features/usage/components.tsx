@@ -157,7 +157,7 @@ const ProviderInsights = ({ provider, usage }: IProviderInsightsProps) => {
   return (
     <section className="usage-local-history" aria-label={`${provider.label} usage history`}>
       <div className="usage-local-history-head">
-        <span>{provider.id === "codex" ? "Local history" : "Usage history"}</span>
+        <span>Local history</span>
         {usage.latestTokenLog ? <small>Latest {usage.latestTokenLog}</small> : null}
       </div>
       {usage.today || usage.yesterday ? (
@@ -366,7 +366,7 @@ const ProviderDetail = ({ provider, settings, usage }: IProviderDetailProps) => 
           ]}
         />
       ) : null}
-      {provider.id === "codex" && hasMetrics ? (
+      {(provider.id === "codex" || provider.id === "claude") && hasMetrics ? (
         <ProviderInsights provider={provider} usage={usage} />
       ) : null}
       {provider.id !== "codex" && (usage.credits || usage.rateLimitResets) ? (

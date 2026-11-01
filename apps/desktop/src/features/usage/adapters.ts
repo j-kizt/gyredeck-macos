@@ -181,7 +181,11 @@ export const parseAgentUsageSnapshot = (
     "yesterday",
     "latest token log",
     "last 30 days",
+    "extra usage",
+    "status",
   ]);
+  // Local history (#276): Codex's and, read the same way, Claude Code's.
+  const hasLocalHistory = providerId === "codex" || providerId === "claude";
 
   return createAgentUsageState(providerId, {
     status: message ? "error" : "online",
@@ -205,7 +209,7 @@ export const parseAgentUsageSnapshot = (
           line.type === "barChart" && line.label.toLowerCase() === "usage trend",
       ) ?? null,
     dailyTokenRows:
-      providerId === "codex"
+      hasLocalHistory
         ? lines
             .filter(
               (line) =>
@@ -219,7 +223,7 @@ export const parseAgentUsageSnapshot = (
             .filter((line) => line.value)
         : [],
     modelShares:
-      providerId === "codex"
+      hasLocalHistory
         ? lines
             .filter(
               (line) =>

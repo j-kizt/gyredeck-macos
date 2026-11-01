@@ -72,6 +72,11 @@ jobs:
       - name: Build frontend
         run: pnpm --filter @gyredeck/desktop build
 
+      # tauri-build fails on a missing resource, and gyredeck-discord.mjs is built, not
+      # committed (adapters/discord/build.mjs), so it must exist before cargo runs.
+      - name: Build Discord connector
+        run: pnpm discord:build
+
       # `universal-apple-darwin` is a Tauri pseudo-target: it builds both real
       # targets and lipos them. Build the same two here, in the same profile, so
       # the cached artifacts are the ones the release actually reuses.

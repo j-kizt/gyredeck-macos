@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 
 mod agy_statusline;
 mod broker;
+mod discord;
 mod github;
 mod heavy_watch;
 mod keep_awake;
@@ -1163,6 +1164,79 @@ fn heavy_patterns(watch: tauri::State<'_, heavy_watch::HeavyWatchState>) -> serd
 #[tauri::command]
 fn set_heavy_patterns(patterns: Vec<String>, watch: tauri::State<'_, heavy_watch::HeavyWatchState>) -> Result<serde_json::Value, String> {
     watch.set(&patterns)
+}
+
+/// Discord as Settings → Permission → Remote access shows it (#199).
+#[tauri::command]
+fn discord_status(discord: tauri::State<'_, discord::DiscordState>) -> discord::DiscordStatus {
+    discord.status()
+}
+
+/// Keep a bot token in the Keychain and (re)start the connector with it. Off the main thread:
+/// stopping a running connector waits for it.
+#[tauri::command]
+async fn discord_set_token(app: tauri::AppHandle, token: String) -> Result<discord::DiscordStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let word = app.state::<broker::BrokerState>().secret().ok();
+        app.state::<discord::DiscordState>().set_token(&token, word.as_deref())
+    })
+        .await
+        .map_err(|error| format!("Saving the token did not finish: {error}"))?
+}
+
+#[tauri::command]
+fn discord_set_forum(discord: tauri::State<'_, discord::DiscordState>, forum_id: String) -> Result<discord::DiscordStatus, String> {
+    discord.set_forum(&forum_id)
+}
+
+/// A fresh six-digit code the owner sends the bot in a direct message.
+#[tauri::command]
+fn discord_start_pairing(discord: tauri::State<'_, discord::DiscordState>) -> Result<String, String> {
+    discord.start_pairing()
+}
+
+/// Stop the connector and forget its token, forum and owner. Posts already made stay.
+#[tauri::command]
+async fn discord_remove(app: tauri::AppHandle) -> Result<discord::DiscordStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let word = app.state::<broker::BrokerState>().secret().ok();
+        app.state::<discord::DiscordState>().remove(word.as_deref())
+    })
+    .await
+    .map_err(|error| format!("Removing Discord did not finish: {error}"))?
+}
+
+/// Follow a room this app founded on Discord.
+#[tauri::command]
+async fn discord_connect(app: tauri::AppHandle, code: String) -> Result<discord::DiscordStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let word = app.state::<broker::BrokerState>().secret()?;
+        app.state::<discord::DiscordState>().connect(&code, &word)
+    })
+    .await
+    .map_err(|error| format!("Connecting the room did not finish: {error}"))?
+}
+
+#[tauri::command]
+async fn discord_disconnect(app: tauri::AppHandle, code: String) -> Result<discord::DiscordStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let word = app.state::<broker::BrokerState>().secret().ok();
+        app.state::<discord::DiscordState>().disconnect(&code, word.as_deref())
+    })
+    .await
+    .map_err(|error| format!("Disconnecting the room did not finish: {error}"))?
+}
+
+/// Take the Discord member out of a room again after a leave the bridge refused. Needs only
+/// the broker's word, so it works after Remove, with no token kept.
+#[tauri::command]
+async fn discord_retry_leave(app: tauri::AppHandle, code: String) -> Result<discord::DiscordStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let word = app.state::<broker::BrokerState>().secret()?;
+        app.state::<discord::DiscordState>().disconnect(&code, Some(&word))
+    })
+    .await
+    .map_err(|error| format!("Leaving the room did not finish: {error}"))?
 }
 
 #[tauri::command]
@@ -6253,6 +6327,14 @@ pub fn run() {
             set_session_name,
             sync_close,
             sync_leave,
+            discord_status,
+            discord_set_token,
+            discord_set_forum,
+            discord_start_pairing,
+            discord_remove,
+            discord_connect,
+            discord_disconnect,
+            discord_retry_leave,
             heavy_status,
             heavy_stop,
             heavy_patterns,
@@ -6317,6 +6399,7 @@ pub fn run() {
         .manage(StandaloneBridgeState::default())
         .manage(broker::BrokerState::default())
         .manage(heavy_watch::HeavyWatchState::default())
+        .manage(discord::DiscordState::default())
         .invoke_handler(move |invoke| command_handler(invoke))
         .setup(|app| {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -6360,6 +6443,20 @@ pub fn run() {
                 Err(error) => {
                     eprintln!("Gyredeck standalone bridge resource is unavailable: {error}");
                 }
+            }
+            // The Discord connector (#199) starts only when a bot token is kept; without
+            // one this remembers where it is and starts nothing.
+            match (
+                standalone_bridge::find_node_binary(),
+                app.path().resolve("gyredeck-discord.mjs", tauri::path::BaseDirectory::Resource),
+            ) {
+                (Some(node), Ok(path)) => {
+                    if let Err(error) = app.state::<discord::DiscordState>().start(node, path) {
+                        eprintln!("Gyredeck Discord connector is unavailable: {error}");
+                    }
+                }
+                (None, _) => eprintln!("Gyredeck Discord connector is unavailable: Node.js was not found"),
+                (_, Err(error)) => eprintln!("Gyredeck Discord connector resource is unavailable: {error}"),
             }
             // The mailbox broker listens beside the bridge. A collect it has decided on is
             // one bridge call with the machine token and the broker's word, for the session
@@ -6450,6 +6547,8 @@ pub fn run() {
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
             app_handle.state::<broker::BrokerState>().stop();
+            // Before the bridge: every room ends with it, and each followed post is told so.
+            app_handle.state::<discord::DiscordState>().shutdown();
             app_handle.state::<StandaloneBridgeState>().stop();
             let _ = app_handle.state::<KeepAwakeState>().set_active(false);
         }

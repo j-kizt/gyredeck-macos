@@ -189,3 +189,29 @@ test("the room's own voice is bounded wherever it speaks, not only when it says 
   assert.ok(r.messages.some((m) => m.text === "OWED"), "and a real message is never spent for it");
 });
 
+
+// #199 r7, I20: the room's own notices are lines its Discord relay is owed.
+const relayRoom = (relaySeq, count) => {
+  const r = room({ members: { peer: 0 } });
+  r.members.set("discord-sync-ab12", { relay: true, confirmed: true, readSeq: relaySeq });
+  for (let seq = 1; seq <= count; seq += 1) {
+    r.seq = seq;
+    r.messages.push({ seq, from: ROOM_SENDER, to: "everyone", kind: "notice", text: `notice ${seq}` });
+    trimRoomNotices(r);
+  }
+  return r;
+};
+
+test("I20: a notice the Discord relay has not read is kept past the allowance", () => {
+  const r = relayRoom(0, MAIL_MAX_NOTICES + 8);
+  assert.equal(r.messages[0].seq, 1, "nothing the relay never took in was dropped");
+  assert.equal(r.droppedThroughSeq, 0);
+  const read = relayRoom(8, MAIL_MAX_NOTICES + 8);
+  assert.equal(read.messages[0].seq, 9, "what the relay has read goes, as before");
+});
+
+test("I20: past the wider ceiling the oldest goes, and the drop is recorded", () => {
+  const r = relayRoom(0, 4 * MAIL_MAX_NOTICES + 5);
+  assert.equal(r.messages.length, 4 * MAIL_MAX_NOTICES);
+  assert.equal(r.droppedThroughSeq, 5, "the reader is told what it will never be handed");
+});

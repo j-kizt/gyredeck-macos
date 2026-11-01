@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{mpsc, Arc, LazyLock, Mutex},
+    sync::{atomic::{AtomicU64, Ordering}, mpsc, Arc, LazyLock, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -21,6 +21,20 @@ static ROOM_PASSWORDS: LazyLock<Mutex<RoomPasswords>> = LazyLock::new(|| Mutex::
 
 fn room_passwords() -> std::sync::MutexGuard<'static, RoomPasswords> {
     ROOM_PASSWORDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The password of a room this app founded, for the app's own reader of it (#199). `None`
+/// for every other room: a room this app did not create is one it holds no password for.
+pub(crate) fn room_password(code: &str) -> Option<String> {
+    room_passwords().get(code)
+}
+
+/// How many bridges this app has spawned. Every room lives in one bridge's memory, so a
+/// change here means every room read before it has ended (#199).
+static BRIDGE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn bridge_generation() -> u64 {
+    BRIDGE_GENERATION.load(Ordering::SeqCst)
 }
 
 /// Each password with the generation it was stored at, so a list of rooms read before a room
@@ -159,6 +173,8 @@ fn append_private_line(path: &Path, line: &str) -> std::io::Result<()> {
     }
     let mut options = fs::OpenOptions::new();
     options.append(true).create(true);
+    // Never appended through a link planted at the log's name (#199 audit).
+    no_follow(&mut options);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -362,23 +378,110 @@ pub(crate) fn config_flag(key: &str, fallback: bool) -> bool {
 }
 
 pub(crate) fn write_config_flag(key: &str, value: bool) -> Result<(), String> {
+    write_config_value(key, Some(serde_json::Value::from(value)))
+}
+
+/// Set one key of the Gyredeck config, or remove it with `None`, keeping every other key.
+pub(crate) fn write_config_value(key: &str, value: Option<serde_json::Value>) -> Result<(), String> {
+    write_config_values(&[(key, value)])
+}
+
+pub(crate) fn write_config_values(changes: &[(&str, Option<serde_json::Value>)]) -> Result<(), String> {
     let path =
         bridge_config_path().ok_or_else(|| "Could not resolve Gyredeck config directory".to_string())?;
+    write_config_values_at(&path, changes)
+}
+
+/// One key of the Gyredeck config, read without following a link.
+pub(crate) fn config_value(key: &str) -> Option<serde_json::Value> {
+    let path = bridge_config_path()?;
+    let contents = read_no_follow(&path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&contents).ok()?.get(key).cloned()
+}
+
+/// The one writer of the Gyredeck config (#199 audit, the #230 class): read without
+/// following a link, written to a fresh sibling that is created and never opened through a
+/// link, synced, and renamed over — so a link planted at the config or at a temp name never
+/// has its target read or overwritten.
+#[cfg(test)]
+pub(crate) fn write_config_value_at(path: &Path, key: &str, value: Option<serde_json::Value>) -> Result<(), String> {
+    write_config_values_at(path, &[(key, value)])
+}
+
+/// Every change in one write. The config is started afresh only when there is none: one that
+/// is a link, cannot be read or is not a JSON object is an error and is left as it is — a
+/// fresh file with one key would silently lose every other setting (#199 r3).
+pub(crate) fn write_config_values_at(path: &Path, changes: &[(&str, Option<serde_json::Value>)]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "Gyredeck config path has no parent directory".to_string())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("Could not create Gyredeck config directory: {error}"))?;
-    let mut config = fs::read_to_string(&path)
-        .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    config.insert(key.to_string(), serde_json::Value::from(value));
+    let mut config = match read_no_follow(path) {
+        Ok(contents) if contents.trim().is_empty() => serde_json::Map::new(),
+        Ok(contents) => serde_json::from_str::<serde_json::Value>(&contents)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .ok_or_else(|| "The Gyredeck config is not valid JSON, so nothing was changed".to_string())?,
+        Err(error) if error.kind() == ErrorKind::NotFound => serde_json::Map::new(),
+        Err(error) => return Err(format!("Could not read the Gyredeck config ({error}), so nothing was changed")),
+    };
+    for (key, value) in changes {
+        match value {
+            Some(value) => config.insert((*key).to_string(), value.clone()),
+            None => config.remove(*key),
+        };
+    }
     let contents = serde_json::to_vec_pretty(&serde_json::Value::Object(config))
         .map_err(|error| format!("Could not serialise Gyredeck config: {error}"))?;
-    fs::write(&path, contents)
-        .map_err(|error| format!("Could not write Gyredeck config: {error}"))
+    replace_file(path, &contents).map_err(|error| format!("Could not write Gyredeck config: {error}"))
+}
+
+fn no_follow(options: &mut fs::OpenOptions) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let _ = options;
+}
+
+fn read_no_follow(path: &Path) -> std::io::Result<String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    no_follow(&mut options);
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Write `bytes` to a sibling created for this write alone, then rename it over `path`.
+fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("gyredeck");
+    let temporary = path.with_file_name(format!("{name}.{}.{unique}.tmp", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    // `create_new` is O_CREAT|O_EXCL, which never follows a link at the name.
+    options.write(true).create_new(true);
+    no_follow(&mut options);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all()).and_then(|()| fs::rename(&temporary, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written
 }
 
 pub(crate) fn write_configured_port(port: u16) -> Result<(), String> {
@@ -388,27 +491,7 @@ pub(crate) fn write_configured_port(port: u16) -> Result<(), String> {
             u16::MAX
         ));
     }
-    let path =
-        bridge_config_path().ok_or_else(|| "Could not resolve Gyredeck config directory".to_string())?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| "Gyredeck config path has no parent directory".to_string())?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("Could not create Gyredeck config directory: {error}"))?;
-    let mut config = fs::read_to_string(&path)
-        .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    config.insert("port".to_string(), serde_json::Value::from(port));
-    let contents = serde_json::to_vec_pretty(&serde_json::Value::Object(config))
-        .map_err(|error| format!("Could not encode Gyredeck config: {error}"))?;
-    let temporary_path = path.with_extension("json.tmp");
-    fs::write(&temporary_path, contents)
-        .map_err(|error| format!("Could not write Gyredeck config: {error}"))?;
-    fs::rename(&temporary_path, &path)
-        .map_err(|error| format!("Could not save Gyredeck config: {error}"))?;
-    Ok(())
+    write_config_value("port", Some(serde_json::Value::from(port)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -747,6 +830,7 @@ fn spawn_bridge(
     // bridge that does not start, with the reason, not a bridge protecting nobody.
     // A new bridge holds none of the old one's rooms.
     room_passwords().clear();
+    BRIDGE_GENERATION.fetch_add(1, Ordering::SeqCst);
     let lines = match handshake {
         Some(handshake) => Some(handshake.lines().map_err(|reason| {
             std::io::Error::other(format!("the broker's protection ledger could not be read: {reason}"))
@@ -960,10 +1044,35 @@ fn bridge_request_within(
     reply_timeout: Duration,
     broker_secret: Option<&str>,
 ) -> Result<(u16, serde_json::Value), String> {
-    let Some(token) = read_ingest_token() else {
-        return Err("Ingest token is not available yet".to_string());
-    };
-    let port = configured_bridge_port();
+    let target = BridgeTarget::configured()?;
+    bridge_request_to(&target, method, path, body, reply_timeout, broker_secret)
+}
+
+/// Which bridge to call and with what machine token: the configured one, or one a test
+/// started on a port of its own.
+#[derive(Clone, Debug)]
+pub(crate) struct BridgeTarget {
+    pub port: u16,
+    pub token: String,
+}
+
+impl BridgeTarget {
+    pub(crate) fn configured() -> Result<Self, String> {
+        let token = read_ingest_token().ok_or_else(|| "Ingest token is not available yet".to_string())?;
+        Ok(Self { port: configured_bridge_port(), token })
+    }
+}
+
+pub(crate) fn bridge_request_to(
+    target: &BridgeTarget,
+    method: &str,
+    path: &str,
+    body: Option<String>,
+    reply_timeout: Duration,
+    broker_secret: Option<&str>,
+) -> Result<(u16, serde_json::Value), String> {
+    let token = &target.token;
+    let port = target.port;
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
     let mut stream = TcpStream::connect_timeout(&address, MAIL_REQUEST_TIMEOUT)
@@ -1257,6 +1366,36 @@ pub(crate) fn sync_join(code: &str, conversation_id: &str, app_word: &str) -> Re
     }
     let body = serde_json::json!({ "conversationId": conversation_id }).to_string();
     let (status, value) = bridge_request_vouched("POST", &format!("/sync/rooms/{code}/members"), Some(body), app_word)?;
+    if !(200..300).contains(&status) {
+        return Err(sync_error(status, &value));
+    }
+    Ok(parse_sync_room(&value, conversation_id))
+}
+
+/// Put the app's Discord relay in a room it founded (#199): the bridge labels it "Discord",
+/// lets it read the whole room and refuses it every post. Only the app may say so.
+pub(crate) fn sync_join_relay(code: &str, conversation_id: &str, app_word: &str) -> Result<SyncRoom, String> {
+    sync_join_relay_to(&BridgeTarget::configured()?, code, conversation_id, app_word)
+}
+
+pub(crate) fn sync_join_relay_to(
+    target: &BridgeTarget,
+    code: &str,
+    conversation_id: &str,
+    app_word: &str,
+) -> Result<SyncRoom, String> {
+    if !valid_room(conversation_id) || !valid_room(code) {
+        return Err("Not a valid room".to_string());
+    }
+    let body = serde_json::json!({ "conversationId": conversation_id, "relay": "discord" }).to_string();
+    let (status, value) = bridge_request_to(
+        target,
+        "POST",
+        &format!("/sync/rooms/{code}/members"),
+        Some(body),
+        MAIL_REQUEST_TIMEOUT,
+        Some(app_word),
+    )?;
     if !(200..300).contains(&status) {
         return Err(sync_error(status, &value));
     }
@@ -1800,6 +1939,56 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
         let lines = log_lines(&path);
         assert_eq!(lines.len(), 1, "the live log restarted with the line written after rotation");
         assert_eq!(lines[0]["event"], "after");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn the_config_and_the_log_are_never_written_through_a_planted_link() {
+        let directory = fixture_dir("config-links");
+        let victim = directory.join("victim.json");
+        fs::write(&victim, b"{\"keep\":true}").unwrap();
+
+        let config = directory.join("gyredeck.config.json");
+        std::os::unix::fs::symlink(&victim, &config).unwrap();
+        assert!(write_config_value_at(&config, "discordForumId", Some(serde_json::Value::from("123456789012345678"))).is_err(), "a linked config is an error");
+        assert_eq!(fs::read(&victim).unwrap(), b"{\"keep\":true}", "the link's target is untouched");
+        assert!(fs::symlink_metadata(&config).unwrap().file_type().is_symlink(), "and the link itself is left as it was");
+        assert!(fs::read_dir(&directory).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+
+        let log = directory.join("gyredeck.supervisor.log");
+        std::os::unix::fs::symlink(&victim, &log).unwrap();
+        assert!(append_private_line(&log, "{}").is_err(), "an append through a link is refused");
+        assert_eq!(fs::read(&victim).unwrap(), b"{\"keep\":true}");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_read_as_it_is_is_never_replaced_by_one_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = fixture_dir("config-unreadable");
+        let saved = b"{\"port\":47999,\"discordOwner\":{\"id\":\"323456789012345678\"}}".to_vec();
+
+        let unreadable = directory.join("unreadable.json");
+        fs::write(&unreadable, &saved).unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o200)).unwrap();
+        assert!(write_config_value_at(&unreadable, "launchAtLogin", Some(serde_json::Value::Bool(true))).is_err());
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(&unreadable).unwrap(), saved, "an unreadable config is left as it was");
+
+        let broken = directory.join("broken.json");
+        fs::write(&broken, b"{\"port\":47999,").unwrap();
+        assert!(write_config_value_at(&broken, "launchAtLogin", Some(serde_json::Value::Bool(true))).is_err());
+        assert_eq!(fs::read(&broken).unwrap(), b"{\"port\":47999,", "a config that is not JSON is left as it was");
+
+        let absent = directory.join("absent.json");
+        write_config_value_at(&absent, "launchAtLogin", Some(serde_json::Value::Bool(true))).expect("no config yet: one is made");
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&fs::read(&absent).unwrap()).unwrap(), serde_json::json!({ "launchAtLogin": true }));
+
+        let kept = directory.join("kept.json");
+        fs::write(&kept, &saved).unwrap();
+        write_config_value_at(&kept, "launchAtLogin", Some(serde_json::Value::Bool(true))).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&kept).unwrap()).unwrap();
+        assert_eq!(after["port"], 47999, "premise: a readable config keeps every other key");
         let _ = fs::remove_dir_all(directory);
     }
 

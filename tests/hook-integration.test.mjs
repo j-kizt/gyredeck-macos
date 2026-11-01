@@ -27,6 +27,10 @@ const CONFIG_DIR = [".config", "gyredeck"];
  */
 process.env.GYREDECK_NO_AGENT_SPAWN = "1";
 
+// A bridge now writes what it learnt about sessions as it stops (the shutdown fixed in #199
+// could not reach its flush before), so a directory a test clears right after stopping one
+// can still be gaining a file: every clean-up here retries instead of failing on ENOTEMPTY.
+
 /**
  * The app's half of a room password (#124). The bridge hands the password over once, when
  * the room is created, and keeps only a hash, so `/passwords` answers whether the caller is
@@ -177,7 +181,7 @@ test("install-claude-hooks copies the adapter and merges settings idempotently",
     // The adapter was copied to the stable config path.
     assert.match(await readFile(installedHook, "utf8"), /Gyredeck Claude Code Hook Adapter/);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -224,7 +228,7 @@ test("claude adapter relays a Notification into the running bridge", async () =>
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -271,7 +275,7 @@ test("claude adapter forwards a PreToolUse ingest event with trusted runtime", a
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -316,7 +320,7 @@ test("antigravity adapter allows PreToolUse and relays a tool_start", async () =
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -389,7 +393,7 @@ test("antigravity adapter raises attention when the model asks the user a questi
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -456,7 +460,7 @@ test("antigravity adapter answers each event with its documented response shape"
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -532,7 +536,7 @@ test("codex adapter reports a session id, a paired tool call, and approval atten
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -570,7 +574,7 @@ test("standalone bridge appends relayed events to the ndjson log", async () => {
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -730,7 +734,7 @@ test("bridge mail rooms push to subscribers and buffer for periodic readers", as
     subscription.abort();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -897,7 +901,7 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -968,7 +972,7 @@ test("a bridge restart cannot leave a reader stranded past its room", async () =
     assert.deepEqual(await deliveredTexts(2), ["after restart"]);
   } finally {
     await stopBridge(bridge);
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -1020,7 +1024,7 @@ test("mail delivery reports how a message will reach the session it is addressed
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -1111,7 +1115,7 @@ test("claude UserPromptSubmit delivers mail as additional context exactly once",
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -1287,7 +1291,7 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
     assert.equal(dead.status, 404);
   } finally {
     bridge.kill("SIGTERM");
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -1390,7 +1394,7 @@ test("a sync room gives each member its own read position", async () => {
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -1474,7 +1478,7 @@ test("an inbox merges a session's mailbox with its sync room, and the cap cannot
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -1558,7 +1562,7 @@ test("a session can wait inside its turn for an answer it needs", async () => {
     await held;
   } finally {
     bridge.kill("SIGTERM");
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -1741,7 +1745,7 @@ test("a room delivery carries only what the session can use, and points at the r
     watch.abort();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -1794,7 +1798,7 @@ test("the founder's prompt that carries the room password still gets its mail (#
     assert.match(context, /"to":"everyone","kind":"tell"/);
   } finally {
     bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -1879,7 +1883,7 @@ test("a room watch is sent a heartbeat, and with no rules file the rules go out 
     watch.abort();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -1979,7 +1983,7 @@ test("a room member hears when its own provider's limit runs low, and can ask fo
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -2167,7 +2171,7 @@ test("an agent outside a room learns it can ask for its usage, and hears when it
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -2300,7 +2304,7 @@ test("mail a hook has collected still reaches the session when building the deli
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -2382,7 +2386,7 @@ test("a password accepted in a turn whose mail is withheld still names the room 
     if (broker) await broker.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -2431,7 +2435,7 @@ test("a password accepted while the bridge refuses the session's TCP read still 
     if (broker) await broker.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -2462,7 +2466,7 @@ test("only the app's word opens, joins, invites into, empties and closes a room 
       });
       return { status: response.status, body: await response.json() };
     };
-    const stop = async () => { bridge.stdin.end(); if (bridge.exitCode === null) bridge.kill(); await rm(home, { recursive: true, force: true }); };
+    const stop = async () => { bridge.stdin.end(); if (bridge.exitCode === null) bridge.kill(); await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }); };
     return { call, stop };
   };
   const app = { "x-gyredeck-broker": appWord };
@@ -2576,7 +2580,7 @@ test("the bridge keeps only a hash of a room's password, and hands the plaintext
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -2657,7 +2661,7 @@ test("a session the broker bound and then turned away is told its mail is held, 
     if (broker) await broker.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -2700,7 +2704,7 @@ test("a message over the size limit is refused with the limit and its own length
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -2807,7 +2811,7 @@ test("a session's assigned name shows wherever the room names it, and to still t
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -2846,8 +2850,8 @@ test("a session declares the name it is called by on its first post; the room an
     }
     // The rule is written where every session reads the rules.
     const rules = await readFile(join(home, ...CONFIG_DIR, "room-rules.md"), "utf8");
-    assert.equal(ROOM_RULES_VERSION, 12);
-    assert.match(rules, /^# Gyredeck room rules — v12/);
+    assert.ok(ROOM_RULES_VERSION >= 12, "the name rule arrived in v12");
+    assert.match(rules, new RegExp(`^# Gyredeck room rules — v${ROOM_RULES_VERSION}\n`));
     assert.match(rules, /## Your name\n- The room calls you by the name you declare, on your \*\*first post\*\*/);
     assert.match(rules, /`name="<Name>"` after the kind/);
     // Only the founder has a name in the app.
@@ -2984,7 +2988,7 @@ test("a session declares the name it is called by on its first post; the room an
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -3092,7 +3096,7 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -3153,7 +3157,7 @@ test("a session that ends is taken out of its sync room", async () => {
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -3330,7 +3334,7 @@ test("a message says who it is for and what it is for, and the room routes on th
     assert.equal(direct.body.seq > 0, true);
   } finally {
     bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -3415,7 +3419,7 @@ test("a wait that times out says whether the message was the problem", async () 
     );
   } finally {
     bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -3470,7 +3474,7 @@ test("a message to a room that is not there is refused, not delivered to a new o
     assert.match(await stream.text(), /^event: error\ndata: /, "a refused watch answers in frames");
   } finally {
     bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -3626,7 +3630,7 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     assert.equal(bare.to, "everyone");
   } finally {
     bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -3717,7 +3721,7 @@ test("a name declared on a post near the held-mail limit is weighed before it is
     assert.ok(members.every((member) => member.declared !== true), "a refused post declares nothing");
   } finally {
     bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -3832,7 +3836,7 @@ test("Codex declares its name in its routing line, name=\"<Name>\" after the kin
     assert.match(next.text, /Members now: Claude Code \/ Gyre Assistant, Codex \/ Gyre Audit\./);
   } finally {
     bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -3892,7 +3896,7 @@ test("the AGY adapter reports token usage when there is any, and never invents i
     );
   } finally {
     bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -3975,7 +3979,7 @@ test("a room message reaches the presence stream, but only when it asks somethin
     assert.doesNotMatch(seen, /FOR-SOMEONE-ELSE/, "somebody else's mail is not yours to be told about");
   } finally {
     bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -4127,7 +4131,7 @@ for (const [label, adapter, args, payload, expectedPaths] of [
       }
     } finally {
       await new Promise((resolve) => recorder.close(resolve));
-      await rm(home, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
   });
 }
@@ -4450,15 +4454,15 @@ test("one Codex turn ending is reported once, whichever of hook and notify speak
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
-    await rm(hooked, { recursive: true, force: true });
-    await rm(hooked2, { recursive: true, force: true });
-    await rm(lame, { recursive: true, force: true });
-    await rm(bare, { recursive: true, force: true });
-    await rm(cold, { recursive: true, force: true });
-    await rm(forged, { recursive: true, force: true });
-    await rm(shared, { recursive: true, force: true });
-    await rm(coldShared, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await rm(hooked, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await rm(hooked2, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await rm(lame, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await rm(bare, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await rm(cold, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await rm(forged, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await rm(shared, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await rm(coldShared, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -4704,7 +4708,7 @@ test("every mutation and every room read needs a credential that verifies", asyn
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -4845,7 +4849,7 @@ test("only the app's own pages may reach the bridge from a browser", async () =>
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -4956,7 +4960,7 @@ test("a room does not outlive the founder that made it", async () => {
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -5041,7 +5045,7 @@ test("a room's password is not handed to whoever asks for it", async () => {
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -5108,7 +5112,7 @@ test("a bridge told not to launch agents does not go looking for one", async () 
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -5161,7 +5165,7 @@ test("a bridge that starts on a world-readable event log narrows it before writi
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -5228,7 +5232,7 @@ test("a room full of unread mail refuses the next message instead of eating the 
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -5309,7 +5313,7 @@ test("a message the bridge accepted is a message that arrives", async () => {
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -5382,7 +5386,7 @@ test("speaking does not count as reading: a busy session keeps the mail it has n
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -5470,7 +5474,7 @@ test("a Codex repeat is settled before the room is full, so it is never held and
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -5620,7 +5624,7 @@ test("a Codex answer the room has no space for is kept, not stepped over", async
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -5697,7 +5701,7 @@ test("trimming the room's notices never carries a reader past mail it has not se
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -5753,7 +5757,7 @@ test("a room code that is not open reads as gone, not as quiet", async () => {
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -5854,7 +5858,7 @@ test("a batch re-read after the dedup window overflows still publishes each answ
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -5915,7 +5919,7 @@ test("a running bridge rotates its event log rather than growing forever", async
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -6331,7 +6335,7 @@ test("a room password carried in by notify lets that session in, once", async ()
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -6398,7 +6402,7 @@ test("a confirmation that never reached Codex is retried, not reported as sent",
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -6475,7 +6479,7 @@ test("reading a room's password out lets nobody in", async () => {
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -6668,7 +6672,7 @@ test("a session can be given a name, and two unidentified ones are still told ap
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -6770,8 +6774,8 @@ test("what a notify says about a session survives the bridge that heard it", asy
     );
   } finally {
     await stop(bridge).catch(() => undefined);
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await rm(workspace, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -6865,7 +6869,7 @@ test("the reply poll reads only what Codex wrote after the push, not the whole l
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -6962,7 +6966,7 @@ test("a new member's harvest and the usage read stay off the log from before", a
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -7063,7 +7067,7 @@ test("words written before a session may speak are never published, on a first j
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -7188,7 +7192,7 @@ test("the reply poll keeps an answer the room cannot take yet, and publishes eac
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -7313,7 +7317,7 @@ const codexInARoom = async ({ replyTimeoutMs = null } = {}) => {
   const close = async () => {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
   return { home, rolloutDir, port, call, headers, founder, thread, code, rollout, stderrRef, saidInRoom, saidInMailbox, until, close };
 };
@@ -7836,7 +7840,7 @@ const codexInNoRoom = async ({ replyTimeoutMs = 1_000, env = {}, records = true 
   const close = async () => {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
   return { call, sender, thread, rollout, rolloutDir, readers, saidInMailbox, endTurn, until, close, stderr: () => stderrRef.value };
 };
@@ -8126,7 +8130,7 @@ const bridgeWithCodexHome = async ({ log = null, kinds = null, codexHome = null,
     close: async () => {
       bridge.stdin.end();
       if (bridge.exitCode === null) bridge.kill();
-      await rm(home, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     },
   };
 };
@@ -8245,7 +8249,7 @@ test("a replayed notify-only thread that Codex keeps a rollout for is a session"
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -8369,7 +8373,7 @@ test("hook evidence outlives the log it was in", async () => {
     assert.equal(after[hooked]?.hookReported, true, "and the provenance survives the second bridge too");
   } finally {
     await stop(bridge);
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -8402,7 +8406,7 @@ test("a rollout under CODEX_HOME counts, live and on replay", async () => {
     assert.equal(seen.filter((event) => event.conversationId === live).length, 1, "and a live one is published");
   } finally {
     await bridge.close();
-    await rm(codexHome, { recursive: true, force: true });
+    await rm(codexHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -8655,7 +8659,7 @@ test("a hook collects through the broker when it can, and falls back only when t
     if (broker) await broker.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -8719,7 +8723,7 @@ test("the Antigravity hook takes the same path to the broker", async () => {
     if (broker) await broker.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -8850,7 +8854,7 @@ test("a hook believes the broker only when the answer is for it, and never colle
     if (broker) await broker.close();
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -8981,7 +8985,7 @@ test("the bridge refuses an old-path collect for a session the broker has bound,
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -9010,7 +9014,7 @@ test("a bridge that was handed no secret vouches for nobody and serves every pat
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -9052,7 +9056,7 @@ test("a broker handshake that is not whole is a bridge that exits, never one tha
       assert.equal(await fetch(`http://127.0.0.1:${port}/health`).then(() => "served").catch(() => null), null, `${name}: nothing was ever served`);
     } finally {
       if (bridge.exitCode === null) bridge.kill();
-      await rm(home, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
   }
 });
@@ -9123,7 +9127,7 @@ test("a Codex session's mailbox has no reader at all, the broker's word included
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -9189,7 +9193,7 @@ test("a session known as Codex's stays closed when a later event names another p
     assert.equal(await inbox(), 403, "a flood of newer sessions does not push it out of what the bridge keeps");
   } finally {
     if (bridge.exitCode === null) { bridge.stdin.end(); bridge.kill(); }
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -9252,7 +9256,7 @@ test("the record of closed Codex mailboxes is never evicted: past its cap the br
     assert.equal((await read("fabricated-codex-5")).status, 403, "nor is an unrecorded one renamed to Claude");
   } finally {
     if (running.bridge.exitCode === null) { running.bridge.stdin.end(); running.bridge.kill(); }
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -9283,7 +9287,7 @@ test("a record of closed Codex mailboxes that cannot be trusted at startup close
     } finally {
       bridge.stdin.end();
       if (bridge.exitCode === null) bridge.kill();
-      await rm(home, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
   }
 });
@@ -9316,7 +9320,7 @@ test("the provider the bridge kept across a restart closes a Codex mailbox from 
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -9439,7 +9443,7 @@ test("the hook's wait goes through the broker: collect only, boundTo validated, 
     assert.equal(waited.code, 2);
     assert.match(waited.stderr, /the bridge did not answer/);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -9620,7 +9624,7 @@ test("a hook that gave up on a slow answer is handed the same batch next turn, a
       assert.ok(!requests.some((request) => request.ack?.delivery === 9), `${hook}: and did not acknowledge it`);
     } finally {
       await new Promise((resolve) => broker.close(resolve));
-      await rm(home, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
   }
 });
@@ -9702,7 +9706,7 @@ test("a watch that has never carried a frame still hears what arrived while it w
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -9752,7 +9756,7 @@ test("an Antigravity member is told to hear the room with a wait that ends, neve
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -9798,7 +9802,7 @@ test("the Antigravity hook's wait asks the broker, ends on mail, and is refused 
     assert.equal((await waitBy(["30"])).code, 3, "an id is required");
     assert.equal((await waitBy(["0", me])).code, 3, "usage");
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -9970,7 +9974,7 @@ const heavyHarness = async (tag) => {
     for (const pgid of groups) if (Number.isInteger(pgid) && pgid > 1) killGroup(pgid);
     for (const parent of parents) { try { parent.kill("SIGKILL"); } catch {} parent.stdout.destroy(); }
     for (const bridge of bridges) await stop(bridge);
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
   return { home, base, loadFile, clockFile, holderPath, helperPath, start, stop, post, state, pair, acquire, group, hold, helper, cleanup, token: () => token, groups };
 };
@@ -10801,7 +10805,7 @@ for (const row of statusCases) {
       for (const value of row.absent ?? []) assert.ok(!`${run.stdout}${run.stderr}`.includes(value), `${value} printed`);
     } finally {
       await fake.close();
-      await rm(home, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
   });
 }
@@ -10825,7 +10829,7 @@ test("#260 r2: a reader that closed stdout gets 69 and one stderr line, not a st
     assert.equal(stderr, "gyredeck: cannot tell whether a heavy run is on — its answer could not be written (EPIPE)\n");
   } finally {
     await fake.close();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -10858,7 +10862,7 @@ test("#260 --status C4/C6: no bridge, a silent bridge, or no token cannot tell w
     assert.equal(silent.requests.length, before, "nothing is asked without a token");
   } finally {
     await silent.close();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -10876,7 +10880,7 @@ test("#260 --status C7: --status with anything else is usage, runs nothing and a
     assert.deepEqual(fake.requests, [], "and the bridge was never asked");
   } finally {
     await fake.close();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -11331,7 +11335,7 @@ test("an unconfirmed Antigravity member sees how to confirm on every invocation,
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -11388,7 +11392,7 @@ test("the Antigravity payload-shape log records lengths, never values, and empti
     assert.ok(records.length >= 1 && records.every((record) => record.v === 2));
     assert.equal(records[0].shape.lastUserInput, "string(32)");
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -11502,7 +11506,7 @@ const agyPasteFixture = async (tag, { breakInbox = false, inboxBody = null, boun
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await new Promise((resolve) => proxy.close(resolve));
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
   /** Confirm the member with the room's password, as the person would. */
   const confirm = async () => assert.equal((await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: agy, password })).status, 200);
@@ -13225,7 +13229,7 @@ const codexHeavyFixture = async (tag) => {
   const close = async () => {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
   return { home, call, pushes, messagesTo, ingestCodex, close };
 };

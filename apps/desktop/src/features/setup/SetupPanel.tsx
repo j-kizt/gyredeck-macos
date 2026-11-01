@@ -10,6 +10,8 @@ import { useGitCredentialHelper } from "./useGitCredentialHelper";
 import HeavyPatternsRow from "./HeavyPatternsRow";
 import { useHeavyRuns } from "./useHeavyRuns";
 import { codexTrustCopy, hookNeedsAttention, hookSettled, type IHookStatus } from "./hookStatus";
+import { useDiscord, type IUseDiscord } from "./useDiscord";
+import { DiscordLogo, DiscordRows } from "./DiscordRows";
 
 export type SyncAgent = "claude" | "agy";
 
@@ -222,12 +224,17 @@ const SyncRoomList = ({
   rooms,
   canUseNativeControls,
   onCloseRoom,
+  discord,
 }: {
   rooms: Record<string, { room: string; members: string[]; pending: number; founder: string | null }>;
   canUseNativeControls: boolean;
   onCloseRoom: (room: string, founder: string) => Promise<void>;
+  discord: IUseDiscord;
 }) => {
   const [closing, setClosing] = useState<string | null>(null);
+  // Offered only once a post has somewhere to go and someone to answer to.
+  // `ready`, not a bot name: a name can be left over from a connector whose token was since refused.
+  const discordReady = Boolean(discord.status?.ready && discord.status.forumId && discord.status.owner);
   if (!canUseNativeControls) return null;
   const open = Object.values(rooms).filter((entry) => entry.members.length > 0);
   // Absent rather than empty. A room exists only while people are using one, so "none
@@ -257,6 +264,15 @@ const SyncRoomList = ({
               {entry.pending} waiting
             </span>
           ) : null}
+          {entry.founder && discordReady ? (() => {
+            const followed = discord.status?.connectedRooms.includes(entry.room) === true;
+            const label = followed ? "Disconnect from Discord" : "Connect to Discord";
+            return (
+              <button className="gh-icon-btn" type="button" data-active={followed} disabled={discord.busy} onClick={() => void discord.run(followed ? "discord_disconnect" : "discord_connect", { code: entry.room })} data-tauri-drag-region="false" title={label} aria-label={label}>
+                <DiscordLogo size={13} />
+              </button>
+            );
+          })() : null}
           {entry.founder ? (
             // Closing ends the room for everyone in it, so it belongs to whoever opened
             // it — the same hand that gave out the password. It is not instant either:
@@ -410,6 +426,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
     notifications.permission === "ephemeral";
   const [compactNavigation, setCompactNavigation] = useState(() => window.matchMedia("(max-width: 380px)").matches);
   const credentialHelper = useGitCredentialHelper(canUseNativeControls);
+  const discord = useDiscord(canUseNativeControls);
   const [portField, setPortField] = useState(String(bridgePort));
   const [portBusy, setPortBusy] = useState(false);
   const [portStatus, setPortStatus] = useState<string | null>(null);
@@ -496,7 +513,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
               <div className="setup-row setup-row-stack"><div className="setup-row-main"><span className="status-slot"><PlugZap className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Bridge port</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : portStatus ?? `Local bridge port · ${bridgePort}`}</span></span>{canUseNativeControls ? <button className="pill-btn" type="button" onClick={toggleEditPort} data-tauri-drag-region="false" aria-expanded={editingPort} aria-label="Edit bridge port"><Pencil size={12} strokeWidth={2.3} />Edit</button> : null}</div>{editingPort ? <span className="setup-row-actions full"><input className="setup-input" type="number" min={MIN_BRIDGE_PORT} max={MAX_BRIDGE_PORT} value={portField} onChange={(event) => setPortField(event.target.value)} disabled={portBusy} data-tauri-drag-region="false" aria-label="Bridge port" autoFocus /><button className="pill-btn accent" type="button" onClick={() => void applyPort()} disabled={!canApplyPort} data-tauri-drag-region="false"><Check size={12} strokeWidth={2.3} />Apply</button></span> : null}</div>
               <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{guidance.title}</span><span className="setup-detail">{guidance.detail}</span></span></div>
               {nativeAction.message ? <div className="notice-row" data-online={nativeAction.bridgeOnline === true} role="status" aria-live="polite">{nativeAction.message}</div> : null}
-              <SyncRoomList rooms={mailRooms} canUseNativeControls={canUseNativeControls} onCloseRoom={onCloseRoom} />
+              <SyncRoomList rooms={mailRooms} canUseNativeControls={canUseNativeControls} onCloseRoom={onCloseRoom} discord={discord} />
               <HeavyRunsRow canUseNativeControls={canUseNativeControls} />
             </>
           ) : null}
@@ -543,6 +560,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
                   <button className="switch-toggle" type="button" role="switch" aria-checked={allowed === true} data-on={allowed === true} disabled={!canUseNativeControls || syncRepliesBusy || typeof allowed != "boolean"} onClick={() => void onSyncRepliesChange(agent, !allowed)} data-tauri-drag-region="false" aria-label={`${allowed === true ? "Stop letting" : "Let"} ${name} answer rooms without asking`}><span className="switch-thumb" /></button>
                 )}</div>;
               })}
+              <DiscordRows discord={discord} canUseNativeControls={canUseNativeControls} />
             </>
           ) : null}
 

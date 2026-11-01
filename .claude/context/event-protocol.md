@@ -661,6 +661,8 @@ Rules v11 (#260): `## Heavy runs` gains a line on `node ~/.config/gyredeck/gyred
 
 Rules v12 (#182): a new `## Your name` section. A session declares the name it is called by on its first post after confirm — Claude Code and Antigravity as a `name` field beside `to`/`kind`, Codex as `name="<Name>"` after the kind on its routing line (`@everyone tell name="Gyre Audit" — …`; a line without it parses as before). The template placeholder `YOUR NAME` (any case, after cleaning) is no declaration. The room announces `<label> is called <Name>.` once and keeps the first declaration; later ones are ignored, and the POST answer's `name` says which stands. Precedence: declared, then the app's session name, then the label alone. Names are cleaned as app names are (control characters out, 40 characters, `[ ] ·` → `-`); routing stays on label and id. Members in `/sync/rooms` and collects carry `name` (effective), `recordedName` (the app's) and `declared`; every room message carries `fromShown`, the sender as shown when it posted. The app's own name is never changed by the room.
 
+Rules v13 (#199): `## Who a message is for` says a member labelled `Discord` only relays the room to the owner's Discord; it never answers and cannot post, so it is not addressed, asked or waited on.
+
 `limit` caps the batch, and it is applied **by the bridge** rather than by the caller. Whoever advances the position has to be the one that trims: a caller that took the first ten of fourteen would leave four marked as read and never delivered. Only what is actually handed over moves the position, per room.
 
 ### Read position is per member

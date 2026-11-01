@@ -36,6 +36,8 @@ pnpm desktop:dev        # run the Tauri app in dev mode (menu-bar window; footer
 pnpm desktop:web        # browser-only demo/dev server (no native features)
 pnpm mod:tail           # tail the local NDJSON event log
 pnpm test:demo          # browser demo Playwright suite
+pnpm discord:build      # bundle adapters/discord into dist/gyredeck-discord.mjs (built, git-ignored; tauri needs it before cargo)
+pnpm test:discord       # build the connector, then its node tests against a fake Discord (part of test:hooks)
 cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
 # The broker's live signature gate, against a real CLI on this machine (ignored by default):
 GYREDECK_BROKER_LIVE_PID=<pid of a running claude or agy> GYREDECK_BROKER_LIVE_NAME=<claude|agy> \

@@ -729,14 +729,23 @@ const confirmLead = (confirm) => {
  * outside a room has no such look for a session the broker holds, so it gets a line to note
  * it now. A message the bridge did not tag with its room counts as outside one.
  */
-const rereadSteps = (endpoint, as, syncRoom, all) => {
+const rereadSteps = (endpoint, as, syncRoom, all, memberKey = null) => {
   // The room's own notices are information, not something to finish, and carry no re-read
   // line (#244): a heavy-run notice must not ask agy to look again.
   const delivered = all.filter((message) => message?.kind !== "notice");
   const inRoom = syncRoom ? delivered.filter((message) => message.room === syncRoom && Number.isInteger(message.seq)) : [];
   const outside = delivered.filter((message) => !inRoom.includes(message));
   const steps = [];
-  if (inRoom.length > 0) {
+  // A look in this session's name takes its own key (#274), handed only through the broker.
+  const key = typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey) ? memberKey : null;
+  if (inRoom.length > 0 && !key) {
+    steps.push({
+      ephemeralMessage:
+        "Ephemeral: the room's messages above are shown in this invocation only, and this delivery did not come" +
+        " through the Gyredeck broker, so there is no key to read them again. If you cannot finish what they ask now, note it now.",
+    });
+  }
+  if (inRoom.length > 0 && key) {
     const since = Math.min(...inRoom.map((message) => message.seq)) - 1;
     // Bounded at the last one delivered: the bridge then hands back only what this
     // delivery held for this session, not the room's traffic since (#251 audit).
@@ -745,7 +754,7 @@ const rereadSteps = (endpoint, as, syncRoom, all) => {
       ephemeralMessage:
         "Ephemeral: the room's messages above are shown in this invocation only. If you cannot finish what they ask now," +
         " note it, or read them again later — the room's password in place of THE ROOM PASSWORD:\n" +
-        `  curl -s "http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}?as=${as}&since=${since}&until=${until}" -H "x-gyredeck-token: THE ROOM PASSWORD"`,
+        `  curl -s "http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}?as=${as}&since=${since}&until=${until}" -H "x-gyredeck-token: THE ROOM PASSWORD" -H "x-gyredeck-member: ${key}"`,
     });
   }
   if (outside.length > 0) {
@@ -821,7 +830,7 @@ const plainSteps = async (taken) => {
   if (typeof taken.result.usageNotice === "string") steps.push({ ephemeralMessage: taken.result.usageNotice.slice(0, MAIL_MAX_TEXT) });
   if (typeof taken.result.heavyNotice === "string") steps.push({ ephemeralMessage: taken.result.heavyNotice.slice(0, MAIL_MAX_TEXT) });
   if (taken.endpoint && messages.length > 0) {
-    steps.push(...rereadSteps(taken.endpoint, taken.as, typeof taken.result.room === "string" ? taken.result.room : null, messages));
+    steps.push(...rereadSteps(taken.endpoint, taken.as, typeof taken.result.room === "string" ? taken.result.room : null, messages, taken.result.memberKey));
   }
   return steps;
 };
@@ -1083,7 +1092,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
     }),
     ...(usageStep ? [usageStep] : []),
     ...(heavyStep ? [heavyStep] : []),
-    ...rereadSteps(endpoint, room, syncRoom, delivered),
+    ...rereadSteps(endpoint, room, syncRoom, delivered, result?.memberKey),
     // Last, so the command is the freshest thing in context when the model acts.
     ...(reply ? [reply] : []),
   ];

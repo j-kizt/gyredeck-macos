@@ -592,13 +592,22 @@ const AGY_SYNC_REPLY_TEMPLATES: [&str; 5] = [
     r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H "x-gyredeck-token: $PW" -d '$BODY'$)"#,
     // SEND, as the bridge's howTo prints it.
     r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H 'x-gyredeck-token: $PW' -d '$BODY'$)"#,
-    // READ again, as the hook prints it.
+    // READ again, as the hook prints it: the reader's own key beside the password (#274).
+    r#"command(regex:^curl -s "http://$HOST:$PORT/mail/$ROOM\?as=$ID&since=[0-9]+&until=[0-9]+" -H "x-gyredeck-token: $PW" -H "x-gyredeck-member: $KEY"$)"#,
+];
+
+/// Rules no longer written but still ours to remove: READ before it took a key (#274).
+const AGY_RETIRED_TEMPLATES: [&str; 1] = [
     r#"command(regex:^curl -s "http://$HOST:$PORT/mail/$ROOM\?as=$ID&since=[0-9]+&until=[0-9]+" -H "x-gyredeck-token: $PW"$)"#,
 ];
 
 /// Every template with everything but the port filled in.
 fn agy_sync_reply_templates(host: &str) -> Vec<String> {
-    AGY_SYNC_REPLY_TEMPLATES
+    fill_agy_templates(&AGY_SYNC_REPLY_TEMPLATES, host)
+}
+
+fn fill_agy_templates(templates: &[&str], host: &str) -> Vec<String> {
+    templates
         .iter()
         .map(|template| {
             template
@@ -606,6 +615,7 @@ fn agy_sync_reply_templates(host: &str) -> Vec<String> {
                 .replace("$ID", AGY_ID)
                 .replace("$ROOM", "sync-[a-z2-9]{4}")
                 .replace("$PW", "[0-9a-f]{32}")
+                .replace("$KEY", "[0-9a-f]{64}")
                 .replace("$HOST", &host.replace('.', r"\."))
         })
         .collect()
@@ -619,7 +629,10 @@ fn agy_sync_reply_rules(host: &str, port: u16) -> Vec<String> {
 }
 
 fn is_agy_sync_reply_rule(rule: &str) -> bool {
-    agy_sync_reply_templates(standalone_bridge::BRIDGE_HOST).iter().any(|template| {
+    let host = standalone_bridge::BRIDGE_HOST;
+    let mut known = agy_sync_reply_templates(host);
+    known.extend(fill_agy_templates(&AGY_RETIRED_TEMPLATES, host));
+    known.iter().any(|template| {
         match template.split_once("$PORT") {
             None => rule == template,
             Some((before, after)) => rule
@@ -7730,6 +7743,7 @@ mod agy_sync_reply_tests {
     const BRIDGE: &str = include_str!("../../../../adapters/bridge/gyredeck-bridge.mjs");
     const HOST: &str = standalone_bridge::BRIDGE_HOST;
     const PASSWORD: &str = "0123456789abcdef0123456789abcdef";
+    const MEMBER_KEY: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
     /// agy's `command(regex:<pattern>)`, as its permissions guide describes it: the pattern
     /// is matched as `^(?:pattern)$`. Go's RE2 and the `regex` crate agree on every construct
@@ -7786,9 +7800,9 @@ mod agy_sync_reply_tests {
             ),
             (
                 "read again",
-                format!("curl -s \"http://{HOST}:{port}/mail/sync-ab2c?as={id}&since=4&until=9\" -H \"x-gyredeck-token: {PASSWORD}\""),
+                format!("curl -s \"http://{HOST}:{port}/mail/sync-ab2c?as={id}&since=4&until=9\" -H \"x-gyredeck-token: {PASSWORD}\" -H \"x-gyredeck-member: {MEMBER_KEY}\""),
                 HOOK,
-                vec!["`  curl -s \"http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}?as=${as}&since=${since}&until=${until}\" -H \"x-gyredeck-token: THE ROOM PASSWORD\"`"],
+                vec!["`  curl -s \"http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}?as=${as}&since=${since}&until=${until}\" -H \"x-gyredeck-token: THE ROOM PASSWORD\" -H \"x-gyredeck-member: ${key}\"`"],
             ),
         ]
     }
@@ -7840,6 +7854,8 @@ mod agy_sync_reply_tests {
             (id, "$(id)"),
             (PASSWORD, "$(cat ~/.ssh/id_rsa)"),
             (PASSWORD, "`id`"),
+            (MEMBER_KEY, "$(cat ~/.ssh/id_rsa)"),
+            (MEMBER_KEY, "fedcba9876543210fedcba9876543210"),
             ("sync-ab2c", "sync-ab2c/../../x"),
             ("Done, see #261", "x'; rm -rf ~; echo '"),
             ("Done, see #261", "$(rm -rf ~)"),
@@ -7855,6 +7871,25 @@ mod agy_sync_reply_tests {
             }
         }
         out
+    }
+
+    /// #274: READ took the reader's key. The rule written before it would let a look without
+    /// a key through the prompt, so it is still recognised as ours and removed either way.
+    #[test]
+    fn the_read_rule_from_before_the_key_is_removed_on_every_rewrite() {
+        let retired: Vec<String> = fill_agy_templates(&AGY_RETIRED_TEMPLATES, HOST)
+            .iter()
+            .map(|template| template.replace("$PORT", "47621"))
+            .collect();
+        let id = "6f1c2d3e-aaaa-bbbb-cccc-0123456789ab";
+        let keyless = format!("curl -s \"http://{HOST}:47621/mail/sync-ab2c?as={id}&since=4&until=9\" -H \"x-gyredeck-token: {PASSWORD}\"");
+        assert!(retired.iter().any(|rule| agy_rule_matches(rule, &keyless)), "the retired rule is the keyless READ");
+        assert!(!agy_sync_reply_rules(HOST, 47621).iter().any(|rule| agy_rule_matches(rule, &keyless)), "no current rule passes a keyless READ");
+        for enabled in [true, false] {
+            let before = json!({ "allow": retired.iter().cloned().map(serde_json::Value::String).collect::<Vec<_>>() });
+            let after = allow_of(&apply_agy_sync_reply_rules(Some(&before), enabled, HOST, 47621).unwrap());
+            assert!(retired.iter().all(|rule| !after.iter().any(|entry| entry.as_str() == Some(rule.as_str()))), "enabled={enabled}: {after:?}");
+        }
     }
 
     #[test]

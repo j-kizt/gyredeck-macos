@@ -2460,20 +2460,32 @@ fn run_ccusage_daily(
         };
         let stdout = drain_capped(child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>), CCUSAGE_STDOUT_CAP);
         let stderr = drain_capped(child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>), CCUSAGE_STDERR_CAP);
+        // One deadline for the process and both readers: a child the runner left behind
+        // keeps the pipes open after the runner itself has exited (#276 audit).
         let deadline = Instant::now() + timeout;
+        let mut exited = None;
         let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
-                _ => {
-                    // The group's id is the child's pid (process_group(0)).
-                    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
+            if exited.is_none() {
+                match child.try_wait() {
+                    Ok(Some(status)) => exited = Some(status),
+                    Ok(None) => {}
+                    Err(_) => break None,
                 }
             }
+            if exited.is_some() && stdout.is_finished() && stderr.is_finished() {
+                break exited;
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            thread::sleep(Duration::from_millis(20));
         };
+        if status.is_none() {
+            // The group's id is the runner's pid (process_group(0)); it outlives the runner.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         let stdout = stdout.join().ok().flatten();
         let _ = stderr.join();
         let Some(status) = status else {
@@ -8368,6 +8380,15 @@ mod claude_usage_history_tests {
         // pipes, and a reader waiting for their end waits for the sleep (#276 audit).
         let started = Instant::now();
         assert!(run_ccusage_daily(&[sh("sleep 3 & wait")], None, Duration::from_millis(100)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_runner_that_exits_leaving_a_child_on_its_pipes_is_still_bound_by_the_timeout() {
+        // The parent is done at once; its background child holds both pipes for 3 s. One
+        // deadline covers the readers too (#276 audit, round 2).
+        let started = Instant::now();
+        assert!(run_ccusage_daily(&[sh("sleep 3 &")], None, Duration::from_millis(100)).is_none());
         assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
     }
 

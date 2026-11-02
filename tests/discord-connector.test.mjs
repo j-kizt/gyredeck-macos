@@ -2442,6 +2442,38 @@ test("#205: Discord can no longer disconnect every room: /disconnect all is gone
   await second.c.close();
 });
 
+// Codex's repro (#205 audit, seq 136): a retried read that lands while the gateway is down
+// must not count as having read the prompt for when it is back.
+test("#205 a retried reaction read while the gateway is down never stands for the read after it is back", async () => {
+  const { c, fake, clock, threadId, of } = await ownerRoom();
+  fake.command({ userId: OWNER, channelId: threadId });
+  await flush();
+  const shown = fake.replies.at(-1);
+  let failOnce = true;
+  let reads = 0;
+  fake.gate = async (op) => {
+    if (op === "reactedBy") {
+      reads++;
+      if (failOnce) {
+        failOnce = false;
+        throw kindError("network", "temporary read failure");
+      }
+    }
+  };
+  fake.emit("offline");
+  fake.emit("online");
+  await flush();
+  assert.equal(failOnce, false, "premise: the first read after coming back failed and a retry is set");
+  fake.emit("offline");
+  await clock.advance(6_000);
+  await flush();
+  fake.given.push({ messageId: shown.id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  fake.emit("online");
+  await flush();
+  assert.equal(of("disconnect_request").length, 1, "the owner's ✅ given during the outage counts once the gateway is back");
+  await c.close();
+});
+
 test("#205 an intent older than its prompt's life is dropped, not searched", async () => {
   const first = await ownerRoom();
   first.fake.after = async (o) => { if (o === "reply") throw new Error("cut off on the way back"); };

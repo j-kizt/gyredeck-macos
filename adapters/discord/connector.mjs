@@ -235,6 +235,9 @@ export function createConnector({ discord, out, clock = realClock }) {
 
   discord.on("online", () => {
     online = true;
+    // A new session: nothing read before it stands for it (#205 audit, seq 136).
+    gatewayEpoch++;
+    read.clear();
     reported.delete("down");
     wake(true);
     // Reactions given while the gateway was down never arrive as events: read them (#205 r7).

@@ -1642,13 +1642,15 @@ test("#205 the relayed-message map keeps at most 500 per room, dropping the olde
 
 test("#205 a leading @Name or Name: asks that member; anything else is for everyone", async () => {
   const { c, fake, of, threadId } = await ownerRoom();
-  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "@Codex please look" });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "@Codex: please look" });
   fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "Claude / Gyre: run the tests" });
   fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "see https://example.com: ok" });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "@Codex please look" });
   assert.deepEqual(of("say").map((s) => [s.kind, s.to, s.text]), [
     ["ask", "Codex", "please look"],
     ["ask", "Claude / Gyre", "run the tests"],
     ["tell", "everyone", "see https://example.com: ok"],
+    ["tell", "everyone", "@Codex please look"],
   ]);
   assert.deepEqual(parseAddress("@Gyre: hi"), { to: "Gyre", text: "hi" });
   assert.equal(parseAddress("no address here"), null);
@@ -2027,16 +2029,17 @@ test("#205 discord.js adapter reports only real edits by people in guilds", asyn
   assert.deepEqual(got, [{ messageId: "D1", channelId: "T1", authorId: OWNER }]);
 });
 
-test("#205 audit: @Name matches a member's whole name, spaces and all, before a shorter one", async () => {
-  const { c, fake, of, threadId } = await ownerRoom({ members: ["Claude Code / Gyre Assistant", "Codex / Gyre"] });
+test("#205 audit: without a colon nothing is addressed, so a name that is not in the room never reaches a shorter one", async () => {
+  // The roster has Gyre; Gyre Assistant is not (or no longer) in the room.
+  const { c, fake, of, threadId } = await ownerRoom({ members: ["Codex / Gyre"] });
   fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "@Gyre Assistant please reply" });
-  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "@Gyre look at this" });
-  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "@Claude Code / Gyre Assistant: hi" });
-  assert.deepEqual(of("say").map((s) => [s.to, s.text]), [
-    ["Gyre Assistant", "please reply"],
-    ["Gyre", "look at this"],
-    ["Claude Code / Gyre Assistant", "hi"],
-  ]);
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "@Gyre Assistant: please reply" });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "Gyre Assistant: please reply" });
+  assert.deepEqual(of("say").map((s) => [s.kind, s.to, s.text]), [
+    ["tell", "everyone", "@Gyre Assistant please reply"],
+    ["ask", "Gyre Assistant", "please reply"],
+    ["ask", "Gyre Assistant", "please reply"],
+  ], "the named forms go to Gyre Assistant, which the bridge refuses with the names that work; never to Gyre");
   await c.close();
 });
 

@@ -48,25 +48,13 @@ export function isYesNo(text) {
   return AUX.test(last) && !/\bor\b/i.test(last);
 }
 
-// "@Name text" or "Name: text" at the very start addresses Name; anything else is for everyone.
-// After "@" the longest member name that fits wins, spaces and all, so "@Gyre Assistant hi" is
-// never read as "@Gyre" with "Assistant hi" for text (#205 audit). `names` are the forms the
-// room shows a member by: "Label / Name", the label, the name.
-export function parseAddress(text, names = []) {
-  if (text.startsWith("@")) {
-    const rest = text.slice(1);
-    const fits = names
-      .filter((name) => name && rest.toLowerCase().startsWith(name.toLowerCase()) && /^(:?\s|:?$)/.test(rest.slice(name.length)))
-      .sort((a, b) => b.length - a.length);
-    if (fits.length) {
-      const tail = rest.slice(fits[0].length).replace(/^:?\s*/, "");
-      if (tail) return { to: rest.slice(0, fits[0].length), text: tail.trim() };
-    }
-  }
-  const at = /^@([^\s:]{1,64}):?\s+([\s\S]*)$/.exec(text);
-  if (at) return { to: at[1], text: at[2].trim() };
-  const colon = /^([^\s:@<][^:\n]{0,63}):\s+([\s\S]*)$/.exec(text);
-  if (colon) return { to: colon[1].trim(), text: colon[2].trim() };
+// "@Name: text" or "Name: text" at the very start addresses Name; anything else is for
+// everyone. The colon is what ends the name: without it "@Gyre Assistant please reply" could
+// mean a member called Gyre Assistant or one called Gyre, and a guess sends it to the wrong
+// one (#205 audit; the owner chose "a colon, always"). With no colon it goes to everyone.
+export function parseAddress(text) {
+  const named = /^@?([^\s:@<][^:\n]{0,63}):\s+([\s\S]*)$/.exec(text);
+  if (named) return { to: named[1].trim(), text: named[2].trim() };
   return null;
 }
 const CLOSE_TEXT = { closed: "Room closed", ended: "Room ended — Gyredeck stopped", disconnected: "Disconnected" };
@@ -293,12 +281,12 @@ export function createConnector({ discord, out, clock = realClock }) {
     // A Reply to something not in the map (too old, or not a room line) is never sent to
     // everyone instead: who it answers cannot be told (#205 audit).
     if (p.replyToId && !relayed) {
-      return botReply(p.channelId, p.messageId, "Not sent: I cannot tell which room message this replies to (it may be too old). Send it again without Reply, or start it with @Name.");
+      return botReply(p.channelId, p.messageId, "Not sent: I cannot tell which room message this replies to (it may be too old). Send it again without Reply, or start it with Name: and the text.");
     }
     let say;
     if (relayed) say = { kind: "ask", to: relayed.senderId || relayed.sender, replyToSeq: relayed.seq, text: body };
     else {
-      const addressed = parseAddress(body, memberNames(code));
+      const addressed = parseAddress(body);
       say = addressed ? { kind: "ask", ...addressed } : { kind: "tell", to: "everyone", text: body };
     }
     if (!say.text) return botReply(p.channelId, p.messageId, "Not sent: there is no text to send.");
@@ -375,13 +363,6 @@ export function createConnector({ discord, out, clock = realClock }) {
   }
 
   // The room whose current post this is: never a set-aside instance (`code@createdAt`).
-  // Every form the room shows its members by, from the roster at connect and from who has
-  // spoken since.
-  function memberNames(code) {
-    const shown = [...(workers.get(code)?.members ?? []), ...(state.rooms[code]?.relayed ?? []).map((r) => r.sender)].filter(Boolean).map(String);
-    return [...new Set(shown.flatMap((form) => [form, ...form.split(" / ")]).map((n) => n.trim()).filter(Boolean))];
-  }
-
   function roomOfThread(threadId) {
     if (!threadId) return null;
     for (const [code, rs] of Object.entries(state.rooms)) if (rs.threadId === threadId && !code.includes("@")) return code;

@@ -25,7 +25,8 @@ import {
   readDismissedSessionIds,
   writeDeletedSessionIds,
   writeDismissedSessionIds,
-  writeSessionEventRegistry,
+  pruneTombstones,
+  SESSION_PRUNE_INTERVAL_MS,
 } from "./features/session/persistence";
 import {
   buildSessionDetail,
@@ -173,6 +174,36 @@ const App = () => {
         })),
     [deletedSessionIds, now, presence, selectedSessionId, sessionEventRegistry, sessionNames],
   );
+  // Tombstones are cleared with the data they hid (#280): soon after start, once the stored
+  // registry is in, and then every hour. Any conversation the app still knows keeps its own.
+  const tombstoneInputsRef = useRef({ registry: sessionEventRegistry, presence });
+  tombstoneInputsRef.current = { registry: sessionEventRegistry, presence };
+  useEffect(() => {
+    const run = () => {
+      const { registry, presence: current } = tombstoneInputsRef.current;
+      const at = new Date();
+      const known = new Set([
+        ...Object.keys(registry),
+        ...buildSessionSummaries(registry, current, at, null).map((session) => session.conversationId),
+      ]);
+      setDismissedSessionIds((ids) => {
+        const next = pruneTombstones(ids, at, known);
+        if (next !== ids) writeDismissedSessionIds(next);
+        return next;
+      });
+      setDeletedSessionIds((ids) => {
+        const next = pruneTombstones(ids, at, known);
+        if (next !== ids) writeDeletedSessionIds(next);
+        return next;
+      });
+    };
+    const first = window.setTimeout(run, 10_000);
+    const hourly = window.setInterval(run, SESSION_PRUNE_INTERVAL_MS);
+    return () => {
+      window.clearTimeout(first);
+      window.clearInterval(hourly);
+    };
+  }, []);
   const sessions = useMemo(
     () =>
       allSessions.filter(
@@ -687,7 +718,6 @@ const App = () => {
     setSessionEventRegistry((current) => {
       const next = { ...current };
       for (const conversationId of removing) delete next[conversationId];
-      writeSessionEventRegistry(next);
       return next;
     });
     setDismissedSessionIds((current) => {

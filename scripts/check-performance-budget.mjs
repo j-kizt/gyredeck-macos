@@ -48,12 +48,16 @@ const assetRoot = join(distRoot, "assets");
  * And again on 2026-11-02 (#277), the same way: Release notes rendered as headings, bullets,
  * bold and code (a few lines of our own, no library) measured 118,522 / 121,598 on main's
  * 118,169 / 121,247 (+353 / +351). 118,663 and 121,758 keep the headroom main had.
+ *
+ * And on 2026-11-02 (#280), by the owner's decision, the same way: the session registry moved
+ * to a file (load, migration, ordered saves, pruning of old data) measured 119,075 / 122,154
+ * on main's 118,565 / 121,641 (+510 / +513). 119,173 and 122,271 keep main's 98 / 117 bytes.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 118_663,
-  jsTotalGzipBytes: 121_758,
+  jsGzipBytes: 119_173,
+  jsTotalGzipBytes: 122_271,
 };
 
 const walk = async (directory) => {

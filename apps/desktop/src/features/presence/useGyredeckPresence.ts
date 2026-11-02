@@ -16,7 +16,9 @@ import {
   normalizeSessionEventIdentity,
 } from "../session/eventRegistry";
 import {
-  readSessionEventRegistry,
+  loadSessionEventRegistry,
+  pruneSessionEventRegistry,
+  SESSION_PRUNE_INTERVAL_MS,
   writeSessionEventRegistry,
 } from "../session/persistence";
 import { collectContextUsage, type ContextUsageRegistry } from "../session/contextWindow";
@@ -540,6 +542,8 @@ const createDemoEvent = (index: number): GyredeckEvent => {
   }
 };
 
+const REGISTRY_WRITE_INTERVAL_MS = 2_000;
+
 export const useGyredeckPresence = ({
   demoMode,
   demoScenario,
@@ -549,13 +553,15 @@ export const useGyredeckPresence = ({
   const [presence, setPresence] = useState<IGyredeckPresence>(() => createInitialPresence());
   const [recentEvents, setRecentEvents] = useState<GyredeckEvent[]>([]);
   const [lastLiveEvent, setLastLiveEvent] = useState<GyredeckEvent | null>(null);
-  const [sessionEventRegistry, setSessionEventRegistry] =
-    useState<SessionEventRegistry>(readSessionEventRegistry);
+  // Empty until the stored registry is read (#280: a file in the desktop app, read once).
+  const [sessionEventRegistry, setSessionEventRegistry] = useState<SessionEventRegistry>({});
   // Sticky per-conversation context usage. Derived from events but never evicted with
   // them: the event registry caps each session, which used to drop the turn_complete
   // holding the usage mid-turn and made the meter blink out.
-  const [contextUsage, setContextUsage] = useState<ContextUsageRegistry>(() =>
-    collectContextUsage({}, Object.values(readSessionEventRegistry()).flat()));
+  const [contextUsage, setContextUsage] = useState<ContextUsageRegistry>({});
+  const registryLoadedRef = useRef(false);
+  // What is already stored: a registry that is still that object has nothing to save.
+  const persistedRegistryRef = useRef<SessionEventRegistry | null>(null);
   const [capabilities, setCapabilities] = useState(() => createDefaultBridgeCapabilities());
   const [connection, setConnection] = useState<IConnectionState>({
     status: "connecting",
@@ -573,14 +579,50 @@ export const useGyredeckPresence = ({
     }
     if (!pendingRegistryWriteRef.current) return;
     writeSessionEventRegistry(pendingRegistryWriteRef.current);
+    persistedRegistryRef.current = pendingRegistryWriteRef.current;
     pendingRegistryWriteRef.current = null;
   };
 
+  // At most one save every two seconds while events arrive, and none before the stored
+  // registry is in: a save before it would replace it with only what arrived since start.
   const scheduleRegistryWrite = (registry: SessionEventRegistry) => {
     pendingRegistryWriteRef.current = registry;
-    if (registryWriteTimerRef.current !== null) return;
-    registryWriteTimerRef.current = window.setTimeout(flushRegistryWrite, 80);
+    if (!registryLoadedRef.current || registryWriteTimerRef.current !== null) return;
+    registryWriteTimerRef.current = window.setTimeout(flushRegistryWrite, REGISTRY_WRITE_INTERVAL_MS);
   };
+
+  // Every change to the registry is saved, whoever made it (an event, a removal, pruning).
+  useEffect(() => {
+    if (registryLoadedRef.current && sessionEventRegistry !== persistedRegistryRef.current) {
+      scheduleRegistryWrite(sessionEventRegistry);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionEventRegistry]);
+
+  useEffect(() => {
+    let disposed = false;
+    if (import.meta.env.DEV && demoMode && demoScenario) {
+      registryLoadedRef.current = true;
+      return;
+    }
+    void loadSessionEventRegistry().then((stored) => {
+      if (disposed) return;
+      registryLoadedRef.current = true;
+      persistedRegistryRef.current = stored;
+      setSessionEventRegistry((current) =>
+        pruneSessionEventRegistry(mergeSessionEvents(stored, Object.values(current).flat()), new Date()));
+      setContextUsage((current) => collectContextUsage(current, Object.values(stored).flat()));
+    });
+    // Old data goes on a quiet app too, not only when an event arrives.
+    const prune = window.setInterval(
+      () => setSessionEventRegistry((current) => pruneSessionEventRegistry(current, new Date())),
+      SESSION_PRUNE_INTERVAL_MS,
+    );
+    return () => {
+      disposed = true;
+      window.clearInterval(prune);
+    };
+  }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 1_000);
@@ -600,11 +642,7 @@ export const useGyredeckPresence = ({
     let disposed = false;
     let source: EventSource | null = null;
     const store = (events: GyredeckEvent[]) => {
-      setSessionEventRegistry((current) => {
-        const next = mergeSessionEvents(current, events);
-        scheduleRegistryWrite(next);
-        return next;
-      });
+      setSessionEventRegistry((current) => pruneSessionEventRegistry(mergeSessionEvents(current, events), new Date()));
       setContextUsage((current) => collectContextUsage(current, events));
     };
 
@@ -619,8 +657,11 @@ export const useGyredeckPresence = ({
         setLastLiveEvent(events.at(-1) ?? null);
         setPresence(events.reduce(reducePresence, createInitialPresence()));
         setRecentEvents([...events].reverse());
+        // A scenario replaces what is stored, at once, as it always has: the tests that
+        // switch scenarios on one page read the registry the last one wrote.
         const next = mergeSessionEvents({}, events);
         writeSessionEventRegistry(next);
+        persistedRegistryRef.current = next;
         setSessionEventRegistry(next);
         setContextUsage(collectContextUsage({}, events));
         return;

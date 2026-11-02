@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import {
   DELETED_SESSIONS_STORAGE_KEY,
   DISMISSED_SESSIONS_STORAGE_KEY,
@@ -10,23 +11,94 @@ import type {
   SessionEventRegistry,
 } from "./types";
 
-export const readSessionEventRegistry = (): SessionEventRegistry => {
+import { pruneSessionEventRegistry } from "./retention";
+
+export {
+  MAX_STORED_CONVERSATIONS,
+  pruneSessionEventRegistry,
+  pruneTombstones,
+  SESSION_PRUNE_INTERVAL_MS,
+  SESSION_RETENTION_MS,
+} from "./retention";
+
+const readLegacySessionEventRegistry = (): SessionEventRegistry => {
   try {
     const raw = window.localStorage.getItem(SESSION_EVENTS_STORAGE_KEY);
     if (!raw) return {};
-
     const parsed: unknown = JSON.parse(raw);
-    if (!isSessionEventRegistry(parsed)) return {};
-
-    const normalized = normalizeSessionEventRegistry(parsed);
-    window.localStorage.setItem(SESSION_EVENTS_STORAGE_KEY, JSON.stringify(normalized));
-    return normalized;
+    return isSessionEventRegistry(parsed) ? normalizeSessionEventRegistry(parsed) : {};
   } catch {
     return {};
   }
 };
 
+const dropLegacySessionEventRegistry = () => {
+  try {
+    window.localStorage.removeItem(SESSION_EVENTS_STORAGE_KEY);
+  } catch {
+    // Nothing more to do: the file is what is read from now on.
+  }
+};
+
+type LoadedSessionRegistry =
+  | { state: "absent" }
+  | { state: "ok"; revision: number; registry: unknown }
+  | { state: "corrupt"; kept: string };
+
+// The desktop app keeps the registry in a file (#280): localStorage was rewritten whole on
+// almost every event and WebKit never checkpointed its WAL. A browser build keeps it in
+// localStorage as before. `revision` orders saves, so a late one never replaces a newer one.
+let registryInFile = false;
+let registryRevision = 0;
+let registrySaves: Promise<unknown> = Promise.resolve();
+
+const saveToFile = (registry: SessionEventRegistry) => {
+  const revision = ++registryRevision;
+  const saved = registrySaves.then(() => invoke("session_registry_save", { revision, registry }));
+  registrySaves = saved.catch(() => undefined);
+  return saved;
+};
+
+/**
+ * Read the registry once, at start. From a file in the desktop app; the old localStorage
+ * copy is moved into the file and removed only after the file is durably written, so a
+ * crash at any step leaves one readable copy. A file that cannot be read was moved aside
+ * by the app and is never treated as an empty registry over the old copy.
+ */
+export const loadSessionEventRegistry = async (now = new Date()): Promise<SessionEventRegistry> => {
+  if (typeof window.__TAURI_INTERNALS__ === "undefined") {
+    return pruneSessionEventRegistry(readLegacySessionEventRegistry(), now);
+  }
+  let loaded: LoadedSessionRegistry;
+  try {
+    loaded = await invoke<LoadedSessionRegistry>("session_registry_load");
+  } catch {
+    return pruneSessionEventRegistry(readLegacySessionEventRegistry(), now);
+  }
+  registryInFile = true;
+  if (loaded.state === "ok" && isSessionEventRegistry(loaded.registry)) {
+    registryRevision = Math.max(registryRevision, loaded.revision);
+    dropLegacySessionEventRegistry();
+    return pruneSessionEventRegistry(normalizeSessionEventRegistry(loaded.registry), now);
+  }
+  const legacy = pruneSessionEventRegistry(readLegacySessionEventRegistry(), now);
+  if (Object.keys(legacy).length > 0) {
+    try {
+      await saveToFile(legacy);
+      dropLegacySessionEventRegistry();
+    } catch {
+      // The old copy stays where it is until a save succeeds.
+    }
+  }
+  return legacy;
+};
+
+/** Save the registry where it was loaded from. */
 export const writeSessionEventRegistry = (registry: SessionEventRegistry) => {
+  if (registryInFile) {
+    void saveToFile(registry).then(dropLegacySessionEventRegistry, () => undefined);
+    return;
+  }
   try {
     window.localStorage.setItem(SESSION_EVENTS_STORAGE_KEY, JSON.stringify(registry));
   } catch {

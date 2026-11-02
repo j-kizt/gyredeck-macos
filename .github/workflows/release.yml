@@ -119,6 +119,15 @@ jobs:
           # Baked into the binary via option_env! for the GitHub device-flow sign-in
           # (a client id is a public identifier, kept out of source as a convenience).
           GYREDECK_GITHUB_CLIENT_ID: ${{ secrets.GYREDECK_GITHUB_CLIENT_ID }}
+          # Developer ID signing and notarization (#288): tauri imports the certificate into a
+          # keychain of its own for this build and notarizes with an app-specific password.
+          # A signed app keeps what it saved in the Keychain across updates; ad-hoc did not.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: apps/desktop
           # Universal binary so one download runs on both Apple Silicon and Intel Macs;
@@ -127,5 +136,30 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "Gyredeck __VERSION__"
           releaseBody: ${{ steps.changelog.outputs.notes }}
-          releaseDraft: false
+          # A draft until the app it carries is checked below: a release cannot be taken back.
+          releaseDraft: true
           prerelease: false
+
+      # What is published must be what an update can trust (#288): Developer ID, not ad-hoc;
+      # both architectures; hardened runtime; notarized with the ticket stapled; accepted by
+      # Gatekeeper. Any miss leaves the release a draft.
+      - name: Check the app is signed, notarized and universal
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          app=apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/Gyredeck.app
+          codesign --verify --strict --deep "$app"
+          details=$(codesign -dv --verbose=2 "$app" 2>&1)
+          grep -q "^Authority=Developer ID Application: " <<<"$details"
+          grep -q "flags=.*runtime" <<<"$details"
+          if grep -q "^Signature=adhoc" <<<"$details"; then exit 1; fi
+          grep -qF "Authority=$APPLE_SIGNING_IDENTITY" <<<"$details"
+          archs=$(lipo -archs "$app/Contents/MacOS/gyredeck-desktop")
+          grep -qw arm64 <<<"$archs" && grep -qw x86_64 <<<"$archs"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute "$app"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false

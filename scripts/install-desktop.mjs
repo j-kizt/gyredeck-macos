@@ -3,6 +3,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { installDecision, pickIdentity, signedWithDeveloperId } from "./signing.mjs";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const appName = "Gyredeck.app";
@@ -57,12 +58,43 @@ if (!process.env.TAURI_SIGNING_PRIVATE_KEY) {
   process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ??= found.stdout.trim();
 }
 
+// Signed with the Developer ID when this Mac has it, so the app keeps what it saved in the
+// Keychain across updates (#288). Tauri reads the identity from the environment; the config
+// keeps "-" so a contributor without one can still build.
+const codesignDetails = (app) => spawnSync("codesign", ["-dv", app], { encoding: "utf8" }).stderr ?? "";
+const picked = pickIdentity(spawnSync("security", ["find-identity", "-v", "-p", "codesigning"], { encoding: "utf8" }).stdout ?? "");
+if (picked.error) {
+  console.error(picked.error);
+  process.exit(1);
+}
+const decision = installDecision({
+  identity: picked.identity,
+  installedIsDeveloperId: existsSync(installPath) && signedWithDeveloperId(codesignDetails(installPath)),
+  allowAdhoc: process.env.GYREDECK_ALLOW_ADHOC === "1",
+});
+if (!decision.ok) {
+  console.error(decision.why);
+  process.exit(1);
+}
+if (picked.identity) process.env.APPLE_SIGNING_IDENTITY = picked.identity;
+else console.warn("Building ad-hoc: this install keeps no Keychain items across updates.");
+
 run("pnpm", ["desktop:build"]);
 
 const sourceApp = existsSync(builtApp) ? builtApp : fallbackApp;
 if (!existsSync(sourceApp)) {
   console.error(`Gyredeck app bundle not found at ${builtApp}`);
   process.exit(1);
+}
+
+// Checked before anything installed is touched: a build that came out unsigned or ad-hoc
+// when the identity was there must not replace the app.
+if (picked.identity) {
+  const verified = spawnSync("codesign", ["--verify", "--strict", "--deep", sourceApp], { stdio: "inherit" });
+  if (verified.status !== 0 || !signedWithDeveloperId(codesignDetails(sourceApp))) {
+    console.error(`${sourceApp} is not validly signed with the Developer ID; the installed app was left as it was.`);
+    process.exit(1);
+  }
 }
 
 // Replacing an app bundle does not reload an already-running process. Stop the

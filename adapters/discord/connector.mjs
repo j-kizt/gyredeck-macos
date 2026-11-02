@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { readState, saveState } from "./state.mjs";
 
 export const PROTOCOL = 1;
@@ -37,7 +38,13 @@ export const COMMANDS = [
     name: "disconnect",
     description: "Stop following this room in Discord (the room stays open)",
   },
+  // Usable in a DM to the bot too: the listing of every connected room (#206).
+  { name: "status", description: "Who is in this room and how far they have got; outside a post, every room", dm: true },
 ];
+/** How long /status waits for the app before it says the answer is not there (#206). */
+const STATUS_WAIT_MS = 10_000;
+const STATUS_ROOMS_SHOWN = 25;
+const STATUS_MAX_CHARS = 1900;
 
 // "@Name: text" or "Name: text" at the very start addresses Name; anything else is for
 // everyone. The colon is what ends the name: without it "@Gyre Assistant please reply" could
@@ -342,9 +349,95 @@ export function createConnector({ discord, out, clock = realClock }) {
     sayToRoom(code, r.channelId, r.messageId, { kind: "tell", to, replyToSeq: relayed.seq, text: r.emoji === YES ? "yes" : "no" });
   }
   discord.on("command", (c) => {
-    if (stopped || c.name !== "disconnect") return;
+    if (stopped) return;
+    if (c.name === "status") return void statusCommand(c).catch((e) => fail("internal", e?.message));
+    if (c.name !== "disconnect") return;
     command(c).catch((e) => fail("internal", e?.message));
   });
+
+  // /status (#206): asked of the app, which checks the owner in the Keychain and answers from
+  // what it holds; nothing goes into a room and nobody is woken. In a room's current post it is
+  // that room instance; outside every post (a channel, a DM) it is every connected room; in any
+  // other thread — an old post among them — it is refused rather than listing every room.
+  const statusAsked = new Map();
+  async function statusCommand(c) {
+    const refuse = (content) => c.reply({ content, ephemeral: true });
+    if (!ownerId || c.userId !== ownerId) return refuse("Only the paired owner can see status.");
+    const code = roomOfThread(c.channelId);
+    const w = code ? workers.get(code) : null;
+    let scope = {};
+    if (w?.accepting) scope = { room: code, createdAt: w.createdAt, threadId: c.channelId };
+    else if (code || c.inThread) return refuse("This is not a connected room's post. Run /status in one, or outside any post for every room.");
+    await c.defer({ ephemeral: true });
+    const requestId = randomBytes(8).toString("hex");
+    const timer = clock.setTimeout(() => statusDone(requestId, "Status is not available right now."), STATUS_WAIT_MS);
+    statusAsked.set(requestId, { c, scope, timer });
+    send({ t: "status_request", requestId, ownerId: c.userId, channelId: c.channelId, ...scope });
+  }
+  function statusDone(requestId, content) {
+    const asked = statusAsked.get(requestId);
+    if (!asked) return;
+    statusAsked.delete(requestId);
+    clock.clearTimeout(asked.timer);
+    const text = content.length > STATUS_MAX_CHARS ? `${content.slice(0, STATUS_MAX_CHARS - 1)}…` : content;
+    asked.c.edit({ content: text, allowedMentions: { parse: [] } }).catch(() => {});
+  }
+  function statusAnswer(msg) {
+    const requestId = String(msg.requestId ?? "");
+    const asked = statusAsked.get(requestId);
+    if (!asked) return;
+    if (typeof msg.error === "string") return statusDone(requestId, msg.error);
+    const { room, createdAt } = asked.scope;
+    if (room) {
+      // Shown only for the instance it was asked of, still followed when it is shown.
+      const w = workers.get(room);
+      if (!w?.accepting || w.createdAt !== createdAt || msg.room?.room !== room || msg.room?.createdAt !== createdAt) {
+        return statusDone(requestId, "That room is no longer connected.");
+      }
+      return statusDone(requestId, roomStatusText(msg.room));
+    }
+    return statusDone(requestId, roomsText(Array.isArray(msg.rooms) ? msg.rooms : [], Number(msg.hiddenRooms) || 0));
+  }
+  // A room this child no longer follows is not shown as connected; `needs you` is the post's tag now.
+  function roomsText(rooms, hidden) {
+    const live = rooms.filter((r) => workers.get(String(r.room))?.accepting);
+    if (!live.length && !hidden) return "No room is connected.";
+    const lines = live.slice(0, STATUS_ROOMS_SHOWN).map((r) => {
+      const n = Number(r.members) || 0;
+      return `${r.room} · ${n} member${n === 1 ? "" : "s"}${state.rooms[r.room]?.needsYou ? " · needs you" : ""}`;
+    });
+    const more = hidden + Math.max(0, live.length - STATUS_ROOMS_SHOWN);
+    if (more) lines.push(`…and ${more} more room${more === 1 ? "" : "s"} not shown`);
+    return lines.join("\n");
+  }
+  function roomStatusText(r) {
+    const lines = (Array.isArray(r.members) ? r.members : []).map((m) => {
+      const doing = m.state === "working" ? "working" : m.state === "idle" ? "idle" : null;
+      return `${plain(m.name)} — ${doing ? `${doing}, ${ago(m.secondsAgo)}` : "not heard from since connect"}`;
+    });
+    if (!lines.length) lines.push("No agent is in this room.");
+    if (Number(r.hiddenMembers) > 0) lines.push(`…and ${r.hiddenMembers} more member${r.hiddenMembers === 1 ? "" : "s"} not shown`);
+    for (const u of Array.isArray(r.usage) ? r.usage : []) {
+      const who = `${plain(u.display ?? u.provider)} usage (the provider's, not this member's)`;
+      if (!Array.isArray(u.lines) || !u.lines.length) {
+        lines.push(`${who}: no reading yet`);
+        continue;
+      }
+      const parts = u.lines.map((l) => `${plain(l.label)} ${Number(l.leftPct)}% left${l.resetsAt ? `, resets ${new Date(l.resetsAt).toISOString().slice(0, 16).replace("T", " ")} UTC` : ""}`);
+      lines.push(`${who}: ${parts.join("; ")}${Number.isFinite(u.secondsOld) ? ` · read ${ago(u.secondsOld)}` : ""}`);
+    }
+    return lines.join("\n");
+  }
+  // Shown as written: a name never pings anyone or turns into formatting.
+  function plain(text) {
+    return String(text ?? "").replace(/[\\*_~`|>@[\]#]/g, (ch) => `\\${ch}`);
+  }
+  function ago(seconds) {
+    const s = Number(seconds);
+    if (!Number.isFinite(s) || s < 60) return "just now";
+    if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+    return `${Math.floor(s / 3600)} h ago`;
+  }
 
   async function command(c) {
     const refuse = (content) => c.reply({ content, ephemeral: true });
@@ -1290,6 +1383,8 @@ export function createConnector({ discord, out, clock = realClock }) {
         const reason = msg.reason === "closed" || msg.reason === "ended" ? msg.reason : "disconnected";
         return enqueue(w, { op: "close", reason, id: typeof msg.id === "string" && msg.id ? msg.id : null, inst: w.createdAt });
       }
+      case "status":
+        return statusAnswer(msg);
       case "said":
         return said(msg);
       case "quiet": {
@@ -1324,6 +1419,7 @@ export function createConnector({ discord, out, clock = realClock }) {
     spoken.clear();
     if (sweepTimer) clock.clearTimeout(sweepTimer);
     if (settleTimer) clock.clearTimeout(settleTimer);
+    for (const id of [...statusAsked.keys()]) statusDone(id, "Status is not available right now.");
     settleTimer = null;
     sweepTimer = null;
     releaseReady();

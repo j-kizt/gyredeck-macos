@@ -13,7 +13,7 @@ const open = async (page: Page, first: Answer) => {
   await page.addInitScript((answer) => {
     window.localStorage.setItem("gyredeck.keep-awake-while-working", "true");
     const w = window as typeof window & { __TAURI_INTERNALS__: unknown; __answer: unknown; __calls: number; __sent: unknown[]; __out: number; __most: number };
-    Object.assign(w, { __answer: answer, __calls: 0, __sent: [], __out: 0, __most: 0 });
+    Object.assign(w, { __answer: answer, __calls: 0, __sent: [], __out: 0, __most: 0, __late: [] });
     w.__TAURI_INTERNALS__ = {
       invoke: async (command: string, args?: unknown) => {
         if (command === "set_keep_awake") {
@@ -22,7 +22,7 @@ const open = async (page: Page, first: Answer) => {
           if (w.__answer === "hang") {
             w.__out += 1;
             w.__most = Math.max(w.__most, w.__out);
-            return new Promise(() => {});
+            return new Promise((resolve) => { (w as unknown as { __late: Array<(v: unknown) => void> }).__late.push(resolve); });
           }
           if (w.__answer === "unreachable") throw new Error("the app did not answer");
           return w.__answer;
@@ -98,8 +98,8 @@ test("an answer older than the one shown never replaces it", async ({ page }) =>
 });
 
 const stats = (page: Page) => page.evaluate(() => {
-  const w = window as typeof window & { __sent: Array<{ enabled: boolean }>; __most: number };
-  return { sent: w.__sent.length, last: w.__sent.at(-1), most: w.__most };
+  const w = window as typeof window & { __sent: Array<{ enabled: boolean; seq: number }>; __most: number };
+  return { sent: w.__sent.length, last: w.__sent.at(-1), seqs: w.__sent.map((call) => call.seq), most: w.__most };
 });
 
 test("a call that hangs holds nothing up: changes meanwhile go once, latest only, when it is given up on", async ({ page }) => {
@@ -122,5 +122,30 @@ test("a call that keeps hanging is shown as unanswered, never as Off", async ({ 
   const row = await open(page, "hang");
   await row.getByRole("switch").click();
   await page.clock.runFor(12_000);
+  await expect(row.getByText("Unavailable · Gyredeck did not answer")).toBeVisible();
+});
+
+test("a switch-on given up on and answered late never turns the row back on", async ({ page }) => {
+  const row = await open(page, "hang");
+  await expect.poll(async () => (await stats(page)).sent).toBe(1);
+  await row.getByRole("switch").click();
+  await answer(page, held(null, 5));
+  await page.clock.runFor(3_500);
+  await expect(row.getByText("Off · display follows macOS idle settings")).toBeVisible();
+  const { seqs } = await stats(page);
+  expect(seqs, "each call later than the one before, so Rust applies none older").toEqual([...seqs].sort((a, b) => a - b));
+  expect(new Set(seqs).size).toBe(seqs.length);
+  // The switch-on sent first is answered now, with what Rust held when it took it.
+  await page.evaluate(() => (window as typeof window & { __late: Array<(v: unknown) => void> }).__late[0]({ display: false, system: true, why: "sync-ab12 connected to Discord — the Mac won't idle-sleep", error: null, rev: 1 }));
+  await page.clock.runFor(100);
+  await expect(row.getByText("Off · display follows macOS idle settings")).toBeVisible();
+});
+
+test("past two calls unanswered, nothing more is sent into a channel that does not answer", async ({ page }) => {
+  const row = await open(page, "hang");
+  await page.clock.runFor(30_000);
+  const { sent, most } = await stats(page);
+  expect(most, "never more than two out at once").toBeLessThanOrEqual(2);
+  expect(sent).toBeLessThanOrEqual(2);
   await expect(row.getByText("Unavailable · Gyredeck did not answer")).toBeVisible();
 });

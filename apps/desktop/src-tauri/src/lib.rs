@@ -1345,8 +1345,8 @@ fn set_launch_at_login(app: tauri::AppHandle, enabled: bool) -> Result<bool, Str
 }
 
 #[tauri::command]
-fn set_keep_awake(state: tauri::State<'_, KeepAwakeState>, active: bool, enabled: Option<bool>) -> Result<keep_awake::Held, String> {
-    state.set_active(enabled.unwrap_or(active), active)
+fn set_keep_awake(state: tauri::State<'_, KeepAwakeState>, active: bool, enabled: bool, seq: u64) -> Result<keep_awake::Held, String> {
+    state.set_active(enabled, active, seq)
 }
 
 /// The session-event registry lives in the app's data folder, not localStorage (#280).

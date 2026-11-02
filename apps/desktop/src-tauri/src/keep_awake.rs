@@ -67,6 +67,8 @@ struct Inputs {
     heavy: Option<String>,
     /// Since when the bridge could not be asked, while it cannot.
     heavy_unknown_since: Option<Instant>,
+    /// The webview's last call applied: an older one arriving late changes nothing.
+    ui_seq: u64,
 }
 
 /// What the inputs ask to be held, and the reason the Settings row gives for it.
@@ -140,8 +142,12 @@ impl KeepAwakeState {
 
     /// The webview's two inputs. Answers with what is held after them, a refusal included, so
     /// the answer to every call is as true as an event.
-    pub(crate) fn set_active(&self, enabled: bool, working: bool) -> Result<Held, String> {
+    pub(crate) fn set_active(&self, enabled: bool, working: bool, seq: u64) -> Result<Held, String> {
         self.update(|inputs| {
+            if seq < inputs.ui_seq {
+                return;
+            }
+            inputs.ui_seq = seq;
             inputs.enabled = enabled;
             inputs.working = working;
         })
@@ -172,7 +178,7 @@ impl KeepAwakeState {
 
     /// Let go of everything: the app is quitting.
     pub fn release_all(&self) {
-        let _ = self.update(|inputs| *inputs = Inputs::default());
+        let _ = self.update(|inputs| *inputs = Inputs { ui_seq: inputs.ui_seq, ..Inputs::default() });
     }
 
     pub(crate) fn held(&self) -> Held {

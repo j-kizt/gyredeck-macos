@@ -163,6 +163,9 @@ const App = () => {
   // One call in flight at a time; a change while it is out is sent, latest only, when it ends.
   const keepAwakeWantRef = useRef({ active: false, enabled: false });
   const keepAwakeFlightRef = useRef<{ again: boolean } | null>(null);
+  // Every call numbered, so Rust applies none older than the last; calls given up on but never
+  // answered are counted, and past two nothing more is sent into a channel that does not answer.
+  const keepAwakeSeqRef = useRef({ seq: 0, unanswered: 0 });
   const displayView =
     isDeletedAfter(deletedSessionIds, presence.conversationId, presence.lastEventAt) ||
     (view.status === "closed" && (acknowledgedConversationId === presence.conversationId || isDismissedAfter(dismissedSessionIds, presence.conversationId, presence.lastEventAt)))
@@ -491,8 +494,13 @@ const App = () => {
     // never arrived is made good, and what a Discord room or a heavy run changed since is read
     // with it (#211, #278). One at a time, so nothing queues behind a call that hangs.
     const syncNativeState = (attempt: number) => {
+      const calls = keepAwakeSeqRef.current;
       if (keepAwakeFlightRef.current) {
         keepAwakeFlightRef.current.again = true;
+        return;
+      }
+      if (calls.unanswered >= 2) {
+        setKeepAwakeError("Gyredeck did not answer");
         return;
       }
       const flight = { again: false };
@@ -508,11 +516,25 @@ const App = () => {
         else if (error && retry !== undefined && !cancelled) retryTimer = window.setTimeout(() => syncNativeState(attempt + 1), retry);
         else setKeepAwakeError(error ? String((error as Error).message ?? error) : null);
       };
-      timer = window.setTimeout(() => ended(new Error("Gyredeck did not answer")), KEEP_AWAKE_TIMEOUT_MS);
-      invoke<IKeepAwakeHeld>("set_keep_awake", want).then((held) => {
+      let givenUp = false;
+      timer = window.setTimeout(() => {
+        givenUp = true;
+        calls.unanswered += 1;
+        ended(new Error("Gyredeck did not answer"));
+      }, KEEP_AWAKE_TIMEOUT_MS);
+      const answered = () => {
+        if (givenUp) calls.unanswered -= 1;
+      };
+      calls.seq += 1;
+      invoke<IKeepAwakeHeld>("set_keep_awake", { ...want, seq: calls.seq }).then((held) => {
+        answered();
+        // A late answer is still Rust's word at its rev; the rev keeps the newest.
         takeKeepAwake(held);
         ended();
-      }, (error) => ended(error ?? "Keep awake unavailable"));
+      }, (error) => {
+        answered();
+        ended(error ?? "Keep awake unavailable");
+      });
     };
     setKeepAwakeError(null);
     syncNativeState(0);

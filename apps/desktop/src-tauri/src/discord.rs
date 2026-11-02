@@ -1536,6 +1536,15 @@ fn owner_from_record(bytes: &[u8]) -> Option<Owner> {
     valid_snowflake(&id).then_some(Owner { id, username: Some(username) })
 }
 
+/// The owner item as read: none, a record, or what is wrong with it. An item that is there and
+/// is not an owner record is said, never read as nobody paired, and is left as it is (#288 audit).
+fn owner_record(bytes: Option<Vec<u8>>) -> Result<Option<Owner>, String> {
+    match bytes {
+        None => Ok(None),
+        Some(bytes) => owner_from_record(&bytes).map(Some).ok_or_else(|| "the saved owner is not a valid owner record".to_string()),
+    }
+}
+
 /// A room's members, and when this room — not its code — was created.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Roster {
@@ -2853,7 +2862,7 @@ impl OwnerStore for KeychainOwner {
     fn read(&self) -> Result<Option<Owner>, String> {
         #[cfg(target_os = "macos")]
         {
-            Ok(keychain_read(KEYCHAIN_OWNER_ACCOUNT, KEYCHAIN_OWNER_MOVED)?.and_then(|bytes| owner_from_record(&bytes)))
+            owner_record(keychain_read(KEYCHAIN_OWNER_ACCOUNT, KEYCHAIN_OWNER_MOVED)?)
         }
         #[cfg(not(target_os = "macos"))]
         Ok(None)

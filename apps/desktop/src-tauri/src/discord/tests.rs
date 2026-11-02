@@ -4077,3 +4077,15 @@ fn a_refused_owner_read_stays_shown_after_the_child_is_ready_and_clears_once_pai
     paired_in(&f, Some(&round));
     assert!(!shown(&f).contains("could not read its saved Discord owner"), "a new pairing that saved puts it right: {}", shown(&f));
 }
+
+// Codex's #288 finding: an owner item that is there but unreadable as a record is not "nobody
+// paired". The read says so, and the item is left as it is.
+#[test]
+fn an_owner_record_that_cannot_be_read_is_an_error_never_no_owner() {
+    let good = br#"{"id":"323456789012345678","username":"jkp","pairedAt":"2026-11-03T00:00:00Z"}"#;
+    assert_eq!(owner_record(Some(good.to_vec())).unwrap().map(|o| o.id), Some("323456789012345678".to_string()));
+    assert_eq!(owner_record(None).unwrap(), None, "no item: nobody paired");
+    for bad in [&b"not json"[..], br#"{"id":42,"username":"jkp"}"#, br#"{"id":"not-a-snowflake","username":"jkp"}"#, br#"{"username":"jkp"}"#] {
+        assert!(owner_record(Some(bad.to_vec())).is_err(), "{}", String::from_utf8_lossy(bad));
+    }
+}

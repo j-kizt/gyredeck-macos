@@ -2031,6 +2031,68 @@ test("#205 a /disconnect prompt Discord took before the child heard back is foun
   await second.c.close();
 });
 
+for (const kind of ["/disconnect", "quiet"]) {
+  test(`#205 a ${kind} prompt whose search failed once is searched again when the owner reacts, and works`, async () => {
+    const first = await ownerRoom();
+    const op = kind === "quiet" ? "botSend" : "reply";
+    first.fake.after = async (o) => { if (o === op) throw new Error("cut off on the way back"); };
+    if (kind === "quiet") first.c.handle({ t: "quiet", room: "sync-abcd" });
+    else first.fake.command({ userId: OWNER, channelId: first.threadId });
+    await flush();
+    first.fake.after = null;
+    const shown = kind === "quiet" ? first.fake.bot.at(-1) : first.fake.replies.at(-1);
+    let down = true;
+    first.fake.gate = async (o) => { if (o === "findOwn" && down) { down = false; throw kindError("network"); } };
+    const second = await restarted(first);
+    if (kind === "quiet") {
+      second.c.handle({ t: "quiet", room: "sync-abcd" });
+      await flush();
+    }
+    assert.equal(down, false, "premise: one search failed");
+    second.fake.addReaction({ messageId: shown.id, channelId: first.threadId, userId: OWNER, emoji: "✅" });
+    await flush();
+    assert.equal(second.of("disconnect_request").length, 1);
+    await second.c.close();
+  });
+}
+
+test("#205 a ✅ given while every search fails counts once a background search finds the prompt; nothing to press again", async () => {
+  const first = await ownerRoom();
+  first.fake.after = async (o) => { if (o === "reply") throw new Error("cut off on the way back"); };
+  first.fake.command({ userId: OWNER, channelId: first.threadId });
+  await flush();
+  first.fake.after = null;
+  const shown = first.fake.replies.at(-1);
+  let down = true;
+  first.fake.gate = async (o) => { if ((o === "findOwn" || o === "reactedBy") && down) throw kindError("network"); };
+  const second = await restarted(first);
+  second.fake.addReaction({ messageId: shown.id, channelId: first.threadId, userId: OWNER, emoji: "✅" });
+  await flush();
+  assert.deepEqual(second.of("disconnect_request"), [], "premise: not found yet");
+  down = false;
+  let reactedOnce = true;
+  second.fake.gate = async (o) => { if (o === "reactedBy" && reactedOnce) { reactedOnce = false; throw kindError("network"); } };
+  await second.clock.advance(2 * 60_000);
+  assert.equal(reactedOnce, false, "premise: one reaction check failed");
+  assert.equal(second.of("disconnect_request").length, 1, "the ✅ already on it counted, the failed check tried again");
+  await second.clock.advance(5 * 60_000);
+  assert.equal(second.of("disconnect_request").length, 1, "once");
+  await second.c.close();
+});
+
+test("#205 an intent older than its prompt's life is dropped, not searched", async () => {
+  const first = await ownerRoom();
+  first.fake.after = async (o) => { if (o === "reply") throw new Error("cut off on the way back"); };
+  first.fake.command({ userId: OWNER, channelId: first.threadId });
+  await flush();
+  first.fake.after = null;
+  await first.clock.advance(11 * 60_000);
+  const second = await restarted(first);
+  assert.ok(!second.fake.log.some((e) => e.op === "findOwn"), "expired: nothing to arm");
+  assert.deepEqual(JSON.parse(readFileSync(first.statePath, "utf8")).promptPosting ?? {}, {});
+  await second.c.close();
+});
+
 test("#205 a prompt is bound to its room's instance: a reconnected room ignores the old ✅", async () => {
   const { c, fake, threadId, of } = await ownerRoom();
   c.handle({ t: "quiet", room: "sync-abcd" });

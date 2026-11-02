@@ -18,6 +18,8 @@ export const READBACK_PAGES = 5;
 export const PROMPT_MS = 10 * 60_000;
 /** At most this many /disconnect prompts are kept armed; quiet ones are one per room. */
 const PROMPTS_MAX = 20;
+const SETTLE_MIN_MS = 5_000;
+const SETTLE_MAX_MS = 60_000;
 /** The bridge's MAIL_MAX_TEXT: a longer say is refused here, never cut. */
 export const SAY_MAX_TEXT = 4_096;
 /** Relayed messages remembered per room, so a Reply or a reaction can name what it answers. */
@@ -302,9 +304,16 @@ export function createConnector({ discord, out, clock = realClock }) {
     spoken.set(e.messageId, true);
     botReply(e.channelId, e.messageId, EDIT_NOTE);
   });
-  discord.on("reaction", (r) => {
+  discord.on("reaction", (r) => onReaction(r));
+  function onReaction(r, searched = false) {
     if (stopped || !ownerId || r.userId !== ownerId) return;
     const prompt = prompts()[r.messageId];
+    // A prompt Discord may hold that no search has found yet: look again now, when it is needed,
+    // so one failed search never leaves a prompt on show that cannot be answered (#205 r4).
+    if (!prompt && !searched && r.emoji === YES && Object.keys(posting()).length) {
+      settleAll();
+      return;
+    }
     if (prompt) {
       if (r.emoji !== YES || clock.now() > prompt.expiresAt) return;
       const w = workers.get(prompt.room);
@@ -334,7 +343,7 @@ export function createConnector({ discord, out, clock = realClock }) {
     if (relayed.kind !== "ask") return;
     if (!relayed.yn) return botReply(r.channelId, r.messageId, "This question needs a typed reply");
     sayToRoom(code, r.channelId, r.messageId, { kind: "tell", to, replyToSeq: relayed.seq, text: r.emoji === YES ? "yes" : "no" });
-  });
+  }
   discord.on("command", (c) => {
     if (stopped || c.name !== "disconnect") return;
     command(c).catch((e) => fail("internal", e?.message));
@@ -396,11 +405,38 @@ export function createConnector({ discord, out, clock = realClock }) {
   async function settlePosting(key) {
     const intent = posting()[key];
     if (!intent) return;
+    if (clock.now() > intent.meta.expiresAt) {
+      delete posting()[key];
+      return save();
+    }
     const id = await discord.findOwn(intent.channelId, { content: intent.content, sinceMs: intent.sinceMs });
+    // Read before the intent is let go: a check that fails is tried again with the search.
+    const given = Boolean(id && ownerId) && (await discord.reactedBy({ channelId: intent.channelId, messageId: id, emoji: YES, userId: ownerId }));
     if (posting()[key] !== intent) return;
     delete posting()[key];
     if (id) arm(id, intent.meta);
     save();
+    if (given) onReaction({ messageId: id, channelId: intent.channelId, userId: ownerId, emoji: YES }, true);
+  }
+  // Every intent not yet settled. One that cannot be searched now is tried again in the
+  // background, backing off, until it is armed, found absent, or past its prompt's life (#205 r4).
+  let settleTimer = null;
+  let settleBackoff = SETTLE_MIN_MS;
+  async function settleAll() {
+    let failed = false;
+    for (const key of Object.keys(posting())) {
+      await settlePosting(key).catch((e) => {
+        failed = true;
+        fail("internal", `Could not look for an earlier prompt: ${e?.message}`);
+      });
+    }
+    if (!failed) settleBackoff = SETTLE_MIN_MS;
+    if (!failed || stopped || settleTimer) return;
+    settleTimer = clock.setTimeout(() => {
+      settleTimer = null;
+      if (!stopped) settleAll();
+    }, settleBackoff);
+    settleBackoff = Math.min(settleBackoff * 2, SETTLE_MAX_MS);
   }
 
   // Work resuming disarms the room's quiet prompt; the next spell asks again.
@@ -507,8 +543,9 @@ export function createConnector({ discord, out, clock = realClock }) {
     const rs = state.rooms[w.code];
     if (!rs?.threadId || !w.accepting) return;
     const key = `quiet:${w.code}`;
-    await settlePosting(key);
-    if (Object.values(prompts()).some((p) => p.quiet && p.room === w.code)) return;
+    // A search that fails now is retried in the background; meanwhile none is posted twice.
+    await settleAll();
+    if (posting()[key] || Object.values(prompts()).some((p) => p.quiet && p.room === w.code)) return;
     const content = `This room has gone quiet. Disconnect? React ${YES} within 10 minutes to disconnect now.`;
     const msg = await postPrompt(key, rs.threadId, content, { room: w.code, inst: w.createdAt, threadId: rs.threadId, quiet: true }, () =>
       discord.botSend({ threadId: rs.threadId, content, allowedMentions: { parse: [] } }),
@@ -547,10 +584,8 @@ export function createConnector({ discord, out, clock = realClock }) {
     discord.registerCommands(COMMANDS).catch((e) =>
       fail(e?.kind === "permission" ? "missing_permission" : "internal", `Could not register /disconnect: ${e?.message}`),
     );
-    // A /disconnect prompt Discord may have taken before a restart is found and armed again.
-    for (const key of Object.keys(posting()).filter((k) => k.startsWith("cmd:"))) {
-      await settlePosting(key).catch((e) => fail("internal", `Could not look for an earlier /disconnect prompt: ${e?.message}`));
-    }
+    // A prompt Discord may have taken before a restart is found and armed again.
+    await settleAll();
     scheduleSweep();
     await sweep();
   }
@@ -1228,6 +1263,8 @@ export function createConnector({ discord, out, clock = realClock }) {
     pairing = null;
     spoken.clear();
     if (sweepTimer) clock.clearTimeout(sweepTimer);
+    if (settleTimer) clock.clearTimeout(settleTimer);
+    settleTimer = null;
     sweepTimer = null;
     releaseReady();
     wake(false);

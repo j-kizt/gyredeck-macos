@@ -329,6 +329,17 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
         await ch.messages.react(messageId, emoji);
       }),
 
+    // Whether this user's reaction is on the message now: a ✅ given while the prompt could not
+    // yet be found is still counted once it is (#205 r4).
+    reactedBy: ({ channelId, messageId, emoji, userId }) =>
+      guarded(async () => {
+        const ch = await client.channels.fetch(channelId);
+        if (!ch?.messages) throw kindError("missing", "channel gone");
+        const reaction = (await ch.messages.fetch({ message: messageId, cache: false })).reactions.cache.get(emoji);
+        if (!reaction) return false;
+        return (await reaction.users.fetch()).has(userId);
+      }),
+
     sendWebhook: ({ forumId, threadId, username, content, allowedMentions }) =>
       guarded(async () => {
         const body = { content, username, threadId, allowedMentions };

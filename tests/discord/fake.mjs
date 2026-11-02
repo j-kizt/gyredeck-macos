@@ -169,7 +169,14 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
     edit(fields) {
       events.emit("edit", fields);
     },
+    async reactedBy({ messageId, emoji, userId }) {
+      await fake.gate?.("reactedBy", { messageId });
+      return fake.given.some((r) => r.messageId === messageId && r.emoji === emoji && r.userId === userId);
+    },
+    // Reactions people gave, as Discord keeps them on the message.
+    given: [],
     addReaction(fields) {
+      fake.given.push(fields);
       events.emit("reaction", fields);
     },
     command(fields) {

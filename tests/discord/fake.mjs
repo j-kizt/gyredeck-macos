@@ -57,8 +57,12 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
   const fake = {
     log: [],
     sent: [],
+    bot: [],
+    reactions: [],
+    commands: null,
+    replies: [],
     threads: new Map(),
-    tags: { open: "tag-open", closed: "tag-closed" },
+    tags: { open: "tag-open", closed: "tag-closed", "needs you": "tag-needs-you" },
     loginError: null,
     gate: null,
     destroyed: false,
@@ -119,7 +123,7 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
       if (!t) throw kindError("missing");
       const id = `M${++n}`;
       (t.messages ??= []).push({ id, webhookId: "W1", username: args.username, content: args.content });
-      fake.sent.push(args);
+      fake.sent.push({ ...args, id });
       fake.log.push({ op: "send", threadId: args.threadId, content: args.content, id });
       await fake.after?.("send", { ...args, id });
       return { id };
@@ -131,6 +135,40 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
       if (!t) throw kindError("missing");
       const from = idNumber(after);
       return (t.messages ?? []).filter((m) => idNumber(m.id) > from).slice(0, limit).map((m) => ({ ...m }));
+    },
+    async registerCommands(defs) {
+      await fake.gate?.("registerCommands", { defs });
+      fake.commands = defs;
+    },
+    async botSend(args) {
+      await fake.gate?.("botSend", args);
+      const id = `M${++n}`;
+      fake.bot.push({ ...args, id });
+      return { id };
+    },
+    async react(args) {
+      await fake.gate?.("react", args);
+      fake.reactions.push(args);
+    },
+    // Gateway events, as the discord.js adapter emits them (#205).
+    ownerSays(fields) {
+      const messageId = fields.messageId ?? `D${++n}`;
+      events.emit("post", { replyToId: null, ...fields, messageId });
+      return messageId;
+    },
+    edit(fields) {
+      events.emit("edit", fields);
+    },
+    addReaction(fields) {
+      events.emit("reaction", fields);
+    },
+    command(fields) {
+      const reply = async ({ content, ephemeral }) => {
+        const id = ephemeral ? null : `M${++n}`;
+        fake.replies.push({ content, ephemeral: Boolean(ephemeral), id, channelId: fields.channelId });
+        return id ? { id } : null;
+      };
+      events.emit("command", { name: "disconnect", all: false, ...fields, reply });
     },
     async destroy() {
       fake.destroyed = true;

@@ -6,6 +6,7 @@ import {
   Events,
   GatewayIntentBits,
   HTTPError,
+  MessageFlags,
   Partials,
   RateLimitError,
   Routes,
@@ -57,6 +58,17 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
   const events = new EventEmitter();
   const webhooks = new Map();
   let client = null;
+  let commands = null;
+
+  async function registerIn(guild) {
+    if (commands) await guild.commands.set(commands);
+  }
+
+  async function textChannel(id) {
+    const ch = await client.channels.fetch(id);
+    if (!ch) throw kindError("missing", "channel gone");
+    return ch;
+  }
 
   async function forum(id) {
     const ch = await client.channels.fetch(id).catch((e) => {
@@ -93,8 +105,11 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
           GatewayIntentBits.GuildMessages,
           GatewayIntentBits.DirectMessages,
           GatewayIntentBits.MessageContent,
+          GatewayIntentBits.GuildMessageReactions,
+          GatewayIntentBits.DirectMessageReactions,
         ],
-        partials: [Partials.Channel],
+        // Reactions on messages sent before this start arrive only as partials (#205).
+        partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.User],
         allowedMentions: { parse: [] },
         rest: { rejectOnRateLimit: () => true },
       });
@@ -103,19 +118,68 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
       client.on(Events.ShardResume, () => events.emit("online"));
       client.on(Events.ShardReconnecting, () => events.emit("offline"));
       client.on(Events.ShardDisconnect, () => events.emit("offline"));
-      client.on(Events.GuildCreate, () => events.emit("forums"));
+      client.on(Events.GuildCreate, (guild) => {
+        events.emit("forums");
+        registerIn(guild).catch(() => {});
+      });
       client.on(Events.GuildDelete, () => events.emit("forums"));
       client.on(Events.ChannelCreate, forumsChanged);
       client.on(Events.ChannelDelete, forumsChanged);
       client.on(Events.ChannelUpdate, (_old, ch) => forumsChanged(ch));
       client.on(Events.Error, () => {});
       client.on(Events.MessageCreate, (msg) => {
-        if (msg.guildId || msg.author?.bot || msg.webhookId) return;
+        if (msg.author?.bot || msg.webhookId) return;
+        // A person writing in a guild channel: the connector keeps only the owner, in a post
+        // it follows (#205).
+        if (msg.guildId) {
+          events.emit("post", {
+            messageId: msg.id,
+            channelId: msg.channelId,
+            authorId: msg.author?.id,
+            text: msg.content ?? "",
+            replyToId: msg.reference?.messageId ?? null,
+          });
+          return;
+        }
         events.emit("dm", {
           userId: msg.author.id,
           username: msg.author.username,
           text: msg.content,
           reply: (text) => msg.reply({ content: text, allowedMentions: { parse: [] } }),
+        });
+      });
+      // Only a real edit: link previews resolving also fire MessageUpdate, with no editedTimestamp.
+      client.on(Events.MessageUpdate, (_old, next) => {
+        if (!next?.guildId || next.author?.bot || next.webhookId || !next.editedTimestamp) return;
+        events.emit("edit", { messageId: next.id, channelId: next.channelId, authorId: next.author?.id });
+      });
+      client.on(Events.MessageReactionAdd, (reaction, user) => {
+        if (user?.bot) return;
+        events.emit("reaction", {
+          messageId: reaction.message?.id,
+          channelId: reaction.message?.channelId,
+          userId: user?.id,
+          emoji: reaction.emoji?.name ?? null,
+        });
+      });
+      client.on(Events.InteractionCreate, (i) => {
+        if (!i.isChatInputCommand?.()) return;
+        events.emit("command", {
+          name: i.commandName,
+          userId: i.user?.id,
+          channelId: i.channelId,
+          all: i.options?.getBoolean?.("all") ?? false,
+          reply: ({ content, ephemeral }) =>
+            guarded(async () => {
+              const allowedMentions = { parse: [] };
+              if (ephemeral) {
+                await i.reply({ content, allowedMentions, flags: MessageFlags.Ephemeral });
+                return null;
+              }
+              const r = await i.reply({ content, allowedMentions, withResponse: true });
+              const m = r?.resource?.message;
+              return m ? { id: m.id } : null;
+            }),
         });
       });
       return new Promise((resolve, reject) => {
@@ -238,6 +302,31 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
       }),
 
     deleteThread: (id) => guarded(() => client.rest.delete(Routes.channel(id))),
+
+    registerCommands: (defs) =>
+      guarded(async () => {
+        commands = defs;
+        for (const g of client.guilds.cache.values()) await registerIn(g);
+      }),
+
+    // The bot's own word in a post (#205): a reply to a say, a prompt. Never a webhook, so the
+    // owner can tell it from the room's lines.
+    botSend: ({ threadId, content, replyTo, allowedMentions }) =>
+      guarded(async () => {
+        const ch = await textChannel(threadId);
+        const m = await ch.send({
+          content,
+          allowedMentions,
+          ...(replyTo ? { reply: { messageReference: replyTo, failIfNotExists: false } } : {}),
+        });
+        return { id: m.id };
+      }),
+
+    react: ({ threadId, messageId, emoji }) =>
+      guarded(async () => {
+        const ch = await textChannel(threadId);
+        await ch.messages.react(messageId, emoji);
+      }),
 
     sendWebhook: ({ forumId, threadId, username, content, allowedMentions }) =>
       guarded(async () => {

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ChannelType, Collection, DiscordAPIError, DiscordjsErrorCodes } from "discord.js";
-import { createConnector, RETENTION_MS } from "../adapters/discord/connector.mjs";
+import { createConnector, isYesNo, parseAddress, RETENTION_MS } from "../adapters/discord/connector.mjs";
 import { loadState, saveState } from "../adapters/discord/state.mjs";
 import { createDiscordJs, FIND_PAGES_MAX } from "../adapters/discord/discord-js.mjs";
 import { createFakeDiscord, fakeClock, flush, kindError } from "./discord/fake.mjs";
@@ -24,10 +24,10 @@ function tmpState() {
   return join(mkdtempSync(join(tmpdir(), "gd-discord-")), "discord-state.json");
 }
 
-async function boot({ fake = createFakeDiscord(), clock = fakeClock(), statePath = tmpState(), forumId = "F1" } = {}) {
+async function boot({ fake = createFakeDiscord(), clock = fakeClock(), statePath = tmpState(), forumId = "F1", ownerId = null } = {}) {
   const lines = [];
   const c = createConnector({ discord: fake, clock, out: (l) => lines.push(l) });
-  c.handle({ t: "hello", v: 1, token: TOKEN, forumId, ownerId: null, statePath });
+  c.handle({ t: "hello", v: 1, token: TOKEN, forumId, ownerId, statePath });
   await flush();
   const of = (t) => lines.map((l) => JSON.parse(l)).filter((m) => m.t === t);
   return { c, fake, clock, statePath, lines, of };
@@ -227,7 +227,7 @@ test("reconnecting the same room reuses its post: unarchive, tag open, divider",
   c.handle({ t: "connect", room: "R", members: ["Gyre"] , createdAt: 1 });
   await flush();
   assert.equal(fake.log.filter((e) => e.op === "createPost").length, 1, "no second post");
-  assert.deepEqual(of("connected").at(-1), { t: "connected", room: "R", threadId, reopened: true });
+  assert.deepEqual(of("connected").at(-1), { t: "connected", room: "R", threadId, createdAt: 1, reopened: true });
   assert.equal(t.archived, false);
   assert.deepEqual(t.appliedTags, ["tag-open"]);
   assert.equal(fake.sent.at(-1).content, "— Reconnected (away 2 h) —");
@@ -1534,4 +1534,491 @@ test("AUDIT-C (Node half): a seq posted earlier and handed again after an instan
   const lastInFirst = b.fake.log.filter((e) => e.op === "send" && e.threadId === first).at(-1).id;
   assert.equal(posted.at(-1).msgId, lastInFirst);
   await b.c.close();
+});
+
+// ── #205: the owner speaking from Discord ──
+
+const OWNER = "U-OWNER";
+
+async function ownerRoom(opts = {}) {
+  const b = await boot({ ownerId: OWNER, ...opts });
+  b.c.handle({ t: "connect", room: "sync-abcd", members: ["Claude / Gyre"], createdAt: 1 });
+  await flush();
+  b.threadId = b.of("connected").at(-1).threadId;
+  assert.ok(b.threadId, "premise: the room has a post");
+  return b;
+}
+
+function relayedIds(fake, seq) {
+  return fake.sent.filter((s) => s.content.endsWith(`m${seq}`)).map((s) => s.id);
+}
+
+const saved = (statePath) => JSON.parse(readFileSync(statePath, "utf8")).rooms["sync-abcd"];
+
+test("#205 the owner's plain text in a connected post is a say to everyone; others and other channels say nothing", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  fake.ownerSays({ channelId: threadId, authorId: "U-STRANGER", text: "hi from a stranger" });
+  fake.ownerSays({ channelId: "T-ELSEWHERE", authorId: OWNER, text: "hi elsewhere" });
+  assert.deepEqual(of("say"), []);
+  const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "  hello room  " });
+  assert.deepEqual(of("say"), [{ t: "say", room: "sync-abcd", threadId, ownerId: OWNER, discordMessageId: id, kind: "tell", to: "everyone", text: "hello room" }]);
+  await c.close();
+});
+
+test("#205 a say is saved before it is sent, and is not sent when it cannot be saved", async () => {
+  const { c, fake, of, threadId, statePath } = await ownerRoom();
+  const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "kept" });
+  assert.deepEqual(saved(statePath).saying.map((l) => [l.discordMessageId, l.text]), [[id, "kept"]]);
+  chmodSync(dirname(statePath), 0o500);
+  try {
+    const refused = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "not kept" });
+    await flush();
+    assert.equal(of("say").length, 1, "nothing sent past a save that failed");
+    assert.equal(fake.bot.at(-1).replyTo, refused);
+    assert.match(fake.bot.at(-1).content, /^Not sent: Gyredeck could not save it first/);
+  } finally {
+    chmodSync(dirname(statePath), 0o700);
+  }
+  await c.close();
+});
+
+test("#205 a Discord Reply to a relayed message asks its sender, with replyToSeq", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  c.handle(message("sync-abcd", 7, { sender: "Claude / Gyre", senderId: "conv-gyre", text: "m7" }));
+  await flush();
+  const [relayed] = relayedIds(fake, 7);
+  assert.ok(relayed, "premise: m7 was relayed and has a Discord id");
+  const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "go ahead", replyToId: relayed });
+  assert.deepEqual(of("say").at(-1), { t: "say", room: "sync-abcd", threadId, ownerId: OWNER, discordMessageId: id, kind: "ask", to: "conv-gyre", replyToSeq: 7, text: "go ahead" });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "plain", replyToId: "M-NOT-RELAYED" });
+  assert.equal(of("say").at(-1).kind, "tell", "a Reply to anything else is plain text");
+  await c.close();
+});
+
+test("#205 every part of a split message answers to its seq, and the map survives a restart", async () => {
+  const statePath = tmpState();
+  const fake = createFakeDiscord();
+  const first = await ownerRoom({ fake, statePath });
+  const words = Array.from({ length: 900 }, (_, i) => `word${i}`).join(" ");
+  first.c.handle(message("sync-abcd", 3, { senderId: "conv-gyre", kind: "ask", text: words }));
+  await flush();
+  const parts = fake.sent.filter((s) => s.content.includes("word")).map((s) => s.id);
+  assert.ok(parts.length >= 3, "premise: split");
+  await first.c.close();
+  assert.deepEqual(saved(statePath).relayed.map((r) => [r.id, r.seq, r.senderId, r.kind]), parts.map((id) => [id, 3, "conv-gyre", "ask"]));
+
+  const second = await ownerRoom({ fake, statePath });
+  fake.ownerSays({ channelId: second.threadId, authorId: OWNER, text: "answer", replyToId: parts.at(-1) });
+  assert.equal(second.of("say").at(-1).replyToSeq, 3);
+  assert.equal(second.of("say").at(-1).to, "conv-gyre");
+  await second.c.close();
+});
+
+test("#205 a line replayed from the journal with no sender id is answered by its shown name", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  c.handle(message("sync-abcd", 4, { sender: "Codex / Altrix", text: "m4" }));
+  await flush();
+  const [relayed] = relayedIds(fake, 4);
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "ok", replyToId: relayed });
+  assert.equal(of("say").at(-1).to, "Codex / Altrix");
+  await c.close();
+});
+
+test("#205 the relayed-message map keeps at most 500 per room, dropping the oldest", async () => {
+  const { c, fake, statePath } = await ownerRoom();
+  for (let seq = 1; seq <= 503; seq++) c.handle(message("sync-abcd", seq, { senderId: "conv-gyre" }));
+  await flush(400);
+  assert.equal(fake.sent.filter((s) => /^m\d+$/.test(s.content.split("\n").at(-1))).length, 503, "premise: all 503 relayed");
+  const kept = saved(statePath).relayed;
+  assert.equal(kept.length, 500);
+  assert.equal(kept[0].seq, 4);
+  assert.equal(kept.at(-1).seq, 503);
+  await c.close();
+});
+
+test("#205 a leading @Name or Name: asks that member; anything else is for everyone", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "@Codex please look" });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "Claude / Gyre: run the tests" });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "see https://example.com: ok" });
+  assert.deepEqual(of("say").map((s) => [s.kind, s.to, s.text]), [
+    ["ask", "Codex", "please look"],
+    ["ask", "Claude / Gyre", "run the tests"],
+    ["tell", "everyone", "see https://example.com: ok"],
+  ]);
+  assert.deepEqual(parseAddress("@Gyre: hi"), { to: "Gyre", text: "hi" });
+  assert.equal(parseAddress("no address here"), null);
+  assert.equal(parseAddress("<@123> hi"), null);
+  await c.close();
+});
+
+test("#205 a say over the bridge's 4096 limit is refused with a reply in the post, never cut", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x".repeat(4097) });
+  await flush();
+  assert.deepEqual(of("say"), []);
+  assert.equal(fake.bot.length, 1);
+  assert.equal(fake.bot[0].threadId, threadId);
+  assert.equal(fake.bot[0].replyTo, id);
+  assert.match(fake.bot[0].content, /at most 4096 characters and this one is 4097/);
+  assert.deepEqual(fake.bot[0].allowedMentions.parse, []);
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x".repeat(4096) });
+  assert.equal(of("say").at(-1).text.length, 4096, "exactly the limit goes through whole");
+  await c.close();
+});
+
+test("#205 📨 only on ok with a seq; a refusal replies with the reason and the names; a second said does nothing", async () => {
+  const { c, fake, threadId, statePath } = await ownerRoom();
+  const good = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "hello" });
+  const bad = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "@Nobody hi" });
+  const noSeq = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "no seq" });
+  c.handle({ t: "said", discordMessageId: good, ok: true, seq: 9 });
+  c.handle({ t: "said", discordMessageId: bad, ok: false, error: "Not sent: no member is called Nobody.", names: ["Claude / Gyre", "Codex"] });
+  c.handle({ t: "said", discordMessageId: noSeq, ok: true });
+  await flush();
+  assert.deepEqual(fake.reactions, [{ threadId, messageId: good, emoji: "📨" }]);
+  assert.deepEqual(fake.bot.map((b) => [b.replyTo, b.content]), [
+    [bad, "Not sent: no member is called Nobody.\nNames that work: Claude / Gyre, Codex"],
+    [noSeq, "Not sent: the room refused it."],
+  ]);
+  assert.deepEqual(saved(statePath).saying, [], "every say answered is let go");
+  c.handle({ t: "said", discordMessageId: good, ok: true, seq: 9 });
+  await flush();
+  assert.equal(fake.reactions.length, 1, "a said for a say already answered does nothing");
+  await c.close();
+});
+
+test("#205 Discord down at the receipt: the 📨 waits and lands once; the say stays saved until then", async () => {
+  const { c, fake, clock, threadId, statePath } = await ownerRoom();
+  const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "hello" });
+  let down = true;
+  fake.gate = async (op) => {
+    if (op === "react" && down) throw kindError("network");
+  };
+  c.handle({ t: "said", discordMessageId: id, ok: true, seq: 3 });
+  await flush();
+  assert.deepEqual(fake.reactions, []);
+  assert.equal(saved(statePath).saying.length, 1, "kept while the receipt is owed");
+  down = false;
+  await clock.advance(2000);
+  assert.deepEqual(fake.reactions, [{ threadId, messageId: id, emoji: "📨" }]);
+  assert.deepEqual(saved(statePath).saying, []);
+  await c.close();
+});
+
+test("#205 a child that dies between a say and its receipt sends it again, with the same Discord id, once", async () => {
+  const statePath = tmpState();
+  const fake = createFakeDiscord();
+  const first = await ownerRoom({ fake, statePath });
+  const id = fake.ownerSays({ channelId: first.threadId, authorId: OWNER, text: "did it land?" });
+  assert.equal(first.of("say").length, 1);
+  await first.c.close();
+
+  const second = await ownerRoom({ fake, statePath });
+  const again = second.of("say");
+  assert.deepEqual(again, [{ t: "say", room: "sync-abcd", threadId: first.threadId, ownerId: OWNER, discordMessageId: id, kind: "tell", to: "everyone", text: "did it land?", retry: true }]);
+  const order = second.lines.map((l) => JSON.parse(l).t);
+  assert.ok(order.indexOf("connected") < order.indexOf("say"), "the post is said before the say, so the app takes it");
+  // A second connect in the same life does not send it again.
+  second.c.handle({ t: "connect", room: "sync-abcd", members: [], createdAt: 1 });
+  await flush();
+  assert.equal(second.of("say").length, 1);
+  // The bridge answers the retry with the seq the first try got: one 📨.
+  second.c.handle({ t: "said", discordMessageId: id, ok: true, seq: 5 });
+  await flush();
+  assert.deepEqual(fake.reactions, [{ threadId: first.threadId, messageId: id, emoji: "📨" }]);
+  await second.c.close();
+});
+
+test("#205 an ask to the owner @-mentions only the owner, once, and tags the post needs you until the owner's next say lands", async () => {
+  const { c, fake, threadId } = await ownerRoom();
+  c.handle(message("sync-abcd", 1, { senderId: "conv-gyre", to: "You", kind: "ask", toOwner: true, text: "m1" }));
+  c.handle(message("sync-abcd", 2, { senderId: "conv-gyre", to: "Codex", kind: "ask", text: "m2" }));
+  c.handle(message("sync-abcd", 3, { senderId: "conv-gyre", to: "You", kind: "tell", toOwner: true, text: "m3" }));
+  await flush();
+  const [one, two, three] = fake.sent.slice(-3);
+  assert.equal(one.content.split("\n")[0], `<@${OWNER}> → You · ask`);
+  assert.deepEqual(one.allowedMentions, { parse: [], users: [OWNER] });
+  for (const s of [two, three]) {
+    assert.ok(!s.content.includes("<@"), s.content);
+    assert.deepEqual(s.allowedMentions, NO_MENTIONS);
+  }
+  const t = fake.threads.get(threadId);
+  assert.deepEqual(t.appliedTags, ["tag-open", "tag-needs-you"]);
+  assert.ok(fake.log.some((e) => e.op === "ensureTags" && e.names.includes("needs you")), "the tag is created if missing");
+
+  const answer = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "yes do it" });
+  await flush();
+  assert.deepEqual(t.appliedTags, ["tag-open", "tag-needs-you"], "a say that has not landed leaves the tag");
+  c.handle({ t: "said", discordMessageId: answer, ok: false, error: "Not sent." });
+  await flush();
+  assert.deepEqual(t.appliedTags, ["tag-open", "tag-needs-you"], "nor does one refused");
+  const landed = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "yes do it" });
+  c.handle({ t: "said", discordMessageId: landed, ok: true, seq: 4 });
+  await flush();
+  assert.deepEqual(t.appliedTags, ["tag-open"]);
+  await c.close();
+});
+
+test("#205 a long ask to the owner pings once: the mention is on the first part only", async () => {
+  const { c, fake } = await ownerRoom();
+  const words = Array.from({ length: 900 }, (_, i) => `word${i}`).join(" ");
+  c.handle(message("sync-abcd", 1, { senderId: "conv-gyre", to: "You", kind: "ask", toOwner: true, text: words }));
+  await flush();
+  const parts = fake.sent.filter((s) => s.content.includes("word"));
+  assert.ok(parts.length >= 3, "premise: the ask was split");
+  assert.deepEqual(parts[0].allowedMentions, { parse: [], users: [OWNER] });
+  for (const p of parts.slice(1)) assert.deepEqual(p.allowedMentions, NO_MENTIONS);
+  await c.close();
+});
+
+test("#205 the owner's ✅ on a relayed tell says acknowledged as a reaction to its sender; anything else does nothing", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  c.handle(message("sync-abcd", 5, { senderId: "conv-gyre", text: "m5" }));
+  await flush();
+  const [id] = relayedIds(fake, 5);
+  fake.addReaction({ messageId: id, channelId: threadId, userId: OWNER, emoji: "❌" });
+  fake.addReaction({ messageId: id, channelId: threadId, userId: OWNER, emoji: "👍" });
+  fake.addReaction({ messageId: id, channelId: threadId, userId: OWNER, emoji: "📨" });
+  fake.addReaction({ messageId: id, channelId: threadId, userId: "U-STRANGER", emoji: "✅" });
+  assert.deepEqual(of("say"), [], "❌ on a tell, another emoji, or another person: nothing");
+  fake.addReaction({ messageId: id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(of("say"), [{ t: "say", room: "sync-abcd", threadId, ownerId: OWNER, discordMessageId: id, kind: "reaction", to: "conv-gyre", replyToSeq: 5, text: "acknowledged" }]);
+  c.handle({ t: "said", discordMessageId: id, ok: true, seq: 6 });
+  await flush();
+  assert.deepEqual(fake.reactions.at(-1), { threadId, messageId: id, emoji: "📨" });
+  await c.close();
+});
+
+test("#205 ✅/❌ on a yes/no ask answers yes/no; on any other ask the bot asks for a typed reply", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  c.handle(message("sync-abcd", 1, { senderId: "conv-gyre", kind: "ask", text: "Tests pass. Should I merge it?" }));
+  c.handle(message("sync-abcd", 2, { senderId: "conv-codex", kind: "ask", text: "Which branch should I use?" }));
+  await flush();
+  const [yn, open] = fake.sent.slice(-2).map((s) => s.id);
+  fake.addReaction({ messageId: yn, channelId: threadId, userId: OWNER, emoji: "✅" });
+  fake.addReaction({ messageId: yn, channelId: threadId, userId: OWNER, emoji: "❌" });
+  assert.deepEqual(of("say").map((s) => [s.kind, s.to, s.replyToSeq, s.text]), [
+    ["tell", "conv-gyre", 1, "yes"],
+    ["tell", "conv-gyre", 1, "no"],
+  ]);
+  for (const say of of("say")) assert.deepEqual([say.threadId, say.ownerId], [threadId, OWNER]);
+  fake.addReaction({ messageId: open, channelId: threadId, userId: OWNER, emoji: "✅" });
+  await flush();
+  assert.equal(of("say").length, 2, "nothing is posted for an open question");
+  assert.equal(fake.bot.at(-1).content, "This question needs a typed reply");
+  assert.equal(fake.bot.at(-1).replyTo, open);
+  await c.close();
+});
+
+test("#205 the yes/no rule: ends with ? and the last sentence opens with an auxiliary verb, with no 'or'", () => {
+  for (const t of ["Should I merge?", "Done. Can I push now?", "OK to release?", "Is it fine?\n", "Don't you want it?"]) assert.ok(isYesNo(t), t);
+  for (const t of ["Which file?", "Should I merge A or B?", "Should I merge.", "I wonder if it works?", ""]) assert.ok(!isYesNo(t), t);
+});
+
+test("#205 the owner voice's own messages coming back from the room are not relayed again, and are acknowledged", async () => {
+  const { c, fake, statePath, of } = await ownerRoom();
+  c.handle(message("sync-abcd", 1, { sender: "You (via Discord)", senderId: "gyredeck-owner-discord", text: "m1" }));
+  c.handle(message("sync-abcd", 2, { senderId: "conv-gyre", text: "m2" }));
+  await flush();
+  assert.deepEqual(texts(fake).filter((t) => /^m\d$/.test(t)), ["m2"]);
+  assert.equal(saved(statePath).lastSeq, 2);
+  assert.deepEqual(of("posted").map((p) => p.seq), [1, 2], "the app may let it go");
+  await c.close();
+});
+
+test("#205 /disconnect is registered as a guild command with an optional all option", async () => {
+  const { c, fake } = await boot({ ownerId: OWNER });
+  assert.deepEqual(fake.commands, [
+    {
+      name: "disconnect",
+      description: "Stop following this room in Discord (the room stays open)",
+      options: [{ type: 5, name: "all", description: "Disconnect every connected room", required: false }],
+    },
+  ]);
+  await c.close();
+});
+
+test("#205 /disconnect from anyone but the paired owner gets an ephemeral refusal", async () => {
+  const { c, fake, threadId, of } = await ownerRoom();
+  fake.command({ userId: "U-STRANGER", channelId: threadId });
+  await flush();
+  assert.deepEqual(fake.replies.map((r) => [r.ephemeral, r.content]), [[true, "Only the paired owner can disconnect rooms."]]);
+  assert.deepEqual(of("disconnect_request"), []);
+  await c.close();
+});
+
+test("#205 /disconnect in a post asks first; only the owner's ✅ within 10 minutes requests it", async () => {
+  const { c, fake, clock, threadId, of } = await ownerRoom();
+  fake.command({ userId: OWNER, channelId: threadId });
+  await flush();
+  const prompt = fake.replies.at(-1);
+  assert.equal(prompt.ephemeral, false);
+  assert.match(prompt.content, /^Disconnect sync-abcd\? If no other room is connected the Mac may sleep, and you cannot reconnect until you are back at it\./);
+  assert.deepEqual(fake.reactions.at(-1), { threadId, messageId: prompt.id, emoji: "✅" }, "the bot offers the ✅");
+  fake.addReaction({ messageId: prompt.id, channelId: threadId, userId: "U-STRANGER", emoji: "✅" });
+  fake.addReaction({ messageId: prompt.id, channelId: threadId, userId: OWNER, emoji: "❌" });
+  assert.deepEqual(of("disconnect_request"), [], "only the owner's ✅ counts");
+  await clock.advance(9 * 60_000);
+  fake.addReaction({ messageId: prompt.id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(of("disconnect_request"), [{ t: "disconnect_request", room: "sync-abcd", ownerId: OWNER, threadId }]);
+
+  fake.command({ userId: OWNER, channelId: threadId });
+  await flush();
+  const late = fake.replies.at(-1);
+  await clock.advance(10 * 60_000 + 1);
+  fake.addReaction({ messageId: late.id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.equal(of("disconnect_request").length, 1, "an expired prompt requests nothing");
+  await c.close();
+});
+
+test("#205 /disconnect all asks, then requests all; outside a post without all it is refused", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  fake.command({ userId: OWNER, channelId: "C-GENERAL" });
+  await flush();
+  assert.deepEqual(fake.replies.map((r) => r.ephemeral), [true]);
+  assert.match(fake.replies[0].content, /inside a connected room's post/);
+  fake.command({ userId: OWNER, channelId: "C-GENERAL", all: true });
+  await flush();
+  const prompt = fake.replies.at(-1);
+  assert.match(prompt.content, /^Disconnect every connected room \(sync-abcd\)\?/);
+  fake.addReaction({ messageId: prompt.id, channelId: "C-GENERAL", userId: OWNER, emoji: "✅" });
+  assert.deepEqual(of("disconnect_request"), [{ t: "disconnect_request", all: true, ownerId: OWNER }]);
+  fake.command({ userId: OWNER, channelId: threadId, all: true });
+  await flush();
+  fake.addReaction({ messageId: fake.replies.at(-1).id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(of("disconnect_request").at(-1), { t: "disconnect_request", all: true, ownerId: OWNER, threadId }, "from a post it names the post");
+  await c.close();
+});
+
+test("#205 quiet posts 'gone quiet' once with a ✅ and never disconnects by itself; the owner's ✅ requests it", async () => {
+  const { c, fake, clock, threadId, of } = await ownerRoom();
+  c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  assert.equal(fake.bot.length, 1);
+  assert.equal(fake.bot[0].threadId, threadId);
+  assert.match(fake.bot[0].content, /^This room has gone quiet\. Disconnect\?/);
+  assert.deepEqual(fake.bot[0].allowedMentions, NO_MENTIONS);
+  assert.deepEqual(fake.reactions.at(-1), { threadId, messageId: fake.bot[0].id, emoji: "✅" });
+  await clock.advance(30 * 60_000);
+  assert.deepEqual(of("disconnect_request"), [], "nothing disconnects on its own");
+  c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  fake.addReaction({ messageId: fake.bot.at(-1).id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(of("disconnect_request"), [{ t: "disconnect_request", room: "sync-abcd", ownerId: OWNER, threadId }]);
+  c.handle({ t: "quiet", room: "sync-zzzz" });
+  assert.equal(of("error").at(-1).code, "room_unknown");
+  await c.close();
+});
+
+test("#205 a newer quiet spell replaces the older prompt, and quiet_over disarms it", async () => {
+  const { c, fake, threadId, of } = await ownerRoom();
+  c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  const [older, newer] = fake.bot.slice(-2);
+  assert.ok(older && newer && older.id !== newer.id, "premise: two prompts were posted");
+  fake.addReaction({ messageId: older.id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(of("disconnect_request"), [], "the older prompt is disarmed");
+  c.handle({ t: "quiet_over", room: "sync-abcd" });
+  fake.addReaction({ messageId: newer.id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(of("disconnect_request"), [], "work resumed: the newer prompt is disarmed too");
+  c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  fake.addReaction({ messageId: fake.bot.at(-1).id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.equal(of("disconnect_request").length, 1, "a fresh prompt still works");
+  await c.close();
+});
+
+test("#205 a disconnect disarms the room's prompts", async () => {
+  const { c, fake, threadId, of } = await ownerRoom();
+  c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  c.handle({ t: "disconnect", room: "sync-abcd", reason: "disconnected", id: "close-1" });
+  await flush();
+  fake.addReaction({ messageId: fake.bot[0].id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(of("disconnect_request"), []);
+  await c.close();
+});
+
+test("#205 an owner edit of a message already sent gets one note in the post, and nothing goes to the room", async () => {
+  const { c, fake, threadId, of } = await ownerRoom();
+  const sent = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "hello" });
+  const before = of("say").length;
+  fake.edit({ messageId: "D-NEVER-SENT", channelId: threadId, authorId: OWNER });
+  fake.edit({ messageId: sent, channelId: threadId, authorId: "U-STRANGER" });
+  await flush();
+  assert.deepEqual(fake.bot, [], "an unsent message or another author's edit: no note");
+  fake.edit({ messageId: sent, channelId: threadId, authorId: OWNER });
+  fake.edit({ messageId: sent, channelId: threadId, authorId: OWNER });
+  await flush();
+  assert.deepEqual(fake.bot.map((b) => [b.replyTo, b.content]), [[sent, "Edits are not sent to the room; send a new message."]], "once per message");
+  assert.equal(of("say").length, before, "the edit is not relayed");
+  await c.close();
+});
+
+test("#205 with no owner paired, or after the owner is unpaired, nothing in a post is a say", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  c.handle({ t: "owner", ownerId: null });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "after unpairing" });
+  c.handle(message("sync-abcd", 1, { senderId: "conv-gyre", kind: "ask", text: "Should I?" }));
+  await flush();
+  const [id] = relayedIds(fake, 1);
+  fake.addReaction({ messageId: id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(of("say"), []);
+  await c.close();
+});
+
+test("#205 discord.js adapter: reaction intents, guild posts, reactions and the slash command reach the connector", async () => {
+  const forum = fakeForum({ tags: [] });
+  const { discord, client, options } = await adapterWith(forum);
+  const { GatewayIntentBits, Partials, MessageFlags } = await import("discord.js");
+  for (const i of [GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.DirectMessageReactions]) assert.ok(options.intents.includes(i));
+  for (const p of [Partials.Message, Partials.Reaction]) assert.ok(options.partials.includes(p));
+  const got = [];
+  for (const e of ["post", "reaction", "command", "dm"]) discord.on(e, (x) => got.push([e, x]));
+  client.emit("messageCreate", { id: "D1", channelId: "T1", guildId: "G1", content: "hi", author: { id: OWNER, bot: false }, reference: { messageId: "M9" } });
+  client.emit("messageCreate", { id: "D2", channelId: "T1", guildId: "G1", content: "relay", author: { id: "W", bot: true }, webhookId: "W1" });
+  client.emit("messageCreate", { id: "D3", channelId: "T1", guildId: "G1", content: "You (via Discord)", author: { id: "W", bot: false }, webhookId: "W1" });
+  client.emit("messageReactionAdd", { emoji: { name: "✅" }, message: { id: "M9", channelId: "T1" } }, { id: OWNER, bot: false });
+  client.emit("messageReactionAdd", { emoji: { name: "✅" }, message: { id: "M9", channelId: "T1" } }, { id: "B1", bot: true });
+  const replies = [];
+  client.emit("interactionCreate", {
+    isChatInputCommand: () => true,
+    commandName: "disconnect",
+    user: { id: OWNER },
+    channelId: "T1",
+    options: { getBoolean: (n) => (n === "all" ? true : null) },
+    reply: async (o) => (replies.push(o), o.withResponse ? { resource: { message: { id: "P1" } } } : undefined),
+  });
+  assert.deepEqual(got.map(([e, x]) => [e, x.messageId ?? x.name]), [["post", "D1"], ["reaction", "M9"], ["command", "disconnect"]], "a webhook's or a bot's message is never a post");
+  assert.deepEqual(got[0][1], { messageId: "D1", channelId: "T1", authorId: OWNER, text: "hi", replyToId: "M9" });
+  assert.deepEqual(got[1][1], { messageId: "M9", channelId: "T1", userId: OWNER, emoji: "✅" });
+  const cmd = got[2][1];
+  assert.equal(cmd.all, true);
+  assert.deepEqual(await cmd.reply({ content: "Disconnect?", ephemeral: false }), { id: "P1" });
+  assert.equal(await cmd.reply({ content: "no", ephemeral: true }), null);
+  assert.equal(replies[1].flags, MessageFlags.Ephemeral);
+  for (const r of replies) assert.deepEqual(r.allowedMentions, NO_MENTIONS);
+
+  const sets = [];
+  client.guilds = { cache: new Map([["G1", { commands: { set: async (d) => sets.push(["G1", d]) } }]]) };
+  await discord.registerCommands([{ name: "disconnect" }]);
+  client.emit("guildCreate", { commands: { set: async (d) => sets.push(["G2", d]) } });
+  await flush();
+  assert.deepEqual(sets.map(([g]) => g), ["G1", "G2"], "registered in every guild, and in one joined later");
+});
+
+test("#205 discord.js adapter reports only real edits by people in guilds", async () => {
+  const { discord, client } = await adapterWith(fakeForum({ tags: [] }));
+  const got = [];
+  discord.on("edit", (e) => got.push(e));
+  const msg = (extra) => ({ id: "D1", channelId: "T1", guildId: "G1", author: { id: OWNER, bot: false }, editedTimestamp: 5, ...extra });
+  client.emit("messageUpdate", {}, msg({ editedTimestamp: null }));
+  client.emit("messageUpdate", {}, msg({ author: { id: "B", bot: true } }));
+  client.emit("messageUpdate", {}, msg({ guildId: null }));
+  assert.deepEqual(got, []);
+  client.emit("messageUpdate", {}, msg());
+  assert.deepEqual(got, [{ messageId: "D1", channelId: "T1", authorId: OWNER }]);
 });

@@ -14,7 +14,48 @@ export const REJECT_TRIES = 3;
 export const PAIR_MAX_MISSES = 5;
 /** Pages of 100 read back after the last message known to be ours before a post is said to be unknowable. */
 export const READBACK_PAGES = 5;
-const TAGS = ["open", "closed"];
+/** How long a ✅ on a disconnect or quiet prompt still counts (#205). */
+export const PROMPT_MS = 10 * 60_000;
+/** The bridge's MAIL_MAX_TEXT: a longer say is refused here, never cut. */
+export const SAY_MAX_TEXT = 4_096;
+/** Relayed messages remembered per room, so a Reply or a reaction can name what it answers. */
+export const RELAYED_MAX = 500;
+const SPOKEN_MAX = 500;
+export const EDIT_NOTE = "Edits are not sent to the room; send a new message.";
+export const OWNER_VOICE = "gyredeck-owner-discord";
+export const YES = "✅";
+export const NO = "❌";
+export const SENT = "📨";
+const NEEDS_YOU = "needs you";
+const TAGS = ["open", "closed", NEEDS_YOU];
+const BOOLEAN_OPTION = 5;
+export const COMMANDS = [
+  {
+    name: "disconnect",
+    description: "Stop following this room in Discord (the room stays open)",
+    options: [{ type: BOOLEAN_OPTION, name: "all", description: "Disconnect every connected room", required: false }],
+  },
+];
+const AUX = /^(is|are|am|was|were|do|does|did|can|could|will|would|shall|should|may|might|must|have|has|had|isn't|aren't|wasn't|weren't|don't|doesn't|didn't|can't|couldn't|won't|wouldn't|shouldn't|haven't|hasn't|hadn't|ok|okay)\b/i;
+
+// A yes/no question: the text ends with "?", and its last sentence opens with an auxiliary
+// verb (is/can/should/…, or "ok"/"okay") and offers no " or " choice. "Should I merge?" is
+// one; "Which file?" and "Should I merge A or B?" are not.
+export function isYesNo(text) {
+  const t = String(text ?? "").trim();
+  if (!t.endsWith("?")) return false;
+  const last = t.slice(0, -1).split(/[.!?\n]/).at(-1).trim().replace(/^[^\p{L}]+/u, "");
+  return AUX.test(last) && !/\bor\b/i.test(last);
+}
+
+// "@Name text" or "Name: text" at the very start addresses Name; anything else is for everyone.
+export function parseAddress(text) {
+  const at = /^@([^\s:]{1,64}):?\s+([\s\S]*)$/.exec(text);
+  if (at) return { to: at[1], text: at[2].trim() };
+  const colon = /^([^\s:@<][^:\n]{0,63}):\s+([\s\S]*)$/.exec(text);
+  if (colon) return { to: colon[1].trim(), text: colon[2].trim() };
+  return null;
+}
 const CLOSE_TEXT = { closed: "Room closed", ended: "Room ended — Gyredeck stopped", disconnected: "Disconnected" };
 
 export const realClock = {
@@ -50,13 +91,13 @@ export function webhookName(name) {
   return clean || "Room";
 }
 
-export function formatMessage(m, delayed) {
+export function formatMessage(m, delayed, mention = null) {
   if (m.kind === "notice") {
     return { username: "Room", content: delayed ? `(delayed)\n${m.text}` : m.text };
   }
   return {
     username: webhookName(m.sender),
-    content: `→ ${m.to} · ${m.kind}${delayed ? " (delayed)" : ""}\n${m.text}`,
+    content: `${mention ? `<@${mention}> ` : ""}→ ${m.to} · ${m.kind}${delayed ? " (delayed)" : ""}\n${m.text}`,
   };
 }
 
@@ -113,6 +154,12 @@ export function createConnector({ discord, out, clock = realClock }) {
   const tagCache = new Map();
   const waiters = new Set();
   const reported = new Set();
+  // Armed ✅ prompts (/disconnect, gone quiet), by the prompt's Discord id (#205).
+  const prompts = new Map();
+  // Owner messages sent to the room, by Discord id → whether the "edits" note was posted.
+  const spoken = new Map();
+  // Rooms whose saved says this child has sent again since it started.
+  const resaid = new Set();
 
   function redact(text) {
     const s = String(text);
@@ -220,6 +267,194 @@ export function createConnector({ discord, out, clock = realClock }) {
     awaitingOwner = { round, userId: dm.userId, reply: dm.reply };
   });
 
+  // ── the owner speaking (#205) ──
+
+  discord.on("post", (p) => {
+    if (stopped || !ownerId || p.authorId !== ownerId) return;
+    const code = roomOfThread(p.channelId);
+    if (!code) return;
+    if (!workers.get(code)?.accepting) return botReply(p.channelId, p.messageId, "Not sent: this room is no longer connected to Discord.");
+    const rs = state.rooms[code];
+    const body = String(p.text ?? "").trim();
+    const relayed = p.replyToId ? (rs.relayed ?? []).find((r) => r.id === p.replyToId) : null;
+    let say;
+    if (relayed) say = { kind: "ask", to: relayed.senderId || relayed.sender, replyToSeq: relayed.seq, text: body };
+    else {
+      const addressed = parseAddress(body);
+      say = addressed ? { kind: "ask", ...addressed } : { kind: "tell", to: "everyone", text: body };
+    }
+    if (!say.text) return botReply(p.channelId, p.messageId, "Not sent: there is no text to send.");
+    if (say.text.length > SAY_MAX_TEXT) {
+      return botReply(p.channelId, p.messageId, `Not sent: a room message is at most ${SAY_MAX_TEXT} characters and this one is ${say.text.length}. Split it.`);
+    }
+    sayToRoom(code, p.channelId, p.messageId, say);
+  });
+  discord.on("edit", (e) => {
+    if (stopped || !ownerId || e.authorId !== ownerId || !roomOfThread(e.channelId)) return;
+    if (spoken.get(e.messageId) !== false) return;
+    spoken.set(e.messageId, true);
+    botReply(e.channelId, e.messageId, EDIT_NOTE);
+  });
+  discord.on("reaction", (r) => {
+    if (stopped || !ownerId || r.userId !== ownerId) return;
+    const prompt = prompts.get(r.messageId);
+    if (prompt) {
+      if (r.emoji !== YES) return;
+      prompts.delete(r.messageId);
+      if (clock.now() > prompt.expiresAt) return;
+      const from = { ownerId: r.userId, ...(prompt.threadId ? { threadId: prompt.threadId } : {}) };
+      if (prompt.all) return send({ t: "disconnect_request", all: true, ...from });
+      if (workers.get(prompt.room)?.accepting) send({ t: "disconnect_request", room: prompt.room, ...from });
+      return;
+    }
+    // Any emoji but these two does nothing (#205).
+    if (r.emoji !== YES && r.emoji !== NO) return;
+    const code = roomOfThread(r.channelId);
+    if (!code || !workers.get(code)?.accepting) return;
+    const relayed = (state.rooms[code].relayed ?? []).find((m) => m.id === r.messageId);
+    if (!relayed) return;
+    const to = relayed.senderId || relayed.sender;
+    if (relayed.kind === "tell" && r.emoji === YES) {
+      return sayToRoom(code, r.channelId, r.messageId, { kind: "reaction", to, replyToSeq: relayed.seq, text: "acknowledged" });
+    }
+    if (relayed.kind !== "ask") return;
+    if (!relayed.yn) return botReply(r.channelId, r.messageId, "This question needs a typed reply");
+    sayToRoom(code, r.channelId, r.messageId, { kind: "tell", to, replyToSeq: relayed.seq, text: r.emoji === YES ? "yes" : "no" });
+  });
+  discord.on("command", (c) => {
+    if (stopped || c.name !== "disconnect") return;
+    command(c).catch((e) => fail("internal", e?.message));
+  });
+
+  async function command(c) {
+    const refuse = (content) => c.reply({ content, ephemeral: true });
+    if (!ownerId || c.userId !== ownerId) return refuse("Only the paired owner can disconnect rooms.");
+    let target;
+    let content;
+    if (c.all) {
+      const rooms = [...workers.values()].filter((w) => w.accepting).map((w) => w.code);
+      if (!rooms.length) return refuse("No room is connected.");
+      target = { all: true };
+      content = `Disconnect every connected room (${rooms.join(", ")})? The Mac may sleep, and you cannot reconnect until you are back at it.`;
+    } else {
+      const code = roomOfThread(c.channelId);
+      if (!code || !workers.get(code)?.accepting) return refuse("Run /disconnect inside a connected room's post, or use /disconnect all:True.");
+      target = { room: code };
+      content = `Disconnect ${code}? If no other room is connected the Mac may sleep, and you cannot reconnect until you are back at it.`;
+    }
+    const msg = await c.reply({ content: `${content}\nReact ${YES} within 10 minutes to confirm.`, ephemeral: false });
+    if (!msg?.id) return;
+    const now = clock.now();
+    for (const [id, p] of prompts) if (now > p.expiresAt) prompts.delete(id);
+    const inPost = roomOfThread(c.channelId) ? { threadId: c.channelId } : {};
+    prompts.set(msg.id, { ...target, ...inPost, expiresAt: now + PROMPT_MS });
+    await discord.react({ threadId: c.channelId, messageId: msg.id, emoji: YES }).catch(() => {});
+  }
+
+  // One armed quiet prompt per room: a newer spell replaces it, and work resuming disarms it.
+  function dropQuietPrompts(code) {
+    for (const [id, p] of prompts) if (p.quiet && p.room === code) prompts.delete(id);
+  }
+
+  // The room whose current post this is: never a set-aside instance (`code@createdAt`).
+  function roomOfThread(threadId) {
+    if (!threadId) return null;
+    for (const [code, rs] of Object.entries(state.rooms)) if (rs.threadId === threadId && !code.includes("@")) return code;
+    return null;
+  }
+
+  // Saved before it is sent, and kept until its receipt is in the post: a child that dies in
+  // between sends it again with the same Discord id, which the bridge answers with the seq
+  // it already has (#205 r1).
+  function sayToRoom(code, threadId, discordMessageId, say) {
+    const rs = state.rooms[code];
+    const { kind, to, text, replyToSeq } = say;
+    const line = { room: code, threadId, discordMessageId, kind, to, text, ...(replyToSeq != null ? { replyToSeq } : {}) };
+    (rs.saying ??= []).push(line);
+    try {
+      save();
+    } catch (e) {
+      rs.saying.pop();
+      return botReply(threadId, discordMessageId, `Not sent: Gyredeck could not save it first (${e?.message}).`);
+    }
+    spoken.delete(discordMessageId);
+    spoken.set(discordMessageId, false);
+    while (spoken.size > SPOKEN_MAX) spoken.delete(spoken.keys().next().value);
+    send({ t: "say", ownerId, ...line });
+  }
+
+  function botReply(threadId, replyTo, content) {
+    discord
+      .botSend({ threadId, content, replyTo, allowedMentions: { parse: [], repliedUser: false } })
+      .catch((e) => fail(e?.kind === "permission" ? "missing_permission" : "internal", `Could not reply in Discord: ${e?.message}`));
+  }
+
+  // What became of a say: in the room's queue, behind what it is already posting, so a
+  // Discord that is down holds the receipt instead of losing it.
+  function said(msg) {
+    const id = String(msg.discordMessageId ?? "");
+    const code = Object.keys(state.rooms).find((c) => !c.includes("@") && (state.rooms[c].saying ?? []).some((l) => l.discordMessageId === id));
+    if (!code) return;
+    enqueue(worker(code), { op: "receipt", id, ok: msg.ok === true && Number.isInteger(msg.seq), error: msg.error, names: msg.names });
+  }
+
+  async function receipt(w, item) {
+    const rs = state.rooms[w.code];
+    const at = (rs?.saying ?? []).findIndex((l) => l.discordMessageId === item.id);
+    if (at < 0) return;
+    const line = rs.saying[at];
+    try {
+      if (item.ok) {
+        await discord.react({ threadId: line.threadId, messageId: item.id, emoji: SENT });
+        if (rs.needsYou && rs.threadId === line.threadId) {
+          const tags = await tagsFor(rs.forumId ?? forumId);
+          await discord.editThread(rs.threadId, { appliedTags: [tags.open] });
+          rs.needsYou = false;
+        }
+      } else {
+        const names = Array.isArray(item.names) && item.names.length ? `\nNames that work: ${item.names.map(String).join(", ")}` : "";
+        // The app's error is already a sentence written for the post.
+        await discord.botSend({
+          threadId: line.threadId,
+          content: `${String(item.error ?? "Not sent: the room refused it.")}${names}`,
+          replyTo: item.id,
+          allowedMentions: { parse: [], repliedUser: false },
+        });
+      }
+    } catch (e) {
+      // Down or slowed: tried again by the queue. A post or message that is gone, or a
+      // refusal, will not change: the receipt is given up rather than holding the room.
+      if (e?.kind === "network" || e?.kind === "rate") throw e;
+      fail(e?.kind === "permission" ? "missing_permission" : "internal", `Could not answer in Discord: ${e?.message}`, w.code);
+    }
+    rs.saying.splice(at, 1);
+    save();
+  }
+
+  // The room's post is open: said to the app first, so a say from it is taken, then the says
+  // an earlier child saved and never saw a receipt for are sent again, once per child, for
+  // the instance followed now only (#205 r1).
+  function opened(w, item, line) {
+    send(line);
+    if (w.accepting && item.createdAt != null && item.createdAt === w.createdAt) resay(w);
+  }
+
+  function resay(w) {
+    if (resaid.has(w.code)) return;
+    resaid.add(w.code);
+    for (const line of state.rooms[w.code]?.saying ?? []) send({ t: "say", ownerId, ...line, retry: true });
+  }
+
+  async function quietPrompt(w) {
+    const rs = state.rooms[w.code];
+    if (!rs?.threadId || !w.accepting) return;
+    const msg = await discord.botSend({ threadId: rs.threadId, content: `This room has gone quiet. Disconnect? React ${YES} within 10 minutes to disconnect now.`, allowedMentions: { parse: [] } });
+    if (!msg?.id) return;
+    dropQuietPrompts(w.code);
+    prompts.set(msg.id, { room: w.code, threadId: rs.threadId, quiet: true, expiresAt: clock.now() + PROMPT_MS });
+    await discord.react({ threadId: rs.threadId, messageId: msg.id, emoji: YES }).catch(() => {});
+  }
+
   function readyMessage() {
     return { t: "ready", v: PROTOCOL, ...identity, forums: discord.listForums() };
   }
@@ -247,6 +482,9 @@ export function createConnector({ discord, out, clock = realClock }) {
     reported.delete("down");
     send(readyMessage());
     releaseReady();
+    discord.registerCommands(COMMANDS).catch((e) =>
+      fail(e?.kind === "permission" ? "missing_permission" : "internal", `Could not register /disconnect: ${e?.message}`),
+    );
     scheduleSweep();
     await sweep();
   }
@@ -402,6 +640,8 @@ export function createConnector({ discord, out, clock = realClock }) {
     }
     if (item.op === "close") return closePost(w, item);
     if (item.op === "lost") return sayLost(w, item);
+    if (item.op === "quiet") return quietPrompt(w);
+    if (item.op === "receipt") return receipt(w, item);
   }
 
   // Whether Discord already holds this post, looked for after the last message known to be
@@ -434,7 +674,7 @@ export function createConnector({ discord, out, clock = realClock }) {
   // posted past. One refused for permission posts and says so: with state intact that
   // repeats at most the one post whose intent was pending; with state lost (replay) every
   // owed line Discord took but the app had not seen ACKed is posted again, once each.
-  async function postOnce(w, rs, { key, username, content, ...extra }, apply = () => {}) {
+  async function postOnce(w, rs, { key, username, content, ...extra }, apply = () => {}, allowedMentions = { parse: [] }) {
     const finish = (id, keep, anchor = true) => {
       if (id && anchor) rs.lastMsgId = id;
       if (!keep) delete rs.pending;
@@ -472,7 +712,7 @@ export function createConnector({ discord, out, clock = realClock }) {
       threadId: rs.threadId,
       username,
       content,
-      allowedMentions: { parse: [] },
+      allowedMentions,
     });
     return finish(sent?.id, false);
   }
@@ -489,7 +729,7 @@ export function createConnector({ discord, out, clock = realClock }) {
     if (item.opened) {
       settle();
       w.open = true;
-      send({ t: "connected", room: w.code, threadId: state.rooms[w.code]?.threadId, reopened: item.opened === "reopened" });
+      opened(w, item, { t: "connected", room: w.code, threadId: state.rooms[w.code]?.threadId, createdAt: item.createdAt ?? null, reopened: item.opened === "reopened" });
       return;
     }
     let rs = state.rooms[w.code];
@@ -515,7 +755,7 @@ export function createConnector({ discord, out, clock = realClock }) {
       w.open = false;
     }
     if (w.open && !fresh && rs) {
-      send({ t: "connected", room: w.code, threadId: state.rooms[w.code].threadId, reopened: false });
+      opened(w, item, { t: "connected", room: w.code, threadId: state.rooms[w.code].threadId, createdAt: item.createdAt ?? null, reopened: false });
       return;
     }
     // Handed a closed post's instance with nothing to say but its close — a replay after a
@@ -523,7 +763,7 @@ export function createConnector({ discord, out, clock = realClock }) {
     // to be closed twice (#199 I12).
     const next = w.queue[w.queue.indexOf(item) + 1];
     if (rs?.threadId && (rs.closedAt || rs.closing) && !fresh && item.createdAt != null && rs.createdAt === item.createdAt && next?.op === "close" && next.inst === item.createdAt) {
-      send({ t: "connected", room: w.code, threadId: rs.threadId, reopened: false });
+      opened(w, item, { t: "connected", room: w.code, threadId: rs.threadId, createdAt: item.createdAt ?? null, reopened: false });
       return;
     }
     const tags = await tagsFor(forum);
@@ -535,11 +775,12 @@ export function createConnector({ discord, out, clock = realClock }) {
         rs.forumId = forum;
         await postOnce(w, rs, { key: "divider", username: "Room", content: divider }, (r) => {
           r.closedAt = null;
+          r.needsYou = false;
           delete r.closing;
           item.opened = "reopened";
         });
         w.open = true;
-        send({ t: "connected", room: w.code, threadId: rs.threadId, reopened: true });
+        opened(w, item, { t: "connected", room: w.code, threadId: rs.threadId, createdAt: item.createdAt ?? null, reopened: true });
         return;
       }
     }
@@ -578,7 +819,7 @@ export function createConnector({ discord, out, clock = realClock }) {
     item.opened = "created";
     save();
     w.open = true;
-    send({ t: "connected", room: w.code, threadId, reopened: false });
+    opened(w, item, { t: "connected", room: w.code, threadId, createdAt: item.createdAt ?? null, reopened: false });
   }
 
   /** This instance's post if Discord already has it: the oldest kept, any later one closed. */
@@ -624,6 +865,23 @@ export function createConnector({ discord, out, clock = realClock }) {
       acked(w, seq, item.inst, rs.lastMsgId ?? rs.threadId);
       return;
     }
+    // The owner's own words are already in the post, as the message they typed (#205).
+    if (item.m.senderId === OWNER_VOICE) {
+      rs.lastSeq = seq;
+      dropParts(rs);
+      save();
+      acked(w, seq, item.inst, rs.lastMsgId ?? rs.threadId);
+      return;
+    }
+    // An ask to the person pings the paired owner, once, on its first part, and marks the
+    // post as waiting on them until their next say lands (#205).
+    const mention = item.m.kind === "ask" && item.m.toOwner && ownerId ? ownerId : null;
+    if (mention && !rs.needsYou) {
+      const tags = await tagsFor(rs.forumId ?? forumId);
+      await discord.editThread(rs.threadId, { appliedTags: [tags.open, tags[NEEDS_YOU]] });
+      rs.needsYou = true;
+      save();
+    }
     if (item.sent === 0) {
       // A seq a previous run had started: its parts are cut the same way again (the same
       // "(delayed)" choice, saved with its first intent), and the ones Discord already
@@ -635,10 +893,10 @@ export function createConnector({ discord, out, clock = realClock }) {
       // "(delayed)": the copy Discord holds is looked for under the other mark too, and when
       // found that is the text the line keeps (#199 I9c).
       if (!intent && !resumed && rs.pending?.key === "replay") {
-        const other = formatMessage(item.m, !delayed);
+        const other = formatMessage(item.m, !delayed, mention);
         if (await readBack(rs, other.username, splitContent(other.content)[0])) delayed = !delayed;
       }
-      const { username, content } = formatMessage(item.m, delayed);
+      const { username, content } = formatMessage(item.m, delayed, mention);
       item.username = username;
       item.parts = splitContent(content);
       item.delayed = delayed;
@@ -656,14 +914,21 @@ export function createConnector({ discord, out, clock = realClock }) {
     for (let i = item.sent; i < item.parts.length; i++) {
       settle();
       const last = i + 1 === item.parts.length;
-      const after = (r) => {
+      const after = (r, id) => {
         item.sent = i + 1;
+        // Each part's Discord id, in the same save as its acceptance, so a Reply or a
+        // reaction to any part names this seq and its sender (#205).
+        if (id && item.m.kind !== "notice") {
+          (r.relayed ??= []).push({ id, seq, senderId: item.m.senderId ?? null, sender: item.m.sender, kind: item.m.kind, yn: isYesNo(item.m.text) });
+          if (r.relayed.length > RELAYED_MAX) r.relayed.splice(0, r.relayed.length - RELAYED_MAX);
+        }
         if (last) finished(r);
         else Object.assign(r, { partSeq: seq, lastPart: i + 1, partDelayed: item.delayed });
       };
       if (item.parts[i]) {
-        msgId = await postOnce(w, rs, { key: `line:${seq}:${i}`, seq, part: i, delayed: item.delayed, username: item.username, content: item.parts[i] }, after);
-      } else after(rs);
+        const allowed = mention && i === 0 ? { parse: [], users: [mention] } : { parse: [] };
+        msgId = await postOnce(w, rs, { key: `line:${seq}:${i}`, seq, part: i, delayed: item.delayed, username: item.username, content: item.parts[i] }, after, allowed);
+      } else after(rs, null);
     }
     if (rs.lastSeq < seq) {
       finished(rs);
@@ -745,6 +1010,7 @@ export function createConnector({ discord, out, clock = realClock }) {
       delete rs.pending;
     }
     rs.closedAt = clock.now();
+    rs.needsYou = false;
     delete rs.closing;
     save();
     done();
@@ -833,7 +1099,16 @@ export function createConnector({ discord, out, clock = realClock }) {
           return;
         }
         w.highSeq = seq;
-        const m = { seq, sender: String(msg.sender ?? ""), to: String(msg.to ?? "everyone"), kind: String(msg.kind ?? "tell"), text: String(msg.text ?? "") };
+        const m = {
+          seq,
+          sender: String(msg.sender ?? ""),
+          // Who said it, as the room knows them, so a Reply can address them (#205).
+          senderId: typeof msg.senderId === "string" && msg.senderId ? msg.senderId : null,
+          to: String(msg.to ?? "everyone"),
+          toOwner: msg.toOwner === true,
+          kind: String(msg.kind ?? "tell"),
+          text: String(msg.text ?? ""),
+        };
         // Held since the room said it, not since this child was handed it: a line kept over a
         // quit reaches Discord at the next launch marked "(delayed)" (#199 I3).
         const said = typeof msg.ts === "string" ? Date.parse(msg.ts) : NaN;
@@ -846,9 +1121,19 @@ export function createConnector({ discord, out, clock = realClock }) {
         const w = workers.get(msg.room);
         if (!w?.accepting) return fail("room_unknown", "That room is not connected.", msg.room);
         w.accepting = false;
+        for (const [id, p] of prompts) if (p.room === msg.room) prompts.delete(id);
         const reason = msg.reason === "closed" || msg.reason === "ended" ? msg.reason : "disconnected";
         return enqueue(w, { op: "close", reason, id: typeof msg.id === "string" && msg.id ? msg.id : null, inst: w.createdAt });
       }
+      case "said":
+        return said(msg);
+      case "quiet": {
+        const w = workers.get(msg.room);
+        if (!w?.accepting) return fail("room_unknown", "That room is not connected.", msg.room);
+        return enqueue(w, { op: "quiet" });
+      }
+      case "quiet_over":
+        return dropQuietPrompts(String(msg.room ?? ""));
       default:
         return fail("internal", `Unknown message type ${String(msg.t).slice(0, 40)}.`);
     }
@@ -866,6 +1151,8 @@ export function createConnector({ discord, out, clock = realClock }) {
     }
     stopped = true;
     pairing = null;
+    prompts.clear();
+    spoken.clear();
     if (sweepTimer) clock.clearTimeout(sweepTimer);
     sweepTimer = null;
     releaseReady();

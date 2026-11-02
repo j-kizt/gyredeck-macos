@@ -149,3 +149,12 @@ test("past two calls unanswered, nothing more is sent into a channel that does n
   expect(sent).toBeLessThanOrEqual(2);
   await expect(row.getByText("Unavailable · Gyredeck did not answer")).toBeVisible();
 });
+
+test("every call carries this page's load time, the same for the page and later than any page before", async ({ page }) => {
+  await open(page, held(null, 1));
+  await page.clock.runFor(5_100);
+  const pages = await page.evaluate(() => (window as typeof window & { __sent: Array<{ page: number }> }).__sent.map((call) => call.page));
+  const origin = await page.evaluate(() => Math.floor(performance.timeOrigin * 1000));
+  expect(pages.length).toBeGreaterThan(1);
+  expect(new Set(pages)).toEqual(new Set([origin]));
+});

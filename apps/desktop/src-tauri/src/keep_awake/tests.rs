@@ -1,10 +1,10 @@
 use super::*;
 
 /// Each call a later one, as the webview numbers them.
-fn tick() -> u64 {
+fn tick() -> (u64, u64) {
     use std::sync::atomic::AtomicU64;
     static SEQ: AtomicU64 = AtomicU64::new(1);
-    SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    (1, SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
 }
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -212,14 +212,20 @@ fn every_change_moves_the_rev_and_a_repeat_does_not() {
 }
 
 #[test]
-fn a_call_older_than_the_last_applied_changes_nothing() {
+fn a_call_older_than_the_last_applied_changes_nothing_and_a_reloaded_page_starts_above_it() {
     let (s, fake) = state();
     s.set_discord_rooms(vec!["sync-ab12".into()]);
-    s.set_active(true, false, 10).unwrap();
+    s.set_active(true, false, (100, 900)).unwrap();
     assert_eq!(log(&fake), ["+System#1"]);
-    s.set_active(false, false, 11).unwrap();
+    s.set_active(false, false, (100, 901)).unwrap();
     assert_eq!(log(&fake), ["-#1"]);
-    let held = s.set_active(true, true, 10).unwrap();
+    let held = s.set_active(true, true, (100, 900)).unwrap();
     assert!(log(&fake).is_empty(), "the switch-on sent first, arriving last, is not applied");
     assert!(!held.display && !held.system);
+    // The page reloads: its first call counts from 1, and is applied at once.
+    s.set_active(true, false, (200, 1)).unwrap();
+    assert_eq!(log(&fake), ["+System#2"]);
+    // A call the old page left hanging, arriving now, changes nothing.
+    s.set_active(false, false, (100, 902)).unwrap();
+    assert!(log(&fake).is_empty());
 }

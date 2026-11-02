@@ -65,6 +65,7 @@ const LocalServicesPanel = lazy(async () => {
 });
 const KEEP_AWAKE_RETRY_DELAYS_MS = [750, 2_500] as const;
 const KEEP_AWAKE_BEAT_MS = 5_000;
+const KEEP_AWAKE_TIMEOUT_MS = 3_000;
 
 /** What Rust holds and why (#211, #278); `rev` rises with every change. */
 interface IKeepAwakeHeld {
@@ -141,7 +142,6 @@ const App = () => {
   const [dismissedSessionIds, setDismissedSessionIds] = useState<DismissedSessionRegistry>(readDismissedSessionIds);
   const [deletedSessionIds, setDeletedSessionIds] = useState<DeletedSessionRegistry>(readDeletedSessionIds);
   const [keepAwakeEnabled, setKeepAwakeEnabled] = useState(readKeepAwakeEnabled);
-  const [keepAwakeActive, setKeepAwakeActive] = useState(false);
   const [keepAwakeError, setKeepAwakeError] = useState<string | null>(null);
   // What Rust says it holds and why: a Discord room or a heavy run holds the Mac without the window (#211, #278).
   // Rust's word on what is held is the whole truth, a failure in the background included.
@@ -160,7 +160,9 @@ const App = () => {
   const returnSessionIdRef = useRef<string | null>(null);
   const shouldFocusPanelRef = useRef(false);
   const keyboardNavigationRef = useRef(false);
-  const keepAwakeRequestRef = useRef<Promise<unknown>>(Promise.resolve());
+  // One call in flight at a time; a change while it is out is sent, latest only, when it ends.
+  const keepAwakeWantRef = useRef({ active: false, enabled: false });
+  const keepAwakeFlightRef = useRef<{ again: boolean } | null>(null);
   const displayView =
     isDeletedAfter(deletedSessionIds, presence.conversationId, presence.lastEventAt) ||
     (view.status === "closed" && (acknowledgedConversationId === presence.conversationId || isDismissedAfter(dismissedSessionIds, presence.conversationId, presence.lastEventAt)))
@@ -477,48 +479,40 @@ const App = () => {
 
   useEffect(() => {
     if (!canUseNativeControls) {
-      setKeepAwakeActive(false);
       setKeepAwakeError(null);
       return undefined;
     }
 
     let cancelled = false;
     let retryTimer: number | null = null;
-    const requestedActive = keepAwakeEnabled && hasWorkingActivity;
+    keepAwakeWantRef.current = { active: keepAwakeEnabled && hasWorkingActivity, enabled: keepAwakeEnabled };
     // Each call answers with what Rust holds, a refusal included, so the UI's own error is only
-    // a call that went unanswered. Sent again on a beat: a call that never arrived is made good,
-    // and what a Discord room or a heavy run changed since is read with it (#211, #278).
+    // a call that went unanswered — or not answered in time. Sent again on a beat: a call that
+    // never arrived is made good, and what a Discord room or a heavy run changed since is read
+    // with it (#211, #278). One at a time, so nothing queues behind a call that hangs.
     const syncNativeState = (attempt: number) => {
-      const request = keepAwakeRequestRef.current
-        .catch(() => undefined)
-        .then(() => invoke<IKeepAwakeHeld | boolean>("set_keep_awake", { active: requestedActive, enabled: keepAwakeEnabled }))
-        .then((answer) => {
-          if (typeof answer === "object" && answer) {
-            takeKeepAwake(answer);
-            return answer.display;
-          }
-          if (answer !== requestedActive) {
-            throw new Error("Native keep-awake state did not match the requested state");
-          }
-          return answer;
-        });
-      keepAwakeRequestRef.current = request;
-      void request
-        .then((active) => {
-          if (cancelled) return;
-          setKeepAwakeActive(active);
-          setKeepAwakeError(null);
-        })
-        .catch((error) => {
-          if (cancelled) return;
-          const retryDelay = KEEP_AWAKE_RETRY_DELAYS_MS[attempt];
-          if (retryDelay !== undefined) {
-            retryTimer = window.setTimeout(() => syncNativeState(attempt + 1), retryDelay);
-            return;
-          }
-          setKeepAwakeActive(false);
-          setKeepAwakeError(error instanceof Error ? error.message : String(error || "Keep awake unavailable"));
-        });
+      if (keepAwakeFlightRef.current) {
+        keepAwakeFlightRef.current.again = true;
+        return;
+      }
+      const flight = { again: false };
+      keepAwakeFlightRef.current = flight;
+      const want = keepAwakeWantRef.current;
+      let timer = 0;
+      const ended = (error?: unknown) => {
+        if (keepAwakeFlightRef.current !== flight) return;
+        window.clearTimeout(timer);
+        keepAwakeFlightRef.current = null;
+        const retry = KEEP_AWAKE_RETRY_DELAYS_MS[attempt];
+        if (flight.again) syncNativeState(0);
+        else if (error && retry !== undefined && !cancelled) retryTimer = window.setTimeout(() => syncNativeState(attempt + 1), retry);
+        else setKeepAwakeError(error ? String((error as Error).message ?? error) : null);
+      };
+      timer = window.setTimeout(() => ended(new Error("Gyredeck did not answer")), KEEP_AWAKE_TIMEOUT_MS);
+      invoke<IKeepAwakeHeld>("set_keep_awake", want).then((held) => {
+        takeKeepAwake(held);
+        ended();
+      }, (error) => ended(error ?? "Keep awake unavailable"));
     };
     setKeepAwakeError(null);
     syncNativeState(0);
@@ -1212,7 +1206,6 @@ const App = () => {
                   connectionTitle={connectionTitle}
                   guidance={setupGuidance}
                   isConnected={isConnected}
-                  keepAwakeActive={keepAwakeActive}
                   keepAwakeWhy={keepAwakeHeld?.why}
                   keepAwakeEnabled={keepAwakeEnabled}
                   keepAwakeError={keepAwakeError ?? keepAwakeHeld?.error ?? null}

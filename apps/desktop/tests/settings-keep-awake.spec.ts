@@ -2,7 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 // #211, #278: every set_keep_awake answers with what Rust holds and why, and it is sent again on
 // a beat, so the row follows Rust with no event to miss.
-type Answer = { display: boolean; system: boolean; why: string | null; error: string | null; rev: number } | "unreachable";
+type Answer = { display: boolean; system: boolean; why: string | null; error: string | null; rev: number } | "unreachable" | "hang";
 
 const ROOM = "sync-ab12 connected to Discord — the Mac won't idle-sleep";
 const HEAVY = "heavy run: vitest — the Mac won't idle-sleep";
@@ -12,13 +12,18 @@ const open = async (page: Page, first: Answer) => {
   await page.clock.install();
   await page.addInitScript((answer) => {
     window.localStorage.setItem("gyredeck.keep-awake-while-working", "true");
-    const w = window as typeof window & { __TAURI_INTERNALS__: unknown; __answer: unknown; __calls: number };
-    w.__answer = answer;
-    w.__calls = 0;
+    const w = window as typeof window & { __TAURI_INTERNALS__: unknown; __answer: unknown; __calls: number; __sent: unknown[]; __out: number; __most: number };
+    Object.assign(w, { __answer: answer, __calls: 0, __sent: [], __out: 0, __most: 0 });
     w.__TAURI_INTERNALS__ = {
-      invoke: async (command: string) => {
+      invoke: async (command: string, args?: unknown) => {
         if (command === "set_keep_awake") {
           w.__calls += 1;
+          w.__sent.push(args);
+          if (w.__answer === "hang") {
+            w.__out += 1;
+            w.__most = Math.max(w.__most, w.__out);
+            return new Promise(() => {});
+          }
           if (w.__answer === "unreachable") throw new Error("the app did not answer");
           return w.__answer;
         }
@@ -90,4 +95,32 @@ test("an answer older than the one shown never replaces it", async ({ page }) =>
   await beat(page);
   await expect.poll(() => page.evaluate(() => (window as typeof window & { __calls: number }).__calls)).toBeGreaterThan(1);
   await expect(row.getByText(`Active · ${ROOM}`)).toBeVisible();
+});
+
+const stats = (page: Page) => page.evaluate(() => {
+  const w = window as typeof window & { __sent: Array<{ enabled: boolean }>; __most: number };
+  return { sent: w.__sent.length, last: w.__sent.at(-1), most: w.__most };
+});
+
+test("a call that hangs holds nothing up: changes meanwhile go once, latest only, when it is given up on", async ({ page }) => {
+  const row = await open(page, "hang");
+  await expect.poll(async () => (await stats(page)).sent).toBe(1);
+  const toggle = row.getByRole("switch");
+  await toggle.click();
+  await toggle.click();
+  await toggle.click();
+  expect((await stats(page)).sent, "nothing sent behind the call that is out").toBe(1);
+  await answer(page, held(null, 9));
+  await page.clock.runFor(3_500);
+  const after = await stats(page);
+  expect(after.sent, "the latest wish, sent once").toBe(2);
+  expect(after.last).toMatchObject({ enabled: false });
+  await expect(row.getByText("Off · display follows macOS idle settings")).toBeVisible();
+});
+
+test("a call that keeps hanging is shown as unanswered, never as Off", async ({ page }) => {
+  const row = await open(page, "hang");
+  await row.getByRole("switch").click();
+  await page.clock.runFor(12_000);
+  await expect(row.getByText("Unavailable · Gyredeck did not answer")).toBeVisible();
 });

@@ -84,7 +84,6 @@ export interface ISetupPanelProps {
   guidance: { title: string; detail: string };
   isConnected: boolean;
   launchAtLogin: { enabled: boolean; busy: boolean; error: string | null; set: (enabled: boolean) => Promise<void> };
-  keepAwakeActive: boolean;
   /** What holds the Mac awake now, as Rust says; null while nothing does. */
   keepAwakeWhy?: string | null;
   keepAwakeEnabled: boolean;

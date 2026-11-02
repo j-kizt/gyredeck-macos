@@ -12,6 +12,7 @@ import {
   Routes,
 } from "discord.js";
 
+const DISCORD_EPOCH = 1420070400000n;
 const NETWORK = /fetch failed|ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|socket|other side closed|aborted/i;
 
 function kindError(kind, message, extra = {}) {
@@ -351,6 +352,25 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
         return [...page.values()]
           .map((m) => ({ id: m.id, webhookId: m.webhookId ?? null, username: m.author?.username ?? null, content: m.content ?? "" }))
           .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0));
+      }),
+
+    // The bot's own message with exactly this content, posted at or after `sinceMs`: its id,
+    // or null when it is not there (#205). Snowflakes carry their time, so older look-alikes
+    // are never searched.
+    findOwn: (channelId, { content, sinceMs, pages = 5 }) =>
+      guarded(async () => {
+        const ch = await client.channels.fetch(channelId);
+        if (!ch?.messages) throw kindError("missing", "channel gone");
+        const since = BigInt(Math.max(0, Math.floor(sinceMs))) - DISCORD_EPOCH;
+        let after = String((since > 0n ? since : 0n) << 22n);
+        for (let page = 0; page < pages; page++) {
+          const list = [...(await ch.messages.fetch({ after, limit: 100, cache: false })).values()];
+          const hit = list.find((m) => m.author?.id === client.user?.id && m.content === content);
+          if (hit) return hit.id;
+          if (list.length < 100) return null;
+          after = list.reduce((max, m) => (BigInt(m.id) > BigInt(max) ? m.id : max), after);
+        }
+        throw kindError("network", "too many messages to search");
       }),
 
     async destroy() {

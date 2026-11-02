@@ -370,6 +370,13 @@ enum FromChild {
         /// The post it was confirmed in, checked against the room's; required for one room.
         #[serde(default)]
         thread_id: Option<String>,
+        /// The room instance the prompt was posted for: a reconnected room is another (#205 r3).
+        #[serde(default)]
+        created_at: Option<u64>,
+        /// From a quiet prompt: honoured only while the room is still quiet here, whatever the
+        /// child remembers of it (#205 r3).
+        #[serde(default)]
+        quiet: bool,
     },
 }
 
@@ -840,6 +847,10 @@ impl Hub {
         for (room, feed) in &self.rooms {
             plan.push(Out::Control(self.connect_line(room, feed, true)));
             plan.push(Out::Feed { room: room.clone(), feed: feed.id });
+            // What the last child was told may have been lost with it, and `send` drops lines
+            // while no child is attached: say where the spell stands now (#205 r3).
+            let room = room.clone();
+            plan.push(Out::Control(if feed.quiet_said { ToChild::Quiet { room } } else { ToChild::QuietOver { room } }));
         }
         self.outbox.extend(plan);
         let feeds = self.rooms.values_mut().chain(self.draining.values_mut().flat_map(|batches| batches.iter_mut().map(|(feed, _)| feed)));
@@ -2306,7 +2317,7 @@ impl Core {
     /// The child asked, on the owner's ✅: the same disconnect the button runs, with the word
     /// each room was connected with. Checked again here: the owner in the Keychain confirmed
     /// it, and a single room's request came from that room's own post.
-    fn disconnect_requested(&self, room: Option<String>, all: bool, owner_id: &str, thread_id: Option<&str>) {
+    fn disconnect_requested(&self, room: Option<String>, all: bool, owner_id: &str, thread_id: Option<&str>, created_at: Option<u64>, quiet: bool) {
         if self.keychain_owner(owner_id).is_err() {
             return;
         }
@@ -2315,7 +2326,11 @@ impl Core {
             hub.rooms
                 .iter()
                 .filter(|(code, feed)| {
-                    all || (room.as_deref() == Some(code.as_str()) && feed.thread_id.is_some() && feed.thread_id.as_deref() == thread_id)
+                    all || (room.as_deref() == Some(code.as_str())
+                        && feed.thread_id.is_some()
+                        && feed.thread_id.as_deref() == thread_id
+                        && created_at.is_none_or(|at| feed.created_at == Some(at))
+                        && (!quiet || feed.quiet_said))
                 })
                 .map(|(code, feed)| (code.clone(), feed.word.clone()))
                 .collect()
@@ -2607,9 +2622,9 @@ fn on_core_event_from(core: &Core, epoch: u64, event: FromChild) {
                 core.say(say);
             }
         }
-        FromChild::DisconnectRequest { room, all, owner_id, thread_id } => {
+        FromChild::DisconnectRequest { room, all, owner_id, thread_id, created_at, quiet } => {
             if lock(&core.hub).epoch == epoch {
-                core.disconnect_requested(room, all, &owner_id, thread_id.as_deref());
+                core.disconnect_requested(room, all, &owner_id, thread_id.as_deref(), created_at, quiet);
             }
         }
         other => on_child_event_from(&core.hub, core.owners.as_ref(), epoch, other),

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,6 +26,7 @@ function tmpState() {
 
 async function boot({ fake = createFakeDiscord(), clock = fakeClock(), statePath = tmpState(), forumId = "F1", ownerId = null } = {}) {
   const lines = [];
+  fake.now = () => clock.now();
   const c = createConnector({ discord: fake, clock, out: (l) => lines.push(l) });
   c.handle({ t: "hello", v: 1, token: TOKEN, forumId, ownerId, statePath });
   await flush();
@@ -1867,7 +1868,7 @@ test("#205 /disconnect in a post asks first; only the owner's ✅ within 10 minu
   assert.deepEqual(of("disconnect_request"), [], "only the owner's ✅ counts");
   await clock.advance(9 * 60_000);
   fake.addReaction({ messageId: prompt.id, channelId: threadId, userId: OWNER, emoji: "✅" });
-  assert.deepEqual(of("disconnect_request"), [{ t: "disconnect_request", room: "sync-abcd", ownerId: OWNER, threadId }]);
+  assert.deepEqual(of("disconnect_request"), [{ t: "disconnect_request", room: "sync-abcd", createdAt: 1, ownerId: OWNER, threadId }]);
 
   fake.command({ userId: OWNER, channelId: threadId });
   await flush();
@@ -1908,28 +1909,26 @@ test("#205 quiet posts 'gone quiet' once with a ✅ and never disconnects by its
   assert.deepEqual(fake.reactions.at(-1), { threadId, messageId: fake.bot[0].id, emoji: "✅" });
   await clock.advance(30 * 60_000);
   assert.deepEqual(of("disconnect_request"), [], "nothing disconnects on its own");
+  c.handle({ t: "quiet_over", room: "sync-abcd" });
   c.handle({ t: "quiet", room: "sync-abcd" });
   await flush();
   fake.addReaction({ messageId: fake.bot.at(-1).id, channelId: threadId, userId: OWNER, emoji: "✅" });
-  assert.deepEqual(of("disconnect_request"), [{ t: "disconnect_request", room: "sync-abcd", ownerId: OWNER, threadId }]);
+  assert.deepEqual(of("disconnect_request"), [{ t: "disconnect_request", room: "sync-abcd", createdAt: 1, quiet: true, ownerId: OWNER, threadId }]);
   c.handle({ t: "quiet", room: "sync-zzzz" });
   assert.equal(of("error").at(-1).code, "room_unknown");
   await c.close();
 });
 
-test("#205 a newer quiet spell replaces the older prompt, and quiet_over disarms it", async () => {
+test("#205 one quiet prompt per spell: a repeated quiet posts nothing, quiet_over disarms it, a new spell asks again", async () => {
   const { c, fake, threadId, of } = await ownerRoom();
   c.handle({ t: "quiet", room: "sync-abcd" });
   await flush();
   c.handle({ t: "quiet", room: "sync-abcd" });
   await flush();
-  const [older, newer] = fake.bot.slice(-2);
-  assert.ok(older && newer && older.id !== newer.id, "premise: two prompts were posted");
-  fake.addReaction({ messageId: older.id, channelId: threadId, userId: OWNER, emoji: "✅" });
-  assert.deepEqual(of("disconnect_request"), [], "the older prompt is disarmed");
+  assert.equal(fake.bot.length, 1, "the same spell asks once");
   c.handle({ t: "quiet_over", room: "sync-abcd" });
-  fake.addReaction({ messageId: newer.id, channelId: threadId, userId: OWNER, emoji: "✅" });
-  assert.deepEqual(of("disconnect_request"), [], "work resumed: the newer prompt is disarmed too");
+  fake.addReaction({ messageId: fake.bot[0].id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(of("disconnect_request"), [], "work resumed: the prompt is disarmed");
   c.handle({ t: "quiet", room: "sync-abcd" });
   await flush();
   fake.addReaction({ messageId: fake.bot.at(-1).id, channelId: threadId, userId: OWNER, emoji: "✅" });
@@ -1945,6 +1944,112 @@ test("#205 a disconnect disarms the room's prompts", async () => {
   await flush();
   fake.addReaction({ messageId: fake.bot[0].id, channelId: threadId, userId: OWNER, emoji: "✅" });
   assert.deepEqual(of("disconnect_request"), []);
+  await c.close();
+});
+
+// A connector restart keeps every ✅ prompt already on Discord: a prompt that shows must still
+// work, and none may request a disconnect twice (#205 audit r3).
+async function restarted(first) {
+  await first.c.close();
+  const b = await boot({ fake: first.fake, clock: first.clock, statePath: first.statePath, ownerId: OWNER });
+  b.c.handle({ t: "connect", room: "sync-abcd", members: ["Claude / Gyre"], createdAt: 1 });
+  await flush();
+  return b;
+}
+
+test("#205 a quiet prompt posted before a restart still disconnects, once; the resent quiet posts nothing new", async () => {
+  const first = await ownerRoom();
+  first.c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  const prompt = first.fake.bot.at(-1);
+  const second = await restarted(first);
+  second.c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  assert.equal(second.fake.bot.length, 1, "the same spell: the prompt already on Discord is the one");
+  second.fake.addReaction({ messageId: prompt.id, channelId: first.threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(second.of("disconnect_request"), [{ t: "disconnect_request", room: "sync-abcd", createdAt: 1, quiet: true, ownerId: OWNER, threadId: first.threadId }]);
+  second.fake.addReaction({ messageId: prompt.id, channelId: first.threadId, userId: OWNER, emoji: "✅" });
+  const third = await restarted(second);
+  third.fake.addReaction({ messageId: prompt.id, channelId: first.threadId, userId: OWNER, emoji: "✅" });
+  assert.equal(second.of("disconnect_request").length + third.of("disconnect_request").length, 1, "one ✅ prompt, one request, across restarts");
+  await third.c.close();
+});
+
+test("#205 a quiet prompt is not posted without a quiet, and work resuming after a restart disarms the old one", async () => {
+  const first = await ownerRoom();
+  first.c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  const prompt = first.fake.bot.at(-1);
+  const second = await restarted(first);
+  second.c.handle({ t: "quiet_over", room: "sync-abcd" });
+  second.fake.addReaction({ messageId: prompt.id, channelId: first.threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(second.of("disconnect_request"), []);
+  second.c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  assert.equal(second.fake.bot.length, 2, "a new spell posts a new prompt");
+  await second.c.close();
+});
+
+test("#205 a /disconnect prompt posted before a restart still works", async () => {
+  const first = await ownerRoom();
+  first.fake.command({ userId: OWNER, channelId: first.threadId });
+  await flush();
+  const prompt = first.fake.replies.at(-1);
+  const second = await restarted(first);
+  second.fake.addReaction({ messageId: prompt.id, channelId: first.threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(second.of("disconnect_request"), [{ t: "disconnect_request", room: "sync-abcd", createdAt: 1, ownerId: OWNER, threadId: first.threadId }]);
+  await second.c.close();
+});
+
+test("#205 a quiet prompt Discord took before the child heard back is found after a restart and works; none is posted again", async () => {
+  const first = await ownerRoom();
+  first.fake.after = async (op) => { if (op === "botSend") throw new Error("cut off on the way back"); };
+  first.c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  first.fake.after = null;
+  const shown = first.fake.bot.at(-1);
+  assert.ok(shown, "premise: Discord shows the prompt");
+  const second = await restarted(first);
+  second.c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  assert.equal(second.fake.bot.length, 1, "the prompt on show is the one");
+  second.fake.addReaction({ messageId: shown.id, channelId: first.threadId, userId: OWNER, emoji: "✅" });
+  assert.equal(second.of("disconnect_request").length, 1);
+  await second.c.close();
+});
+
+test("#205 a /disconnect prompt Discord took before the child heard back is found at start and works", async () => {
+  const first = await ownerRoom();
+  first.fake.after = async (op) => { if (op === "reply") throw new Error("cut off on the way back"); };
+  first.fake.command({ userId: OWNER, channelId: first.threadId });
+  await flush();
+  first.fake.after = null;
+  const shown = first.fake.replies.at(-1);
+  const second = await restarted(first);
+  second.fake.addReaction({ messageId: shown.id, channelId: first.threadId, userId: OWNER, emoji: "✅" });
+  assert.equal(second.of("disconnect_request").length, 1);
+  await second.c.close();
+});
+
+test("#205 a prompt is bound to its room's instance: a reconnected room ignores the old ✅", async () => {
+  const { c, fake, threadId, of } = await ownerRoom();
+  c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  c.handle({ t: "connect", room: "sync-abcd", members: ["Claude / Gyre"], createdAt: 2 });
+  await flush();
+  fake.addReaction({ messageId: fake.bot[0].id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(of("disconnect_request"), []);
+  await c.close();
+});
+
+test("#205 a ✅ that cannot be recorded as used requests nothing", async () => {
+  const { c, fake, threadId, of, statePath } = await ownerRoom();
+  c.handle({ t: "quiet", room: "sync-abcd" });
+  await flush();
+  rmSync(statePath);
+  mkdirSync(statePath);
+  fake.addReaction({ messageId: fake.bot.at(-1).id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(of("disconnect_request"), [], "else a restart could request it again");
   await c.close();
 });
 

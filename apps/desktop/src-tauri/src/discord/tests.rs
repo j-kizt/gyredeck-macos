@@ -1558,7 +1558,7 @@ fn i18_an_attach_of_more_lines_than_any_queue_held_keeps_the_channel_while_the_c
     let mut counted = String::new();
     process.stdout.take().unwrap().read_to_string(&mut counted).unwrap();
     let _ = process.wait();
-    assert_eq!(counted.trim().parse::<usize>().unwrap(), held + 2, "hello, connect and every held line reached the child");
+    assert_eq!(counted.trim().parse::<usize>().unwrap(), held + 3, "hello, connect, every held line and where the quiet spell stands reached the child");
 }
 
 /// I18: stuck is the child not reading — one write blocked past the bound — never the size.
@@ -4450,6 +4450,59 @@ fn a_room_whose_agents_have_all_been_idle_ten_minutes_is_said_quiet_once_a_spell
     let lines = buffer.lines();
     let order: Vec<&str> = lines.iter().filter_map(|line| line["t"].as_str()).filter(|t| *t == "quiet" || *t == "quiet_over").collect();
     assert_eq!(order, vec!["quiet", "quiet_over", "quiet"]);
+}
+
+#[test]
+fn a_restarted_child_is_told_where_each_rooms_quiet_spell_stands() {
+    let f = fixture("quiet-restart", Some(TOKEN));
+    let _first = f.attach_buffer();
+    f.members(ROOM, &[("founder-1", "Claude Code")]);
+    f.members(OTHER, &[("peer-a", "Codex")]);
+    f.acts.founded.lock().unwrap().push(OTHER.to_string());
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.state.connect(OTHER, "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6").unwrap();
+    {
+        let mut hub = lock(&f.state.hub);
+        hub.rooms.get_mut(ROOM).unwrap().connected_at = ago(20, 0);
+        hub.note_presence("founder-1", "turn_complete", ago(12, 0));
+        hub.check_quiet(Instant::now());
+        assert!(hub.rooms[ROOM].quiet_said && !hub.rooms[OTHER].quiet_said, "premise");
+    }
+    // The child dies; while none is attached `send` drops lines, so the new one is told afresh.
+    let second = f.attach_buffer();
+    wait_until("both rooms connected again", || of_kind(&second.lines(), "connect").len() == 2);
+    wait_until("the quiet state", || of_kind(&second.lines(), "quiet").len() + of_kind(&second.lines(), "quiet_over").len() == 2);
+    let lines = second.lines();
+    let told: Vec<(&str, &str)> = lines
+        .iter()
+        .filter(|line| line["t"] == "quiet" || line["t"] == "quiet_over")
+        .map(|line| (line["room"].as_str().unwrap(), line["t"].as_str().unwrap()))
+        .collect();
+    assert!(told.contains(&(ROOM, "quiet")) && told.contains(&(OTHER, "quiet_over")), "{told:?}");
+    let at = |t: &str, room: &str| lines.iter().position(|line| line["t"] == t && line["room"] == room).unwrap();
+    assert!(at("connect", ROOM) < at("quiet", ROOM), "after the room's connect, so the child knows the room");
+}
+
+#[test]
+fn a_quiet_prompts_request_counts_only_while_the_room_is_quiet_and_for_its_own_instance() {
+    let f = fixture_owned("disconnect-quiet", Some(TOKEN), &[], the_owner());
+    let _buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let at = lock(&f.state.hub).rooms[ROOM].created_at.expect("premise: an instance");
+    let request = |created_at: u64, quiet: bool| {
+        on_core_event(
+            &f.state.core,
+            disconnect_line(&format!(r#"{{"t":"disconnect_request","room":"{ROOM}","ownerId":"{OWNER_ID}","threadId":"{THREAD}","createdAt":{created_at},"quiet":{quiet}}}"#)),
+        );
+    };
+    request(at, true);
+    assert_eq!(f.state.status().connected_rooms.len(), 1, "work resumed, or the child's word only: not quiet here");
+    request(at + 1, false);
+    assert_eq!(f.state.status().connected_rooms.len(), 1, "a prompt for another instance of the room");
+    lock(&f.state.hub).rooms.get_mut(ROOM).unwrap().quiet_said = true;
+    request(at, true);
+    assert!(f.state.status().connected_rooms.is_empty(), "quiet here, its own instance");
 }
 
 #[test]

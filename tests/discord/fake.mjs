@@ -61,6 +61,9 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
     reactions: [],
     commands: null,
     replies: [],
+    // What the bot itself posted (botSend, command replies), for `findOwn`; `now` is the clock.
+    own: [],
+    now: () => Date.now(),
     threads: new Map(),
     tags: { open: "tag-open", closed: "tag-closed", "needs you": "tag-needs-you" },
     loginError: null,
@@ -136,6 +139,11 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
       const from = idNumber(after);
       return (t.messages ?? []).filter((m) => idNumber(m.id) > from).slice(0, limit).map((m) => ({ ...m }));
     },
+    async findOwn(channelId, { content, sinceMs }) {
+      fake.log.push({ op: "findOwn", channelId });
+      await fake.gate?.("findOwn", { channelId });
+      return fake.own.find((m) => m.channelId === channelId && m.content === content && m.at >= sinceMs)?.id ?? null;
+    },
     async registerCommands(defs) {
       await fake.gate?.("registerCommands", { defs });
       fake.commands = defs;
@@ -144,6 +152,8 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
       await fake.gate?.("botSend", args);
       const id = `M${++n}`;
       fake.bot.push({ ...args, id });
+      fake.own.push({ channelId: args.threadId, content: args.content, id, at: fake.now() });
+      await fake.after?.("botSend", { ...args, id });
       return { id };
     },
     async react(args) {
@@ -166,6 +176,8 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
       const reply = async ({ content, ephemeral }) => {
         const id = ephemeral ? null : `M${++n}`;
         fake.replies.push({ content, ephemeral: Boolean(ephemeral), id, channelId: fields.channelId });
+        if (id) fake.own.push({ channelId: fields.channelId, content, id, at: fake.now() });
+        await fake.after?.("reply", { content, id });
         return id ? { id } : null;
       };
       events.emit("command", { name: "disconnect", all: false, ...fields, reply });

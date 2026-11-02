@@ -16,6 +16,8 @@ export const PAIR_MAX_MISSES = 5;
 export const READBACK_PAGES = 5;
 /** How long a ✅ on a disconnect or quiet prompt still counts (#205). */
 export const PROMPT_MS = 10 * 60_000;
+/** At most this many /disconnect prompts are kept armed; quiet ones are one per room. */
+const PROMPTS_MAX = 20;
 /** The bridge's MAIL_MAX_TEXT: a longer say is refused here, never cut. */
 export const SAY_MAX_TEXT = 4_096;
 /** Relayed messages remembered per room, so a Reply or a reaction can name what it answers. */
@@ -155,8 +157,7 @@ export function createConnector({ discord, out, clock = realClock }) {
   const tagCache = new Map();
   const waiters = new Set();
   const reported = new Set();
-  // Armed ✅ prompts (/disconnect, gone quiet), by the prompt's Discord id (#205).
-  const prompts = new Map();
+  let promptSeq = 0;
   // Owner messages sent to the room, by Discord id → whether the "edits" note was posted.
   const spoken = new Map();
   // Rooms whose saved says this child has sent again since it started.
@@ -303,15 +304,22 @@ export function createConnector({ discord, out, clock = realClock }) {
   });
   discord.on("reaction", (r) => {
     if (stopped || !ownerId || r.userId !== ownerId) return;
-    const prompt = prompts.get(r.messageId);
+    const prompt = prompts()[r.messageId];
     if (prompt) {
-      if (r.emoji !== YES) return;
-      prompts.delete(r.messageId);
-      if (clock.now() > prompt.expiresAt) return;
+      if (r.emoji !== YES || clock.now() > prompt.expiresAt) return;
+      const w = workers.get(prompt.room);
+      if (!prompt.all && !(w?.accepting && w.createdAt === prompt.inst)) return;
+      // Used up on disk before it is acted on: a restart never requests it a second time.
+      delete prompts()[r.messageId];
+      try {
+        save();
+      } catch (e) {
+        prompts()[r.messageId] = prompt;
+        return fail("storage_blocked", e?.message);
+      }
       const from = { ownerId: r.userId, ...(prompt.threadId ? { threadId: prompt.threadId } : {}) };
       if (prompt.all) return send({ t: "disconnect_request", all: true, ...from });
-      if (workers.get(prompt.room)?.accepting) send({ t: "disconnect_request", room: prompt.room, ...from });
-      return;
+      return send({ t: "disconnect_request", room: prompt.room, createdAt: prompt.inst, ...(prompt.quiet ? { quiet: true } : {}), ...from });
     }
     // Any emoji but these two does nothing (#205).
     if (r.emoji !== YES && r.emoji !== NO) return;
@@ -348,18 +356,58 @@ export function createConnector({ discord, out, clock = realClock }) {
       target = { room: code };
       content = `Disconnect ${code}? If no other room is connected the Mac may sleep, and you cannot reconnect until you are back at it.`;
     }
-    const msg = await c.reply({ content: `${content}\nReact ${YES} within 10 minutes to confirm.`, ephemeral: false });
-    if (!msg?.id) return;
-    const now = clock.now();
-    for (const [id, p] of prompts) if (now > p.expiresAt) prompts.delete(id);
     const inPost = roomOfThread(c.channelId) ? { threadId: c.channelId } : {};
-    prompts.set(msg.id, { ...target, ...inPost, expiresAt: now + PROMPT_MS });
-    await discord.react({ threadId: c.channelId, messageId: msg.id, emoji: YES }).catch(() => {});
+    const inst = target.room ? { inst: workers.get(target.room).createdAt } : {};
+    const full = `${content}\nReact ${YES} within 10 minutes to confirm.`;
+    const msg = await postPrompt(`cmd:${++promptSeq}@${clock.now()}`, c.channelId, full, { ...target, ...inst, ...inPost }, () => c.reply({ content: full, ephemeral: false }));
+    if (msg?.id) await discord.react({ threadId: c.channelId, messageId: msg.id, emoji: YES }).catch(() => {});
   }
 
-  // One armed quiet prompt per room: a newer spell replaces it, and work resuming disarms it.
+  // Armed ✅ prompts (/disconnect, gone quiet), by the prompt's Discord id, kept in the state
+  // file: a prompt the owner can see still works after a restart (#205 r3). A quiet one stays
+  // until its spell ends, so a restart in the same spell posts no second one.
+  function prompts() {
+    return (state.prompts ??= {});
+  }
+  function posting() {
+    return (state.promptPosting ??= {});
+  }
+  function arm(id, prompt) {
+    const now = clock.now();
+    const all = prompts();
+    for (const [key, p] of Object.entries(all)) if (!p.quiet && now > p.expiresAt) delete all[key];
+    all[id] = prompt;
+    const asked = Object.entries(all).filter(([, p]) => !p.quiet).sort(([, a], [, b]) => a.expiresAt - b.expiresAt);
+    for (const [key] of asked.slice(0, Math.max(0, asked.length - PROMPTS_MAX))) delete all[key];
+  }
+  // The intent is durable before the post, so a post Discord took but this child never heard
+  // back from is found again by `settlePosting` and armed, not left on show unanswerable.
+  async function postPrompt(key, channelId, content, meta, post) {
+    const intent = { channelId, content, sinceMs: clock.now(), meta: { ...meta, expiresAt: clock.now() + PROMPT_MS } };
+    posting()[key] = intent;
+    save();
+    const msg = await post();
+    if (posting()[key] !== intent) return null;
+    delete posting()[key];
+    if (msg?.id) arm(msg.id, intent.meta);
+    save();
+    return msg;
+  }
+  async function settlePosting(key) {
+    const intent = posting()[key];
+    if (!intent) return;
+    const id = await discord.findOwn(intent.channelId, { content: intent.content, sinceMs: intent.sinceMs });
+    if (posting()[key] !== intent) return;
+    delete posting()[key];
+    if (id) arm(id, intent.meta);
+    save();
+  }
+
+  // Work resuming disarms the room's quiet prompt; the next spell asks again.
   function dropQuietPrompts(code) {
-    for (const [id, p] of prompts) if (p.quiet && p.room === code) prompts.delete(id);
+    for (const [id, p] of Object.entries(prompts())) if (p.quiet && p.room === code) delete prompts()[id];
+    delete posting()[`quiet:${code}`];
+    save();
   }
 
   // The room whose current post this is: never a set-aside instance (`code@createdAt`).
@@ -458,10 +506,14 @@ export function createConnector({ discord, out, clock = realClock }) {
   async function quietPrompt(w) {
     const rs = state.rooms[w.code];
     if (!rs?.threadId || !w.accepting) return;
-    const msg = await discord.botSend({ threadId: rs.threadId, content: `This room has gone quiet. Disconnect? React ${YES} within 10 minutes to disconnect now.`, allowedMentions: { parse: [] } });
+    const key = `quiet:${w.code}`;
+    await settlePosting(key);
+    if (Object.values(prompts()).some((p) => p.quiet && p.room === w.code)) return;
+    const content = `This room has gone quiet. Disconnect? React ${YES} within 10 minutes to disconnect now.`;
+    const msg = await postPrompt(key, rs.threadId, content, { room: w.code, inst: w.createdAt, threadId: rs.threadId, quiet: true }, () =>
+      discord.botSend({ threadId: rs.threadId, content, allowedMentions: { parse: [] } }),
+    );
     if (!msg?.id) return;
-    dropQuietPrompts(w.code);
-    prompts.set(msg.id, { room: w.code, threadId: rs.threadId, quiet: true, expiresAt: clock.now() + PROMPT_MS });
     await discord.react({ threadId: rs.threadId, messageId: msg.id, emoji: YES }).catch(() => {});
   }
 
@@ -495,6 +547,10 @@ export function createConnector({ discord, out, clock = realClock }) {
     discord.registerCommands(COMMANDS).catch((e) =>
       fail(e?.kind === "permission" ? "missing_permission" : "internal", `Could not register /disconnect: ${e?.message}`),
     );
+    // A /disconnect prompt Discord may have taken before a restart is found and armed again.
+    for (const key of Object.keys(posting()).filter((k) => k.startsWith("cmd:"))) {
+      await settlePosting(key).catch((e) => fail("internal", `Could not look for an earlier /disconnect prompt: ${e?.message}`));
+    }
     scheduleSweep();
     await sweep();
   }
@@ -1131,7 +1187,11 @@ export function createConnector({ discord, out, clock = realClock }) {
         const w = workers.get(msg.room);
         if (!w?.accepting) return fail("room_unknown", "That room is not connected.", msg.room);
         w.accepting = false;
-        for (const [id, p] of prompts) if (p.room === msg.room) prompts.delete(id);
+        for (const [id, p] of Object.entries(prompts())) if (p.room === msg.room) delete prompts()[id];
+        for (const [key, i] of Object.entries(posting())) if (i.meta.room === msg.room) delete posting()[key];
+        try {
+          save();
+        } catch {}
         const reason = msg.reason === "closed" || msg.reason === "ended" ? msg.reason : "disconnected";
         return enqueue(w, { op: "close", reason, id: typeof msg.id === "string" && msg.id ? msg.id : null, inst: w.createdAt });
       }
@@ -1143,7 +1203,12 @@ export function createConnector({ discord, out, clock = realClock }) {
         return enqueue(w, { op: "quiet" });
       }
       case "quiet_over":
-        return dropQuietPrompts(String(msg.room ?? ""));
+        try {
+          dropQuietPrompts(String(msg.room ?? ""));
+        } catch (e) {
+          fail("storage_blocked", e?.message, msg.room);
+        }
+        return;
       default:
         return fail("internal", `Unknown message type ${String(msg.t).slice(0, 40)}.`);
     }
@@ -1161,7 +1226,6 @@ export function createConnector({ discord, out, clock = realClock }) {
     }
     stopped = true;
     pairing = null;
-    prompts.clear();
     spoken.clear();
     if (sweepTimer) clock.clearTimeout(sweepTimer);
     sweepTimer = null;

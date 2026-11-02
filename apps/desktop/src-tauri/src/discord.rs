@@ -69,6 +69,16 @@ const BUSY_STALE: Duration = Duration::from_secs(30 * 60);
 const STATUS_ROOMS: usize = 25;
 const STATUS_MEMBERS: usize = 20;
 
+/// How far ahead of this clock a read time may be and still count as just read.
+const READ_CLOCK_SKEW: i64 = 5 * 60;
+
+/// A reading's age in seconds, or unknown: a read time further ahead than clock skew allows
+/// has no age that can be told, so it is never shown as "just now" (#206 audit).
+fn reading_age(at: time::OffsetDateTime, now: time::OffsetDateTime) -> Option<i64> {
+    let old = (now - at).whole_seconds();
+    (old >= -READ_CLOCK_SKEW).then_some(old.max(0))
+}
+
 /// Each provider's usage from the bridge's room status, with how old the reading is: a provider
 /// never read says so, and no number is made up (#206).
 fn status_usage(status: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -84,7 +94,7 @@ fn status_usage(status: &serde_json::Value) -> Vec<serde_json::Value> {
             Some(reading) => {
                 let fetched = reading.get("fetchedAt").and_then(serde_json::Value::as_str)
                     .and_then(|at| time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok());
-                let old = fetched.map(|at| (time::OffsetDateTime::now_utc() - at).whole_seconds().max(0));
+                let old = fetched.and_then(|at| reading_age(at, time::OffsetDateTime::now_utc()));
                 serde_json::json!({
                     "provider": provider,
                     "display": reading.get("displayName").cloned().unwrap_or_else(|| provider.clone().into()),

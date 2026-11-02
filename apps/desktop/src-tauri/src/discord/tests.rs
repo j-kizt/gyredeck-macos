@@ -4958,13 +4958,27 @@ fn status_with_the_owner_record_unreadable_answers_nothing_about_any_room() {
     assert!(answers[0].get("rooms").is_none_or(serde_json::Value::is_null));
 }
 
+
+/// Every read time the bridge can pass on, and the age /status may show for it (#206 audit).
 #[test]
-fn status_usage_age_is_unknown_when_the_read_time_is_not_a_date() {
-    let status = serde_json::json!({ "usage": {
-        "codex": { "displayName": "Codex", "lines": [{ "label": "Weekly", "leftPct": 10 }], "fetchedAt": "bad-date" },
-        "claude": { "displayName": "Claude", "lines": [{ "label": "Weekly", "leftPct": 40 }], "fetchedAt": null },
-    }});
-    for row in status_usage(&status) {
-        assert!(row["secondsOld"].is_null(), "{row}");
+fn status_usage_age_table() {
+    let now = time::OffsetDateTime::now_utc();
+    let at = |secs: i64| (now + time::Duration::seconds(secs)).format(&time::format_description::well_known::Rfc3339).unwrap();
+    let cases: Vec<(&str, serde_json::Value, Option<i64>)> = vec![
+        ("absent", serde_json::Value::Null, None),
+        ("not a string", serde_json::json!(12), None),
+        ("not a date", serde_json::json!("bad-date"), None),
+        ("an hour ahead", serde_json::json!(at(3600)), None),
+        ("just past the skew", serde_json::json!(at(READ_CLOCK_SKEW + 30)), None),
+        ("ahead within the skew", serde_json::json!(at(60)), Some(0)),
+        ("ten minutes ago", serde_json::json!(at(-600)), Some(600)),
+    ];
+    for (name, fetched, want) in cases {
+        let status = serde_json::json!({ "usage": { "codex": { "displayName": "Codex", "lines": [], "fetchedAt": fetched } } });
+        let got = status_usage(&status)[0]["secondsOld"].as_i64();
+        match want {
+            None => assert_eq!(got, None, "{name}"),
+            Some(want) => assert!(got.is_some_and(|got| (got - want).abs() <= 2), "{name}: {got:?}"),
+        }
     }
 }

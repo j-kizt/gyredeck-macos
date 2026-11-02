@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { BarChart3, Check, ChevronLeft, Copy, Focus, GitBranch, List, Server, Settings, Trash2 } from "lucide-react";
 import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState, type ErrorInfo, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
@@ -134,6 +135,8 @@ const App = () => {
   const [keepAwakeEnabled, setKeepAwakeEnabled] = useState(readKeepAwakeEnabled);
   const [keepAwakeActive, setKeepAwakeActive] = useState(false);
   const [keepAwakeError, setKeepAwakeError] = useState<string | null>(null);
+  // What Rust says it holds and why: a Discord room or a heavy run holds the Mac without the window (#211, #278).
+  const [keepAwakeWhy, setKeepAwakeWhy] = useState<string | null>(null);
   const [terminal, setTerminal] = useState<TerminalChoice>(readTerminalChoice);
   const [expandedSessionGroupKeys, setExpandedSessionGroupKeys] = useState<Set<string>>(() => new Set());
   const [clearCompletedArmed, setClearCompletedArmed] = useState(false);
@@ -474,7 +477,7 @@ const App = () => {
     const syncNativeState = (attempt: number) => {
       const request = keepAwakeRequestRef.current
         .catch(() => undefined)
-        .then(() => invoke<boolean>("set_keep_awake", { active: requestedActive }))
+        .then(() => invoke<boolean>("set_keep_awake", { active: requestedActive, enabled: keepAwakeEnabled }))
         .then((active) => {
           if (active !== requestedActive) {
             throw new Error("Native keep-awake state did not match the requested state");
@@ -507,6 +510,23 @@ const App = () => {
       if (retryTimer !== null) window.clearTimeout(retryTimer);
     };
   }, [canUseNativeControls, hasWorkingActivity, keepAwakeEnabled]);
+
+  useEffect(() => {
+    if (!canUseNativeControls) {
+      setKeepAwakeWhy(null);
+      return undefined;
+    }
+    let cancelled = false;
+    const take = (held?: { why?: string | null }) => {
+      if (!cancelled) setKeepAwakeWhy(held?.why ?? null);
+    };
+    const unlisten = listen<{ why?: string | null }>("keep_awake", (event) => take(event.payload)).catch(() => undefined);
+    void invoke<{ why?: string | null }>("keep_awake_status").then(take, () => undefined);
+    return () => {
+      cancelled = true;
+      void unlisten.then((stop) => stop?.());
+    };
+  }, [canUseNativeControls]);
 
   const setupGuidance = (() => {
     if (!canUseNativeControls) {
@@ -1190,6 +1210,7 @@ const App = () => {
                   guidance={setupGuidance}
                   isConnected={isConnected}
                   keepAwakeActive={keepAwakeActive}
+                  keepAwakeWhy={keepAwakeWhy}
                   keepAwakeEnabled={keepAwakeEnabled}
                   keepAwakeError={keepAwakeError}
                   hookStatus={hookStatus}

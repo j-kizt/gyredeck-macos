@@ -2692,7 +2692,7 @@ test("#206 /status outside any post lists the rooms the app says are connected, 
   const [req] = of("status_request");
   assert.equal(req.room, undefined, "no room: every connected one");
   assert.equal(req.threadId, undefined);
-  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 2 }], hiddenRooms: 0 });
+  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 2, createdAt: 1 }], hiddenRooms: 0 });
   await flush();
   assert.equal(answer.edits[0].content, "sync-abcd · 2 members · needs you");
   void threadId;
@@ -2717,7 +2717,7 @@ test("#206 two /status at once each get their own answer; one that never comes s
   const first = await askStatus(fake, threadId);
   const second = await askStatus(fake, "C-GENERAL");
   const [a, b] = of("status_request");
-  c.handle({ t: "status", requestId: b.requestId, rooms: [{ room: "sync-abcd", members: 1 }], hiddenRooms: 0 });
+  c.handle({ t: "status", requestId: b.requestId, rooms: [{ room: "sync-abcd", members: 1, createdAt: 1 }], hiddenRooms: 0 });
   c.handle({ t: "status", requestId: "unknown", rooms: [], hiddenRooms: 0 });
   await flush();
   assert.equal(second.edits[0].content, "sync-abcd · 1 member");
@@ -2747,7 +2747,7 @@ test("#206 the listing drops a room disconnected while it was asked, and says ho
   const answer = await askStatus(fake, "C-GENERAL");
   const [req] = of("status_request");
   const rooms = Array.from({ length: 30 }, (_, i) => ({ room: `sync-${String(i).padStart(4, "0")}`, members: 1 }));
-  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 1 }, ...rooms.slice(0, 24)], hiddenRooms: 6 });
+  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 1, createdAt: 1 }, ...rooms.slice(0, 24)], hiddenRooms: 6 });
   await flush();
   const text = answer.edits[0].content;
   assert.match(text, /^sync-abcd · 1 member/);
@@ -2763,7 +2763,7 @@ test("#206 /status in a DM to the bot lists every connected room, as outside a p
   const answer = fake.interactions.at(-1);
   const [req] = of("status_request");
   assert.equal(req.room, undefined);
-  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 2 }], hiddenRooms: 0 });
+  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 2, createdAt: 1 }], hiddenRooms: 0 });
   await flush();
   assert.equal(answer.edits[0].content, "sync-abcd · 2 members");
   await c.close();
@@ -2800,7 +2800,7 @@ test("#206 needs you is read when the answer is shown, not when it was asked", a
   const [req] = of("status_request");
   c.handle(message("sync-abcd", 1, { kind: "ask", to: "Owner", toOwner: true, senderId: "conv-gyre" }));
   await flush();
-  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 2 }], hiddenRooms: 0 });
+  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 2, createdAt: 1 }], hiddenRooms: 0 });
   await flush();
   assert.equal(answer.edits[0].content, "sync-abcd · 2 members · needs you", "set while it was asked: shown");
   await c.close();
@@ -2822,4 +2822,42 @@ test("discord.js adapter: /status goes to the app's global commands for the serv
   client.emit("interactionCreate", interaction({ guildId: "G1", channel: { isThread: () => true } }));
   await flush();
   assert.deepEqual(got.map((x) => [x.dm, x.inThread]), [[true, false], [false, true]]);
+});
+
+test("#206 a /status asked before a re-pair is not shown to the old owner", async () => {
+  const { c, fake, of } = await ownerRoom();
+  const answer = await askStatus(fake, "C-GENERAL");
+  const [req] = of("status_request");
+  c.handle({ t: "owner", ownerId: "U-NEW-OWNER" });
+  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 2, createdAt: 1 }], hiddenRooms: 0 });
+  await flush();
+  assert.equal(answer.edits.length, 1);
+  assert.doesNotMatch(answer.edits[0].content, /sync-abcd/, "nothing about any room");
+  assert.match(answer.edits[0].content, /paired owner changed/);
+  await c.close();
+});
+
+test("#206 a usage reset time that is not a date is left out, never a crash", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  const answer = await askStatus(fake, threadId);
+  const [req] = of("status_request");
+  c.handle(roomStatus(req.requestId, { usage: [{ provider: "codex", display: "Codex", lines: [{ label: "Weekly", leftPct: 10, resetsAt: "bad-date" }], secondsOld: 60 }] }));
+  await flush();
+  assert.match(answer.edits[0]?.content ?? "", /Weekly 10% left · read 1 min ago/);
+  await c.close();
+});
+
+test("#206 a room reconnected while the listing was asked is not shown with the old instance's numbers", async () => {
+  const { c, fake, of } = await ownerRoom();
+  const answer = await askStatus(fake, "C-GENERAL");
+  const [req] = of("status_request");
+  c.handle({ t: "disconnect", room: "sync-abcd", reason: "disconnected", id: "close-1" });
+  await flush();
+  c.handle({ t: "connect", room: "sync-abcd", members: ["Claude / Gyre"], createdAt: 2 });
+  await flush();
+  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 2, createdAt: 1 }], hiddenRooms: 0 });
+  await flush();
+  assert.doesNotMatch(answer.edits[0].content, /2 members/);
+  assert.match(answer.edits[0].content, /sync-abcd · reconnected while asked — run \/status again/);
+  await c.close();
 });

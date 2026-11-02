@@ -4937,6 +4937,9 @@ fn status_outside_a_post_lists_every_connected_room_with_its_agents_counted() {
     f.state.connect(ROOM, APP_WORD).unwrap();
     f.state.connect(OTHER, "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6").unwrap();
     let answers = status_ask(&f, &buffer, format!(r#"{{"t":"status_request","requestId":"all","ownerId":"{OWNER_ID}","channelId":"C1"}}"#));
+    for r in answers[0]["rooms"].as_array().unwrap() {
+        assert!(r["createdAt"].is_u64(), "each room names its instance: {r}");
+    }
     let mut rooms: Vec<(String, u64)> = answers[0]["rooms"].as_array().unwrap().iter().map(|r| (r["room"].as_str().unwrap().to_string(), r["members"].as_u64().unwrap())).collect();
     rooms.sort();
     let mut expected = vec![(ROOM.to_string(), 2), (OTHER.to_string(), 0)];

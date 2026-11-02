@@ -4267,7 +4267,8 @@ function startBridge(config) {
       lines.push({
         label: line.label.slice(0, 64),
         leftPct: 100 - used,
-        resetsAt: typeof line.resetsAt === "string" ? line.resetsAt : null,
+        // Kept only when it is a date, so nothing downstream shows or chokes on another string (#206).
+        resetsAt: typeof line.resetsAt === "string" && !Number.isNaN(Date.parse(line.resetsAt)) ? line.resetsAt : null,
       });
     }
     return {

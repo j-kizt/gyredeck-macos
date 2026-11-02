@@ -2429,10 +2429,11 @@ impl Core {
         }
         let Some(code) = room else {
             let hub = lock(&self.hub);
-            let mut rooms: Vec<(&String, usize)> = hub.rooms.iter().map(|(code, feed)| (code, feed.agents.len())).collect();
+            // Each with its instance, so the child shows no numbers for a room reconnected since.
+            let mut rooms: Vec<(&String, usize, Option<u64>)> = hub.rooms.iter().map(|(code, feed)| (code, feed.agents.len(), feed.created_at)).collect();
             rooms.sort();
             let hidden = rooms.len().saturating_sub(STATUS_ROOMS);
-            let rooms = rooms.into_iter().take(STATUS_ROOMS).map(|(code, n)| serde_json::json!({ "room": code, "members": n })).collect();
+            let rooms = rooms.into_iter().take(STATUS_ROOMS).map(|(code, n, at)| serde_json::json!({ "room": code, "members": n, "createdAt": at })).collect();
             return ToChild::Status { request_id: request_id.clone(), error: None, room: None, rooms: Some(rooms), hidden_rooms: Some(hidden) };
         };
         let now = Instant::now();

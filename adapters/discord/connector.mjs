@@ -49,7 +49,20 @@ export function isYesNo(text) {
 }
 
 // "@Name text" or "Name: text" at the very start addresses Name; anything else is for everyone.
-export function parseAddress(text) {
+// After "@" the longest member name that fits wins, spaces and all, so "@Gyre Assistant hi" is
+// never read as "@Gyre" with "Assistant hi" for text (#205 audit). `names` are the forms the
+// room shows a member by: "Label / Name", the label, the name.
+export function parseAddress(text, names = []) {
+  if (text.startsWith("@")) {
+    const rest = text.slice(1);
+    const fits = names
+      .filter((name) => name && rest.toLowerCase().startsWith(name.toLowerCase()) && /^(:?\s|:?$)/.test(rest.slice(name.length)))
+      .sort((a, b) => b.length - a.length);
+    if (fits.length) {
+      const tail = rest.slice(fits[0].length).replace(/^:?\s*/, "");
+      if (tail) return { to: rest.slice(0, fits[0].length), text: tail.trim() };
+    }
+  }
   const at = /^@([^\s:]{1,64}):?\s+([\s\S]*)$/.exec(text);
   if (at) return { to: at[1], text: at[2].trim() };
   const colon = /^([^\s:@<][^:\n]{0,63}):\s+([\s\S]*)$/.exec(text);
@@ -277,10 +290,15 @@ export function createConnector({ discord, out, clock = realClock }) {
     const rs = state.rooms[code];
     const body = String(p.text ?? "").trim();
     const relayed = p.replyToId ? (rs.relayed ?? []).find((r) => r.id === p.replyToId) : null;
+    // A Reply to something not in the map (too old, or not a room line) is never sent to
+    // everyone instead: who it answers cannot be told (#205 audit).
+    if (p.replyToId && !relayed) {
+      return botReply(p.channelId, p.messageId, "Not sent: I cannot tell which room message this replies to (it may be too old). Send it again without Reply, or start it with @Name.");
+    }
     let say;
     if (relayed) say = { kind: "ask", to: relayed.senderId || relayed.sender, replyToSeq: relayed.seq, text: body };
     else {
-      const addressed = parseAddress(body);
+      const addressed = parseAddress(body, memberNames(code));
       say = addressed ? { kind: "ask", ...addressed } : { kind: "tell", to: "everyone", text: body };
     }
     if (!say.text) return botReply(p.channelId, p.messageId, "Not sent: there is no text to send.");
@@ -357,6 +375,13 @@ export function createConnector({ discord, out, clock = realClock }) {
   }
 
   // The room whose current post this is: never a set-aside instance (`code@createdAt`).
+  // Every form the room shows its members by, from the roster at connect and from who has
+  // spoken since.
+  function memberNames(code) {
+    const shown = [...(workers.get(code)?.members ?? []), ...(state.rooms[code]?.relayed ?? []).map((r) => r.sender)].filter(Boolean).map(String);
+    return [...new Set(shown.flatMap((form) => [form, ...form.split(" / ")]).map((n) => n.trim()).filter(Boolean))];
+  }
+
   function roomOfThread(threadId) {
     if (!threadId) return null;
     for (const [code, rs] of Object.entries(state.rooms)) if (rs.threadId === threadId && !code.includes("@")) return code;
@@ -369,7 +394,9 @@ export function createConnector({ discord, out, clock = realClock }) {
   function sayToRoom(code, threadId, discordMessageId, say) {
     const rs = state.rooms[code];
     const { kind, to, text, replyToSeq } = say;
-    const line = { room: code, threadId, discordMessageId, kind, to, text, ...(replyToSeq != null ? { replyToSeq } : {}) };
+    // The owner who typed it is kept with it: a retry after the owner changed carries the old
+    // id, which the app's Keychain check refuses (#205 audit).
+    const line = { room: code, threadId, discordMessageId, ownerId, kind, to, text, ...(replyToSeq != null ? { replyToSeq } : {}) };
     (rs.saying ??= []).push(line);
     try {
       save();
@@ -380,7 +407,7 @@ export function createConnector({ discord, out, clock = realClock }) {
     spoken.delete(discordMessageId);
     spoken.set(discordMessageId, false);
     while (spoken.size > SPOKEN_MAX) spoken.delete(spoken.keys().next().value);
-    send({ t: "say", ownerId, ...line });
+    send({ t: "say", ...line });
   }
 
   function botReply(threadId, replyTo, content) {
@@ -442,7 +469,9 @@ export function createConnector({ discord, out, clock = realClock }) {
   function resay(w) {
     if (resaid.has(w.code)) return;
     resaid.add(w.code);
-    for (const line of state.rooms[w.code]?.saying ?? []) send({ t: "say", ownerId, ...line, retry: true });
+    // A line saved before owners were kept with it names nobody, and is refused, never sent
+    // as whoever is paired now.
+    for (const line of state.rooms[w.code]?.saying ?? []) send({ t: "say", ...line, ownerId: line.ownerId ?? "", retry: true });
   }
 
   async function quietPrompt(w) {

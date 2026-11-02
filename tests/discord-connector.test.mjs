@@ -1542,7 +1542,7 @@ const OWNER = "U-OWNER";
 
 async function ownerRoom(opts = {}) {
   const b = await boot({ ownerId: OWNER, ...opts });
-  b.c.handle({ t: "connect", room: "sync-abcd", members: ["Claude / Gyre"], createdAt: 1 });
+  b.c.handle({ t: "connect", room: "sync-abcd", members: opts.members ?? ["Claude / Gyre"], createdAt: 1 });
   await flush();
   b.threadId = b.of("connected").at(-1).threadId;
   assert.ok(b.threadId, "premise: the room has a post");
@@ -1590,8 +1590,12 @@ test("#205 a Discord Reply to a relayed message asks its sender, with replyToSeq
   assert.ok(relayed, "premise: m7 was relayed and has a Discord id");
   const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "go ahead", replyToId: relayed });
   assert.deepEqual(of("say").at(-1), { t: "say", room: "sync-abcd", threadId, ownerId: OWNER, discordMessageId: id, kind: "ask", to: "conv-gyre", replyToSeq: 7, text: "go ahead" });
-  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "plain", replyToId: "M-NOT-RELAYED" });
-  assert.equal(of("say").at(-1).kind, "tell", "a Reply to anything else is plain text");
+  const before = of("say").length;
+  const lost = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "plain", replyToId: "M-NOT-RELAYED" });
+  await flush();
+  assert.equal(of("say").length, before, "a Reply whose message is not known is never sent to everyone instead (#205 audit)");
+  assert.equal(fake.bot.at(-1).replyTo, lost);
+  assert.match(fake.bot.at(-1).content, /^Not sent: .*cannot tell which room message/);
   await c.close();
 });
 
@@ -2021,4 +2025,31 @@ test("#205 discord.js adapter reports only real edits by people in guilds", asyn
   assert.deepEqual(got, []);
   client.emit("messageUpdate", {}, msg());
   assert.deepEqual(got, [{ messageId: "D1", channelId: "T1", authorId: OWNER }]);
+});
+
+test("#205 audit: @Name matches a member's whole name, spaces and all, before a shorter one", async () => {
+  const { c, fake, of, threadId } = await ownerRoom({ members: ["Claude Code / Gyre Assistant", "Codex / Gyre"] });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "@Gyre Assistant please reply" });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "@Gyre look at this" });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "@Claude Code / Gyre Assistant: hi" });
+  assert.deepEqual(of("say").map((s) => [s.to, s.text]), [
+    ["Gyre Assistant", "please reply"],
+    ["Gyre", "look at this"],
+    ["Claude Code / Gyre Assistant", "hi"],
+  ]);
+  await c.close();
+});
+
+test("#205 audit: a say saved under one owner is never sent again under another", async () => {
+  const statePath = tmpState();
+  const fake = createFakeDiscord();
+  const first = await ownerRoom({ fake, statePath });
+  const id = fake.ownerSays({ channelId: first.threadId, authorId: OWNER, text: "from the first owner" });
+  await first.c.close();
+  const second = await ownerRoom({ fake, statePath, ownerId: "U-NEW-OWNER" });
+  const again = second.of("say");
+  assert.equal(again.length, 1, "premise: the saved say is tried again");
+  assert.equal(again[0].discordMessageId, id);
+  assert.equal(again[0].ownerId, OWNER, "it carries the owner who typed it, so the app's Keychain check refuses it");
+  await second.c.close();
 });

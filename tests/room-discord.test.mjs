@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -646,6 +647,14 @@ test("#206 a room's status is read by the app alone: machine token and broker wo
       const refused = await h.call("GET", `/sync/rooms/${code}/status`, undefined, headers);
       assert.ok([401, 403].includes(refused.status), `${who}: ${refused.status}`);
     }
+    // A read time that is not a date is kept as unknown, never as "now" (#206 audit).
+    const lines = [{ type: "progress", label: "Weekly", used: 90, limit: 100 }];
+    assert.equal((await h.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: "peer-a", cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 },
+    })).status, 202);
+    assert.equal((await h.call("POST", "/usage", { providerId: "claude", displayName: "Claude Code", lines, fetchedAt: "bad-date" })).status, 200);
+    assert.equal((await h.call("GET", `/sync/rooms/${code}/status`)).body.usage.claude?.fetchedAt, null);
     assert.equal((await h.call("GET", "/sync/rooms/sync-zz99/status")).status, 404, "a room that is not there");
     assert.equal((await readRoom(h, code)).length, before, "nothing was posted into the room");
   } finally {

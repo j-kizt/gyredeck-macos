@@ -4957,3 +4957,14 @@ fn status_with_the_owner_record_unreadable_answers_nothing_about_any_room() {
     assert!(answers[0]["error"].as_str().unwrap().contains("Keychain"), "{}", answers[0]);
     assert!(answers[0].get("rooms").is_none_or(serde_json::Value::is_null));
 }
+
+#[test]
+fn status_usage_age_is_unknown_when_the_read_time_is_not_a_date() {
+    let status = serde_json::json!({ "usage": {
+        "codex": { "displayName": "Codex", "lines": [{ "label": "Weekly", "leftPct": 10 }], "fetchedAt": "bad-date" },
+        "claude": { "displayName": "Claude", "lines": [{ "label": "Weekly", "leftPct": 40 }], "fetchedAt": null },
+    }});
+    for row in status_usage(&status) {
+        assert!(row["secondsOld"].is_null(), "{row}");
+    }
+}

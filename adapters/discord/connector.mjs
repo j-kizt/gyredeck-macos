@@ -426,13 +426,18 @@ export function createConnector({ discord, out, clock = realClock }) {
         lines.push(`${who}: no reading yet`);
         continue;
       }
+      // Numbers whose age is unknown could be days old: they are not shown as the current ones.
+      if (!Number.isFinite(u.secondsOld)) {
+        lines.push(`${who}: a reading of unknown age, not shown`);
+        continue;
+      }
       const parts = u.lines.map((l) => {
         // A reset time that is not a date is left out rather than shown or thrown on.
         const at = l.resetsAt ? new Date(l.resetsAt) : null;
         const resets = at && !Number.isNaN(at.getTime()) ? `, resets ${at.toISOString().slice(0, 16).replace("T", " ")} UTC` : "";
         return `${plain(l.label)} ${Number(l.leftPct)}% left${resets}`;
       });
-      lines.push(`${who}: ${parts.join("; ")}${Number.isFinite(u.secondsOld) ? ` · read ${ago(u.secondsOld)}` : ""}`);
+      lines.push(`${who}: ${parts.join("; ")} · read ${ago(u.secondsOld)}`);
     }
     return lines.join("\n");
   }

@@ -45,6 +45,7 @@ export const COMMANDS = [
 const STATUS_WAIT_MS = 10_000;
 const STATUS_ROOMS_SHOWN = 25;
 const STATUS_MAX_CHARS = 1900;
+const OWNER_CHANGED = "No status was shown: the paired owner changed while it was asked.";
 
 // "@Name: text" or "Name: text" at the very start addresses Name; anything else is for
 // everyone. The colon is what ends the name: without it "@Gyre Assistant please reply" could
@@ -371,7 +372,7 @@ export function createConnector({ discord, out, clock = realClock }) {
     await c.defer({ ephemeral: true });
     const requestId = randomBytes(8).toString("hex");
     const timer = clock.setTimeout(() => statusDone(requestId, "Status is not available right now."), STATUS_WAIT_MS);
-    statusAsked.set(requestId, { c, scope, timer });
+    statusAsked.set(requestId, { c, scope, timer, askedBy: c.userId });
     send({ t: "status_request", requestId, ownerId: c.userId, channelId: c.channelId, ...scope });
   }
   function statusDone(requestId, content) {
@@ -398,11 +399,13 @@ export function createConnector({ discord, out, clock = realClock }) {
     }
     return statusDone(requestId, roomsText(Array.isArray(msg.rooms) ? msg.rooms : [], Number(msg.hiddenRooms) || 0));
   }
-  // A room this child no longer follows is not shown as connected; `needs you` is the post's tag now.
+  // A room this child no longer follows is not shown as connected; one reconnected since is not
+  // shown with the old instance's numbers; `needs you` is the post's tag now.
   function roomsText(rooms, hidden) {
     const live = rooms.filter((r) => workers.get(String(r.room))?.accepting);
     if (!live.length && !hidden) return "No room is connected.";
     const lines = live.slice(0, STATUS_ROOMS_SHOWN).map((r) => {
+      if (workers.get(String(r.room)).createdAt !== r.createdAt) return `${r.room} · reconnected while asked — run /status again`;
       const n = Number(r.members) || 0;
       return `${r.room} · ${n} member${n === 1 ? "" : "s"}${state.rooms[r.room]?.needsYou ? " · needs you" : ""}`;
     });
@@ -423,7 +426,12 @@ export function createConnector({ discord, out, clock = realClock }) {
         lines.push(`${who}: no reading yet`);
         continue;
       }
-      const parts = u.lines.map((l) => `${plain(l.label)} ${Number(l.leftPct)}% left${l.resetsAt ? `, resets ${new Date(l.resetsAt).toISOString().slice(0, 16).replace("T", " ")} UTC` : ""}`);
+      const parts = u.lines.map((l) => {
+        // A reset time that is not a date is left out rather than shown or thrown on.
+        const at = l.resetsAt ? new Date(l.resetsAt) : null;
+        const resets = at && !Number.isNaN(at.getTime()) ? `, resets ${at.toISOString().slice(0, 16).replace("T", " ")} UTC` : "";
+        return `${plain(l.label)} ${Number(l.leftPct)}% left${resets}`;
+      });
       lines.push(`${who}: ${parts.join("; ")}${Number.isFinite(u.secondsOld) ? ` · read ${ago(u.secondsOld)}` : ""}`);
     }
     return lines.join("\n");
@@ -1304,6 +1312,8 @@ export function createConnector({ discord, out, clock = realClock }) {
       case "owner":
         ownerId = msg.ownerId ?? null;
         cancelOthers();
+        // A status asked by the old owner is never shown after a re-pair (#206 audit).
+        for (const [id, asked] of [...statusAsked]) if (asked.askedBy !== ownerId) statusDone(id, OWNER_CHANGED);
         if (awaitingOwner && msg.round === awaitingOwner.round && msg.ownerId === awaitingOwner.userId) {
           awaitingOwner.reply?.("Paired with Gyredeck.")?.catch?.(() => {});
           awaitingOwner = null;

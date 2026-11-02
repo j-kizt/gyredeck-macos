@@ -1,5 +1,21 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Updates keep your Discord setup — (v1.29.3)
+
+### Fixes
+
+- **An update no longer makes Gyredeck forget its Discord bot token and paired owner.** Until
+  now every update was a new app to macOS, so what Gyredeck had saved in the Keychain could not
+  be read after it, and Discord had to be set up again. Gyredeck is now signed with a Developer
+  ID and notarized by Apple, and keeps the token and owner where every later version can read
+  them.
+- **The first time you open this version, macOS asks twice whether Gyredeck may use
+  "Gyredeck Discord"** — once for the token, once for the paired owner. Enter your Mac password
+  and choose **Always Allow** both times; Gyredeck moves them over and macOS does not ask again
+  on later updates. If it cannot read them, Settings says so and asks you to paste the token or
+  pair again, once — it never shows them as not set up.
+- macOS may also ask once more about notifications, for the same reason.
+
 ## Gyredeck stops filling your disk with session history — (v1.29.2)
 
 ### Fixes

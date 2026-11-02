@@ -137,7 +137,7 @@ const App = () => {
   const [keepAwakeError, setKeepAwakeError] = useState<string | null>(null);
   // What Rust says it holds and why: a Discord room or a heavy run holds the Mac without the window (#211, #278).
   // Rust's word on what is held is the whole truth, a failure in the background included.
-  const [keepAwakeHeld, setKeepAwakeHeld] = useState<{ why?: string | null; error?: string | null } | undefined>();
+  const [keepAwakeHeld, setKeepAwakeHeld] = useState<{ why?: string | null; error?: string | null; rev: number }>();
   const [terminal, setTerminal] = useState<TerminalChoice>(readTerminalChoice);
   const [expandedSessionGroupKeys, setExpandedSessionGroupKeys] = useState<Set<string>>(() => new Set());
   const [clearCompletedArmed, setClearCompletedArmed] = useState(false);
@@ -514,9 +514,15 @@ const App = () => {
 
   useEffect(() => {
     if (!canUseNativeControls) return undefined;
-    const unlisten = listen<typeof keepAwakeHeld>("keep_awake", (event) => setKeepAwakeHeld(event.payload)).catch(() => undefined);
-    void invoke<typeof keepAwakeHeld>("keep_awake_status").then(setKeepAwakeHeld, () => undefined);
-    return () => void unlisten.then((stop) => stop?.());
+    // The newest by rev wins, so a snapshot answered late never overwrites a later event; it
+    // is asked for once the listener is in, so no change falls between the two.
+    type Held = NonNullable<typeof keepAwakeHeld>;
+    const take = (next: Held) => setKeepAwakeHeld((held) => (held && held.rev > next.rev ? held : next));
+    const unlisten = listen<Held>("keep_awake", (event) => take(event.payload)).then((stop) => {
+      invoke<Held>("keep_awake_status").then(take, () => {});
+      return stop;
+    }, () => {});
+    return () => { unlisten.then((stop) => stop?.()); };
   }, [canUseNativeControls]);
 
   const setupGuidance = (() => {
@@ -1203,7 +1209,7 @@ const App = () => {
                   keepAwakeActive={keepAwakeActive}
                   keepAwakeWhy={keepAwakeHeld?.why}
                   keepAwakeEnabled={keepAwakeEnabled}
-                  keepAwakeError={keepAwakeError ?? keepAwakeHeld?.error ?? null}
+                  keepAwakeError={keepAwakeHeld ? keepAwakeHeld.error ?? null : keepAwakeError}
                   hookStatus={hookStatus}
                   launchAtLogin={launchAtLogin}
                   mailRooms={mailRooms.rooms}

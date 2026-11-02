@@ -106,6 +106,8 @@ pub(crate) struct Held {
     /// Said only for what is actually held.
     pub why: Option<String>,
     pub error: Option<String>,
+    /// Goes up with every change, so a reader keeps the newest of a snapshot and an event.
+    pub rev: u64,
 }
 
 struct Inner {
@@ -114,6 +116,7 @@ struct Inner {
     system: Option<u32>,
     error: Option<String>,
     last: Option<Held>,
+    rev: u64,
 }
 
 pub struct KeepAwakeState {
@@ -131,7 +134,7 @@ impl Default for KeepAwakeState {
 impl KeepAwakeState {
     pub(crate) fn with(power: Box<dyn Power>) -> Self {
         Self {
-            inner: Mutex::new(Inner { inputs: Inputs::default(), display: None, system: None, error: None, last: None }),
+            inner: Mutex::new(Inner { inputs: Inputs::default(), display: None, system: None, error: None, last: None, rev: 0 }),
             power,
             notify: Mutex::new(None),
         }
@@ -186,8 +189,8 @@ impl KeepAwakeState {
 
     pub(crate) fn held(&self) -> Held {
         match self.inner.lock() {
-            Ok(inner) => held_of(&inner),
-            Err(_) => Held { display: false, system: false, why: None, error: Some("Keep-awake state lock failed".to_string()) },
+            Ok(inner) => Held { rev: inner.rev, ..held_of(&inner) },
+            Err(_) => Held { display: false, system: false, why: None, error: Some("Keep-awake state lock failed".to_string()), rev: 0 },
         }
     }
 
@@ -214,8 +217,10 @@ impl KeepAwakeState {
                 }
             }
             inner.error = (!errors.is_empty()).then(|| errors.join("; "));
-            let held = held_of(&inner);
-            let changed = inner.last.as_ref() != Some(&held);
+            let mut held = held_of(&inner);
+            let changed = inner.last.as_ref().is_none_or(|last| Held { rev: 0, ..last.clone() } != held);
+            inner.rev += u64::from(changed);
+            held.rev = inner.rev;
             inner.last = Some(held.clone());
             (held, changed)
         };
@@ -247,7 +252,7 @@ fn held_of(inner: &Inner) -> Held {
     let system = inner.system.is_some();
     let want = wanted(&inner.inputs);
     let why = want.why.filter(|_| (want.display && display) || (want.system && system));
-    Held { display, system, why, error: inner.error.clone() }
+    Held { display, system, why, error: inner.error.clone(), rev: 0 }
 }
 
 impl Drop for KeepAwakeState {

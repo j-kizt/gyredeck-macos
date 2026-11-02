@@ -29,8 +29,15 @@ test("keep awake retries a transient native synchronization failure", async ({ p
     const calls: Array<{ active: boolean }> = [];
     let activeAttempts = 0;
     (window as typeof window & { __keepAwakeCalls: Array<{ active: boolean }> }).__keepAwakeCalls = calls;
+    let held = false;
+    let told: ((event: unknown) => void) | null = null;
+    const snapshot = () => ({ display: held, system: false, why: held ? "agent working — display won't sleep" : null, error: null, rev: calls.length });
     (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+      transformCallback: (callback: (event: unknown) => void) => { told = callback; return 1; },
       invoke: async (command: string, args?: { active?: boolean }) => {
+        // The row says what Rust holds (#211): the agent-working reason once the display is held.
+        if (command === "plugin:event|listen") return 1;
+        if (command === "keep_awake_status") return snapshot();
         if (command !== "set_keep_awake") return null;
         const active = args?.active === true;
         calls.push({ active });
@@ -38,6 +45,8 @@ test("keep awake retries a transient native synchronization failure", async ({ p
           activeAttempts += 1;
           if (activeAttempts === 1) throw new Error("transient IOKit failure");
         }
+        held = active;
+        told?.({ event: "keep_awake", id: 1, payload: snapshot() });
         return active;
       },
     };

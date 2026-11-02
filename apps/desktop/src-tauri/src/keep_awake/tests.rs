@@ -46,7 +46,7 @@ fn c1_c2_a_followed_room_holds_system_sleep_with_nobody_working_and_its_end_lets
     assert_eq!(held.why.as_deref(), Some("sync-ab12 connected to Discord — the Mac won't idle-sleep"));
     s.set_discord_rooms(vec![]);
     assert_eq!(log(&fake), ["-#1"]);
-    assert_eq!(s.held(), Held { display: false, system: false, why: None, error: None });
+    assert_eq!(s.held(), Held { display: false, system: false, why: None, error: None, rev: s.held().rev });
 }
 
 #[test]
@@ -91,7 +91,7 @@ fn c5_the_switch_off_lets_go_of_both_and_nothing_is_held_before_the_ui_speaks() 
     assert_eq!(log(&fake), ["+Display#1"]);
     s.set_active(false, true).unwrap();
     assert_eq!(log(&fake), ["-#1"]);
-    assert_eq!(s.held(), Held { display: false, system: false, why: None, error: None });
+    assert_eq!(s.held(), Held { display: false, system: false, why: None, error: None, rev: s.held().rev });
 }
 
 #[test]
@@ -172,7 +172,7 @@ fn both_native_assertions_can_be_acquired_and_released() {
     let held = state.held();
     assert!(held.system && !held.display && held.error.is_none(), "{held:?}");
     state.release_all();
-    assert_eq!(state.held(), Held { display: false, system: false, why: None, error: None });
+    assert_eq!(state.held(), Held { display: false, system: false, why: None, error: None, rev: state.held().rev });
 }
 
 #[test]
@@ -193,4 +193,16 @@ fn a_hand_over_whose_new_assertion_is_refused_keeps_the_old_one_until_it_can() {
         assert_eq!(log(&fake).len(), 2, "{from_working}->{to_working}: taken, then the old one let go");
         assert_eq!(s.held().error, None);
     }
+}
+
+#[test]
+fn every_change_moves_the_rev_and_a_repeat_does_not() {
+    let (s, _fake) = state();
+    s.set_active(true, false).unwrap();
+    let first = s.held().rev;
+    s.set_discord_rooms(vec!["sync-ab12".into()]);
+    let second = s.held().rev;
+    assert!(second > first);
+    s.set_discord_rooms(vec!["sync-ab12".into()]);
+    assert_eq!(s.held().rev, second);
 }

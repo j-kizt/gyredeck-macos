@@ -88,17 +88,19 @@ pub(crate) fn write(team: &dyn Slot, moved: &dyn Slot, file: &dyn Slot, value: &
     }
 }
 
-/// Gone from where this build reads it. The moved marker stays, so an old file-keychain item
-/// macOS would not let this build delete never comes back as the value.
-pub(crate) fn delete(team: &dyn Slot, file: &dyn Slot) -> Result<(), String> {
-    match team.delete() {
-        Ok(()) => {
-            let _ = file.delete();
-            Ok(())
-        }
-        Err(MISSING_ENTITLEMENT) => file.delete().map_err(describe),
-        Err(code) => Err(describe(code)),
+/// Gone from where this build reads it, and for good: the moved marker is saved before the
+/// team's item goes, so an old file-keychain item macOS will not let this build delete can never
+/// be moved back in as the value. A marker that cannot be saved refuses the Remove and leaves
+/// the value as it was (#288 audit).
+pub(crate) fn delete(team: &dyn Slot, moved: &dyn Slot, file: &dyn Slot) -> Result<(), String> {
+    match moved.write(b"1") {
+        Ok(()) => {}
+        Err(MISSING_ENTITLEMENT) => return file.delete().map_err(describe),
+        Err(code) => return Err(describe(code)),
     }
+    team.delete().map_err(describe)?;
+    let _ = file.delete();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -161,7 +163,7 @@ mod tests {
     fn an_old_item_this_build_cannot_delete_never_comes_back_after_a_remove() {
         let (team, moved, file) = (Fake::default(), Fake::default(), Fake { delete_err: Some(-25293), ..Fake::holding(b"old") });
         assert_eq!(read(&team, &moved, &file), Read::Found(b"old".to_vec()));
-        assert_eq!(delete(&team, &file), Ok(()));
+        assert_eq!(delete(&team, &moved, &file), Ok(()));
         assert_eq!(read(&team, &moved, &file), Read::Absent, "moved once; the old item is not taken again");
     }
 
@@ -198,17 +200,37 @@ mod tests {
 
     #[test]
     fn a_refused_delete_is_reported_not_claimed() {
-        let (team, file) = (Fake { delete_err: Some(-25293), ..Fake::holding(b"one") }, Fake::default());
-        assert!(delete(&team, &file).is_err());
+        let (team, moved, file) = (Fake { delete_err: Some(-25293), ..Fake::holding(b"one") }, Fake::default(), Fake::default());
+        assert!(delete(&team, &moved, &file).is_err());
         assert_eq!(team.now(), Some(b"one".to_vec()));
+    }
+
+    // Codex's #288 finding: a Remove reported done while an old item could still come back.
+    #[test]
+    fn a_remove_whose_marker_cannot_be_saved_is_refused_and_leaves_the_value() {
+        let refused = || Fake { write_err: Some(-25293), ..Fake::default() };
+        let (team, moved, file) = (Fake::default(), refused(), Fake { delete_err: Some(-25293), ..Fake::holding(b"old") });
+        assert_eq!(read(&team, &moved, &file), Read::Found(b"old".to_vec()), "premise: moved over, marker refused");
+        assert!(delete(&team, &moved, &file).is_err(), "not reported gone while the old item could come back");
+        assert_eq!(read(&team, &moved, &file), Read::Found(b"old".to_vec()), "the value is as it was");
+        assert_eq!(team.now(), Some(b"old".to_vec()));
+    }
+
+    #[test]
+    fn a_new_value_then_a_remove_with_the_marker_refused_is_refused_too() {
+        let (team, moved, file) = (Fake::default(), Fake { write_err: Some(-25293), ..Fake::default() }, Fake { delete_err: Some(-25293), ..Fake::holding(b"old") });
+        assert_eq!(write(&team, &moved, &file, b"new"), Ok(()), "premise: the new value is saved, its marker is not");
+        assert!(delete(&team, &moved, &file).is_err());
+        assert_eq!(read(&team, &moved, &file), Read::Found(b"new".to_vec()), "never the old item in its place");
     }
 
     #[test]
     fn an_ad_hoc_build_keeps_using_the_file_keychain() {
-        let (team, moved, file) = (Fake::unentitled(), Fake::default(), Fake::default());
+        // The marker lives in the team's group too, which an ad-hoc build cannot reach.
+        let (team, moved, file) = (Fake::unentitled(), Fake::unentitled(), Fake::default());
         assert_eq!(write(&team, &moved, &file, b"v"), Ok(()));
         assert_eq!(read(&team, &moved, &file), Read::Found(b"v".to_vec()));
-        assert_eq!(delete(&team, &file), Ok(()));
+        assert_eq!(delete(&team, &moved, &file), Ok(()));
         assert_eq!(read(&team, &moved, &file), Read::Absent);
         assert_eq!(moved.now(), None);
     }

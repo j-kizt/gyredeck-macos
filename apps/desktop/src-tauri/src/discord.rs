@@ -2866,7 +2866,7 @@ impl OwnerStore for KeychainOwner {
     fn delete(&self) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
-            secrets::delete(&TeamSlot(KEYCHAIN_OWNER_ACCOUNT), &FileSlot(KEYCHAIN_OWNER_ACCOUNT))
+            secrets::delete(&TeamSlot(KEYCHAIN_OWNER_ACCOUNT), &TeamSlot(KEYCHAIN_OWNER_MOVED), &FileSlot(KEYCHAIN_OWNER_ACCOUNT))
                 .map_err(|why| format!("Could not remove the owner from the Keychain: {why}"))
         }
         #[cfg(not(target_os = "macos"))]
@@ -2906,7 +2906,7 @@ impl TokenStore for KeychainTokens {
     fn delete(&self) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
-            secrets::delete(&TeamSlot(KEYCHAIN_ACCOUNT), &FileSlot(KEYCHAIN_ACCOUNT))
+            secrets::delete(&TeamSlot(KEYCHAIN_ACCOUNT), &TeamSlot(KEYCHAIN_MOVED), &FileSlot(KEYCHAIN_ACCOUNT))
                 .map_err(|why| format!("Could not remove the token from the Keychain: {why}"))
         }
         #[cfg(not(target_os = "macos"))]

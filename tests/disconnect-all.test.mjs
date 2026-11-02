@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 const module = new URL("../apps/desktop/src/features/setup/disconnectAll.ts", import.meta.url);
-const { disconnectAll, offerDisconnectAll, stillHeld } = await import(module.href);
+const { disconnectAll, offerDisconnectAll, showSyncRooms, stillHeld } = await import(module.href);
 
 test("#205 Disconnect all acts on the rooms connected when it was pressed, never on one that joins meanwhile", async () => {
   const connected = ["sync-aaaa", "sync-bbbb"];
@@ -51,4 +51,12 @@ test("#205 Disconnect all is offered while rooms are connected even with the con
   assert.equal(offerDisconnectAll(status.connectedRooms, stillHeld([], status)), true);
   assert.equal(offerDisconnectAll([], none), false);
   assert.equal(offerDisconnectAll([], { connected: [], leaving: ["sync-bbbb"] }), true, "a room that could not leave keeps the notice");
+});
+
+test("#205 the Sync rooms section shows for Disconnect all even with no open room; hidden only with nothing at all", () => {
+  const none = { connected: [], leaving: [] };
+  assert.equal(showSyncRooms(0, ["sync-aaaa"], none), true, "Discord still follows a room nobody is in");
+  assert.equal(showSyncRooms(0, [], { connected: [], leaving: ["sync-bbbb"] }), true);
+  assert.equal(showSyncRooms(2, [], none), true);
+  assert.equal(showSyncRooms(0, [], none), false);
 });

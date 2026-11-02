@@ -8,21 +8,37 @@ export const SESSION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const MAX_STORED_CONVERSATIONS = 200;
 export const SESSION_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
-const newestAt = (events: SessionEventRegistry[string]) =>
-  events.reduce((latest, event) => Math.max(latest, Date.parse(event.timestamp) || 0), 0);
+// A timestamp more than a day ahead is not believed: it would keep its conversation forever.
+const FUTURE_SLACK_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Keep conversations with an event inside the retention window, at most the newest 200.
- * Returns the same object when nothing goes, so an unchanged registry is not saved again.
+ * Keep events inside the retention window and conversations that still have one, at most
+ * the newest 200. The conversation the person has open is kept whole, whatever its age or
+ * rank. Returns the same object when nothing goes, so an unchanged registry is not saved.
  */
-export const pruneSessionEventRegistry = (registry: SessionEventRegistry, now: Date): SessionEventRegistry => {
+export const pruneSessionEventRegistry = (
+  registry: SessionEventRegistry,
+  now: Date,
+  keep: string | null = null,
+): SessionEventRegistry => {
   const cutoff = now.getTime() - SESSION_RETENTION_MS;
-  const kept = Object.entries(registry)
-    .map(([conversationId, events]) => [conversationId, events, newestAt(events)] as const)
-    .filter(([, , latest]) => latest >= cutoff)
-    .sort((a, b) => b[2] - a[2])
-    .slice(0, MAX_STORED_CONVERSATIONS);
-  if (kept.length === Object.keys(registry).length) return registry;
+  const ceiling = now.getTime() + FUTURE_SLACK_MS;
+  let changed = false;
+  const dated = Object.entries(registry).flatMap(([conversationId, events]) => {
+    if (conversationId === keep) return [[conversationId, events, Number.POSITIVE_INFINITY] as const];
+    const inside = events.filter((event) => {
+      const at = Date.parse(event.timestamp);
+      return at >= cutoff && at <= ceiling;
+    });
+    if (inside.length !== events.length) changed = true;
+    if (inside.length === 0) return [];
+    return [[conversationId, inside, Math.max(...inside.map((event) => Date.parse(event.timestamp)))] as const];
+  });
+  dated.sort((a, b) => b[2] - a[2]);
+  const open = dated.find(([conversationId]) => conversationId === keep);
+  const others = dated.filter(([conversationId]) => conversationId !== keep);
+  const kept = open ? [open, ...others.slice(0, MAX_STORED_CONVERSATIONS - 1)] : others.slice(0, MAX_STORED_CONVERSATIONS);
+  if (!changed && kept.length === Object.keys(registry).length) return registry;
   return Object.fromEntries(kept.map(([conversationId, events]) => [conversationId, events]));
 };
 

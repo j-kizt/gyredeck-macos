@@ -59,3 +59,25 @@ test("no resurrection: a cleared tombstone only ever hid a conversation the regi
   // And while anything still names it, the tombstone stays.
   assert.deepEqual(Object.keys(pruneTombstones({ busy: dismissedAt }, NOW, new Set(["busy"]))), ["busy"]);
 });
+
+test("inside a kept conversation, events past 30 days go too", () => {
+  const kept = pruneSessionEventRegistry({ mixed: events(ago(DAY), ago(40 * DAY)) }, NOW);
+  assert.deepEqual(kept.mixed.map((event) => event.id), ["e0"]);
+});
+
+test("a timestamp more than a day ahead is not believed: it keeps nothing alive", () => {
+  const kept = pruneSessionEventRegistry({ future: events("9999-01-01T00:00:00.000Z"), soon: events(ago(-60 * 60 * 1000)) }, NOW);
+  assert.deepEqual(Object.keys(kept), ["soon"], "an hour ahead is clock skew; year 9999 is not");
+});
+
+test("the open conversation is kept whole, whatever its age or rank", () => {
+  const registry = Object.fromEntries(
+    Array.from({ length: 201 }, (_, index) => [`c${String(index).padStart(3, "0")}`, events(ago(index * 60_000))]),
+  );
+  registry.old = events(ago(90 * DAY));
+  const kept = pruneSessionEventRegistry(registry, NOW, "c200");
+  assert.ok("c200" in kept, "the 201st, open, stays");
+  assert.equal(Object.keys(kept).length, MAX_STORED_CONVERSATIONS);
+  assert.ok(!("c199" in kept), "it takes a place, it does not add one");
+  assert.deepEqual(pruneSessionEventRegistry(registry, NOW, "old").old, registry.old, "an old open one stays whole");
+});

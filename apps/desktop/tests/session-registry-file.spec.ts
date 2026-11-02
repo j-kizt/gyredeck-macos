@@ -8,7 +8,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 const KEY = "gyredeck.session-events";
 
-type Mode = { load: "absent" | "ok" | "corrupt"; failFirstSave?: boolean; saveDelayMs?: number };
+type Mode = { load: "absent" | "ok" | "corrupt" | "unreadable" | "throws"; failFirstSave?: boolean; failSaves?: number; saveDelayMs?: number };
 
 const event = (conversationId: string, message: string) => ({
   version: 2,
@@ -45,22 +45,29 @@ const open = async (page: Page, mode: Mode, legacy: Record<string, unknown[]> | 
         return removeItem.call(this, name);
       };
       let saves = 0;
+      let revision = 7;
       (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
-        invoke: async (command: string, args?: { revision: number; registry: Record<string, unknown> }) => {
+        invoke: async (command: string, args?: { registry: Record<string, unknown> }) => {
           if (command === "set_keep_awake") return false;
           if (command === "session_registry_load") {
             if (mode.load === "ok") return { state: "ok", revision: 7, registry: fileRegistry };
             if (mode.load === "corrupt") return { state: "corrupt", kept: "/tmp/session-events.corrupt-1.json" };
+            if (mode.load === "unreadable") return { state: "unreadable", reason: "permission denied" };
+            if (mode.load === "throws") throw new Error("no app data folder");
             return { state: "absent" };
           }
           if (command === "session_registry_save") {
             saves += 1;
-            const failed = mode.failFirstSave && saves === 1;
-            log.push({ at: performance.now(), what: "save", detail: { revision: args?.revision, keys: Object.keys(args?.registry ?? {}), failed } });
+            const failed = saves <= (mode.failSaves ?? (mode.failFirstSave ? 1 : 0));
+            log.push({ at: performance.now(), what: "save", detail: { keys: Object.keys(args?.registry ?? {}), failed } });
             await new Promise((resolve) => setTimeout(resolve, mode.saveDelayMs ?? 0));
-            log.push({ at: performance.now(), what: failed ? "save failed" : "save done", detail: { revision: args?.revision } });
-            if (failed) throw new Error("disk full");
-            return null;
+            if (failed) {
+              log.push({ at: performance.now(), what: "save failed" });
+              throw new Error("disk full");
+            }
+            revision += 1;
+            log.push({ at: performance.now(), what: "save done", detail: { revision } });
+            return revision;
           }
           throw new Error(`${command} unavailable`);
         },
@@ -83,9 +90,9 @@ test("in the desktop app the registry is saved to the file, in order and spaced,
   expect(saves.length).toBeGreaterThan(0);
   // Demo events arrive every 800 ms; a save at most every two seconds.
   expect(saves.length).toBeLessThanOrEqual(4);
-  const revisions = saves.map((entry) => entry.detail?.revision ?? 0);
-  expect(revisions).toEqual([...revisions].sort((a, b) => a - b));
-  expect(new Set(revisions).size).toBe(revisions.length);
+  // One window's saves reach the store one after another: each starts after the last ended.
+  const order = entries.filter((entry) => entry.what === "save" || entry.what === "save done").map((entry) => entry.what);
+  expect(order.every((what, index) => what === (index % 2 === 0 ? "save" : "save done"))).toBe(true);
 });
 
 test("the old localStorage copy is moved into the file and removed only after the file holds it", async ({ page }) => {
@@ -97,7 +104,6 @@ test("the old localStorage copy is moved into the file and removed only after th
   const done = entries.find((entry) => entry.what === "save done");
   const removed = entries.find((entry) => entry.what === "localStorage.removeItem");
   expect(save?.detail?.keys).toContain("legacy-conv");
-  expect(save?.detail?.revision).toBe(1);
   expect(removed!.at).toBeGreaterThanOrEqual(done!.at);
 });
 
@@ -145,4 +151,29 @@ test("a quiet app clears data that ages past 30 days within the hour, and saves 
   expect(first?.detail?.keys?.sort()).toEqual(["ageing-conv", "fresh-conv"]);
   await page.clock.runFor(61 * 60 * 1000);
   await expect.poll(async () => (await log(page)).filter((entry) => entry.what === "save").at(-1)?.detail?.keys).toEqual(["fresh-conv"]);
+});
+
+for (const [why, load] of [["the store cannot be reached", "throws"], ["the file is there but unreadable", "unreadable"]] as const) {
+  test(`when ${why}, the registry is kept in memory: no localStorage write, no save, the old copy untouched`, async ({ page }) => {
+    const legacy = { "legacy-conv": [event("legacy-conv", "From localStorage")] };
+    await open(page, { load }, legacy);
+    await page.waitForTimeout(3_000);
+    const entries = await log(page);
+    expect(entries.map((entry) => entry.what)).not.toContain("localStorage.setItem");
+    expect(entries.map((entry) => entry.what)).not.toContain("localStorage.removeItem");
+    expect(entries.map((entry) => entry.what)).not.toContain("save");
+    expect(JSON.parse((await page.evaluate((key) => localStorage.getItem(key), KEY)) ?? "null")).toEqual(legacy);
+  });
+}
+
+test("on a quiet app a save that failed is tried again until it lands, and only then is the old copy removed", async ({ page }) => {
+  // Three failures in a row: the migration's own save, then the first two retries.
+  await open(page, { load: "absent", failSaves: 3 }, { "legacy-conv": [event("legacy-conv", "From localStorage")] }, false);
+  await expect.poll(async () => (await log(page)).map((entry) => entry.what), { timeout: 10_000 }).toContain("save done");
+  const entries = await log(page);
+  const failedAt = entries.find((entry) => entry.what === "save failed")!.at;
+  const doneAt = entries.find((entry) => entry.what === "save done")!.at;
+  expect(doneAt).toBeGreaterThan(failedAt);
+  expect(entries.filter((entry) => entry.what === "localStorage.removeItem").every((entry) => entry.at >= doneAt)).toBe(true);
+  await expect.poll(async () => (await log(page)).map((entry) => entry.what)).toContain("localStorage.removeItem");
 });

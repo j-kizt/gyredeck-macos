@@ -36,6 +36,8 @@ export interface IGyredeckPresenceOptions {
   demoMode: boolean;
   demoScenario: string | null;
   bridgePort?: number;
+  /** Never pruned away: the conversation the person has open. */
+  keepConversationId?: string | null;
 }
 
 export interface IGyredeckPresenceResult {
@@ -548,7 +550,12 @@ export const useGyredeckPresence = ({
   demoMode,
   demoScenario,
   bridgePort = DEFAULT_BRIDGE_PORT,
+  keepConversationId = null,
 }: IGyredeckPresenceOptions): IGyredeckPresenceResult => {
+  // The conversation the person has open is never pruned away (#280 audit).
+  const keepRef = useRef(keepConversationId);
+  keepRef.current = keepConversationId;
+  const prune = (registry: SessionEventRegistry) => pruneSessionEventRegistry(registry, new Date(), keepRef.current);
   const bridgeUrl = bridgeUrlFor(bridgePort);
   const [presence, setPresence] = useState<IGyredeckPresence>(() => createInitialPresence());
   const [recentEvents, setRecentEvents] = useState<GyredeckEvent[]>([]);
@@ -572,15 +579,22 @@ export const useGyredeckPresence = ({
   const registryWriteTimerRef = useRef<number | null>(null);
   const liveEventVersionRef = useRef(0);
 
+  // A save that fails stays pending and is tried again, so a quiet app still gets there.
   const flushRegistryWrite = () => {
     if (registryWriteTimerRef.current !== null) {
       window.clearTimeout(registryWriteTimerRef.current);
       registryWriteTimerRef.current = null;
     }
-    if (!pendingRegistryWriteRef.current) return;
-    writeSessionEventRegistry(pendingRegistryWriteRef.current);
-    persistedRegistryRef.current = pendingRegistryWriteRef.current;
+    const registry = pendingRegistryWriteRef.current;
+    if (!registry) return;
     pendingRegistryWriteRef.current = null;
+    void writeSessionEventRegistry(registry).then((saved) => {
+      if (saved) {
+        persistedRegistryRef.current = registry;
+      } else if (!pendingRegistryWriteRef.current) {
+        scheduleRegistryWrite(registry);
+      }
+    });
   };
 
   // At most one save every two seconds while events arrive, and none before the stored
@@ -605,22 +619,19 @@ export const useGyredeckPresence = ({
       registryLoadedRef.current = true;
       return;
     }
-    void loadSessionEventRegistry().then((stored) => {
+    void loadSessionEventRegistry().then(({ registry: stored, stored: saved }) => {
       if (disposed) return;
       registryLoadedRef.current = true;
-      persistedRegistryRef.current = stored;
-      setSessionEventRegistry((current) =>
-        pruneSessionEventRegistry(mergeSessionEvents(stored, Object.values(current).flat()), new Date()));
+      // Unsaved (a migration whose save failed) stays owed, so the effect below saves it.
+      persistedRegistryRef.current = saved ? stored : null;
+      setSessionEventRegistry((current) => prune(mergeSessionEvents(stored, Object.values(current).flat())));
       setContextUsage((current) => collectContextUsage(current, Object.values(stored).flat()));
     });
     // Old data goes on a quiet app too, not only when an event arrives.
-    const prune = window.setInterval(
-      () => setSessionEventRegistry((current) => pruneSessionEventRegistry(current, new Date())),
-      SESSION_PRUNE_INTERVAL_MS,
-    );
+    const sweep = window.setInterval(() => setSessionEventRegistry(prune), SESSION_PRUNE_INTERVAL_MS);
     return () => {
       disposed = true;
-      window.clearInterval(prune);
+      window.clearInterval(sweep);
     };
   }, []);
 
@@ -642,7 +653,7 @@ export const useGyredeckPresence = ({
     let disposed = false;
     let source: EventSource | null = null;
     const store = (events: GyredeckEvent[]) => {
-      setSessionEventRegistry((current) => pruneSessionEventRegistry(mergeSessionEvents(current, events), new Date()));
+      setSessionEventRegistry((current) => prune(mergeSessionEvents(current, events)));
       setContextUsage((current) => collectContextUsage(current, events));
     };
 
@@ -660,7 +671,7 @@ export const useGyredeckPresence = ({
         // A scenario replaces what is stored, at once, as it always has: the tests that
         // switch scenarios on one page read the registry the last one wrote.
         const next = mergeSessionEvents({}, events);
-        writeSessionEventRegistry(next);
+        void writeSessionEventRegistry(next);
         persistedRegistryRef.current = next;
         setSessionEventRegistry(next);
         setContextUsage(collectContextUsage({}, events));

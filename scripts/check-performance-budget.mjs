@@ -50,14 +50,15 @@ const assetRoot = join(distRoot, "assets");
  * 118,169 / 121,247 (+353 / +351). 118,663 and 121,758 keep the headroom main had.
  *
  * And on 2026-11-02 (#280), by the owner's decision, the same way: the session registry moved
- * to a file (load, migration, ordered saves, pruning of old data) measured 119,075 / 122,154
- * on main's 118,565 / 121,641 (+510 / +513). 119,173 and 122,271 keep main's 98 / 117 bytes.
+ * to a file (load, migration, ordered saves, retried saves, pruning of old data) measured
+ * 119,313 / 122,392 on main's 118,565 / 121,641 (+748 / +751, after its audit round). 119,411
+ * and 122,509 keep main's 98 / 117 bytes.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 119_173,
-  jsTotalGzipBytes: 122_271,
+  jsGzipBytes: 119_411,
+  jsTotalGzipBytes: 122_509,
 };
 
 const walk = async (directory) => {

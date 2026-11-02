@@ -43,18 +43,20 @@ const dropLegacySessionEventRegistry = () => {
 type LoadedSessionRegistry =
   | { state: "absent" }
   | { state: "ok"; revision: number; registry: unknown }
-  | { state: "corrupt"; kept: string };
+  | { state: "corrupt"; kept: string }
+  | { state: "unreadable"; reason: string };
 
 // The desktop app keeps the registry in a file (#280): localStorage was rewritten whole on
 // almost every event and WebKit never checkpointed its WAL. A browser build keeps it in
-// localStorage as before. `revision` orders saves, so a late one never replaces a newer one.
-let registryInFile = false;
-let registryRevision = 0;
+// localStorage as before. In the desktop app with no usable file it is kept in memory only:
+// never localStorage, whose copy a later run would lose to the file.
+let registryStore: "local" | "file" | "memory" = "local";
 let registrySaves: Promise<unknown> = Promise.resolve();
 
+// One window's saves go one after another, so they reach the store in the order they were
+// made; the store numbers them under its own lock.
 const saveToFile = (registry: SessionEventRegistry) => {
-  const revision = ++registryRevision;
-  const saved = registrySaves.then(() => invoke("session_registry_save", { revision, registry }));
+  const saved = registrySaves.then(() => invoke<number>("session_registry_save", { registry }));
   registrySaves = saved.catch(() => undefined);
   return saved;
 };
@@ -65,45 +67,53 @@ const saveToFile = (registry: SessionEventRegistry) => {
  * crash at any step leaves one readable copy. A file that cannot be read was moved aside
  * by the app and is never treated as an empty registry over the old copy.
  */
-export const loadSessionEventRegistry = async (now = new Date()): Promise<SessionEventRegistry> => {
+export const loadSessionEventRegistry = async (now = new Date()): Promise<{ registry: SessionEventRegistry; stored: boolean }> => {
+  const inMemory = (registry: SessionEventRegistry, stored: boolean) => ({ registry, stored });
   if (typeof window.__TAURI_INTERNALS__ === "undefined") {
-    return pruneSessionEventRegistry(readLegacySessionEventRegistry(), now);
+    return inMemory(pruneSessionEventRegistry(readLegacySessionEventRegistry(), now), true);
   }
   let loaded: LoadedSessionRegistry;
   try {
     loaded = await invoke<LoadedSessionRegistry>("session_registry_load");
   } catch {
-    return pruneSessionEventRegistry(readLegacySessionEventRegistry(), now);
+    registryStore = "memory";
+    return inMemory(pruneSessionEventRegistry(readLegacySessionEventRegistry(), now), true);
   }
-  registryInFile = true;
+  if (loaded.state === "unreadable") {
+    registryStore = "memory";
+    return inMemory(pruneSessionEventRegistry(readLegacySessionEventRegistry(), now), true);
+  }
+  registryStore = "file";
   if (loaded.state === "ok" && isSessionEventRegistry(loaded.registry)) {
-    registryRevision = Math.max(registryRevision, loaded.revision);
     dropLegacySessionEventRegistry();
-    return pruneSessionEventRegistry(normalizeSessionEventRegistry(loaded.registry), now);
+    const registry = normalizeSessionEventRegistry(loaded.registry);
+    const pruned = pruneSessionEventRegistry(registry, now);
+    return inMemory(pruned, pruned === registry);
   }
   const legacy = pruneSessionEventRegistry(readLegacySessionEventRegistry(), now);
-  if (Object.keys(legacy).length > 0) {
-    try {
-      await saveToFile(legacy);
-      dropLegacySessionEventRegistry();
-    } catch {
-      // The old copy stays where it is until a save succeeds.
-    }
-  }
-  return legacy;
+  if (Object.keys(legacy).length === 0) return inMemory(legacy, true);
+  // `stored: false` keeps it owed: the presence hook saves it again until a save lands.
+  return inMemory(legacy, await writeSessionEventRegistry(legacy));
 };
 
-/** Save the registry where it was loaded from. */
-export const writeSessionEventRegistry = (registry: SessionEventRegistry) => {
-  if (registryInFile) {
-    void saveToFile(registry).then(dropLegacySessionEventRegistry, () => undefined);
-    return;
+/** Save the registry where it was loaded from; resolves false when the save failed. */
+export const writeSessionEventRegistry = async (registry: SessionEventRegistry): Promise<boolean> => {
+  if (registryStore === "memory") return true;
+  if (registryStore === "file") {
+    try {
+      await saveToFile(registry);
+      dropLegacySessionEventRegistry();
+      return true;
+    } catch {
+      return false;
+    }
   }
   try {
     window.localStorage.setItem(SESSION_EVENTS_STORAGE_KEY, JSON.stringify(registry));
   } catch {
     // The in-memory registry remains available when persistence is unavailable.
   }
+  return true;
 };
 
 const readTimestampRegistry = (

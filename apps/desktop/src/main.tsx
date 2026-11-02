@@ -112,14 +112,14 @@ const getGroupRemovalId = (groupKey: string, group: IWorkspaceSessionGroup) => [
 
 const App = () => {
   const [bridgePort, setBridgePort] = useState(DEFAULT_BRIDGE_PORT);
-  const { capabilities, connection, contextUsage, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO, bridgePort });
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const { capabilities, connection, contextUsage, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO, bridgePort, keepConversationId: selectedSessionId });
   const [usageSettings, setUsageSettings] = useState<IUsageSettings>(readUsageSettings);
   const { refresh: refreshAgentUsage, refreshing: agentUsageRefreshing, usages: agentUsages } = useAgentUsageList(usageSettings, DEMO_MODE);
   const [acknowledgedConversationId, setAcknowledgedConversationId] = useState<string | null>(null);
   const [nativeAction, setNativeAction] = useState<INativeActionState>({ bridgeOnline: null, message: null });
   const [sessionAction, setSessionAction] = useState<ISessionActionState>({ ok: null, message: null });
   const [activeMainTab, setActiveMainTab] = useState<MainPanelTab>("sessions");
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
   const [hookStatus, setHookStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
   // Whether a session may answer its room without being approved each time. Null until

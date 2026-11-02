@@ -1366,10 +1366,9 @@ fn session_registry_load(
 fn session_registry_save(
     app: tauri::AppHandle,
     state: tauri::State<'_, session_store::SessionStoreState>,
-    revision: u64,
     registry: Value,
-) -> Result<(), String> {
-    session_store::save(&session_store_dir(&app)?, &state, revision, &registry)
+) -> Result<u64, String> {
+    session_store::save(&session_store_dir(&app)?, &state, &registry)
 }
 
 /// Hands each usage reading to the bridge, so agents in a room can be told when their own

@@ -44,3 +44,14 @@ test("#288 a signed build claims its own keychain group only, and the team comes
     bundle: { macOS: { entitlements: "/e.plist", files: { "embedded.provisionprofile": "/p.provisionprofile" } } },
   });
 });
+
+test("#288 the signature is read from codesign itself: -dvv shows the authority, -dv does not", { skip: process.platform !== "darwin" }, async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { readFileSync } = await import("node:fs");
+  const script = readFileSync(new URL("../scripts/install-desktop.mjs", import.meta.url), "utf8");
+  assert.match(script, /spawnSync\("codesign", \["-dvv", app\]/, "the install script asks for the authority");
+  const plain = spawnSync("codesign", ["-dv", "/System/Applications/Calculator.app"], { encoding: "utf8" }).stderr;
+  const verbose = spawnSync("codesign", ["-dvv", "/System/Applications/Calculator.app"], { encoding: "utf8" }).stderr;
+  assert.doesNotMatch(plain, /^Authority=/m);
+  assert.match(verbose, /^Authority=/m);
+});

@@ -61,7 +61,8 @@ if (!process.env.TAURI_SIGNING_PRIVATE_KEY) {
 // Signed with the Developer ID when this Mac has it, so the app keeps what it saved in the
 // Keychain across updates (#288). Tauri reads the identity from the environment; the config
 // keeps "-" so a contributor without one can still build.
-const codesignDetails = (app) => spawnSync("codesign", ["-dv", app], { encoding: "utf8" }).stderr ?? "";
+// -dvv: plain -dv prints no Authority lines, so every signature read as not Developer ID.
+const codesignDetails = (app) => spawnSync("codesign", ["-dvv", app], { encoding: "utf8" }).stderr ?? "";
 const picked = pickIdentity(spawnSync("security", ["find-identity", "-v", "-p", "codesigning"], { encoding: "utf8" }).stdout ?? "");
 if (picked.error) {
   console.error(picked.error);

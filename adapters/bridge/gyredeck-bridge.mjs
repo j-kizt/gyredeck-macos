@@ -4275,7 +4275,8 @@ function startBridge(config) {
       provider,
       displayName: typeof body.displayName === "string" ? body.displayName.slice(0, 40) : provider,
       lines,
-      fetchedAt: typeof body.fetchedAt === "string" ? body.fetchedAt : new Date().toISOString(),
+      // A time that is not a date is unknown, never "now": an old reading must not pass as fresh (#206).
+      fetchedAt: body.fetchedAt === undefined ? new Date().toISOString() : typeof body.fetchedAt === "string" && !Number.isNaN(Date.parse(body.fetchedAt)) ? body.fetchedAt : null,
     };
   };
 

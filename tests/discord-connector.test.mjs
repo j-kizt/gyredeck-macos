@@ -2847,6 +2847,18 @@ test("#206 a usage reset time that is not a date is left out, never a crash", as
   await c.close();
 });
 
+test("#206 usage numbers whose read time is unknown are not shown as the current ones", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  const answer = await askStatus(fake, threadId);
+  const [req] = of("status_request");
+  c.handle(roomStatus(req.requestId, { usage: [{ provider: "codex", display: "Codex", lines: [{ label: "Weekly", leftPct: 10, resetsAt: null }], secondsOld: null }] }));
+  await flush();
+  const content = answer.edits[0]?.content ?? "";
+  assert.match(content, /Codex usage \(the provider's, not this member's\): a reading of unknown age, not shown/);
+  assert.doesNotMatch(content, /10% left/);
+  await c.close();
+});
+
 test("#206 a room reconnected while the listing was asked is not shown with the old instance's numbers", async () => {
   const { c, fake, of } = await ownerRoom();
   const answer = await askStatus(fake, "C-GENERAL");

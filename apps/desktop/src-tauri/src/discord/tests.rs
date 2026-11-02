@@ -5047,3 +5047,14 @@ fn c3_a_mark_whose_delete_failed_is_let_go_by_the_next_launch_without_saying_it_
     assert_eq!(held_seqs(&lock(&again.hub), ROOM), vec![1, 2], "the journal's copy only");
     assert!(marks_of(&f).is_none(), "found in the journal, so let go");
 }
+
+#[test]
+fn c5_a_keychain_record_holding_anything_but_a_loss_is_unreadable_never_skipped() {
+    let f = quit_with_failing_loss_write("282-c5-not-loss", Some(QUIT_LOSS_TRIES));
+    let not_a_loss = serde_json::json!({ "marks": [{ "room": ROOM, "at": CREATED, "record": { "t": "close", "id": "x", "reason": "ended", "at": 1 } }] });
+    let bytes = serde_json::to_vec(&not_a_loss).unwrap();
+    *f.losses.bytes.lock().unwrap() = Some(bytes.clone());
+    let next = relaunch(&f);
+    assert!(next.status().journal_errors.get("loss:keychain").is_some_and(|error| error.code == LOSS_UNRECORDED), "{:?}", next.status().journal_errors);
+    assert_eq!(*f.losses.bytes.lock().unwrap(), Some(bytes), "kept as it is");
+}

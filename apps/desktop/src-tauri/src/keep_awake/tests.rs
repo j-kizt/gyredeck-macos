@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Counts what is asked of the power manager, and can refuse an acquire.
 #[derive(Default)]
@@ -130,18 +131,13 @@ fn c7_a_failed_acquire_says_nothing_is_held_and_the_next_input_tries_again() {
 }
 
 #[test]
-fn every_change_is_told_once_and_quit_lets_go() {
+fn quit_lets_go_of_everything() {
     let (s, fake) = state();
-    let told = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&told);
-    s.on_change(Arc::new(move |held| sink.lock().unwrap().push(held)));
     s.set_active(true, false).unwrap();
     s.set_discord_rooms(vec!["sync-ab12".into()]);
-    s.set_discord_rooms(vec!["sync-ab12".into()]);
     s.release_all();
-    let told = told.lock().unwrap();
-    assert_eq!(told.iter().map(|held| held.system).collect::<Vec<_>>(), [false, true, false], "{told:?}");
     assert_eq!(log(&fake), ["+System#1", "-#1"]);
+    assert!(!s.held().system);
 }
 
 #[test]

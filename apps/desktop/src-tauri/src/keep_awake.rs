@@ -3,11 +3,11 @@
 //! Three things may: an agent working (the display stays on, as before), a room followed on
 //! Discord, and a heavy run on the machine. The last two hold only idle *system* sleep — the
 //! display may dim and sleep (the owner, 2026-10-27) — and a closed lid still sleeps whatever
-//! is held. The webview reports only the switch and whether an agent is working; Discord and
-//! the heavy-run watcher report straight to this state, so a hidden or throttled window never
-//! lets the Mac sleep under a room or a run.
+//! is held. The webview reports only the switch and whether an agent is working, and reads
+//! what is held from the answer; Discord and the heavy-run watcher report straight to this
+//! state, so a hidden or throttled window never lets the Mac sleep under a room or a run.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How long a heavy run last seen live still holds the Mac when the bridge cannot be asked:
@@ -122,7 +122,6 @@ struct Inner {
 pub struct KeepAwakeState {
     inner: Mutex<Inner>,
     power: Box<dyn Power>,
-    notify: Mutex<Option<Arc<dyn Fn(Held) + Send + Sync>>>,
 }
 
 impl Default for KeepAwakeState {
@@ -136,14 +135,6 @@ impl KeepAwakeState {
         Self {
             inner: Mutex::new(Inner { inputs: Inputs::default(), display: None, system: None, error: None, last: None, rev: 0 }),
             power,
-            notify: Mutex::new(None),
-        }
-    }
-
-    /// Told every time what is held changes, whichever input changed it.
-    pub(crate) fn on_change(&self, notify: Arc<dyn Fn(Held) + Send + Sync>) {
-        if let Ok(mut slot) = self.notify.lock() {
-            *slot = Some(notify);
         }
     }
 
@@ -192,7 +183,7 @@ impl KeepAwakeState {
     }
 
     fn update(&self, change: impl FnOnce(&mut Inputs)) -> Result<Held, String> {
-        let (held, changed) = {
+        let held = {
             let mut inner = self.inner.lock().map_err(|_| "Keep-awake state lock failed".to_string())?;
             change(&mut inner.inputs);
             let want = wanted(&inner.inputs);
@@ -219,13 +210,8 @@ impl KeepAwakeState {
             inner.rev += u64::from(changed);
             held.rev = inner.rev;
             inner.last = Some(held.clone());
-            (held, changed)
+            held
         };
-        if changed {
-            if let Some(notify) = self.notify.lock().ok().and_then(|slot| slot.clone()) {
-                notify(held.clone());
-            }
-        }
         Ok(held)
     }
 

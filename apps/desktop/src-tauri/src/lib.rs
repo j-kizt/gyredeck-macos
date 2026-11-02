@@ -1349,12 +1349,6 @@ fn set_keep_awake(state: tauri::State<'_, KeepAwakeState>, active: bool, enabled
     state.set_active(enabled.unwrap_or(active), active)
 }
 
-/// What is held and why, for the Settings row (#211, #278); changes arrive as `keep_awake`.
-#[tauri::command]
-fn keep_awake_status(state: tauri::State<'_, KeepAwakeState>) -> keep_awake::Held {
-    state.held()
-}
-
 /// The session-event registry lives in the app's data folder, not localStorage (#280).
 fn session_store_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path().app_data_dir().map_err(|error| format!("no app data folder: {error}"))
@@ -6571,7 +6565,6 @@ pub fn run() {
             request_notification_permission,
             open_notification_settings,
             set_keep_awake,
-            keep_awake_status,
             launch_at_login_enabled,
             set_launch_at_login,
             install_codex_notify,
@@ -6600,12 +6593,6 @@ pub fn run() {
         .invoke_handler(move |invoke| command_handler(invoke))
         .setup(|app| {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-            // What keeps the Mac awake reaches the window as it changes, from whichever input.
-            let handle = app.handle().clone();
-            app.state::<KeepAwakeState>().on_change(std::sync::Arc::new(move |held| {
-                use tauri::Emitter;
-                let _ = handle.emit("keep_awake", held);
-            }));
             let awake = app.handle().clone();
             app.state::<discord::DiscordState>().on_rooms(std::sync::Arc::new(move |rooms| awake.state::<KeepAwakeState>().set_discord_rooms(rooms)));
             notification::initialize();

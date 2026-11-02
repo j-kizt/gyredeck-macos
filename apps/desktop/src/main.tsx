@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { BarChart3, Check, ChevronLeft, Copy, Focus, GitBranch, List, Server, Settings, Trash2 } from "lucide-react";
 import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState, type ErrorInfo, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
@@ -65,6 +64,7 @@ const LocalServicesPanel = lazy(async () => {
   return { default: module.LocalServicesPanel };
 });
 const KEEP_AWAKE_RETRY_DELAYS_MS = [750, 2_500] as const;
+const KEEP_AWAKE_BEAT_MS = 5_000;
 
 /** What Rust holds and why (#211, #278); `rev` rises with every change. */
 interface IKeepAwakeHeld {
@@ -146,7 +146,7 @@ const App = () => {
   // What Rust says it holds and why: a Discord room or a heavy run holds the Mac without the window (#211, #278).
   // Rust's word on what is held is the whole truth, a failure in the background included.
   const [keepAwakeHeld, setKeepAwakeHeld] = useState<IKeepAwakeHeld>();
-  // The newest by rev wins: a command's answer, an event and a snapshot are each Rust's word.
+  // The newest by rev wins, should two answers ever cross.
   const takeKeepAwake = (next: IKeepAwakeHeld) => setKeepAwakeHeld((held) => (held && held.rev > next.rev ? held : next));
   const [terminal, setTerminal] = useState<TerminalChoice>(readTerminalChoice);
   const [expandedSessionGroupKeys, setExpandedSessionGroupKeys] = useState<Set<string>>(() => new Set());
@@ -485,24 +485,22 @@ const App = () => {
     let cancelled = false;
     let retryTimer: number | null = null;
     const requestedActive = keepAwakeEnabled && hasWorkingActivity;
-    // Rust answered: whatever it refused is in its answer, and the UI has no error of its own.
-    let answered = false;
+    // Each call answers with what Rust holds, a refusal included, so the UI's own error is only
+    // a call that went unanswered. Sent again on a beat: a call that never arrived is made good,
+    // and what a Discord room or a heavy run changed since is read with it (#211, #278).
     const syncNativeState = (attempt: number) => {
       const request = keepAwakeRequestRef.current
         .catch(() => undefined)
         .then(() => invoke<IKeepAwakeHeld | boolean>("set_keep_awake", { active: requestedActive, enabled: keepAwakeEnabled }))
         .then((answer) => {
-          const held = typeof answer === "object" && answer ? answer : null;
-          if (held) {
-            answered = true;
-            takeKeepAwake(held);
+          if (typeof answer === "object" && answer) {
+            takeKeepAwake(answer);
+            return answer.display;
           }
-          const active = held ? held.display : answer === true;
-          // A refusal Rust answered with is already shown from its answer: retried, not an IPC error.
-          if (active !== requestedActive) {
+          if (answer !== requestedActive) {
             throw new Error("Native keep-awake state did not match the requested state");
           }
-          return active;
+          return answer;
         });
       keepAwakeRequestRef.current = request;
       void request
@@ -519,27 +517,19 @@ const App = () => {
             return;
           }
           setKeepAwakeActive(false);
-          setKeepAwakeError(answered ? null : error instanceof Error ? error.message : String(error || "Keep awake unavailable"));
+          setKeepAwakeError(error instanceof Error ? error.message : String(error || "Keep awake unavailable"));
         });
     };
     setKeepAwakeError(null);
     syncNativeState(0);
+    const beat = window.setInterval(() => syncNativeState(KEEP_AWAKE_RETRY_DELAYS_MS.length), KEEP_AWAKE_BEAT_MS);
 
     return () => {
       cancelled = true;
+      window.clearInterval(beat);
       if (retryTimer !== null) window.clearTimeout(retryTimer);
     };
   }, [canUseNativeControls, hasWorkingActivity, keepAwakeEnabled]);
-
-  useEffect(() => {
-    if (!canUseNativeControls) return undefined;
-    // The newest by rev wins, so a snapshot answered late never overwrites a later event; it
-    // is asked for once the listener is in, so no change falls between the two.
-    // Asked whether or not the listener could be installed; the rev keeps the newest.
-    const unlisten = listen<IKeepAwakeHeld>("keep_awake", (event) => takeKeepAwake(event.payload)).catch(() => {});
-    invoke<IKeepAwakeHeld>("keep_awake_status").then(takeKeepAwake, () => {});
-    return () => { unlisten.then((stop) => stop?.()); };
-  }, [canUseNativeControls]);
 
   const setupGuidance = (() => {
     if (!canUseNativeControls) {

@@ -2712,30 +2712,6 @@ impl SseParser {
 
 // ── the real dependencies ──
 
-/// Delete any item under this name, then create a fresh one. `set_generic_password` updates an
-/// existing item in place, keeping its access list — and an item another process of this user
-/// planted could carry an open one. A fresh item is this app's, with its own access list.
-/// What remains: such a process can still delete and replant the item while the app is not
-/// running, and this API cannot say who created an item it reads. Nor is delete-then-set
-/// atomic: a crash between the two leaves no item; the next launch reads the Keychain again
-/// and is honest about it, at the cost of one more token entry or pairing.
-#[cfg(target_os = "macos")]
-fn replace_keychain_item(account: &str, value: &[u8]) -> Result<(), security_framework::base::Error> {
-    let previous = security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, account).ok();
-    match security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, account) {
-        Ok(()) => {}
-        Err(error) if error.code() == -25300 => {}
-        Err(error) => return Err(error),
-    }
-    security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE, account, value).inspect_err(|_| {
-        // The new value did not land: put the old one back, best effort. The caller reads the
-        // Keychain again either way, so what the app believes is what is there.
-        if let Some(previous) = previous.as_deref() {
-            let _ = security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE, account, previous);
-        }
-    })
-}
-
 /// One value in the team's data-protection keychain group (#288).
 #[cfg(target_os = "macos")]
 struct TeamSlot(&'static str);
@@ -2769,25 +2745,79 @@ impl secrets::Slot for TeamSlot {
     }
 }
 
-/// The same name in the file keychain, where ad-hoc builds kept it before #288.
+/// The same name in the file keychain, where ad-hoc builds kept it before #288. Only the
+/// `SecKeychain*` calls reach it alone: for a build with a keychain access group, a `SecItem*`
+/// query without the data-protection flag reaches the team's item too, and the first version
+/// of this deleted the token it had just saved (found by the migration test on real builds).
 #[cfg(target_os = "macos")]
 struct FileSlot(&'static str);
 
 #[cfg(target_os = "macos")]
+mod file_keychain {
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SecKeychainFindGenericPassword(
+            keychains: *const c_void,
+            service_len: u32,
+            service: *const c_char,
+            account_len: u32,
+            account: *const c_char,
+            password_len: *mut u32,
+            password: *mut *mut c_void,
+            item: *mut *mut c_void,
+        ) -> i32;
+        fn SecKeychainItemDelete(item: *mut c_void) -> i32;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(object: *const c_void);
+    }
+
+    /// Delete the item without asking for its data, so no ACL prompt; macOS answers for itself.
+    pub(super) fn delete(service: &str, account: &str) -> Result<(), i32> {
+        let mut item: *mut c_void = std::ptr::null_mut();
+        // SAFETY: lengths match the buffers; no password is requested; the item is released below.
+        let found = unsafe {
+            SecKeychainFindGenericPassword(
+                std::ptr::null(),
+                service.len() as u32,
+                service.as_ptr().cast(),
+                account.len() as u32,
+                account.as_ptr().cast(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut item,
+            )
+        };
+        if found != 0 {
+            return Err(found);
+        }
+        // SAFETY: `item` is the reference macOS just returned, released exactly once.
+        let deleted = unsafe { SecKeychainItemDelete(item) };
+        unsafe { CFRelease(item.cast_const()) };
+        if deleted == 0 { Ok(()) } else { Err(deleted) }
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl secrets::Slot for FileSlot {
     fn read(&self) -> Result<Option<Vec<u8>>, i32> {
-        match security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, self.0) {
-            Ok(bytes) => Ok(Some(bytes)),
+        match security_framework::os::macos::passwords::find_generic_password(None, KEYCHAIN_SERVICE, self.0) {
+            Ok((password, _)) => Ok(Some(password.to_vec())),
             Err(error) if error.code() == secrets::NOT_FOUND => Ok(None),
             Err(error) => Err(error.code()),
         }
     }
     fn write(&self, value: &[u8]) -> Result<(), i32> {
-        replace_keychain_item(self.0, value).map_err(|error| error.code())
+        let keychain = security_framework::os::macos::keychain::SecKeychain::default().map_err(|error| error.code())?;
+        keychain.set_generic_password(KEYCHAIN_SERVICE, self.0, value).map_err(|error| error.code())
     }
     fn delete(&self) -> Result<(), i32> {
-        match security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, self.0) {
-            Err(error) if error.code() != secrets::NOT_FOUND => Err(error.code()),
+        match file_keychain::delete(KEYCHAIN_SERVICE, self.0) {
+            Err(code) if code != secrets::NOT_FOUND => Err(code),
             _ => Ok(()),
         }
     }

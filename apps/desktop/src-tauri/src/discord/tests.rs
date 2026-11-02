@@ -5050,7 +5050,8 @@ fn c3_a_mark_whose_delete_failed_is_let_go_by_the_next_launch_without_saying_it_
 
 #[test]
 fn c5_a_keychain_record_holding_anything_but_a_loss_is_unreadable_never_skipped() {
-    let f = quit_with_failing_loss_write("282-c5-not-loss", Some(QUIT_LOSS_TRIES));
+    let f = quit_with_both_loss_writes_refused("282-c5-not-loss");
+    assert!(!journal_path(&f).join(format!("{ROOM}@{CREATED}.loss")).exists(), "premise: both disk writes refused");
     let not_a_loss = serde_json::json!({ "marks": [{ "room": ROOM, "at": CREATED, "record": { "t": "close", "id": "x", "reason": "ended", "at": 1 } }] });
     let bytes = serde_json::to_vec(&not_a_loss).unwrap();
     *f.losses.bytes.lock().unwrap() = Some(bytes.clone());

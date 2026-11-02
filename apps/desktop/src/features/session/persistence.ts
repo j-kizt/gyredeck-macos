@@ -85,13 +85,19 @@ export const loadSessionEventRegistry = async (now = new Date()): Promise<Loaded
     return { ready: false, problem: String(error) };
   }
   if (loaded.state === "unreadable") return { ready: false, problem: loaded.reason };
-  registryStore = "file";
-  if (loaded.state === "ok" && isSessionEventRegistry(loaded.registry)) {
+  if (loaded.state === "ok") {
+    // The store checks the same shape; an answer this side cannot accept is never replaced
+    // by the old copy — it is treated as unreadable, and nothing is saved (#280 audit).
+    if (!isSessionEventRegistry(loaded.registry)) {
+      return { ready: false, problem: "the stored session history is not in a shape this version reads" };
+    }
+    registryStore = "file";
     dropLegacySessionEventRegistry();
     const registry = normalizeSessionEventRegistry(loaded.registry);
     const pruned = pruneSessionEventRegistry(registry, now);
     return inMemory(pruned, pruned === registry);
   }
+  registryStore = "file";
   const legacy = pruneSessionEventRegistry(readLegacySessionEventRegistry(), now);
   if (Object.keys(legacy).length === 0) return inMemory(legacy, true);
   // `stored: false` keeps it owed: the presence hook saves it again until a save lands.

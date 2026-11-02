@@ -8,7 +8,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 const KEY = "gyredeck.session-events";
 
-type Mode = { load: "absent" | "ok" | "corrupt" | "unreadable" | "throws"; loadFailures?: number; failFirstSave?: boolean; failSaves?: number; saveDelayMs?: number; firstSaveDelayMs?: number };
+type Mode = { load: "absent" | "ok" | "okBadShape" | "corrupt" | "unreadable" | "throws"; loadFailures?: number; failFirstSave?: boolean; failSaves?: number; saveDelayMs?: number; firstSaveDelayMs?: number };
 
 const event = (conversationId: string, message: string) => ({
   version: 2,
@@ -55,6 +55,7 @@ const open = async (page: Page, mode: Mode, legacy: Record<string, unknown[]> | 
             log.push({ at: performance.now(), what: "load" });
             if (loads <= (mode.loadFailures ?? 0)) throw new Error("app data folder busy");
             if (mode.load === "ok") return { state: "ok", revision: 7, registry: fileRegistry };
+            if (mode.load === "okBadShape") return { state: "ok", revision: 7, registry: { "file-conv": [{ id: "e", timestamp: new Date().toISOString() }] } };
             if (mode.load === "corrupt") return { state: "corrupt", kept: "/tmp/session-events.corrupt-1.json" };
             if (mode.load === "unreadable") return { state: "unreadable", reason: "permission denied" };
             if (mode.load === "throws") throw new Error("no app data folder");
@@ -203,4 +204,16 @@ test("a slow save that fails never brings an older registry back over a newer on
   const done = (await log(page)).filter((entry) => entry.what === "save done").map((entry) => entry.detail?.count ?? 0);
   expect(done.length).toBeGreaterThan(1);
   expect(done, "what is kept never shrinks").toEqual([...done].sort((a, b) => a - b));
+});
+
+test("a stored registry this version cannot read is never replaced by the old copy: nothing is saved, and the sessions tab says so", async ({ page }) => {
+  const legacy = { "legacy-conv": [event("legacy-conv", "From localStorage")] };
+  await open(page, { load: "okBadShape" }, legacy);
+  await expect(page.getByRole("status").filter({ hasText: "Session history is not being saved" })).toBeVisible();
+  await page.waitForTimeout(3_000);
+  const entries = await log(page);
+  expect(entries.map((entry) => entry.what)).not.toContain("save");
+  expect(entries.map((entry) => entry.what)).not.toContain("localStorage.removeItem");
+  expect(entries.map((entry) => entry.what)).not.toContain("localStorage.setItem");
+  expect(JSON.parse((await page.evaluate((key) => localStorage.getItem(key), KEY)) ?? "null")).toEqual(legacy);
 });

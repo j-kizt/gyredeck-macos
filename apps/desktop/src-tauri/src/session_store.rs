@@ -47,6 +47,21 @@ struct Inner {
     blocked: Option<String>,
 }
 
+/// The registry's shape, the same rule the app's `isSessionEventRegistry` applies: an object
+/// of arrays of events, each with a string `id`, `timestamp` and `conversationId`. A file the
+/// app would refuse is not accepted here either, so the two never disagree (#280 audit).
+pub(crate) fn is_registry(value: &Value) -> bool {
+    value.as_object().is_some_and(|conversations| {
+        conversations.values().all(|events| {
+            events.as_array().is_some_and(|events| {
+                events.iter().all(|event| {
+                    ["id", "timestamp", "conversationId"].iter().all(|key| event.get(key).is_some_and(Value::is_string))
+                })
+            })
+        })
+    })
+}
+
 fn file_in(dir: &Path) -> PathBuf {
     dir.join(FILE_NAME)
 }
@@ -88,7 +103,7 @@ pub fn load(dir: &Path, state: &SessionStoreState) -> Loaded {
     let parsed = serde_json::from_str::<Value>(&text).ok().and_then(|value| {
         let revision = value.get("revision")?.as_u64()?;
         let registry = value.get("registry")?.clone();
-        registry.is_object().then_some((revision, registry))
+        is_registry(&registry).then_some((revision, registry))
     });
     match parsed {
         Some((revision, registry)) => {
@@ -112,8 +127,8 @@ pub fn load(dir: &Path, state: &SessionStoreState) -> Loaded {
 /// this store's, taken under its lock, so saves are ordered as they arrive and two windows
 /// can never mint the same one.
 pub fn save(dir: &Path, state: &SessionStoreState, registry: &Value) -> Result<u64, String> {
-    if !registry.is_object() {
-        return Err("the registry is not an object".to_string());
+    if !is_registry(registry) {
+        return Err("the registry is not a session-event registry".to_string());
     }
     let mut inner = state.inner.lock().map_err(|_| "session store lock failed".to_string())?;
     if let Some(reason) = &inner.blocked {
@@ -158,6 +173,10 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use std::thread;
+
+    fn ev(id: &str) -> Value {
+        json!({ "id": id, "timestamp": "2026-11-02T00:00:00.000Z", "conversationId": "c" })
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("gyredeck-session-store-{name}-{}", std::process::id()));
@@ -218,11 +237,21 @@ mod tests {
     }
 
     #[test]
+    fn a_registry_the_app_would_refuse_is_never_saved() {
+        let dir = scratch("refuse");
+        let state = SessionStoreState::default();
+        for bad in [json!({ "c": [{ "id": "e", "timestamp": "t" }] }), json!({ "c": {} }), json!({ "c": [1] }), json!([])] {
+            assert!(save(&dir, &state, &bad).is_err(), "{bad}");
+        }
+        assert!(!file_in(&dir).exists());
+    }
+
+    #[test]
     fn reads_and_writes_are_capped() {
         let dir = scratch("cap");
         let big = "x".repeat(MAX_BYTES as usize + 1);
         let state = SessionStoreState::default();
-        assert!(save(&dir, &state, &json!({ "c": [big] })).is_err(), "an oversized save is refused");
+        assert!(save(&dir, &state, &json!({ "c": [ev(&big)] })).is_err(), "an oversized save is refused");
         fs::write(file_in(&dir), format!(r#"{{"revision":1,"registry":{{"c":["{}"]}}}}"#, "x".repeat(MAX_BYTES as usize))).unwrap();
         assert!(matches!(load(&dir, &state), Loaded::Unreadable { .. }), "an oversized file is not read");
     }
@@ -232,9 +261,9 @@ mod tests {
         let dir = scratch("roundtrip");
         let state = SessionStoreState::default();
         assert_eq!(load(&dir, &state), Loaded::Absent);
-        assert_eq!(save(&dir, &state, &json!({ "c1": [{ "id": "e1" }] })).unwrap(), 1);
+        assert_eq!(save(&dir, &state, &json!({ "c1": [ev("e1")] })).unwrap(), 1);
         let fresh = SessionStoreState::default();
-        assert_eq!(load(&dir, &fresh), Loaded::Ok { revision: 1, registry: json!({ "c1": [{ "id": "e1" }] }) });
+        assert_eq!(load(&dir, &fresh), Loaded::Ok { revision: 1, registry: json!({ "c1": [ev("e1")] }) });
         let names: Vec<_> = fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name()).collect();
         assert_eq!(names, [FILE_NAME], "no temporary file left");
     }
@@ -257,7 +286,7 @@ mod tests {
         let saves: Vec<_> = (0..20)
             .map(|n| {
                 let (dir, state) = (Arc::clone(&dir), Arc::clone(&state));
-                thread::spawn(move || save(&dir, &state, &json!({ "n": [n] })).unwrap())
+                thread::spawn(move || save(&dir, &state, &json!({ "n": [ev(&n.to_string())] })).unwrap())
             })
             .collect();
         let mut revisions: Vec<u64> = saves.into_iter().map(|save| save.join().unwrap()).collect();
@@ -283,7 +312,13 @@ mod tests {
 
     #[test]
     fn an_unreadable_file_is_moved_aside_and_reported_never_read_as_empty() {
-        for (name, text) in [("trunc", "{\"revision\":3,\"regi"), ("shape", "{\"revision\":3,\"registry\":[]}"), ("norev", "{\"registry\":{}}")] {
+        for (name, text) in [
+            ("trunc", "{\"revision\":3,\"regi"),
+            ("shape", "{\"revision\":3,\"registry\":[]}"),
+            ("norev", "{\"registry\":{}}"),
+            ("event", "{\"revision\":3,\"registry\":{\"c\":[{\"id\":\"e\",\"timestamp\":\"t\"}]}}"),
+            ("events", "{\"revision\":3,\"registry\":{\"c\":{\"id\":\"e\"}}}"),
+        ] {
             let dir = scratch(name);
             fs::write(file_in(&dir), text).unwrap();
             let loaded = load(&dir, &SessionStoreState::default());

@@ -4877,3 +4877,80 @@ fn an_owner_record_that_cannot_be_read_is_an_error_never_no_owner() {
         assert!(owner_record(Some(bad.to_vec())).is_err(), "{}", String::from_utf8_lossy(bad));
     }
 }
+
+// ---- #206 /status: asked by the child, answered by the app from what it holds ----
+
+fn status_ask(f: &Fixture, buffer: &SharedBuf, json: String) -> Vec<serde_json::Value> {
+    let before = of_kind(&buffer.lines(), "status").len();
+    on_core_event(&f.state.core, serde_json::from_str::<FromChild>(&json).expect("a status request parses"));
+    wait_until("the status answer", || of_kind(&buffer.lines(), "status").len() > before);
+    of_kind(&buffer.lines(), "status").into_iter().skip(before).cloned().collect()
+}
+
+#[test]
+fn status_in_a_post_answers_that_room_instance_with_its_agents_and_what_they_last_did() {
+    let f = fixture_owned("status-room", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.members(ROOM, &[("founder-1", "Claude Code / Gyre Assistant"), ("peer-a", "Codex / Gyre Audit"), (relay_member(ROOM).as_str(), "Discord")]);
+    // Heard before this Connect: not known to hold now, so "not heard from since connect".
+    lock(&f.state.hub).note_presence("founder-1", "turn_complete", Instant::now());
+    thread::sleep(Duration::from_millis(5));
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let created = lock(&f.state.hub).rooms[ROOM].created_at.unwrap();
+    lock(&f.state.hub).note_presence("peer-a", "tool_start", Instant::now());
+    let answers = status_ask(&f, &buffer, format!(r#"{{"t":"status_request","requestId":"r1","ownerId":"{OWNER_ID}","channelId":"{THREAD}","threadId":"{THREAD}","room":"{ROOM}","createdAt":{created}}}"#));
+    let room = &answers[0]["room"];
+    assert_eq!(answers[0]["requestId"], "r1");
+    assert_eq!(room["room"], ROOM);
+    let members: Vec<(String, String)> = room["members"].as_array().unwrap().iter().map(|m| (m["name"].as_str().unwrap().to_string(), m["state"].as_str().unwrap().to_string())).collect();
+    assert_eq!(members, vec![("Claude Code / Gyre Assistant".to_string(), "unknown".to_string()), ("Codex / Gyre Audit".to_string(), "working".to_string())], "the agents only, never the relay");
+    assert!(room["usage"].is_array());
+}
+
+#[test]
+fn status_is_refused_to_anyone_but_the_keychain_owner_and_for_a_post_or_instance_that_is_not_current() {
+    let f = fixture_owned("status-refused", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let created = lock(&f.state.hub).rooms[ROOM].created_at.unwrap();
+    for (json, why) in [
+        (format!(r#"{{"t":"status_request","requestId":"a","ownerId":"999999999999999999","channelId":"{THREAD}","threadId":"{THREAD}","room":"{ROOM}","createdAt":{created}}}"#), "another person"),
+        (format!(r#"{{"t":"status_request","requestId":"b","ownerId":"{OWNER_ID}","channelId":"{OTHER_THREAD}","threadId":"{OTHER_THREAD}","room":"{ROOM}","createdAt":{created}}}"#), "another post"),
+        (format!(r#"{{"t":"status_request","requestId":"c","ownerId":"{OWNER_ID}","channelId":"{THREAD}","threadId":"{THREAD}","room":"{ROOM}","createdAt":{}}}"#, created + 1), "another instance"),
+        (format!(r#"{{"t":"status_request","requestId":"d","ownerId":"999999999999999999","channelId":"C1"}}"#), "another person, every room"),
+    ] {
+        let answers = status_ask(&f, &buffer, json);
+        let last = answers.last().unwrap();
+        assert!(last["error"].is_string(), "{why}: {last}");
+        assert!(last.get("room").is_none_or(serde_json::Value::is_null) && last.get("rooms").is_none_or(serde_json::Value::is_null), "{why}: nothing about any room");
+    }
+}
+
+#[test]
+fn status_outside_a_post_lists_every_connected_room_with_its_agents_counted() {
+    let f = fixture_owned("status-all", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.members(ROOM, &[("founder-1", "Claude Code"), ("peer-a", "Codex"), (relay_member(ROOM).as_str(), "Discord")]);
+    f.acts.founded.lock().unwrap().push(OTHER.to_string());
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.state.connect(OTHER, "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6").unwrap();
+    let answers = status_ask(&f, &buffer, format!(r#"{{"t":"status_request","requestId":"all","ownerId":"{OWNER_ID}","channelId":"C1"}}"#));
+    let mut rooms: Vec<(String, u64)> = answers[0]["rooms"].as_array().unwrap().iter().map(|r| (r["room"].as_str().unwrap().to_string(), r["members"].as_u64().unwrap())).collect();
+    rooms.sort();
+    let mut expected = vec![(ROOM.to_string(), 2), (OTHER.to_string(), 0)];
+    expected.sort();
+    assert_eq!(rooms, expected);
+    assert_eq!(answers[0]["hiddenRooms"], 0);
+}
+
+#[test]
+fn status_with_the_owner_record_unreadable_answers_nothing_about_any_room() {
+    let f = fixture_built("status-keychain", Some(TOKEN), &[], the_owner(), true);
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    let answers = status_ask(&f, &buffer, format!(r#"{{"t":"status_request","requestId":"k","ownerId":"{OWNER_ID}","channelId":"C1"}}"#));
+    assert!(answers[0]["error"].as_str().unwrap().contains("Keychain"), "{}", answers[0]);
+    assert!(answers[0].get("rooms").is_none_or(serde_json::Value::is_null));
+}

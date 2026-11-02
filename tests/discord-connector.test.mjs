@@ -1860,7 +1860,7 @@ test("#205 the owner voice's own messages coming back from the room are not rela
 
 test("#205 /disconnect is registered as a guild command with no option: it acts on its post's room only", async () => {
   const { c, fake } = await boot({ ownerId: OWNER });
-  assert.deepEqual(fake.commands, [{ name: "disconnect", description: "Stop following this room in Discord (the room stays open)" }]);
+  assert.deepEqual(fake.commands.find((d) => d.name === "disconnect"), { name: "disconnect", description: "Stop following this room in Discord (the room stays open)" });
   await c.close();
 });
 
@@ -2640,4 +2640,186 @@ test("#205 audit: a say saved under one owner is never sent again under another"
   assert.equal(again[0].discordMessageId, id);
   assert.equal(again[0].ownerId, OWNER, "it carries the owner who typed it, so the app's Keychain check refuses it");
   await second.c.close();
+});
+
+// ---- #206 /status: answered from what the app holds, to the paired owner only ----
+
+const askStatus = async (fake, channelId, userId = OWNER) => {
+  fake.command({ name: "status", userId, channelId });
+  await flush();
+  return fake.interactions.at(-1);
+};
+const roomStatus = (requestId, extra = {}) => ({
+  t: "status",
+  requestId,
+  room: {
+    room: "sync-abcd",
+    createdAt: 1,
+    members: [
+      { name: "Codex / Gyre Audit", state: "working", secondsAgo: 120 },
+      { name: "Claude Code / @everyone **bold**", state: "unknown" },
+    ],
+    hiddenMembers: 0,
+    usage: [{ provider: "codex", display: "Codex", lines: [{ label: "Weekly", leftPct: 10, resetsAt: "2026-11-05T03:09:00.000Z" }], secondsOld: 300 }],
+    ...extra,
+  },
+});
+
+test("#206 /status in a connected room's post: deferred, asked of the app for that room instance, answered with members, what they last did and the provider's usage", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  const answer = await askStatus(fake, threadId);
+  assert.deepEqual(answer.deferred, { ephemeral: true }, "only the owner sees it");
+  const [req] = of("status_request");
+  assert.deepEqual({ ...req, requestId: typeof req.requestId }, { t: "status_request", requestId: "string", ownerId: OWNER, channelId: threadId, threadId, room: "sync-abcd", createdAt: 1 });
+  c.handle(roomStatus(req.requestId));
+  await flush();
+  const [edit] = answer.edits;
+  assert.deepEqual(edit.allowedMentions, { parse: [] });
+  assert.match(edit.content, /Codex \/ Gyre Audit — working, 2 min ago/);
+  assert.match(edit.content, /not heard from since connect/);
+  assert.match(edit.content, /\\@everyone \\\*\\\*bold\\\*\\\*/, "names are shown as text, never as a ping or formatting");
+  assert.match(edit.content, /Codex usage \(the provider's, not this member's\): Weekly 10% left, resets/);
+  assert.match(edit.content, /read 5 min ago/);
+  assert.deepEqual([of("say"), fake.sent.slice(-1)[0]?.content?.includes("Weekly") ? ["posted"] : []], [[], []], "nothing goes into the room or its post");
+  await c.close();
+});
+
+test("#206 /status outside any post lists the rooms the app says are connected, with members and needs you as they are now", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  c.handle(message("sync-abcd", 1, { kind: "ask", to: "Owner", toOwner: true, senderId: "conv-gyre" }));
+  await flush();
+  const answer = await askStatus(fake, "C-GENERAL");
+  const [req] = of("status_request");
+  assert.equal(req.room, undefined, "no room: every connected one");
+  assert.equal(req.threadId, undefined);
+  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 2 }], hiddenRooms: 0 });
+  await flush();
+  assert.equal(answer.edits[0].content, "sync-abcd · 2 members · needs you");
+  void threadId;
+  await c.close();
+});
+
+test("#206 /status from another person, or in a post whose room is no longer connected, is refused and asks the app nothing", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  await askStatus(fake, threadId, "U-STRANGER");
+  assert.match(fake.replies.at(-1).content, /Only the paired owner/);
+  assert.equal(fake.replies.at(-1).ephemeral, true);
+  c.handle({ t: "disconnect", room: "sync-abcd", reason: "disconnected", id: "close-1" });
+  await flush();
+  await askStatus(fake, threadId);
+  assert.match(fake.replies.at(-1).content, /not a connected room's post/, "an old post never falls through to the list of every room");
+  assert.deepEqual(of("status_request"), []);
+  await c.close();
+});
+
+test("#206 two /status at once each get their own answer; one that never comes says so", async () => {
+  const { c, fake, of, clock, threadId } = await ownerRoom();
+  const first = await askStatus(fake, threadId);
+  const second = await askStatus(fake, "C-GENERAL");
+  const [a, b] = of("status_request");
+  c.handle({ t: "status", requestId: b.requestId, rooms: [{ room: "sync-abcd", members: 1 }], hiddenRooms: 0 });
+  c.handle({ t: "status", requestId: "unknown", rooms: [], hiddenRooms: 0 });
+  await flush();
+  assert.equal(second.edits[0].content, "sync-abcd · 1 member");
+  assert.deepEqual(first.edits, []);
+  await clock.advance(11_000);
+  assert.equal(first.edits[0].content, "Status is not available right now.");
+  c.handle(roomStatus(a.requestId));
+  await flush();
+  assert.equal(first.edits.length, 1, "a late answer is not shown after the timeout said so");
+  await c.close();
+});
+
+test("#206 an answer for a room that disconnected or reconnected meanwhile is not shown as current", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  const gone = await askStatus(fake, threadId);
+  const [req] = of("status_request");
+  c.handle({ t: "disconnect", room: "sync-abcd", reason: "disconnected", id: "close-1" });
+  await flush();
+  c.handle(roomStatus(req.requestId));
+  await flush();
+  assert.equal(gone.edits[0].content, "That room is no longer connected.");
+  await c.close();
+});
+
+test("#206 the listing drops a room disconnected while it was asked, and says how many it did not show", async () => {
+  const { c, fake, of } = await ownerRoom();
+  const answer = await askStatus(fake, "C-GENERAL");
+  const [req] = of("status_request");
+  const rooms = Array.from({ length: 30 }, (_, i) => ({ room: `sync-${String(i).padStart(4, "0")}`, members: 1 }));
+  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 1 }, ...rooms.slice(0, 24)], hiddenRooms: 6 });
+  await flush();
+  const text = answer.edits[0].content;
+  assert.match(text, /^sync-abcd · 1 member/);
+  assert.doesNotMatch(text, /sync-0000/, "a room this child no longer follows is not shown as connected");
+  assert.match(text, /…and 6 more rooms not shown/, "the hidden count is what the app held back; a room no longer connected is not a hidden one");
+  await c.close();
+});
+
+test("#206 /status in a DM to the bot lists every connected room, as outside a post", async () => {
+  const { c, fake, of } = await ownerRoom();
+  fake.command({ name: "status", userId: OWNER, channelId: "DM-1", dm: true, inThread: false });
+  await flush();
+  const answer = fake.interactions.at(-1);
+  const [req] = of("status_request");
+  assert.equal(req.room, undefined);
+  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 2 }], hiddenRooms: 0 });
+  await flush();
+  assert.equal(answer.edits[0].content, "sync-abcd · 2 members");
+  await c.close();
+});
+
+test("#206 /status is registered for the server and for a DM to the bot; /disconnect only in the server", async () => {
+  const { c, fake } = await boot({ ownerId: OWNER });
+  const status = fake.commands.find((d) => d.name === "status");
+  assert.ok(status, "registered");
+  assert.equal(status.dm, true, "usable in a DM to the bot");
+  assert.notEqual(fake.commands.find((d) => d.name === "disconnect").dm, true);
+  await c.close();
+});
+
+test("#206 a provider with no reading says so, and an old reading says how old; nothing is made up", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  const answer = await askStatus(fake, threadId);
+  const [req] = of("status_request");
+  c.handle(roomStatus(req.requestId, { usage: [
+    { provider: "claude", display: "Claude", lines: null, secondsOld: null },
+    { provider: "codex", display: "Codex", lines: [{ label: "Weekly", leftPct: 40, resetsAt: null }], secondsOld: 3 * 3600 },
+  ] }));
+  await flush();
+  const text = answer.edits[0].content;
+  assert.match(text, /Claude usage[^\n]*: no reading yet/);
+  assert.match(text, /Codex usage[^\n]*: Weekly 40% left[^\n]*read 3 h ago/);
+  assert.doesNotMatch(text, /Claude usage[^\n]*%/);
+  await c.close();
+});
+
+test("#206 needs you is read when the answer is shown, not when it was asked", async () => {
+  const { c, fake, of } = await ownerRoom();
+  const answer = await askStatus(fake, "C-GENERAL");
+  const [req] = of("status_request");
+  c.handle(message("sync-abcd", 1, { kind: "ask", to: "Owner", toOwner: true, senderId: "conv-gyre" }));
+  await flush();
+  c.handle({ t: "status", requestId: req.requestId, rooms: [{ room: "sync-abcd", members: 2 }], hiddenRooms: 0 });
+  await flush();
+  assert.equal(answer.edits[0].content, "sync-abcd · 2 members · needs you", "set while it was asked: shown");
+  await c.close();
+});
+
+test("discord.js adapter: /status goes to the app's global commands for the server and DMs; a command says whether it came from a DM or a thread", async () => {
+  const { discord, client } = await adapterWith(fakeForum({ tags: [] }));
+  const guildSets = [];
+  const globalSets = [];
+  client.guilds = { cache: new Map([["G1", { commands: { set: async (d) => guildSets.push(d) } }]]) };
+  client.application = { commands: { set: async (d) => globalSets.push(d) } };
+  await discord.registerCommands([{ name: "disconnect", description: "d" }, { name: "status", description: "s", dm: true }]);
+  assert.deepEqual(guildSets.at(-1).map((d) => d.name), ["disconnect"]);
+  assert.deepEqual(globalSets.at(-1), [{ name: "status", description: "s", contexts: [0, 1], integration_types: [0] }]);
+  const got = [];
+  discord.on("command", (x) => got.push(x));
+  const interaction = (extra) => ({ isChatInputCommand: () => true, commandName: "status", user: { id: OWNER }, channelId: "C9", ...extra });
+  client.emit("interactionCreate", interaction({ guildId: null, channel: { isThread: () => false } }));
+  client.emit("interactionCreate", interaction({ guildId: "G1", channel: { isThread: () => true } }));
+  await flush();
+  assert.deepEqual(got.map((x) => [x.dm, x.inThread]), [[true, false], [false, true]]);
 });

@@ -61,8 +61,11 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
   let client = null;
   let commands = null;
 
+  // A command marked `dm` is the app's global one, usable in the server and in a DM to the bot
+  // (#206); the rest are set per server, as before. The mark itself is never sent.
+  const guildCommands = () => (commands ?? []).filter((d) => !d.dm);
   async function registerIn(guild) {
-    if (commands) await guild.commands.set(commands);
+    if (commands) await guild.commands.set(guildCommands());
   }
 
   async function textChannel(id) {
@@ -169,6 +172,12 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
           name: i.commandName,
           userId: i.user?.id,
           channelId: i.channelId,
+          dm: !i.guildId,
+          inThread: i.channel?.isThread?.() === true,
+          // An answer that takes the app a moment (#206): shown only to the asker at once,
+          // filled in when it is known.
+          defer: ({ ephemeral }) => guarded(() => i.deferReply(ephemeral ? { flags: MessageFlags.Ephemeral } : {})),
+          edit: ({ content, allowedMentions }) => guarded(() => i.editReply({ content, allowedMentions })),
           reply: ({ content, ephemeral }) =>
             guarded(async () => {
               const allowedMentions = { parse: [] };
@@ -307,6 +316,9 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
       guarded(async () => {
         commands = defs;
         for (const g of client.guilds.cache.values()) await registerIn(g);
+        // Guild install, used in a server (0) and in a DM with the bot (1).
+        const global = defs.filter((d) => d.dm).map(({ dm, ...d }) => ({ ...d, contexts: [0, 1], integration_types: [0] }));
+        if (global.length) await client.application?.commands?.set(global);
       }),
 
     // The bot's own word in a post (#205): a reply to a say, a prompt. Never a webhook, so the

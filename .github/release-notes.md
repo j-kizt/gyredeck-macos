@@ -1,5 +1,23 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Gyredeck stops filling your disk with session history — (v1.29.2)
+
+### Fixes
+
+- **Session history no longer grows WebKit's storage without end.** The list of recent sessions
+  was rewritten whole into the app's browser storage on almost every event — over 2 MB, about
+  ten times a minute — and that storage never compacted while the app ran, so its write-ahead
+  file grew by gigabytes a day. Session history now lives in its own file in the app's data
+  folder, written at most every two seconds. Your existing history is moved into it on the
+  first start, and the old copy is removed only once the file holds it.
+- **Old session history is cleared on its own.** Conversations with nothing in the last 30 days
+  go, at most 200 are kept, and older dismissed and removed marks go with them — at start and
+  every hour, so a quiet app sheds them too. The conversation you have open always stays.
+- **When history cannot be saved, the Sessions tab says so** — a file it cannot read, or a save
+  that keeps failing — instead of carrying on as if it had been. Nothing is written over a file
+  it could not read.
+- The `regex` library moves to 1.13.1, which fixes a wrongly reported match position.
+
 ## The "answer rooms without asking" switch says only what it controls — (v1.29.1)
 
 ### Fixes

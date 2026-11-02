@@ -167,6 +167,8 @@ impl RoomActs for Arc<FakeActs> {
 /// given a `log` is served like the bridge serves it instead: everything after `since`.
 #[derive(Default)]
 struct FakeSource {
+    /// How long a room status takes to answer, as a slow bridge would (#206).
+    status_delay: Mutex<Duration>,
     members: Mutex<HashMap<String, Vec<RoomMember>>>,
     streams: Mutex<HashMap<String, VecDeque<Vec<u8>>>>,
     logs: Mutex<HashMap<String, Vec<serde_json::Value>>>,
@@ -221,6 +223,10 @@ fn frames(room: &str, messages: &[&serde_json::Value]) -> Vec<u8> {
 }
 
 impl RoomSource for Arc<FakeSource> {
+    fn status(&self, _room: &str, _app_word: &str) -> Result<serde_json::Value, SourceError> {
+        thread::sleep(*self.status_delay.lock().unwrap());
+        Ok(serde_json::json!({ "ok": true, "members": [], "usage": {} }))
+    }
     fn members(&self, room: &str, _as_id: &str) -> Result<Roster, SourceError> {
         if self.roster_fails.load(Ordering::SeqCst) {
             return Err(SourceError::Unavailable);
@@ -4981,4 +4987,30 @@ fn status_usage_age_table() {
             Some(want) => assert!(got.is_some_and(|got| (got - want).abs() <= 2), "{name}: {got:?}"),
         }
     }
+}
+
+#[test]
+fn a_slow_status_never_holds_up_a_say_read_after_it_and_a_second_waits_its_turn() {
+    let f = fixture_owned("status-slow", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let created = lock(&f.state.hub).rooms[ROOM].created_at.unwrap();
+    *f.source.status_delay.lock().unwrap() = Duration::from_millis(1500);
+    let ask = |id: &str| format!(r#"{{"t":"status_request","requestId":"{id}","ownerId":"{OWNER_ID}","channelId":"{THREAD}","threadId":"{THREAD}","room":"{ROOM}","createdAt":{created}}}"#);
+    let say = format!(r#"{{"t":"say","room":"{ROOM}","discordMessageId":"{}","threadId":"{THREAD}","ownerId":"{OWNER_ID}","text":"after the status"}}"#, msg_id(1));
+    let lines = [ask("s1"), ask("s2"), ask("s3"), say];
+    let epoch = lock(&f.state.hub).epoch;
+    let started = Instant::now();
+    read_child(Cursor::new(lines.join("\n") + "\n"), &f.state.core, epoch);
+    assert!(started.elapsed() < Duration::from_millis(1000), "the reader waited {:?}", started.elapsed());
+    assert_eq!(posted_texts(&f), vec!["after the status".to_string()]);
+    let lines = buffer.lines();
+    let answers = of_kind(&lines, "status");
+    let busy: Vec<&str> = answers.iter().filter(|a| a["error"] == STATUS_BUSY).map(|a| a["requestId"].as_str().unwrap()).collect();
+    assert_eq!(busy, vec!["s2", "s3"]);
+    wait_until("the first status answered", || of_kind(&buffer.lines(), "status").iter().any(|a| a["requestId"] == "s1" && a["error"].is_null()));
+    // Answered, the next one is taken.
+    let again = status_ask(&f, &buffer, ask("s4"));
+    assert!(again[0]["error"].is_null(), "{again:?}");
 }

@@ -68,6 +68,7 @@ const BUSY_STALE: Duration = Duration::from_secs(30 * 60);
 /** What one /status shows at most (#206); the rest is counted, never dropped silently. */
 const STATUS_ROOMS: usize = 25;
 const STATUS_MEMBERS: usize = 20;
+const STATUS_BUSY: &str = "Another /status is still being answered; try again in a moment.";
 
 /// How far ahead of this clock a read time may be and still count as just read.
 const READ_CLOCK_SKEW: i64 = 5 * 60;
@@ -1923,6 +1924,8 @@ pub(crate) struct Core {
     acts: Arc<dyn RoomActs>,
     source: Arc<dyn RoomSource>,
     owners: Arc<dyn OwnerStore>,
+    /// A /status being answered; the next is refused until it is (#206 audit).
+    status_busy: AtomicBool,
 }
 
 pub(crate) struct DiscordState {
@@ -2009,6 +2012,7 @@ impl DiscordState {
             acts: Arc::clone(&deps.acts),
             source: Arc::clone(&deps.source),
             owners: Arc::clone(&deps.owners),
+            status_busy: AtomicBool::new(false),
         });
         Self {
             hub,
@@ -2766,7 +2770,7 @@ fn spawn_child(node: &Path, script: &Path, core: &Arc<Core>, epoch: u64) -> Resu
     Ok((process, ChildChannel::new(Box::new(stdin))))
 }
 
-fn read_child(stdout: impl Read, core: &Core, epoch: u64) {
+fn read_child(stdout: impl Read, core: &Arc<Core>, epoch: u64) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
     loop {
@@ -2791,7 +2795,7 @@ fn read_child(stdout: impl Read, core: &Core, epoch: u64) {
 
 /// What child `epoch` said, with what the hub alone cannot do: a `say` is published and a
 /// `disconnect_request` disconnects, each with the hub unlocked while the bridge answers.
-fn on_core_event_from(core: &Core, epoch: u64, event: FromChild) {
+fn on_core_event_from(core: &Arc<Core>, epoch: u64, event: FromChild) {
     match event {
         FromChild::Say(say) => {
             if lock(&core.hub).epoch == epoch {
@@ -2804,10 +2808,23 @@ fn on_core_event_from(core: &Core, epoch: u64, event: FromChild) {
             }
         }
         FromChild::StatusRequest { request_id, owner_id, thread_id, room, created_at } => {
-            if lock(&core.hub).epoch == epoch {
-                let answer = core.status_requested(request_id, &owner_id, thread_id.as_deref(), room.as_deref(), created_at);
-                lock(&core.hub).send(&answer);
+            if lock(&core.hub).epoch != epoch {
+                return;
             }
+            // Answered off this reader and one at a time: the bridge may be slow, and a say or a
+            // disconnect read after it never waits behind it (#206 audit).
+            if core.status_busy.swap(true, Ordering::SeqCst) {
+                lock(&core.hub).send(&ToChild::Status { request_id, error: Some(STATUS_BUSY.to_string()), room: None, rooms: None, hidden_rooms: None });
+                return;
+            }
+            let core = Arc::clone(core);
+            thread::spawn(move || {
+                let answer = core.status_requested(request_id, &owner_id, thread_id.as_deref(), room.as_deref(), created_at);
+                core.status_busy.store(false, Ordering::SeqCst);
+                if lock(&core.hub).epoch == epoch {
+                    lock(&core.hub).send(&answer);
+                }
+            });
         }
         other => on_child_event_from(&core.hub, core.owners.as_ref(), epoch, other),
     }
@@ -2815,7 +2832,7 @@ fn on_core_event_from(core: &Core, epoch: u64, event: FromChild) {
 
 /// What the current child said, through the core; the tests' way in for #205's lines.
 #[cfg(test)]
-fn on_core_event(core: &Core, event: FromChild) {
+fn on_core_event(core: &Arc<Core>, event: FromChild) {
     let epoch = lock(&core.hub).epoch;
     on_core_event_from(core, epoch, event);
 }

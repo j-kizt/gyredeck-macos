@@ -7,14 +7,18 @@
  * - A registry that is what was last stored is not saved again.
  * - A failed save is retried with the latest registry, never the one that failed: a newer
  *   save may already have landed, and the old one would replace it.
+ * - `onSaving` hears false after a failed save and true after the next save lands, so the app
+ *   can say history is not being saved while that is so (#280 audit).
  */
 export const createRegistryWriter = <T>({
   write,
   delayMs,
   setTimer = (run, ms) => setTimeout(run, ms),
   clearTimer = (timer) => clearTimeout(timer as number),
+  onSaving = () => {},
 }: {
   write: (registry: T) => Promise<boolean>;
+  onSaving?: (saving: boolean) => void;
   delayMs: number;
   setTimer?: (run: () => void, ms: number) => unknown;
   clearTimer?: (timer: unknown) => void;
@@ -40,6 +44,7 @@ export const createRegistryWriter = <T>({
     if (registry === null) return;
     pending = null;
     void write(registry).then((saved) => {
+      onSaving(saved);
       if (saved) {
         persisted = registry;
         return;

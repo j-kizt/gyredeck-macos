@@ -217,3 +217,20 @@ test("a stored registry this version cannot read is never replaced by the old co
   expect(entries.map((entry) => entry.what)).not.toContain("localStorage.setItem");
   expect(JSON.parse((await page.evaluate((key) => localStorage.getItem(key), KEY)) ?? "null")).toEqual(legacy);
 });
+
+test("while saves keep failing the sessions tab says history is not being saved, and the notice goes once one lands", async ({ page }) => {
+  // No demo events: a quiet app, three failures in a row, then a save that lands.
+  await open(page, { load: "absent", failSaves: 3 }, { "legacy-conv": [event("legacy-conv", "From localStorage")] }, false);
+  const notice = page.getByRole("status").filter({ hasText: "Session history is not being saved" });
+  await expect(notice).toBeVisible({ timeout: 6_000 });
+  await expect.poll(async () => (await log(page)).map((entry) => entry.what), { timeout: 12_000 }).toContain("save done");
+  await expect(notice).toHaveCount(0);
+});
+
+test("with every save failing while events arrive, the notice stays", async ({ page }) => {
+  await open(page, { load: "absent", failSaves: 1_000 }, null);
+  const notice = page.getByRole("status").filter({ hasText: "Session history is not being saved" });
+  await expect(notice).toBeVisible({ timeout: 6_000 });
+  await page.waitForTimeout(4_000);
+  await expect(notice).toBeVisible();
+});

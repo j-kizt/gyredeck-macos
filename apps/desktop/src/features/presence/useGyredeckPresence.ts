@@ -569,7 +569,11 @@ export const useGyredeckPresence = ({
   // them: the event registry caps each session, which used to drop the turn_complete
   // holding the usage mid-turn and made the meter blink out.
   const [contextUsage, setContextUsage] = useState<ContextUsageRegistry>({});
-  const [registryProblem, setRegistryProblem] = useState<string | null>(null);
+  // Why history the app shows is not stored: it could not be read, or a save failed and is
+  // being retried. One notice for both; it goes once the history is stored again (#280).
+  const [readProblem, setRegistryProblem] = useState<string | null>(null);
+  const [saveFailing, setSaveFailing] = useState(false);
+  const registryProblem = readProblem ?? (saveFailing ? "the last save failed; retrying" : null);
   const [capabilities, setCapabilities] = useState(() => createDefaultBridgeCapabilities());
   const [connection, setConnection] = useState<IConnectionState>({
     status: "connecting",
@@ -583,6 +587,7 @@ export const useGyredeckPresence = ({
   writerRef.current ??= createRegistryWriter<SessionEventRegistry>({
     write: writeSessionEventRegistry,
     delayMs: REGISTRY_WRITE_INTERVAL_MS,
+    onSaving: (saving) => setSaveFailing(!saving),
   });
   const writer = writerRef.current;
   const flushRegistryWrite = () => writer.flush();

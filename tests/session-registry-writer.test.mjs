@@ -11,9 +11,10 @@ const { createRegistryWriter } = await import(
  */
 const harness = ({ failFirst = false } = {}) => {
   const timers = [];
-  const store = { kept: null, calls: [], queue: Promise.resolve(), gates: [] };
+  const store = { kept: null, calls: [], queue: Promise.resolve(), gates: [], saving: [] };
   const writer = createRegistryWriter({
     delayMs: 2000,
+    onSaving: (saving) => store.saving.push(saving),
     setTimer: (run) => { timers.push(run); return timers.length; },
     clearTimer: () => {},
     write: (registry) => {
@@ -85,4 +86,16 @@ test("a failed save on a quiet app is retried until it lands", async () => {
   await tick(); // retry
   await settle(1);
   assert.equal(store.kept, only);
+});
+
+test("a failed save is reported, and the next save that lands clears it", async () => {
+  const { writer, store, tick, settle } = harness({ failFirst: true });
+  writer.ready(null);
+  writer.update({ a: [1] });
+  await tick();
+  await settle(0);
+  assert.deepEqual(store.saving, [false], "the failure is said at once");
+  await tick();
+  await settle(1);
+  assert.deepEqual(store.saving, [false, true], "and cleared when a save lands");
 });

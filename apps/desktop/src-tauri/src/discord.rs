@@ -1851,7 +1851,12 @@ impl Default for Marks {
 fn read_marks(store: &dyn LossStore) -> Marks {
     Marks(match store.read() {
         Ok(None) => Ok(LossMarks::default()),
-        Ok(Some(bytes)) => serde_json::from_slice(&bytes).map_err(|_| "the Keychain's record of lost lines is not one this app wrote".to_string()),
+        // Every entry must be a loss: anything else would be passed over by the merge and hidden
+        // by the journal it names, so the whole record counts as unreadable (#282 audit).
+        Ok(Some(bytes)) => serde_json::from_slice::<LossMarks>(&bytes)
+            .ok()
+            .filter(|marks| marks.marks.iter().all(|mark| matches!(mark.record, journal::Record::Loss { .. })))
+            .ok_or_else(|| "the Keychain's record of lost lines is not one this app wrote".to_string()),
         Err(why) => Err(why),
     })
 }

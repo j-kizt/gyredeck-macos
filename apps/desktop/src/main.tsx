@@ -165,7 +165,7 @@ const App = () => {
   const keepAwakeFlightRef = useRef<{ again: boolean } | null>(null);
   // Every call numbered, so Rust applies none older than the last; calls given up on but never
   // answered are counted, and past two nothing more is sent into a channel that does not answer.
-  const keepAwakeSeqRef = useRef({ page: 0, seq: 0, unanswered: 0 });
+  const keepAwakeSeqRef = useRef<{ page?: Promise<number>; seq: number; unanswered: number }>({ seq: 0, unanswered: 0 });
   const displayView =
     isDeletedAfter(deletedSessionIds, presence.conversationId, presence.lastEventAt) ||
     (view.status === "closed" && (acknowledgedConversationId === presence.conversationId || isDismissedAfter(dismissedSessionIds, presence.conversationId, presence.lastEventAt)))
@@ -525,11 +525,15 @@ const App = () => {
       const answered = () => {
         if (givenUp) calls.unanswered -= 1;
       };
-      // The page's number comes from Rust, once per load, inside the first flight.
-      (calls.page ? Promise.resolve(calls.page) : invoke<number>("keep_awake_page")).then((page) => {
-        calls.page ||= page;
+      // The page's number comes from Rust, asked once per load: every flight waits on the one
+      // request, so two can never be out and answered out of order. Asked again only if refused.
+      calls.page ??= invoke<number>("keep_awake_page").catch((error) => {
+        calls.page = undefined;
+        throw error;
+      });
+      calls.page.then((page) => {
         calls.seq += 1;
-        return invoke<IKeepAwakeHeld>("set_keep_awake", { ...want, page: calls.page, seq: calls.seq });
+        return invoke<IKeepAwakeHeld>("set_keep_awake", { ...want, page, seq: calls.seq });
       }).then((held) => {
         answered();
         // A late answer is still Rust's word at its rev; the rev keeps the newest.

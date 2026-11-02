@@ -16,7 +16,11 @@ const open = async (page: Page, first: Answer) => {
     Object.assign(w, { __answer: answer, __calls: 0, __sent: [], __out: 0, __most: 0, __late: [] });
     w.__TAURI_INTERNALS__ = {
       invoke: async (command: string, args?: unknown) => {
-        if (command === "keep_awake_page") return 7;
+        if (command === "keep_awake_page") {
+          const pages = (w as unknown as { __pages: number }).__pages = ((w as unknown as { __pages?: number }).__pages ?? 0) + 1;
+          if ((w as unknown as { __pageHangs?: boolean }).__pageHangs) return new Promise((resolve) => { (w as unknown as { __pageLate: Array<(v: unknown) => void> }).__pageLate = [...((w as unknown as { __pageLate?: Array<(v: unknown) => void> }).__pageLate ?? []), resolve]; });
+          return 6 + pages;
+        }
         if (command === "set_keep_awake") {
           w.__calls += 1;
           w.__sent.push(args);
@@ -157,4 +161,17 @@ test("every call carries the page number Rust gave this page, asked once", async
   const pages = await page.evaluate(() => (window as typeof window & { __sent: Array<{ page: number }> }).__sent.map((call) => call.page));
   expect(pages.length).toBeGreaterThan(1);
   expect(new Set(pages)).toEqual(new Set([7]));
+});
+
+test("the page number is asked once, however long it takes, so no two requests can cross", async ({ page }) => {
+  await page.clock.install();
+  await page.addInitScript(() => { (window as unknown as { __pageHangs: boolean }).__pageHangs = true; });
+  const row = await open(page, held(ROOM, 1));
+  await page.clock.runFor(12_000);
+  expect(await page.evaluate(() => (window as unknown as { __pages: number }).__pages), "one request out, however many flights gave up on it").toBe(1);
+  await page.evaluate(() => (window as unknown as { __pageLate: Array<(v: unknown) => void> }).__pageLate[0](7));
+  await page.clock.runFor(5_100);
+  const pages = await page.evaluate(() => (window as typeof window & { __sent: Array<{ page: number }> }).__sent.map((call) => call.page));
+  expect(new Set(pages)).toEqual(new Set([7]));
+  await expect(row.getByText(`Active · ${ROOM}`)).toBeVisible();
 });

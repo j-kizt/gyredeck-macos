@@ -53,12 +53,16 @@ const assetRoot = join(distRoot, "assets");
  * to a file (load, migration, ordered saves, retried saves and re-reads, pruning of old data,
  * a notice when history is not being saved) measured 119,546 / 122,624 on main's 118,565 /
  * 121,641 (+981 / +983, after its audit rounds). 119,644 and 122,741 keep main's 98 / 117.
+ *
+ * And on 2026-11-03 (#288), by the owner's decision ("A", from Discord): the rows saying macOS
+ * refused the saved token or owner measured 119,692 / 122,769 on main's 119,546 / 122,624
+ * (+146 / +145). 119,790 and 122,886 keep main's 98 / 117.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 119_644,
-  jsTotalGzipBytes: 122_741,
+  jsGzipBytes: 119_790,
+  jsTotalGzipBytes: 122_886,
 };
 
 const walk = async (directory) => {

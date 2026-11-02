@@ -37,4 +37,4 @@ objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSScreen", "NSGraphics"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSCalendar", "NSDate", "NSDictionary", "NSGeometry", "NSObject", "NSString"] }
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["block2", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSettings", "UNNotificationTrigger", "UNUserNotificationCenter"] }
-security-framework = "3.5.1"
+security-framework = { version = "3.5.1", features = ["OSX_10_15"] }

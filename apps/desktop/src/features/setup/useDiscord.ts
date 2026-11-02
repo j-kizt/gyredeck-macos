@@ -15,6 +15,8 @@ export interface IDiscordStatus {
   connectedRooms: string[];
   /** Per connected room, lines handed to the bot that Discord has not yet accepted. */
   behind?: Record<string, number>;
+  /** A saved token or owner macOS would not hand over, by which (#288). */
+  keychainRefused?: Record<string, string>;
   /** Rooms the Discord member could not be taken out of, with why; kept after Remove. */
   leaving?: Record<string, string>;
   /** What Remove had to leave undelivered, per room; kept after Remove. */

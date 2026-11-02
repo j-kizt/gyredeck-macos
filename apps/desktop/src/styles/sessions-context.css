@@ -1167,3 +1167,12 @@
 .session-sync-note[data-error="true"] {
   color: var(--warn-text, #e0a458);
 }
+
+/* The session history could not be read or saved (#280): said, never silent. */
+.session-store-warning {
+  margin: 0 0 8px;
+  color: var(--accent-text);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}

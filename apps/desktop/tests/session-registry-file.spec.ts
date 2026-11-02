@@ -8,7 +8,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 const KEY = "gyredeck.session-events";
 
-type Mode = { load: "absent" | "ok" | "corrupt" | "unreadable" | "throws"; failFirstSave?: boolean; failSaves?: number; saveDelayMs?: number };
+type Mode = { load: "absent" | "ok" | "corrupt" | "unreadable" | "throws"; loadFailures?: number; failFirstSave?: boolean; failSaves?: number; saveDelayMs?: number; firstSaveDelayMs?: number };
 
 const event = (conversationId: string, message: string) => ({
   version: 2,
@@ -45,11 +45,15 @@ const open = async (page: Page, mode: Mode, legacy: Record<string, unknown[]> | 
         return removeItem.call(this, name);
       };
       let saves = 0;
+      let loads = 0;
       let revision = 7;
       (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
         invoke: async (command: string, args?: { registry: Record<string, unknown> }) => {
           if (command === "set_keep_awake") return false;
           if (command === "session_registry_load") {
+            loads += 1;
+            log.push({ at: performance.now(), what: "load" });
+            if (loads <= (mode.loadFailures ?? 0)) throw new Error("app data folder busy");
             if (mode.load === "ok") return { state: "ok", revision: 7, registry: fileRegistry };
             if (mode.load === "corrupt") return { state: "corrupt", kept: "/tmp/session-events.corrupt-1.json" };
             if (mode.load === "unreadable") return { state: "unreadable", reason: "permission denied" };
@@ -59,14 +63,15 @@ const open = async (page: Page, mode: Mode, legacy: Record<string, unknown[]> | 
           if (command === "session_registry_save") {
             saves += 1;
             const failed = saves <= (mode.failSaves ?? (mode.failFirstSave ? 1 : 0));
-            log.push({ at: performance.now(), what: "save", detail: { keys: Object.keys(args?.registry ?? {}), failed } });
-            await new Promise((resolve) => setTimeout(resolve, mode.saveDelayMs ?? 0));
+            const count = Object.values(args?.registry ?? {}).reduce((sum: number, events) => sum + (events as unknown[]).length, 0);
+            log.push({ at: performance.now(), what: "save", detail: { keys: Object.keys(args?.registry ?? {}), failed, count } });
+            await new Promise((resolve) => setTimeout(resolve, saves === 1 && mode.firstSaveDelayMs ? mode.firstSaveDelayMs : mode.saveDelayMs ?? 0));
             if (failed) {
               log.push({ at: performance.now(), what: "save failed" });
               throw new Error("disk full");
             }
             revision += 1;
-            log.push({ at: performance.now(), what: "save done", detail: { revision } });
+            log.push({ at: performance.now(), what: "save done", detail: { revision, count } });
             return revision;
           }
           throw new Error(`${command} unavailable`);
@@ -79,7 +84,7 @@ const open = async (page: Page, mode: Mode, legacy: Record<string, unknown[]> | 
 };
 
 const log = (page: Page) =>
-  page.evaluate(() => (window as typeof window & { __registryLog: { at: number; what: string; detail?: { revision?: number; keys?: string[]; failed?: boolean } }[] }).__registryLog);
+  page.evaluate(() => (window as typeof window & { __registryLog: { at: number; what: string; detail?: { revision?: number; keys?: string[]; failed?: boolean; count?: number } }[] }).__registryLog);
 
 test("in the desktop app the registry is saved to the file, in order and spaced, and never to localStorage", async ({ page }) => {
   await open(page, { load: "absent" }, null);
@@ -149,12 +154,12 @@ test("a quiet app clears data that ages past 30 days within the hour, and saves 
   await expect.poll(async () => (await log(page)).filter((entry) => entry.what === "save done").length).toBeGreaterThan(0);
   const first = (await log(page)).find((entry) => entry.what === "save");
   expect(first?.detail?.keys?.sort()).toEqual(["ageing-conv", "fresh-conv"]);
-  await page.clock.runFor(61 * 60 * 1000);
+  await page.clock.fastForward("01:01:00");
   await expect.poll(async () => (await log(page)).filter((entry) => entry.what === "save").at(-1)?.detail?.keys).toEqual(["fresh-conv"]);
 });
 
 for (const [why, load] of [["the store cannot be reached", "throws"], ["the file is there but unreadable", "unreadable"]] as const) {
-  test(`when ${why}, the registry is kept in memory: no localStorage write, no save, the old copy untouched`, async ({ page }) => {
+  test(`when ${why}, nothing is saved anywhere, the read is retried, and the sessions tab says so`, async ({ page }) => {
     const legacy = { "legacy-conv": [event("legacy-conv", "From localStorage")] };
     await open(page, { load }, legacy);
     await page.waitForTimeout(3_000);
@@ -162,7 +167,9 @@ for (const [why, load] of [["the store cannot be reached", "throws"], ["the file
     expect(entries.map((entry) => entry.what)).not.toContain("localStorage.setItem");
     expect(entries.map((entry) => entry.what)).not.toContain("localStorage.removeItem");
     expect(entries.map((entry) => entry.what)).not.toContain("save");
+    expect(entries.filter((entry) => entry.what === "load").length, "the read is tried again").toBeGreaterThan(1);
     expect(JSON.parse((await page.evaluate((key) => localStorage.getItem(key), KEY)) ?? "null")).toEqual(legacy);
+    await expect(page.getByRole("status").filter({ hasText: "Session history is not being saved" })).toBeVisible();
   });
 }
 
@@ -176,4 +183,24 @@ test("on a quiet app a save that failed is tried again until it lands, and only 
   expect(doneAt).toBeGreaterThan(failedAt);
   expect(entries.filter((entry) => entry.what === "localStorage.removeItem").every((entry) => entry.at >= doneAt)).toBe(true);
   await expect.poll(async () => (await log(page)).map((entry) => entry.what)).toContain("localStorage.removeItem");
+});
+
+test("a read that fails for a while is retried, and what arrived meanwhile is kept and saved once it reads", async ({ page }) => {
+  await open(page, { load: "absent", loadFailures: 2 }, null);
+  await expect(page.getByRole("status").filter({ hasText: "Session history is not being saved" })).toBeVisible();
+  await expect.poll(async () => (await log(page)).map((entry) => entry.what), { timeout: 10_000 }).toContain("save done");
+  const entries = await log(page);
+  const firstSave = entries.findIndex((entry) => entry.what === "save");
+  expect(entries.slice(0, firstSave).filter((entry) => entry.what === "load").length, "no save before a read succeeded").toBe(3);
+  expect(entries[firstSave].detail?.count ?? 0).toBeGreaterThan(1);
+  await expect(page.getByRole("status").filter({ hasText: "Session history is not being saved" })).toHaveCount(0);
+});
+
+test("a slow save that fails never brings an older registry back over a newer one", async ({ page }) => {
+  // The first save fails after 5 s, while newer ones succeed behind it.
+  await open(page, { load: "absent", failSaves: 1, firstSaveDelayMs: 5_000 }, null);
+  await page.waitForTimeout(12_000);
+  const done = (await log(page)).filter((entry) => entry.what === "save done").map((entry) => entry.detail?.count ?? 0);
+  expect(done.length).toBeGreaterThan(1);
+  expect(done, "what is kept never shrinks").toEqual([...done].sort((a, b) => a - b));
 });

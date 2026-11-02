@@ -113,7 +113,7 @@ const getGroupRemovalId = (groupKey: string, group: IWorkspaceSessionGroup) => [
 const App = () => {
   const [bridgePort, setBridgePort] = useState(DEFAULT_BRIDGE_PORT);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-  const { capabilities, connection, contextUsage, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO, bridgePort, keepConversationId: selectedSessionId });
+  const { capabilities, connection, contextUsage, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, registryProblem, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO, bridgePort, keepConversationId: selectedSessionId });
   const [usageSettings, setUsageSettings] = useState<IUsageSettings>(readUsageSettings);
   const { refresh: refreshAgentUsage, refreshing: agentUsageRefreshing, usages: agentUsages } = useAgentUsageList(usageSettings, DEMO_MODE);
   const [acknowledgedConversationId, setAcknowledgedConversationId] = useState<string | null>(null);
@@ -1179,6 +1179,9 @@ const App = () => {
               role={!setupOpen && !selectedSession ? "tabpanel" : undefined}
               aria-labelledby={!setupOpen && !selectedSession ? `main-tab-${activeMainTab}` : undefined}
             >
+              {registryProblem && !setupOpen && activeMainTab === "sessions" ? (
+                <p className="session-store-warning" role="status">Session history is not being saved: {registryProblem}</p>
+              ) : null}
               {setupOpen ? (
                 <SetupPanel
                   capabilities={capabilities}

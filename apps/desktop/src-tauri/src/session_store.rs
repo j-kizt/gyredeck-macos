@@ -67,7 +67,10 @@ pub fn load(dir: &Path, state: &SessionStoreState) -> Loaded {
         Loaded::Unreadable { reason }
     };
     match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Loaded::Absent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            inner.blocked = None;
+            return Loaded::Absent;
+        }
         Err(error) => return unreadable(&mut inner, format!("cannot look at {}: {error}", path.display())),
         Ok(meta) if !meta.file_type().is_file() => return unreadable(&mut inner, format!("{} is not a plain file", path.display())),
         Ok(meta) if meta.len() > MAX_BYTES => return unreadable(&mut inner, format!("{} is larger than {MAX_BYTES} bytes", path.display())),
@@ -89,6 +92,8 @@ pub fn load(dir: &Path, state: &SessionStoreState) -> Loaded {
     });
     match parsed {
         Some((revision, registry)) => {
+            // Read at last: saves may follow it again.
+            inner.blocked = None;
             inner.revision = inner.revision.max(revision);
             Loaded::Ok { revision, registry }
         }
@@ -173,6 +178,20 @@ mod tests {
         assert!(save(&dir, &fresh, &json!({ "new": [] })).is_err(), "no save over a file it could not read");
         fs::set_permissions(file_in(&dir), fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(fs::read_to_string(file_in(&dir)).unwrap(), r#"{"registry":{"kept":[]},"revision":1}"#);
+    }
+
+    #[test]
+    fn once_the_file_can_be_read_again_saves_follow_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("recover");
+        let state = SessionStoreState::default();
+        save(&dir, &state, &json!({ "kept": [] })).unwrap();
+        fs::set_permissions(file_in(&dir), fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(matches!(load(&dir, &state), Loaded::Unreadable { .. }));
+        assert!(save(&dir, &state, &json!({ "new": [] })).is_err());
+        fs::set_permissions(file_in(&dir), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(load(&dir, &state), Loaded::Ok { revision: 1, .. }), "read again");
+        assert_eq!(save(&dir, &state, &json!({ "new": [] })).unwrap(), 2, "and saved after it");
     }
 
     #[test]

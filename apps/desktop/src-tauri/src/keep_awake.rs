@@ -147,16 +147,13 @@ impl KeepAwakeState {
         }
     }
 
-    /// The webview's two inputs. Answers whether the display assertion is held.
-    pub fn set_active(&self, enabled: bool, working: bool) -> Result<bool, String> {
-        let held = self.update(|inputs| {
+    /// The webview's two inputs. Answers with what is held after them, a refusal included, so
+    /// the answer to every call is as true as an event.
+    pub(crate) fn set_active(&self, enabled: bool, working: bool) -> Result<Held, String> {
+        self.update(|inputs| {
             inputs.enabled = enabled;
             inputs.working = working;
-        })?;
-        match held.error {
-            Some(error) if held.display != (enabled && working) => Err(error),
-            _ => Ok(held.display),
-        }
+        })
     }
 
     pub(crate) fn set_discord_rooms(&self, rooms: Vec<String>) {

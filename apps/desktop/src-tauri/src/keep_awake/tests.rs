@@ -121,7 +121,8 @@ fn c7_a_failed_acquire_says_nothing_is_held_and_the_next_input_tries_again() {
     let held = s.held();
     assert!(!held.system && held.why.is_none(), "{held:?}");
     assert_eq!(held.error.as_deref(), Some("refused"));
-    assert_eq!(s.set_active(true, true), Err("refused".to_string()), "the display was asked for and is not held");
+    let held = s.set_active(true, true).unwrap();
+    assert!(!held.display && held.error.as_deref() == Some("refused"), "the answer itself says the display is not held: {held:?}");
     fake.refuse.store(false, Ordering::SeqCst);
     s.set_active(true, false).unwrap();
     assert_eq!(log(&fake), ["+System#1"]);
@@ -166,7 +167,7 @@ fn heavy_seen_reads_every_shape_the_bridge_answers() {
 #[test]
 fn both_native_assertions_can_be_acquired_and_released() {
     let state = KeepAwakeState::default();
-    assert_eq!(state.set_active(true, true), Ok(true));
+    assert!(state.set_active(true, true).unwrap().display);
     state.set_active(true, false).unwrap();
     state.set_discord_rooms(vec!["sync-test".into()]);
     let held = state.held();

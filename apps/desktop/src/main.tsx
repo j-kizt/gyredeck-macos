@@ -65,6 +65,14 @@ const LocalServicesPanel = lazy(async () => {
   return { default: module.LocalServicesPanel };
 });
 const KEEP_AWAKE_RETRY_DELAYS_MS = [750, 2_500] as const;
+
+/** What Rust holds and why (#211, #278); `rev` rises with every change. */
+interface IKeepAwakeHeld {
+  display: boolean;
+  why?: string | null;
+  error?: string | null;
+  rev: number;
+}
 interface INativeActionState {
   bridgeOnline: boolean | null;
   message: string | null;
@@ -137,7 +145,9 @@ const App = () => {
   const [keepAwakeError, setKeepAwakeError] = useState<string | null>(null);
   // What Rust says it holds and why: a Discord room or a heavy run holds the Mac without the window (#211, #278).
   // Rust's word on what is held is the whole truth, a failure in the background included.
-  const [keepAwakeHeld, setKeepAwakeHeld] = useState<{ why?: string | null; error?: string | null; rev: number }>();
+  const [keepAwakeHeld, setKeepAwakeHeld] = useState<IKeepAwakeHeld>();
+  // The newest by rev wins: a command's answer, an event and a snapshot are each Rust's word.
+  const takeKeepAwake = (next: IKeepAwakeHeld) => setKeepAwakeHeld((held) => (held && held.rev > next.rev ? held : next));
   const [terminal, setTerminal] = useState<TerminalChoice>(readTerminalChoice);
   const [expandedSessionGroupKeys, setExpandedSessionGroupKeys] = useState<Set<string>>(() => new Set());
   const [clearCompletedArmed, setClearCompletedArmed] = useState(false);
@@ -475,11 +485,20 @@ const App = () => {
     let cancelled = false;
     let retryTimer: number | null = null;
     const requestedActive = keepAwakeEnabled && hasWorkingActivity;
+    // Rust answered: whatever it refused is in its answer, and the UI has no error of its own.
+    let answered = false;
     const syncNativeState = (attempt: number) => {
       const request = keepAwakeRequestRef.current
         .catch(() => undefined)
-        .then(() => invoke<boolean>("set_keep_awake", { active: requestedActive, enabled: keepAwakeEnabled }))
-        .then((active) => {
+        .then(() => invoke<IKeepAwakeHeld | boolean>("set_keep_awake", { active: requestedActive, enabled: keepAwakeEnabled }))
+        .then((answer) => {
+          const held = typeof answer === "object" && answer ? answer : null;
+          if (held) {
+            answered = true;
+            takeKeepAwake(held);
+          }
+          const active = held ? held.display : answer === true;
+          // A refusal Rust answered with is already shown from its answer: retried, not an IPC error.
           if (active !== requestedActive) {
             throw new Error("Native keep-awake state did not match the requested state");
           }
@@ -500,7 +519,7 @@ const App = () => {
             return;
           }
           setKeepAwakeActive(false);
-          setKeepAwakeError(error instanceof Error ? error.message : String(error || "Keep awake unavailable"));
+          setKeepAwakeError(answered ? null : error instanceof Error ? error.message : String(error || "Keep awake unavailable"));
         });
     };
     setKeepAwakeError(null);
@@ -516,12 +535,9 @@ const App = () => {
     if (!canUseNativeControls) return undefined;
     // The newest by rev wins, so a snapshot answered late never overwrites a later event; it
     // is asked for once the listener is in, so no change falls between the two.
-    type Held = NonNullable<typeof keepAwakeHeld>;
-    const take = (next: Held) => setKeepAwakeHeld((held) => (held && held.rev > next.rev ? held : next));
-    const unlisten = listen<Held>("keep_awake", (event) => take(event.payload)).then((stop) => {
-      invoke<Held>("keep_awake_status").then(take, () => {});
-      return stop;
-    }, () => {});
+    // Asked whether or not the listener could be installed; the rev keeps the newest.
+    const unlisten = listen<IKeepAwakeHeld>("keep_awake", (event) => takeKeepAwake(event.payload)).catch(() => {});
+    invoke<IKeepAwakeHeld>("keep_awake_status").then(takeKeepAwake, () => {});
     return () => { unlisten.then((stop) => stop?.()); };
   }, [canUseNativeControls]);
 
@@ -1209,7 +1225,7 @@ const App = () => {
                   keepAwakeActive={keepAwakeActive}
                   keepAwakeWhy={keepAwakeHeld?.why}
                   keepAwakeEnabled={keepAwakeEnabled}
-                  keepAwakeError={keepAwakeHeld ? keepAwakeHeld.error ?? null : keepAwakeError}
+                  keepAwakeError={keepAwakeError ?? keepAwakeHeld?.error ?? null}
                   hookStatus={hookStatus}
                   launchAtLogin={launchAtLogin}
                   mailRooms={mailRooms.rooms}

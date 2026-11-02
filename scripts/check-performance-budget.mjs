@@ -57,12 +57,17 @@ const assetRoot = join(distRoot, "assets");
  * And on 2026-11-03 (#288), by the owner's decision ("A", from Discord): the rows saying macOS
  * refused the saved token or owner measured 119,692 / 122,769 on main's 119,546 / 122,624
  * (+146 / +145). 119,790 and 122,886 keep main's 98 / 117.
+ *
+ * And for #211/#278 (the row saying what Rust holds and why, its IPC failures included):
+ * 119,820 / 122,899 on main's 119,692 / 122,769 (+128 / +130). 119,918 and 123,016 keep
+ * main's 98 / 117. Raised as the owner chose for #205 and #288 ("A"); their word on this
+ * card is still to come, and it does not merge before it.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 119_790,
-  jsTotalGzipBytes: 122_886,
+  jsGzipBytes: 119_918,
+  jsTotalGzipBytes: 123_016,
 };
 
 const walk = async (directory) => {

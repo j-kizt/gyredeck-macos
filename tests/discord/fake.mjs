@@ -170,6 +170,7 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
       events.emit("edit", fields);
     },
     async reactedBy({ messageId, emoji, userId }) {
+      fake.log.push({ op: "reactedBy", messageId });
       await fake.gate?.("reactedBy", { messageId });
       return fake.given.some((r) => r.messageId === messageId && r.emoji === emoji && r.userId === userId);
     },

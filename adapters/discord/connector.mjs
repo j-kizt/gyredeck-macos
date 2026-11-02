@@ -238,9 +238,12 @@ export function createConnector({ discord, out, clock = realClock }) {
     online = true;
     reported.delete("down");
     wake(true);
+    // Reactions given while the gateway was down never arrive as events: read them (#205 r7).
+    if (identity && !stopped) settleAll();
   });
   discord.on("offline", () => {
     online = false;
+    read.clear();
   });
   discord.on("forums", () => {
     if (identity && !stopped) send(readyMessage());

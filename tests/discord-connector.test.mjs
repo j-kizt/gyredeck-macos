@@ -2162,6 +2162,26 @@ test("#205 a ✅ given while the child was down is not used for another instance
   await second.c.close();
 });
 
+for (const kind of ["/disconnect", "quiet"]) {
+  test(`#205 a ✅ on a ${kind} prompt given while the gateway was down counts once it is back, once`, async () => {
+    const { c, fake, threadId, of } = await ownerRoom();
+    if (kind === "quiet") c.handle({ t: "quiet", room: "sync-abcd" });
+    else fake.command({ userId: OWNER, channelId: threadId });
+    await flush();
+    const shown = kind === "quiet" ? fake.bot.at(-1) : fake.replies.at(-1);
+    fake.emit("offline");
+    fake.given.push({ messageId: shown.id, channelId: threadId, userId: OWNER, emoji: "✅" });
+    fake.emit("online");
+    await flush();
+    assert.equal(of("disconnect_request").length, 1);
+    fake.emit("offline");
+    fake.emit("online");
+    await flush();
+    assert.equal(of("disconnect_request").length, 1, "used once");
+    await c.close();
+  });
+}
+
 test("#205 an intent older than its prompt's life is dropped, not searched", async () => {
   const first = await ownerRoom();
   first.fake.after = async (o) => { if (o === "reply") throw new Error("cut off on the way back"); };

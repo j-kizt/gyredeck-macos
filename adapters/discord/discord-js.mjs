@@ -169,7 +169,6 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
           name: i.commandName,
           userId: i.user?.id,
           channelId: i.channelId,
-          all: i.options?.getBoolean?.("all") ?? false,
           reply: ({ content, ephemeral }) =>
             guarded(async () => {
               const allowedMentions = { parse: [] };
@@ -321,6 +320,14 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
           ...(replyTo ? { reply: { messageReference: replyTo, failIfNotExists: false } } : {}),
         });
         return { id: m.id };
+      }),
+
+    // Rewrite the bot's own message, e.g. a prompt that no longer works (#205).
+    botEdit: ({ channelId, messageId, content }) =>
+      guarded(async () => {
+        const ch = await client.channels.fetch(channelId);
+        if (!ch?.messages) throw kindError("missing", "channel gone");
+        await ch.messages.edit(messageId, { content, allowedMentions: { parse: [] } });
       }),
 
     react: ({ threadId, messageId, emoji }) =>

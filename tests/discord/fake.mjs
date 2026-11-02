@@ -156,6 +156,12 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
       await fake.after?.("botSend", { ...args, id });
       return { id };
     },
+    // The bot's edits of its own messages.
+    edits: [],
+    async botEdit(args) {
+      await fake.gate?.("botEdit", args);
+      fake.edits.push(args);
+    },
     async react(args) {
       await fake.gate?.("react", args);
       fake.reactions.push(args);
@@ -188,7 +194,7 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
         await fake.after?.("reply", { content, id });
         return id ? { id } : null;
       };
-      events.emit("command", { name: "disconnect", all: false, ...fields, reply });
+      events.emit("command", { name: "disconnect", ...fields, reply });
     },
     async destroy() {
       fake.destroyed = true;

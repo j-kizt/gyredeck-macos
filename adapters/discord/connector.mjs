@@ -32,12 +32,10 @@ export const NO = "❌";
 export const SENT = "📨";
 const NEEDS_YOU = "needs you";
 const TAGS = ["open", "closed", NEEDS_YOU];
-const BOOLEAN_OPTION = 5;
 export const COMMANDS = [
   {
     name: "disconnect",
     description: "Stop following this room in Discord (the room stays open)",
-    options: [{ type: BOOLEAN_OPTION, name: "all", description: "Disconnect every connected room", required: false }],
   },
 ];
 const AUX = /^(is|are|am|was|were|do|does|did|can|could|will|would|shall|should|may|might|must|have|has|had|isn't|aren't|wasn't|weren't|don't|doesn't|didn't|can't|couldn't|won't|wouldn't|shouldn't|haven't|hasn't|hadn't|ok|okay)\b/i;
@@ -160,6 +158,7 @@ export function createConnector({ discord, out, clock = realClock }) {
   const waiters = new Set();
   const reported = new Set();
   let promptSeq = 0;
+  let gatewayEpoch = 0;
   // Owner messages sent to the room, by Discord id → whether the "edits" note was posted.
   const spoken = new Map();
   // Rooms whose saved says this child has sent again since it started.
@@ -243,6 +242,7 @@ export function createConnector({ discord, out, clock = realClock }) {
   });
   discord.on("offline", () => {
     online = false;
+    gatewayEpoch++;
     read.clear();
   });
   discord.on("forums", () => {
@@ -319,9 +319,9 @@ export function createConnector({ discord, out, clock = realClock }) {
       return;
     }
     if (prompt) {
-      if (r.emoji !== YES || prompt.used || clock.now() > prompt.expiresAt) return;
+      if (r.emoji !== YES || prompt.used || prompt.askedOf !== ownerId || clock.now() > prompt.expiresAt) return;
       const w = workers.get(prompt.room);
-      if (!prompt.all && !(w?.accepting && w.createdAt === prompt.inst)) return;
+      if (prompt.all || !(w?.accepting && w.createdAt === prompt.inst)) return;
       // Used up on disk before it is acted on: a restart never requests it a second time. A
       // quiet one is kept, used, so its spell is not asked about again.
       if (prompt.quiet) prompts()[r.messageId] = { ...prompt, used: true };
@@ -333,7 +333,6 @@ export function createConnector({ discord, out, clock = realClock }) {
         return fail("storage_blocked", e?.message);
       }
       const from = { ownerId: r.userId, ...(prompt.threadId ? { threadId: prompt.threadId } : {}) };
-      if (prompt.all) return send({ t: "disconnect_request", all: true, ...from });
       return send({ t: "disconnect_request", room: prompt.room, createdAt: prompt.inst, ...(prompt.quiet ? { quiet: true } : {}), ...from });
     }
     // Any emoji but these two does nothing (#205).
@@ -358,27 +357,18 @@ export function createConnector({ discord, out, clock = realClock }) {
   async function command(c) {
     const refuse = (content) => c.reply({ content, ephemeral: true });
     if (!ownerId || c.userId !== ownerId) return refuse("Only the paired owner can disconnect rooms.");
-    let target;
-    let content;
-    if (c.all) {
-      const rooms = [...workers.values()].filter((w) => w.accepting).map((w) => w.code);
-      if (!rooms.length) return refuse("No room is connected.");
-      target = { all: true };
-      content = `Disconnect every connected room (${rooms.join(", ")})? The Mac may sleep, and you cannot reconnect until you are back at it.`;
-    } else {
-      const code = roomOfThread(c.channelId);
-      if (!code || !workers.get(code)?.accepting) return refuse("Run /disconnect inside a connected room's post, or use /disconnect all:True.");
-      target = { room: code };
-      content = `Disconnect ${code}? If no other room is connected the Mac may sleep, and you cannot reconnect until you are back at it.`;
-    }
-    const inPost = roomOfThread(c.channelId) ? { threadId: c.channelId } : {};
-    const inst = target.room ? { inst: workers.get(target.room).createdAt } : {};
+    // A post acts on its own room only: every room at once is the app's Settings button (owner,
+    // 2026-11-02). An `all` option left over from an older registration is ignored.
+    const code = roomOfThread(c.channelId);
+    if (!code || !workers.get(code)?.accepting) return refuse("Run /disconnect inside a connected room's post.");
+    const content = `Disconnect ${code}? If no other room is connected the Mac may sleep, and you cannot reconnect until you are back at it.`;
+    const target = { room: code, inst: workers.get(code).createdAt, threadId: c.channelId };
     const full = `${content}\nReact ${YES} within 10 minutes to confirm.`;
     // Unsettled intents are bounded too: a new prompt waits rather than one on show going quiet.
     if (Object.keys(posting()).filter((k) => k.startsWith("cmd:")).length >= PROMPTS_MAX) {
       return refuse("Earlier /disconnect prompts are still being checked with Discord. Try again in a minute.");
     }
-    const msg = await postPrompt(`cmd:${++promptSeq}@${clock.now()}`, c.channelId, full, { ...target, ...inst, ...inPost }, () => c.reply({ content: full, ephemeral: false }));
+    const msg = await postPrompt(`cmd:${++promptSeq}@${clock.now()}`, c.channelId, full, target, () => c.reply({ content: full, ephemeral: false }));
     if (msg?.id) await discord.react({ threadId: c.channelId, messageId: msg.id, emoji: YES }).catch(() => {});
   }
 
@@ -402,11 +392,15 @@ export function createConnector({ discord, out, clock = realClock }) {
   // The intent is durable before the post, so a post Discord took but this child never heard
   // back from is found again by `settlePosting` and armed, not left on show unanswerable.
   async function postPrompt(key, channelId, content, meta, post) {
-    const intent = { channelId, content, sinceMs: clock.now(), meta: { ...meta, channelId, expiresAt: clock.now() + PROMPT_MS } };
+    const intent = { channelId, content, sinceMs: clock.now(), meta: { ...meta, channelId, askedOf: ownerId, expiresAt: clock.now() + PROMPT_MS } };
     posting()[key] = intent;
     save();
     const msg = await post();
-    if (posting()[key] !== intent) return null;
+    // Cancelled while it was being posted (a re-pair): it is on show, so say it does not work.
+    if (posting()[key] !== intent) {
+      if (msg?.id) voided(channelId, msg.id);
+      return null;
+    }
     delete posting()[key];
     if (msg?.id) {
       arm(msg.id, intent.meta);
@@ -423,7 +417,10 @@ export function createConnector({ discord, out, clock = realClock }) {
       return save();
     }
     const id = await discord.findOwn(intent.channelId, { content: intent.content, sinceMs: intent.sinceMs });
-    if (posting()[key] !== intent) return;
+    if (posting()[key] !== intent) {
+      if (id && intent.meta.askedOf !== ownerId) voided(intent.channelId, id);
+      return;
+    }
     delete posting()[key];
     if (id) arm(id, intent.meta);
     save();
@@ -440,11 +437,36 @@ export function createConnector({ discord, out, clock = realClock }) {
     const p = prompts()[id];
     if (!p || p.used || read.has(id) || !p.channelId || clock.now() > p.expiresAt) return;
     const w = workers.get(p.room);
-    if (!p.all && !(w?.accepting && w.createdAt === p.inst)) return;
-    if (p.all && !online) return;
-    const given = ownerId && (await discord.reactedBy({ channelId: p.channelId, messageId: id, emoji: YES, userId: ownerId }));
+    if (p.all || !(w?.accepting && w.createdAt === p.inst)) return;
+    // An answer is only good for the gateway session it was asked under: one that comes back
+    // after a drop is dropped, and the read after the drop asks again (#205 r7). Whose ✅ it was
+    // is `onReaction`'s to check, the one door every ✅ goes through.
+    const asked = { owner: ownerId, epoch: gatewayEpoch };
+    const given = await discord.reactedBy({ channelId: p.channelId, messageId: id, emoji: YES, userId: asked.owner });
+    if (gatewayEpoch !== asked.epoch) return;
     read.add(id);
-    if (given) onReaction({ messageId: id, channelId: p.channelId, userId: ownerId, emoji: YES }, true);
+    if (given) onReaction({ messageId: id, channelId: p.channelId, userId: asked.owner, emoji: YES }, true);
+  }
+
+  // A prompt is asked of the owner paired when it was posted. A re-pair cancels every other
+  // owner's prompt and intent, in memory first so a save that fails cannot bring one back here,
+  // and says so on the prompts still on show (#205 r7).
+  function cancelOthers() {
+    for (const [id, p] of Object.entries(prompts())) {
+      if (p.askedOf === ownerId) continue;
+      delete prompts()[id];
+      if (p.channelId) voided(p.channelId, id);
+    }
+    for (const [key, i] of Object.entries(posting())) if (i.meta.askedOf !== ownerId) delete posting()[key];
+    read.clear();
+    try {
+      save();
+    } catch (e) {
+      fail("storage_blocked", e?.message);
+    }
+  }
+  function voided(channelId, messageId) {
+    discord.botEdit({ channelId, messageId, content: "This prompt no longer works: the paired owner changed." }).catch(() => {});
   }
 
   // One search at a time: two never race over the same intent (#205 r5).
@@ -1180,6 +1202,8 @@ export function createConnector({ discord, out, clock = realClock }) {
         fail("storage_blocked", storageBlocked);
         statePath = null;
       }
+      // Prompts asked of an owner paired before this start are no one's to answer now.
+      if (!loaded.blocked) cancelOthers();
       if (loaded.aside) {
         fail("internal", `The Discord state file could not be read and was kept aside as ${loaded.aside}; posts will be found again by their marker.`);
       }
@@ -1194,6 +1218,7 @@ export function createConnector({ discord, out, clock = realClock }) {
         return;
       case "owner":
         ownerId = msg.ownerId ?? null;
+        cancelOthers();
         if (awaitingOwner && msg.round === awaitingOwner.round && msg.ownerId === awaitingOwner.userId) {
           awaitingOwner.reply?.("Paired with Gyredeck.")?.catch?.(() => {});
           awaitingOwner = null;

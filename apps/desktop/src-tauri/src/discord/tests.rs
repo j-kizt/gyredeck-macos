@@ -4361,7 +4361,6 @@ fn a_disconnect_request_runs_the_same_disconnect_as_the_button_for_the_named_pos
         format!(r#"{{"t":"disconnect_request","room":"sync-zz99","ownerId":"{OWNER_ID}","threadId":"{THREAD}"}}"#),
         // Confirmed by someone other than the paired owner.
         format!(r#"{{"t":"disconnect_request","room":"{ROOM}","ownerId":"999999999999999999","threadId":"{THREAD}"}}"#),
-        format!(r#"{{"t":"disconnect_request","all":true,"ownerId":"999999999999999999"}}"#),
         // Confirmed in another room's post, or in no post.
         format!(r#"{{"t":"disconnect_request","room":"{ROOM}","ownerId":"{OWNER_ID}","threadId":"{OTHER_THREAD}"}}"#),
         format!(r#"{{"t":"disconnect_request","room":"{ROOM}","ownerId":"{OWNER_ID}"}}"#),
@@ -4382,10 +4381,37 @@ fn a_disconnect_request_runs_the_same_disconnect_as_the_button_for_the_named_pos
     assert_eq!(ended, vec![(ROOM, "disconnected")], "the post is told Disconnected, not Room closed: the room stays open");
     assert!(!f.state.core.readers.lock().unwrap().contains_key(ROOM), "its reader stopped");
 
+    // Every room at once is the app's own button now, never a request from Discord (owner, 2026-11-02).
+    assert_eq!(f.acts.leave_words.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_disconnect_request_for_every_room_disconnects_none_discord_acts_only_on_its_own_post() {
+    let f = fixture_owned("disconnect-all-gone", Some(TOKEN), &[], the_owner());
+    let _buffer = f.attach_buffer();
+    f.acts.founded.lock().unwrap().push(OTHER.to_string());
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.state.connect(OTHER, "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6").unwrap();
+    connected(&f, ROOM, THREAD);
+    connected(&f, OTHER, OTHER_THREAD);
     on_core_event(&f.state.core, disconnect_line(&format!(r#"{{"t":"disconnect_request","all":true,"ownerId":"{OWNER_ID}"}}"#)));
-    assert!(f.state.status().connected_rooms.is_empty());
-    assert_eq!(f.acts.leave_words.lock().unwrap()[1].0, OTHER);
-    assert_eq!(f.acts.leave_words.lock().unwrap()[1].1, "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6");
+    assert_eq!(f.state.status().connected_rooms.len(), 2, "all, naming no room: nothing");
+    assert!(f.acts.leaves.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_disconnect_request_carrying_all_is_refused_even_from_its_own_post() {
+    let f = fixture_owned("disconnect-all-own-post", Some(TOKEN), &[], the_owner());
+    let _buffer = f.attach_buffer();
+    f.acts.founded.lock().unwrap().push(OTHER.to_string());
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.state.connect(OTHER, "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6").unwrap();
+    connected(&f, ROOM, THREAD);
+    connected(&f, OTHER, OTHER_THREAD);
+    // Named with its own post, every other check passes: only `all` itself refuses it.
+    on_core_event(&f.state.core, disconnect_line(&format!(r#"{{"t":"disconnect_request","all":true,"room":"{ROOM}","ownerId":"{OWNER_ID}","threadId":"{THREAD}"}}"#)));
+    assert_eq!(f.state.status().connected_rooms.len(), 2, "no request from Discord carries all");
+    assert!(f.acts.leaves.lock().unwrap().is_empty());
 }
 
 #[test]

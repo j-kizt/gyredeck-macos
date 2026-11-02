@@ -2326,7 +2326,8 @@ impl Core {
             hub.rooms
                 .iter()
                 .filter(|(code, feed)| {
-                    all || (room.as_deref() == Some(code.as_str())
+                    // Every room at once is the app's own button; Discord acts on one post's room (owner, 2026-11-02).
+                    !all && (room.as_deref() == Some(code.as_str())
                         && feed.thread_id.is_some()
                         && feed.thread_id.as_deref() == thread_id
                         && created_at.is_none_or(|at| feed.created_at == Some(at))

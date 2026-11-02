@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ChannelType, Collection, DiscordAPIError, DiscordjsErrorCodes } from "discord.js";
-import { COMMANDS, createConnector, isYesNo, parseAddress, RETENTION_MS } from "../adapters/discord/connector.mjs";
+import { COMMANDS, createConnector, parseAddress, RETENTION_MS } from "../adapters/discord/connector.mjs";
 import { loadState, saveState } from "../adapters/discord/state.mjs";
 import { createDiscordJs, FIND_PAGES_MAX } from "../adapters/discord/discord-js.mjs";
 import { createFakeDiscord, fakeClock, flush, kindError } from "./discord/fake.mjs";
@@ -1797,30 +1797,54 @@ test("#205 the owner's ✅ on a relayed tell says acknowledged as a reaction to 
   await c.close();
 });
 
-test("#205 ✅/❌ on a yes/no ask answers yes/no; on any other ask the bot asks for a typed reply", async () => {
+// The asker says an ask is yes/no when it posts it; nothing is guessed from the wording, in any
+// language (owner, 2026-11-02, after the live test: a Thai ask got "needs a typed reply").
+test("#205 ✅/❌ answers only an ask its asker marked yes/no, in any language; any other ask needs a typed reply", async () => {
   const { c, fake, of, threadId } = await ownerRoom();
-  c.handle(message("sync-abcd", 1, { senderId: "conv-gyre", kind: "ask", text: "Tests pass. Should I merge it?" }));
-  c.handle(message("sync-abcd", 2, { senderId: "conv-codex", kind: "ask", text: "Which branch should I use?" }));
+  c.handle(message("sync-abcd", 1, { senderId: "conv-gyre", kind: "ask", yesNo: true, text: "ทดสอบต่ออีกไหม" }));
+  c.handle(message("sync-abcd", 2, { senderId: "conv-codex", kind: "ask", text: "Tests pass. Should I merge it?" }));
+  c.handle(message("sync-abcd", 3, { senderId: "conv-codex", kind: "ask", yesNo: false, text: "Is it fine?" }));
+  c.handle(message("sync-abcd", 4, { senderId: "conv-codex", kind: "ask", yesNo: "true", text: "Release now?" }));
   await flush();
-  const [yn, open] = fake.sent.slice(-2).map((s) => s.id);
-  fake.addReaction({ messageId: yn, channelId: threadId, userId: OWNER, emoji: "✅" });
-  fake.addReaction({ messageId: yn, channelId: threadId, userId: OWNER, emoji: "❌" });
+  const [marked, unmarked, off, malformed] = fake.sent.slice(-4).map((s) => s.id);
+  fake.addReaction({ messageId: marked, channelId: threadId, userId: OWNER, emoji: "✅" });
+  fake.addReaction({ messageId: marked, channelId: threadId, userId: OWNER, emoji: "❌" });
   assert.deepEqual(of("say").map((s) => [s.kind, s.to, s.replyToSeq, s.text]), [
     ["tell", "conv-gyre", 1, "yes"],
     ["tell", "conv-gyre", 1, "no"],
   ]);
   for (const say of of("say")) assert.deepEqual([say.threadId, say.ownerId], [threadId, OWNER]);
-  fake.addReaction({ messageId: open, channelId: threadId, userId: OWNER, emoji: "✅" });
+  for (const id of [unmarked, off, malformed]) fake.addReaction({ messageId: id, channelId: threadId, userId: OWNER, emoji: "✅" });
   await flush();
-  assert.equal(of("say").length, 2, "nothing is posted for an open question");
-  assert.equal(fake.bot.at(-1).content, "This question needs a typed reply");
-  assert.equal(fake.bot.at(-1).replyTo, open);
+  assert.equal(of("say").length, 2, "an English yes/no wording, a false flag and a non-boolean one answer nothing");
+  assert.deepEqual(fake.bot.slice(-3).map((b) => [b.replyTo, b.content]), [unmarked, off, malformed].map((id) => [id, "This question needs a typed reply"]));
   await c.close();
 });
 
-test("#205 the yes/no rule: ends with ? and the last sentence opens with an auxiliary verb, with no 'or'", () => {
-  for (const t of ["Should I merge?", "Done. Can I push now?", "OK to release?", "Is it fine?\n", "Don't you want it?"]) assert.ok(isYesNo(t), t);
-  for (const t of ["Which file?", "Should I merge A or B?", "Should I merge.", "I wonder if it works?", ""]) assert.ok(!isYesNo(t), t);
+test("#205 a yes/no flag on anything but an ask opens no yes/no answer", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  c.handle(message("sync-abcd", 1, { senderId: "conv-gyre", kind: "tell", yesNo: true, text: "Done?" }));
+  await flush();
+  fake.addReaction({ messageId: fake.sent.at(-1).id, channelId: threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(of("say").map((s) => [s.kind, s.text]), [["reaction", "acknowledged"]], "✅ on a tell stays an acknowledgement");
+  await c.close();
+});
+
+test("#205 every part of a long yes/no ask takes ✅ as yes, and the flag outlives a restart", async () => {
+  const statePath = tmpState();
+  const fake = createFakeDiscord();
+  const first = await ownerRoom({ fake, statePath });
+  first.c.handle(message("sync-abcd", 1, { senderId: "conv-gyre", kind: "ask", yesNo: true, text: "ก".repeat(3500) }));
+  await flush();
+  const parts = fake.sent.filter((s) => s.threadId === first.threadId).map((s) => s.id);
+  assert.ok(parts.length >= 2, "premise: split into parts");
+  await first.c.close();
+  const second = await boot({ fake, statePath, ownerId: OWNER });
+  second.c.handle({ t: "connect", room: "sync-abcd", members: ["Claude / Gyre"], createdAt: 1 });
+  await flush();
+  second.fake.addReaction({ messageId: parts.at(-1), channelId: first.threadId, userId: OWNER, emoji: "✅" });
+  assert.deepEqual(second.of("say").map((s) => [s.to, s.replyToSeq, s.text]), [["conv-gyre", 1, "yes"]]);
+  await second.c.close();
 });
 
 test("#205 the owner voice's own messages coming back from the room are not relayed again, and are acknowledged", async () => {

@@ -38,17 +38,6 @@ export const COMMANDS = [
     description: "Stop following this room in Discord (the room stays open)",
   },
 ];
-const AUX = /^(is|are|am|was|were|do|does|did|can|could|will|would|shall|should|may|might|must|have|has|had|isn't|aren't|wasn't|weren't|don't|doesn't|didn't|can't|couldn't|won't|wouldn't|shouldn't|haven't|hasn't|hadn't|ok|okay)\b/i;
-
-// A yes/no question: the text ends with "?", and its last sentence opens with an auxiliary
-// verb (is/can/should/…, or "ok"/"okay") and offers no " or " choice. "Should I merge?" is
-// one; "Which file?" and "Should I merge A or B?" are not.
-export function isYesNo(text) {
-  const t = String(text ?? "").trim();
-  if (!t.endsWith("?")) return false;
-  const last = t.slice(0, -1).split(/[.!?\n]/).at(-1).trim().replace(/^[^\p{L}]+/u, "");
-  return AUX.test(last) && !/\bor\b/i.test(last);
-}
 
 // "@Name: text" or "Name: text" at the very start addresses Name; anything else is for
 // everyone. The colon is what ends the name: without it "@Gyre Assistant please reply" could
@@ -1086,7 +1075,7 @@ export function createConnector({ discord, out, clock = realClock }) {
         // Each part's Discord id, in the same save as its acceptance, so a Reply or a
         // reaction to any part names this seq and its sender (#205).
         if (id && item.m.kind !== "notice") {
-          (r.relayed ??= []).push({ id, seq, senderId: item.m.senderId ?? null, sender: item.m.sender, kind: item.m.kind, yn: isYesNo(item.m.text) });
+          (r.relayed ??= []).push({ id, seq, senderId: item.m.senderId ?? null, sender: item.m.sender, kind: item.m.kind, yn: item.m.yesNo === true });
           if (r.relayed.length > RELAYED_MAX) r.relayed.splice(0, r.relayed.length - RELAYED_MAX);
         }
         if (last) finished(r);
@@ -1276,6 +1265,8 @@ export function createConnector({ discord, out, clock = realClock }) {
           senderId: typeof msg.senderId === "string" && msg.senderId ? msg.senderId : null,
           to: String(msg.to ?? "everyone"),
           toOwner: msg.toOwner === true,
+          // The asker marked it yes/no; only `true` on an ask counts (#205).
+          yesNo: msg.yesNo === true,
           kind: String(msg.kind ?? "tell"),
           text: String(msg.text ?? ""),
         };

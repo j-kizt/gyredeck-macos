@@ -432,6 +432,7 @@ fn nothing_is_read_or_forwarded_for_a_room_that_is_not_connected() {
         ts: String::new(),
         sender_id: None,
         to_owner: false,
+        yes_no: false,
     });
     thread::sleep(Duration::from_millis(200));
     assert!(f.source.opens.lock().unwrap().iter().all(|(room, ..)| room == ROOM), "only the connected room is read");
@@ -780,7 +781,7 @@ fn an_ack_trims_exactly_the_seqs_it_names() {
     lock(&f.state.hub).connect(ROOM, vec![], Some(CREATED)).unwrap();
     for seq in 1..=5 {
         lock(&f.state.hub).forward(ToChild::Message {
-            room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false,
+            room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false,
         });
     }
     assert_eq!(f.state.status().behind.get(ROOM), Some(&5));
@@ -884,7 +885,7 @@ fn what_discord_accepted_is_told_to_the_bridge_coalesced_on_the_apps_word() {
 fn a_late_ack_for_a_codes_earlier_room_never_trims_its_new_room() {
     let f = fixture("stale-ack", Some(TOKEN));
     let _buffer = f.attach_buffer();
-    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false };
+    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false };
     {
         let mut hub = lock(&f.state.hub);
         hub.connect(ROOM, vec![], Some(100)).unwrap();
@@ -947,7 +948,7 @@ fn a_disconnect_keeps_what_discord_has_not_taken_and_a_new_child_gets_it() {
 fn a_second_disconnect_before_the_first_was_taken_keeps_both() {
     let f = fixture("two-disconnects", Some(TOKEN));
     let _first = f.attach_buffer();
-    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false };
+    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false };
     {
         let mut hub = lock(&f.state.hub);
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
@@ -1364,7 +1365,7 @@ fn standin_a_room_closed_while_no_child_runs_is_still_closed_by_the_next_child()
     {
         let mut hub = lock(&f.state.hub);
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
-        hub.forward(ToChild::Message { room: ROOM.into(), seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "m1".into(), ts: String::new(), sender_id: None, to_owner: false });
+        hub.forward(ToChild::Message { room: ROOM.into(), seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "m1".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false });
         hub.ack(ROOM, 1, Some(CREATED), None);
         assert_eq!(hub.backlog(ROOM), Some(0), "premise: nothing owed to Discord");
         // The child is gone (died, or its pipe filled) and the room ends before the next is up.
@@ -1389,7 +1390,7 @@ fn standin_remove_keeps_the_child_epoch() {
 }
 
 fn audit_line(seq: u64) -> ToChild {
-    ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false }
+    ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false }
 }
 
 #[test]
@@ -1530,7 +1531,7 @@ fn a_storage_refusal_stays_shown_through_ready() {
 // ── #199 r7: the invariants the audit found open (199-invariants.md §5), one proof each ──
 
 fn held_line(seq: u64, sender: &str) -> ToChild {
-    ToChild::Message { room: ROOM.to_string(), seq, sender: sender.into(), to: "everyone".into(), kind: "tell".into(), text: "x".repeat(1024), ts: String::new(), sender_id: None, to_owner: false }
+    ToChild::Message { room: ROOM.to_string(), seq, sender: sender.into(), to: "everyone".into(), kind: "tell".into(), text: "x".repeat(1024), ts: String::new(), sender_id: None, to_owner: false, yes_no: false }
 }
 
 /// I18: an attach hands a fresh child everything held, however much, at the pace it reads.
@@ -1707,7 +1708,7 @@ fn recovered_hub(path: &Path, window: usize) -> Arc<Mutex<Hub>> {
 }
 
 fn line_in(room: &str, seq: u64) -> ToChild {
-    ToChild::Message { room: room.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: "2026-10-27T10:00:00.000Z".into(), sender_id: None, to_owner: false }
+    ToChild::Message { room: room.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: "2026-10-27T10:00:00.000Z".into(), sender_id: None, to_owner: false, yes_no: false }
 }
 
 fn held_seqs(hub: &Hub, room: &str) -> Vec<u64> {
@@ -1828,7 +1829,7 @@ fn audit_repeated_disconnect_cycles_stay_inside_the_one_budget() {
     for cycle in 0..4_u64 {
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
         for seq in cycle * 3 + 1..=cycle * 3 + 3 {
-            hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false });
+            hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false });
         }
         hub.disconnect(ROOM, DisconnectReason::Disconnected);
     }
@@ -1866,7 +1867,7 @@ fn attach_holds_references_not_lines() {
         hub.cap = held as usize + 1;
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
         for seq in 1..=held {
-            assert_eq!(hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "a".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false }), Forwarded::Taken);
+            assert_eq!(hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "a".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false }), Forwarded::Taken);
         }
         hub.disconnect(ROOM, DisconnectReason::Disconnected);
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
@@ -4754,4 +4755,61 @@ fn a_real_bridge_takes_the_owners_say_as_you_via_discord_and_no_one_else_can_spe
     }
     drop(state);
     drop(bridge);
+}
+
+// The asker's yes/no flag (#205, owner 2026-11-02): carried from the room to the child on an
+// ask only, and kept by the journal through a compaction and a relaunch.
+fn yes_no_frame(seq: u64, kind: &str, yes_no: serde_json::Value) -> serde_json::Value {
+    let mut frame = mail(seq, "peer-a", "everyone", kind, &format!("q{seq}"));
+    frame["yesNo"] = yes_no;
+    frame
+}
+
+#[test]
+fn an_asks_yes_no_flag_reaches_the_child_and_nothing_else_carries_one() {
+    let f = fixture("yes-no-wire", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.stream(ROOM, &[
+        yes_no_frame(1, "ask", serde_json::json!(true)),
+        mail(2, "peer-a", "everyone", "ask", "q2"),
+        yes_no_frame(3, "tell", serde_json::json!(true)),
+        yes_no_frame(4, "ask", serde_json::json!(false)),
+    ]);
+    wait_until("four lines", || of_kind(&buffer.lines(), "message").len() == 4);
+    let all = buffer.lines();
+    let lines = of_kind(&all, "message");
+    let flag = |seq: u64| lines.iter().find(|line| line["seq"] == seq).map(|line| line.get("yesNo").cloned());
+    assert_eq!(flag(1), Some(Some(serde_json::json!(true))), "a yes/no ask says so");
+    for seq in [2, 3, 4] {
+        assert_eq!(flag(seq), Some(None), "seq {seq}: no flag, a tell with one, or false: none reaches the child");
+    }
+}
+
+#[test]
+fn a_yes_no_flag_outlives_a_compaction_and_a_relaunch_and_old_lines_have_none() {
+    let f = fixture("yes-no-journal", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.stream(ROOM, &[
+        mail(1, "peer-a", "everyone", "tell", "one"),
+        mail(2, "peer-a", "everyone", "tell", "two"),
+        mail(3, "peer-a", "everyone", "tell", "three"),
+        yes_no_frame(4, "ask", serde_json::json!(true)),
+    ]);
+    wait_until("four lines", || of_kind(&buffer.lines(), "message").len() == 4);
+    {
+        let hub = lock(&f.state.hub);
+        let file = hub.rooms[ROOM].journal.as_ref().unwrap();
+        file.append(&journal::Record::Ack { seq: 3, msg: None }).unwrap();
+        assert!(file.compact().unwrap(), "premise: the acked lines compact away");
+    }
+    let path = journal_path(&f);
+    let (_next, handed) = launch_wire(&path, Moment::Launch).unwrap();
+    let replayed: Vec<&serde_json::Value> = handed.iter().filter(|line| line["t"] == "message").collect();
+    assert_eq!(replayed.iter().map(|line| line["seq"].as_u64().unwrap()).collect::<Vec<_>>(), vec![4], "premise: only the unacked ask is replayed");
+    assert_eq!(replayed[0]["yesNo"], serde_json::json!(true), "the flag came back from the journal");
+    let old: journal::Record = serde_json::from_str(r#"{"t":"line","seq":9,"sender":"Codex","to":"everyone","kind":"ask","text":"x","ts":""}"#)
+        .expect("a line written before the flag still parses");
+    assert!(!serde_json::to_string(&old).unwrap().contains("yesNo"), "a line from before the flag has none");
 }

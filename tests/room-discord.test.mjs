@@ -357,7 +357,7 @@ test("T12b: the relay's stream opens with what the room dropped and where the re
 // ── #205: the owner's Discord voice ──
 
 test("rules v15 tell every agent what the owner's Discord voice may ask, and never approve", () => {
-  assert.equal(ROOM_RULES_VERSION, 15);
+  assert.ok(ROOM_RULES_VERSION >= 15);
   const rules = roomRules("http://127.0.0.1:47621");
   assert.ok(
     rules.includes("- A message from `You (via Discord)` (`gyredeck-owner-discord`) is the owner speaking from their phone. It carries the owner's authority to ask for work, never to approve a commit, a release, a credential or a settings change: ask for those at the terminal."),
@@ -578,4 +578,50 @@ test("a reserved voice, or a lookalike, is never a session: not founded, joined,
   } finally {
     await h.stop();
   }
+});
+
+// The asker says an ask is yes/no when it posts it (#205, owner 2026-11-02): only then may the
+// owner answer it with ✅/❌ from Discord. Nothing is guessed from the wording.
+test("#205 a yes/no flag is a boolean on an ask, kept on the message; anything else is refused, never quietly dropped", async () => {
+  const h = await startBridge();
+  try {
+    const { code, password } = await roomWithRelay(h);
+    const post = (body) => fetch(`${h.base}/mail/${code}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": password },
+      body: JSON.stringify({ from: "peer-a", to: "everyone", ...body }),
+    }).then(async (r) => ({ status: r.status, body: await r.json() }));
+    const asked = await post({ kind: "ask", yesNo: true, text: "ทดสอบต่ออีกไหม" });
+    assert.equal(asked.body.ok, true, `premise: the post landed (${asked.status})`);
+    const plain = await post({ kind: "ask", text: "Should I merge?" });
+    const off = await post({ kind: "ask", yesNo: false, text: "Is it fine?" });
+    for (const [body, why] of [
+      [{ kind: "ask", yesNo: "true", text: "a" }, "a string is not a boolean"],
+      [{ kind: "ask", yesNo: 1, text: "b" }, "a number is not a boolean"],
+      [{ kind: "tell", yesNo: true, text: "c" }, "only an ask can be answered yes or no"],
+      [{ kind: "reaction", yesNo: true, text: "d" }, "nor a reaction"],
+    ]) {
+      const refused = await post(body);
+      assert.equal(refused.status, 400, why);
+      assert.equal(refused.body.error, "invalid_yes_no", why);
+    }
+    const messages = await readRoom(h, code);
+    const by = (seq) => messages.find((m) => m.seq === seq);
+    assert.equal(by(asked.body.seq).yesNo, true);
+    assert.equal("yesNo" in by(plain.body.seq), false, "an unmarked ask carries no flag, whatever its wording");
+    assert.equal("yesNo" in by(off.body.seq), false, "false is the same as no flag");
+    assert.equal(messages.filter((m) => ["a", "b", "c", "d"].includes(m.text)).length, 0, "a refused post is not published");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("rules v16 tell every agent how to mark a yes/no ask, and that ✅ is a yes, never an approval", () => {
+  assert.equal(ROOM_RULES_VERSION, 16);
+  const rules = roomRules("http://127.0.0.1:47621");
+  assert.match(rules, /"yesNo": true/, "Claude Code and Antigravity: the field");
+  assert.match(rules, /invalid_yes_no/, "and what a wrong one gets back");
+  assert.match(rules, /ask yn/, "Codex: the routing line");
+  assert.match(rules, /never an approval/);
+  assert.match(rules, /An unmarked ask needs a typed answer/);
 });

@@ -202,6 +202,9 @@ pub(crate) enum ToChild {
         sender_id: Option<String>,
         /// An ask addressed to the person: the child mentions the paired owner on this one.
         to_owner: bool,
+        /// The asker marked this ask yes/no: ✅/❌ on Discord answers it (#205).
+        #[serde(rename = "yesNo", skip_serializing_if = "std::ops::Not::not")]
+        yes_no: bool,
     },
     /// `id` names this close, so `closed` clears this one and not another of the instance.
     Disconnect { room: String, reason: DisconnectReason, id: String },
@@ -630,6 +633,7 @@ fn notice(room: &str, seq: u64, text: String) -> ToChild {
         ts: String::new(),
         sender_id: None,
         to_owner: false,
+        yes_no: false,
     }
 }
 
@@ -649,8 +653,8 @@ fn loss_text(n: u64, label: &str) -> String {
 
 fn line_record(line: &ToChild) -> Option<journal::Record> {
     match line.clone() {
-        ToChild::Message { seq, sender, to, kind, text, ts, sender_id, to_owner, .. } => {
-            Some(journal::Record::Line { seq, sender, to, kind, text, ts, through: None, sender_id, to_owner })
+        ToChild::Message { seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, .. } => {
+            Some(journal::Record::Line { seq, sender, to, kind, text, ts, through: None, sender_id, to_owner, yes_no })
         }
         _ => None,
     }
@@ -658,8 +662,8 @@ fn line_record(line: &ToChild) -> Option<journal::Record> {
 
 fn item_line(room: &str, item: journal::Item) -> ToChild {
     match item {
-        journal::Item::Line { seq, sender, to, kind, text, ts, sender_id, to_owner, .. } => {
-            ToChild::Message { room: room.to_string(), seq, sender, to, kind, text, ts, sender_id, to_owner }
+        journal::Item::Line { seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, .. } => {
+            ToChild::Message { room: room.to_string(), seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no }
         }
         journal::Item::Loss { seq, n, label, .. } => notice(room, seq, loss_text(n, &label)),
     }
@@ -2778,6 +2782,9 @@ struct WireMessage {
     /// The sender as the room showed it when it spoke (#182): its declared name, if any.
     #[serde(default, rename = "fromShown")]
     from_shown: Option<String>,
+    /// Kept only when it is `true` on an ask; any other value is no flag (#205).
+    #[serde(default, rename = "yesNo")]
+    yes_no: Option<serde_json::Value>,
 }
 
 impl RoomReader {
@@ -3035,6 +3042,7 @@ impl RoomReader {
         let from_room = message.from == ROOM_SENDER;
         // The person, by either of their voices: an ask to them is the one that pings (#205).
         let to_owner = kind == "ask" && matches!(message.to.as_deref(), Some(OWNER_SENDER | APP_SENDER));
+        let yes_no = kind == "ask" && message.yes_no == Some(serde_json::Value::Bool(true));
         let forwarded = lock(&self.hub).forward(ToChild::Message {
             room: self.room.clone(),
             seq: message.seq,
@@ -3045,6 +3053,7 @@ impl RoomReader {
             ts: message.ts.unwrap_or_default(),
             sender_id: Some(message.from),
             to_owner,
+            yes_no,
         });
         // The room's notices are where joins and departures are said.
         if from_room {

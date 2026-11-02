@@ -3843,6 +3843,25 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     assert.equal(inline.kind, "reaction");
     assert.equal(inline.to, founder, "addressed to the member it names, not to the room");
 
+    // A yes/no ask is said on the routing line (#205): `yn` after `ask`. After any other kind
+    // it opens nothing, and the message under it is still published, not swallowed.
+    await appendFile(rollout, turn("@everyone ask yn\nShould I merge #205?"));
+    await endTurn();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    history = await readRoom();
+    const yn = history.find((message) => message.text === "Should I merge #205?");
+    assert.ok(yn, "a yes/no ask is published with the routing line taken off");
+    assert.equal(yn.kind, "ask");
+    assert.equal(yn.yesNo, true, "`ask yn` marks the ask yes/no");
+    await appendFile(rollout, turn("@everyone tell yn — merged it"));
+    await endTurn();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    history = await readRoom();
+    const told = history.find((message) => message.text === "merged it");
+    assert.ok(told, "yn after tell: the routing line is still taken off and the message kept");
+    assert.equal(told.kind, "tell");
+    assert.equal("yesNo" in told, false, "yn opens nothing on a tell");
+
     // A turn that never learned the convention must still be heard, loudly.
     await appendFile(rollout, turn("no routing line here"));
     await endTurn();

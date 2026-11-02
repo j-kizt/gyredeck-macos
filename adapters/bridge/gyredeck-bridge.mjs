@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 15;
+export const ROOM_RULES_VERSION = 16;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -241,7 +241,7 @@ room names the version it expects; if it names a newer one than you read, read t
 ## Who a message is for, and what it is for
 - \`to\` is a member or \`everyone\`. A member is shown as its room label, then \` / \` and its name — \`Codex / Altrix Audit\`. Address it by the label, the whole form as shown, or the name alone when no other member has that name or that label — a label always wins. Answer the member who asked — that wakes one session, not the room.
 - \`kind\` is one of four:
-  - **ask** wants an answer.
+  - **ask** wants an answer. One the owner can answer yes or no, mark yes/no when you send it (below): only then can they answer it with ✅ or ❌ from Discord. A ✅ is "yes" to that question, never an approval of a commit, a release, a credential or a settings change. An unmarked ask needs a typed answer, whatever its wording or language.
   - **tell** does not, but may draw a reaction.
   - **reaction** is a short line saying it landed and where that leaves you. Send one for a tell if it helps the sender; a notice about someone joining or leaving may draw one too. **Never answer a reaction** — that is where an exchange stops.
   - **notice** is the room speaking about itself. It interrupts nobody and needs nothing back.
@@ -257,8 +257,9 @@ room names the version it expects; if it names a newer one than you read, read t
 \`\`\`json
 {"from":"<your id>","to":"<member or everyone>","kind":"ask|tell|reaction","text":"<your message>","replyTo":"<your id>","name":"<your name — first post only>"}
 \`\`\`
+- Claude Code and Antigravity mark a yes/no ask with \`"yesNo": true\` beside \`kind\`. It must be \`true\` or \`false\` and \`true\` only on an ask; anything else is refused with \`invalid_yes_no\` and nothing is sent.
 - Claude Code and Antigravity never put \`[to: …]\` or \`@…\` in \`text\`: they route only through the \`to\` and \`kind\` fields.
-- Codex only — you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\`, with \`name="<Name>"\` after the kind on your first message — and is removed before the room sees it. This first line is Codex's alone. Say everything in one closing message.
+- Codex only — you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\`, with \`yn\` right after \`ask\` for a yes/no ask (\`@Claude Code ask yn — merge it?\`) and \`name="<Name>"\` after that on your first message — and is removed before the room sees it. This first line is Codex's alone. Say everything in one closing message.
 - A send happened only if you saw \`ok:true\` and a \`seq\`. Never say you sent something you did not see land.
 - Codex: your seq is reported on the next message you get, with the turn, recipient and kind it belongs to. Until then a message has not failed — **do not send it again**. A room or a mailbox posts an identical tell to the same member within a minute only once. Claude Code and Antigravity, which post with curl, can add \`"again": true\` to say the same thing again on purpose; Codex has no such switch, so a word-for-word repeat within the minute is taken as a resend.
 - \`listening\` in a receipt names the members with a watch open; a member that is pushed to, as Codex is, hears you without one.
@@ -2144,7 +2145,7 @@ function startBridge(config) {
   // the one place it can say it, since it posts no fields. Quoted, so a name may hold spaces
   // and dashes without being read as the separator. A line without it parses as it always did.
   const CODEX_ROUTING_LINE =
-    /^@(.+?)[ \t]+(ask|tell|reaction|ack)(?:[ \t]+name="([^"]*)")?[ \t]*(?:[—–\-:|][ \t]*(.*))?$/i;
+    /^@(.+?)[ \t]+(ask|tell|reaction|ack)(?:[ \t]+(yn))?(?:[ \t]+name="([^"]*)")?[ \t]*(?:[—–\-:|][ \t]*(.*))?$/i;
   const routeCodexReply = (room, text) => {
     const [first, ...rest] = text.split("\n");
     const match = CODEX_ROUTING_LINE.exec(first.trim());
@@ -2152,7 +2153,7 @@ function startBridge(config) {
     // or label. A goal turn's answer is published on that and nothing else; a line that
     // named nobody, or somebody not here, is not a message to this room (#149).
     if (!match) return { text, routing: { to: MAIL_EVERYONE, kind: MAIL_DEFAULT_KIND }, explicit: false };
-    const inline = (match[4] ?? "").trim();
+    const inline = (match[5] ?? "").trim();
     const target = match[1].trim();
     const named = /^everyone$/i.test(target)
       ? MAIL_EVERYONE
@@ -2166,7 +2167,10 @@ function startBridge(config) {
     // to the whole text published `@everyone ack` as the message body, which is the
     // instruction wearing the costume of a reply.
     const body = [inline, rest.join("\n").trim()].filter(Boolean).join("\n");
-    return { text: body || "ok", routing: { to, kind: asKind(match[2].toLowerCase()) }, explicit: named !== null, name: match[3] };
+    // `yn` after `ask` says the owner may answer it ✅/❌ from Discord (#205); after any
+    // other kind it is read off the line and opens nothing.
+    const kind = asKind(match[2].toLowerCase());
+    return { text: body || "ok", routing: { to, kind, ...(match[3] && kind === "ask" ? { yesNo: true } : {}) }, explicit: named !== null, name: match[4] };
   };
 
   /**
@@ -5364,6 +5368,8 @@ function startBridge(config) {
       replyTo: replyTo ?? null,
       ts: new Date().toISOString(),
       ...(routing?.quiet === true ? { quiet: true } : {}),
+      // Only an ask is ever yes/no, whoever asked to mark it (#205).
+      ...(routing?.yesNo === true && kind === "ask" ? { yesNo: true } : {}),
       ...(from === ROOM_SENDER && typeof routing?.about === "string" ? { about: routing.about } : {}),
       // Which message the person on Discord answered (#205), by seq — not `replyTo`, which
       // names a mailbox to answer to.
@@ -7755,6 +7761,13 @@ function startBridge(config) {
           ? asKind(body.kind)
           : MAIL_DEFAULT_KIND;
         const routedTo = typeof body.to === "string" && body.to.length > 0 ? body.to : MAIL_EVERYONE;
+        // The asker says an ask is yes/no (#205): a boolean, on an ask. Anything else is
+        // refused out loud, so a sender never believes the owner can answer ✅/❌ when they
+        // cannot. Nothing is guessed from the wording.
+        if (body.yesNo !== undefined && (typeof body.yesNo !== "boolean" || (body.yesNo && routedKind !== "ask"))) {
+          sendJson(400, { ok: false, error: "invalid_yes_no", message: "yesNo must be true or false, and true only on an ask." });
+          return;
+        }
         // Asked before the name is resolved, because resolving a mailbox name creates it:
         // an uncredentialed caller must otherwise be able to fill the room table with
         // mailboxes nobody will ever read.
@@ -7945,6 +7958,7 @@ function startBridge(config) {
           publishMail(room, from, text, replyTo, false, {
             to: addressed,
             kind: routedKind,
+            ...(body.yesNo === true ? { yesNo: true } : {}),
             ...(vouched ? { [VOUCHED]: true, inReplyTo } : {}),
           }, body.name));
         const message = declared.published;

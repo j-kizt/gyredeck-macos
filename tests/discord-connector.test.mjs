@@ -2080,6 +2080,48 @@ test("#205 a ✅ given while every search fails counts once a background search 
   await second.c.close();
 });
 
+test("#205 a ✅ given while a search is under way counts once that search arms the prompt; searches never overlap", async () => {
+  const first = await ownerRoom();
+  first.fake.after = async (o) => { if (o === "reply") throw new Error("cut off on the way back"); };
+  first.fake.command({ userId: OWNER, channelId: first.threadId });
+  await flush();
+  first.fake.after = null;
+  const shown = first.fake.replies.at(-1);
+  let release;
+  const held = new Promise((r) => (release = r));
+  let checks = 0;
+  first.fake.gate = async (o) => { if (o === "reactedBy" && ++checks === 1) await held; };
+  const realReacted = first.fake.reactedBy;
+  let searches = 0;
+  const realFind = first.fake.findOwn;
+  first.fake.findOwn = (...a) => (searches++, realFind(...a));
+  // The first check reads "not given" from before the owner reacts.
+  first.fake.reactedBy = async (q) => { const before = checks === 0; const answer = await realReacted(q); return before ? false : answer; };
+  const second = await restarted(first);
+  second.fake.addReaction({ messageId: shown.id, channelId: first.threadId, userId: OWNER, emoji: "✅" });
+  await flush();
+  release();
+  await flush();
+  assert.equal(second.of("disconnect_request").length, 1, "the ✅ given during the search counted, once");
+  assert.equal(searches, 1, "the second search waited for the first, which had settled it");
+  await second.c.close();
+});
+
+test("#205 unsettled /disconnect prompts are bounded: past the limit a new one is refused, none on show goes quiet", async () => {
+  const { c, fake, threadId, statePath } = await ownerRoom();
+  fake.after = async (o) => { if (o === "reply") throw new Error("cut off on the way back"); };
+  for (let i = 0; i < 22; i++) {
+    fake.command({ userId: OWNER, channelId: threadId });
+    await flush();
+  }
+  fake.after = null;
+  assert.equal(Object.keys(JSON.parse(readFileSync(statePath, "utf8")).promptPosting).length, 20);
+  assert.equal(fake.replies.filter((r) => !r.ephemeral).length, 20, "no prompt past the limit is posted");
+  assert.match(fake.replies.at(-1).content, /still being checked/);
+  assert.equal(fake.replies.at(-1).ephemeral, true);
+  await c.close();
+});
+
 test("#205 an intent older than its prompt's life is dropped, not searched", async () => {
   const first = await ownerRoom();
   first.fake.after = async (o) => { if (o === "reply") throw new Error("cut off on the way back"); };

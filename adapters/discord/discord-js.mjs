@@ -337,7 +337,14 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
         if (!ch?.messages) throw kindError("missing", "channel gone");
         const reaction = (await ch.messages.fetch({ message: messageId, cache: false })).reactions.cache.get(emoji);
         if (!reaction) return false;
-        return (await reaction.users.fetch()).has(userId);
+        // A page holds at most 100 users: walk them all.
+        let after;
+        for (;;) {
+          const page = await reaction.users.fetch({ limit: 100, ...(after ? { after } : {}) });
+          if (page.has(userId)) return true;
+          if (page.size < 100) return false;
+          after = page.lastKey();
+        }
       }),
 
     sendWebhook: ({ forumId, threadId, username, content, allowedMentions }) =>

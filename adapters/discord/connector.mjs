@@ -310,8 +310,9 @@ export function createConnector({ discord, out, clock = realClock }) {
     const prompt = prompts()[r.messageId];
     // A prompt Discord may hold that no search has found yet: look again now, when it is needed,
     // so one failed search never leaves a prompt on show that cannot be answered (#205 r4).
+    // The ✅ itself is looked at again once the search is done, whichever search armed it.
     if (!prompt && !searched && r.emoji === YES && Object.keys(posting()).length) {
-      settleAll();
+      settleAll().then(() => onReaction(r, true));
       return;
     }
     if (prompt) {
@@ -368,6 +369,10 @@ export function createConnector({ discord, out, clock = realClock }) {
     const inPost = roomOfThread(c.channelId) ? { threadId: c.channelId } : {};
     const inst = target.room ? { inst: workers.get(target.room).createdAt } : {};
     const full = `${content}\nReact ${YES} within 10 minutes to confirm.`;
+    // Unsettled intents are bounded too: a new prompt waits rather than one on show going quiet.
+    if (Object.keys(posting()).filter((k) => k.startsWith("cmd:")).length >= PROMPTS_MAX) {
+      return refuse("Earlier /disconnect prompts are still being checked with Discord. Try again in a minute.");
+    }
     const msg = await postPrompt(`cmd:${++promptSeq}@${clock.now()}`, c.channelId, full, { ...target, ...inst, ...inPost }, () => c.reply({ content: full, ephemeral: false }));
     if (msg?.id) await discord.react({ threadId: c.channelId, messageId: msg.id, emoji: YES }).catch(() => {});
   }
@@ -422,7 +427,13 @@ export function createConnector({ discord, out, clock = realClock }) {
   // background, backing off, until it is armed, found absent, or past its prompt's life (#205 r4).
   let settleTimer = null;
   let settleBackoff = SETTLE_MIN_MS;
-  async function settleAll() {
+  // One search at a time: two never race over the same intent (#205 r5).
+  let settling = Promise.resolve();
+  function settleAll() {
+    settling = settling.then(settleOnce, settleOnce);
+    return settling;
+  }
+  async function settleOnce() {
     let failed = false;
     for (const key of Object.keys(posting())) {
       await settlePosting(key).catch((e) => {

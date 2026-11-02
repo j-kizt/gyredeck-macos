@@ -367,6 +367,10 @@ pub(crate) struct DiscordStatus {
     pub held: usize,
     /// What the journal refused: `journal_blocked` per room code, `journal_corrupt` per file.
     pub journal_errors: BTreeMap<String, DiscordError>,
+    /// A saved token or owner macOS would not hand over, by which ("token", "owner") (#288). Its
+    /// own field, so nothing that clears the connector's error clears it: it goes only when a
+    /// read or a save of that item succeeds.
+    pub keychain_refused: BTreeMap<String, String>,
 }
 
 struct Pairing {
@@ -606,6 +610,7 @@ struct Hub {
     /// Why the journal directory could not be used: every Connect is refused until it can.
     journal_down: Option<String>,
     journal_errors: BTreeMap<String, DiscordError>,
+    keychain_refused: BTreeMap<String, String>,
     /// Journals recovery refused, by name: left as they are, until Remove deletes them.
     refused: Vec<String>,
     /// Recovered journals past the launch window, oldest first.
@@ -1656,7 +1661,7 @@ impl DiscordState {
         let mut hub = Hub {
             forum_id: text(deps.settings.get(CONFIG_FORUM)),
             owner: owner.clone().ok().flatten(),
-            error: owner.err().map(|why| keychain_refused("owner", &why)),
+            keychain_refused: owner.err().map(|why| keychain_refused("owner", &why)).into_iter().collect(),
             ..Hub::default()
         };
         let journal_path = deps.state_path.parent().map(|dir| dir.join(JOURNAL_DIR)).unwrap_or_else(|| PathBuf::from(JOURNAL_DIR));
@@ -1705,11 +1710,14 @@ impl DiscordState {
             return Err("The Discord connector is not part of this build".to_string());
         };
         let token = match self.deps.tokens.read() {
-            Ok(token) => token,
+            Ok(token) => {
+                lock(&self.hub).keychain_refused.remove("token");
+                token
+            }
             Err(why) => {
                 // Not "not set up": the token may be saved and macOS would not hand it over.
                 self.configured.store(false, Ordering::SeqCst);
-                lock(&self.hub).error = Some(keychain_refused("token", &why));
+                lock(&self.hub).keychain_refused.extend([keychain_refused("token", &why)]);
                 return Ok(());
             }
         };
@@ -1821,6 +1829,7 @@ impl DiscordState {
             error: hub.error.clone(),
             held: hub.parked.len(),
             journal_errors: hub.journal_errors.clone(),
+            keychain_refused: hub.keychain_refused.clone(),
         }
     }
 
@@ -2324,6 +2333,7 @@ fn on_child_event_from(hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64, ev
                 return;
             }
             hub.owner = Some(Owner { id: owner_id.clone(), username: Some(username) });
+            hub.keychain_refused.remove("owner");
             hub.pairing = None;
             hub.send(&ToChild::Owner { owner_id: Some(owner_id), round });
         }
@@ -2823,9 +2833,9 @@ impl secrets::Slot for FileSlot {
     }
 }
 
-/// The token or owner as macOS gave it, or why it would not.
-fn keychain_refused(what: &str, why: &str) -> DiscordError {
-    DiscordError { code: "keychain_refused".to_string(), message: format!("Gyredeck could not read its saved Discord {what}: {why}") }
+/// Which saved item macOS would not hand over, and what to tell the person.
+fn keychain_refused(what: &str, why: &str) -> (String, String) {
+    (what.to_string(), format!("Gyredeck could not read its saved Discord {what}: {why}"))
 }
 
 #[cfg(target_os = "macos")]

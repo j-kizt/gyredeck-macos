@@ -77,3 +77,14 @@ export const signedBuildConfig = ({ entitlementsPath, profilePath }) => ({
 
 /** The Team ID in a Developer ID identity's name, "Developer ID Application: Name (TEAMID)". */
 export const teamOf = (identity) => /\(([A-Z0-9]{10})\)$/.exec(String(identity))?.[1] ?? null;
+
+/**
+ * The Developer ID certificate the app is signed with, pinned by the SHA-256 of its leaf (#288).
+ * The Keychain group follows the team, so a build signed by another certificate — a wrong
+ * identity, a stale secret — would build and pass every other check, then lose the saved token.
+ * Not a secret, and no Team ID: the certificate itself ships inside every signed app. When the
+ * certificate is renewed, put the new one's fingerprint here, with the new profile.
+ */
+export const DEVELOPER_ID_LEAF_SHA256 = "1b81d7d23b4a2d064cf43d74ad75750e41141808077ce8a0cbf3b74b7c223d0b";
+
+export const leafIsPinned = (sha256) => String(sha256).trim().toLowerCase() === DEVELOPER_ID_LEAF_SHA256;

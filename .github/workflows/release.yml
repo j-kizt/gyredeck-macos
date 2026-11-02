@@ -163,6 +163,8 @@ jobs:
           grep -q "flags=.*runtime" <<<"$details"
           if grep -q "^Signature=adhoc" <<<"$details"; then exit 1; fi
           grep -qF "Authority=$APPLE_SIGNING_IDENTITY" <<<"$details"
+          # The pinned certificate, not only one the secrets name: a renewed or wrong one fails here.
+          node scripts/check-signer.mjs "$app"
           archs=$(lipo -archs "$app/Contents/MacOS/gyredeck-desktop")
           grep -qw arm64 <<<"$archs" && grep -qw x86_64 <<<"$archs"
           test -f "$app/Contents/embedded.provisionprofile"

@@ -21,11 +21,8 @@ const ERROR_COPY: Record<string, string> = {
   pairing_locked: "Too many wrong codes were sent to the bot. Press Pair again for a new code.",
 };
 
-// A token or owner macOS would not hand over is not "not set up": say so, and what fixes it (#288).
 const errorCopy = (error: { code: string; message: string }) =>
-  error.code === "keychain_refused"
-    ? `${error.message}. Paste the bot token again, or pair again.`
-    : (ERROR_COPY[error.code] ?? `The Discord connector stopped on an error: ${error.message}`);
+  ERROR_COPY[error.code] ?? `The Discord connector stopped on an error: ${error.message}`;
 
 /** Settings → Permission → Remote access (#199): a bot that follows sync rooms into a Discord forum. */
 export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDiscord; canUseNativeControls: boolean }) => {
@@ -88,6 +85,17 @@ export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDi
           </span>
         ) : null}
       </div>
+      {Object.entries(status?.keychainRefused ?? {}).map(([what, message]) => (
+        // A token or owner macOS would not hand over is not "not set up" (#288): said until a
+        // read or a save of it succeeds, and what puts it right.
+        <div className="setup-row" data-discord="keychain-refused" key={`keychain-${what}`}>
+          <span className="status-slot"><RefreshCw className="setup-icon" size={14} strokeWidth={2.3} /></span>
+          <span className="setup-copy">
+            <span className="setup-title">{message}</span>
+            <span className="setup-detail">{what === "owner" ? "Pair again to put it right." : "Paste the bot token again to put it right."}</span>
+          </span>
+        </div>
+      ))}
       {Object.entries(status?.leaving ?? {}).map(([room, reason]) => (
         // Shown with or without a token: the member still sits in the room, holding it up.
         <div className="setup-row" data-discord="leaving" key={`leaving-${room}`}>

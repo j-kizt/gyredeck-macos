@@ -3,7 +3,8 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } fr
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { checkProfile, entitlementsPlist, installDecision, pickIdentity, signedBuildConfig, signedWithDeveloperId, teamOf } from "./signing.mjs";
+import { checkProfile, entitlementsPlist, installDecision, leafIsPinned, pickIdentity, signedBuildConfig, signedWithDeveloperId, teamOf } from "./signing.mjs";
+import { leafSha256 } from "./check-signer.mjs";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const appName = "Gyredeck.app";
@@ -132,6 +133,12 @@ if (picked.identity) {
   const verified = spawnSync("codesign", ["--verify", "--strict", "--deep", sourceApp], { stdio: "inherit" });
   if (verified.status !== 0 || !signedWithDeveloperId(codesignDetails(sourceApp))) {
     console.error(`${sourceApp} is not validly signed with the Developer ID; the installed app was left as it was.`);
+    process.exit(1);
+  }
+  // Not just any Developer ID: the pinned certificate, or the Keychain group is not the one the
+  // installed app saved into.
+  if (!leafIsPinned(leafSha256(sourceApp))) {
+    console.error(`${sourceApp} is signed by a different certificate than the pinned Developer ID one; the installed app was left as it was.`);
     process.exit(1);
   }
 }

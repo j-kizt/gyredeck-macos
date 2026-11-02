@@ -55,3 +55,17 @@ test("#288 the signature is read from codesign itself: -dvv shows the authority,
   assert.doesNotMatch(plain, /^Authority=/m);
   assert.match(verbose, /^Authority=/m);
 });
+
+test("#288 the signer is the pinned Developer ID certificate, read from the app itself", { skip: process.platform !== "darwin" }, async () => {
+  const { leafIsPinned, DEVELOPER_ID_LEAF_SHA256 } = await import("../scripts/signing.mjs");
+  const { leafSha256 } = await import("../scripts/check-signer.mjs");
+  assert.match(DEVELOPER_ID_LEAF_SHA256, /^[0-9a-f]{64}$/);
+  assert.equal(leafIsPinned(DEVELOPER_ID_LEAF_SHA256.toUpperCase()), true);
+  const apple = leafSha256("/System/Applications/Calculator.app");
+  assert.match(apple ?? "", /^[0-9a-f]{64}$/, "premise: a signed app's leaf is read");
+  assert.equal(leafIsPinned(apple), false, "a valid signature by anyone else is not ours");
+  assert.equal(leafSha256("/nonexistent.app"), null);
+  const { readFileSync } = await import("node:fs");
+  assert.match(readFileSync(new URL("../scripts/install-desktop.mjs", import.meta.url), "utf8"), /if \(!leafIsPinned\(leafSha256\(sourceApp\)\)\)/, "the install checks it before touching the installed app");
+  assert.match(readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8"), /node scripts\/check-signer\.mjs "\$app"/, "CI checks it before publishing");
+});

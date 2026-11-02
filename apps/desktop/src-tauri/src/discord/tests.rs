@@ -60,6 +60,8 @@ impl TokenStore for Arc<MemTokens> {
 #[derive(Default)]
 struct MemOwner {
     record: Mutex<Option<(Owner, String)>>,
+    /// macOS would not hand the owner record over (#288).
+    refuse_read: AtomicBool,
     fail: AtomicBool,
     /// The failed write also took the old item.
     wipe: AtomicBool,
@@ -67,6 +69,9 @@ struct MemOwner {
 
 impl OwnerStore for MemOwner {
     fn read(&self) -> Result<Option<Owner>, String> {
+        if self.refuse_read.load(Ordering::SeqCst) {
+            return Err("macOS did not allow it (OSStatus -25293)".to_string());
+        }
         Ok(self.record.lock().unwrap().as_ref().map(|(owner, _)| owner.clone()))
     }
     fn write(&self, owner: &Owner, paired_at: &str) -> Result<(), String> {
@@ -290,7 +295,13 @@ fn fixture_with(name: &str, token: Option<&str>, saved: &[(&str, &str)]) -> Fixt
 
 /// And with an owner already in the (fake) Keychain.
 fn fixture_owned(name: &str, token: Option<&str>, saved: &[(&str, &str)], owner: Option<Owner>) -> Fixture {
+    fixture_built(name, token, saved, owner, false)
+}
+
+/// `refuse_owner`: the owner record is there and macOS will not hand it over at launch.
+fn fixture_built(name: &str, token: Option<&str>, saved: &[(&str, &str)], owner: Option<Owner>, refuse_owner: bool) -> Fixture {
     let owners = Arc::new(MemOwner::default());
+    owners.refuse_read.store(refuse_owner, Ordering::SeqCst);
     *owners.record.lock().unwrap() = owner.map(|owner| (owner, "2026-10-27T00:00:00Z".to_string()));
     let tokens = Arc::new(MemTokens::default());
     if let Some(token) = token {
@@ -4038,7 +4049,31 @@ fn a_token_macos_will_not_hand_over_is_said_so_never_shown_as_not_set_up() {
     f.state.start(node(), PathBuf::from("/nonexistent/connector.mjs")).unwrap();
     let status = f.state.status();
     assert!(!status.configured);
-    let error = status.error.expect("the refusal is reported");
-    assert_eq!(error.code, "keychain_refused");
-    assert!(error.message.contains("-25293"), "{}", error.message);
+    let refused = status.keychain_refused.get("token").expect("the refusal is reported");
+    assert!(refused.contains("-25293"), "{refused}");
+    f.tokens.refuse_read.store(false, Ordering::SeqCst);
+    // The connector path is fake here, so the restart after the save fails; the save did not.
+    let _ = f.state.set_token(TOKEN, None);
+    assert!(f.state.status().keychain_refused.is_empty(), "a saved token puts it right");
+}
+
+// Codex's #288 finding: a refused Keychain read must stay said until it is put right, not be
+// wiped by the child coming up (which clears its own errors).
+#[test]
+fn a_refused_owner_read_stays_shown_after_the_child_is_ready_and_clears_once_paired_again() {
+    let f = fixture_built("owner-refused-ready", Some(TOKEN), &[], None, true);
+    let _buffer = f.attach_buffer();
+    let shown = |f: &Fixture| serde_json::to_string(&f.state.status()).unwrap();
+    assert!(shown(&f).contains("could not read its saved Discord owner"), "premise: said at launch: {}", shown(&f));
+    on_child_event(
+        &f.state.hub,
+        f.owners.as_ref(),
+        FromChild::Ready { bot: Bot { id: "42".into(), username: "Gyre Bot".into() }, application_id: "123456789012345678".into(), forums: vec![] },
+    );
+    assert!(shown(&f).contains("could not read its saved Discord owner"), "the child's Ready does not wipe a Keychain refusal: {}", shown(&f));
+    f.owners.refuse_read.store(false, Ordering::SeqCst);
+    f.state.start_pairing().unwrap();
+    let round = current_round(&f);
+    paired_in(&f, Some(&round));
+    assert!(!shown(&f).contains("could not read its saved Discord owner"), "a new pairing that saved puts it right: {}", shown(&f));
 }

@@ -197,13 +197,18 @@ impl KeepAwakeState {
             change(&mut inner.inputs);
             let want = wanted(&inner.inputs);
             let mut errors = Vec::new();
-            // The one wanted is taken before the other is let go, so a hand-over leaves no gap.
+            // The one wanted is taken before the other is let go, and the other is kept while it
+            // cannot be: a hand-over never leaves nothing held while something still asks.
             let kinds = if want.display { [Kind::Display, Kind::System] } else { [Kind::System, Kind::Display] };
             for kind in kinds {
                 let (slot, on) = match kind {
                     Kind::Display => (&mut inner.display, want.display),
                     Kind::System => (&mut inner.system, want.system),
                 };
+                let still_asked = want.display || want.system;
+                if !on && slot.is_some() && !errors.is_empty() && still_asked {
+                    continue;
+                }
                 if let Err(error) = self.settle(slot, kind, on) {
                     errors.push(error);
                 }

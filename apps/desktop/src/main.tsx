@@ -136,7 +136,8 @@ const App = () => {
   const [keepAwakeActive, setKeepAwakeActive] = useState(false);
   const [keepAwakeError, setKeepAwakeError] = useState<string | null>(null);
   // What Rust says it holds and why: a Discord room or a heavy run holds the Mac without the window (#211, #278).
-  const [keepAwakeWhy, setKeepAwakeWhy] = useState<string | null>(null);
+  // Rust's word on what is held is the whole truth, a failure in the background included.
+  const [keepAwakeHeld, setKeepAwakeHeld] = useState<{ why?: string | null; error?: string | null } | undefined>();
   const [terminal, setTerminal] = useState<TerminalChoice>(readTerminalChoice);
   const [expandedSessionGroupKeys, setExpandedSessionGroupKeys] = useState<Set<string>>(() => new Set());
   const [clearCompletedArmed, setClearCompletedArmed] = useState(false);
@@ -512,20 +513,10 @@ const App = () => {
   }, [canUseNativeControls, hasWorkingActivity, keepAwakeEnabled]);
 
   useEffect(() => {
-    if (!canUseNativeControls) {
-      setKeepAwakeWhy(null);
-      return undefined;
-    }
-    let cancelled = false;
-    const take = (held?: { why?: string | null }) => {
-      if (!cancelled) setKeepAwakeWhy(held?.why ?? null);
-    };
-    const unlisten = listen<{ why?: string | null }>("keep_awake", (event) => take(event.payload)).catch(() => undefined);
-    void invoke<{ why?: string | null }>("keep_awake_status").then(take, () => undefined);
-    return () => {
-      cancelled = true;
-      void unlisten.then((stop) => stop?.());
-    };
+    if (!canUseNativeControls) return undefined;
+    const unlisten = listen<typeof keepAwakeHeld>("keep_awake", (event) => setKeepAwakeHeld(event.payload)).catch(() => undefined);
+    void invoke<typeof keepAwakeHeld>("keep_awake_status").then(setKeepAwakeHeld, () => undefined);
+    return () => void unlisten.then((stop) => stop?.());
   }, [canUseNativeControls]);
 
   const setupGuidance = (() => {
@@ -1210,9 +1201,9 @@ const App = () => {
                   guidance={setupGuidance}
                   isConnected={isConnected}
                   keepAwakeActive={keepAwakeActive}
-                  keepAwakeWhy={keepAwakeWhy}
+                  keepAwakeWhy={keepAwakeHeld?.why}
                   keepAwakeEnabled={keepAwakeEnabled}
-                  keepAwakeError={keepAwakeError}
+                  keepAwakeError={keepAwakeError ?? keepAwakeHeld?.error ?? null}
                   hookStatus={hookStatus}
                   launchAtLogin={launchAtLogin}
                   mailRooms={mailRooms.rooms}

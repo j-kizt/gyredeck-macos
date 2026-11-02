@@ -174,3 +174,23 @@ fn both_native_assertions_can_be_acquired_and_released() {
     state.release_all();
     assert_eq!(state.held(), Held { display: false, system: false, why: None, error: None });
 }
+
+#[test]
+fn a_hand_over_whose_new_assertion_is_refused_keeps_the_old_one_until_it_can() {
+    for (from_working, to_working) in [(false, true), (true, false)] {
+        let (s, fake) = state();
+        s.set_discord_rooms(vec!["sync-ab12".into()]);
+        s.set_active(true, from_working).unwrap();
+        log(&fake);
+        fake.refuse.store(true, Ordering::SeqCst);
+        let _ = s.set_active(true, to_working);
+        assert!(log(&fake).is_empty(), "{from_working}->{to_working}: the old one is kept");
+        let held = s.held();
+        assert!(held.display || held.system, "{from_working}->{to_working}: never nothing while a room is on Discord");
+        assert_eq!(held.error.as_deref(), Some("refused"));
+        fake.refuse.store(false, Ordering::SeqCst);
+        s.set_active(true, to_working).unwrap();
+        assert_eq!(log(&fake).len(), 2, "{from_working}->{to_working}: taken, then the old one let go");
+        assert_eq!(s.held().error, None);
+    }
+}

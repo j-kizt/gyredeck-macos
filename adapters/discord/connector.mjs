@@ -316,11 +316,13 @@ export function createConnector({ discord, out, clock = realClock }) {
       return;
     }
     if (prompt) {
-      if (r.emoji !== YES || clock.now() > prompt.expiresAt) return;
+      if (r.emoji !== YES || prompt.used || clock.now() > prompt.expiresAt) return;
       const w = workers.get(prompt.room);
       if (!prompt.all && !(w?.accepting && w.createdAt === prompt.inst)) return;
-      // Used up on disk before it is acted on: a restart never requests it a second time.
-      delete prompts()[r.messageId];
+      // Used up on disk before it is acted on: a restart never requests it a second time. A
+      // quiet one is kept, used, so its spell is not asked about again.
+      if (prompt.quiet) prompts()[r.messageId] = { ...prompt, used: true };
+      else delete prompts()[r.messageId];
       try {
         save();
       } catch (e) {
@@ -397,13 +399,16 @@ export function createConnector({ discord, out, clock = realClock }) {
   // The intent is durable before the post, so a post Discord took but this child never heard
   // back from is found again by `settlePosting` and armed, not left on show unanswerable.
   async function postPrompt(key, channelId, content, meta, post) {
-    const intent = { channelId, content, sinceMs: clock.now(), meta: { ...meta, expiresAt: clock.now() + PROMPT_MS } };
+    const intent = { channelId, content, sinceMs: clock.now(), meta: { ...meta, channelId, expiresAt: clock.now() + PROMPT_MS } };
     posting()[key] = intent;
     save();
     const msg = await post();
     if (posting()[key] !== intent) return null;
     delete posting()[key];
-    if (msg?.id) arm(msg.id, intent.meta);
+    if (msg?.id) {
+      arm(msg.id, intent.meta);
+      read.add(msg.id);
+    }
     save();
     return msg;
   }
@@ -415,18 +420,30 @@ export function createConnector({ discord, out, clock = realClock }) {
       return save();
     }
     const id = await discord.findOwn(intent.channelId, { content: intent.content, sinceMs: intent.sinceMs });
-    // Read before the intent is let go: a check that fails is tried again with the search.
-    const given = Boolean(id && ownerId) && (await discord.reactedBy({ channelId: intent.channelId, messageId: id, emoji: YES, userId: ownerId }));
     if (posting()[key] !== intent) return;
     delete posting()[key];
     if (id) arm(id, intent.meta);
     save();
-    if (given) onReaction({ messageId: id, channelId: intent.channelId, userId: ownerId, emoji: YES }, true);
   }
   // Every intent not yet settled. One that cannot be searched now is tried again in the
   // background, backing off, until it is armed, found absent, or past its prompt's life (#205 r4).
   let settleTimer = null;
   let settleBackoff = SETTLE_MIN_MS;
+  // A ✅ is a state Discord keeps, not an event this child must have heard: each armed prompt
+  // this child has not seen posted is read once its room is followed again, and a ✅ already on
+  // it counts then (#205 r6). Event and read both end in `onReaction`, which uses a prompt once.
+  const read = new Set();
+  async function readPrompt(id) {
+    const p = prompts()[id];
+    if (!p || p.used || read.has(id) || !p.channelId || clock.now() > p.expiresAt) return;
+    const w = workers.get(p.room);
+    if (!p.all && !(w?.accepting && w.createdAt === p.inst)) return;
+    if (p.all && !online) return;
+    const given = ownerId && (await discord.reactedBy({ channelId: p.channelId, messageId: id, emoji: YES, userId: ownerId }));
+    read.add(id);
+    if (given) onReaction({ messageId: id, channelId: p.channelId, userId: ownerId, emoji: YES }, true);
+  }
+
   // One search at a time: two never race over the same intent (#205 r5).
   let settling = Promise.resolve();
   function settleAll() {
@@ -439,6 +456,12 @@ export function createConnector({ discord, out, clock = realClock }) {
       await settlePosting(key).catch((e) => {
         failed = true;
         fail("internal", `Could not look for an earlier prompt: ${e?.message}`);
+      });
+    }
+    for (const id of Object.keys(prompts())) {
+      await readPrompt(id).catch((e) => {
+        failed = true;
+        fail("internal", `Could not read the reactions on a prompt: ${e?.message}`);
       });
     }
     if (!failed) settleBackoff = SETTLE_MIN_MS;
@@ -539,7 +562,11 @@ export function createConnector({ discord, out, clock = realClock }) {
   // the instance followed now only (#205 r1).
   function opened(w, item, line) {
     send(line);
-    if (w.accepting && item.createdAt != null && item.createdAt === w.createdAt) resay(w);
+    if (w.accepting && item.createdAt != null && item.createdAt === w.createdAt) {
+      resay(w);
+      // A ✅ given while this room was not followed is read from Discord now (#205 r6).
+      settleAll();
+    }
   }
 
   function resay(w) {

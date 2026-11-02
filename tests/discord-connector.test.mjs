@@ -2122,6 +2122,46 @@ test("#205 unsettled /disconnect prompts are bounded: past the limit a new one i
   await c.close();
 });
 
+// The ✅ is given while no child runs; the new child finds the prompt before the room's Connect.
+for (const kind of ["/disconnect", "quiet"]) {
+  for (const lost of [true, false]) {
+    test(`#205 a ${kind} prompt ${lost ? "never heard back" : "armed before"}: a ✅ given while the child was down counts once its room connects`, async () => {
+      const first = await ownerRoom();
+      const op = kind === "quiet" ? "botSend" : "reply";
+      if (lost) first.fake.after = async (o) => { if (o === op) throw new Error("cut off on the way back"); };
+      if (kind === "quiet") first.c.handle({ t: "quiet", room: "sync-abcd" });
+      else first.fake.command({ userId: OWNER, channelId: first.threadId });
+      await flush();
+      first.fake.after = null;
+      const shown = kind === "quiet" ? first.fake.bot.at(-1) : first.fake.replies.at(-1);
+      await first.c.close();
+      first.fake.addReaction({ messageId: shown.id, channelId: first.threadId, userId: OWNER, emoji: "✅" });
+      const second = await boot({ fake: first.fake, clock: first.clock, statePath: first.statePath, ownerId: OWNER });
+      assert.deepEqual(second.of("disconnect_request"), [], "no room followed yet");
+      second.c.handle({ t: "connect", room: "sync-abcd", members: ["Claude / Gyre"], createdAt: 1 });
+      if (kind === "quiet") second.c.handle({ t: "quiet", room: "sync-abcd" });
+      await flush();
+      assert.equal(second.of("disconnect_request").length, 1);
+      assert.equal(second.fake.bot.length + second.fake.replies.length, 1, "nothing posted again");
+      await second.c.close();
+    });
+  }
+}
+
+test("#205 a ✅ given while the child was down is not used for another instance of the room", async () => {
+  const first = await ownerRoom();
+  first.fake.command({ userId: OWNER, channelId: first.threadId });
+  await flush();
+  const shown = first.fake.replies.at(-1);
+  await first.c.close();
+  first.fake.addReaction({ messageId: shown.id, channelId: first.threadId, userId: OWNER, emoji: "✅" });
+  const second = await boot({ fake: first.fake, clock: first.clock, statePath: first.statePath, ownerId: OWNER });
+  second.c.handle({ t: "connect", room: "sync-abcd", members: ["Claude / Gyre"], createdAt: 2 });
+  await flush();
+  assert.deepEqual(second.of("disconnect_request"), []);
+  await second.c.close();
+});
+
 test("#205 an intent older than its prompt's life is dropped, not searched", async () => {
   const first = await ownerRoom();
   first.fake.after = async (o) => { if (o === "reply") throw new Error("cut off on the way back"); };

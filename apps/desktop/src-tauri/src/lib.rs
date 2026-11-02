@@ -1349,6 +1349,12 @@ fn set_keep_awake(state: tauri::State<'_, KeepAwakeState>, active: bool, enabled
     state.set_active(enabled, active, (page, seq))
 }
 
+/// The page's number for its keep-awake calls, asked once per load (#211).
+#[tauri::command]
+fn keep_awake_page(state: tauri::State<'_, KeepAwakeState>) -> Result<u64, String> {
+    state.new_page()
+}
+
 /// The session-event registry lives in the app's data folder, not localStorage (#280).
 fn session_store_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path().app_data_dir().map_err(|error| format!("no app data folder: {error}"))
@@ -6565,6 +6571,7 @@ pub fn run() {
             request_notification_permission,
             open_notification_settings,
             set_keep_awake,
+            keep_awake_page,
             launch_at_login_enabled,
             set_launch_at_login,
             install_codex_notify,

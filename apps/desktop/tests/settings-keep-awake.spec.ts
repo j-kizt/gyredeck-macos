@@ -16,6 +16,7 @@ const open = async (page: Page, first: Answer) => {
     Object.assign(w, { __answer: answer, __calls: 0, __sent: [], __out: 0, __most: 0, __late: [] });
     w.__TAURI_INTERNALS__ = {
       invoke: async (command: string, args?: unknown) => {
+        if (command === "keep_awake_page") return 7;
         if (command === "set_keep_awake") {
           w.__calls += 1;
           w.__sent.push(args);
@@ -150,11 +151,10 @@ test("past two calls unanswered, nothing more is sent into a channel that does n
   await expect(row.getByText("Unavailable · Gyredeck did not answer")).toBeVisible();
 });
 
-test("every call carries this page's load time, the same for the page and later than any page before", async ({ page }) => {
+test("every call carries the page number Rust gave this page, asked once", async ({ page }) => {
   await open(page, held(null, 1));
   await page.clock.runFor(5_100);
   const pages = await page.evaluate(() => (window as typeof window & { __sent: Array<{ page: number }> }).__sent.map((call) => call.page));
-  const origin = await page.evaluate(() => Math.floor(performance.timeOrigin * 1000));
   expect(pages.length).toBeGreaterThan(1);
-  expect(new Set(pages)).toEqual(new Set([origin]));
+  expect(new Set(pages)).toEqual(new Set([7]));
 });

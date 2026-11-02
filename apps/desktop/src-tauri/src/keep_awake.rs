@@ -67,9 +67,10 @@ struct Inputs {
     heavy: Option<String>,
     /// Since when the bridge could not be asked, while it cannot.
     heavy_unknown_since: Option<Instant>,
-    /// The webview's last call applied, as (page load, call): an older one arriving late changes
-    /// nothing, and a page loaded since starts above every call of the one before it.
+    /// The webview's last call applied, as (page, call). Pages are numbered here, one per load,
+    /// so a page loaded since ranks above every call of the one before it, whatever the clock.
     ui_seq: (u64, u64),
+    pages: u64,
 }
 
 /// What the inputs ask to be held, and the reason the Settings row gives for it.
@@ -143,6 +144,17 @@ impl KeepAwakeState {
 
     /// The webview's two inputs. Answers with what is held after them, a refusal included, so
     /// the answer to every call is as true as an event.
+    /// A page loaded: its number, above every page before it. Their calls change nothing after.
+    pub(crate) fn new_page(&self) -> Result<u64, String> {
+        let mut page = 0;
+        self.update(|inputs| {
+            inputs.pages += 1;
+            page = inputs.pages;
+            inputs.ui_seq = (page, 0);
+        })?;
+        Ok(page)
+    }
+
     pub(crate) fn set_active(&self, enabled: bool, working: bool, seq: (u64, u64)) -> Result<Held, String> {
         self.update(|inputs| {
             if seq < inputs.ui_seq {
@@ -179,7 +191,7 @@ impl KeepAwakeState {
 
     /// Let go of everything: the app is quitting.
     pub fn release_all(&self) {
-        let _ = self.update(|inputs| *inputs = Inputs { ui_seq: inputs.ui_seq, ..Inputs::default() });
+        let _ = self.update(|inputs| *inputs = Inputs { ui_seq: inputs.ui_seq, pages: inputs.pages, ..Inputs::default() });
     }
 
     pub(crate) fn held(&self) -> Held {

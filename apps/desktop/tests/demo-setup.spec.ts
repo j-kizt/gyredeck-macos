@@ -31,6 +31,7 @@ test("keep awake retries a transient native synchronization failure", async ({ p
     (window as typeof window & { __keepAwakeCalls: Array<{ active: boolean }> }).__keepAwakeCalls = calls;
     (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
       invoke: async (command: string, args?: { active?: boolean }) => {
+        if (command === "keep_awake_page") return 1;
         if (command !== "set_keep_awake") return null;
         const active = args?.active === true;
         calls.push({ active });

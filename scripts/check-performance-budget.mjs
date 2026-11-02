@@ -59,15 +59,15 @@ const assetRoot = join(distRoot, "assets");
  * (+146 / +145). 119,790 and 122,886 keep main's 98 / 117.
  *
  * #211/#278 (the keep-awake row reading Rust's answer on a beat: one numbered call in flight,
- * given up on after 3 s, at most two left unanswered) measured 119,899 / 122,977 on main's
- * 119,692 / 122,769; 119,997 and 123,094 keep main's 98 / 117.
+ * given up on after 3 s, at most two left unanswered, a page number from Rust) measured 119,910 / 122,985 on main's
+ * 119,692 / 122,769; 120,008 and 123,102 keep main's 98 / 117.
  * OWNER'S DECISION STILL OWED: raised here so CI can run, not to be merged before their word.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 119_997,
-  jsTotalGzipBytes: 123_094,
+  jsGzipBytes: 120_008,
+  jsTotalGzipBytes: 123_102,
 };
 
 const walk = async (directory) => {

@@ -215,17 +215,18 @@ fn every_change_moves_the_rev_and_a_repeat_does_not() {
 fn a_call_older_than_the_last_applied_changes_nothing_and_a_reloaded_page_starts_above_it() {
     let (s, fake) = state();
     s.set_discord_rooms(vec!["sync-ab12".into()]);
-    s.set_active(true, false, (100, 900)).unwrap();
+    let old = s.new_page().unwrap();
+    s.set_active(true, false, (old, 900)).unwrap();
     assert_eq!(log(&fake), ["+System#1"]);
-    s.set_active(false, false, (100, 901)).unwrap();
+    s.set_active(false, false, (old, 901)).unwrap();
     assert_eq!(log(&fake), ["-#1"]);
-    let held = s.set_active(true, true, (100, 900)).unwrap();
+    s.set_active(true, true, (old, 900)).unwrap();
     assert!(log(&fake).is_empty(), "the switch-on sent first, arriving last, is not applied");
-    assert!(!held.display && !held.system);
-    // The page reloads: its first call counts from 1, and is applied at once.
-    s.set_active(true, false, (200, 1)).unwrap();
-    assert_eq!(log(&fake), ["+System#2"]);
-    // A call the old page left hanging, arriving now, changes nothing.
-    s.set_active(false, false, (100, 902)).unwrap();
-    assert!(log(&fake).is_empty());
+    // The page reloads, whatever the clock did: Rust numbers it above the old one.
+    let new = s.new_page().unwrap();
+    assert!(new > old);
+    s.set_active(true, false, (new, 1)).unwrap();
+    assert_eq!(log(&fake), ["+System#2"], "the new page's first call applies at once");
+    s.set_active(false, false, (old, 902)).unwrap();
+    assert!(log(&fake).is_empty(), "a call the old page left hanging changes nothing");
 }

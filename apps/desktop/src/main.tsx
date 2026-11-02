@@ -66,9 +66,6 @@ const LocalServicesPanel = lazy(async () => {
 const KEEP_AWAKE_RETRY_DELAYS_MS = [750, 2_500] as const;
 const KEEP_AWAKE_BEAT_MS = 5_000;
 const KEEP_AWAKE_TIMEOUT_MS = 3_000;
-// When this page loaded, in microseconds: a reload's calls rank above every call of the page
-// before it, in Rust as well as here. A wall clock set back between two loads delays that.
-const KEEP_AWAKE_PAGE = Math.floor(performance.timeOrigin * 1000);
 
 /** What Rust holds and why (#211, #278); `rev` rises with every change. */
 interface IKeepAwakeHeld {
@@ -168,7 +165,7 @@ const App = () => {
   const keepAwakeFlightRef = useRef<{ again: boolean } | null>(null);
   // Every call numbered, so Rust applies none older than the last; calls given up on but never
   // answered are counted, and past two nothing more is sent into a channel that does not answer.
-  const keepAwakeSeqRef = useRef({ seq: 0, unanswered: 0 });
+  const keepAwakeSeqRef = useRef({ page: 0, seq: 0, unanswered: 0 });
   const displayView =
     isDeletedAfter(deletedSessionIds, presence.conversationId, presence.lastEventAt) ||
     (view.status === "closed" && (acknowledgedConversationId === presence.conversationId || isDismissedAfter(dismissedSessionIds, presence.conversationId, presence.lastEventAt)))
@@ -528,8 +525,12 @@ const App = () => {
       const answered = () => {
         if (givenUp) calls.unanswered -= 1;
       };
-      calls.seq += 1;
-      invoke<IKeepAwakeHeld>("set_keep_awake", { ...want, page: KEEP_AWAKE_PAGE, seq: calls.seq }).then((held) => {
+      // The page's number comes from Rust, once per load, inside the first flight.
+      (calls.page ? Promise.resolve(calls.page) : invoke<number>("keep_awake_page")).then((page) => {
+        calls.page ||= page;
+        calls.seq += 1;
+        return invoke<IKeepAwakeHeld>("set_keep_awake", { ...want, page: calls.page, seq: calls.seq });
+      }).then((held) => {
         answered();
         // A late answer is still Rust's word at its rev; the rev keeps the newest.
         takeKeepAwake(held);

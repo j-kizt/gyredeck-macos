@@ -1,5 +1,14 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## The "answer rooms without asking" switch says only what it controls — (v1.29.1)
+
+### Fixes
+
+- **Off now reads "Gyredeck's rules are removed; rules you added yourself still apply."** It used
+  to say the agent would ask before every reply and every wait, which was not true when you had
+  broad allow rules of your own: Gyredeck leaves those in place, so the agent kept running those
+  commands without asking. The same line serves Claude Code and Antigravity.
+
 ## Claude Code's usage card shows its local history — (v1.29.0)
 
 ### Added

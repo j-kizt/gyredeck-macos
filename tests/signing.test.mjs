@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { installDecision, pickIdentity, signedWithDeveloperId } from "../scripts/signing.mjs";
+import { checkProfile, entitlementsPlist, installDecision, pickIdentity, signedBuildConfig, signedWithDeveloperId, teamOf } from "../scripts/signing.mjs";
 
 const line = (n, name) => `  ${n}) ${"A".repeat(40)} "${name}"`;
 const DEV = "Developer ID Application: Someone (ABCDE12345)";
@@ -23,4 +23,24 @@ test("#288 an ad-hoc build never replaces a Developer ID install, and needs aski
   assert.equal(installDecision({ identity: null, installedIsDeveloperId: true, allowAdhoc: true }).ok, false, "not even when asked");
   assert.equal(installDecision({ identity: null, installedIsDeveloperId: false, allowAdhoc: false }).ok, false);
   assert.deepEqual(installDecision({ identity: null, installedIsDeveloperId: false, allowAdhoc: true }), { ok: true, adhoc: true });
+});
+
+test("#288 a profile is embedded only for this app, this team, the Mac, and before it expires", () => {
+  const good = { teamIds: ["ABCDE12345"], appIdentifier: "ABCDE12345.com.j-kizt.gyredeck", platforms: ["OSX"], expires: new Date("2044-10-28"), now: new Date("2026-11-02") };
+  assert.equal(checkProfile(good, "ABCDE12345"), null);
+  assert.match(checkProfile(good, "ZZZZZ99999"), /another team/);
+  assert.match(checkProfile({ ...good, appIdentifier: "ABCDE12345.com.j-kizt.other" }, "ABCDE12345"), /not for com\.j-kizt\.gyredeck/);
+  assert.match(checkProfile({ ...good, platforms: ["iOS"] }, "ABCDE12345"), /not for the Mac/);
+  assert.match(checkProfile({ ...good, now: new Date("2045-01-01") }, "ABCDE12345"), /expired/);
+});
+
+test("#288 a signed build claims its own keychain group only, and the team comes from the identity", () => {
+  const plist = entitlementsPlist("ABCDE12345");
+  assert.match(plist, /<string>ABCDE12345\.com\.j-kizt\.gyredeck<\/string>\s*<\/array>/);
+  assert.doesNotMatch(plist, /\*/, "no wildcard group, though the profile would allow one");
+  assert.throws(() => entitlementsPlist("abc"));
+  assert.equal(teamOf(DEV), "ABCDE12345");
+  assert.deepEqual(signedBuildConfig({ entitlementsPath: "/e.plist", profilePath: "/p.provisionprofile" }), {
+    bundle: { macOS: { entitlements: "/e.plist", files: { "embedded.provisionprofile": "/p.provisionprofile" } } },
+  });
 });

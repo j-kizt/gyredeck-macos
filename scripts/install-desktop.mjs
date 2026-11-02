@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { installDecision, pickIdentity, signedWithDeveloperId } from "./signing.mjs";
+import { checkProfile, entitlementsPlist, installDecision, pickIdentity, signedBuildConfig, signedWithDeveloperId, teamOf } from "./signing.mjs";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const appName = "Gyredeck.app";
@@ -76,10 +76,48 @@ if (!decision.ok) {
   console.error(decision.why);
   process.exit(1);
 }
-if (picked.identity) process.env.APPLE_SIGNING_IDENTITY = picked.identity;
-else console.warn("Building ad-hoc: this install keeps no Keychain items across updates.");
+const buildArgs = ["desktop:build"];
+if (picked.identity) {
+  process.env.APPLE_SIGNING_IDENTITY = picked.identity;
+  // The Keychain items live in the team's access group, which macOS grants only with the
+  // provisioning profile inside the app. Both files carry the Team ID, so they are written
+  // here for this build and never committed.
+  const teamId = teamOf(picked.identity);
+  const profilePath = process.env.GYREDECK_PROVISIONING_PROFILE || join(homedir(), ".config", "gyredeck", "Gyredeck_Developer_ID.provisionprofile");
+  if (!existsSync(profilePath)) {
+    console.error(`No provisioning profile at ${profilePath}. Download the "Gyredeck Developer ID" profile from developer.apple.com and put it there.`);
+    process.exit(1);
+  }
+  // Field by field: the profile holds certificates and dates, which plutil cannot turn into JSON.
+  const signingDir = join(root, "apps/desktop/src-tauri/target/signing");
+  mkdirSync(signingDir, { recursive: true });
+  const decodedPath = join(signingDir, "profile.plist");
+  if (spawnSync("sh", ["-c", 'security cms -D -i "$1" > "$2"', "sh", profilePath, decodedPath]).status !== 0) {
+    console.error(`Could not read the provisioning profile at ${profilePath}.`);
+    process.exit(1);
+  }
+  const field = (path) => spawnSync("plutil", ["-extract", path, "raw", "-o", "-", decodedPath], { encoding: "utf8" }).stdout?.trim() ?? "";
+  const refused = checkProfile(
+    {
+      teamIds: [field("TeamIdentifier.0")],
+      appIdentifier: field("Entitlements.com\\.apple\\.application-identifier"),
+      platforms: [field("Platform.0")],
+      expires: new Date(field("ExpirationDate")),
+    },
+    teamId,
+  );
+  if (refused) {
+    console.error(refused);
+    process.exit(1);
+  }
+  const entitlementsPath = join(signingDir, "entitlements.plist");
+  const configPath = join(signingDir, "tauri.signing.json");
+  writeFileSync(entitlementsPath, entitlementsPlist(teamId));
+  writeFileSync(configPath, JSON.stringify(signedBuildConfig({ entitlementsPath, profilePath })));
+  buildArgs.push("--config", configPath);
+} else console.warn("Building ad-hoc: this install keeps no Keychain items across updates.");
 
-run("pnpm", ["desktop:build"]);
+run("pnpm", buildArgs);
 
 const sourceApp = existsSync(builtApp) ? builtApp : fallbackApp;
 if (!existsSync(sourceApp)) {

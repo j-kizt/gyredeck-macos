@@ -110,6 +110,15 @@ jobs:
           --expect-signing-pubkey dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNDNTEyMzAxRDU2QUUwMTMKUldRVDRHclZBU05SUEFUV3BWL3o3MHFZL0dNaG9oeXRVbHIvVTBXRTU3elFwd2tnQURHclhkWmgK
           --expect-config-pubkey dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNDNTEyMzAxRDU2QUUwMTMKUldRVDRHclZBU05SUEFUV3BWL3o3MHFZL0dNaG9oeXRVbHIvVTBXRTU3elFwd2tnQURHclhkWmgK
 
+      # The team's keychain access group needs its entitlement and the provisioning profile
+      # inside the app (#288). Both carry the Team ID, so they are written here from secrets.
+      - name: Prepare the Developer ID entitlements and profile
+        id: signing
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_PROVISIONING_PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE }}
+        run: echo "config=$(node scripts/ci-signing-config.mjs)" >> "$GITHUB_OUTPUT"
+
       - name: Build and release
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
@@ -132,7 +141,7 @@ jobs:
           projectPath: apps/desktop
           # Universal binary so one download runs on both Apple Silicon and Intel Macs;
           # latest.json then serves both darwin-aarch64 and darwin-x86_64 for auto-update.
-          args: --target universal-apple-darwin
+          args: --target universal-apple-darwin --config ${{ steps.signing.outputs.config }}
           tagName: ${{ github.ref_name }}
           releaseName: "Gyredeck __VERSION__"
           releaseBody: ${{ steps.changelog.outputs.notes }}
@@ -156,6 +165,8 @@ jobs:
           grep -qF "Authority=$APPLE_SIGNING_IDENTITY" <<<"$details"
           archs=$(lipo -archs "$app/Contents/MacOS/gyredeck-desktop")
           grep -qw arm64 <<<"$archs" && grep -qw x86_64 <<<"$archs"
+          test -f "$app/Contents/embedded.provisionprofile"
+          codesign -d --entitlements - --xml "$app" 2>/dev/null | grep -q "keychain-access-groups"
           xcrun stapler validate "$app"
           spctl --assess --type execute "$app"
 

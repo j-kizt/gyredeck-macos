@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use crate::standalone_bridge::{self, SupervisorLog};
 
 mod journal;
+mod secrets;
 
 pub(crate) const KEYCHAIN_SERVICE: &str = "Gyredeck Discord";
 pub(crate) const KEYCHAIN_ACCOUNT: &str = "bot-token";
@@ -44,6 +45,11 @@ const CONFIG_FORUM: &str = "discordForumId";
 /// any process of this user can write: the owner is who #205 lets give commands. These are
 /// the config keys earlier builds kept it under; they are never read, and deleted on start.
 const KEYCHAIN_OWNER_ACCOUNT: &str = "owner";
+/// Set once the token and owner left by an ad-hoc build were moved to the team's group (#288).
+#[cfg(target_os = "macos")]
+const KEYCHAIN_MOVED: &str = "moved-bot-token";
+#[cfg(target_os = "macos")]
+const KEYCHAIN_OWNER_MOVED: &str = "moved-owner";
 const LEGACY_OWNER_KEYS: [&str; 3] = ["discordOwner", "discordOwnerId", "discordOwnerName"];
 /// The sender the bridge uses when the room speaks about itself (`ROOM_SENDER`).
 const ROOM_SENDER: &str = "gyredeck-room";
@@ -1491,7 +1497,8 @@ fn lock(hub: &Mutex<Hub>) -> MutexGuard<'_, Hub> {
 
 /// Where the bot token is kept: the Keychain, or a fake in the tests.
 pub(crate) trait TokenStore: Send + Sync {
-    fn read(&self) -> Option<BotToken>;
+    /// `Ok(None)` only when nothing is saved; a value macOS would not hand over is `Err` (#288).
+    fn read(&self) -> Result<Option<BotToken>, String>;
     fn write(&self, token: &BotToken) -> Result<(), String>;
     fn delete(&self) -> Result<(), String>;
 }
@@ -1509,7 +1516,8 @@ fn text(value: Option<serde_json::Value>) -> Option<String> {
 
 /// Where the paired owner is kept: one Keychain item, or a fake in the tests.
 pub(crate) trait OwnerStore: Send + Sync {
-    fn read(&self) -> Option<Owner>;
+    /// `Ok(None)` only when nobody is paired; an unreadable record is `Err` (#288).
+    fn read(&self) -> Result<Option<Owner>, String>;
     /// The whole record in one call.
     fn write(&self, owner: &Owner, paired_at: &str) -> Result<(), String>;
     fn delete(&self) -> Result<(), String>;
@@ -1644,9 +1652,11 @@ impl DiscordState {
         if LEGACY_OWNER_KEYS.iter().any(|key| deps.settings.get(key).is_some()) {
             let _ = deps.settings.set(&LEGACY_OWNER_KEYS.map(|key| (key, None)));
         }
+        let owner = deps.owners.read();
         let mut hub = Hub {
             forum_id: text(deps.settings.get(CONFIG_FORUM)),
-            owner: deps.owners.read(),
+            owner: owner.clone().ok().flatten(),
+            error: owner.err().map(|why| keychain_refused("owner", &why)),
             ..Hub::default()
         };
         let journal_path = deps.state_path.parent().map(|dir| dir.join(JOURNAL_DIR)).unwrap_or_else(|| PathBuf::from(JOURNAL_DIR));
@@ -1694,7 +1704,15 @@ impl DiscordState {
         let Some((node, script)) = self.launch.lock().ok().and_then(|launch| launch.clone()) else {
             return Err("The Discord connector is not part of this build".to_string());
         };
-        let token = self.deps.tokens.read();
+        let token = match self.deps.tokens.read() {
+            Ok(token) => token,
+            Err(why) => {
+                // Not "not set up": the token may be saved and macOS would not hand it over.
+                self.configured.store(false, Ordering::SeqCst);
+                lock(&self.hub).error = Some(keychain_refused("token", &why));
+                return Ok(());
+            }
+        };
         self.configured.store(token.is_some(), Ordering::SeqCst);
         let Some(token) = token else {
             return Ok(());
@@ -1811,7 +1829,7 @@ impl DiscordState {
         if let Err(error) = self.deps.tokens.write(&token) {
             // A failed replace may have taken the old token with it: believe the Keychain, and
             // stop following every room the way Remove does, relay members out included.
-            if self.deps.tokens.read().is_none() {
+            if !matches!(self.deps.tokens.read(), Ok(Some(_))) {
                 self.configured.store(false, Ordering::SeqCst);
                 let failed = self.stop_following(app_word);
                 if !failed.is_empty() {
@@ -2294,7 +2312,7 @@ fn on_child_event_from(hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64, ev
                 // Whatever the failed replace left is what the app believes — and the child is
                 // told, so it does not go on treating a lost owner as paired (#199 r6).
                 let had = hub.owner.is_some();
-                hub.owner = owners.read();
+                hub.owner = owners.read().ok().flatten();
                 hub.pairing = None;
                 if had && hub.owner.is_none() {
                     hub.send(&ToChild::Owner { owner_id: None, round: None });
@@ -2718,25 +2736,95 @@ fn replace_keychain_item(account: &str, value: &[u8]) -> Result<(), security_fra
     })
 }
 
+/// One value in the team's data-protection keychain group (#288).
+#[cfg(target_os = "macos")]
+struct TeamSlot(&'static str);
+
+#[cfg(target_os = "macos")]
+impl TeamSlot {
+    fn options(&self) -> security_framework::passwords::PasswordOptions {
+        let mut options = security_framework::passwords::PasswordOptions::new_generic_password(KEYCHAIN_SERVICE, self.0);
+        options.use_protected_keychain();
+        options
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl secrets::Slot for TeamSlot {
+    fn read(&self) -> Result<Option<Vec<u8>>, i32> {
+        match security_framework::passwords::generic_password(self.options()) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.code() == secrets::NOT_FOUND => Ok(None),
+            Err(error) => Err(error.code()),
+        }
+    }
+    fn write(&self, value: &[u8]) -> Result<(), i32> {
+        security_framework::passwords::set_generic_password_options(value, self.options()).map_err(|error| error.code())
+    }
+    fn delete(&self) -> Result<(), i32> {
+        match security_framework::passwords::delete_generic_password_options(self.options()) {
+            Err(error) if error.code() != secrets::NOT_FOUND => Err(error.code()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The same name in the file keychain, where ad-hoc builds kept it before #288.
+#[cfg(target_os = "macos")]
+struct FileSlot(&'static str);
+
+#[cfg(target_os = "macos")]
+impl secrets::Slot for FileSlot {
+    fn read(&self) -> Result<Option<Vec<u8>>, i32> {
+        match security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, self.0) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.code() == secrets::NOT_FOUND => Ok(None),
+            Err(error) => Err(error.code()),
+        }
+    }
+    fn write(&self, value: &[u8]) -> Result<(), i32> {
+        replace_keychain_item(self.0, value).map_err(|error| error.code())
+    }
+    fn delete(&self) -> Result<(), i32> {
+        match security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, self.0) {
+            Err(error) if error.code() != secrets::NOT_FOUND => Err(error.code()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The token or owner as macOS gave it, or why it would not.
+fn keychain_refused(what: &str, why: &str) -> DiscordError {
+    DiscordError { code: "keychain_refused".to_string(), message: format!("Gyredeck could not read its saved Discord {what}: {why}") }
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_read(account: &'static str, moved: &'static str) -> Result<Option<Vec<u8>>, String> {
+    match secrets::read(&TeamSlot(account), &TeamSlot(moved), &FileSlot(account)) {
+        secrets::Read::Found(bytes) => Ok(Some(bytes)),
+        secrets::Read::Absent => Ok(None),
+        secrets::Read::Refused(why) => Err(why),
+    }
+}
+
 struct KeychainOwner;
 
 impl OwnerStore for KeychainOwner {
-    fn read(&self) -> Option<Owner> {
+    fn read(&self) -> Result<Option<Owner>, String> {
         #[cfg(target_os = "macos")]
         {
-            let bytes = security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_OWNER_ACCOUNT).ok()?;
-            owner_from_record(&bytes)
+            Ok(keychain_read(KEYCHAIN_OWNER_ACCOUNT, KEYCHAIN_OWNER_MOVED)?.and_then(|bytes| owner_from_record(&bytes)))
         }
         #[cfg(not(target_os = "macos"))]
-        None
+        Ok(None)
     }
 
     fn write(&self, owner: &Owner, paired_at: &str) -> Result<(), String> {
         let record = serde_json::json!({ "id": owner.id, "username": owner.username, "pairedAt": paired_at }).to_string();
         #[cfg(target_os = "macos")]
         {
-            replace_keychain_item(KEYCHAIN_OWNER_ACCOUNT, record.as_bytes())
-                .map_err(|error| format!("Could not save the owner in the Keychain: {error}"))
+            secrets::write(&TeamSlot(KEYCHAIN_OWNER_ACCOUNT), &TeamSlot(KEYCHAIN_OWNER_MOVED), &FileSlot(KEYCHAIN_OWNER_ACCOUNT), record.as_bytes())
+                .map_err(|why| format!("Could not save the owner in the Keychain: {why}"))
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -2748,11 +2836,8 @@ impl OwnerStore for KeychainOwner {
     fn delete(&self) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
-            match security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_OWNER_ACCOUNT) {
-                Ok(()) => Ok(()),
-                Err(error) if error.code() == -25300 => Ok(()),
-                Err(error) => Err(format!("Could not remove the owner from the Keychain: {error}")),
-            }
+            secrets::delete(&TeamSlot(KEYCHAIN_OWNER_ACCOUNT), &FileSlot(KEYCHAIN_OWNER_ACCOUNT))
+                .map_err(|why| format!("Could not remove the owner from the Keychain: {why}"))
         }
         #[cfg(not(target_os = "macos"))]
         Ok(())
@@ -2762,21 +2847,24 @@ impl OwnerStore for KeychainOwner {
 struct KeychainTokens;
 
 impl TokenStore for KeychainTokens {
-    fn read(&self) -> Option<BotToken> {
+    fn read(&self) -> Result<Option<BotToken>, String> {
         #[cfg(target_os = "macos")]
         {
-            let bytes = security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).ok()?;
-            BotToken::parse(&String::from_utf8(bytes).ok()?).ok()
+            let Some(bytes) = keychain_read(KEYCHAIN_ACCOUNT, KEYCHAIN_MOVED)? else {
+                return Ok(None);
+            };
+            let text = String::from_utf8(bytes).map_err(|_| "the saved token is not text".to_string())?;
+            BotToken::parse(&text).map(Some).map_err(|_| "the saved token is not a bot token".to_string())
         }
         #[cfg(not(target_os = "macos"))]
-        None
+        Ok(None)
     }
 
     fn write(&self, token: &BotToken) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
-            replace_keychain_item(KEYCHAIN_ACCOUNT, token.0.as_bytes())
-                .map_err(|error| format!("Could not save the token in the Keychain: {error}"))
+            secrets::write(&TeamSlot(KEYCHAIN_ACCOUNT), &TeamSlot(KEYCHAIN_MOVED), &FileSlot(KEYCHAIN_ACCOUNT), token.0.as_bytes())
+                .map_err(|why| format!("Could not save the token in the Keychain: {why}"))
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -2788,12 +2876,8 @@ impl TokenStore for KeychainTokens {
     fn delete(&self) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
-            match security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
-                Ok(()) => Ok(()),
-                // errSecItemNotFound: already gone is what was asked for.
-                Err(error) if error.code() == -25300 => Ok(()),
-                Err(error) => Err(format!("Could not remove the token from the Keychain: {error}")),
-            }
+            secrets::delete(&TeamSlot(KEYCHAIN_ACCOUNT), &FileSlot(KEYCHAIN_ACCOUNT))
+                .map_err(|why| format!("Could not remove the token from the Keychain: {why}"))
         }
         #[cfg(not(target_os = "macos"))]
         Ok(())

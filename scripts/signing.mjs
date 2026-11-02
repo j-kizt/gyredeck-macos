@@ -32,3 +32,48 @@ export const installDecision = ({ identity, installedIsDeveloperId, allowAdhoc }
   }
   return { ok: true, adhoc: true };
 };
+
+export const APP_ID = "com.j-kizt.gyredeck";
+
+/**
+ * What a provisioning profile (its plist, decoded with `security cms -D`) allows, checked
+ * before it is embedded (#288): a Mac Developer ID profile for this app and this team, not
+ * expired. The data-protection keychain needs it: without one macOS kills an app that claims a
+ * keychain access group.
+ */
+export const checkProfile = ({ teamIds, appIdentifier, platforms, expires, now = new Date() }, teamId) => {
+  if (!Array.isArray(teamIds) || !teamIds.includes(teamId)) return "The provisioning profile is for another team.";
+  if (appIdentifier !== `${teamId}.${APP_ID}`) return `The provisioning profile is not for ${APP_ID}.`;
+  if (!Array.isArray(platforms) || !platforms.includes("OSX")) return "The provisioning profile is not for the Mac.";
+  if (!(expires instanceof Date) || Number.isNaN(expires.getTime()) || expires <= now) return "The provisioning profile has expired.";
+  return null;
+};
+
+/** The entitlements a signed build carries: its own keychain access group, nothing wider. */
+export const entitlementsPlist = (teamId) => {
+  if (!/^[A-Z0-9]{10}$/.test(teamId)) throw new Error("Not a Team ID.");
+  const group = `${teamId}.${APP_ID}`;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.application-identifier</key>
+  <string>${group}</string>
+  <key>com.apple.developer.team-identifier</key>
+  <string>${teamId}</string>
+  <key>keychain-access-groups</key>
+  <array>
+    <string>${group}</string>
+  </array>
+</dict>
+</plist>
+`;
+};
+
+/** Tauri config merged over tauri.conf.json for a signed build: entitlements and the profile. */
+export const signedBuildConfig = ({ entitlementsPath, profilePath }) => ({
+  bundle: { macOS: { entitlements: entitlementsPath, files: { "embedded.provisionprofile": profilePath } } },
+});
+
+/** The Team ID in a Developer ID identity's name, "Developer ID Application: Name (TEAMID)". */
+export const teamOf = (identity) => /\(([A-Z0-9]{10})\)$/.exec(String(identity))?.[1] ?? null;

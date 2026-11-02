@@ -21,8 +21,11 @@ const ERROR_COPY: Record<string, string> = {
   pairing_locked: "Too many wrong codes were sent to the bot. Press Pair again for a new code.",
 };
 
+// A token or owner macOS would not hand over is not "not set up": say so, and what fixes it (#288).
 const errorCopy = (error: { code: string; message: string }) =>
-  ERROR_COPY[error.code] ?? `The Discord connector stopped on an error: ${error.message}`;
+  error.code === "keychain_refused"
+    ? `${error.message}. Paste the bot token again, or pair again.`
+    : (ERROR_COPY[error.code] ?? `The Discord connector stopped on an error: ${error.message}`);
 
 /** Settings → Permission → Remote access (#199): a bot that follows sync rooms into a Discord forum. */
 export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDiscord; canUseNativeControls: boolean }) => {

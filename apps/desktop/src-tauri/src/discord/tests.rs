@@ -27,11 +27,16 @@ struct MemTokens {
     wipe_on_write: AtomicBool,
     /// A write that failed and left the old token in place.
     fail_write: AtomicBool,
+    /// macOS would not hand the saved token over (#288).
+    refuse_read: AtomicBool,
 }
 
 impl TokenStore for Arc<MemTokens> {
-    fn read(&self) -> Option<BotToken> {
-        self.token.lock().unwrap().clone()
+    fn read(&self) -> Result<Option<BotToken>, String> {
+        if self.refuse_read.load(Ordering::SeqCst) {
+            return Err("macOS did not allow it (OSStatus -25293)".to_string());
+        }
+        Ok(self.token.lock().unwrap().clone())
     }
     fn write(&self, token: &BotToken) -> Result<(), String> {
         if self.fail_write.load(Ordering::SeqCst) {
@@ -61,8 +66,8 @@ struct MemOwner {
 }
 
 impl OwnerStore for MemOwner {
-    fn read(&self) -> Option<Owner> {
-        self.record.lock().unwrap().as_ref().map(|(owner, _)| owner.clone())
+    fn read(&self) -> Result<Option<Owner>, String> {
+        Ok(self.record.lock().unwrap().as_ref().map(|(owner, _)| owner.clone()))
     }
     fn write(&self, owner: &Owner, paired_at: &str) -> Result<(), String> {
         if self.wipe.load(Ordering::SeqCst) {
@@ -642,7 +647,7 @@ fn no_child_is_spawned_when_the_keychain_has_no_token() {
     // Premise: the same fixture with a token does spawn.
     f.state.set_token(TOKEN, Some(APP_WORD)).unwrap();
     wait_until("a spawn once a token is saved", || !read(&PathBuf::from(format!("{}.spawns", script.display()))).is_empty());
-    assert_eq!(f.tokens.read().map(|token| token.expose().to_string()).as_deref(), Some(TOKEN));
+    assert_eq!(f.tokens.read().unwrap().map(|token| token.expose().to_string()).as_deref(), Some(TOKEN));
 }
 
 #[test]
@@ -685,9 +690,9 @@ fn remove_deletes_the_keychain_item_stops_the_child_and_clears_the_settings() {
     assert_eq!((hello["forumId"].as_str(), hello["ownerId"].as_str()), (Some("123456789012345678"), Some("323456789012345678")));
 
     let status = f.state.remove(Some(APP_WORD)).unwrap();
-    assert!(f.tokens.deleted.load(Ordering::SeqCst) && f.tokens.read().is_none(), "the Keychain item is deleted");
+    assert!(f.tokens.deleted.load(Ordering::SeqCst) && f.tokens.read().unwrap().is_none(), "the Keychain item is deleted");
     assert!(f.settings.get(CONFIG_FORUM).is_none(), "the forum is cleared");
-    assert!(f.owners.read().is_none(), "and the owner's Keychain item deleted");
+    assert!(f.owners.read().unwrap().is_none(), "and the owner's Keychain item deleted");
     assert!(!status.configured && !status.running && status.forum_id.is_none() && status.owner.is_none());
     wait_until("the child's stdin to end", || !read(&PathBuf::from(format!("{}.eof", script.display()))).is_empty());
     assert!(!f.state.is_running(), "the supervisor is gone");
@@ -1426,7 +1431,7 @@ fn audit_a_token_write_that_failed_but_kept_the_old_one_leaves_the_app_configure
     assert!(f.state.set_token(&TOKEN.replace('G', "H"), Some(APP_WORD)).is_err());
     assert!(f.state.status().configured, "the Keychain still has the old token");
     assert!(f.state.is_running(), "and the connector on it keeps going");
-    assert_eq!(f.tokens.read().map(|t| t.expose().to_string()), Some(TOKEN.to_string()));
+    assert_eq!(f.tokens.read().unwrap().map(|t| t.expose().to_string()), Some(TOKEN.to_string()));
 }
 
 #[test]
@@ -4024,4 +4029,16 @@ fn auditor_a_failed_name_refresh_must_retry_for_the_next_line() {
     let messages = of_kind(&lines, "message");
     assert_eq!(messages[0]["sender"], "Codex / Gyre Audit");
     assert_eq!(messages[1]["to"], "Codex / Gyre Audit", "a failed roster read must not permanently mark this name checked");
+}
+
+#[test]
+fn a_token_macos_will_not_hand_over_is_said_so_never_shown_as_not_set_up() {
+    let f = fixture("keychain-refused", Some(TOKEN));
+    f.tokens.refuse_read.store(true, Ordering::SeqCst);
+    f.state.start(node(), PathBuf::from("/nonexistent/connector.mjs")).unwrap();
+    let status = f.state.status();
+    assert!(!status.configured);
+    let error = status.error.expect("the refusal is reported");
+    assert_eq!(error.code, "keychain_refused");
+    assert!(error.message.contains("-25293"), "{}", error.message);
 }

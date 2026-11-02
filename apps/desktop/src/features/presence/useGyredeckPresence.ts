@@ -16,10 +16,13 @@ import {
   normalizeSessionEventIdentity,
 } from "../session/eventRegistry";
 import {
-  readSessionEventRegistry,
+  loadSessionEventRegistry,
+  pruneSessionEventRegistry,
+  SESSION_PRUNE_INTERVAL_MS,
   writeSessionEventRegistry,
 } from "../session/persistence";
 import { collectContextUsage, type ContextUsageRegistry } from "../session/contextWindow";
+import { createRegistryWriter } from "../session/registryWriter";
 import type { SessionEventRegistry } from "../session/types";
 
 export const DEFAULT_BRIDGE_PORT = 47621;
@@ -34,6 +37,8 @@ export interface IGyredeckPresenceOptions {
   demoMode: boolean;
   demoScenario: string | null;
   bridgePort?: number;
+  /** Never pruned away: the conversation the person has open. */
+  keepConversationId?: string | null;
 }
 
 export interface IGyredeckPresenceResult {
@@ -46,6 +51,8 @@ export interface IGyredeckPresenceResult {
   refreshCapabilities: () => Promise<boolean>;
   sessionEventRegistry: SessionEventRegistry;
   setSessionEventRegistry: React.Dispatch<React.SetStateAction<SessionEventRegistry>>;
+  /** Why session history is not being saved right now, or null when it is. */
+  registryProblem: string | null;
   contextUsage: ContextUsageRegistry;
   view: ReturnType<typeof getPresenceView>;
 }
@@ -540,47 +547,91 @@ const createDemoEvent = (index: number): GyredeckEvent => {
   }
 };
 
+const REGISTRY_WRITE_INTERVAL_MS = 2_000;
+
 export const useGyredeckPresence = ({
   demoMode,
   demoScenario,
   bridgePort = DEFAULT_BRIDGE_PORT,
+  keepConversationId = null,
 }: IGyredeckPresenceOptions): IGyredeckPresenceResult => {
+  // The conversation the person has open is never pruned away (#280 audit).
+  const keepRef = useRef(keepConversationId);
+  keepRef.current = keepConversationId;
+  const prune = (registry: SessionEventRegistry) => pruneSessionEventRegistry(registry, new Date(), keepRef.current);
   const bridgeUrl = bridgeUrlFor(bridgePort);
   const [presence, setPresence] = useState<IGyredeckPresence>(() => createInitialPresence());
   const [recentEvents, setRecentEvents] = useState<GyredeckEvent[]>([]);
   const [lastLiveEvent, setLastLiveEvent] = useState<GyredeckEvent | null>(null);
-  const [sessionEventRegistry, setSessionEventRegistry] =
-    useState<SessionEventRegistry>(readSessionEventRegistry);
+  // Empty until the stored registry is read (#280: a file in the desktop app, read once).
+  const [sessionEventRegistry, setSessionEventRegistry] = useState<SessionEventRegistry>({});
   // Sticky per-conversation context usage. Derived from events but never evicted with
   // them: the event registry caps each session, which used to drop the turn_complete
   // holding the usage mid-turn and made the meter blink out.
-  const [contextUsage, setContextUsage] = useState<ContextUsageRegistry>(() =>
-    collectContextUsage({}, Object.values(readSessionEventRegistry()).flat()));
+  const [contextUsage, setContextUsage] = useState<ContextUsageRegistry>({});
+  // Why history the app shows is not stored: it could not be read, or a save failed and is
+  // being retried. One notice for both; it goes once the history is stored again (#280).
+  const [readProblem, setRegistryProblem] = useState<string | null>(null);
+  const [saveFailing, setSaveFailing] = useState(false);
+  const registryProblem = readProblem ?? (saveFailing ? "the last save failed; retrying" : null);
   const [capabilities, setCapabilities] = useState(() => createDefaultBridgeCapabilities());
   const [connection, setConnection] = useState<IConnectionState>({
     status: "connecting",
     message: null,
   });
   const [now, setNow] = useState(() => new Date());
-  const pendingRegistryWriteRef = useRef<SessionEventRegistry | null>(null);
-  const registryWriteTimerRef = useRef<number | null>(null);
   const liveEventVersionRef = useRef(0);
+  // When the registry is saved: not before it is read, at most every two seconds, retried
+  // with the latest registry when a save fails (#280).
+  const writerRef = useRef<ReturnType<typeof createRegistryWriter<SessionEventRegistry>> | null>(null);
+  writerRef.current ??= createRegistryWriter<SessionEventRegistry>({
+    write: writeSessionEventRegistry,
+    delayMs: REGISTRY_WRITE_INTERVAL_MS,
+    onSaving: (saving) => setSaveFailing(!saving),
+  });
+  const writer = writerRef.current;
+  const flushRegistryWrite = () => writer.flush();
 
-  const flushRegistryWrite = () => {
-    if (registryWriteTimerRef.current !== null) {
-      window.clearTimeout(registryWriteTimerRef.current);
-      registryWriteTimerRef.current = null;
+  // Every change to the registry goes to the writer, whoever made it (an event, a removal, pruning).
+  useEffect(() => {
+    writer.update(sessionEventRegistry);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionEventRegistry]);
+
+  useEffect(() => {
+    let disposed = false;
+    if (import.meta.env.DEV && demoMode && demoScenario) {
+      writer.ready(null);
+      return;
     }
-    if (!pendingRegistryWriteRef.current) return;
-    writeSessionEventRegistry(pendingRegistryWriteRef.current);
-    pendingRegistryWriteRef.current = null;
-  };
-
-  const scheduleRegistryWrite = (registry: SessionEventRegistry) => {
-    pendingRegistryWriteRef.current = registry;
-    if (registryWriteTimerRef.current !== null) return;
-    registryWriteTimerRef.current = window.setTimeout(flushRegistryWrite, 80);
-  };
+    // Read until it can be read: nothing is saved before, and what arrives meanwhile is merged
+    // into what is read. While it cannot be, the session list says history is not being saved.
+    let retry: number | null = null;
+    const read = () => {
+      void loadSessionEventRegistry().then((loaded) => {
+        if (disposed) return;
+        if (!loaded.ready) {
+          setRegistryProblem(loaded.problem);
+          retry = window.setTimeout(read, REGISTRY_WRITE_INTERVAL_MS);
+          return;
+        }
+        const { registry: stored, stored: saved } = loaded;
+        setRegistryProblem(null);
+        // Unsaved (a migration whose save failed) stays owed, so it is saved next.
+        writer.ready(saved ? stored : null);
+        setSessionEventRegistry((current) => prune(mergeSessionEvents(stored, Object.values(current).flat())));
+        setContextUsage((current) => collectContextUsage(current, Object.values(stored).flat()));
+      });
+    };
+    read();
+    // Old data goes on a quiet app too, not only when an event arrives.
+    const sweep = window.setInterval(() => setSessionEventRegistry(prune), SESSION_PRUNE_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      window.clearInterval(sweep);
+      if (retry !== null) window.clearTimeout(retry);
+    };
+  }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 1_000);
@@ -600,11 +651,7 @@ export const useGyredeckPresence = ({
     let disposed = false;
     let source: EventSource | null = null;
     const store = (events: GyredeckEvent[]) => {
-      setSessionEventRegistry((current) => {
-        const next = mergeSessionEvents(current, events);
-        scheduleRegistryWrite(next);
-        return next;
-      });
+      setSessionEventRegistry((current) => prune(mergeSessionEvents(current, events)));
       setContextUsage((current) => collectContextUsage(current, events));
     };
 
@@ -619,8 +666,11 @@ export const useGyredeckPresence = ({
         setLastLiveEvent(events.at(-1) ?? null);
         setPresence(events.reduce(reducePresence, createInitialPresence()));
         setRecentEvents([...events].reverse());
+        // A scenario replaces what is stored, at once, as it always has: the tests that
+        // switch scenarios on one page read the registry the last one wrote.
         const next = mergeSessionEvents({}, events);
-        writeSessionEventRegistry(next);
+        void writeSessionEventRegistry(next);
+        writer.stored(next);
         setSessionEventRegistry(next);
         setContextUsage(collectContextUsage({}, events));
         return;
@@ -743,6 +793,7 @@ export const useGyredeckPresence = ({
     refreshCapabilities,
     sessionEventRegistry,
     setSessionEventRegistry,
+    registryProblem,
     contextUsage,
     view,
   };

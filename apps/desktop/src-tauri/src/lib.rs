@@ -32,6 +32,7 @@ mod heavy_watch;
 mod keep_awake;
 mod local_services;
 mod notification;
+mod session_store;
 mod standalone_bridge;
 
 use github::{
@@ -1346,6 +1347,28 @@ fn set_launch_at_login(app: tauri::AppHandle, enabled: bool) -> Result<bool, Str
 #[tauri::command]
 fn set_keep_awake(state: tauri::State<'_, KeepAwakeState>, active: bool) -> Result<bool, String> {
     state.set_active(active)
+}
+
+/// The session-event registry lives in the app's data folder, not localStorage (#280).
+fn session_store_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path().app_data_dir().map_err(|error| format!("no app data folder: {error}"))
+}
+
+#[tauri::command]
+fn session_registry_load(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, session_store::SessionStoreState>,
+) -> Result<session_store::Loaded, String> {
+    Ok(session_store::load(&session_store_dir(&app)?, &state))
+}
+
+#[tauri::command]
+fn session_registry_save(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, session_store::SessionStoreState>,
+    registry: Value,
+) -> Result<u64, String> {
+    session_store::save(&session_store_dir(&app)?, &state, &registry)
 }
 
 /// Hands each usage reading to the bridge, so agents in a room can be told when their own
@@ -6479,6 +6502,8 @@ pub fn run() {
     let command_handler: Box<tauri::ipc::InvokeHandler<tauri::Wry>> =
         Box::new(tauri::generate_handler![
             agy_usage,
+            session_registry_load,
+            session_registry_save,
             bridge_health,
             get_bridge_port,
             mail_rooms,
@@ -6557,6 +6582,7 @@ pub fn run() {
             None,
         ))
         .manage(KeepAwakeState::default())
+        .manage(session_store::SessionStoreState::default())
         .manage(TrayAttentionState::default())
         .manage(DisplayPreferenceState::default())
         .manage(LocalServicesControlState::default())

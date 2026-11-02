@@ -25,7 +25,8 @@ import {
   readDismissedSessionIds,
   writeDeletedSessionIds,
   writeDismissedSessionIds,
-  writeSessionEventRegistry,
+  pruneTombstones,
+  SESSION_PRUNE_INTERVAL_MS,
 } from "./features/session/persistence";
 import {
   buildSessionDetail,
@@ -111,14 +112,14 @@ const getGroupRemovalId = (groupKey: string, group: IWorkspaceSessionGroup) => [
 
 const App = () => {
   const [bridgePort, setBridgePort] = useState(DEFAULT_BRIDGE_PORT);
-  const { capabilities, connection, contextUsage, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO, bridgePort });
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const { capabilities, connection, contextUsage, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, registryProblem, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO, bridgePort, keepConversationId: selectedSessionId });
   const [usageSettings, setUsageSettings] = useState<IUsageSettings>(readUsageSettings);
   const { refresh: refreshAgentUsage, refreshing: agentUsageRefreshing, usages: agentUsages } = useAgentUsageList(usageSettings, DEMO_MODE);
   const [acknowledgedConversationId, setAcknowledgedConversationId] = useState<string | null>(null);
   const [nativeAction, setNativeAction] = useState<INativeActionState>({ bridgeOnline: null, message: null });
   const [sessionAction, setSessionAction] = useState<ISessionActionState>({ ok: null, message: null });
   const [activeMainTab, setActiveMainTab] = useState<MainPanelTab>("sessions");
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
   const [hookStatus, setHookStatus] = useState<IHookStatus>({ path: null, installed: null, stale: null });
   // Whether a session may answer its room without being approved each time. Null until
@@ -173,6 +174,36 @@ const App = () => {
         })),
     [deletedSessionIds, now, presence, selectedSessionId, sessionEventRegistry, sessionNames],
   );
+  // Tombstones are cleared with the data they hid (#280): soon after start, once the stored
+  // registry is in, and then every hour. Any conversation the app still knows keeps its own.
+  const tombstoneInputsRef = useRef({ registry: sessionEventRegistry, presence });
+  tombstoneInputsRef.current = { registry: sessionEventRegistry, presence };
+  useEffect(() => {
+    const run = () => {
+      const { registry, presence: current } = tombstoneInputsRef.current;
+      const at = new Date();
+      const known = new Set([
+        ...Object.keys(registry),
+        ...buildSessionSummaries(registry, current, at, null).map((session) => session.conversationId),
+      ]);
+      setDismissedSessionIds((ids) => {
+        const next = pruneTombstones(ids, at, known);
+        if (next !== ids) writeDismissedSessionIds(next);
+        return next;
+      });
+      setDeletedSessionIds((ids) => {
+        const next = pruneTombstones(ids, at, known);
+        if (next !== ids) writeDeletedSessionIds(next);
+        return next;
+      });
+    };
+    const first = window.setTimeout(run, 10_000);
+    const hourly = window.setInterval(run, SESSION_PRUNE_INTERVAL_MS);
+    return () => {
+      window.clearTimeout(first);
+      window.clearInterval(hourly);
+    };
+  }, []);
   const sessions = useMemo(
     () =>
       allSessions.filter(
@@ -687,7 +718,6 @@ const App = () => {
     setSessionEventRegistry((current) => {
       const next = { ...current };
       for (const conversationId of removing) delete next[conversationId];
-      writeSessionEventRegistry(next);
       return next;
     });
     setDismissedSessionIds((current) => {
@@ -1149,6 +1179,9 @@ const App = () => {
               role={!setupOpen && !selectedSession ? "tabpanel" : undefined}
               aria-labelledby={!setupOpen && !selectedSession ? `main-tab-${activeMainTab}` : undefined}
             >
+              {registryProblem && !setupOpen && activeMainTab === "sessions" ? (
+                <p className="session-store-warning" role="status">Session history is not being saved: {registryProblem}</p>
+              ) : null}
               {setupOpen ? (
                 <SetupPanel
                   capabilities={capabilities}

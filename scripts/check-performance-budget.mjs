@@ -54,15 +54,19 @@ const assetRoot = join(distRoot, "assets");
  * a notice when history is not being saved) measured 119,546 / 122,624 on main's 118,565 /
  * 121,641 (+981 / +983, after its audit rounds). 119,644 and 122,741 keep main's 98 / 117.
  *
+ * And on 2026-11-03 (#288), by the owner's decision ("A", from Discord): the rows saying macOS
+ * refused the saved token or owner measured 119,692 / 122,769 on main's 119,546 / 122,624
+ * (+146 / +145). 119,790 and 122,886 keep main's 98 / 117.
  * And on 2026-11-02 (#205), by the owner's decision ("A": raise it by what is used): Disconnect
- * all in Settings, with the rooms it could not disconnect and a retry, measured 119,992 /
- * 123,069 on main's 119,546 / 122,624 (+446 / +445). 120,090 and 123,186 keep main's 98 / 117.
+ * all in Settings, with the rooms it could not disconnect and a retry, measured 120,033 /
+ * 123,109 on main's 119,692 / 122,769 after #288 (+341 / +340). 120,131 and 123,226 keep
+ * main's 98 / 117.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 120_090,
-  jsTotalGzipBytes: 123_186,
+  jsGzipBytes: 120_131,
+  jsTotalGzipBytes: 123_226,
 };
 
 const walk = async (directory) => {

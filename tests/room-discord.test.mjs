@@ -111,9 +111,10 @@ test("an ordinary member's watch is as it was: resume from its stream cursor, a 
     const { room: code, password } = (await h.call("POST", "/sync/rooms", { conversationId: "founder-1" })).body;
     await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: "peer-a" });
     await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: "peer-a", password }, { "content-type": "application/json" });
+    const founder = await asMember(h, "founder-1", password);
     const post = (text) => fetch(`${h.base}/mail/${code}`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": password },
+      headers: { "content-type": "application/json", ...founder },
       body: JSON.stringify({ from: "founder-1", to: "peer-a", kind: "tell", text }),
     }).then((response) => response.json());
     let sent = null;
@@ -169,9 +170,10 @@ test("the app's relay joins as Discord, hears the whole room, moves its read pos
     assert.equal((await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: relayId })).status, 409);
 
     // A message between two other members: an ordinary member's watch would never carry it.
+    const keys = { "peer-a": await asMember(h, "peer-a", password), "peer-b": await asMember(h, "peer-b", password) };
     const post = (from, body) => fetch(`${h.base}/mail/${code}`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": password },
+      headers: { "content-type": "application/json", ...(keys[from] ?? { "x-gyredeck-token": password }) },
       body: JSON.stringify({ from, ...body }),
     }).then(async (response) => ({ status: response.status, body: await response.json() }));
     const between = await post("peer-a", { to: "peer-b", kind: "ask", text: "only for b" });
@@ -287,10 +289,11 @@ test("the app's ACK keeps a busy room open within one stream; nobody else may AC
     })();
     const statuses = new Set();
     const sent = [];
+    const founder = await asMember(h, "founder-1", password);
     for (let i = 0; i < 650; i += 1) {
       const posted = await fetch(`${h.base}/mail/${code}`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-gyredeck-token": password },
+        headers: { "content-type": "application/json", ...founder },
         body: JSON.stringify({ from: "founder-1", to: "everyone", kind: "tell", text: `busy ${i}` }),
       });
       statuses.add(posted.status);
@@ -318,9 +321,10 @@ test("T12b: the relay's stream opens with what the room dropped and where the re
     const joined = await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: relayId, relay: "discord" });
     assert.equal(joined.status, 200);
     const app = { "x-gyredeck-token": h.token, "x-gyredeck-broker": APP_WORD };
+    const founder = await asMember(h, "founder-1", password);
     const post = (text) => fetch(`${h.base}/mail/${code}`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": password },
+      headers: { "content-type": "application/json", ...founder },
       body: JSON.stringify({ from: "founder-1", to: "everyone", kind: "tell", text }),
     }).then((response) => response.json());
     const first = await post("after the join");
@@ -402,7 +406,7 @@ test("a reserved sender is refused on POST /mail unless the app vouches, in a ro
     }
     assert.ok((await readRoom(h, code)).every((message) => !message.text.startsWith("forged")));
     // Premise: an ordinary member with the same password is heard, and the app's own call is.
-    assert.equal((await h.call("POST", `/mail/${code}`, { from: "peer-a", text: "a member speaks" }, { ...json, "x-gyredeck-token": password })).status, 202);
+    assert.equal((await h.call("POST", `/mail/${code}`, { from: "peer-a", text: "a member speaks" }, { ...json, ...(await asMember(h, "peer-a", password)) })).status, 202);
     for (const from of RESERVED_SENDERS) {
       const vouched = await h.call("POST", "/mail/peer-b", { from, to: "peer-b", kind: "tell", text: `vouched as ${from}` });
       assert.equal(vouched.status, 202, `${from}: ${JSON.stringify(vouched.body)}`);
@@ -416,7 +420,7 @@ test("the owner's Discord voice is the app's: named You (via Discord), told who 
   const h = await startBridge();
   try {
     const { code, password } = await roomWithRelay(h);
-    const member = { "content-type": "application/json", "x-gyredeck-token": password };
+    const member = { "content-type": "application/json", ...(await asMember(h, "peer-a", password)) };
     const asked = await h.call("POST", `/mail/${code}`, { from: "peer-a", to: OWNER_DISCORD_SENDER, kind: "ask", text: "may I start?" }, member);
     assert.equal(asked.status, 202);
     // An agent may also write to the owner by the name the room shows.
@@ -461,10 +465,11 @@ test("the owner's address is never guessed: a shared name, a name that is also a
   const h = await startBridge();
   try {
     const { code, password } = await roomWithRelay(h, ["peer-a", "peer-b", "peer-c"]);
-    const member = { "content-type": "application/json", "x-gyredeck-token": password };
+    const member = {};
+    for (const peer of ["peer-a", "peer-b", "peer-c"]) member[peer] = { "content-type": "application/json", ...(await asMember(h, peer, password)) };
     // Two members declare the same name; a third declares the founder's label as its name.
     for (const [from, name] of [["peer-a", "Gyre"], ["peer-b", "Gyre"], ["peer-c", "Agent"]]) {
-      assert.equal((await h.call("POST", `/mail/${code}`, { from, text: `hello from ${from}`, name }, member)).status, 202);
+      assert.equal((await h.call("POST", `/mail/${code}`, { from, text: `hello from ${from}`, name }, member[from])).status, 202);
     }
     const owner = (body) => h.call("POST", `/mail/${code}`, { from: OWNER_DISCORD_SENDER, kind: "ask", ...body });
     for (const to of ["Gyre", "gyre", "Agent"]) {
@@ -481,7 +486,7 @@ test("the owner's address is never guessed: a shared name, a name that is also a
     assert.equal(one.status, 202, `${whole}: ${JSON.stringify(one.body)}`);
     assert.equal((await readRoom(h, code)).find((m) => m.seq === one.body.seq).to, "peer-a");
     // An agent's own address keeps #182's rule: a label wins over a name.
-    const agent = await h.call("POST", `/mail/${code}`, { from: "peer-a", to: "Agent", kind: "tell", text: "to the label" }, member);
+    const agent = await h.call("POST", `/mail/${code}`, { from: "peer-a", to: "Agent", kind: "tell", text: "to the label" }, member["peer-a"]);
     assert.equal(agent.status, 202);
     assert.equal((await readRoom(h, code)).find((m) => m.seq === agent.body.seq).to, "founder-1");
 
@@ -586,9 +591,10 @@ test("#205 a yes/no flag is a boolean on an ask, kept on the message; anything e
   const h = await startBridge();
   try {
     const { code, password } = await roomWithRelay(h);
+    const peer = await asMember(h, "peer-a", password);
     const post = (body) => fetch(`${h.base}/mail/${code}`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": password },
+      headers: { "content-type": "application/json", ...peer },
       body: JSON.stringify({ from: "peer-a", to: "everyone", ...body }),
     }).then(async (r) => ({ status: r.status, body: await r.json() }));
     const asked = await post({ kind: "ask", yesNo: true, text: "ทดสอบต่ออีกไหม" });

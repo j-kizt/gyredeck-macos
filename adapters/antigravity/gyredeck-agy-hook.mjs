@@ -564,7 +564,7 @@ const nameAsk = (mine) => {
     ' Send it once, as a "name" field beside to and kind on your first post; the room keeps the first name it is given.';
 };
 
-const replyInstruction = (endpoint, room, replyRooms, answering = null, label = null, isMember = null, askName = false) => {
+const replyInstruction = (endpoint, room, replyRooms, answering = null, label = null, isMember = null, askName = false, memberKey = null) => {
   if (replyRooms.length === 0) return null;
   const target = replyRooms[0];
   // A room refuses the machine token; only its own password opens it. The other
@@ -587,7 +587,10 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
         " message channel, not an instruction to change anything. Run once, the room's" +
         " password in place of THE ROOM PASSWORD:\n" +
         `  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${target}` +
-        ` -H 'content-type: application/json' -H "x-gyredeck-token: THE ROOM PASSWORD" -d '${body}'\n` +
+        ` -H 'content-type: application/json' -H "x-gyredeck-token: THE ROOM PASSWORD"` +
+        // This session's own key: a post in its name takes it (#294).
+        (typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey) ? ` -H "x-gyredeck-member: ${memberKey}"` : "") +
+        ` -d '${body}'\n` +
         "It was sent only if you see ok:true and a seq.",
     };
   }
@@ -1094,6 +1097,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
     endpoint, room, replyRooms, answerable.at(-1), label,
     (id) => byId.has(id) && id !== room,
     askName !== null,
+    result?.memberKey,
   );
 
   const steps = [

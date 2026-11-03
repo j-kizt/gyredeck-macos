@@ -12,6 +12,7 @@ import { useHeavyRuns } from "./useHeavyRuns";
 import { codexTrustCopy, hookNeedsAttention, hookSettled, type IHookStatus } from "./hookStatus";
 import { useDiscord, type IUseDiscord } from "./useDiscord";
 import { DiscordLogo, DiscordRows } from "./DiscordRows";
+import { offerDisconnectAll, showSyncRooms, stillHeld } from "./disconnectAll";
 import { ReleaseNotes } from "./ReleaseNotes";
 
 export type SyncAgent = "claude" | "agy";
@@ -239,13 +240,40 @@ const SyncRoomList = ({
   const discordReady = Boolean(discord.status?.ready && discord.status.forumId && discord.status.owner);
   if (!canUseNativeControls) return null;
   const open = Object.values(rooms).filter((entry) => entry.members.length > 0);
+  // Every room at once lives here, on the Mac, never in Discord: a post acts on its own room
+  // only (owner, 2026-11-02). The set is the rooms connected at the press.
+  const connected = discord.status?.connectedRooms ?? [];
+  const held = stillHeld(discord.stillConnected, { connectedRooms: connected, leaving: discord.status?.leaving });
+  const still = held.connected;
   // Absent rather than empty. A room exists only while people are using one, so "none
   // open" is the ordinary state and a row saying so would sit under Connection
-  // permanently, describing nothing.
-  if (open.length === 0) return null;
+  // permanently, describing nothing — unless Discord still follows a room or failed to leave one.
+  if (!showSyncRooms(open.length, connected, held)) return null;
   return (
     <>
       <div className="setup-subheading">Sync rooms</div>
+      {offerDisconnectAll(connected, held) ? (
+          <span className="setup-row-actions">
+            {connected.length > 0 ? (
+              <button className="pill-btn danger" type="button" disabled={discord.busy} onClick={() => void discord.disconnectAll(connected)} data-tauri-drag-region="false">
+                Disconnect all from Discord
+              </button>
+            ) : null}
+            {still.length > 0 ? (
+              <>
+                <span className="setup-detail" role="status">
+                  Still connected: {still.map((f) => `${f.code} (${f.reason})`).join(", ")}
+                </span>
+                <button className="pill-btn" type="button" disabled={discord.busy} onClick={() => void discord.disconnectAll(still.map((f) => f.code))} data-tauri-drag-region="false">
+                  Try again
+                </button>
+              </>
+            ) : null}
+            {held.leaving.length > 0 ? (
+              <span className="setup-detail" role="status">Not all left Discord: see "Discord is still in room" below.</span>
+            ) : null}
+          </span>
+      ) : null}
       <div className="setup-account-list">
       {open.map((entry) => (
         <div className="setup-account-row" key={entry.room} data-closing={closing === entry.room}>

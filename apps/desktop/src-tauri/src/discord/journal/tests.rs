@@ -170,12 +170,12 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn line(seq: u64) -> Record {
-    Record::Line { seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: "2026-10-27T10:00:00.000Z".into(), through: None }
+    Record::Line { seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: "2026-10-27T10:00:00.000Z".into(), through: None, sender_id: None, to_owner: false, yes_no: false }
 }
 
 fn item(seq: u64) -> Item {
     match line(seq) {
-        Record::Line { seq, sender, to, kind, text, ts, through } => Item::Line { seq, sender, to, kind, text, ts, through },
+        Record::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no } => Item::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no },
         _ => unreachable!(),
     }
 }
@@ -247,7 +247,7 @@ fn seq_going_backwards_is_corrupt() {
 fn a_duplicate_line_is_ignored_a_conflicting_one_is_corrupt() {
     let parsed = parse(&name(), &bytes_of(&[open_record(), line(1), line(2), line(1)])).unwrap();
     assert_eq!(seqs(&parsed), vec![1, 2]);
-    let other = Record::Line { seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "different".into(), ts: String::new(), through: None };
+    let other = Record::Line { seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "different".into(), ts: String::new(), through: None, sender_id: None, to_owner: false, yes_no: false };
     let corrupt = parse(&name(), &bytes_of(&[open_record(), line(1), line(2), other])).unwrap_err();
     assert_eq!(corrupt.line, 4);
     assert!(corrupt.why.contains("different content"), "{corrupt:?}");
@@ -423,7 +423,7 @@ fn crash_helper() {
         let mut hub = super::super::Hub { journal_dir: Some(dir), ..Default::default() };
         hub.channel = Some(super::super::ChildChannel::new(Box::new(std::io::sink())));
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
-        hub.forward(super::super::ToChild::Message { room: ROOM.into(), seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "m1".into(), ts: String::new() });
+        hub.forward(super::super::ToChild::Message { room: ROOM.into(), seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "m1".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false });
         fail_appends(1);
         hub.disconnect(ROOM, DisconnectReason::Closed);
         point("close_pending");

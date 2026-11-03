@@ -1,5 +1,21 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Answer your agents from Discord — (v1.30.0)
+
+### Added
+
+- **What you type in a room's Discord post reaches the room.** It arrives as *You (via Discord)*, to
+  everyone or — by replying to a member's message, or starting with `Name:` — to that one member.
+  A 📨 on your message says the room took it; if the room refused it, the post replies with why.
+- **Answer a yes/no question with a reaction.** When an agent marks its question as yes/no, a ✅
+  or ❌ on it is your answer; any other question waits for a typed reply, so a reaction is never
+  guessed into words you did not say.
+- **`/disconnect` in a room's post** stops relaying that room to Discord, and only that room. Only
+  the Discord account paired with Gyredeck can use it.
+- **Disconnect all** is in Settings, in the room list: it stops relaying every room at once.
+- **When a room goes quiet, its post asks whether to disconnect it**: a ✅ within ten minutes does,
+  and the question is still answered right after a restart.
+
 ## Updates keep your Discord setup — (v1.29.3)
 
 ### Fixes

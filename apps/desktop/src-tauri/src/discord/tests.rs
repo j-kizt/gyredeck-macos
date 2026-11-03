@@ -120,11 +120,24 @@ struct FakeActs {
     founded: Mutex<Vec<String>>,
     joins: Mutex<Vec<(String, String, String)>>,
     leaves: Mutex<Vec<String>>,
+    /// The word each leave went with (#205: a Discord disconnect uses the room's own).
+    leave_words: Mutex<Vec<(String, String)>>,
+    /// Every owner post the bridge was asked to publish, and what it answers.
+    posts: Mutex<Vec<(String, OwnerPost, String)>>,
+    answer: Mutex<Option<Result<u64, Refused>>>,
 }
 
 impl Default for FakeActs {
     fn default() -> Self {
-        Self { fail_leave: AtomicBool::new(false), founded: Mutex::new(vec![ROOM.to_string()]), joins: Mutex::default(), leaves: Mutex::default() }
+        Self {
+            fail_leave: AtomicBool::new(false),
+            founded: Mutex::new(vec![ROOM.to_string()]),
+            joins: Mutex::default(),
+            leaves: Mutex::default(),
+            leave_words: Mutex::default(),
+            posts: Mutex::default(),
+            answer: Mutex::default(),
+        }
     }
 }
 
@@ -136,8 +149,13 @@ impl RoomActs for Arc<FakeActs> {
         self.joins.lock().unwrap().push((room.to_string(), member.to_string(), app_word.to_string()));
         Ok(())
     }
-    fn leave(&self, room: &str, _member: &str, _app_word: &str) -> Result<(), String> {
+    fn post_owner(&self, room: &str, post: &OwnerPost, app_word: &str) -> Result<u64, Refused> {
+        self.posts.lock().unwrap().push((room.to_string(), post.clone(), app_word.to_string()));
+        self.answer.lock().unwrap().clone().unwrap_or(Ok(7))
+    }
+    fn leave(&self, room: &str, _member: &str, app_word: &str) -> Result<(), String> {
         self.leaves.lock().unwrap().push(room.to_string());
+        self.leave_words.lock().unwrap().push((room.to_string(), app_word.to_string()));
         if self.fail_leave.load(Ordering::SeqCst) {
             return Err("Bridge is not reachable".to_string());
         }
@@ -149,6 +167,8 @@ impl RoomActs for Arc<FakeActs> {
 /// given a `log` is served like the bridge serves it instead: everything after `since`.
 #[derive(Default)]
 struct FakeSource {
+    /// How long a room status takes to answer, as a slow bridge would (#206).
+    status_delay: Mutex<Duration>,
     members: Mutex<HashMap<String, Vec<RoomMember>>>,
     streams: Mutex<HashMap<String, VecDeque<Vec<u8>>>>,
     logs: Mutex<HashMap<String, Vec<serde_json::Value>>>,
@@ -165,6 +185,8 @@ struct FakeSource {
     synced_at: Mutex<Vec<(&'static str, u64, u64)>>,
     /// Streams stay open once their frames are read, as the bridge's do.
     hold: Arc<AtomicBool>,
+    /// The bridge's `/events`, one stream per open (#205).
+    events: Mutex<VecDeque<Vec<u8>>>,
 }
 
 /// A stream that counts being closed, so a test can see the reader let go of it.
@@ -201,6 +223,10 @@ fn frames(room: &str, messages: &[&serde_json::Value]) -> Vec<u8> {
 }
 
 impl RoomSource for Arc<FakeSource> {
+    fn status(&self, _room: &str, _app_word: &str) -> Result<serde_json::Value, SourceError> {
+        thread::sleep(*self.status_delay.lock().unwrap());
+        Ok(serde_json::json!({ "ok": true, "members": [], "usage": {} }))
+    }
     fn members(&self, room: &str, _as_id: &str) -> Result<Roster, SourceError> {
         if self.roster_fails.load(Ordering::SeqCst) {
             return Err(SourceError::Unavailable);
@@ -232,6 +258,12 @@ impl RoomSource for Arc<FakeSource> {
     }
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+    fn events(&self) -> Result<Box<dyn Read + Send>, SourceError> {
+        match self.events.lock().unwrap().pop_front() {
+            Some(bytes) => Ok(Box::new(Cursor::new(bytes))),
+            None => Err(SourceError::Unavailable),
+        }
     }
 }
 
@@ -319,7 +351,7 @@ fn fixture_built(name: &str, token: Option<&str>, saved: &[(&str, &str)], owner:
         settings: Arc::clone(&settings) as Arc<dyn SettingsStore>,
         owners: Arc::clone(&owners) as Arc<dyn OwnerStore>,
         source: Arc::new(Arc::clone(&source)),
-        acts: Box::new(Arc::clone(&acts)),
+        acts: Arc::new(Arc::clone(&acts)),
         state_path: dir.join("discord-state.json"),
         log: SupervisorLog::at(Some(dir.join("supervisor.log"))),
     });
@@ -420,6 +452,9 @@ fn nothing_is_read_or_forwarded_for_a_room_that_is_not_connected() {
         kind: "tell".to_string(),
         text: "in a room nobody connected".to_string(),
         ts: String::new(),
+        sender_id: None,
+        to_owner: false,
+        yes_no: false,
     });
     thread::sleep(Duration::from_millis(200));
     assert!(f.source.opens.lock().unwrap().iter().all(|(room, ..)| room == ROOM), "only the connected room is read");
@@ -728,7 +763,7 @@ fn the_paired_owner_and_its_name_survive_a_relaunch() {
         settings: Arc::clone(&f.settings) as Arc<dyn SettingsStore>,
         owners: Arc::clone(&f.owners) as Arc<dyn OwnerStore>,
         source: Arc::new(Arc::clone(&f.source)),
-        acts: Box::new(Arc::clone(&f.acts)),
+        acts: Arc::new(Arc::clone(&f.acts)),
         state_path: f.dir.join("discord-state.json"),
         log: SupervisorLog::at(None),
     });
@@ -768,7 +803,7 @@ fn an_ack_trims_exactly_the_seqs_it_names() {
     lock(&f.state.hub).connect(ROOM, vec![], Some(CREATED)).unwrap();
     for seq in 1..=5 {
         lock(&f.state.hub).forward(ToChild::Message {
-            room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(),
+            room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false,
         });
     }
     assert_eq!(f.state.status().behind.get(ROOM), Some(&5));
@@ -872,7 +907,7 @@ fn what_discord_accepted_is_told_to_the_bridge_coalesced_on_the_apps_word() {
 fn a_late_ack_for_a_codes_earlier_room_never_trims_its_new_room() {
     let f = fixture("stale-ack", Some(TOKEN));
     let _buffer = f.attach_buffer();
-    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new() };
+    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false };
     {
         let mut hub = lock(&f.state.hub);
         hub.connect(ROOM, vec![], Some(100)).unwrap();
@@ -935,7 +970,7 @@ fn a_disconnect_keeps_what_discord_has_not_taken_and_a_new_child_gets_it() {
 fn a_second_disconnect_before_the_first_was_taken_keeps_both() {
     let f = fixture("two-disconnects", Some(TOKEN));
     let _first = f.attach_buffer();
-    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new() };
+    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false };
     {
         let mut hub = lock(&f.state.hub);
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
@@ -1058,7 +1093,7 @@ fn relaunch(f: &Fixture) -> DiscordState {
         settings: Arc::clone(&f.settings) as Arc<dyn SettingsStore>,
         owners: Arc::clone(&f.owners) as Arc<dyn OwnerStore>,
         source: Arc::new(Arc::clone(&f.source)),
-        acts: Box::new(Arc::clone(&f.acts)),
+        acts: Arc::new(Arc::clone(&f.acts)),
         state_path: f.dir.join("discord-state.json"),
         log: SupervisorLog::at(None),
     })
@@ -1225,6 +1260,9 @@ impl RoomActs for LiveActs {
     fn leave(&self, _room: &str, _member: &str, _app_word: &str) -> Result<(), String> {
         Ok(())
     }
+    fn post_owner(&self, room: &str, post: &OwnerPost, app_word: &str) -> Result<u64, Refused> {
+        post_owner_to(&self.target, room, post, app_word)
+    }
 }
 
 struct LiveBridge {
@@ -1288,7 +1326,7 @@ fn a_real_bridge_room_reaches_the_child_in_order_named_and_closes() {
         settings: Arc::new(MemSettings::default()),
         owners: Arc::new(MemOwner::default()),
         source: Arc::new(BridgeSource { target: Some(app.clone()) }),
-        acts: Box::new(LiveActs { target: app.clone(), password: password.clone(), room: room.clone() }),
+        acts: Arc::new(LiveActs { target: app.clone(), password: password.clone(), room: room.clone() }),
         state_path: home.join("discord-state.json"),
         log: SupervisorLog::at(None),
     });
@@ -1349,7 +1387,7 @@ fn standin_a_room_closed_while_no_child_runs_is_still_closed_by_the_next_child()
     {
         let mut hub = lock(&f.state.hub);
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
-        hub.forward(ToChild::Message { room: ROOM.into(), seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "m1".into(), ts: String::new() });
+        hub.forward(ToChild::Message { room: ROOM.into(), seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "m1".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false });
         hub.ack(ROOM, 1, Some(CREATED), None);
         assert_eq!(hub.backlog(ROOM), Some(0), "premise: nothing owed to Discord");
         // The child is gone (died, or its pipe filled) and the room ends before the next is up.
@@ -1374,7 +1412,7 @@ fn standin_remove_keeps_the_child_epoch() {
 }
 
 fn audit_line(seq: u64) -> ToChild {
-    ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new() }
+    ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false }
 }
 
 #[test]
@@ -1515,7 +1553,7 @@ fn a_storage_refusal_stays_shown_through_ready() {
 // ── #199 r7: the invariants the audit found open (199-invariants.md §5), one proof each ──
 
 fn held_line(seq: u64, sender: &str) -> ToChild {
-    ToChild::Message { room: ROOM.to_string(), seq, sender: sender.into(), to: "everyone".into(), kind: "tell".into(), text: "x".repeat(1024), ts: String::new() }
+    ToChild::Message { room: ROOM.to_string(), seq, sender: sender.into(), to: "everyone".into(), kind: "tell".into(), text: "x".repeat(1024), ts: String::new(), sender_id: None, to_owner: false, yes_no: false }
 }
 
 /// I18: an attach hands a fresh child everything held, however much, at the pace it reads.
@@ -1543,7 +1581,7 @@ fn i18_an_attach_of_more_lines_than_any_queue_held_keeps_the_channel_while_the_c
     let mut counted = String::new();
     process.stdout.take().unwrap().read_to_string(&mut counted).unwrap();
     let _ = process.wait();
-    assert_eq!(counted.trim().parse::<usize>().unwrap(), held + 2, "hello, connect and every held line reached the child");
+    assert_eq!(counted.trim().parse::<usize>().unwrap(), held + 3, "hello, connect, every held line and where the quiet spell stands reached the child");
 }
 
 /// I18: stuck is the child not reading — one write blocked past the bound — never the size.
@@ -1692,7 +1730,7 @@ fn recovered_hub(path: &Path, window: usize) -> Arc<Mutex<Hub>> {
 }
 
 fn line_in(room: &str, seq: u64) -> ToChild {
-    ToChild::Message { room: room.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: "2026-10-27T10:00:00.000Z".into() }
+    ToChild::Message { room: room.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: "2026-10-27T10:00:00.000Z".into(), sender_id: None, to_owner: false, yes_no: false }
 }
 
 fn held_seqs(hub: &Hub, room: &str) -> Vec<u64> {
@@ -1813,7 +1851,7 @@ fn audit_repeated_disconnect_cycles_stay_inside_the_one_budget() {
     for cycle in 0..4_u64 {
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
         for seq in cycle * 3 + 1..=cycle * 3 + 3 {
-            hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new() });
+            hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false });
         }
         hub.disconnect(ROOM, DisconnectReason::Disconnected);
     }
@@ -1851,7 +1889,7 @@ fn attach_holds_references_not_lines() {
         hub.cap = held as usize + 1;
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
         for seq in 1..=held {
-            assert_eq!(hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "a".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new() }), Forwarded::Taken);
+            assert_eq!(hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "a".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false }), Forwarded::Taken);
         }
         hub.disconnect(ROOM, DisconnectReason::Disconnected);
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
@@ -2115,8 +2153,8 @@ fn ipc_the_real_child_round_trips_every_new_field() {
         hub.epoch
     };
     lock(&f.state.hub).attach(ChildChannel::new(Box::new(stdin)), BotToken::parse(TOKEN).unwrap(), f.dir.join("discord-state.json").display().to_string());
-    let (hub, owners) = (Arc::clone(&f.state.hub), Arc::clone(&f.owners));
-    thread::spawn(move || read_child(stdout, &hub, owners.as_ref(), epoch));
+    let core = Arc::clone(&f.state.core);
+    thread::spawn(move || read_child(stdout, &core, epoch));
     wait_until("ready", || lock(&f.state.hub).ready);
 
     let anchor = || lock(&f.state.hub).resume_of(ROOM, Some(CREATED));
@@ -4042,6 +4080,762 @@ fn auditor_a_failed_name_refresh_must_retry_for_the_next_line() {
     assert_eq!(messages[1]["to"], "Codex / Gyre Audit", "a failed roster read must not permanently mark this name checked");
 }
 
+// ── the owner's voice (#205), ported onto #199 r12 ──
+
+const OWNER_ID: &str = "323456789012345678";
+const THREAD: &str = "423456789012345678";
+const OTHER_THREAD: &str = "523456789012345678";
+
+fn the_owner() -> Option<Owner> {
+    Some(Owner { id: OWNER_ID.to_string(), username: Some("jkp".to_string()) })
+}
+
+/// A Discord message id: a snowflake, as the child hands it.
+fn msg_id(n: u64) -> String {
+    format!("{}", 600_000_000_000_000_000 + n)
+}
+
+fn say_in(room: &str, thread: &str, id: &str, to: Option<&str>, kind: Option<&str>, text: &str, reply_to_seq: Option<u64>) -> FromChild {
+    FromChild::Say(Say {
+        room: room.to_string(),
+        discord_message_id: id.to_string(),
+        kind: kind.map(str::to_string),
+        to: to.map(str::to_string),
+        text: text.to_string(),
+        reply_to_seq,
+        thread_id: thread.to_string(),
+        owner_id: OWNER_ID.to_string(),
+        retry: false,
+    })
+}
+
+fn say(room: &str, id: &str, to: Option<&str>, kind: Option<&str>, text: &str, reply_to_seq: Option<u64>) -> FromChild {
+    say_in(room, THREAD, id, to, kind, text, reply_to_seq)
+}
+
+fn said<'a>(lines: &'a [serde_json::Value], id: &str) -> Option<&'a serde_json::Value> {
+    lines.iter().find(|line| line["t"] == "said" && line["discordMessageId"] == id)
+}
+
+fn connected(f: &Fixture, room: &str, thread: &str) {
+    on_core_event(&f.state.core, FromChild::Connected { room: Some(room.into()), thread_id: Some(thread.into()), created_at: Some(CREATED) });
+}
+
+fn posted_texts(f: &Fixture) -> Vec<String> {
+    f.acts.posts.lock().unwrap().iter().map(|(_, post, _)| post.text.clone()).collect()
+}
+
+#[test]
+fn a_say_is_posted_as_the_owner_only_for_a_connected_room_its_own_post_and_the_keychain_owner() {
+    let f = fixture_owned("say", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+
+    // No post recorded yet for the room: the child cannot be speaking in it.
+    on_core_event(&f.state.core, say(ROOM, &msg_id(1), None, None, "too early", None));
+    // A room that is not connected.
+    on_core_event(&f.state.core, say(OTHER, &msg_id(2), None, None, "elsewhere", None));
+    connected(&f, ROOM, THREAD);
+    // A post that is not the room's, and an author who is not the owner.
+    on_core_event(&f.state.core, say_in(ROOM, OTHER_THREAD, &msg_id(3), None, None, "wrong post", None));
+    let mut wrong_owner = say(ROOM, &msg_id(4), None, None, "not the owner", None);
+    if let FromChild::Say(inner) = &mut wrong_owner {
+        inner.owner_id = "999999999999999999".into();
+    }
+    on_core_event(&f.state.core, wrong_owner);
+    // Premise: the same say, in the right place, is posted — plain text to everyone as a
+    // tell, and a Reply as an ask to its sender with the seq it answers.
+    on_core_event(&f.state.core, say(ROOM, &msg_id(5), None, None, "hello room", None));
+    on_core_event(&f.state.core, say(ROOM, &msg_id(6), Some("peer-a"), None, "and you?", Some(3)));
+
+    wait_until("six answers", || of_kind(&buffer.lines(), "said").len() == 6);
+    let lines = buffer.lines();
+    for n in 1..=4 {
+        let answer = said(&lines, &msg_id(n)).unwrap();
+        assert_eq!(answer["ok"], false, "{n}: {answer}");
+        assert!(answer["error"].as_str().is_some_and(|error| error.contains("nothing was sent")), "{n}: {answer}");
+        assert!(answer.get("seq").is_none(), "no seq, so no 📨");
+    }
+    assert_eq!(said(&lines, &msg_id(5)).unwrap()["ok"], true);
+    assert_eq!(said(&lines, &msg_id(5)).unwrap()["seq"], 7);
+    assert_eq!(
+        f.acts.posts.lock().unwrap().clone(),
+        vec![
+            (ROOM.to_string(), OwnerPost { discord_message_id: msg_id(5), to: "everyone".into(), kind: "tell".into(), text: "hello room".into(), in_reply_to: None }, APP_WORD.to_string()),
+            (ROOM.to_string(), OwnerPost { discord_message_id: msg_id(6), to: "peer-a".into(), kind: "ask".into(), text: "and you?".into(), in_reply_to: Some(3) }, APP_WORD.to_string()),
+        ],
+        "only the two in the right place reached the bridge, with the word the room was connected with"
+    );
+    for (index, line) in buffer.text().lines().enumerate() {
+        assert!(!line.contains(APP_WORD) && !line.contains(PASSWORD), "line {index}: {line}");
+    }
+}
+
+#[test]
+fn the_owner_is_read_from_the_keychain_at_each_say_never_from_config_or_memory() {
+    // The config carries the owner's id, as an earlier build kept it; the Keychain does not.
+    let f = fixture_with("say-keychain", Some(TOKEN), &[("discordOwnerId", OWNER_ID)]);
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    on_core_event(&f.state.core, say(ROOM, &msg_id(1), None, None, "from the config's owner", None));
+    // The Keychain held the owner at launch, then could not be read (deleted, locked): the
+    // copy in memory does not speak for it.
+    *f.owners.record.lock().unwrap() = Some((the_owner().unwrap(), "2026-10-27T00:00:00Z".into()));
+    lock(&f.state.hub).owner = the_owner();
+    *f.owners.record.lock().unwrap() = None;
+    on_core_event(&f.state.core, say(ROOM, &msg_id(2), None, None, "keychain unreadable", None));
+    wait_until("two answers", || of_kind(&buffer.lines(), "said").len() == 2);
+    for n in [1, 2] {
+        let answer = said(&buffer.lines(), &msg_id(n)).unwrap().clone();
+        assert_eq!(answer["ok"], false, "{answer}");
+        assert!(answer["error"].as_str().unwrap().contains("No Discord account is paired"), "{answer}");
+    }
+    assert!(f.acts.posts.lock().unwrap().is_empty());
+    // Premise: the item readable again, the same say is posted.
+    *f.owners.record.lock().unwrap() = Some((the_owner().unwrap(), "2026-10-27T00:00:00Z".into()));
+    on_core_event(&f.state.core, say(ROOM, &msg_id(3), None, None, "readable", None));
+    assert_eq!(posted_texts(&f), vec!["readable".to_string()]);
+}
+
+#[test]
+fn a_say_line_that_does_not_name_its_post_and_author_is_never_posted() {
+    let f = fixture_owned("say-unnamed", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let (a, b, c, d, e) = (msg_id(1), msg_id(2), msg_id(3), msg_id(4), "not-a-snowflake");
+    let lines = [
+        format!(r#"{{"t":"say","room":"{ROOM}","discordMessageId":"{a}","ownerId":"{OWNER_ID}","text":"no post named"}}"#),
+        format!(r#"{{"t":"say","room":"{ROOM}","discordMessageId":"{b}","threadId":"{THREAD}","text":"no author named"}}"#),
+        format!(r#"{{"t":"say","room":"{ROOM}","discordMessageId":"{c}","threadId":"","ownerId":"","text":"both empty"}}"#),
+        format!(r#"{{"t":"say","room":"{ROOM}","discordMessageId":"{e}","threadId":"{THREAD}","ownerId":"{OWNER_ID}","text":"no message id"}}"#),
+        // Premise: the same line with both is posted.
+        format!(r#"{{"t":"say","room":"{ROOM}","discordMessageId":"{d}","threadId":"{THREAD}","ownerId":"{OWNER_ID}","text":"both named"}}"#),
+    ];
+    let epoch = lock(&f.state.hub).epoch;
+    read_child(Cursor::new(lines.join("\n") + "\n"), &f.state.core, epoch);
+    assert_eq!(posted_texts(&f), vec!["both named".to_string()]);
+    wait_until("the answers", || said(&buffer.lines(), &d).is_some());
+    assert_eq!(said(&buffer.lines(), &c).unwrap()["ok"], false);
+    assert_eq!(said(&buffer.lines(), e).unwrap()["ok"], false);
+}
+
+#[test]
+fn a_say_from_a_child_that_is_no_longer_current_is_not_heard() {
+    let f = fixture_owned("say-stale", Some(TOKEN), &[], the_owner());
+    let _buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let stale = lock(&f.state.hub).epoch;
+    lock(&f.state.hub).epoch += 1;
+    let line = format!(r#"{{"t":"say","room":"{ROOM}","discordMessageId":"{}","threadId":"{THREAD}","ownerId":"{OWNER_ID}","text":"late"}}"#, msg_id(1));
+    read_child(Cursor::new(line.clone() + "\n"), &f.state.core, stale);
+    let request = format!(r#"{{"t":"disconnect_request","all":true,"ownerId":"{OWNER_ID}"}}"#);
+    read_child(Cursor::new(request.clone() + "\n"), &f.state.core, stale);
+    assert!(f.acts.posts.lock().unwrap().is_empty(), "an earlier child's say is not news");
+    assert_eq!(f.state.status().connected_rooms, vec![ROOM.to_string()]);
+    // Premise: the current child's same lines are heard.
+    read_child(Cursor::new(line + "\n"), &f.state.core, stale + 1);
+    assert_eq!(posted_texts(&f), vec!["late".to_string()]);
+}
+
+#[test]
+fn a_post_is_bound_to_its_own_room_when_two_rooms_have_the_same_members() {
+    let f = fixture_owned("say-two-rooms", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.acts.founded.lock().unwrap().push(OTHER.to_string());
+    for room in [ROOM, OTHER] {
+        f.members(room, &[("founder-1", "Claude Code"), ("peer-a", "Codex")]);
+        f.state.connect(room, APP_WORD).unwrap();
+    }
+    connected(&f, ROOM, THREAD);
+    connected(&f, OTHER, OTHER_THREAD);
+    // Room B's post naming room A, and room A's post naming room B: neither is taken.
+    on_core_event(&f.state.core, say_in(ROOM, OTHER_THREAD, &msg_id(1), Some("peer-a"), None, "crossed", None));
+    on_core_event(&f.state.core, say_in(OTHER, THREAD, &msg_id(2), Some("peer-a"), None, "crossed back", None));
+    on_core_event(&f.state.core, say_in(OTHER, OTHER_THREAD, &msg_id(3), Some("peer-a"), None, "in B", None));
+    on_core_event(&f.state.core, say_in(ROOM, THREAD, &msg_id(4), Some("peer-a"), None, "in A", None));
+    wait_until("four answers", || of_kind(&buffer.lines(), "said").len() == 4);
+    let posts: Vec<(String, String)> = f.acts.posts.lock().unwrap().iter().map(|(room, post, _)| (room.clone(), post.text.clone())).collect();
+    assert_eq!(posts, vec![(OTHER.to_string(), "in B".to_string()), (ROOM.to_string(), "in A".to_string())]);
+}
+
+#[test]
+fn an_earlier_instances_post_is_not_where_the_owner_speaks_to_this_one() {
+    let f = fixture_owned("say-instance", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    // The child replays an earlier instance of the code (draining) and says its post.
+    on_core_event(&f.state.core, FromChild::Connected { room: Some(ROOM.into()), thread_id: Some(OTHER_THREAD.into()), created_at: Some(CREATED - 1) });
+    on_core_event(&f.state.core, say_in(ROOM, OTHER_THREAD, &msg_id(1), None, None, "to the old post", None));
+    connected(&f, ROOM, THREAD);
+    on_core_event(&f.state.core, say_in(ROOM, OTHER_THREAD, &msg_id(2), None, None, "still the old post", None));
+    on_core_event(&f.state.core, say(ROOM, &msg_id(3), None, None, "the live post", None));
+    wait_until("three answers", || of_kind(&buffer.lines(), "said").len() == 3);
+    assert_eq!(posted_texts(&f), vec!["the live post".to_string()]);
+}
+
+#[test]
+fn a_refused_owner_post_hands_the_reason_and_the_names_back_and_no_seq() {
+    let f = fixture_owned("say-refused", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    *f.acts.answer.lock().unwrap() = Some(Err(Refused {
+        message: "Nobody in this room goes by \"Bob\".".into(),
+        names: Some(vec!["Codex".into(), "Claude Code / Lead".into()]),
+    }));
+    on_core_event(&f.state.core, say(ROOM, &msg_id(1), Some("Bob"), None, "hi Bob", None));
+    wait_until("the answer", || !of_kind(&buffer.lines(), "said").is_empty());
+    let lines = buffer.lines();
+    let answer = said(&lines, &msg_id(1)).unwrap();
+    assert_eq!(answer["ok"], false);
+    assert!(answer.get("seq").is_none());
+    assert_eq!(answer["error"], "Nobody in this room goes by \"Bob\".");
+    assert_eq!(answer["names"], serde_json::json!(["Codex", "Claude Code / Lead"]));
+}
+
+#[test]
+fn a_retried_say_for_a_room_since_disconnected_says_it_cannot_tell() {
+    let f = fixture_owned("say-retry", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    let line = |retry: bool, n: u64| format!(r#"{{"t":"say","room":"{ROOM}","discordMessageId":"{}","threadId":"{THREAD}","ownerId":"{OWNER_ID}","text":"x","retry":{retry}}}"#, msg_id(n));
+    let epoch = lock(&f.state.hub).epoch;
+    read_child(Cursor::new(line(true, 1) + "\n" + &line(false, 2) + "\n"), &f.state.core, epoch);
+    wait_until("two answers", || of_kind(&buffer.lines(), "said").len() == 2);
+    let lines = buffer.lines();
+    assert!(said(&lines, &msg_id(1)).unwrap()["error"].as_str().unwrap().contains("may or may not have reached the room"), "never claimed unsent");
+    assert!(said(&lines, &msg_id(2)).unwrap()["error"].as_str().unwrap().contains("nothing was sent"));
+}
+
+#[test]
+fn each_message_names_its_sender_id_and_an_ask_to_the_person_is_marked_live_and_after_relaunch() {
+    let f = fixture("toowner", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    f.members(ROOM, &[("peer-a", "Codex"), ("peer-b", "Antigravity")]);
+    f.stream(ROOM, &[
+        mail(1, "peer-a", OWNER_SENDER, "ask", "may I?"),
+        mail(2, OWNER_SENDER, "peer-a", "tell", "yes"),
+        mail(3, "peer-a", "peer-b", "ask", "and you?"),
+        mail(4, "peer-b", OWNER_SENDER, "tell", "done"),
+        mail(5, "peer-b", "gyredeck", "ask", "which one?"),
+    ]);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("five", || of_kind(&buffer.lines(), "message").len() == 5);
+    let shape = |lines: &[serde_json::Value]| -> Vec<(String, String, String, bool)> {
+        of_kind(lines, "message")
+            .iter()
+            .map(|m| (m["sender"].as_str().unwrap().into(), m["senderId"].as_str().unwrap_or("-").into(), m["to"].as_str().unwrap().into(), m["toOwner"].as_bool().unwrap()))
+            .collect()
+    };
+    let expected: Vec<(String, String, String, bool)> = vec![
+        ("Codex".into(), "peer-a".into(), "You (via Discord)".into(), true),
+        ("You (via Discord)".into(), OWNER_SENDER.into(), "Codex".into(), false),
+        ("Codex".into(), "peer-a".into(), "Antigravity".into(), false),
+        ("Antigravity".into(), "peer-b".into(), "You (via Discord)".into(), false),
+        ("Antigravity".into(), "peer-b".into(), "You (via Gyredeck)".into(), true),
+    ];
+    assert_eq!(shape(&buffer.lines()), expected);
+
+    // Discord took none of them; the app quits and launches again: the journal hands the
+    // next child the same sender ids and the same mention (#199 replay, #205 fields).
+    lock(&f.state.hub).channel = None;
+    f.state.shutdown();
+    let next = relaunch(&f);
+    let replay = SharedBuf::default();
+    lock(&next.hub).attach(ChildChannel::new(Box::new(replay.clone())), BotToken::parse(TOKEN).unwrap(), String::new());
+    wait_until("the replay", || of_kind(&replay.lines(), "message").len() >= 5);
+    let replayed: Vec<(String, String, String, bool)> = shape(&replay.lines()).into_iter().take(5).collect();
+    assert_eq!(replayed, expected);
+}
+
+#[test]
+fn a_journal_written_before_205_replays_with_no_sender_id_and_no_mention() {
+    let (hub, path) = journal_hub("pre205");
+    let line = r#"{"t":"line","seq":1,"sender":"Codex","to":"everyone","kind":"ask","text":"old","ts":""}"#;
+    let open = format!(r#"{{"t":"open","code":"{ROOM}","createdAt":{CREATED},"members":[],"v":1}}"#);
+    fs::write(path.join(journal::file_name(ROOM, CREATED)), format!("{open}\n{line}\n")).unwrap();
+    let parsed = journal_of(&path, ROOM, CREATED);
+    assert_eq!(parsed.batches[0].items.len(), 1);
+    let ToChild::Message { sender_id, to_owner, .. } = item_line(ROOM, parsed.batches[0].items[0].clone()) else { panic!("a line") };
+    assert_eq!((sender_id, to_owner), (None, false));
+    let wire = serde_json::to_value(item_line(ROOM, parsed.batches[0].items[0].clone())).unwrap();
+    assert!(wire.get("senderId").is_none(), "{wire}");
+    drop(hub);
+}
+
+fn disconnect_line(json: &str) -> FromChild {
+    serde_json::from_str(json).unwrap()
+}
+
+#[test]
+fn a_disconnect_request_runs_the_same_disconnect_as_the_button_for_the_named_post_only() {
+    let f = fixture_owned("disconnect-request", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.acts.founded.lock().unwrap().push(OTHER.to_string());
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.state.connect(OTHER, "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6").unwrap();
+    connected(&f, ROOM, THREAD);
+    connected(&f, OTHER, OTHER_THREAD);
+
+    for refused in [
+        // A room nobody connected.
+        format!(r#"{{"t":"disconnect_request","room":"sync-zz99","ownerId":"{OWNER_ID}","threadId":"{THREAD}"}}"#),
+        // Confirmed by someone other than the paired owner.
+        format!(r#"{{"t":"disconnect_request","room":"{ROOM}","ownerId":"999999999999999999","threadId":"{THREAD}"}}"#),
+        // Confirmed in another room's post, or in no post.
+        format!(r#"{{"t":"disconnect_request","room":"{ROOM}","ownerId":"{OWNER_ID}","threadId":"{OTHER_THREAD}"}}"#),
+        format!(r#"{{"t":"disconnect_request","room":"{ROOM}","ownerId":"{OWNER_ID}"}}"#),
+    ] {
+        on_core_event(&f.state.core, disconnect_line(&refused));
+        assert_eq!(f.state.status().connected_rooms.len(), 2, "refused: {refused}");
+    }
+    // Naming no owner does not parse at all.
+    assert!(serde_json::from_str::<FromChild>(r#"{"t":"disconnect_request","all":true}"#).is_err());
+    assert!(f.acts.leaves.lock().unwrap().is_empty());
+
+    on_core_event(&f.state.core, disconnect_line(&format!(r#"{{"t":"disconnect_request","room":"{ROOM}","ownerId":"{OWNER_ID}","threadId":"{THREAD}"}}"#)));
+    assert_eq!(f.state.status().connected_rooms, vec![OTHER.to_string()], "that room alone");
+    assert_eq!(f.acts.leave_words.lock().unwrap().clone(), vec![(ROOM.to_string(), APP_WORD.to_string())], "the relay left it, with its own word");
+    wait_until("the disconnect line", || !of_kind(&buffer.lines(), "disconnect").is_empty());
+    let lines = buffer.lines();
+    let ended: Vec<(&str, &str)> = of_kind(&lines, "disconnect").iter().map(|line| (line["room"].as_str().unwrap(), line["reason"].as_str().unwrap())).collect();
+    assert_eq!(ended, vec![(ROOM, "disconnected")], "the post is told Disconnected, not Room closed: the room stays open");
+    assert!(!f.state.core.readers.lock().unwrap().contains_key(ROOM), "its reader stopped");
+
+    // Every room at once is the app's own button now, never a request from Discord (owner, 2026-11-02).
+    assert_eq!(f.acts.leave_words.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_disconnect_request_for_every_room_disconnects_none_discord_acts_only_on_its_own_post() {
+    let f = fixture_owned("disconnect-all-gone", Some(TOKEN), &[], the_owner());
+    let _buffer = f.attach_buffer();
+    f.acts.founded.lock().unwrap().push(OTHER.to_string());
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.state.connect(OTHER, "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6").unwrap();
+    connected(&f, ROOM, THREAD);
+    connected(&f, OTHER, OTHER_THREAD);
+    on_core_event(&f.state.core, disconnect_line(&format!(r#"{{"t":"disconnect_request","all":true,"ownerId":"{OWNER_ID}"}}"#)));
+    assert_eq!(f.state.status().connected_rooms.len(), 2, "all, naming no room: nothing");
+    assert!(f.acts.leaves.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_disconnect_request_carrying_all_is_refused_even_from_its_own_post() {
+    let f = fixture_owned("disconnect-all-own-post", Some(TOKEN), &[], the_owner());
+    let _buffer = f.attach_buffer();
+    f.acts.founded.lock().unwrap().push(OTHER.to_string());
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.state.connect(OTHER, "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6").unwrap();
+    connected(&f, ROOM, THREAD);
+    connected(&f, OTHER, OTHER_THREAD);
+    // Named with its own post, every other check passes: only `all` itself refuses it.
+    on_core_event(&f.state.core, disconnect_line(&format!(r#"{{"t":"disconnect_request","all":true,"room":"{ROOM}","ownerId":"{OWNER_ID}","threadId":"{THREAD}"}}"#)));
+    assert_eq!(f.state.status().connected_rooms.len(), 2, "no request from Discord carries all");
+    assert!(f.acts.leaves.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_disconnect_request_with_no_owner_in_the_keychain_does_nothing() {
+    let f = fixture("disconnect-noowner", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    // An owner the app once held in memory is not the Keychain's word.
+    lock(&f.state.hub).owner = the_owner();
+    on_core_event(&f.state.core, disconnect_line(&format!(r#"{{"t":"disconnect_request","all":true,"ownerId":"{OWNER_ID}"}}"#)));
+    assert_eq!(f.state.status().connected_rooms, vec![ROOM.to_string()]);
+}
+
+fn ago(minutes: u64, seconds: u64) -> Instant {
+    Instant::now().checked_sub(Duration::from_secs(minutes * 60 + seconds)).expect("an uptime longer than an hour")
+}
+
+#[test]
+fn a_room_whose_agents_have_all_been_idle_ten_minutes_is_said_quiet_once_a_spell() {
+    let f = fixture("quiet", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    let relay = relay_member(ROOM);
+    f.members(ROOM, &[("founder-1", "Claude Code"), ("peer-a", "Codex"), (relay.as_str(), "Discord")]);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    let quiet = || of_kind(&buffer.lines(), "quiet").len();
+    let now = Instant::now();
+    {
+        let mut hub = lock(&f.state.hub);
+        hub.rooms.get_mut(ROOM).unwrap().connected_at = ago(20, 0);
+        assert_eq!(hub.rooms[ROOM].agents, vec!["founder-1".to_string(), "peer-a".to_string()], "the relay is no agent");
+        hub.note_presence("founder-1", "turn_complete", ago(12, 0));
+        // One agent still mid-turn a minute ago: not quiet.
+        hub.note_presence("peer-a", "tool_start", ago(1, 0));
+        hub.check_quiet(now);
+        // Done, but only nine minutes ago.
+        hub.note_presence("peer-a", "turn_complete", ago(9, 0));
+        hub.check_quiet(now);
+    }
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(quiet(), 0, "{:?}", buffer.lines());
+    {
+        let mut hub = lock(&f.state.hub);
+        hub.note_presence("peer-a", "turn_complete", ago(10, 30));
+        hub.check_quiet(now);
+        hub.check_quiet(now + Duration::from_secs(60));
+    }
+    wait_until("the quiet line", || quiet() == 1);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(quiet(), 1, "once a spell, not every tick");
+    assert_eq!(of_kind(&buffer.lines(), "quiet")[0]["room"], ROOM);
+    assert_eq!(f.state.status().connected_rooms, vec![ROOM.to_string()], "quiet never disconnects");
+    {
+        let mut hub = lock(&f.state.hub);
+        hub.note_presence("founder-1", "turn_start", now);
+        hub.check_quiet(now + Duration::from_secs(1));
+        hub.note_presence("founder-1", "turn_complete", now + Duration::from_secs(2));
+        hub.check_quiet(now + Duration::from_secs(5 * 60));
+        hub.check_quiet(now + Duration::from_secs(11 * 60));
+    }
+    wait_until("a second spell", || quiet() == 2);
+    let lines = buffer.lines();
+    let order: Vec<&str> = lines.iter().filter_map(|line| line["t"].as_str()).filter(|t| *t == "quiet" || *t == "quiet_over").collect();
+    assert_eq!(order, vec!["quiet", "quiet_over", "quiet"]);
+}
+
+#[test]
+fn a_restarted_child_is_told_where_each_rooms_quiet_spell_stands() {
+    let f = fixture("quiet-restart", Some(TOKEN));
+    let _first = f.attach_buffer();
+    f.members(ROOM, &[("founder-1", "Claude Code")]);
+    f.members(OTHER, &[("peer-a", "Codex")]);
+    f.acts.founded.lock().unwrap().push(OTHER.to_string());
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.state.connect(OTHER, "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6").unwrap();
+    {
+        let mut hub = lock(&f.state.hub);
+        hub.rooms.get_mut(ROOM).unwrap().connected_at = ago(20, 0);
+        hub.note_presence("founder-1", "turn_complete", ago(12, 0));
+        hub.check_quiet(Instant::now());
+        assert!(hub.rooms[ROOM].quiet_said && !hub.rooms[OTHER].quiet_said, "premise");
+    }
+    // The child dies; while none is attached `send` drops lines, so the new one is told afresh.
+    let second = f.attach_buffer();
+    wait_until("both rooms connected again", || of_kind(&second.lines(), "connect").len() == 2);
+    wait_until("the quiet state", || of_kind(&second.lines(), "quiet").len() + of_kind(&second.lines(), "quiet_over").len() == 2);
+    let lines = second.lines();
+    let told: Vec<(&str, &str)> = lines
+        .iter()
+        .filter(|line| line["t"] == "quiet" || line["t"] == "quiet_over")
+        .map(|line| (line["room"].as_str().unwrap(), line["t"].as_str().unwrap()))
+        .collect();
+    assert!(told.contains(&(ROOM, "quiet")) && told.contains(&(OTHER, "quiet_over")), "{told:?}");
+    let at = |t: &str, room: &str| lines.iter().position(|line| line["t"] == t && line["room"] == room).unwrap();
+    assert!(at("connect", ROOM) < at("quiet", ROOM), "after the room's connect, so the child knows the room");
+}
+
+#[test]
+fn a_quiet_prompts_request_counts_only_while_the_room_is_quiet_and_for_its_own_instance() {
+    let f = fixture_owned("disconnect-quiet", Some(TOKEN), &[], the_owner());
+    let _buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let at = lock(&f.state.hub).rooms[ROOM].created_at.expect("premise: an instance");
+    let request = |created_at: u64, quiet: bool| {
+        on_core_event(
+            &f.state.core,
+            disconnect_line(&format!(r#"{{"t":"disconnect_request","room":"{ROOM}","ownerId":"{OWNER_ID}","threadId":"{THREAD}","createdAt":{created_at},"quiet":{quiet}}}"#)),
+        );
+    };
+    request(at, true);
+    assert_eq!(f.state.status().connected_rooms.len(), 1, "work resumed, or the child's word only: not quiet here");
+    request(at + 1, false);
+    assert_eq!(f.state.status().connected_rooms.len(), 1, "a prompt for another instance of the room");
+    lock(&f.state.hub).rooms.get_mut(ROOM).unwrap().quiet_said = true;
+    request(at, true);
+    assert!(f.state.status().connected_rooms.is_empty(), "quiet here, its own instance");
+}
+
+#[test]
+fn an_agent_not_heard_from_since_connect_is_not_counted_idle() {
+    let f = fixture("quiet-unknown", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    f.members(ROOM, &[("founder-1", "Claude Code"), ("peer-a", "Codex")]);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    let now = Instant::now();
+    {
+        let mut hub = lock(&f.state.hub);
+        hub.rooms.get_mut(ROOM).unwrap().connected_at = ago(20, 0);
+        hub.note_presence("founder-1", "turn_complete", ago(15, 0));
+        hub.check_quiet(now);
+        hub.check_quiet(now + Duration::from_secs(60 * 60));
+    }
+    thread::sleep(Duration::from_millis(100));
+    assert!(of_kind(&buffer.lines(), "quiet").is_empty(), "an agent not heard from is not idle");
+    let mut hub = lock(&f.state.hub);
+    hub.note_presence("peer-a", "turn_complete", ago(11, 0));
+    hub.check_quiet(now);
+    drop(hub);
+    wait_until("quiet", || of_kind(&buffer.lines(), "quiet").len() == 1);
+}
+
+#[test]
+fn what_was_heard_before_connect_or_a_reconnect_does_not_make_a_room_quiet() {
+    let f = fixture("quiet-before", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    f.members(ROOM, &[("peer-a", "Codex")]);
+    let quiet = || of_kind(&buffer.lines(), "quiet").len();
+    lock(&f.state.hub).note_presence("peer-a", "turn_complete", ago(20, 0));
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    let now = Instant::now();
+    {
+        let mut hub = lock(&f.state.hub);
+        hub.rooms.get_mut(ROOM).unwrap().connected_at = ago(11, 0);
+        hub.check_quiet(now);
+    }
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(quiet(), 0, "heard before Connect is not heard");
+    {
+        let mut hub = lock(&f.state.hub);
+        hub.note_presence("peer-a", "turn_complete", ago(10, 30));
+        hub.check_quiet(now);
+    }
+    wait_until("quiet", || quiet() == 1);
+    // A reconnect starts again: what was heard before it does not count.
+    f.state.disconnect(ROOM, Some(APP_WORD)).unwrap();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    lock(&f.state.hub).check_quiet(Instant::now() + Duration::from_secs(11 * 60));
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(quiet(), 1, "nothing heard since the reconnect");
+}
+
+#[test]
+fn a_session_mid_turn_is_not_idle_until_its_silence_is_stale() {
+    let f = fixture("quiet-busy", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    f.members(ROOM, &[("peer-a", "Codex")]);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    let now = Instant::now();
+    {
+        let mut hub = lock(&f.state.hub);
+        hub.rooms.get_mut(ROOM).unwrap().connected_at = ago(40, 0);
+        hub.note_presence("peer-a", "tool_start", ago(12, 0));
+        hub.check_quiet(now);
+    }
+    thread::sleep(Duration::from_millis(100));
+    assert!(of_kind(&buffer.lines(), "quiet").is_empty(), "a running tool is work");
+    lock(&f.state.hub).check_quiet(now + BUSY_STALE);
+    wait_until("quiet once the silence is stale", || of_kind(&buffer.lines(), "quiet").len() == 1);
+}
+
+#[test]
+fn the_bridge_event_stream_says_who_is_working() {
+    let f = fixture("presence", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    f.source.events.lock().unwrap().push_back(
+        b": gyredeck standalone bridge connected\n\nevent: tool_start\ndata: {\"type\":\"tool_start\",\"conversationId\":\"peer-a\"}\n\nevent: turn_complete\ndata: {\"type\":\"turn_complete\",\"conversationId\":\"founder-1\"}\n\n".to_vec(),
+    );
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("both sessions seen", || lock(&f.state.hub).presence.len() == 2);
+    let hub = lock(&f.state.hub);
+    assert!(hub.presence["peer-a"].busy);
+    assert!(!hub.presence["founder-1"].busy);
+}
+
+#[test]
+fn a_real_bridge_takes_the_owners_say_as_you_via_discord_and_no_one_else_can_speak_so() {
+    let port = {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let home = scratch("live-owner");
+    fs::create_dir_all(home.join(".config/gyredeck")).unwrap();
+    fs::write(home.join(".config/gyredeck/gyredeck.config.json"), format!("{{\"host\":\"127.0.0.1\",\"port\":{port}}}")).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../adapters/bridge/gyredeck-bridge.mjs");
+    let mut child = Command::new(node())
+        .arg(&script)
+        .args(["--port", &port.to_string(), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"])
+        .env("HOME", &home)
+        .env("GYREDECK_NO_AGENT_SPAWN", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the bridge");
+    child.stdin.as_mut().unwrap().write_all(format!("broker-secret {APP_WORD}\nbroker-ready\n").as_bytes()).unwrap();
+    let bridge = LiveBridge { child, home: home.clone() };
+    let token_path = home.join(".config/gyredeck/gyredeck.ingest-token");
+    wait_until("the bridge to serve", || token_path.exists() && TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok());
+    let app = standalone_bridge::BridgeTarget { port, token: fs::read_to_string(&token_path).unwrap().trim().to_string() };
+    let call = |target: &standalone_bridge::BridgeTarget, method: &str, path: &str, body: Option<serde_json::Value>, word: Option<&str>| {
+        standalone_bridge::bridge_request_to(target, method, path, body.map(|body| body.to_string()), Duration::from_secs(2), word).unwrap()
+    };
+    let (status, created) = call(&app, "POST", "/sync/rooms", Some(serde_json::json!({ "conversationId": "founder-1" })), Some(APP_WORD));
+    assert_eq!(status, 201, "{created}");
+    let room = created["room"].as_str().unwrap().to_string();
+    let password = created["password"].as_str().unwrap().to_string();
+    assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/members"), Some(serde_json::json!({ "conversationId": "peer-a" })), Some(APP_WORD)).0, 200);
+    assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/confirm"), Some(serde_json::json!({ "conversationId": "peer-a", "password": password })), None).0, 200);
+
+    let tokens = Arc::new(MemTokens::default());
+    *tokens.token.lock().unwrap() = Some(BotToken::parse(TOKEN).unwrap());
+    let owners = Arc::new(MemOwner::default());
+    *owners.record.lock().unwrap() = Some((the_owner().unwrap(), "2026-10-27T00:00:00Z".into()));
+    let state = DiscordState::with(Deps {
+        tokens: Box::new(tokens),
+        settings: Arc::new(MemSettings::default()),
+        owners: owners as Arc<dyn OwnerStore>,
+        source: Arc::new(BridgeSource { target: Some(app.clone()) }),
+        acts: Arc::new(LiveActs { target: app.clone(), password: password.clone(), room: room.clone() }),
+        state_path: home.join("discord-state.json"),
+        log: SupervisorLog::at(None),
+    });
+    let buffer = SharedBuf::default();
+    state.configured.store(true, Ordering::SeqCst);
+    lock(&state.hub).attach(ChildChannel::new(Box::new(buffer.clone())), BotToken::parse(TOKEN).unwrap(), String::new());
+    lock(&state.hub).ready = true;
+    lock(&state.hub).forum_id = Some("223456789012345678".to_string());
+    state.connect(&room, APP_WORD).expect("connect through the real join");
+    on_core_event(&state.core, FromChild::Connected { room: Some(room.clone()), thread_id: Some(THREAD.into()), created_at: None });
+
+    let speaker = standalone_bridge::BridgeTarget { port, token: password.clone() };
+    let (status, asked) = call(&speaker, "POST", &format!("/mail/{room}"), Some(serde_json::json!({ "from": "peer-a", "to": OWNER_SENDER, "kind": "ask", "text": "may I start?" })), None);
+    assert_eq!(status, 202, "{asked}");
+    let asked_seq = asked["seq"].as_u64().unwrap();
+    wait_until("the ask, relayed", || of_kind(&buffer.lines(), "message").iter().any(|m| m["seq"] == asked_seq));
+    let relayed = of_kind(&buffer.lines(), "message").into_iter().find(|m| m["seq"] == asked_seq).unwrap().clone();
+    assert_eq!((relayed["senderId"].as_str(), relayed["to"].as_str(), relayed["toOwner"].as_bool()), (Some("peer-a"), Some("You (via Discord)"), Some(true)));
+
+    // A Discord Reply to that ask: addressed by the sender's raw id, answering its seq.
+    let say_live = |id: &str, to: Option<&str>, kind: Option<&str>, text: &str, reply: Option<u64>| {
+        on_core_event(&state.core, FromChild::Say(Say {
+            room: room.clone(),
+            discord_message_id: id.to_string(),
+            kind: kind.map(str::to_string),
+            to: to.map(str::to_string),
+            text: text.to_string(),
+            reply_to_seq: reply,
+            thread_id: THREAD.to_string(),
+            owner_id: OWNER_ID.to_string(),
+            retry: false,
+        }));
+    };
+    let answers = |id: &str| -> Vec<serde_json::Value> { buffer.lines().into_iter().filter(|line| line["t"] == "said" && line["discordMessageId"] == id).collect() };
+    let answer_n = |id: &str, nth: usize| -> serde_json::Value {
+        wait_until("the answer", || answers(id).len() > nth);
+        answers(id)[nth].clone()
+    };
+    say_live(&msg_id(1), Some("peer-a"), Some("ask"), "yes, go ahead", Some(asked_seq));
+    let answer = answer_n(&msg_id(1), 0);
+    assert_eq!(answer["ok"], true, "{answer}");
+    let seq = answer["seq"].as_u64().unwrap();
+    // An address nobody in the room goes by is refused, with the names that work.
+    say_live(&msg_id(2), Some("Bob"), None, "hi Bob", None);
+    let refused = answer_n(&msg_id(2), 0);
+    assert_eq!(refused["ok"], false, "{refused}");
+    let names: Vec<&str> = refused["names"].as_array().unwrap().iter().map(|name| name.as_str().unwrap()).collect();
+    assert!(names.contains(&"Agent #peer-a") && !names.contains(&"Discord"), "{names:?}");
+
+    // What the room holds, read on the app's word (#274: a member's read takes its own key).
+    let read = || call(&app, "GET", &format!("/mail/{room}?as={}&since=0", relay_member(&room)), None, Some(APP_WORD)).1;
+    let messages = read()["messages"].as_array().unwrap().clone();
+    let posted = messages.iter().find(|m| m["seq"] == seq).unwrap().clone();
+    assert_eq!(posted["from"], OWNER_SENDER);
+    assert_eq!(posted["to"], "peer-a");
+    assert_eq!(posted["kind"], "ask");
+    assert_eq!(posted["text"], "yes, go ahead");
+    assert_eq!(posted["inReplyTo"], asked_seq);
+    // It comes back to the child as itself, so the child can skip it and keep its count.
+    wait_until("the owner's line, relayed", || of_kind(&buffer.lines(), "message").iter().any(|m| m["seq"] == seq));
+    let echoed = of_kind(&buffer.lines(), "message").into_iter().find(|m| m["seq"] == seq).unwrap().clone();
+    assert_eq!((echoed["sender"].as_str(), echoed["senderId"].as_str()), (Some("You (via Discord)"), Some(OWNER_SENDER)));
+
+    // Two Discord messages with the same words are two messages; the same one sent again is
+    // the first. Through the child's line, the app's check and the real bridge.
+    let ping = |n: u64| {
+        let line = format!(r#"{{"t":"say","room":"{room}","discordMessageId":"{}","threadId":"{THREAD}","ownerId":"{OWNER_ID}","kind":"tell","to":"everyone","text":"ping"}}"#, msg_id(n));
+        let epoch = lock(&state.hub).epoch;
+        read_child(Cursor::new(line + "\n"), &state.core, epoch);
+    };
+    let seq_of = |n: u64, nth: usize| {
+        let answer = answer_n(&msg_id(n), nth);
+        assert_eq!(answer["ok"], true, "{answer}");
+        answer["seq"].as_u64().unwrap()
+    };
+    ping(10);
+    let first = seq_of(10, 0);
+    ping(11);
+    let second = seq_of(11, 0);
+    assert_ne!(first, second, "two pings are two messages");
+    ping(10);
+    assert_eq!(seq_of(10, 1), first, "a retry of one is that one");
+    let pings = read()["messages"].as_array().unwrap().iter().filter(|m| m["from"] == OWNER_SENDER && m["text"] == "ping").count();
+    assert_eq!(pings, 2);
+
+    // Nobody else speaks as the owner: not with the room's password, nor the machine token alone.
+    for target in [&speaker, &app] {
+        let (status, body) = call(target, "POST", &format!("/mail/{room}"), Some(serde_json::json!({ "from": OWNER_SENDER, "to": "everyone", "text": "forged" })), None);
+        assert_eq!((status, body["error"].as_str()), (403, Some("reserved_sender")), "{body}");
+    }
+    drop(state);
+    drop(bridge);
+}
+
+// The asker's yes/no flag (#205, owner 2026-11-02): carried from the room to the child on an
+// ask only, and kept by the journal through a compaction and a relaunch.
+fn yes_no_frame(seq: u64, kind: &str, yes_no: serde_json::Value) -> serde_json::Value {
+    let mut frame = mail(seq, "peer-a", "everyone", kind, &format!("q{seq}"));
+    frame["yesNo"] = yes_no;
+    frame
+}
+
+#[test]
+fn an_asks_yes_no_flag_reaches_the_child_and_nothing_else_carries_one() {
+    let f = fixture("yes-no-wire", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.stream(ROOM, &[
+        yes_no_frame(1, "ask", serde_json::json!(true)),
+        mail(2, "peer-a", "everyone", "ask", "q2"),
+        yes_no_frame(3, "tell", serde_json::json!(true)),
+        yes_no_frame(4, "ask", serde_json::json!(false)),
+    ]);
+    wait_until("four lines", || of_kind(&buffer.lines(), "message").len() == 4);
+    let all = buffer.lines();
+    let lines = of_kind(&all, "message");
+    let flag = |seq: u64| lines.iter().find(|line| line["seq"] == seq).map(|line| line.get("yesNo").cloned());
+    assert_eq!(flag(1), Some(Some(serde_json::json!(true))), "a yes/no ask says so");
+    for seq in [2, 3, 4] {
+        assert_eq!(flag(seq), Some(None), "seq {seq}: no flag, a tell with one, or false: none reaches the child");
+    }
+}
+
+#[test]
+fn a_yes_no_flag_outlives_a_compaction_and_a_relaunch_and_old_lines_have_none() {
+    let f = fixture("yes-no-journal", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.stream(ROOM, &[
+        mail(1, "peer-a", "everyone", "tell", "one"),
+        mail(2, "peer-a", "everyone", "tell", "two"),
+        mail(3, "peer-a", "everyone", "tell", "three"),
+        yes_no_frame(4, "ask", serde_json::json!(true)),
+    ]);
+    wait_until("four lines", || of_kind(&buffer.lines(), "message").len() == 4);
+    {
+        let hub = lock(&f.state.hub);
+        let file = hub.rooms[ROOM].journal.as_ref().unwrap();
+        file.append(&journal::Record::Ack { seq: 3, msg: None }).unwrap();
+        assert!(file.compact().unwrap(), "premise: the acked lines compact away");
+    }
+    let path = journal_path(&f);
+    let (_next, handed) = launch_wire(&path, Moment::Launch).unwrap();
+    let replayed: Vec<&serde_json::Value> = handed.iter().filter(|line| line["t"] == "message").collect();
+    assert_eq!(replayed.iter().map(|line| line["seq"].as_u64().unwrap()).collect::<Vec<_>>(), vec![4], "premise: only the unacked ask is replayed");
+    assert_eq!(replayed[0]["yesNo"], serde_json::json!(true), "the flag came back from the journal");
+    let old: journal::Record = serde_json::from_str(r#"{"t":"line","seq":9,"sender":"Codex","to":"everyone","kind":"ask","text":"x","ts":""}"#)
+        .expect("a line written before the flag still parses");
+    assert!(!serde_json::to_string(&old).unwrap().contains("yesNo"), "a line from before the flag has none");
+}
+
 #[test]
 fn a_token_macos_will_not_hand_over_is_said_so_never_shown_as_not_set_up() {
     let f = fixture("keychain-refused", Some(TOKEN));
@@ -4101,4 +4895,135 @@ fn the_followed_rooms_are_told_on_connect_and_on_disconnect() {
     f.state.connect(ROOM, APP_WORD).unwrap();
     f.state.disconnect(ROOM, Some(APP_WORD)).unwrap();
     assert_eq!(*told.lock().unwrap(), vec![vec![], vec![ROOM.to_string()], vec![]]);
+}
+
+// ---- #206 /status: asked by the child, answered by the app from what it holds ----
+
+fn status_ask(f: &Fixture, buffer: &SharedBuf, json: String) -> Vec<serde_json::Value> {
+    let before = of_kind(&buffer.lines(), "status").len();
+    on_core_event(&f.state.core, serde_json::from_str::<FromChild>(&json).expect("a status request parses"));
+    wait_until("the status answer", || of_kind(&buffer.lines(), "status").len() > before);
+    of_kind(&buffer.lines(), "status").into_iter().skip(before).cloned().collect()
+}
+
+#[test]
+fn status_in_a_post_answers_that_room_instance_with_its_agents_and_what_they_last_did() {
+    let f = fixture_owned("status-room", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.members(ROOM, &[("founder-1", "Claude Code / Gyre Assistant"), ("peer-a", "Codex / Gyre Audit"), (relay_member(ROOM).as_str(), "Discord")]);
+    // Heard before this Connect: not known to hold now, so "not heard from since connect".
+    lock(&f.state.hub).note_presence("founder-1", "turn_complete", Instant::now());
+    thread::sleep(Duration::from_millis(5));
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let created = lock(&f.state.hub).rooms[ROOM].created_at.unwrap();
+    lock(&f.state.hub).note_presence("peer-a", "tool_start", Instant::now());
+    let answers = status_ask(&f, &buffer, format!(r#"{{"t":"status_request","requestId":"r1","ownerId":"{OWNER_ID}","channelId":"{THREAD}","threadId":"{THREAD}","room":"{ROOM}","createdAt":{created}}}"#));
+    let room = &answers[0]["room"];
+    assert_eq!(answers[0]["requestId"], "r1");
+    assert_eq!(room["room"], ROOM);
+    let members: Vec<(String, String)> = room["members"].as_array().unwrap().iter().map(|m| (m["name"].as_str().unwrap().to_string(), m["state"].as_str().unwrap().to_string())).collect();
+    assert_eq!(members, vec![("Claude Code / Gyre Assistant".to_string(), "unknown".to_string()), ("Codex / Gyre Audit".to_string(), "working".to_string())], "the agents only, never the relay");
+    assert!(room["usage"].is_array());
+}
+
+#[test]
+fn status_is_refused_to_anyone_but_the_keychain_owner_and_for_a_post_or_instance_that_is_not_current() {
+    let f = fixture_owned("status-refused", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let created = lock(&f.state.hub).rooms[ROOM].created_at.unwrap();
+    for (json, why) in [
+        (format!(r#"{{"t":"status_request","requestId":"a","ownerId":"999999999999999999","channelId":"{THREAD}","threadId":"{THREAD}","room":"{ROOM}","createdAt":{created}}}"#), "another person"),
+        (format!(r#"{{"t":"status_request","requestId":"b","ownerId":"{OWNER_ID}","channelId":"{OTHER_THREAD}","threadId":"{OTHER_THREAD}","room":"{ROOM}","createdAt":{created}}}"#), "another post"),
+        (format!(r#"{{"t":"status_request","requestId":"c","ownerId":"{OWNER_ID}","channelId":"{THREAD}","threadId":"{THREAD}","room":"{ROOM}","createdAt":{}}}"#, created + 1), "another instance"),
+        (format!(r#"{{"t":"status_request","requestId":"d","ownerId":"999999999999999999","channelId":"C1"}}"#), "another person, every room"),
+    ] {
+        let answers = status_ask(&f, &buffer, json);
+        let last = answers.last().unwrap();
+        assert!(last["error"].is_string(), "{why}: {last}");
+        assert!(last.get("room").is_none_or(serde_json::Value::is_null) && last.get("rooms").is_none_or(serde_json::Value::is_null), "{why}: nothing about any room");
+    }
+}
+
+#[test]
+fn status_outside_a_post_lists_every_connected_room_with_its_agents_counted() {
+    let f = fixture_owned("status-all", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.members(ROOM, &[("founder-1", "Claude Code"), ("peer-a", "Codex"), (relay_member(ROOM).as_str(), "Discord")]);
+    f.acts.founded.lock().unwrap().push(OTHER.to_string());
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.state.connect(OTHER, "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6").unwrap();
+    let answers = status_ask(&f, &buffer, format!(r#"{{"t":"status_request","requestId":"all","ownerId":"{OWNER_ID}","channelId":"C1"}}"#));
+    for r in answers[0]["rooms"].as_array().unwrap() {
+        assert!(r["createdAt"].is_u64(), "each room names its instance: {r}");
+    }
+    let mut rooms: Vec<(String, u64)> = answers[0]["rooms"].as_array().unwrap().iter().map(|r| (r["room"].as_str().unwrap().to_string(), r["members"].as_u64().unwrap())).collect();
+    rooms.sort();
+    let mut expected = vec![(ROOM.to_string(), 2), (OTHER.to_string(), 0)];
+    expected.sort();
+    assert_eq!(rooms, expected);
+    assert_eq!(answers[0]["hiddenRooms"], 0);
+}
+
+#[test]
+fn status_with_the_owner_record_unreadable_answers_nothing_about_any_room() {
+    let f = fixture_built("status-keychain", Some(TOKEN), &[], the_owner(), true);
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    let answers = status_ask(&f, &buffer, format!(r#"{{"t":"status_request","requestId":"k","ownerId":"{OWNER_ID}","channelId":"C1"}}"#));
+    assert!(answers[0]["error"].as_str().unwrap().contains("Keychain"), "{}", answers[0]);
+    assert!(answers[0].get("rooms").is_none_or(serde_json::Value::is_null));
+}
+
+
+/// Every read time the bridge can pass on, and the age /status may show for it (#206 audit).
+#[test]
+fn status_usage_age_table() {
+    let now = time::OffsetDateTime::now_utc();
+    let at = |secs: i64| (now + time::Duration::seconds(secs)).format(&time::format_description::well_known::Rfc3339).unwrap();
+    let cases: Vec<(&str, serde_json::Value, Option<i64>)> = vec![
+        ("absent", serde_json::Value::Null, None),
+        ("not a string", serde_json::json!(12), None),
+        ("not a date", serde_json::json!("bad-date"), None),
+        ("an hour ahead", serde_json::json!(at(3600)), None),
+        ("just past the skew", serde_json::json!(at(READ_CLOCK_SKEW + 30)), None),
+        ("ahead within the skew", serde_json::json!(at(60)), Some(0)),
+        ("ten minutes ago", serde_json::json!(at(-600)), Some(600)),
+    ];
+    for (name, fetched, want) in cases {
+        let status = serde_json::json!({ "usage": { "codex": { "displayName": "Codex", "lines": [], "fetchedAt": fetched } } });
+        let got = status_usage(&status)[0]["secondsOld"].as_i64();
+        match want {
+            None => assert_eq!(got, None, "{name}"),
+            Some(want) => assert!(got.is_some_and(|got| (got - want).abs() <= 2), "{name}: {got:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_slow_status_never_holds_up_a_say_read_after_it_and_a_second_waits_its_turn() {
+    let f = fixture_owned("status-slow", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let created = lock(&f.state.hub).rooms[ROOM].created_at.unwrap();
+    *f.source.status_delay.lock().unwrap() = Duration::from_millis(1500);
+    let ask = |id: &str| format!(r#"{{"t":"status_request","requestId":"{id}","ownerId":"{OWNER_ID}","channelId":"{THREAD}","threadId":"{THREAD}","room":"{ROOM}","createdAt":{created}}}"#);
+    let say = format!(r#"{{"t":"say","room":"{ROOM}","discordMessageId":"{}","threadId":"{THREAD}","ownerId":"{OWNER_ID}","text":"after the status"}}"#, msg_id(1));
+    let lines = [ask("s1"), ask("s2"), ask("s3"), say];
+    let epoch = lock(&f.state.hub).epoch;
+    let started = Instant::now();
+    read_child(Cursor::new(lines.join("\n") + "\n"), &f.state.core, epoch);
+    assert!(started.elapsed() < Duration::from_millis(1000), "the reader waited {:?}", started.elapsed());
+    assert_eq!(posted_texts(&f), vec!["after the status".to_string()]);
+    let lines = buffer.lines();
+    let answers = of_kind(&lines, "status");
+    let busy: Vec<&str> = answers.iter().filter(|a| a["error"] == STATUS_BUSY).map(|a| a["requestId"].as_str().unwrap()).collect();
+    assert_eq!(busy, vec!["s2", "s3"]);
+    wait_until("the first status answered", || of_kind(&buffer.lines(), "status").iter().any(|a| a["requestId"] == "s1" && a["error"].is_null()));
+    // Answered, the next one is taken.
+    let again = status_ask(&f, &buffer, ask("s4"));
+    assert!(again[0]["error"].is_null(), "{again:?}");
 }

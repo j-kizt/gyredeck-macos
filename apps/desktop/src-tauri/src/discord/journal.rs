@@ -51,6 +51,17 @@ pub(crate) enum Record {
         ts: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         through: Option<u64>,
+        /// Who said it, by conversation id, so a Reply on Discord can address them (#205).
+        /// Absent in journals written before #205, which replay with no sender id.
+        #[serde(default, rename = "senderId", skip_serializing_if = "Option::is_none")]
+        sender_id: Option<String>,
+        /// An ask to the person: the child mentions the paired owner on it (#205).
+        #[serde(default, rename = "toOwner", skip_serializing_if = "std::ops::Not::not")]
+        to_owner: bool,
+        /// The asker marked this ask yes/no, so ✅/❌ on Discord answers it (#205). Absent in
+        /// journals written before it, which replay with no yes/no answer.
+        #[serde(default, rename = "yesNo", skip_serializing_if = "std::ops::Not::not")]
+        yes_no: bool,
     },
     Ack { seq: u64, msg: Option<String> },
     Close { id: String, reason: DisconnectReason, at: u64 },
@@ -67,7 +78,7 @@ pub(crate) enum Record {
 /// A line or a loss, as the journal holds it until Discord takes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Item {
-    Line { seq: u64, sender: String, to: String, kind: String, text: String, ts: String, through: Option<u64> },
+    Line { seq: u64, sender: String, to: String, kind: String, text: String, ts: String, through: Option<u64>, sender_id: Option<String>, to_owner: bool, yes_no: bool },
     Loss { seq: u64, n: u64, label: String, through: Option<u64> },
 }
 
@@ -87,7 +98,7 @@ impl Item {
 
     fn record(&self) -> Record {
         match self.clone() {
-            Item::Line { seq, sender, to, kind, text, ts, through } => Record::Line { seq, sender, to, kind, text, ts, through },
+            Item::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no } => Record::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no },
             Item::Loss { seq, n, label, through } => Record::Loss { seq, n, label, through },
         }
     }
@@ -216,7 +227,7 @@ pub(crate) fn parse(name: &str, bytes: &[u8]) -> Result<Parsed, Corrupt> {
             Record::Open { .. } => return Err(corrupt(line, "a second open".to_string())),
             Record::Line { .. } | Record::Loss { .. } => {
                 let item = match record {
-                    Record::Line { seq, sender, to, kind, text, ts, through } => Item::Line { seq, sender, to, kind, text, ts, through },
+                    Record::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no } => Item::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no },
                     Record::Loss { seq, n, label, through } => Item::Loss { seq, n, label, through },
                     _ => unreachable!(),
                 };

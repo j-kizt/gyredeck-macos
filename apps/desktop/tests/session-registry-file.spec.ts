@@ -149,9 +149,13 @@ test("leaving the page saves what is pending at once", async ({ page }) => {
 
 test("a quiet app clears data that ages past 30 days within the hour, and saves the result", async ({ page }) => {
   // No demo events: nothing arrives, so only the hourly sweep can clear it.
-  await page.clock.install({ time: new Date("2026-11-02T03:00:00.000Z") });
-  const almostOld = { ...event("ageing-conv", "Ages out"), timestamp: new Date(Date.parse("2026-11-02T03:00:00.000Z") - 30 * 24 * 60 * 60 * 1000 + 30 * 60 * 1000).toISOString() };
-  await open(page, { load: "absent" }, { "ageing-conv": [almostOld], "fresh-conv": [event("fresh-conv", "Stays")] }, false);
+  const now = Date.parse("2026-11-02T03:00:00.000Z");
+  await page.clock.install({ time: new Date(now) });
+  // Both timestamps from the page's clock, never this machine's: a fixture dated by the real
+  // clock passed only on the day the test was written.
+  const almostOld = { ...event("ageing-conv", "Ages out"), timestamp: new Date(now - 30 * 24 * 60 * 60 * 1000 + 30 * 60 * 1000).toISOString() };
+  const fresh = { ...event("fresh-conv", "Stays"), timestamp: new Date(now - 60_000).toISOString() };
+  await open(page, { load: "absent" }, { "ageing-conv": [almostOld], "fresh-conv": [fresh] }, false);
   await expect.poll(async () => (await log(page)).filter((entry) => entry.what === "save done").length).toBeGreaterThan(0);
   const first = (await log(page)).find((entry) => entry.what === "save");
   expect(first?.detail?.keys?.sort()).toEqual(["ageing-conv", "fresh-conv"]);

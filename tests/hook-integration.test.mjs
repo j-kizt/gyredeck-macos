@@ -2479,16 +2479,19 @@ test("mail a hook has collected still reaches the session when building the deli
     process.env.GYREDECK_TEST_FAULT = "delivery";
     try {
       assert.match(await claudeContext(), /^USAGE: ask Gyredeck/m, "a usage-only answer survives");
-      // The founder is a room member reading over TCP, with no broker in this home: since
-      // #274 the bridge refuses a member's mailbox to a read that holds neither the broker's
-      // word nor the member's key. The acceptance is still said; the room's mail is not
-      // taken, so nothing collected is lost to the fault.
+      // The founder is a room member reading over TCP, through a broker that cannot bind this
+      // CLI's reads: since #274 the bridge refuses a member's mailbox to a read that holds
+      // neither the broker's word nor the member's key. The confirm still goes through the
+      // broker (#294), so the acceptance is still said; the room's mail is not taken, so
+      // nothing collected is lost to the fault.
+      const confirmer = await fakeBroker(home, () => ({ v: 1, ok: false, error: "ineligible", message: "not a CLI this broker binds" }), { confirmVia: `http://127.0.0.1:${port}` });
       const result = await runAdapter(
         "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
         { hook_event_name: "UserPromptSubmit", session_id: founder, cwd: "/tmp/project", prompt: password },
       );
+      await confirmer.close();
       assert.equal(result.code, 0, result.stderr);
-      assert.match(result.stderr, /mail withheld this turn — the broker said no broker, the bridge said not_your_key/);
+      assert.match(result.stderr, /mail withheld this turn — the broker said ineligible, the bridge said not_your_key/);
       const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
       assert.match(context, /the password you were just given was accepted/);
       assert.doesNotMatch(context, /joined this room/, "no room mail was read over TCP");
@@ -2508,7 +2511,7 @@ test("mail a hook has collected still reaches the session when building the deli
     let broker = await fakeBroker(home, (request) =>
       request.collect
         ? { v: 1, ok: true, delivery: 7, boundTo: owner, messages: [{ seq: 1, from: "gyredeck-app", kind: "tell", text: "VIA-BROKER", ts: new Date().toISOString() }] }
-        : request.ack ? { v: 1, ok: true } : { v: 1, ok: true, bound: { conversationId: owner, pid: 1 } });
+        : request.ack ? { v: 1, ok: true } : { v: 1, ok: true, bound: { conversationId: owner, pid: 1 } }, { confirmVia: `http://127.0.0.1:${port}` });
     try {
       const ownerPrompt = async (prompt) => {
         const result = await runAdapter(

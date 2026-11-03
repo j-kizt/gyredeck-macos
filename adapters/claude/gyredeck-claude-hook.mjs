@@ -682,6 +682,8 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // What the drain read wins; the confirmation's own answer stands in when the drain read
   // nothing, so the session is told its room either way (#196).
   const room_ = typeof result?.room === "string" ? result.room : (justConfirmed?.room ?? null);
+  // This session's own key, handed with its own deliveries: a post in its name takes it (#294).
+  const memberKey = typeof result?.memberKey === "string" && /^[a-f0-9]{64}$/.test(result.memberKey) ? result.memberKey : null;
   const members = Array.isArray(result?.members)
     ? result.members
     : (justConfirmed?.members ?? []).map((member) => ({ ...member, you: member.conversationId === room }));
@@ -866,6 +868,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
       "REPLY — run once, the room's password in place of THE ROOM PASSWORD:\n" +
         `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${replyTo} ` +
         `-H 'content-type: application/json' -H "x-gyredeck-token: THE ROOM PASSWORD" ` +
+        (memberKey ? `-H "x-gyredeck-member: ${memberKey}" ` : "") +
         `-d '${JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''")}'\n` +
         "It was sent only if you see ok:true and a seq.",
     );
@@ -912,7 +915,6 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // that does not say is answered as before.
   // The watch reads in this session's name, which takes its own key (#274); the bridge
   // hands it only to a collect the broker made, so without one there is no watch to offer.
-  const memberKey = typeof result?.memberKey === "string" && /^[a-f0-9]{64}$/.test(result.memberKey) ? result.memberKey : null;
   if (room_ && confirmed && result?.watching !== true && !memberKey) {
     lines.push(
       "HEAR — this delivery carries no key for watching the room in this session's name: the room" +

@@ -10,7 +10,8 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   Mac.
 - **A heavy run holds it too** — a check queued through the heavy-run helper, or a heavy command
   Gyredeck sees running outside it — until it ends, so a long build or test run is not cut off
-  by idle sleep. If Gyredeck's bridge cannot be asked, the last answer holds for two minutes, then
+  by idle sleep. A heavy command seen running outside the helper holds it whether or not the
+  bridge answers; with neither, a run the bridge last reported holds for two more minutes, then
   lets go.
 - **Settings says what is holding the Mac awake**, for example "sync-ab12 connected to Discord —
   the Mac won't idle-sleep", and says "Unavailable" with the reason when macOS refuses.

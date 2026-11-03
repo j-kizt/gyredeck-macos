@@ -434,7 +434,7 @@ test("journal errors and an unrecorded loss each get a row, and none show when t
   await expect(rows).toHaveCount(3);
   for (const error of Object.values(journalErrors)) await expect(rows.filter({ hasText: error.message })).toHaveCount(1);
   await expect(rows.filter({ hasText: "4 lines of sync-zz99" })).toContainText("Remove Discord clears this");
-  await expect(rows.filter({ hasText: "could not be written" })).toContainText("Resumes once the journal can be written");
+  await expect(rows.filter({ hasText: "could not be written" })).toContainText("Resumes once the journal is writable");
 });
 
 test("no journal error, no journal row", async ({ page }) => {

@@ -104,7 +104,7 @@ export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDi
           <span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span>
           <span className="setup-copy">
             <span className="setup-title">{error.message}</span>
-            <span className="setup-detail">{error.code === "journal_blocked" ? "Resumes once the journal can be written." : "Kept as it is; Remove Discord clears this."}</span>
+            <span className="setup-detail">{error.code === "journal_blocked" ? "Resumes once the journal is writable." : "Remove Discord clears this."}</span>
           </span>
         </div>
       ))}

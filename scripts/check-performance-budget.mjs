@@ -61,7 +61,7 @@ const assetRoot = join(distRoot, "assets");
  * #211/#278 (the keep-awake row reading Rust's answer on a beat: one numbered call in flight,
  * given up on after 3 s, at most two left unanswered, a page number from Rust) measured 119,910 / 122,985 on main's
  * 119,692 / 122,769; 120,008 and 123,102 keep main's 98 / 117.
- * OWNER'S DECISION STILL OWED: raised here so CI can run, not to be merged before their word.
+ * Raised by the owner's decision, "A" at the terminal on 2026-11-03.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,

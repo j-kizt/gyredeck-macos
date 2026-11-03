@@ -1,5 +1,18 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Discord messages lost at quit are no longer forgotten — (v1.32.1)
+
+### Fixes
+
+- **A room message the Discord relay could not record when Gyredeck quit is now reported after
+  relaunch.** Before, if the disk refused both the relay's journal and its fallback file, the
+  loss was only held in memory and disappeared when the app restarted. It is now also kept in the
+  Keychain, and on the next launch the room's Discord post reports it with its count. If the
+  Keychain refuses as well, the loss still cannot outlive a relaunch.
+- **Settings now shows the relay's journal problems.** When the journal could not be written,
+  could not be read, or a loss went unrecorded, the Discord section shows a row with the message.
+  The row stays until you remove Discord.
+
 ## Your Mac stays awake for Discord rooms and long checks — (v1.32.0)
 
 ### Added

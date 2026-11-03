@@ -54,6 +54,8 @@ async function guarded(fn) {
 
 /** Archived pages looked through for a room's post; posts go after 30 days, so this is far. */
 export const FIND_PAGES_MAX = 50;
+/** First messages read by a marker-only search, newest post first (#305). */
+export const FIND_STARTERS_MAX = 200;
 
 export function createDiscordJs({ makeClient = (options) => new Client(options) } = {}) {
   const events = new EventEmitter();
@@ -244,12 +246,17 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
     // — active, and archived paged back by time until there are no more. Only a post with
     // the room's name has its first message fetched. `complete` is false when the safety cap
     // stopped the search with more archived posts left unseen.
-    findPosts: (forumId, { name, marker }) =>
+    findPosts: (forumId, { name, marker, byMarker = false }) =>
       guarded(async () => {
         const ch = await forum(forumId);
         const named = new Map();
+        // Every other post this bot started in the forum, for a search by marker alone (#305).
+        const others = new Map();
         const keep = (threads) => {
-          for (const t of threads) if (t.name === name) named.set(t.id, t);
+          for (const t of threads) {
+            if (t.name === name) named.set(t.id, t);
+            else if (byMarker && t.parentId === ch.id && t.ownerId === client.user?.id) others.set(t.id, t);
+          }
         };
         keep((await ch.threads.fetchActive()).threads.values());
         let before;
@@ -281,8 +288,29 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
         for (const t of named.values()) {
           if (t.parentId !== ch.id || t.ownerId !== client.user?.id) continue;
           const starter = await t.fetchStarterMessage().catch(() => null);
-          if (starter?.content?.split("\n").at(-1) === marker) {
+          // A post by this name whose first message cannot be read may be this room's: not a miss.
+          if (starter == null) {
+            complete = false;
+            continue;
+          }
+          if (starter.content?.split("\n").at(-1) === marker) {
             found.push({ id: t.id, createdAt: t.createdTimestamp ?? 0, archived: Boolean(t.archived) });
+          }
+        }
+        // A post renamed by its owner keeps its marker, not its name. Looked for by the marker
+        // only when the name found nothing and the caller lost its record of posts, newest
+        // first and bounded; a starter that cannot be read, or the bound, leaves it incomplete.
+        if (byMarker && found.length === 0) {
+          const newest = [...others.values()].sort((a, b) => (b.createdTimestamp ?? 0) - (a.createdTimestamp ?? 0));
+          if (newest.length > FIND_STARTERS_MAX) complete = false;
+          for (const t of newest.slice(0, FIND_STARTERS_MAX)) {
+            // discord.js answers null for a first message it could not find: not read, so not a miss.
+            const starter = await t.fetchStarterMessage().catch(() => null);
+            if (starter == null) {
+              complete = false;
+              continue;
+            }
+            if (starter?.content?.split("\n").at(-1) === marker) found.push({ id: t.id, createdAt: t.createdTimestamp ?? 0, archived: Boolean(t.archived) });
           }
         }
         return { found, complete };

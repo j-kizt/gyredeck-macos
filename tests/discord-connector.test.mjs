@@ -2908,6 +2908,27 @@ test("#305 past FIND_STARTERS_MAX first messages, or with one unreadable, the ma
   first.fetchStarterMessage = async () => { throw new Error("gone"); };
   const unreadable = await b.discord.findPosts("F1", { name: "Room R", marker: "gyredeck-room: R · 1700", byMarker: true });
   assert.equal(unreadable.complete, false, "an unreadable first message is not a miss");
+  const none = forumWithArchive({ pages: 1 });
+  const c = await adapterWith(none.forum);
+  const [gone] = [...(await none.forum.threads.fetchArchived({})).threads.values()];
+  gone.fetchStarterMessage = async () => null;
+  const missing = await c.discord.findPosts("F1", { name: "Room R", marker: "gyredeck-room: R · 1700", byMarker: true });
+  assert.equal(missing.complete, false, "a first message discord.js answers null for is not a miss either");
+});
+
+test("#305 a life with no record of its posts searches by marker for every room it connects, each bounded", async () => {
+  // The cost the owner accepted (option A): until this child restarts, each new room it
+  // connects may read up to FIND_STARTERS_MAX first messages, once.
+  const fresh = await boot();
+  // One after another, each search done before the next room connects.
+  for (const [room, createdAt] of [["R", 1700], ["S", 1701], ["T", 1702]]) {
+    fresh.c.handle({ t: "connect", room, members: [], createdAt });
+    await flush();
+  }
+  const searches = fresh.fake.log.filter((e) => e.op === "findPosts");
+  assert.equal(searches.length, 3, "one search a room");
+  assert.ok(searches.every((e) => e.byMarker === true), "each by marker");
+  await fresh.c.close();
 });
 
 test("#305 only a life that began with no record of its posts searches by marker", async () => {

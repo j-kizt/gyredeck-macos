@@ -299,8 +299,9 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
           const newest = [...others.values()].sort((a, b) => (b.createdTimestamp ?? 0) - (a.createdTimestamp ?? 0));
           if (newest.length > FIND_STARTERS_MAX) complete = false;
           for (const t of newest.slice(0, FIND_STARTERS_MAX)) {
-            const starter = await t.fetchStarterMessage().catch(() => undefined);
-            if (starter === undefined) {
+            // discord.js answers null for a first message it could not find: not read, so not a miss.
+            const starter = await t.fetchStarterMessage().catch(() => null);
+            if (starter == null) {
               complete = false;
               continue;
             }

@@ -5109,7 +5109,7 @@ function startBridge(config) {
    */
   const MEMBER_KEY_HEADER = "x-gyredeck-member";
   const MEMBER_KEY_HINT =
-    "A read in a member's name takes that member's own key in x-gyredeck-member, beside the room's password." +
+    "A read or a post in a member's name takes that member's own key in x-gyredeck-member, beside the room's password." +
     " The key arrives with this session's own deliveries, written into the commands they hand you; a session" +
     " the Gyredeck broker cannot vouch for is never given one.";
   const holdsMemberKey = (member, req) =>
@@ -7833,6 +7833,13 @@ function startBridge(config) {
         // The app's own call: the machine token and the app's word together, the pair the
         // app-only routes take. Only it may speak as the room or the person (#205).
         const vouched = holdsMachineToken(headerToken) && holdsBrokerSecret(req.headers["x-gyredeck-broker"]);
+        // A post in a member's name takes that member's own key or the broker's word (#294),
+        // the door #274 set for reads: the password and the machine token are every member's.
+        const notTheirs = refuseToPublish(room, from, vouched) ? null : refuseMemberRead(from, req);
+        if (notTheirs) {
+          sendJson(403, { ok: false, ...notTheirs });
+          return;
+        }
         const refusal = refuseToPublish(room, from, vouched);
         if (refusal) {
           sendJson(403, {

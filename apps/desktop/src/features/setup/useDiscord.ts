@@ -18,6 +18,8 @@ export interface IDiscordStatus {
   behind?: Record<string, number>;
   /** A saved token or owner macOS would not hand over, by which (#288). */
   keychainRefused?: Record<string, string>;
+  /** What the relay's journal refused, or a loss nothing recorded, by room, file or `loss:` key (#199, #282). */
+  journalErrors?: Record<string, { code: string; message: string }>;
   /** Rooms the Discord member could not be taken out of, with why; kept after Remove. */
   leaving?: Record<string, string>;
   /** What Remove had to leave undelivered, per room; kept after Remove. */

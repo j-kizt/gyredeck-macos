@@ -96,6 +96,17 @@ export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDi
           </span>
         </div>
       ))}
+      {Object.entries(status?.journalErrors ?? {}).map(([key, error]) => (
+        // Kept in the app until Remove: a loss nothing could record, or a journal the disk
+        // refused or that could not be read, is never only in memory (#282, #199).
+        <div className="setup-row" data-discord="journal-error" key={`journal-${key}`}>
+          <span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span>
+          <span className="setup-copy">
+            <span className="setup-title">{error.message}</span>
+            <span className="setup-detail">{error.code === "journal_blocked" ? "Resumes once the journal can be written." : "Kept as it is; Remove Discord clears this."}</span>
+          </span>
+        </div>
+      ))}
       {Object.entries(status?.leaving ?? {}).map(([room, reason]) => (
         // Shown with or without a token: the member still sits in the room, holding it up.
         <div className="setup-row" data-discord="leaving" key={`leaving-${room}`}>

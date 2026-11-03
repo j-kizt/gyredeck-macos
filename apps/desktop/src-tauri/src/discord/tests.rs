@@ -5336,7 +5336,8 @@ fn c325_a_read_that_began_before_a_re_pair_never_holds_the_old_owner() {
     started.recv().unwrap();
     held.write(&b, "2026-11-03T00:00:01Z").unwrap();
     release.send(()).unwrap();
-    assert_eq!(reading.join().unwrap().unwrap(), Some(a), "premise: the late read answered A");
+    assert_eq!(reading.join().unwrap().unwrap(), Some(b.clone()), "the read A began answers B, so A's message is refused");
+    assert_ne!(Some(a), Some(b.clone()), "premise: two owners");
     store.locked.store(true, Ordering::SeqCst);
     assert_eq!(held.read().unwrap(), Some(b), "locked: B is held, never the A read before the re-pair");
 }
@@ -5350,4 +5351,40 @@ fn c325_a_refused_move_is_said_and_tried_again_until_it_is_made() {
     assert_eq!(team_keychain::settle_with(account, || { asked = true; 0 }), Ok(()));
     assert!(asked, "and tried again at the next read, not marked done");
     assert_eq!(team_keychain::settle_with(account, || panic!("a move made is not made twice")), Ok(()));
+    let account = "c325-settle-test-missing";
+    assert_eq!(team_keychain::settle_with(account, || -25300), Err(-25300), "an item read and then not found to move is said");
+    assert_eq!(team_keychain::settle_with(account, || 0), Ok(()), "and tried again");
+}
+
+/// An owner store that is re-paired under every read it answers.
+struct ChurnOwner {
+    inner: Arc<MemOwner>,
+    held: std::sync::OnceLock<std::sync::Weak<HeldOwner>>,
+}
+
+impl OwnerStore for ChurnOwner {
+    fn read(&self) -> Result<Option<Owner>, Refusal> {
+        let read = self.inner.read();
+        if let Some(held) = self.held.get().and_then(std::sync::Weak::upgrade) {
+            held.forget();
+        }
+        read
+    }
+    fn write(&self, owner: &Owner, paired_at: &str) -> Result<(), String> {
+        self.inner.write(owner, paired_at)
+    }
+    fn delete(&self) -> Result<(), String> {
+        self.inner.delete()
+    }
+}
+
+#[test]
+fn c325_a_read_overlapped_every_time_is_refused_never_answered_stale() {
+    let store = Arc::new(MemOwner::default());
+    store.write(&Owner { id: "323456789012345678".into(), username: Some("a".into()) }, "2026-11-03T00:00:00Z").unwrap();
+    let churn = Arc::new(ChurnOwner { inner: store, held: std::sync::OnceLock::new() });
+    let held = Arc::new(HeldOwner::new(Arc::clone(&churn) as Arc<dyn OwnerStore>));
+    churn.held.set(Arc::downgrade(&held)).unwrap();
+    let refusal = held.read().unwrap_err();
+    assert!(!refusal.locked && refusal.why.contains("changed while it was read"), "{refusal:?}");
 }

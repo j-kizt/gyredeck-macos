@@ -1951,6 +1951,8 @@ fn lost_lines(record: &journal::Record) -> u64 {
 /// held owner stands in. Any other refusal, a record that is not an owner's included, is said
 /// as it is. An answer always wins, "nobody" included, so an item deleted or replaced is obeyed
 /// at once. A read that began before a write or a delete is not held: it may be the old owner.
+const HELD_OWNER_TRIES: usize = 3;
+
 pub(crate) struct HeldOwner {
     store: Arc<dyn OwnerStore>,
     held: Mutex<Held>,
@@ -1985,18 +1987,23 @@ impl HeldOwner {
 
 impl OwnerStore for HeldOwner {
     fn read(&self) -> Result<Option<Owner>, Refusal> {
-        let began = self.held().generation;
-        match self.store.read() {
-            Ok(read) => {
-                let mut held = self.held();
-                if held.generation == began {
-                    held.owner = Some(read.clone());
+        // A read a write or a delete overlapped may be the owner before it: read again, and
+        // past a few tries refuse rather than answer with it.
+        for _ in 0..HELD_OWNER_TRIES {
+            let began = self.held().generation;
+            match self.store.read() {
+                Ok(read) => {
+                    let mut held = self.held();
+                    if held.generation == began {
+                        held.owner = Some(read.clone());
+                        return Ok(read);
+                    }
                 }
-                Ok(read)
+                Err(refusal) if refusal.locked => return self.held().owner.clone().ok_or(refusal),
+                Err(refusal) => return Err(refusal),
             }
-            Err(refusal) if refusal.locked => self.held().owner.clone().ok_or(refusal),
-            Err(refusal) => Err(refusal),
         }
+        Err(Refusal { why: "the paired owner changed while it was read".to_string(), locked: false })
     }
     fn write(&self, owner: &Owner, paired_at: &str) -> Result<(), String> {
         // Whatever the store now holds is not known if the write failed: read it again then.
@@ -3755,8 +3762,9 @@ mod team_keychain {
         if is_settled(account) {
             return Ok(());
         }
+        // Called once the item was read, so an update that finds nothing has moved nothing.
         match update() {
-            0 | NOT_FOUND => {
+            0 => {
                 settled(account);
                 Ok(())
             }

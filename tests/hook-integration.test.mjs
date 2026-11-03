@@ -12337,6 +12337,11 @@ for (const path of rereadPaths) {
         assert.ok(!result.text.includes("x-gyredeck-member"), "and no key header at all");
         assert.equal(own.filter((text) => text.includes("there is no key to read them again")).length, 1, "the line that says it cannot be read again, once");
         assert.equal(notes.length, 0, "not the outside-a-room note");
+        // #294: a post in its name takes its key, so no REPLY command is printed without one.
+        const reply = result.steps.filter((text) => text.startsWith("The mail above is addressed to you"));
+        assert.equal(reply.length, 1, "premise: mail addressed to it was delivered");
+        assert.match(reply[0], /no reply command can be given in this delivery/);
+        assert.ok(!reply[0].includes("curl"), "and no REPLY it could not run");
       } else {
         assert.equal(own.length + notes.length, 0, "I3: neither line when nothing was delivered");
       }
@@ -12345,6 +12350,26 @@ for (const path of rereadPaths) {
     }
   });
 }
+
+test("#294: a Claude delivery with no key says REPLY is unavailable, and prints no command", async () => {
+  const f = await agyPasteFixture("cnokey", { withBroker: true, inboxBody: ({ memberKey: _key, ...body }) => body });
+  try {
+    await f.confirm();
+    await f.say("no key");
+    const result = await runAdapter(
+      "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], f.home,
+      { hook_event_name: "UserPromptSubmit", session_id: f.agy, cwd: "/tmp/project", prompt: "hi" },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+    assert.ok(context.includes("no key"), "premise: the room mail was delivered");
+    assert.match(context, /REPLY — not available in this delivery/);
+    assert.ok(!context.includes("curl -s -X POST"), "no REPLY it could not run");
+    assert.ok(!context.includes("x-gyredeck-member"), "and no key header at all");
+  } finally {
+    await f.close();
+  }
+});
 
 test("#251 I6: the re-read is a look, not a take", async () => {
   const f = await agyPasteFixture("plook", { withBroker: true });

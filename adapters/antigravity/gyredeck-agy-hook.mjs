@@ -581,6 +581,16 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
       : answering && label && isMember?.(answering.from) ? label(answering) : "everyone";
     const kind = answering?.kind === "tell" ? "reaction" : "tell";
     const body = JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''");
+    // A post in this session's name takes its own key (#294): with none in this delivery, a
+    // command without it would only be refused, so none is printed, and why is said.
+    if (!(typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey))) {
+      return {
+        ephemeralMessage:
+          "The mail above is addressed to you, but no reply command can be given in this delivery:" +
+          " a post in your name takes your own key, and the Gyredeck broker could not vouch for this" +
+          " session to hand it over. Tell the person at this terminal; nothing you send by hand would be accepted.",
+      };
+    }
     return {
       ephemeralMessage:
         "The mail above is addressed to you, and answering is expected — a reply on a" +
@@ -589,7 +599,7 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
         `  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${target}` +
         ` -H 'content-type: application/json' -H "x-gyredeck-token: THE ROOM PASSWORD"` +
         // This session's own key: a post in its name takes it (#294).
-        (typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey) ? ` -H "x-gyredeck-member: ${memberKey}"` : "") +
+        ` -H "x-gyredeck-member: ${memberKey}"` +
         ` -d '${body}'\n` +
         "It was sent only if you see ok:true and a seq.",
     };

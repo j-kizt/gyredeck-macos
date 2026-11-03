@@ -864,13 +864,16 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
         ? label(lastAnswerable)
         : "everyone";
     const kind = kindOf(lastAnswerable) === "tell" ? "reaction" : "tell";
-    lines.push(
-      "REPLY — run once, the room's password in place of THE ROOM PASSWORD:\n" +
+    // A post in this session's name takes its own key (#294): with none in this delivery, a
+    // command without it would only be refused, so none is printed, and why is said.
+    lines.push(memberKey
+      ? "REPLY — run once, the room's password in place of THE ROOM PASSWORD:\n" +
         `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${replyTo} ` +
         `-H 'content-type: application/json' -H "x-gyredeck-token: THE ROOM PASSWORD" ` +
-        (memberKey ? `-H "x-gyredeck-member: ${memberKey}" ` : "") +
+        `-H "x-gyredeck-member: ${memberKey}" ` +
         `-d '${JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''")}'\n` +
-        "It was sent only if you see ok:true and a seq.",
+        "It was sent only if you see ok:true and a seq."
+      : "REPLY — not available in this delivery: a post in your name takes your own key, and the Gyredeck broker could not vouch for this session to hand it over. Tell the person at this terminal; nothing you send by hand would be accepted.",
     );
   } else if (replyTo && !room_) {
     // A plain mailbox takes the machine token, read at send time rather than written in

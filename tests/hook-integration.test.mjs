@@ -1855,8 +1855,13 @@ test("a room delivery carries only what the session can use, and points at the r
     // #294: the REPLY carries this session's own key, and run as printed it posts.
     const reply = tell.split("\n").find((line) => line.startsWith("curl -s -X POST"));
     assert.match(reply, /-H "x-gyredeck-member: [a-f0-9]{64}"/, "the REPLY carries the member's own key");
-    const ran = spawnSync("sh", ["-c", reply.replace("THE ROOM PASSWORD", minted.password).replace("YOUR REPLY HERE", "seen")], { encoding: "utf8" });
-    assert.equal(JSON.parse(ran.stdout).ok, true, `the printed REPLY posts: ${ran.stdout}`);
+    // Sent as printed, read off the line rather than run by a shell: its URL, headers and body.
+    const printed = reply.replace("THE ROOM PASSWORD", minted.password).replace("YOUR REPLY HERE", "seen");
+    const url = printed.match(/curl -s -X POST (\S+)/)[1];
+    const sent = Object.fromEntries([...printed.matchAll(/-H (?:"([^"]*)"|'([^']*)')/g)].map((m) => (m[1] ?? m[2]).split(/:\s*/, 2)));
+    const data = printed.match(/-d '((?:[^']|'\\'')*)'/)[1].replace(/'\\''/g, "'");
+    const ran = await (await fetch(url, { method: "POST", headers: sent, body: data })).json();
+    assert.equal(ran.ok, true, `the printed REPLY posts: ${JSON.stringify(ran)}`);
 
     // An ask wants an answer, to the asker.
     await post(`/mail/${code}`, { from: peer, to: me, kind: "ask", text: "which branch?" });

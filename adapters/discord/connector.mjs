@@ -188,6 +188,7 @@ export function createConnector({ discord, out, clock = realClock }) {
   let dirty = false;
   // Why state cannot be stored, when it cannot: nothing is connected or posted meanwhile.
   let storageBlocked = null;
+  let postsForgotten = false;
   function save() {
     dirty = true;
     if (storageBlocked) throw new Error(storageBlocked);
@@ -1086,7 +1087,7 @@ export function createConnector({ discord, out, clock = realClock }) {
 
   /** This instance's post if Discord already has it: the oldest kept, any later one closed. */
   async function adoptPost(forum, code, marker, tags) {
-    const { found: posts, complete } = await discord.findPosts(forum, { name: postName(code), marker });
+    const { found: posts, complete } = await discord.findPosts(forum, { name: postName(code), marker, byMarker: postsForgotten });
     // Said, not hidden: the room still connects, and may get a second post.
     if (!complete) fail("reconcile_incomplete", "Not every older post could be checked for this room; it may get a second post.", code);
     const found = posts.sort((a, b) => a.createdAt - b.createdAt || String(a.id).localeCompare(String(b.id)));
@@ -1291,6 +1292,10 @@ export function createConnector({ discord, out, clock = realClock }) {
       forumId = msg.forumId ?? null;
       ownerId = msg.ownerId ?? null;
       const loaded = readState(statePath);
+      // Begun with no record of its posts (absent, or set aside as unreadable): a post the
+      // owner renamed can be found by its marker alone in this life (#305). A file it could
+      // not read at all is blocked, and nothing is posted until it is fixed.
+      postsForgotten = loaded.fresh === true && !loaded.blocked;
       state = loaded.state;
       if (loaded.blocked) {
         // Not read, so not replaced — and with nowhere to record progress nothing is posted

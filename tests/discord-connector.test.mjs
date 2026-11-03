@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { ChannelType, Collection, DiscordAPIError, DiscordjsErrorCodes } from "discord.js";
 import { COMMANDS, createConnector, parseAddress, RETENTION_MS } from "../adapters/discord/connector.mjs";
 import { loadState, saveState } from "../adapters/discord/state.mjs";
-import { createDiscordJs, FIND_PAGES_MAX } from "../adapters/discord/discord-js.mjs";
+import { createDiscordJs, FIND_PAGES_MAX, FIND_STARTERS_MAX } from "../adapters/discord/discord-js.mjs";
 import { createFakeDiscord, fakeClock, flush, kindError } from "./discord/fake.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -2871,5 +2871,66 @@ test("#206 a room reconnected while the listing was asked is not shown with the 
   await flush();
   assert.doesNotMatch(answer.edits[0].content, /2 members/);
   assert.match(answer.edits[0].content, /sync-abcd · reconnected while asked — run \/status again/);
+  await c.close();
+});
+
+// #305: a post the owner renamed is found again by its marker alone, only in a life that began
+// with no record of its posts, bounded, and never another room's.
+test("#305 findPosts by marker finds a renamed post; without byMarker only named posts are read", async () => {
+  const marker = "gyredeck-room: R · 1700";
+  const { forum, starters } = forumWithArchive({ pages: 2, match: { at: 120, name: "My notes on R", content: `Room R\nMembers: —\n${marker}` } });
+  const { discord } = await adapterWith(forum);
+  assert.deepEqual((await discord.findPosts("F1", { name: "Room R", marker })).found, [], "by name alone: not found");
+  assert.deepEqual(starters.fetched, [], "and no first message read");
+  const { found, complete } = await discord.findPosts("F1", { name: "Room R", marker, byMarker: true });
+  assert.deepEqual(found.map((p) => p.id), ["A120"]);
+  assert.equal(complete, true);
+});
+
+test("#305 the marker search never takes another room's or another instance's post", async () => {
+  const { forum } = forumWithArchive({ pages: 1, match: { at: 5, name: "Renamed", content: "Room R\nMembers: —\ngyredeck-room: R · 1699" } });
+  const { discord } = await adapterWith(forum);
+  const { found } = await discord.findPosts("F1", { name: "Room R", marker: "gyredeck-room: R · 1700", byMarker: true });
+  assert.deepEqual(found, []);
+});
+
+test("#305 past FIND_STARTERS_MAX first messages, or with one unreadable, the marker search says it is incomplete", async () => {
+  const many = forumWithArchive({ pages: Math.ceil((FIND_STARTERS_MAX + 50) / 100) });
+  const a = await adapterWith(many.forum);
+  const capped = await a.discord.findPosts("F1", { name: "Room R", marker: "gyredeck-room: R · 1700", byMarker: true });
+  assert.equal(capped.complete, false, "past the bound");
+  assert.equal(many.starters.fetched.length, FIND_STARTERS_MAX, "and no more read than the bound");
+  const one = forumWithArchive({ pages: 1 });
+  [...one.forum.threads.all ?? []];
+  const b = await adapterWith(one.forum);
+  const archived = await one.forum.threads.fetchArchived({});
+  const first = [...archived.threads.values()][0];
+  first.fetchStarterMessage = async () => { throw new Error("gone"); };
+  const unreadable = await b.discord.findPosts("F1", { name: "Room R", marker: "gyredeck-room: R · 1700", byMarker: true });
+  assert.equal(unreadable.complete, false, "an unreadable first message is not a miss");
+});
+
+test("#305 only a life that began with no record of its posts searches by marker", async () => {
+  const fresh = await boot();
+  fresh.c.handle({ t: "connect", room: "R", members: [], createdAt: 1700 });
+  await flush();
+  assert.equal(fresh.fake.log.find((e) => e.op === "findPosts")?.byMarker, true, "no state file: by marker");
+  await fresh.c.close();
+  const statePath = tmpState();
+  saveState(statePath, { v: 1, rooms: {} });
+  const kept = await boot({ statePath });
+  kept.c.handle({ t: "connect", room: "S", members: [], createdAt: 1701 });
+  await flush();
+  assert.equal(kept.fake.log.find((e) => e.op === "findPosts")?.byMarker, false, "a state file read: by name only");
+  await kept.c.close();
+});
+
+test("#305 a renamed post is adopted after the state file is lost, so no second post is made", async () => {
+  const fake = createFakeDiscord();
+  fake.threads.set("T9", { forumId: "F1", archived: false, name: "Renamed by the owner", content: "Room R\nMembers: —\ngyredeck-room: R · 1700", createdAt: 1 });
+  const { c } = await boot({ fake });
+  c.handle({ t: "connect", room: "R", members: [], createdAt: 1700 });
+  await flush();
+  assert.ok(!fake.log.some((e) => e.op === "createPost"), "no second post");
   await c.close();
 });

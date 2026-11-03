@@ -92,11 +92,13 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
       return id;
     },
     findIncomplete: false,
-    async findPosts(forumId, { name, marker }) {
-      fake.log.push({ op: "findPosts", forumId, name, marker });
+    async findPosts(forumId, { name, marker, byMarker = false }) {
+      fake.log.push({ op: "findPosts", forumId, name, marker, byMarker });
       await fake.gate?.("findPosts", { forumId, name, marker });
-      const found = [...fake.threads.entries()]
-        .filter(([, t]) => t.forumId === forumId && (t.name === undefined || t.name === name) && typeof t.content === "string" && t.content.split("\n").at(-1) === marker)
+      const byName = [...fake.threads.entries()].filter(([, t]) => t.name === undefined || t.name === name);
+      const pool = byMarker && !byName.some(([, t]) => t.forumId === forumId && t.content?.split("\n").at(-1) === marker) ? [...fake.threads.entries()] : byName;
+      const found = pool
+        .filter(([, t]) => t.forumId === forumId && typeof t.content === "string" && t.content.split("\n").at(-1) === marker)
         .map(([id, t]) => ({ id, createdAt: t.createdAt ?? Number(id.slice(1)), archived: t.archived }));
       return { found, complete: !fake.findIncomplete };
     },

@@ -67,6 +67,40 @@ struct MemOwner {
     wipe: AtomicBool,
 }
 
+/// The Keychain's record of lost lines (#282), and whether macOS refuses it.
+#[derive(Default)]
+struct MemLoss {
+    bytes: Mutex<Option<Vec<u8>>>,
+    refuse_read: AtomicBool,
+    refuse_write: AtomicBool,
+    refuse_delete: AtomicBool,
+    writes: std::sync::atomic::AtomicUsize,
+}
+
+impl LossStore for MemLoss {
+    fn read(&self) -> Result<Option<Vec<u8>>, String> {
+        if self.refuse_read.load(Ordering::SeqCst) {
+            return Err("macOS did not allow it (OSStatus -25293)".to_string());
+        }
+        Ok(self.bytes.lock().unwrap().clone())
+    }
+    fn write(&self, value: &[u8]) -> Result<(), String> {
+        if self.refuse_write.load(Ordering::SeqCst) {
+            return Err("macOS refused (OSStatus -61)".to_string());
+        }
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        *self.bytes.lock().unwrap() = Some(value.to_vec());
+        Ok(())
+    }
+    fn delete(&self) -> Result<(), String> {
+        if self.refuse_delete.load(Ordering::SeqCst) {
+            return Err("macOS refused (OSStatus -61)".to_string());
+        }
+        *self.bytes.lock().unwrap() = None;
+        Ok(())
+    }
+}
+
 impl OwnerStore for MemOwner {
     fn read(&self) -> Result<Option<Owner>, String> {
         if self.refuse_read.load(Ordering::SeqCst) {
@@ -304,6 +338,7 @@ struct Fixture {
     tokens: Arc<MemTokens>,
     settings: Arc<MemSettings>,
     owners: Arc<MemOwner>,
+    losses: Arc<MemLoss>,
     source: Arc<FakeSource>,
     acts: Arc<FakeActs>,
     dir: PathBuf,
@@ -333,6 +368,7 @@ fn fixture_owned(name: &str, token: Option<&str>, saved: &[(&str, &str)], owner:
 /// `refuse_owner`: the owner record is there and macOS will not hand it over at launch.
 fn fixture_built(name: &str, token: Option<&str>, saved: &[(&str, &str)], owner: Option<Owner>, refuse_owner: bool) -> Fixture {
     let owners = Arc::new(MemOwner::default());
+    let losses = Arc::new(MemLoss::default());
     owners.refuse_read.store(refuse_owner, Ordering::SeqCst);
     *owners.record.lock().unwrap() = owner.map(|owner| (owner, "2026-10-27T00:00:00Z".to_string()));
     let tokens = Arc::new(MemTokens::default());
@@ -350,12 +386,13 @@ fn fixture_built(name: &str, token: Option<&str>, saved: &[(&str, &str)], owner:
         tokens: Box::new(Arc::clone(&tokens)),
         settings: Arc::clone(&settings) as Arc<dyn SettingsStore>,
         owners: Arc::clone(&owners) as Arc<dyn OwnerStore>,
+        losses: Arc::clone(&losses) as Arc<dyn LossStore>,
         source: Arc::new(Arc::clone(&source)),
         acts: Arc::new(Arc::clone(&acts)),
         state_path: dir.join("discord-state.json"),
         log: SupervisorLog::at(Some(dir.join("supervisor.log"))),
     });
-    Fixture { state, tokens, settings, owners, source, acts, dir }
+    Fixture { state, tokens, settings, owners, losses, source, acts, dir }
 }
 
 impl Fixture {
@@ -762,6 +799,7 @@ fn the_paired_owner_and_its_name_survive_a_relaunch() {
         tokens: Box::new(Arc::clone(&f.tokens)),
         settings: Arc::clone(&f.settings) as Arc<dyn SettingsStore>,
         owners: Arc::clone(&f.owners) as Arc<dyn OwnerStore>,
+        losses: Arc::clone(&f.losses) as Arc<dyn LossStore>,
         source: Arc::new(Arc::clone(&f.source)),
         acts: Arc::new(Arc::clone(&f.acts)),
         state_path: f.dir.join("discord-state.json"),
@@ -1092,6 +1130,7 @@ fn relaunch(f: &Fixture) -> DiscordState {
         tokens: Box::new(Arc::clone(&f.tokens)),
         settings: Arc::clone(&f.settings) as Arc<dyn SettingsStore>,
         owners: Arc::clone(&f.owners) as Arc<dyn OwnerStore>,
+        losses: Arc::clone(&f.losses) as Arc<dyn LossStore>,
         source: Arc::new(Arc::clone(&f.source)),
         acts: Arc::new(Arc::clone(&f.acts)),
         state_path: f.dir.join("discord-state.json"),
@@ -1325,6 +1364,7 @@ fn a_real_bridge_room_reaches_the_child_in_order_named_and_closes() {
         tokens: Box::new(tokens),
         settings: Arc::new(MemSettings::default()),
         owners: Arc::new(MemOwner::default()),
+        losses: Arc::new(MemLoss::default()),
         source: Arc::new(BridgeSource { target: Some(app.clone()) }),
         acts: Arc::new(LiveActs { target: app.clone(), password: password.clone(), room: room.clone() }),
         state_path: home.join("discord-state.json"),
@@ -4683,6 +4723,7 @@ fn a_real_bridge_takes_the_owners_say_as_you_via_discord_and_no_one_else_can_spe
         tokens: Box::new(tokens),
         settings: Arc::new(MemSettings::default()),
         owners: owners as Arc<dyn OwnerStore>,
+        losses: Arc::new(MemLoss::default()),
         source: Arc::new(BridgeSource { target: Some(app.clone()) }),
         acts: Arc::new(LiveActs { target: app.clone(), password: password.clone(), room: room.clone() }),
         state_path: home.join("discord-state.json"),
@@ -4884,6 +4925,106 @@ fn an_owner_record_that_cannot_be_read_is_an_error_never_no_owner() {
     }
 }
 
+// ── #282: a loss both disk writes refused is kept in the Keychain and said after relaunch ──
+
+fn quit_with_both_loss_writes_refused(name: &str) -> Fixture {
+    journal::tests::set_fail_loss_write(true);
+    let f = quit_with_failing_loss_write(name, None);
+    journal::tests::set_fail_loss_write(false);
+    f
+}
+
+fn marks_of(f: &Fixture) -> Option<LossMarks> {
+    f.losses.bytes.lock().unwrap().as_ref().map(|bytes| serde_json::from_slice(bytes).unwrap())
+}
+
+fn loss_mark(room: &str, n: u64) -> LossMark {
+    LossMark { room: room.to_string(), at: CREATED, record: journal::Record::Loss { seq: 2, n, label: UNREAD_AT_QUIT.into(), through: Some(1 + n) } }
+}
+
+fn keep(f: &Fixture, marks: &LossMarks) {
+    *f.losses.bytes.lock().unwrap() = Some(serde_json::to_vec(marks).unwrap());
+}
+
+#[test]
+fn c1_a_loss_both_disk_writes_refused_is_said_after_relaunch_with_its_count() {
+    let f = quit_with_both_loss_writes_refused("282-c1");
+    assert!(!journal_path(&f).join(format!("{ROOM}@{CREATED}.loss")).exists(), "premise: the fallback file was refused too");
+    let marks = marks_of(&f).expect("kept in the Keychain");
+    assert_eq!(marks.marks.iter().map(|mark| (mark.room.as_str(), mark.at, lost_lines(&mark.record))).collect::<Vec<_>>(), vec![(ROOM, CREATED, 3)]);
+    let next = relaunch(&f);
+    let held = held_seqs_texts(&lock(&next.hub));
+    assert_eq!(held.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(), vec![1, 2], "the loss is the next line, before the close");
+    assert!(held[1].1.contains('3'), "with its count: {}", held[1].1);
+}
+
+#[test]
+fn c2_once_journalled_the_keychain_lets_it_go_and_a_second_relaunch_does_not_say_it_again() {
+    let f = quit_with_both_loss_writes_refused("282-c2");
+    let next = relaunch(&f);
+    wait_until("the loss in the journal, the mark gone", || marks_of(&f).is_none());
+    assert!(next.status().journal_errors.keys().all(|key| !key.starts_with("loss:")));
+    drop(next);
+    let again = relaunch(&f);
+    assert_eq!(held_seqs(&lock(&again.hub), ROOM), vec![1, 2], "said once: the journal's copy, nothing added");
+}
+
+#[test]
+fn c3_a_relaunch_that_cannot_journal_it_leaves_it_for_the_next() {
+    let f = quit_with_both_loss_writes_refused("282-c3");
+    journal::tests::fail_appends(u32::MAX);
+    let next = relaunch(&f);
+    journal::tests::fail_appends(0);
+    assert!(marks_of(&f).is_some(), "not journalled, so still kept");
+    drop(next);
+    let again = relaunch(&f);
+    assert_eq!(held_seqs(&lock(&again.hub), ROOM), vec![1, 2]);
+    wait_until("landed this time", || marks_of(&f).is_none());
+}
+
+#[test]
+fn c4_a_fallback_file_and_a_mark_for_the_same_quit_say_it_once() {
+    let f = quit_with_failing_loss_write("282-c4", None);
+    assert!(journal_path(&f).join(format!("{ROOM}@{CREATED}.loss")).exists(), "premise: the fallback file holds it");
+    keep(&f, &LossMarks { marks: vec![loss_mark(ROOM, 3)], ..LossMarks::default() });
+    let next = relaunch(&f);
+    assert_eq!(held_seqs(&lock(&next.hub), ROOM), vec![1, 2]);
+    wait_until("both let go once journalled", || marks_of(&f).is_none());
+}
+
+#[test]
+fn c5_a_mark_no_journal_takes_up_is_shown_until_remove() {
+    let f = fixture("282-c5", Some(TOKEN));
+    keep(&f, &LossMarks { marks: vec![loss_mark("sync-zz99", 4)], overflow_instances: 2, overflow_lines: 9 });
+    let next = relaunch(&f);
+    let errors = next.status().journal_errors;
+    let shown = |key: &str| errors.get(key).map(|error| (error.code.clone(), error.message.clone()));
+    let (code, message) = shown(&format!("loss:sync-zz99@{CREATED}")).expect("shown");
+    assert_eq!(code, LOSS_UNRECORDED);
+    assert!(message.contains("4 lines of sync-zz99"), "{message}");
+    assert!(shown("loss:more").is_some_and(|(_, message)| message.contains("9 more lines in 2 more rooms")), "{errors:?}");
+    next.remove(Some(APP_WORD)).unwrap();
+    assert!(marks_of(&f).is_none(), "Remove lets it go");
+    assert!(next.status().journal_errors.keys().all(|key| !key.starts_with("loss:")));
+}
+
+#[test]
+fn c5_a_keychain_record_that_cannot_be_read_is_shown_and_never_written_over() {
+    for (name, refuse, bytes) in [("282-c5-refused", true, None), ("282-c5-malformed", false, Some(b"not json".to_vec()))] {
+        let f = fixture(name, Some(TOKEN));
+        f.losses.refuse_read.store(refuse, Ordering::SeqCst);
+        *f.losses.bytes.lock().unwrap() = bytes.clone();
+        let next = relaunch(&f);
+        assert!(next.status().journal_errors.get("loss:keychain").is_some_and(|error| error.code == LOSS_UNRECORDED), "{name}: shown");
+        // A quit's loss now has nowhere to go: said in memory, the unreadable record kept as it is.
+        let record = journal::Record::Loss { seq: 2, n: 3, label: UNREAD_AT_QUIT.into(), through: None };
+        lock(&next.hub).mark_loss(ROOM, CREATED, &record);
+        assert!(lock(&next.hub).journal_errors.get(ROOM).is_some_and(|error| error.message.contains("could not be read")), "{name}");
+        assert_eq!(f.losses.writes.load(Ordering::SeqCst), 0, "{name}: nothing written over it");
+        assert_eq!(*f.losses.bytes.lock().unwrap(), bytes, "{name}");
+    }
+}
+
 /// #211: keep-awake hears every room followed and let go, straight from the hub.
 #[test]
 fn the_followed_rooms_are_told_on_connect_and_on_disconnect() {
@@ -4945,6 +5086,47 @@ fn status_is_refused_to_anyone_but_the_keychain_owner_and_for_a_post_or_instance
         assert!(last["error"].is_string(), "{why}: {last}");
         assert!(last.get("room").is_none_or(serde_json::Value::is_null) && last.get("rooms").is_none_or(serde_json::Value::is_null), "{why}: nothing about any room");
     }
+}
+
+#[test]
+fn c5_past_the_cap_the_oldest_are_counted_together_never_dropped() {
+    let (hub, _path) = journal_hub("282-cap");
+    let store = Arc::new(MemLoss::default());
+    let mut hub = lock(&hub);
+    hub.losses = Some(Arc::clone(&store) as Arc<dyn LossStore>);
+    for i in 0..LOSS_MARKS_MAX + 2 {
+        let record = journal::Record::Loss { seq: 2, n: i as u64 + 1, label: UNREAD_AT_QUIT.into(), through: None };
+        hub.mark_loss(&format!("sync-{i:04}"), CREATED, &record);
+    }
+    let marks: LossMarks = serde_json::from_slice(store.bytes.lock().unwrap().as_ref().unwrap()).unwrap();
+    assert_eq!(marks.marks.len(), LOSS_MARKS_MAX);
+    assert_eq!((marks.overflow_instances, marks.overflow_lines), (2, 1 + 2), "the two oldest, counted");
+}
+
+#[test]
+fn c3_a_mark_whose_delete_failed_is_let_go_by_the_next_launch_without_saying_it_twice() {
+    let f = quit_with_both_loss_writes_refused("282-c3-delete");
+    f.losses.refuse_delete.store(true, Ordering::SeqCst);
+    let next = relaunch(&f);
+    wait_until("journalled", || lock(&next.hub).pending.is_empty());
+    assert!(marks_of(&f).is_some(), "premise: the delete was refused, so the Keychain still holds it");
+    drop(next);
+    f.losses.refuse_delete.store(false, Ordering::SeqCst);
+    let again = relaunch(&f);
+    assert_eq!(held_seqs(&lock(&again.hub), ROOM), vec![1, 2], "the journal's copy only");
+    assert!(marks_of(&f).is_none(), "found in the journal, so let go");
+}
+
+#[test]
+fn c5_a_keychain_record_holding_anything_but_a_loss_is_unreadable_never_skipped() {
+    let f = quit_with_both_loss_writes_refused("282-c5-not-loss");
+    assert!(!journal_path(&f).join(format!("{ROOM}@{CREATED}.loss")).exists(), "premise: both disk writes refused");
+    let not_a_loss = serde_json::json!({ "marks": [{ "room": ROOM, "at": CREATED, "record": { "t": "close", "id": "x", "reason": "ended", "at": 1 } }] });
+    let bytes = serde_json::to_vec(&not_a_loss).unwrap();
+    *f.losses.bytes.lock().unwrap() = Some(bytes.clone());
+    let next = relaunch(&f);
+    assert!(next.status().journal_errors.get("loss:keychain").is_some_and(|error| error.code == LOSS_UNRECORDED), "{:?}", next.status().journal_errors);
+    assert_eq!(*f.losses.bytes.lock().unwrap(), Some(bytes), "kept as it is");
 }
 
 #[test]

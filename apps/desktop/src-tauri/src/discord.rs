@@ -119,6 +119,12 @@ const LAUNCH_WINDOW: usize = 2 * UNACKED_CAP;
 const JOURNAL_COMPACT_FACTOR: u64 = 2;
 const JOURNAL_DIR: &str = "discord-journal";
 const JOURNAL_BLOCKED: &str = "journal_blocked";
+/// A quit's loss kept only in the Keychain, or a Keychain record of losses that cannot be read.
+const LOSS_UNRECORDED: &str = "loss_unrecorded";
+/// Room instances whose loss the Keychain keeps one by one; past it they are counted together.
+const LOSS_MARKS_MAX: usize = 16;
+const KEYCHAIN_LOSS_ACCOUNT: &str = "discord-loss";
+const KEYCHAIN_LOSS_MOVED: &str = "moved-discord-loss";
 const JOURNAL_CORRUPT: &str = "journal_corrupt";
 /// The label of the loss a quit leaves: what the bridge held unread for the relay.
 const UNREAD_AT_QUIT: &str = "unread when Gyredeck quit";
@@ -823,6 +829,11 @@ struct Hub {
     /// Per room instance, the ACK watermark and the Discord id of its last part.
     progress: HashMap<(String, u64), (u64, Option<String>)>,
     journal_dir: Option<journal::Dir>,
+    /// Where a quit's loss goes when the journal and its fallback file both refuse it (#282).
+    losses: Option<Arc<dyn LossStore>>,
+    /// What the Keychain holds of them, or why it could not be read: then it is never written
+    /// over, since that would drop what it holds.
+    marks: Marks,
     /// Why the journal directory could not be used: every Connect is refused until it can.
     journal_down: Option<String>,
     journal_errors: BTreeMap<String, DiscordError>,
@@ -1244,10 +1255,85 @@ impl Hub {
         let (Some(file), Some(at), Some(feed)) = (self.rooms.get(room).and_then(|feed| feed.journal.clone()), created_at, self.rooms.get(room).map(|feed| feed.id)) else {
             return;
         };
-        if let Some(Err(error)) = self.journal_dir.as_ref().map(|dir| dir.write_loss(room, at, &record)) {
-            self.journal_blocked(room, error);
+        match self.journal_dir.as_ref().map(|dir| dir.write_loss(room, at, &record)) {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                self.journal_blocked(room, error);
+                self.mark_loss(room, at, &record);
+            }
+            None => self.mark_loss(room, at, &record),
         }
         self.pending.push_back(Pending { room: room.to_string(), file, record, then: Then::LossLanded { room: room.to_string(), at, feed, line } });
+    }
+
+    /// The journal and its fallback file both refused this quit's loss: the Keychain keeps it
+    /// for the next launch. A record that could not be read is never written over.
+    fn mark_loss(&mut self, room: &str, at: u64, record: &journal::Record) {
+        let Some(store) = self.losses.clone() else {
+            return;
+        };
+        let marks = match &mut self.marks.0 {
+            Ok(marks) => marks,
+            Err(why) => {
+                let why = format!("the Keychain's record of lost lines could not be read ({why}), so this loss is not kept either");
+                self.journal_blocked(room, why);
+                return;
+            }
+        };
+        marks.marks.retain(|mark| !(mark.room == room && mark.at == at));
+        marks.marks.push(LossMark { room: room.to_string(), at, record: record.clone() });
+        while marks.marks.len() > LOSS_MARKS_MAX {
+            let oldest = marks.marks.remove(0);
+            marks.overflow_instances += 1;
+            marks.overflow_lines += lost_lines(&oldest.record);
+        }
+        let bytes = serde_json::to_vec(&*marks).unwrap_or_default();
+        if let Err(why) = store.write(&bytes) {
+            self.journal_blocked(room, format!("the Keychain refused it too ({why})"));
+        }
+    }
+
+    fn mark_of(&self, room: &str, at: u64) -> Option<journal::Record> {
+        let marks = self.marks.0.as_ref().ok()?;
+        marks.marks.iter().find(|mark| mark.room == room && mark.at == at).map(|mark| mark.record.clone())
+    }
+
+    /// The loss is in a synced journal: the Keychain lets it go. A delete that fails leaves it for
+    /// the next launch, which finds it in the journal and lets it go then, without saying it twice.
+    fn drop_mark(&mut self, room: &str, at: u64) {
+        let (Some(store), Ok(marks)) = (self.losses.clone(), &mut self.marks.0) else {
+            return;
+        };
+        let before = marks.marks.len();
+        marks.marks.retain(|mark| !(mark.room == room && mark.at == at));
+        if marks.marks.len() == before {
+            return;
+        }
+        let _ = if *marks == LossMarks::default() { store.delete() } else { store.write(&serde_json::to_vec(&*marks).unwrap_or_default()) };
+        self.journal_errors.remove(&format!("loss:{room}@{at}"));
+    }
+
+    /// After recovery: every loss the Keychain keeps that no journal took up is shown, and kept
+    /// shown until Remove — as is a record that could not be read.
+    fn show_marks(&mut self) {
+        let shown: Vec<(String, String)> = match &self.marks.0 {
+            Err(why) => vec![("loss:keychain".to_string(), format!("Lines may have been lost at an earlier quit: the Keychain's record of them could not be read ({why})."))],
+            Ok(marks) => {
+                let mut shown: Vec<(String, String)> = marks
+                    .marks
+                    .iter()
+                    .filter(|mark| !self.progress.contains_key(&(mark.room.clone(), mark.at)))
+                    .map(|mark| (format!("loss:{}@{}", mark.room, mark.at), format!("At an earlier quit, {} line{} of {} never reached Discord and could not be recorded in its post.", lost_lines(&mark.record), plural(lost_lines(&mark.record)), mark.room)))
+                    .collect();
+                if marks.overflow_instances > 0 {
+                    shown.push(("loss:more".to_string(), format!("At earlier quits, {} more line{} in {} more room{} never reached Discord.", marks.overflow_lines, plural(marks.overflow_lines), marks.overflow_instances, plural(marks.overflow_instances))));
+                }
+                shown
+            }
+        };
+        for (key, message) in shown {
+            self.journal_errors.insert(key, DiscordError { code: LOSS_UNRECORDED.to_string(), message });
+        }
     }
 
     fn rooms_changed(&self) {
@@ -1467,6 +1553,7 @@ impl Hub {
                 if let Some(dir) = &self.journal_dir {
                     dir.drop_loss(&room, at);
                 }
+                self.drop_mark(&room, at);
                 let draining = self.draining.get_mut(&room).into_iter().flat_map(|batches| batches.iter_mut().map(|(entry, _)| entry));
                 let target = self.rooms.get_mut(&room).into_iter().chain(draining).find(|entry| entry.id == feed);
                 if let Some(entry) = target {
@@ -1675,7 +1762,8 @@ impl Hub {
         let Some(dir) = self.journal_dir.as_ref() else {
             return Ok(None);
         };
-        let Some(record) = dir.read_loss(&parsed.code, parsed.created_at)? else {
+        let from_file = dir.read_loss(&parsed.code, parsed.created_at)?;
+        let Some(record) = from_file.or_else(|| self.mark_of(&parsed.code, parsed.created_at)) else {
             return Ok(None);
         };
         let journal::Record::Loss { seq, n, label, through } = record.clone() else {
@@ -1694,6 +1782,7 @@ impl Hub {
             // otherwise (#199 r9).
             if file.sync().is_ok() {
                 dir.drop_loss(&code, at);
+                self.drop_mark(&code, at);
             }
             return Ok(None);
         }
@@ -1799,6 +1888,64 @@ fn text(value: Option<serde_json::Value>) -> Option<String> {
 }
 
 /// Where the paired owner is kept: one Keychain item, or a fake in the tests.
+/// A quit's loss the journal and its fallback file both refused, kept off that disk path so a
+/// relaunch still says it (#282). Bytes only; what they hold is `LossMarks`.
+pub(crate) trait LossStore: Send + Sync {
+    /// `Ok(None)` only when nothing is kept; one that cannot be read is `Err`.
+    fn read(&self) -> Result<Option<Vec<u8>>, String>;
+    fn write(&self, value: &[u8]) -> Result<(), String>;
+    fn delete(&self) -> Result<(), String>;
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LossMarks {
+    marks: Vec<LossMark>,
+    /// Losses past `LOSS_MARKS_MAX`, oldest first: counted together, never dropped.
+    #[serde(default)]
+    overflow_instances: u64,
+    #[serde(default)]
+    overflow_lines: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LossMark {
+    room: String,
+    at: u64,
+    record: journal::Record,
+}
+
+/// The Keychain's losses as this life knows them, or why they could not be read.
+#[derive(Debug)]
+struct Marks(Result<LossMarks, String>);
+
+impl Default for Marks {
+    fn default() -> Self {
+        Self(Ok(LossMarks::default()))
+    }
+}
+
+fn read_marks(store: &dyn LossStore) -> Marks {
+    Marks(match store.read() {
+        Ok(None) => Ok(LossMarks::default()),
+        // Every entry must be a loss: anything else would be passed over by the merge and hidden
+        // by the journal it names, so the whole record counts as unreadable (#282 audit).
+        Ok(Some(bytes)) => serde_json::from_slice::<LossMarks>(&bytes)
+            .ok()
+            .filter(|marks| marks.marks.iter().all(|mark| matches!(mark.record, journal::Record::Loss { .. })))
+            .ok_or_else(|| "the Keychain's record of lost lines is not one this app wrote".to_string()),
+        Err(why) => Err(why),
+    })
+}
+
+fn lost_lines(record: &journal::Record) -> u64 {
+    match record {
+        journal::Record::Loss { n, .. } => *n,
+        _ => 0,
+    }
+}
+
 pub(crate) trait OwnerStore: Send + Sync {
     /// `Ok(None)` only when nobody is paired; an unreadable record is `Err` (#288).
     fn read(&self) -> Result<Option<Owner>, String>;
@@ -1906,6 +2053,7 @@ pub(crate) struct Deps {
     pub tokens: Box<dyn TokenStore>,
     pub settings: Arc<dyn SettingsStore>,
     pub owners: Arc<dyn OwnerStore>,
+    pub losses: Arc<dyn LossStore>,
     pub source: Arc<dyn RoomSource>,
     pub acts: Arc<dyn RoomActs>,
     pub state_path: PathBuf,
@@ -1955,6 +2103,7 @@ impl Default for DiscordState {
             tokens: Box::new(KeychainTokens),
             settings: Arc::new(ConfigSettings),
             owners: Arc::new(KeychainOwner),
+            losses: Arc::new(KeychainLosses),
             source: Arc::new(BridgeSource { target: None }),
             acts: Arc::new(BridgeActs),
             state_path: crate::home_dir()
@@ -1998,6 +2147,8 @@ impl DiscordState {
             forum_id: text(deps.settings.get(CONFIG_FORUM)),
             owner: owner.clone().ok().flatten(),
             keychain_refused: owner.err().map(|why| keychain_refused("owner", &why)).into_iter().collect(),
+            losses: Some(Arc::clone(&deps.losses)),
+            marks: read_marks(deps.losses.as_ref()),
             ..Hub::default()
         };
         let journal_path = deps.state_path.parent().map(|dir| dir.join(JOURNAL_DIR)).unwrap_or_else(|| PathBuf::from(JOURNAL_DIR));
@@ -2020,6 +2171,8 @@ impl DiscordState {
                 hub.journal_down = Some(why);
             }
         }
+        // Losses only the Keychain kept, whose journal is gone or unreadable, are shown (#282).
+        hub.show_marks();
         let hub = Arc::new(Mutex::new(hub));
         lock(&hub).me = Arc::downgrade(&hub);
         let core = Arc::new(Core {
@@ -2273,6 +2426,8 @@ impl DiscordState {
         self.deps.tokens.delete()?;
         self.configured.store(false, Ordering::SeqCst);
         self.deps.owners.delete()?;
+        // Remove is the one way a kept loss is let go unsaid.
+        self.deps.losses.delete()?;
         self.deps.settings.set(&[(CONFIG_FORUM, None)])?;
         let mut hub = lock(&self.hub);
         let leaving = std::mem::take(&mut hub.leaving);
@@ -2285,7 +2440,8 @@ impl DiscordState {
         // still handing over the last lines (the `end`) finishes them.
         let (me, wake, journal_dir, journal_down, writer, outbox) =
             (hub.me.clone(), Arc::clone(&hub.wake), hub.journal_dir.take(), hub.journal_down.take(), hub.writer, std::mem::take(&mut hub.outbox));
-        *hub = Hub { leaving, dropped, dropped_lines, epoch, me, wake, journal_dir, journal_down, writer, outbox, ..Hub::default() };
+        let losses = hub.losses.take();
+        *hub = Hub { leaving, dropped, dropped_lines, epoch, me, wake, journal_dir, journal_down, writer, outbox, losses, ..Hub::default() };
         drop(hub);
         if !failed.is_empty() {
             return Err(format!("Discord was removed, but {}", failed.join("; ")));
@@ -3500,6 +3656,40 @@ fn keychain_read(account: &'static str, moved: &'static str) -> Result<Option<Ve
         secrets::Read::Found(bytes) => Ok(Some(bytes)),
         secrets::Read::Absent => Ok(None),
         secrets::Read::Refused(why) => Err(why),
+    }
+}
+
+struct KeychainLosses;
+
+impl LossStore for KeychainLosses {
+    fn read(&self) -> Result<Option<Vec<u8>>, String> {
+        #[cfg(target_os = "macos")]
+        {
+            keychain_read(KEYCHAIN_LOSS_ACCOUNT, KEYCHAIN_LOSS_MOVED)
+        }
+        #[cfg(not(target_os = "macos"))]
+        Ok(None)
+    }
+
+    fn write(&self, value: &[u8]) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            secrets::write(&TeamSlot(KEYCHAIN_LOSS_ACCOUNT), &TeamSlot(KEYCHAIN_LOSS_MOVED), &FileSlot(KEYCHAIN_LOSS_ACCOUNT), value)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = value;
+            Err("Keychain writes require macOS".to_string())
+        }
+    }
+
+    fn delete(&self) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            secrets::delete(&TeamSlot(KEYCHAIN_LOSS_ACCOUNT), &TeamSlot(KEYCHAIN_LOSS_MOVED), &FileSlot(KEYCHAIN_LOSS_ACCOUNT))
+        }
+        #[cfg(not(target_os = "macos"))]
+        Ok(())
     }
 }
 

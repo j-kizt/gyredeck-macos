@@ -62,6 +62,10 @@ struct MemOwner {
     record: Mutex<Option<(Owner, String)>>,
     /// macOS would not hand the owner record over (#288).
     refuse_read: AtomicBool,
+    /// The Mac is locked: -25308 (#325).
+    locked: AtomicBool,
+    /// The item is there and is not an owner record.
+    corrupt: AtomicBool,
     fail: AtomicBool,
     /// The failed write also took the old item.
     wipe: AtomicBool,
@@ -102,9 +106,15 @@ impl LossStore for MemLoss {
 }
 
 impl OwnerStore for MemOwner {
-    fn read(&self) -> Result<Option<Owner>, String> {
+    fn read(&self) -> Result<Option<Owner>, Refusal> {
+        if self.locked.load(Ordering::SeqCst) {
+            return Err(Refusal { why: "macOS needed to ask and could not (OSStatus -25308)".to_string(), locked: true });
+        }
         if self.refuse_read.load(Ordering::SeqCst) {
-            return Err("macOS did not allow it (OSStatus -25293)".to_string());
+            return Err(Refusal { why: "macOS did not allow it (OSStatus -25293)".to_string(), locked: false });
+        }
+        if self.corrupt.load(Ordering::SeqCst) {
+            return Err(Refusal { why: "the saved owner is not a valid owner record".to_string(), locked: false });
         }
         Ok(self.record.lock().unwrap().as_ref().map(|(owner, _)| owner.clone()))
     }
@@ -5223,7 +5233,7 @@ fn c325_the_owner_read_once_is_held_so_a_locked_keychain_never_stops_their_messa
     f.state.connect(ROOM, APP_WORD).unwrap();
     connected(&f, ROOM, THREAD);
     // The Mac locks: the Keychain answers -25308 from now on.
-    f.owners.refuse_read.store(true, Ordering::SeqCst);
+    f.owners.locked.store(true, Ordering::SeqCst);
     let epoch = lock(&f.state.hub).epoch;
     read_child(Cursor::new(say_line(1, "sent while locked") + "\n"), &f.state.core, epoch);
     assert_eq!(posted_texts(&f), vec!["sent while locked".to_string()], "posted, not refused for the Keychain");
@@ -5233,6 +5243,8 @@ fn c325_the_owner_read_once_is_held_so_a_locked_keychain_never_stops_their_messa
 fn c325_a_keychain_locked_at_launch_refuses_until_it_opens_then_holds() {
     // Launched with the Mac locked: the Keychain refuses from the first read.
     let f = fixture_built("325-launch", Some(TOKEN), &[], the_owner(), true);
+    f.owners.refuse_read.store(false, Ordering::SeqCst);
+    f.owners.locked.store(true, Ordering::SeqCst);
     let _buffer = f.attach_buffer();
     f.state.connect(ROOM, APP_WORD).unwrap();
     connected(&f, ROOM, THREAD);
@@ -5241,9 +5253,9 @@ fn c325_a_keychain_locked_at_launch_refuses_until_it_opens_then_holds() {
     read_child(Cursor::new(say_line(1, "before the unlock") + "\n"), &next.core, epoch);
     assert!(posted_texts(&f).is_empty(), "nobody known yet: refused, as before");
     // Unlocked once: read, and held from then on even if the Mac locks again.
-    f.owners.refuse_read.store(false, Ordering::SeqCst);
+    f.owners.locked.store(false, Ordering::SeqCst);
     read_child(Cursor::new(say_line(2, "after the unlock") + "\n"), &next.core, epoch);
-    f.owners.refuse_read.store(true, Ordering::SeqCst);
+    f.owners.locked.store(true, Ordering::SeqCst);
     read_child(Cursor::new(say_line(3, "locked again") + "\n"), &next.core, epoch);
     assert_eq!(posted_texts(&f), vec!["after the unlock".to_string(), "locked again".to_string()]);
 }
@@ -5255,15 +5267,87 @@ fn c325_what_is_held_follows_a_re_pair_and_a_remove() {
     assert_eq!(held.read().unwrap(), None);
     let a = Owner { id: "323456789012345678".into(), username: Some("a".into()) };
     held.write(&a, "2026-11-03T00:00:00Z").unwrap();
-    store.refuse_read.store(true, Ordering::SeqCst);
+    store.locked.store(true, Ordering::SeqCst);
     assert_eq!(held.read().unwrap(), Some(a.clone()), "held after the write, the store unread");
     store.fail.store(true, Ordering::SeqCst);
     let b = Owner { id: "423456789012345678".into(), username: Some("b".into()) };
     assert!(held.write(&b, "2026-11-03T00:00:00Z").is_err());
     assert!(held.read().is_err(), "a failed write holds nothing old: the store is asked, and it is locked");
     store.fail.store(false, Ordering::SeqCst);
-    store.refuse_read.store(false, Ordering::SeqCst);
+    store.locked.store(false, Ordering::SeqCst);
     held.delete().unwrap();
-    store.refuse_read.store(true, Ordering::SeqCst);
+    store.locked.store(true, Ordering::SeqCst);
     assert_eq!(held.read().unwrap(), None, "Remove holds nobody");
+}
+
+#[test]
+fn c325_only_the_lock_lets_the_held_owner_stand_in() {
+    let store = Arc::new(MemOwner::default());
+    let held = HeldOwner::new(Arc::clone(&store) as Arc<dyn OwnerStore>);
+    let a = Owner { id: "323456789012345678".into(), username: Some("a".into()) };
+    held.write(&a, "2026-11-03T00:00:00Z").unwrap();
+    assert_eq!(held.read().unwrap(), Some(a.clone()), "premise: held");
+    store.locked.store(true, Ordering::SeqCst);
+    assert_eq!(held.read().unwrap(), Some(a.clone()), "locked: the held owner stands in");
+    store.locked.store(false, Ordering::SeqCst);
+    store.refuse_read.store(true, Ordering::SeqCst);
+    assert!(!held.read().unwrap_err().locked, "any other refusal is said, never covered");
+    store.refuse_read.store(false, Ordering::SeqCst);
+    store.corrupt.store(true, Ordering::SeqCst);
+    assert!(held.read().unwrap_err().why.contains("not a valid owner record"), "a record that is not an owner's is said");
+}
+
+/// An owner store whose next read is held mid-way: it has read the store, and has not answered.
+struct GatedOwner {
+    inner: Arc<MemOwner>,
+    gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+impl OwnerStore for GatedOwner {
+    fn read(&self) -> Result<Option<Owner>, Refusal> {
+        let read = self.inner.read();
+        let gate = self.gate.lock().unwrap().take();
+        if let Some((started, release)) = gate {
+            started.send(()).unwrap();
+            release.recv().unwrap();
+        }
+        read
+    }
+    fn write(&self, owner: &Owner, paired_at: &str) -> Result<(), String> {
+        self.inner.write(owner, paired_at)
+    }
+    fn delete(&self) -> Result<(), String> {
+        self.inner.delete()
+    }
+}
+
+#[test]
+fn c325_a_read_that_began_before_a_re_pair_never_holds_the_old_owner() {
+    let store = Arc::new(MemOwner::default());
+    let a = Owner { id: "323456789012345678".into(), username: Some("a".into()) };
+    let b = Owner { id: "423456789012345678".into(), username: Some("b".into()) };
+    store.write(&a, "2026-11-03T00:00:00Z").unwrap();
+    let (started_tx, started) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let gated = Arc::new(GatedOwner { inner: Arc::clone(&store), gate: Mutex::new(Some((started_tx, release_rx))) });
+    let held = Arc::new(HeldOwner::new(gated as Arc<dyn OwnerStore>));
+    // A's read has read the store and not answered; B is paired meanwhile; then A's read ends.
+    let reading = { let held = Arc::clone(&held); std::thread::spawn(move || held.read()) };
+    started.recv().unwrap();
+    held.write(&b, "2026-11-03T00:00:01Z").unwrap();
+    release.send(()).unwrap();
+    assert_eq!(reading.join().unwrap().unwrap(), Some(a), "premise: the late read answered A");
+    store.locked.store(true, Ordering::SeqCst);
+    assert_eq!(held.read().unwrap(), Some(b), "locked: B is held, never the A read before the re-pair");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn c325_a_refused_move_is_said_and_tried_again_until_it_is_made() {
+    let account = "c325-settle-test";
+    assert_eq!(team_keychain::settle_with(account, || -25293), Err(-25293), "a refused move is said");
+    let mut asked = false;
+    assert_eq!(team_keychain::settle_with(account, || { asked = true; 0 }), Ok(()));
+    assert!(asked, "and tried again at the next read, not marked done");
+    assert_eq!(team_keychain::settle_with(account, || panic!("a move made is not made twice")), Ok(()));
 }

@@ -2916,6 +2916,18 @@ test("#305 past FIND_STARTERS_MAX first messages, or with one unreadable, the ma
   assert.equal(missing.complete, false, "a first message discord.js answers null for is not a miss either");
 });
 
+test("#305 a post by the room's name whose first message cannot be read leaves the name search incomplete", async () => {
+  for (const [why, read] of [["null", async () => null], ["a throw", async () => { throw new Error("gone"); }]]) {
+    const { forum } = forumWithArchive({ pages: 1, match: { at: 3, name: "Room R", content: "Room R\nMembers: —\ngyredeck-room: R · 1700" } });
+    const [named] = [...(await forum.threads.fetchArchived({})).threads.values()].filter((t) => t.name === "Room R");
+    named.fetchStarterMessage = read;
+    const { discord } = await adapterWith(forum);
+    const { found, complete } = await discord.findPosts("F1", { name: "Room R", marker: "gyredeck-room: R · 1700" });
+    assert.deepEqual(found, [], `${why}: premise, not found`);
+    assert.equal(complete, false, `${why}: not a miss, so no second post is made unwarned`);
+  }
+});
+
 test("#305 a life with no record of its posts searches by marker for every room it connects, each bounded", async () => {
   // The cost the owner accepted (option A): until this child restarts, each new room it
   // connects may read up to FIND_STARTERS_MAX first messages, once.

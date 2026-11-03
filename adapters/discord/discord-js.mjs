@@ -288,7 +288,12 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
         for (const t of named.values()) {
           if (t.parentId !== ch.id || t.ownerId !== client.user?.id) continue;
           const starter = await t.fetchStarterMessage().catch(() => null);
-          if (starter?.content?.split("\n").at(-1) === marker) {
+          // A post by this name whose first message cannot be read may be this room's: not a miss.
+          if (starter == null) {
+            complete = false;
+            continue;
+          }
+          if (starter.content?.split("\n").at(-1) === marker) {
             found.push({ id: t.id, createdAt: t.createdTimestamp ?? 0, archived: Boolean(t.archived) });
           }
         }

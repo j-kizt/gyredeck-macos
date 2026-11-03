@@ -1946,6 +1946,48 @@ fn lost_lines(record: &journal::Record) -> u64 {
     }
 }
 
+/// The paired owner, read from its store once and then held, so a Keychain the Mac will not
+/// open while its screen is locked never stops the owner's messages (#325). Only an answer
+/// is held: a read that fails is tried again next time. Pairing and Remove go through here,
+/// so what is held is never older than what is stored.
+pub(crate) struct HeldOwner {
+    store: Arc<dyn OwnerStore>,
+    held: Mutex<Option<Option<Owner>>>,
+}
+
+impl HeldOwner {
+    pub(crate) fn new(store: Arc<dyn OwnerStore>) -> Self {
+        Self { store, held: Mutex::new(None) }
+    }
+    fn held(&self) -> MutexGuard<'_, Option<Option<Owner>>> {
+        self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl OwnerStore for HeldOwner {
+    fn read(&self) -> Result<Option<Owner>, String> {
+        if let Some(held) = self.held().clone() {
+            return Ok(held);
+        }
+        let read = self.store.read()?;
+        *self.held() = Some(read.clone());
+        Ok(read)
+    }
+    fn write(&self, owner: &Owner, paired_at: &str) -> Result<(), String> {
+        // Whatever the store now holds is not known if the write failed: read it again then.
+        *self.held() = None;
+        self.store.write(owner, paired_at)?;
+        *self.held() = Some(Some(owner.clone()));
+        Ok(())
+    }
+    fn delete(&self) -> Result<(), String> {
+        *self.held() = None;
+        self.store.delete()?;
+        *self.held() = Some(None);
+        Ok(())
+    }
+}
+
 pub(crate) trait OwnerStore: Send + Sync {
     /// `Ok(None)` only when nobody is paired; an unreadable record is `Err` (#288).
     fn read(&self) -> Result<Option<Owner>, String>;
@@ -2137,7 +2179,10 @@ impl DiscordState {
         hub.rooms_changed();
     }
 
-    pub(crate) fn with(deps: Deps) -> Self {
+    pub(crate) fn with(mut deps: Deps) -> Self {
+        // The owner is held once read: a Mac whose screen is locked refuses the Keychain, and
+        // every message from Discord asks who the owner is (#325).
+        deps.owners = Arc::new(HeldOwner::new(Arc::clone(&deps.owners)));
         // An owner id an earlier build left in the config never counts; it is deleted.
         if LEGACY_OWNER_KEYS.iter().any(|key| deps.settings.get(key).is_some()) {
             let _ = deps.settings.set(&LEGACY_OWNER_KEYS.map(|key| (key, None)));

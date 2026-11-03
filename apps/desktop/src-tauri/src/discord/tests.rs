@@ -5209,3 +5209,61 @@ fn a_slow_status_never_holds_up_a_say_read_after_it_and_a_second_waits_its_turn(
     let again = status_ask(&f, &buffer, ask("s4"));
     assert!(again[0]["error"].is_null(), "{again:?}");
 }
+
+// ── #325: a Mac whose screen is locked refuses the Keychain; the owner's messages still land ──
+
+fn say_line(n: u64, text: &str) -> String {
+    format!(r#"{{"t":"say","room":"{ROOM}","discordMessageId":"{}","threadId":"{THREAD}","ownerId":"{OWNER_ID}","text":"{text}"}}"#, msg_id(n))
+}
+
+#[test]
+fn c325_the_owner_read_once_is_held_so_a_locked_keychain_never_stops_their_message() {
+    let f = fixture_owned("325-held", Some(TOKEN), &[], the_owner());
+    let _buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    // The Mac locks: the Keychain answers -25308 from now on.
+    f.owners.refuse_read.store(true, Ordering::SeqCst);
+    let epoch = lock(&f.state.hub).epoch;
+    read_child(Cursor::new(say_line(1, "sent while locked") + "\n"), &f.state.core, epoch);
+    assert_eq!(posted_texts(&f), vec!["sent while locked".to_string()], "posted, not refused for the Keychain");
+}
+
+#[test]
+fn c325_a_keychain_locked_at_launch_refuses_until_it_opens_then_holds() {
+    // Launched with the Mac locked: the Keychain refuses from the first read.
+    let f = fixture_built("325-launch", Some(TOKEN), &[], the_owner(), true);
+    let _buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let next = &f.state;
+    let epoch = lock(&next.hub).epoch;
+    read_child(Cursor::new(say_line(1, "before the unlock") + "\n"), &next.core, epoch);
+    assert!(posted_texts(&f).is_empty(), "nobody known yet: refused, as before");
+    // Unlocked once: read, and held from then on even if the Mac locks again.
+    f.owners.refuse_read.store(false, Ordering::SeqCst);
+    read_child(Cursor::new(say_line(2, "after the unlock") + "\n"), &next.core, epoch);
+    f.owners.refuse_read.store(true, Ordering::SeqCst);
+    read_child(Cursor::new(say_line(3, "locked again") + "\n"), &next.core, epoch);
+    assert_eq!(posted_texts(&f), vec!["after the unlock".to_string(), "locked again".to_string()]);
+}
+
+#[test]
+fn c325_what_is_held_follows_a_re_pair_and_a_remove() {
+    let store = Arc::new(MemOwner::default());
+    let held = HeldOwner::new(Arc::clone(&store) as Arc<dyn OwnerStore>);
+    assert_eq!(held.read().unwrap(), None);
+    let a = Owner { id: "323456789012345678".into(), username: Some("a".into()) };
+    held.write(&a, "2026-11-03T00:00:00Z").unwrap();
+    store.refuse_read.store(true, Ordering::SeqCst);
+    assert_eq!(held.read().unwrap(), Some(a.clone()), "held after the write, the store unread");
+    store.fail.store(true, Ordering::SeqCst);
+    let b = Owner { id: "423456789012345678".into(), username: Some("b".into()) };
+    assert!(held.write(&b, "2026-11-03T00:00:00Z").is_err());
+    assert!(held.read().is_err(), "a failed write holds nothing old: the store is asked, and it is locked");
+    store.fail.store(false, Ordering::SeqCst);
+    store.refuse_read.store(false, Ordering::SeqCst);
+    held.delete().unwrap();
+    store.refuse_read.store(true, Ordering::SeqCst);
+    assert_eq!(held.read().unwrap(), None, "Remove holds nobody");
+}

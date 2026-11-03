@@ -1,5 +1,16 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A Discord post you renamed is found again — (v1.32.2)
+
+### Fixes
+
+- **A room's Discord post you renamed is found again after Gyredeck loses its record of
+  posts.** Before, if the relay's state file was missing or unreadable, a room was looked
+  for only by its post's name, so a post you had renamed was missed and the room got a
+  second post. It is now also recognised by the line Gyredeck writes at the end of its first
+  message. That search reads at most 200 posts. If it cannot finish, the room opens with
+  the existing warning that it may get a second post.
+
 ## Discord messages lost at quit are no longer forgotten — (v1.32.1)
 
 ### Fixes

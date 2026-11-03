@@ -55,6 +55,16 @@ const LEGACY_OWNER_KEYS: [&str; 3] = ["discordOwner", "discordOwnerId", "discord
 const ROOM_SENDER: &str = "gyredeck-room";
 /// The sender of what the person typed into Gyredeck itself.
 const APP_SENDER: &str = "gyredeck";
+/// The sender of what the owner types in a followed post (#205); the bridge takes it only
+/// from a call carrying the machine token and the app's word.
+pub(crate) const OWNER_SENDER: &str = "gyredeck-owner-discord";
+const OWNER_LABEL: &str = "You (via Discord)";
+/// Every agent in a connected room idle this long, and the owner is asked once whether to
+/// disconnect (#205). Nothing disconnects on its own.
+const QUIET_AFTER: Duration = Duration::from_secs(10 * 60);
+/// A session last seen mid-turn this long ago has stopped saying anything; it is no longer
+/// counted as working. Generous, so a long build is never called quiet.
+const BUSY_STALE: Duration = Duration::from_secs(30 * 60);
 const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 /// How many of a room's lines may wait for the child's `posted` before the room's stream is
 /// closed. Lines are dropped only by an acknowledgement, never by a count: a full room stops
@@ -184,12 +194,46 @@ pub(crate) enum ToChild {
     Pair { code: String, round: String },
     #[serde(rename_all = "camelCase")]
     Connect { room: String, members: Vec<String>, created_at: Option<u64>, resume: Option<Resume> },
-    Message { room: String, seq: u64, sender: String, to: String, kind: String, text: String, ts: String },
+    #[serde(rename_all = "camelCase")]
+    Message {
+        room: String,
+        seq: u64,
+        sender: String,
+        to: String,
+        kind: String,
+        text: String,
+        ts: String,
+        /// The conversation id behind `sender`, so a Reply on Discord can address it (#205).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sender_id: Option<String>,
+        /// An ask addressed to the person: the child mentions the paired owner on this one.
+        to_owner: bool,
+        /// The asker marked this ask yes/no: ✅/❌ on Discord answers it (#205).
+        #[serde(rename = "yesNo", skip_serializing_if = "std::ops::Not::not")]
+        yes_no: bool,
+    },
     /// `id` names this close, so `closed` clears this one and not another of the instance.
     Disconnect { room: String, reason: DisconnectReason, id: String },
     /// Remove stops the relay: what is still queued will not be delivered, so each closing
     /// room's post says so once before its close (#199 I21). Quitting does not send it.
     End {},
+    /// What became of one `say` (#205): 📨 only on `ok` with a seq.
+    #[serde(rename_all = "camelCase")]
+    Said {
+        discord_message_id: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        names: Option<Vec<String>>,
+    },
+    /// Every agent in the room has been idle for [`QUIET_AFTER`]; sent once per quiet spell.
+    Quiet { room: String },
+    /// A room said quiet shows work again: the child disarms its prompt.
+    #[serde(rename = "quiet_over")]
+    QuietOver { room: String },
 }
 
 /// The child's stdin. One thread owns the pipe and pulls each line from the [`Hub`] only when
@@ -310,8 +354,60 @@ enum FromChild {
     /// The close `id` of that room instance is said, archived and `closedAt` saved (#199 I12).
     #[serde(rename_all = "camelCase")]
     Closed { room: String, #[serde(default)] created_at: Option<u64>, #[serde(default)] id: Option<String> },
-    Connected {},
+    /// The post the child opened for a room instance: the only post a `say` is taken from.
+    #[serde(rename_all = "camelCase")]
+    Connected {
+        #[serde(default)]
+        room: Option<String>,
+        #[serde(default)]
+        thread_id: Option<String>,
+        #[serde(default)]
+        created_at: Option<u64>,
+    },
     Error { code: String, message: String },
+    /// The owner typed in a followed post, or reacted to a relayed message (#205).
+    Say(Say),
+    #[serde(rename = "disconnect_request")]
+    #[serde(rename_all = "camelCase")]
+    DisconnectRequest {
+        #[serde(default)]
+        room: Option<String>,
+        #[serde(default)]
+        all: bool,
+        /// Who confirmed it, checked against the owner in the Keychain; required.
+        owner_id: String,
+        /// The post it was confirmed in, checked against the room's; required for one room.
+        #[serde(default)]
+        thread_id: Option<String>,
+        /// The room instance the prompt was posted for: a reconnected room is another (#205 r3).
+        #[serde(default)]
+        created_at: Option<u64>,
+        /// From a quiet prompt: honoured only while the room is still quiet here, whatever the
+        /// child remembers of it (#205 r3).
+        #[serde(default)]
+        quiet: bool,
+    },
+}
+
+/// One owner message, as the child saw it (#205). The post and the author are both checked
+/// here against what the app holds, never taken on the child's word.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Say {
+    room: String,
+    discord_message_id: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    text: String,
+    #[serde(default)]
+    reply_to_seq: Option<u64>,
+    thread_id: String,
+    owner_id: String,
+    /// Sent again by a child that found it saved without a receipt.
+    #[serde(default)]
+    retry: bool,
 }
 
 // ── the shared state ──
@@ -411,6 +507,36 @@ struct RoomFeed {
     close_id: Option<String>,
     /// The room instance's journal; `None` only for a Hub with no journal directory (tests).
     journal: Option<Arc<journal::File>>,
+    /// The post the child said it opened for this instance; a `say` is taken only from it (#205).
+    thread_id: Option<String>,
+    /// The app's word this room was connected with, for the owner's posts and the relay's
+    /// leave on a Discord disconnect. Never in a [`ToChild`].
+    word: String,
+    /// The agents in the room, by conversation id: whose idleness makes it quiet (#205).
+    agents: Vec<String>,
+    /// When this Connect began: only what is heard after it counts toward quiet.
+    connected_at: Instant,
+    quiet_said: bool,
+}
+
+/// What the bridge's event stream last said of a session (#205).
+#[derive(Clone, Copy, Debug)]
+struct Seen {
+    at: Instant,
+    busy: bool,
+}
+
+/// Whether an event leaves its session working or done, as the presence model reads it.
+fn busy_after(event: &str) -> Option<bool> {
+    match event {
+        "turn_start" | "llm_start" | "llm_end" | "tool_start" | "tool_end" | "compact_start" | "compact_end" | "attention_requested" => Some(true),
+        "turn_complete" | "turn_stop" | "conversation_open" | "conversation_close" => Some(false),
+        _ => None,
+    }
+}
+
+fn is_agent(room: &str, id: &str) -> bool {
+    id != relay_member(room) && ![ROOM_SENDER, APP_SENDER, OWNER_SENDER].contains(&id)
 }
 
 impl RoomFeed {
@@ -440,6 +566,11 @@ impl RoomFeed {
             close_pending: false,
             close_id: None,
             journal,
+            thread_id: None,
+            word: String::new(),
+            agents: Vec::new(),
+            connected_at: Instant::now(),
+            quiet_said: false,
         }
     }
 
@@ -502,7 +633,18 @@ fn line_bytes(line: &ToChild) -> usize {
 }
 
 fn notice(room: &str, seq: u64, text: String) -> ToChild {
-    ToChild::Message { room: room.to_string(), seq, sender: "Room".to_string(), to: "everyone".to_string(), kind: "notice".to_string(), text, ts: String::new() }
+    ToChild::Message {
+        room: room.to_string(),
+        seq,
+        sender: "Room".to_string(),
+        to: "everyone".to_string(),
+        kind: "notice".to_string(),
+        text,
+        ts: String::new(),
+        sender_id: None,
+        to_owner: false,
+        yes_no: false,
+    }
 }
 
 fn plural(count: u64) -> &'static str {
@@ -521,14 +663,18 @@ fn loss_text(n: u64, label: &str) -> String {
 
 fn line_record(line: &ToChild) -> Option<journal::Record> {
     match line.clone() {
-        ToChild::Message { seq, sender, to, kind, text, ts, .. } => Some(journal::Record::Line { seq, sender, to, kind, text, ts, through: None }),
+        ToChild::Message { seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, .. } => {
+            Some(journal::Record::Line { seq, sender, to, kind, text, ts, through: None, sender_id, to_owner, yes_no })
+        }
         _ => None,
     }
 }
 
 fn item_line(room: &str, item: journal::Item) -> ToChild {
     match item {
-        journal::Item::Line { seq, sender, to, kind, text, ts, .. } => ToChild::Message { room: room.to_string(), seq, sender, to, kind, text, ts },
+        journal::Item::Line { seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, .. } => {
+            ToChild::Message { room: room.to_string(), seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no }
+        }
         journal::Item::Loss { seq, n, label, .. } => notice(room, seq, loss_text(n, &label)),
     }
 }
@@ -623,6 +769,8 @@ struct Hub {
     window: usize,
     /// `JOURNAL_COMPACT_FACTOR × ROOM_BUDGET_BYTES` unless a test sets a smaller one.
     compact_over: u64,
+    /// What the bridge's event stream last said of each session, for the quiet prompt (#205).
+    presence: HashMap<String, Seen>,
 }
 
 impl Hub {
@@ -714,6 +862,10 @@ impl Hub {
         for (room, feed) in &self.rooms {
             plan.push(Out::Control(self.connect_line(room, feed, true)));
             plan.push(Out::Feed { room: room.clone(), feed: feed.id });
+            // What the last child was told may have been lost with it, and `send` drops lines
+            // while no child is attached: say where the spell stands now (#205 r3).
+            let room = room.clone();
+            plan.push(Out::Control(if feed.quiet_said { ToChild::Quiet { room } } else { ToChild::QuietOver { room } }));
         }
         self.outbox.extend(plan);
         let feeds = self.rooms.values_mut().chain(self.draining.values_mut().flat_map(|batches| batches.iter_mut().map(|(feed, _)| feed)));
@@ -823,6 +975,55 @@ impl Hub {
         self.send(&line);
         self.queue_feed(room, id);
         Ok(())
+    }
+
+    /// The agents of a connected room, from a roster read: whose idleness makes it quiet.
+    fn set_agents(&mut self, room: &str, roster: &Roster) {
+        if let Some(feed) = self.rooms.get_mut(room) {
+            feed.agents = roster.members.iter().map(|entry| entry.id.clone()).filter(|id| is_agent(room, id)).collect();
+        }
+    }
+
+    fn note_presence(&mut self, conversation_id: &str, event: &str, at: Instant) {
+        if let Some(busy) = busy_after(event) {
+            self.presence.insert(conversation_id.to_string(), Seen { at, busy });
+        }
+    }
+
+    /// Tell the child of each connected room whose agents have all been idle for
+    /// [`QUIET_AFTER`], once per quiet spell: any sign of work starts a new one. Only this
+    /// Connect's own hearing counts; nothing here ever disconnects (#205).
+    fn check_quiet(&mut self, now: Instant) {
+        let mut lines = Vec::new();
+        for (room, feed) in self.rooms.iter_mut() {
+            if feed.agents.is_empty() {
+                continue;
+            }
+            // Only what was heard while this room was followed: a session last seen before
+            // Connect, or before a reconnect, is not known to be idle now.
+            let seen: Vec<Seen> = feed
+                .agents
+                .iter()
+                .filter_map(|id| self.presence.get(id).copied())
+                .filter(|entry| entry.at >= feed.connected_at)
+                .collect();
+            // An agent the event stream has not spoken of since it was followed may be deep in
+            // a tool call that began before: unknown, so not idle, until its first event.
+            let unknown = seen.len() < feed.agents.len();
+            let working = unknown || seen.iter().any(|entry| entry.busy && now.saturating_duration_since(entry.at) < BUSY_STALE);
+            let last = seen.iter().map(|entry| entry.at).fold(feed.connected_at, Instant::max);
+            let is_quiet = !working && now.saturating_duration_since(last) >= QUIET_AFTER;
+            if is_quiet && !feed.quiet_said {
+                feed.quiet_said = true;
+                lines.push(ToChild::Quiet { room: room.clone() });
+            } else if !is_quiet && feed.quiet_said {
+                feed.quiet_said = false;
+                lines.push(ToChild::QuietOver { room: room.clone() });
+            }
+        }
+        for line in lines {
+            self.send(&line);
+        }
     }
 
     /// Take lines into a connected room: each is journalled before it can be handed on, and
@@ -1587,6 +1788,26 @@ pub(crate) trait RoomSource: Send + Sync {
     fn ack(&self, room: &str, as_id: &str, app_word: &str, seq: u64) -> Result<(), SourceError>;
     /// Which bridge is running; a different answer means every room has ended.
     fn generation(&self) -> u64;
+    /// The bridge's event stream, which says what each session is doing (#205).
+    fn events(&self) -> Result<Box<dyn Read + Send>, SourceError>;
+}
+
+/// One message the owner sends, as the bridge is asked to publish it (#205).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OwnerPost {
+    /// The Discord message it came from: the bridge's key for telling two posts apart.
+    pub discord_message_id: String,
+    pub to: String,
+    pub kind: String,
+    pub text: String,
+    pub in_reply_to: Option<u64>,
+}
+
+/// Why the bridge did not publish an owner post, and who could have been written to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Refused {
+    pub message: String,
+    pub names: Option<Vec<String>>,
 }
 
 /// The app's own acts on a room, which take the broker's secret.
@@ -1594,6 +1815,8 @@ pub(crate) trait RoomActs: Send + Sync {
     fn password(&self, room: &str) -> Option<String>;
     fn join_relay(&self, room: &str, member: &str, app_word: &str) -> Result<(), String>;
     fn leave(&self, room: &str, member: &str, app_word: &str) -> Result<(), String>;
+    /// Publish as [`OWNER_SENDER`], vouched by the app's word. Answers the seq.
+    fn post_owner(&self, room: &str, post: &OwnerPost, app_word: &str) -> Result<u64, Refused>;
 }
 
 pub(crate) struct Deps {
@@ -1601,7 +1824,7 @@ pub(crate) struct Deps {
     pub settings: Arc<dyn SettingsStore>,
     pub owners: Arc<dyn OwnerStore>,
     pub source: Arc<dyn RoomSource>,
-    pub acts: Box<dyn RoomActs>,
+    pub acts: Arc<dyn RoomActs>,
     pub state_path: PathBuf,
     pub log: SupervisorLog,
 }
@@ -1618,11 +1841,23 @@ struct ReaderHandle {
     join: JoinHandle<()>,
 }
 
+/// What the child's own requests reach as well as the app's commands (#205): the hub, the
+/// room readers and the app's acts, so a `disconnect_request` is the same disconnect as the
+/// button, and a `say` is checked against the owner in the Keychain.
+pub(crate) struct Core {
+    hub: Arc<Mutex<Hub>>,
+    readers: Mutex<HashMap<String, ReaderHandle>>,
+    presence: Mutex<Option<ReaderHandle>>,
+    acts: Arc<dyn RoomActs>,
+    source: Arc<dyn RoomSource>,
+    owners: Arc<dyn OwnerStore>,
+}
+
 pub(crate) struct DiscordState {
     hub: Arc<Mutex<Hub>>,
+    core: Arc<Core>,
     deps: Deps,
     supervisor: Mutex<Option<SupervisorHandle>>,
-    readers: Mutex<HashMap<String, ReaderHandle>>,
     launch: Mutex<Option<(PathBuf, PathBuf)>>,
     /// Whether a token is kept, as last read or written — so a status poll never asks the
     /// Keychain.
@@ -1636,7 +1871,7 @@ impl Default for DiscordState {
             settings: Arc::new(ConfigSettings),
             owners: Arc::new(KeychainOwner),
             source: Arc::new(BridgeSource { target: None }),
-            acts: Box::new(BridgeActs),
+            acts: Arc::new(BridgeActs),
             state_path: crate::home_dir()
                 .map(|home| home.join(".config").join("gyredeck").join("discord-state.json"))
                 .unwrap_or_else(|| PathBuf::from("discord-state.json")),
@@ -1695,11 +1930,19 @@ impl DiscordState {
         }
         let hub = Arc::new(Mutex::new(hub));
         lock(&hub).me = Arc::downgrade(&hub);
+        let core = Arc::new(Core {
+            hub: Arc::clone(&hub),
+            readers: Mutex::new(HashMap::new()),
+            presence: Mutex::new(None),
+            acts: Arc::clone(&deps.acts),
+            source: Arc::clone(&deps.source),
+            owners: Arc::clone(&deps.owners),
+        });
         Self {
             hub,
+            core,
             deps,
             supervisor: Mutex::new(None),
-            readers: Mutex::new(HashMap::new()),
             launch: Mutex::new(None),
             configured: AtomicBool::new(false),
         }
@@ -1745,13 +1988,12 @@ impl DiscordState {
             return Ok(());
         }
         let (stop_tx, stop_rx) = mpsc::channel();
-        let hub = Arc::clone(&self.hub);
+        let core = Arc::clone(&self.core);
         let state_path = self.deps.state_path.display().to_string();
         let log = self.deps.log.clone();
-        let owners = Arc::clone(&self.deps.owners);
         let join = thread::Builder::new()
             .name("gyredeck-discord-supervisor".to_string())
-            .spawn(move || supervise(Launch { node, script, token, state_path, owners }, hub, stop_rx, log))
+            .spawn(move || supervise(Launch { node, script, token, state_path }, core, stop_rx, log))
             .map_err(|error| format!("Could not start the Discord supervisor: {error}"))?;
         *supervisor = Some(SupervisorHandle { stop_tx, join });
         Ok(())
@@ -1802,11 +2044,13 @@ impl DiscordState {
     }
 
     fn stop_readers(&self) {
-        let readers: Vec<ReaderHandle> = self
+        let mut readers: Vec<ReaderHandle> = self
+            .core
             .readers
             .lock()
             .map(|mut readers| readers.drain().map(|(_, handle)| handle).collect())
             .unwrap_or_default();
+        readers.extend(self.core.presence.lock().ok().and_then(|mut slot| slot.take()));
         for reader in &readers {
             reader.stop.store(true, Ordering::SeqCst);
         }
@@ -2001,9 +2245,15 @@ impl DiscordState {
         let names: HashMap<String, String> =
             roster.members.iter().map(|entry| (entry.id.clone(), entry.shown.clone())).collect();
         let room_seq = roster.seq;
-        let connected = lock(&self.hub).connect(room, roster.members.into_iter().map(|entry| entry.shown).collect(), roster.created_at);
-        if let Some(feed) = lock(&self.hub).rooms.get_mut(room) {
-            feed.bridge_seq = room_seq.unwrap_or(0);
+        let connected = lock(&self.hub).connect(room, roster.members.iter().map(|entry| entry.shown.clone()).collect(), roster.created_at);
+        {
+            let mut hub = lock(&self.hub);
+            if let Some(feed) = hub.rooms.get_mut(room) {
+                feed.bridge_seq = room_seq.unwrap_or(0);
+                // The word the owner's posts and a Discord disconnect go with (#205).
+                feed.word = app_word.to_string();
+            }
+            hub.set_agents(room, &roster);
         }
         if let Err(error) = connected {
             if let Err(left) = self.deps.acts.leave(room, &member, app_word) {
@@ -2038,11 +2288,12 @@ impl DiscordState {
             .name(format!("gyredeck-discord-{room}"))
             .spawn(move || reader.run())
             .map_err(|error| format!("Could not start reading the room: {error}"))?;
-        if let Ok(mut readers) = self.readers.lock() {
+        if let Ok(mut readers) = self.core.readers.lock() {
             if let Some(old) = readers.insert(room.to_string(), ReaderHandle { stop, join }) {
                 old.stop.store(true, Ordering::SeqCst);
             }
         }
+        self.core.watch_presence();
         Ok(self.status())
     }
 
@@ -2050,6 +2301,16 @@ impl DiscordState {
         if !valid_sync_code(room) {
             return Err("Not a room code".to_string());
         }
+        self.core.disconnect(room, app_word)?;
+        Ok(self.status())
+    }
+}
+
+impl Core {
+    /// Stop reading a room, close its post as Disconnected, and take the relay out: the one
+    /// disconnect, for the button, Remove and the owner's ✅ on Discord (#205). The room
+    /// itself goes on.
+    fn disconnect(&self, room: &str, app_word: Option<&str>) -> Result<(), String> {
         let reader = self.readers.lock().ok().and_then(|mut readers| readers.remove(room));
         if let Some(reader) = reader {
             reader.stop.store(true, Ordering::SeqCst);
@@ -2059,19 +2320,19 @@ impl DiscordState {
             let mut hub = lock(&self.hub);
             (hub.disconnect(room, DisconnectReason::Disconnected), hub.leaving.contains_key(room))
         };
+        self.stop_presence_if_idle();
         if !was_connected && !was_leaving {
-            return Ok(self.status());
+            return Ok(());
         }
         let left = match app_word {
-            Some(word) => self.deps.acts.leave(room, &relay_member(room), word),
+            Some(word) => self.acts.leave(room, &relay_member(room), word),
             None => Err("Gyredeck could not vouch for itself to its own bridge".to_string()),
         };
         let mut hub = lock(&self.hub);
         match left {
             Ok(()) => {
                 hub.leaving.remove(room);
-                drop(hub);
-                Ok(self.status())
+                Ok(())
             }
             Err(error) => {
                 let said = format!("the Discord member is still in room {room} ({error}). Disconnect it again to retry");
@@ -2079,6 +2340,127 @@ impl DiscordState {
                 Err(said)
             }
         }
+    }
+
+    /// The owner in the Keychain, read now: never a copy in the config, nor the child's word.
+    /// An item that cannot be read is no owner, so nothing is taken from Discord (#205).
+    fn keychain_owner(&self, owner_id: &str) -> Result<Owner, String> {
+        let owner = match self.owners.read() {
+            Ok(Some(owner)) => owner,
+            Ok(None) => return Err("No Discord account is paired with Gyredeck, so nothing was sent".to_string()),
+            Err(why) => return Err(format!("Gyredeck could not read the paired owner from the Keychain ({why}), so nothing was sent")),
+        };
+        if owner.id != owner_id {
+            return Err("Only the paired owner speaks for Gyredeck here, so nothing was sent".to_string());
+        }
+        Ok(owner)
+    }
+
+    /// The child asked, on the owner's ✅: the same disconnect the button runs, with the word
+    /// each room was connected with. Checked again here: the owner in the Keychain confirmed
+    /// it, and a single room's request came from that room's own post.
+    fn disconnect_requested(&self, room: Option<String>, all: bool, owner_id: &str, thread_id: Option<&str>, created_at: Option<u64>, quiet: bool) {
+        if self.keychain_owner(owner_id).is_err() {
+            return;
+        }
+        let rooms: Vec<(String, String)> = {
+            let hub = lock(&self.hub);
+            hub.rooms
+                .iter()
+                .filter(|(code, feed)| {
+                    // Every room at once is the app's own button; Discord acts on one post's room (owner, 2026-11-02).
+                    !all && (room.as_deref() == Some(code.as_str())
+                        && feed.thread_id.is_some()
+                        && feed.thread_id.as_deref() == thread_id
+                        && created_at.is_none_or(|at| feed.created_at == Some(at))
+                        && (!quiet || feed.quiet_said))
+                })
+                .map(|(code, feed)| (code.clone(), feed.word.clone()))
+                .collect()
+        };
+        for (code, word) in rooms {
+            let _ = self.disconnect(&code, Some(&word));
+        }
+    }
+
+    /// Follow the bridge's event stream while any room is connected, for the quiet prompt.
+    fn watch_presence(&self) {
+        let Ok(mut slot) = self.presence.lock() else {
+            return;
+        };
+        if slot.as_ref().is_some_and(|handle| !handle.join.is_finished()) {
+            return;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = PresenceReader { source: Arc::clone(&self.source), hub: Arc::clone(&self.hub), stop: Arc::clone(&stop) };
+        if let Ok(join) = thread::Builder::new().name("gyredeck-discord-presence".to_string()).spawn(move || reader.run()) {
+            *slot = Some(ReaderHandle { stop, join });
+        }
+    }
+
+    fn stop_presence_if_idle(&self) {
+        if !lock(&self.hub).rooms.is_empty() {
+            return;
+        }
+        let presence = self.presence.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(presence) = presence {
+            presence.stop.store(true, Ordering::SeqCst);
+            let _ = presence.join.join();
+        }
+    }
+
+    /// The owner's `say`, checked again here, then published as the owner, vouched. The
+    /// answer goes to the child in the order the says came; the hub is unlocked meanwhile.
+    fn say(&self, say: Say) {
+        let id = say.discord_message_id.clone();
+        let answer = match self.check_say(&say) {
+            Err(error) => ToChild::Said { discord_message_id: id, ok: false, seq: None, error: Some(error), names: None },
+            Ok((word, post)) => match self.acts.post_owner(&say.room, &post, &word) {
+                Ok(seq) => ToChild::Said { discord_message_id: id, ok: true, seq: Some(seq), error: None, names: None },
+                Err(refused) => ToChild::Said { discord_message_id: id, ok: false, seq: None, error: Some(refused.message), names: refused.names },
+            },
+        };
+        lock(&self.hub).send(&answer);
+    }
+
+    fn check_say(&self, say: &Say) -> Result<(String, OwnerPost), String> {
+        // A say saved by a child that died before its receipt: its room may have gone since,
+        // and whether the first try reached it cannot be told from here.
+        let gone = if say.retry {
+            "Gyredeck restarted before it could confirm this message, and this room is no longer connected to Discord, so it may or may not have reached the room. Nothing more was sent"
+        } else {
+            "This room is no longer connected to Discord, so nothing was sent"
+        };
+        if !valid_snowflake(&say.discord_message_id) {
+            return Err("That is not a Discord message, so nothing was sent".to_string());
+        }
+        let (word, thread) = {
+            let hub = lock(&self.hub);
+            let Some(feed) = hub.rooms.get(&say.room) else {
+                return Err(gone.to_string());
+            };
+            (feed.word.clone(), feed.thread_id.clone())
+        };
+        let Some(thread) = thread else {
+            return Err("This post is not open for the room yet, so nothing was sent".to_string());
+        };
+        if say.thread_id != thread {
+            return Err("This is not the room's post, so nothing was sent".to_string());
+        }
+        self.keychain_owner(&say.owner_id)?;
+        if say.text.trim().is_empty() {
+            return Err("There is nothing to send".to_string());
+        }
+        if word.is_empty() {
+            return Err(gone.to_string());
+        }
+        let to = say.to.as_deref().map(str::trim).filter(|to| !to.is_empty()).unwrap_or("everyone").to_string();
+        let kind = match say.kind.as_deref() {
+            Some(kind @ ("ask" | "tell" | "reaction")) => kind.to_string(),
+            _ if to == "everyone" => "tell".to_string(),
+            _ => "ask".to_string(),
+        };
+        Ok((word, OwnerPost { discord_message_id: say.discord_message_id.clone(), to, kind, text: say.text.clone(), in_reply_to: say.reply_to_seq }))
     }
 }
 
@@ -2140,11 +2522,11 @@ struct Launch {
     script: PathBuf,
     token: BotToken,
     state_path: String,
-    owners: Arc<dyn OwnerStore>,
 }
 
-fn supervise(launch: Launch, hub: Arc<Mutex<Hub>>, stop_rx: mpsc::Receiver<()>, log: SupervisorLog) {
-    let Launch { node, script, token, state_path, owners } = launch;
+fn supervise(launch: Launch, core: Arc<Core>, stop_rx: mpsc::Receiver<()>, log: SupervisorLog) {
+    let Launch { node, script, token, state_path } = launch;
+    let hub = Arc::clone(&core.hub);
     let mut child: Option<(Child, Instant)> = None;
     let mut backoff = Duration::from_secs(1);
     let mut next_start = Instant::now();
@@ -2180,7 +2562,7 @@ fn supervise(launch: Launch, hub: Arc<Mutex<Hub>>, stop_rx: mpsc::Receiver<()>, 
                 hub.epoch += 1;
                 hub.epoch
             };
-            match spawn_child(&node, &script, &hub, &owners, epoch) {
+            match spawn_child(&node, &script, &core, epoch) {
                 Ok((process, channel)) => {
                     let mut fields = serde_json::Map::new();
                     fields.insert("pid".to_string(), serde_json::Value::from(process.id()));
@@ -2197,6 +2579,9 @@ fn supervise(launch: Launch, hub: Arc<Mutex<Hub>>, stop_rx: mpsc::Receiver<()>, 
                     next_start = Instant::now() + backoff;
                 }
             }
+        }
+        if child.is_some() {
+            lock(&hub).check_quiet(Instant::now());
         }
         match stop_rx.recv_timeout(SUPERVISOR_INTERVAL) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2221,13 +2606,7 @@ fn supervise(launch: Launch, hub: Arc<Mutex<Hub>>, stop_rx: mpsc::Receiver<()>, 
     }
 }
 
-fn spawn_child(
-    node: &Path,
-    script: &Path,
-    hub: &Arc<Mutex<Hub>>,
-    owners: &Arc<dyn OwnerStore>,
-    epoch: u64,
-) -> Result<(Child, ChildChannel), String> {
+fn spawn_child(node: &Path, script: &Path, core: &Arc<Core>, epoch: u64) -> Result<(Child, ChildChannel), String> {
     // Nothing of the app's environment goes with it, and the token is not in argv either.
     let mut command = Command::new(node);
     command
@@ -2247,15 +2626,14 @@ fn spawn_child(
         let _ = process.wait();
         return Err("The Discord connector was started without its pipes".to_string());
     };
-    let hub = Arc::clone(hub);
-    let owners = Arc::clone(owners);
+    let core = Arc::clone(core);
     let _ = thread::Builder::new()
         .name("gyredeck-discord-stdout".to_string())
-        .spawn(move || read_child(stdout, &hub, owners.as_ref(), epoch));
+        .spawn(move || read_child(stdout, &core, epoch));
     Ok((process, ChildChannel::new(Box::new(stdin))))
 }
 
-fn read_child(stdout: impl Read, hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64) {
+fn read_child(stdout: impl Read, core: &Core, epoch: u64) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
     loop {
@@ -2273,9 +2651,34 @@ fn read_child(stdout: impl Read, hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoc
             continue;
         }
         if let Ok(event) = serde_json::from_slice::<FromChild>(&line) {
-            on_child_event_from(hub, owners, epoch, event);
+            on_core_event_from(core, epoch, event);
         }
     }
+}
+
+/// What child `epoch` said, with what the hub alone cannot do: a `say` is published and a
+/// `disconnect_request` disconnects, each with the hub unlocked while the bridge answers.
+fn on_core_event_from(core: &Core, epoch: u64, event: FromChild) {
+    match event {
+        FromChild::Say(say) => {
+            if lock(&core.hub).epoch == epoch {
+                core.say(say);
+            }
+        }
+        FromChild::DisconnectRequest { room, all, owner_id, thread_id, created_at, quiet } => {
+            if lock(&core.hub).epoch == epoch {
+                core.disconnect_requested(room, all, &owner_id, thread_id.as_deref(), created_at, quiet);
+            }
+        }
+        other => on_child_event_from(&core.hub, core.owners.as_ref(), epoch, other),
+    }
+}
+
+/// What the current child said, through the core; the tests' way in for #205's lines.
+#[cfg(test)]
+fn on_core_event(core: &Core, event: FromChild) {
+    let epoch = lock(&core.hub).epoch;
+    on_core_event_from(core, epoch, event);
 }
 
 /// What the current child said; the tests' way in.
@@ -2358,7 +2761,16 @@ fn on_child_event_from(hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64, ev
         }
         FromChild::Posted { room, seq, created_at, msg_id } => hub.ack(&room, seq, created_at, msg_id),
         FromChild::Closed { room, created_at, id } => hub.closed(&room, created_at, id),
-        FromChild::Connected {} => {}
+        // The post of the room instance followed now; one of an earlier instance, replayed
+        // while it drains, is not where the owner speaks to this one.
+        FromChild::Connected { room: Some(room), thread_id: Some(thread_id), created_at } => {
+            if let Some(feed) = hub.rooms.get_mut(&room) {
+                if created_at.is_none() || created_at == feed.created_at {
+                    feed.thread_id = Some(thread_id);
+                }
+            }
+        }
+        FromChild::Connected { .. } | FromChild::Say(_) | FromChild::DisconnectRequest { .. } => {}
     }
 }
 
@@ -2409,6 +2821,9 @@ struct WireMessage {
     /// The sender as the room showed it when it spoke (#182): its declared name, if any.
     #[serde(default, rename = "fromShown")]
     from_shown: Option<String>,
+    /// Kept only when it is `true` on an ask; any other value is no flag (#205).
+    #[serde(default, rename = "yesNo")]
+    yes_no: Option<serde_json::Value>,
 }
 
 impl RoomReader {
@@ -2609,6 +3024,7 @@ impl RoomReader {
                 feed.bridge_seq = feed.bridge_seq.max(seq);
             }
         }
+        lock(&self.hub).set_agents(&self.room, &roster);
         for member in roster.members {
             self.names.insert(member.id, member.shown);
         }
@@ -2619,6 +3035,7 @@ impl RoomReader {
         match id {
             ROOM_SENDER => return "Room".to_string(),
             APP_SENDER => return "You (via Gyredeck)".to_string(),
+            OWNER_SENDER => return OWNER_LABEL.to_string(),
             _ => {}
         }
         if !self.names.contains_key(id) {
@@ -2636,7 +3053,7 @@ impl RoomReader {
             self.names_stale = false;
         }
         let sender = match message.from_shown.as_deref().map(str::trim).filter(|shown| !shown.is_empty()) {
-            Some(shown) if message.from != ROOM_SENDER && message.from != APP_SENDER => {
+            Some(shown) if ![ROOM_SENDER, APP_SENDER, OWNER_SENDER].contains(&message.from.as_str()) => {
                 let held = self.names.get(&message.from).map(String::as_str);
                 if held != Some(shown) && self.shown_checked.get(&message.from).map(String::as_str) != Some(shown) {
                     if self.refresh_names() {
@@ -2651,7 +3068,7 @@ impl RoomReader {
         };
         let to = match message.to.as_deref() {
             None | Some("everyone") => "everyone".to_string(),
-            Some(id) if self.names.contains_key(id) || id == APP_SENDER || id == ROOM_SENDER => self.name_of(id),
+            Some(id) if self.names.contains_key(id) || [APP_SENDER, ROOM_SENDER, OWNER_SENDER].contains(&id) => self.name_of(id),
             Some(other) => {
                 self.refresh_names();
                 self.names.get(other).cloned().unwrap_or_else(|| other.to_string())
@@ -2662,6 +3079,9 @@ impl RoomReader {
             _ => "tell".to_string(),
         };
         let from_room = message.from == ROOM_SENDER;
+        // The person, by either of their voices: an ask to them is the one that pings (#205).
+        let to_owner = kind == "ask" && matches!(message.to.as_deref(), Some(OWNER_SENDER | APP_SENDER));
+        let yes_no = kind == "ask" && message.yes_no == Some(serde_json::Value::Bool(true));
         let forwarded = lock(&self.hub).forward(ToChild::Message {
             room: self.room.clone(),
             seq: message.seq,
@@ -2670,12 +3090,66 @@ impl RoomReader {
             kind,
             text: message.text,
             ts: message.ts.unwrap_or_default(),
+            sender_id: Some(message.from),
+            to_owner,
+            yes_no,
         });
         // The room's notices are where joins and departures are said.
         if from_room {
             self.refresh_names();
         }
         forwarded
+    }
+}
+
+/// Follows the bridge's event stream and notes, per session, whether it is working (#205).
+struct PresenceReader {
+    source: Arc<dyn RoomSource>,
+    hub: Arc<Mutex<Hub>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl PresenceReader {
+    fn run(self) {
+        let mut backoff = Duration::from_secs(1);
+        while !self.stop.load(Ordering::SeqCst) {
+            if let Ok(stream) = self.source.events() {
+                backoff = Duration::from_secs(1);
+                self.follow(stream);
+                continue;
+            }
+            let until = Instant::now() + backoff;
+            while Instant::now() < until {
+                if self.stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(READER_POLL.min(until.saturating_duration_since(Instant::now())));
+            }
+            backoff = (backoff * 2).min(READER_BACKOFF_MAX);
+        }
+    }
+
+    fn follow(&self, mut stream: Box<dyn Read + Send>) {
+        let mut parser = SseParser::default();
+        let mut buffer = [0_u8; 8192];
+        while !self.stop.load(Ordering::SeqCst) {
+            match stream.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(read) => {
+                    for event in parser.feed(&buffer[..read]) {
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+                            continue;
+                        };
+                        let kind = value.get("type").and_then(serde_json::Value::as_str).unwrap_or(&event.name);
+                        if let Some(id) = value.get("conversationId").and_then(serde_json::Value::as_str) {
+                            lock(&self.hub).note_presence(id, kind, Instant::now());
+                        }
+                    }
+                }
+                Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
+                Err(_) => return,
+            }
+        }
     }
 }
 
@@ -2959,6 +3433,45 @@ impl RoomActs for BridgeActs {
     fn leave(&self, room: &str, member: &str, app_word: &str) -> Result<(), String> {
         standalone_bridge::sync_leave(room, member, app_word)
     }
+
+    fn post_owner(&self, room: &str, post: &OwnerPost, app_word: &str) -> Result<u64, Refused> {
+        let target = standalone_bridge::BridgeTarget::configured()
+            .map_err(|error| Refused { message: format!("Gyredeck could not reach its bridge: {error}"), names: None })?;
+        post_owner_to(&target, room, post, app_word)
+    }
+}
+
+/// Publish one owner post on `target` with the machine token and the app's word (#205).
+pub(crate) fn post_owner_to(target: &standalone_bridge::BridgeTarget, room: &str, post: &OwnerPost, app_word: &str) -> Result<u64, Refused> {
+    if !valid_sync_code(room) {
+        return Err(Refused { message: "Not a room code".to_string(), names: None });
+    }
+    let mut body = serde_json::json!({
+        "from": OWNER_SENDER,
+        "to": post.to,
+        "kind": post.kind,
+        "text": post.text,
+        "discordMessageId": post.discord_message_id,
+    });
+    if let Some(seq) = post.in_reply_to {
+        body["inReplyTo"] = serde_json::Value::from(seq);
+    }
+    let (status, value) = standalone_bridge::bridge_request_to(target, "POST", &format!("/mail/{room}"), Some(body.to_string()), Duration::from_secs(3), Some(app_word))
+        .map_err(|error| Refused { message: format!("Gyredeck could not reach its bridge: {error}"), names: None })?;
+    // 📨 only for a seq the bridge says it published.
+    if status == 202 && value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        if let Some(seq) = value.get("seq").and_then(serde_json::Value::as_u64) {
+            return Ok(seq);
+        }
+    }
+    Err(Refused {
+        message: value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("The room did not take it (status {status})")),
+        names: value.get("names").and_then(serde_json::Value::as_array).map(|names| names.iter().filter_map(serde_json::Value::as_str).map(ToOwned::to_owned).collect()),
+    })
 }
 
 /// The running bridge; `target` names one a test started, `None` the configured one.
@@ -3047,6 +3560,22 @@ impl RoomSource for BridgeSource {
             Ok((404, _)) => Err(SourceError::Gone),
             Ok(_) | Err(_) => Err(SourceError::Unavailable),
         }
+    }
+
+    fn events(&self) -> Result<Box<dyn Read + Send>, SourceError> {
+        let target = self.target()?;
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), target.port);
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(1500)).map_err(|_| SourceError::Unavailable)?;
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
+        let request = format!(
+            "GET /events HTTP/1.0\r\nHost: {}:{}\r\nAccept: text/event-stream\r\nX-Gyredeck-Token: {}\r\n\r\n",
+            standalone_bridge::BRIDGE_HOST,
+            target.port,
+            target.token
+        );
+        stream.write_all(request.as_bytes()).map_err(|_| SourceError::Unavailable)?;
+        let _ = stream.set_read_timeout(Some(READER_POLL));
+        Ok(Box::new(stream))
     }
 
     fn generation(&self) -> u64 {

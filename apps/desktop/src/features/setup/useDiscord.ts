@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useState } from "react";
+import { disconnectAll, type IDisconnectAllResult } from "./disconnectAll";
 
 /** `discord_status()`, as the native side answers it (#199). */
 export interface IDiscordStatus {
@@ -33,6 +34,9 @@ export interface IUseDiscord {
   failure: string | null;
   busy: boolean;
   run: (command: string, args?: Record<string, unknown>) => Promise<unknown>;
+  /** Disconnect these rooms from Discord; what failed is kept until the next try (#205). */
+  disconnectAll: (rooms: readonly string[]) => Promise<void>;
+  stillConnected: IDisconnectAllResult["failed"];
 }
 
 const DISCORD_POLL_MS = 5_000;
@@ -42,6 +46,7 @@ export const useDiscord = (canUseNativeControls: boolean): IUseDiscord => {
   const [status, setStatus] = useState<IDiscordStatus | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [stillConnected, setStillConnected] = useState<IDisconnectAllResult["failed"]>([]);
 
   const read = useCallback(async () => {
     try {
@@ -72,5 +77,17 @@ export const useDiscord = (canUseNativeControls: boolean): IUseDiscord => {
     }
   }, [read]);
 
-  return { status, failure, busy, run };
+  const disconnectEvery = useCallback(async (rooms: readonly string[]) => {
+    setBusy(true);
+    setFailure(null);
+    try {
+      const result = await disconnectAll(rooms, (code) => invoke("discord_disconnect", { code }));
+      setStillConnected(result.failed);
+    } finally {
+      await read();
+      setBusy(false);
+    }
+  }, [read]);
+
+  return { status, failure, busy, run, disconnectAll: disconnectEvery, stillConnected };
 };

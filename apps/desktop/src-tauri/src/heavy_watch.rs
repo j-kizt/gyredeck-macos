@@ -564,6 +564,7 @@ pub(crate) fn start(
     app_word: String,
     session_of: Arc<dyn Fn(i32) -> Option<String> + Send + Sync>,
     emit: Arc<dyn Fn(serde_json::Value) + Send + Sync>,
+    keep_awake: Arc<dyn Fn(crate::keep_awake::HeavySeen) + Send + Sync>,
 ) -> Result<(), String> {
     let custom = Arc::clone(&state.custom);
     std::thread::Builder::new()
@@ -589,7 +590,12 @@ pub(crate) fn start(
                 // The slot as the bridge now sees it, every round, for the notifications
                 // (#244): helper runs start and end in the bridge, so it is asked rather
                 // than inferred. The window may be hidden; the webview still hears it.
-                if let Ok(state) = crate::standalone_bridge::heavy_status() {
+                let status = crate::standalone_bridge::heavy_status().ok();
+                // Every round, so a run that ends, or a bridge that stops answering, is heard
+                // within one interval whether or not the window is open (#278).
+                let observed: Vec<String> = runs.iter().map(|run| run.pattern.clone()).collect();
+                keep_awake(crate::keep_awake::heavy_seen(status.as_ref(), &observed));
+                if let Some(state) = status {
                     emit(state);
                 }
                 std::thread::sleep(SCAN_INTERVAL);

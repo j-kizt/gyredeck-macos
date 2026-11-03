@@ -1345,8 +1345,14 @@ fn set_launch_at_login(app: tauri::AppHandle, enabled: bool) -> Result<bool, Str
 }
 
 #[tauri::command]
-fn set_keep_awake(state: tauri::State<'_, KeepAwakeState>, active: bool) -> Result<bool, String> {
-    state.set_active(active)
+fn set_keep_awake(state: tauri::State<'_, KeepAwakeState>, active: bool, enabled: bool, page: u64, seq: u64) -> Result<keep_awake::Held, String> {
+    state.set_active(enabled, active, (page, seq))
+}
+
+/// The page's number for its keep-awake calls, asked once per load (#211).
+#[tauri::command]
+fn keep_awake_page(state: tauri::State<'_, KeepAwakeState>) -> Result<u64, String> {
+    state.new_page()
 }
 
 /// The session-event registry lives in the app's data folder, not localStorage (#280).
@@ -6565,6 +6571,7 @@ pub fn run() {
             request_notification_permission,
             open_notification_settings,
             set_keep_awake,
+            keep_awake_page,
             launch_at_login_enabled,
             set_launch_at_login,
             install_codex_notify,
@@ -6593,6 +6600,8 @@ pub fn run() {
         .invoke_handler(move |invoke| command_handler(invoke))
         .setup(|app| {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            let awake = app.handle().clone();
+            app.state::<discord::DiscordState>().on_rooms(std::sync::Arc::new(move |rooms| awake.state::<KeepAwakeState>().set_discord_rooms(rooms)));
             notification::initialize();
             let preference = read_display_preference(app.handle());
             app.state::<DisplayPreferenceState>().set(preference);
@@ -6683,7 +6692,9 @@ pub fn run() {
                     use tauri::Emitter;
                     let _ = handle.emit("heavy_state", state);
                 });
-                if let Err(error) = heavy_watch::start(&watch, secret, session_of, emit) {
+                let awake = app.handle().clone();
+                let keep_awake = std::sync::Arc::new(move |seen| awake.state::<KeepAwakeState>().set_heavy(seen, std::time::Instant::now()));
+                if let Err(error) = heavy_watch::start(&watch, secret, session_of, emit, keep_awake) {
                     eprintln!("{error}");
                 }
             }
@@ -6740,14 +6751,14 @@ pub fn run() {
             // Before the bridge: every room ends with it, and each followed post is told so.
             app_handle.state::<discord::DiscordState>().shutdown();
             app_handle.state::<StandaloneBridgeState>().stop();
-            let _ = app_handle.state::<KeepAwakeState>().set_active(false);
+            app_handle.state::<KeepAwakeState>().release_all();
         }
         tauri::RunEvent::WindowEvent {
             label,
             event: tauri::WindowEvent::Destroyed,
             ..
         } if label == "main" => {
-            let _ = app_handle.state::<KeepAwakeState>().set_active(false);
+            app_handle.state::<KeepAwakeState>().release_all();
         }
         // Clicking the app icon (Launchpad/Dock/Finder) while the menu-bar app is
         // already running fires Reopen; surface the window instead of doing nothing.

@@ -811,6 +811,8 @@ struct Hub {
     dropped_lines: BTreeMap<String, String>,
     /// The Hub's own handle, for the stdin writer an attach starts.
     me: Weak<Mutex<Hub>>,
+    /// Told the followed room codes whenever one is followed or let go (#211).
+    on_rooms: Option<Arc<dyn Fn(Vec<String>) + Send + Sync>>,
     /// Wakes the stdin writer when the outbox has something.
     wake: Arc<Condvar>,
     /// What the current child is handed next, in order: references, never copies (I18).
@@ -1040,6 +1042,7 @@ impl Hub {
         let id = feed.id;
         self.resume.remove(room);
         self.rooms.insert(room.to_string(), feed);
+        self.rooms_changed();
         self.send(&line);
         self.queue_feed(room, id);
         Ok(())
@@ -1247,6 +1250,12 @@ impl Hub {
         self.pending.push_back(Pending { room: room.to_string(), file, record, then: Then::LossLanded { room: room.to_string(), at, feed, line } });
     }
 
+    fn rooms_changed(&self) {
+        if let Some(on_rooms) = &self.on_rooms {
+            on_rooms(self.rooms.keys().cloned().collect());
+        }
+    }
+
     fn disconnect(&mut self, room: &str, reason: DisconnectReason) -> bool {
         let Some(mut feed) = self.rooms.remove(room) else {
             if reason == DisconnectReason::Closed {
@@ -1254,6 +1263,7 @@ impl Hub {
             }
             return false;
         };
+        self.rooms_changed();
         match reason {
             DisconnectReason::Disconnected => {
                 self.resume.insert(room.to_string(), (feed.created_at, feed.last_seq, feed.seen_through()));
@@ -1971,6 +1981,13 @@ fn valid_snowflake(id: &str) -> bool {
 }
 
 impl DiscordState {
+    /// Told the followed room codes now, and every time one is followed or let go.
+    pub(crate) fn on_rooms(&self, on_rooms: Arc<dyn Fn(Vec<String>) + Send + Sync>) {
+        let mut hub = lock(&self.hub);
+        hub.on_rooms = Some(on_rooms);
+        hub.rooms_changed();
+    }
+
     pub(crate) fn with(deps: Deps) -> Self {
         // An owner id an earlier build left in the config never counts; it is deleted.
         if LEGACY_OWNER_KEYS.iter().any(|key| deps.settings.get(key).is_some()) {

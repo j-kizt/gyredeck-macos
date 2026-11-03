@@ -4884,6 +4884,19 @@ fn an_owner_record_that_cannot_be_read_is_an_error_never_no_owner() {
     }
 }
 
+/// #211: keep-awake hears every room followed and let go, straight from the hub.
+#[test]
+fn the_followed_rooms_are_told_on_connect_and_on_disconnect() {
+    let f = fixture("on-rooms", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    let told = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let sink = Arc::clone(&told);
+    f.state.on_rooms(Arc::new(move |rooms| sink.lock().unwrap().push(rooms)));
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.state.disconnect(ROOM, Some(APP_WORD)).unwrap();
+    assert_eq!(*told.lock().unwrap(), vec![vec![], vec![ROOM.to_string()], vec![]]);
+}
+
 // ---- #206 /status: asked by the child, answered by the app from what it holds ----
 
 fn status_ask(f: &Fixture, buffer: &SharedBuf, json: String) -> Vec<serde_json::Value> {

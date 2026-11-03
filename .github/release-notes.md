@@ -1,5 +1,20 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Your Mac stays awake for Discord rooms and long checks — (v1.32.0)
+
+### Added
+
+- **With "Keep awake while working" on, a room connected to Discord keeps the Mac from idle
+  sleep**, so a message you send from Discord reaches an agent that is still running. Only idle
+  *system* sleep is held: the display may still dim and sleep. Closing the lid still sleeps the
+  Mac.
+- **A heavy run holds it too** — a check queued through the heavy-run helper, or a heavy command
+  Gyredeck sees running outside it — until it ends, so a long build or test run is not cut off
+  by idle sleep. If Gyredeck's bridge cannot be asked, the last answer holds for two minutes, then
+  lets go.
+- **Settings says what is holding the Mac awake**, for example "sync-ab12 connected to Discord —
+  the Mac won't idle-sleep", and says "Unavailable" with the reason when macOS refuses.
+
 ## Ask Discord how a room is doing — (v1.31.0)
 
 ### Added

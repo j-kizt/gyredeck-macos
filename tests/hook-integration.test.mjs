@@ -1339,11 +1339,26 @@ test("speaking in a room is granted by the founder, one session at a time", asyn
       return { status: response.status, body: await response.json() };
     };
 
-    const spoke = await asRoom(`/mail/${code}`, { from: joiner, text: "yes" });
+    // A post never lets a member in (#294): the password confirms the joiner through the
+    // room's /confirm, and only then may it speak.
+    const unconfirmedPost = await asRoom(`/mail/${code}`, { from: joiner, text: "yes" });
+    assert.equal(unconfirmedPost.status, 403, "a post with the password does not confirm a pending member");
+    assert.equal(unconfirmedPost.body.error, "not_confirmed");
+    assert.equal((await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: joiner, password: minted.body.password })).status, 200);
+
+    // Every member holds the password, so a post in the joiner's name takes its own key too.
+    const passwordPost = await asRoom(`/mail/${code}`, { from: joiner, text: "yes" });
+    assert.equal(passwordPost.status, 403, "the password alone does not post as a member");
+    assert.equal(passwordPost.body.error, "not_your_key");
+    const spoke = await fetch(`http://127.0.0.1:${port}/mail/${code}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(await memberHeaders(`http://127.0.0.1:${port}`, joiner, minted.body.password)) },
+      body: JSON.stringify({ from: joiner, text: "yes" }),
+    });
     assert.equal(spoke.status, 202);
 
-    // Presenting it once is remembered, because Codex never posts for itself: the
-    // bridge reads its answer out of its own log and publishes with no header at all.
+    // Confirming is remembered, because Codex never posts for itself: the bridge reads
+    // its answer out of its own log and publishes on the broker's word.
     assert.equal(
       (await call("GET", `/sync/rooms?as=${joiner}`)).body.members.find((m) => m.conversationId === joiner).confirmed,
       true,
@@ -1811,6 +1826,11 @@ test("a room delivery carries only what the session can use, and points at the r
     const tell = await context();
     assert.match(tell, /REPLY —/);
     assert.match(tell, /"to":"Codex","kind":"reaction"/);
+    // #294: the REPLY carries this session's own key, and run as printed it posts.
+    const reply = tell.split("\n").find((line) => line.startsWith("curl -s -X POST"));
+    assert.match(reply, /-H "x-gyredeck-member: [a-f0-9]{64}"/, "the REPLY carries the member's own key");
+    const ran = spawnSync("sh", ["-c", reply.replace("THE ROOM PASSWORD", minted.password).replace("YOUR REPLY HERE", "seen")], { encoding: "utf8" });
+    assert.equal(JSON.parse(ran.stdout).ok, true, `the printed REPLY posts: ${ran.stdout}`);
 
     // An ask wants an answer, to the asker.
     await post(`/mail/${code}`, { from: peer, to: me, kind: "ask", text: "which branch?" });
@@ -7645,9 +7665,11 @@ test("a receipt says what landed: listening by name, one post for a repeated tel
   try {
     assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), room.stderrRef.value);
     const password = (await room.call("POST", `/sync/rooms/${room.code}/passwords`, { conversationId: room.founder })).body.password;
+    // A post in the founder's name takes the founder's own key beside the password (#294).
+    const founderHeaders = await memberHeaders(`http://127.0.0.1:${room.port}`, room.founder, room.headers["x-gyredeck-token"], password);
     const post = async (body) => {
       const response = await fetch(`http://127.0.0.1:${room.port}/mail/${room.code}`, {
-        method: "POST", headers: { "content-type": "application/json", "x-gyredeck-token": password }, body: JSON.stringify(body),
+        method: "POST", headers: { "content-type": "application/json", ...founderHeaders }, body: JSON.stringify(body),
       });
       return response.json();
     };
@@ -9223,7 +9245,9 @@ test("the bridge refuses an old-path collect for a session the broker has bound,
     await call("POST", `/sync/rooms/${code}/members`, { "x-gyredeck-broker": secret }, { conversationId: bound });
     const password = (await call("POST", `/sync/rooms/${code}/passwords`, { "x-gyredeck-broker": secret }, { conversationId: unbound })).body.password;
     await call("POST", `/sync/rooms/${code}/confirm`, { "x-gyredeck-broker": secret }, { conversationId: bound, password });
-    await call("POST", `/mail/${code}`, { "x-gyredeck-token": password }, { from: unbound, text: "room mail", to: bound, kind: "tell" });
+    // A post in the founder's name takes the founder's own key beside the password (#294).
+    const asFounder = await memberHeaders(`http://127.0.0.1:${port}`, unbound, token, password);
+    await call("POST", `/mail/${code}`, asFounder, { from: unbound, text: "room mail", to: bound, kind: "tell" });
     // Reading in a member's name takes that member's own key beside the password (#274).
     const boundKey = await memberKeyAt(`http://127.0.0.1:${port}`, bound, token);
     const asBound = { "x-gyredeck-token": password, "x-gyredeck-member": boundKey };
@@ -9239,7 +9263,7 @@ test("the bridge refuses an old-path collect for a session the broker has bound,
     });
     assert.equal(onceWatch.status, 200, "not refused for a bound session");
     await new Promise((resolve) => setTimeout(resolve, 200));
-    await call("POST", `/mail/${code}`, { "x-gyredeck-token": password }, { from: unbound, text: "wake the bound one", to: bound, kind: "ask" });
+    await call("POST", `/mail/${code}`, asFounder, { from: unbound, text: "wake the bound one", to: bound, kind: "ask" });
     const woke = await Promise.race([
       onceWatch.text(),
       new Promise((resolve) => setTimeout(() => resolve("STILL OPEN"), 3_000)),
@@ -13347,27 +13371,27 @@ const confirmPaths = [
     before: true,
     confirm: (f, provider, id) => drainAs(f, provider, id),
   },
-  {
-    name: "posting with the password in the header",
-    who: async (f, provider) => {
-      if (provider === "agy") return f.agy;
-      const id = "a2590000-0000-4000-8000-0000000000c2";
-      await ingestAs(f, id, provider);
-      await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: id });
-      return id;
-    },
-    before: false,
-    confirm: async (f, provider, id) => {
-      const posted = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-gyredeck-token": f.password },
-        body: JSON.stringify({ from: id, to: f.founder, kind: "tell", text: "in by posting" }),
-      });
-      assert.equal((await posted.json()).ok, true, "premise: the post was accepted");
-      return drainAs(f, provider, id);
-    },
-  },
 ];
+
+// #294 (the owner's decision): a post never confirms. A pending member that posts with the
+// password is refused — it has no key yet — and stays pending; its hook's /confirm lets it in.
+test("#294 a pending member's post with the password is refused and does not confirm it", async () => {
+  const f = await agyPasteFixture("p294", { withBroker: true });
+  try {
+    const id = "a2940000-0000-4000-8000-0000000000c2";
+    await ingestAs(f, id, "claude");
+    await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: id });
+    const posted = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": f.password },
+      body: JSON.stringify({ from: id, to: f.founder, kind: "tell", text: "in by posting?" }),
+    });
+    assert.equal(posted.status, 403);
+    assert.equal(await confirmedIn(f, id), false, "still pending");
+  } finally {
+    await f.close();
+  }
+});
 
 for (const provider of ["claude", "agy"]) {
   for (const [index, path] of confirmPaths.entries()) {

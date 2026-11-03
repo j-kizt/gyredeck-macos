@@ -7845,19 +7845,9 @@ function startBridge(config) {
           }
           return;
         }
-        // This is where the password earns its place. A room with members is one people
-        // were put into deliberately, and the framing tells an agent that a request
-        // from a member is what it is there for — so being able to post as a member has
-        // to be granted, not assumed.
-        // Presenting the room's token is the whole of the authorisation, and it is
-        // presented on every call because that is where a credential already travels.
-        // The first time it arrives from a member, remember it: Codex never posts for
-        // itself — the bridge reads its answer out of its own log and publishes on its
-        // behalf, with no header to carry anything.
-        if (room.members.has(from) && holdsRoomPassword(room, headerToken)) {
-          const member = room.members.get(from);
-          if (member.confirmed !== true) markConfirmed(member);
-        }
+        // A post never lets a member in (#294, the owner's decision): a pending member is
+        // confirmed only by the password it is handed through its hook's /confirm, and a
+        // post in a member's name takes that member's own key, which a pending one has not.
         // The app's own call: the machine token and the app's word together, the pair the
         // app-only routes take. Only it may speak as the room or the person (#205).
         const vouched = holdsMachineToken(headerToken) && holdsBrokerSecret(req.headers["x-gyredeck-broker"]);

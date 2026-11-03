@@ -588,24 +588,23 @@ const AGY_ID: &str = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const AGY_BODY: &str = r#"\{"from":"$ID",[^'`;&|$\r\n]*\}"#;
 
 /// `$PORT` is the only part [`is_agy_sync_reply_rule`] lets vary.
-const AGY_SYNC_REPLY_TEMPLATES: [&str; 5] = [
+const AGY_SYNC_REPLY_TEMPLATES: [&str; 4] = [
     // HEAR, as the hook and the bridge print it (#228).
     r#"command(regex:^while :; do node ~/\.config/gyredeck/gyredeck-agy-hook\.mjs wait 300 $ID; rc=\$\?; \[ \$rc -eq 4 \] \|\| break; done$)"#,
     // WAIT, as the bridge's howTo prints it.
     r#"command(regex:^node ~/\.config/gyredeck/gyredeck-agy-hook\.mjs wait 60 $ID$)"#,
     // REPLY, as the hook prints it: the poster's own key beside the password (#294).
     r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H "x-gyredeck-token: $PW" -H "x-gyredeck-member: $KEY" -d '$BODY'$)"#,
-    // SEND, as the bridge's howTo prints it.
-    r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H 'x-gyredeck-token: $PW' -d '$BODY'$)"#,
     // READ again, as the hook prints it: the reader's own key beside the password (#274).
     r#"command(regex:^curl -s "http://$HOST:$PORT/mail/$ROOM\?as=$ID&since=[0-9]+&until=[0-9]+" -H "x-gyredeck-token: $PW" -H "x-gyredeck-member: $KEY"$)"#,
 ];
 
-/// Rules no longer written but still ours to remove: READ before it took a key (#274), and
-/// REPLY before it did (#294).
-const AGY_RETIRED_TEMPLATES: [&str; 2] = [
+/// Rules no longer written but still ours to remove: READ before it took a key (#274), REPLY
+/// before it did, and the howTo's SEND, which no longer prints a ready command (#294).
+const AGY_RETIRED_TEMPLATES: [&str; 3] = [
     r#"command(regex:^curl -s "http://$HOST:$PORT/mail/$ROOM\?as=$ID&since=[0-9]+&until=[0-9]+" -H "x-gyredeck-token: $PW"$)"#,
     r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H "x-gyredeck-token: $PW" -d '$BODY'$)"#,
+    r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H 'x-gyredeck-token: $PW' -d '$BODY'$)"#,
 ];
 
 /// Every template with everything but the port filled in.
@@ -7980,16 +7979,6 @@ mod agy_sync_reply_tests {
                 ],
             ),
             (
-                "send (howTo)",
-                format!("curl -s -X POST http://{HOST}:{port}/mail/sync-ab2c -H 'content-type: application/json' -H 'x-gyredeck-token: {PASSWORD}' -d '{{\"from\":\"{id}\",\"to\":\"everyone\",\"kind\":\"tell\",\"text\":\"hi\",\"replyTo\":\"{id}\"}}'"),
-                BRIDGE,
-                vec![
-                    "`curl -s -X POST http://${host}:${port}/mail/${name}` +",
-                    "` -H 'content-type: application/json' -H 'x-gyredeck-token: ${password}'` +",
-                    "` -d '{\"from\":\"${conversationId}\",\"to\":\"everyone\",\"kind\":\"tell\",\"text\":\"YOUR TEXT\",\"replyTo\":\"${conversationId}\"}'`,",
-                ],
-            ),
-            (
                 "read again",
                 format!("curl -s \"http://{HOST}:{port}/mail/sync-ab2c?as={id}&since=4&until=9\" -H \"x-gyredeck-token: {PASSWORD}\" -H \"x-gyredeck-member: {MEMBER_KEY}\""),
                 HOOK,
@@ -8186,7 +8175,7 @@ mod agy_sync_reply_tests {
             let mut want = file.clone();
             want["permissions"]["allow"] = serde_json::Value::Null;
             assert_eq!(read, want, "enabled={enabled}: everything but allow is as it was");
-            assert_eq!(allow.as_array().unwrap().len(), if enabled { 6 } else { 1 });
+            assert_eq!(allow.as_array().unwrap().len(), if enabled { 1 + AGY_SYNC_REPLY_TEMPLATES.len() } else { 1 });
             assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o644);
         }
     }

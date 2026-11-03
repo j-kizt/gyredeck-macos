@@ -194,8 +194,20 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
         await fake.after?.("reply", { content, id });
         return id ? { id } : null;
       };
-      events.emit("command", { name: "disconnect", ...fields, reply });
+      // /status answers in two steps (#206): deferred at once, the answer edited in later.
+      const answer = { name: fields.name ?? "disconnect", channelId: fields.channelId, deferred: null, edits: [] };
+      fake.interactions.push(answer);
+      const defer = async ({ ephemeral }) => {
+        await fake.gate?.("defer", fields);
+        answer.deferred = { ephemeral: Boolean(ephemeral) };
+      };
+      const edit = async ({ content, allowedMentions }) => {
+        await fake.gate?.("editReply", fields);
+        answer.edits.push({ content, allowedMentions });
+      };
+      events.emit("command", { name: "disconnect", inThread: fake.threads.has(fields.channelId), ...fields, reply, defer, edit });
     },
+    interactions: [],
     async destroy() {
       fake.destroyed = true;
     },

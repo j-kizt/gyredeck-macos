@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -624,4 +625,39 @@ test("rules v16 tell every agent how to mark a yes/no ask, and that ✅ is a yes
   assert.match(rules, /ask yn/, "Codex: the routing line");
   assert.match(rules, /never an approval/);
   assert.match(rules, /An unmarked ask needs a typed answer/);
+});
+
+// #206: /status reads a room's members and the providers' usage through a door only the app
+// holds — the machine token and the broker word together. Nothing is posted, nobody is woken.
+test("#206 a room's status is read by the app alone: machine token and broker word both, never a room password or a member key", async () => {
+  const h = await startBridge();
+  try {
+    const { code, password } = await roomWithRelay(h);
+    const before = (await readRoom(h, code)).length;
+    const ok = await h.call("GET", `/sync/rooms/${code}/status`);
+    assert.equal(ok.status, 200, JSON.stringify(ok.body));
+    assert.deepEqual(ok.body.members.map((m) => m.id).sort(), ["founder-1", "peer-a"], "the agents, not the relay");
+    for (const m of ok.body.members) assert.ok("provider" in m && "shown" in m);
+    assert.equal(typeof ok.body.usage, "object");
+    const tokenOnly = { "content-type": "application/json", "x-gyredeck-token": h.token };
+    const brokerOnly = { "content-type": "application/json", "x-gyredeck-broker": APP_WORD };
+    const roomWord = { "content-type": "application/json", "x-gyredeck-token": password, "x-gyredeck-broker": APP_WORD };
+    const member = { ...(await asMember(h, "peer-a", password)), "content-type": "application/json" };
+    for (const [headers, who] of [[tokenOnly, "the token alone"], [brokerOnly, "the broker word alone"], [roomWord, "the room password"], [member, "a member's key"]]) {
+      const refused = await h.call("GET", `/sync/rooms/${code}/status`, undefined, headers);
+      assert.ok([401, 403].includes(refused.status), `${who}: ${refused.status}`);
+    }
+    // A read time that is not a date is kept as unknown, never as "now" (#206 audit).
+    const lines = [{ type: "progress", label: "Weekly", used: 90, limit: 100 }];
+    assert.equal((await h.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: "peer-a", cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 },
+    })).status, 202);
+    assert.equal((await h.call("POST", "/usage", { providerId: "claude", displayName: "Claude Code", lines, fetchedAt: "bad-date" })).status, 200);
+    assert.equal((await h.call("GET", `/sync/rooms/${code}/status`)).body.usage.claude?.fetchedAt, null);
+    assert.equal((await h.call("GET", "/sync/rooms/sync-zz99/status")).status, 404, "a room that is not there");
+    assert.equal((await readRoom(h, code)).length, before, "nothing was posted into the room");
+  } finally {
+    await h.stop();
+  }
 });

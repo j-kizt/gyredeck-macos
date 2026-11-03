@@ -4267,14 +4267,16 @@ function startBridge(config) {
       lines.push({
         label: line.label.slice(0, 64),
         leftPct: 100 - used,
-        resetsAt: typeof line.resetsAt === "string" ? line.resetsAt : null,
+        // Kept only when it is a date, so nothing downstream shows or chokes on another string (#206).
+        resetsAt: typeof line.resetsAt === "string" && !Number.isNaN(Date.parse(line.resetsAt)) ? line.resetsAt : null,
       });
     }
     return {
       provider,
       displayName: typeof body.displayName === "string" ? body.displayName.slice(0, 40) : provider,
       lines,
-      fetchedAt: typeof body.fetchedAt === "string" ? body.fetchedAt : new Date().toISOString(),
+      // A time that is not a date is unknown, never "now": an old reading must not pass as fresh (#206).
+      fetchedAt: body.fetchedAt === undefined ? new Date().toISOString() : typeof body.fetchedAt === "string" && !Number.isNaN(Date.parse(body.fetchedAt)) ? body.fetchedAt : null,
     };
   };
 
@@ -6891,7 +6893,9 @@ function startBridge(config) {
       const appOnly =
         (req.method === "POST" && segments.length === 2) ||
         (req.method === "POST" && segments.length === 4 && (segments[3] === "passwords" || segments[3] === "members")) ||
-        (req.method === "DELETE" && segments.length >= 3);
+        (req.method === "DELETE" && segments.length >= 3) ||
+        // A room's status for /status in Discord (#206): the app's to read, nobody else's.
+        (req.method === "GET" && segments.length === 4 && segments[3] === "status");
       if (appOnly) {
         if (!holdsMachineToken(req.headers["x-gyredeck-token"])) {
           sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
@@ -6913,6 +6917,32 @@ function startBridge(config) {
           });
           return;
         }
+      }
+
+      // GET /sync/rooms/<code>/status — the agents in a room and their providers' usage as the
+      // app last read it, for /status in Discord (#206). Read only: nothing is posted, nobody is
+      // woken, and no usage is refreshed.
+      if (req.method === "GET" && segments.length === 4 && segments[3] === "status") {
+        const room = SYNC_CODE.test(code ?? "") ? mailRooms.get(code) : null;
+        if (!room) {
+          sendJson(404, { ok: false, error: "room_not_found" });
+          return;
+        }
+        const members = [...room.members]
+          .filter(([, member]) => member.relay !== true)
+          .map(([id]) => {
+            const label = labelIn(room, id);
+            const name = nameIn(room, id);
+            return { id, provider: usageProviderFor(id), shown: name && name !== label ? `${label} / ${name}` : label };
+          });
+        const usage = {};
+        for (const { provider } of members) {
+          if (!provider || provider in usage) continue;
+          const reading = usageByProvider.get(provider) ?? null;
+          usage[provider] = reading ? { displayName: reading.displayName, lines: reading.lines, fetchedAt: reading.fetchedAt } : null;
+        }
+        sendJson(200, { ok: true, members, usage });
+        return;
       }
 
       // GET /sync/rooms?as=<id> — which room this session is in, if any.

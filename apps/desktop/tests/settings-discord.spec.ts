@@ -7,6 +7,7 @@ import { expect, test, type Page } from "@playwright/test";
  */
 
 type Status = {
+  failLossDelete?: boolean;
   journalErrors?: Record<string, { code: string; message: string }>;
   configured: boolean;
   running: boolean;
@@ -88,6 +89,8 @@ const mock = async (page: Page, status: Status) => {
         if (command === "discord_set_forum") { state.forumId = String(args?.forumId); return after(); }
         if (command === "discord_start_pairing") { state.pairingCode = "482913"; return "482913"; }
         if (command === "discord_remove") {
+          // A Keychain that refuses to let the kept loss go: nothing is reset, as discord.rs returns early.
+          if (state.failLossDelete) throw new Error("Could not remove the kept loss from the Keychain");
           // A leave the bridge refuses leaves the room listed, as the native side keeps it.
           if (state.failLeave) state.leaving = Object.fromEntries(state.connectedRooms.map((code) => [code, "Gyredeck could not vouch for itself to its own bridge. Quit and reopen Gyredeck"]));
           // Remove starts the hub over, its journal errors with it (as discord.rs remove() does).
@@ -437,6 +440,21 @@ test("journal errors and an unrecorded loss each get a row, and none show when t
 test("no journal error, no journal row", async ({ page }) => {
   await open(page, { ...blank, configured: true, running: true, ready: true } as Status);
   await expect(page.locator(".setup-row[data-discord='journal-error']")).toHaveCount(0);
+});
+
+test("an unrecorded loss with no token saved can still be removed, and stays while the Keychain refuses", async ({ page }) => {
+  const journalErrors = { "loss:sync-zz99@1700": { code: "loss_unrecorded", message: "At an earlier quit, 4 lines of sync-zz99 never reached Discord and could not be recorded in its post." } };
+  await open(page, { ...blank, journalErrors, failLossDelete: true });
+  const rows = page.locator(".setup-row[data-discord='journal-error']");
+  await expect(rows).toHaveCount(1);
+  await page.getByRole("button", { name: "Remove", exact: true }).click();
+  await page.getByRole("button", { name: "Remove Discord" }).click();
+  await expect(rows).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Remove", exact: true })).toBeVisible();
+  await page.evaluate(() => { (window as typeof window & { __discord: { failLossDelete?: boolean } }).__discord.failLossDelete = false; });
+  await page.getByRole("button", { name: "Remove", exact: true }).click();
+  await page.getByRole("button", { name: "Remove Discord" }).click();
+  await expect(rows).toHaveCount(0);
 });
 
 test("an unrecorded loss is shown even with no token saved, and goes with Remove", async ({ page }) => {

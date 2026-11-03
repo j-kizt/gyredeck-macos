@@ -69,7 +69,8 @@ export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDi
             {failure ? <span className="setup-detail" role="status">{failure}</span> : null}
             {confirming ? <span className="setup-detail" role="alert">Remove Discord? The bot stops and its token is deleted. Posts already in Discord stay there.</span> : null}
           </span>
-          {status?.configured && !confirming ? (
+          {/* Also with no token left: a kept warning says Remove clears it, so Remove is there (#282). */}
+          {(status?.configured || Object.keys(status?.journalErrors ?? {}).length > 0) && !confirming ? (
             <button className="pill-btn danger" type="button" disabled={busy} onClick={() => setConfirming(true)} data-tauri-drag-region="false"><Trash2 size={12} strokeWidth={2.3} />Remove</button>
           ) : null}
         </div>

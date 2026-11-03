@@ -3597,13 +3597,18 @@ impl TeamSlot {
 impl secrets::Slot for TeamSlot {
     fn read(&self) -> Result<Option<Vec<u8>>, i32> {
         match security_framework::passwords::generic_password(self.options()) {
-            Ok(bytes) => Ok(Some(bytes)),
+            Ok(bytes) => {
+                // An item an earlier build wrote can be read only while the Mac is unlocked: moved
+                // to after-first-unlock in place, once per launch, the first time it is read.
+                team_keychain::settle(self.0);
+                Ok(Some(bytes))
+            }
             Err(error) if error.code() == secrets::NOT_FOUND => Ok(None),
             Err(error) => Err(error.code()),
         }
     }
     fn write(&self, value: &[u8]) -> Result<(), i32> {
-        security_framework::passwords::set_generic_password_options(value, self.options()).map_err(|error| error.code())
+        team_keychain::write(self.0, value)
     }
     fn delete(&self) -> Result<(), i32> {
         match security_framework::passwords::delete_generic_password_options(self.options()) {
@@ -3619,6 +3624,107 @@ impl secrets::Slot for TeamSlot {
 /// of this deleted the token it had just saved (found by the migration test on real builds).
 #[cfg(target_os = "macos")]
 struct FileSlot(&'static str);
+
+/// The team's items, readable after the Mac's first unlock — a locked screen included — and on
+/// this Mac only (#325). The crate's own write searches by every attribute it sets, so an item
+/// already there with another accessibility is not found to update; these calls name the item
+/// by class, service, account and keychain alone, and set the accessibility as an attribute.
+#[cfg(target_os = "macos")]
+mod team_keychain {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::data::CFData;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::collections::HashSet;
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        static kSecClass: CFStringRef;
+        static kSecClassGenericPassword: CFStringRef;
+        static kSecAttrService: CFStringRef;
+        static kSecAttrAccount: CFStringRef;
+        static kSecUseDataProtectionKeychain: CFStringRef;
+        static kSecValueData: CFStringRef;
+        static kSecAttrAccessible: CFStringRef;
+        static kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly: CFStringRef;
+        fn SecItemAdd(attributes: *const c_void, result: *mut *const c_void) -> i32;
+        fn SecItemUpdate(query: *const c_void, attributes: *const c_void) -> i32;
+    }
+
+    const NOT_FOUND: i32 = super::secrets::NOT_FOUND;
+    static SETTLED: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
+
+    fn key(name: CFStringRef) -> CFString {
+        unsafe { CFString::wrap_under_get_rule(name) }
+    }
+
+    fn query(account: &str) -> Vec<(CFString, CFType)> {
+        unsafe {
+            vec![
+                (key(kSecClass), key(kSecClassGenericPassword).as_CFType()),
+                (key(kSecAttrService), CFString::new(super::KEYCHAIN_SERVICE).as_CFType()),
+                (key(kSecAttrAccount), CFString::new(account).as_CFType()),
+                (key(kSecUseDataProtectionKeychain), CFBoolean::true_value().as_CFType()),
+            ]
+        }
+    }
+
+    fn after_first_unlock() -> (CFString, CFType) {
+        unsafe { (key(kSecAttrAccessible), key(kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly).as_CFType()) }
+    }
+
+    fn update(account: &str, mut attributes: Vec<(CFString, CFType)>) -> i32 {
+        attributes.push(after_first_unlock());
+        let query = CFDictionary::from_CFType_pairs(&query(account));
+        let attributes = CFDictionary::from_CFType_pairs(&attributes);
+        unsafe { SecItemUpdate(query.as_concrete_TypeRef() as *const c_void, attributes.as_concrete_TypeRef() as *const c_void) }
+    }
+
+    /// Replace the value in place, or add it: never a delete first, so no moment holds nothing.
+    pub(super) fn write(account: &'static str, value: &[u8]) -> Result<(), i32> {
+        let data = (unsafe { key(kSecValueData) }, CFData::from_buffer(value).as_CFType());
+        match update(account, vec![data.clone()]) {
+            0 => {}
+            NOT_FOUND => {
+                let mut attributes = query(account);
+                attributes.push(data);
+                attributes.push(after_first_unlock());
+                let attributes = CFDictionary::from_CFType_pairs(&attributes);
+                let status = unsafe { SecItemAdd(attributes.as_concrete_TypeRef() as *const c_void, std::ptr::null_mut()) };
+                if status != 0 {
+                    return Err(status);
+                }
+            }
+            status => return Err(status),
+        }
+        settled(account);
+        Ok(())
+    }
+
+    /// The accessibility of an item already there, moved once per launch. A failure is left
+    /// for the next launch: the value is untouched either way.
+    pub(super) fn settle(account: &'static str) {
+        if is_settled(account) {
+            return;
+        }
+        if matches!(update(account, Vec::new()), 0 | NOT_FOUND) {
+            settled(account);
+        }
+    }
+
+    fn is_settled(account: &'static str) -> bool {
+        SETTLED.lock().map(|set| set.as_ref().is_some_and(|set| set.contains(account))).unwrap_or(false)
+    }
+
+    fn settled(account: &'static str) {
+        if let Ok(mut set) = SETTLED.lock() {
+            set.get_or_insert_with(HashSet::new).insert(account);
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod file_keychain {

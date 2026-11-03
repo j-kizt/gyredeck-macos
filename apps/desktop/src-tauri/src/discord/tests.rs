@@ -201,6 +201,8 @@ impl RoomActs for Arc<FakeActs> {
 /// given a `log` is served like the bridge serves it instead: everything after `since`.
 #[derive(Default)]
 struct FakeSource {
+    /// How long a room status takes to answer, as a slow bridge would (#206).
+    status_delay: Mutex<Duration>,
     members: Mutex<HashMap<String, Vec<RoomMember>>>,
     streams: Mutex<HashMap<String, VecDeque<Vec<u8>>>>,
     logs: Mutex<HashMap<String, Vec<serde_json::Value>>>,
@@ -255,6 +257,10 @@ fn frames(room: &str, messages: &[&serde_json::Value]) -> Vec<u8> {
 }
 
 impl RoomSource for Arc<FakeSource> {
+    fn status(&self, _room: &str, _app_word: &str) -> Result<serde_json::Value, SourceError> {
+        thread::sleep(*self.status_delay.lock().unwrap());
+        Ok(serde_json::json!({ "ok": true, "members": [], "usage": {} }))
+    }
     fn members(&self, room: &str, _as_id: &str) -> Result<Roster, SourceError> {
         if self.roster_fails.load(Ordering::SeqCst) {
             return Err(SourceError::Unavailable);
@@ -5019,6 +5025,69 @@ fn c5_a_keychain_record_that_cannot_be_read_is_shown_and_never_written_over() {
     }
 }
 
+/// #211: keep-awake hears every room followed and let go, straight from the hub.
+#[test]
+fn the_followed_rooms_are_told_on_connect_and_on_disconnect() {
+    let f = fixture("on-rooms", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    let told = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let sink = Arc::clone(&told);
+    f.state.on_rooms(Arc::new(move |rooms| sink.lock().unwrap().push(rooms)));
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.state.disconnect(ROOM, Some(APP_WORD)).unwrap();
+    assert_eq!(*told.lock().unwrap(), vec![vec![], vec![ROOM.to_string()], vec![]]);
+}
+
+// ---- #206 /status: asked by the child, answered by the app from what it holds ----
+
+fn status_ask(f: &Fixture, buffer: &SharedBuf, json: String) -> Vec<serde_json::Value> {
+    let before = of_kind(&buffer.lines(), "status").len();
+    on_core_event(&f.state.core, serde_json::from_str::<FromChild>(&json).expect("a status request parses"));
+    wait_until("the status answer", || of_kind(&buffer.lines(), "status").len() > before);
+    of_kind(&buffer.lines(), "status").into_iter().skip(before).cloned().collect()
+}
+
+#[test]
+fn status_in_a_post_answers_that_room_instance_with_its_agents_and_what_they_last_did() {
+    let f = fixture_owned("status-room", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.members(ROOM, &[("founder-1", "Claude Code / Gyre Assistant"), ("peer-a", "Codex / Gyre Audit"), (relay_member(ROOM).as_str(), "Discord")]);
+    // Heard before this Connect: not known to hold now, so "not heard from since connect".
+    lock(&f.state.hub).note_presence("founder-1", "turn_complete", Instant::now());
+    thread::sleep(Duration::from_millis(5));
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let created = lock(&f.state.hub).rooms[ROOM].created_at.unwrap();
+    lock(&f.state.hub).note_presence("peer-a", "tool_start", Instant::now());
+    let answers = status_ask(&f, &buffer, format!(r#"{{"t":"status_request","requestId":"r1","ownerId":"{OWNER_ID}","channelId":"{THREAD}","threadId":"{THREAD}","room":"{ROOM}","createdAt":{created}}}"#));
+    let room = &answers[0]["room"];
+    assert_eq!(answers[0]["requestId"], "r1");
+    assert_eq!(room["room"], ROOM);
+    let members: Vec<(String, String)> = room["members"].as_array().unwrap().iter().map(|m| (m["name"].as_str().unwrap().to_string(), m["state"].as_str().unwrap().to_string())).collect();
+    assert_eq!(members, vec![("Claude Code / Gyre Assistant".to_string(), "unknown".to_string()), ("Codex / Gyre Audit".to_string(), "working".to_string())], "the agents only, never the relay");
+    assert!(room["usage"].is_array());
+}
+
+#[test]
+fn status_is_refused_to_anyone_but_the_keychain_owner_and_for_a_post_or_instance_that_is_not_current() {
+    let f = fixture_owned("status-refused", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let created = lock(&f.state.hub).rooms[ROOM].created_at.unwrap();
+    for (json, why) in [
+        (format!(r#"{{"t":"status_request","requestId":"a","ownerId":"999999999999999999","channelId":"{THREAD}","threadId":"{THREAD}","room":"{ROOM}","createdAt":{created}}}"#), "another person"),
+        (format!(r#"{{"t":"status_request","requestId":"b","ownerId":"{OWNER_ID}","channelId":"{OTHER_THREAD}","threadId":"{OTHER_THREAD}","room":"{ROOM}","createdAt":{created}}}"#), "another post"),
+        (format!(r#"{{"t":"status_request","requestId":"c","ownerId":"{OWNER_ID}","channelId":"{THREAD}","threadId":"{THREAD}","room":"{ROOM}","createdAt":{}}}"#, created + 1), "another instance"),
+        (format!(r#"{{"t":"status_request","requestId":"d","ownerId":"999999999999999999","channelId":"C1"}}"#), "another person, every room"),
+    ] {
+        let answers = status_ask(&f, &buffer, json);
+        let last = answers.last().unwrap();
+        assert!(last["error"].is_string(), "{why}: {last}");
+        assert!(last.get("room").is_none_or(serde_json::Value::is_null) && last.get("rooms").is_none_or(serde_json::Value::is_null), "{why}: nothing about any room");
+    }
+}
+
 #[test]
 fn c5_past_the_cap_the_oldest_are_counted_together_never_dropped() {
     let (hub, _path) = journal_hub("282-cap");
@@ -5058,4 +5127,85 @@ fn c5_a_keychain_record_holding_anything_but_a_loss_is_unreadable_never_skipped(
     let next = relaunch(&f);
     assert!(next.status().journal_errors.get("loss:keychain").is_some_and(|error| error.code == LOSS_UNRECORDED), "{:?}", next.status().journal_errors);
     assert_eq!(*f.losses.bytes.lock().unwrap(), Some(bytes), "kept as it is");
+}
+
+#[test]
+fn status_outside_a_post_lists_every_connected_room_with_its_agents_counted() {
+    let f = fixture_owned("status-all", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.members(ROOM, &[("founder-1", "Claude Code"), ("peer-a", "Codex"), (relay_member(ROOM).as_str(), "Discord")]);
+    f.acts.founded.lock().unwrap().push(OTHER.to_string());
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.state.connect(OTHER, "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6").unwrap();
+    let answers = status_ask(&f, &buffer, format!(r#"{{"t":"status_request","requestId":"all","ownerId":"{OWNER_ID}","channelId":"C1"}}"#));
+    for r in answers[0]["rooms"].as_array().unwrap() {
+        assert!(r["createdAt"].is_u64(), "each room names its instance: {r}");
+    }
+    let mut rooms: Vec<(String, u64)> = answers[0]["rooms"].as_array().unwrap().iter().map(|r| (r["room"].as_str().unwrap().to_string(), r["members"].as_u64().unwrap())).collect();
+    rooms.sort();
+    let mut expected = vec![(ROOM.to_string(), 2), (OTHER.to_string(), 0)];
+    expected.sort();
+    assert_eq!(rooms, expected);
+    assert_eq!(answers[0]["hiddenRooms"], 0);
+}
+
+#[test]
+fn status_with_the_owner_record_unreadable_answers_nothing_about_any_room() {
+    let f = fixture_built("status-keychain", Some(TOKEN), &[], the_owner(), true);
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    let answers = status_ask(&f, &buffer, format!(r#"{{"t":"status_request","requestId":"k","ownerId":"{OWNER_ID}","channelId":"C1"}}"#));
+    assert!(answers[0]["error"].as_str().unwrap().contains("Keychain"), "{}", answers[0]);
+    assert!(answers[0].get("rooms").is_none_or(serde_json::Value::is_null));
+}
+
+
+/// Every read time the bridge can pass on, and the age /status may show for it (#206 audit).
+#[test]
+fn status_usage_age_table() {
+    let now = time::OffsetDateTime::now_utc();
+    let at = |secs: i64| (now + time::Duration::seconds(secs)).format(&time::format_description::well_known::Rfc3339).unwrap();
+    let cases: Vec<(&str, serde_json::Value, Option<i64>)> = vec![
+        ("absent", serde_json::Value::Null, None),
+        ("not a string", serde_json::json!(12), None),
+        ("not a date", serde_json::json!("bad-date"), None),
+        ("an hour ahead", serde_json::json!(at(3600)), None),
+        ("just past the skew", serde_json::json!(at(READ_CLOCK_SKEW + 30)), None),
+        ("ahead within the skew", serde_json::json!(at(60)), Some(0)),
+        ("ten minutes ago", serde_json::json!(at(-600)), Some(600)),
+    ];
+    for (name, fetched, want) in cases {
+        let status = serde_json::json!({ "usage": { "codex": { "displayName": "Codex", "lines": [], "fetchedAt": fetched } } });
+        let got = status_usage(&status)[0]["secondsOld"].as_i64();
+        match want {
+            None => assert_eq!(got, None, "{name}"),
+            Some(want) => assert!(got.is_some_and(|got| (got - want).abs() <= 2), "{name}: {got:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_slow_status_never_holds_up_a_say_read_after_it_and_a_second_waits_its_turn() {
+    let f = fixture_owned("status-slow", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let created = lock(&f.state.hub).rooms[ROOM].created_at.unwrap();
+    *f.source.status_delay.lock().unwrap() = Duration::from_millis(1500);
+    let ask = |id: &str| format!(r#"{{"t":"status_request","requestId":"{id}","ownerId":"{OWNER_ID}","channelId":"{THREAD}","threadId":"{THREAD}","room":"{ROOM}","createdAt":{created}}}"#);
+    let say = format!(r#"{{"t":"say","room":"{ROOM}","discordMessageId":"{}","threadId":"{THREAD}","ownerId":"{OWNER_ID}","text":"after the status"}}"#, msg_id(1));
+    let lines = [ask("s1"), ask("s2"), ask("s3"), say];
+    let epoch = lock(&f.state.hub).epoch;
+    let started = Instant::now();
+    read_child(Cursor::new(lines.join("\n") + "\n"), &f.state.core, epoch);
+    assert!(started.elapsed() < Duration::from_millis(1000), "the reader waited {:?}", started.elapsed());
+    assert_eq!(posted_texts(&f), vec!["after the status".to_string()]);
+    let lines = buffer.lines();
+    let answers = of_kind(&lines, "status");
+    let busy: Vec<&str> = answers.iter().filter(|a| a["error"] == STATUS_BUSY).map(|a| a["requestId"].as_str().unwrap()).collect();
+    assert_eq!(busy, vec!["s2", "s3"]);
+    wait_until("the first status answered", || of_kind(&buffer.lines(), "status").iter().any(|a| a["requestId"] == "s1" && a["error"].is_null()));
+    // Answered, the next one is taken.
+    let again = status_ask(&f, &buffer, ask("s4"));
+    assert!(again[0]["error"].is_null(), "{again:?}");
 }

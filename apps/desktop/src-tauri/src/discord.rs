@@ -65,6 +65,47 @@ const QUIET_AFTER: Duration = Duration::from_secs(10 * 60);
 /// A session last seen mid-turn this long ago has stopped saying anything; it is no longer
 /// counted as working. Generous, so a long build is never called quiet.
 const BUSY_STALE: Duration = Duration::from_secs(30 * 60);
+/** What one /status shows at most (#206); the rest is counted, never dropped silently. */
+const STATUS_ROOMS: usize = 25;
+const STATUS_MEMBERS: usize = 20;
+const STATUS_BUSY: &str = "Another /status is still being answered; try again in a moment.";
+
+/// How far ahead of this clock a read time may be and still count as just read.
+const READ_CLOCK_SKEW: i64 = 5 * 60;
+
+/// A reading's age in seconds, or unknown: a read time further ahead than clock skew allows
+/// has no age that can be told, so it is never shown as "just now" (#206 audit).
+fn reading_age(at: time::OffsetDateTime, now: time::OffsetDateTime) -> Option<i64> {
+    let old = (now - at).whole_seconds();
+    (old >= -READ_CLOCK_SKEW).then_some(old.max(0))
+}
+
+/// Each provider's usage from the bridge's room status, with how old the reading is: a provider
+/// never read says so, and no number is made up (#206).
+fn status_usage(status: &serde_json::Value) -> Vec<serde_json::Value> {
+    let Some(usage) = status.get("usage").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    let mut providers: Vec<&String> = usage.keys().collect();
+    providers.sort();
+    providers
+        .into_iter()
+        .map(|provider| match usage.get(provider).filter(|reading| !reading.is_null()) {
+            None => serde_json::json!({ "provider": provider, "display": provider, "lines": null, "secondsOld": null }),
+            Some(reading) => {
+                let fetched = reading.get("fetchedAt").and_then(serde_json::Value::as_str)
+                    .and_then(|at| time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok());
+                let old = fetched.and_then(|at| reading_age(at, time::OffsetDateTime::now_utc()));
+                serde_json::json!({
+                    "provider": provider,
+                    "display": reading.get("displayName").cloned().unwrap_or_else(|| provider.clone().into()),
+                    "lines": reading.get("lines").cloned().unwrap_or(serde_json::Value::Null),
+                    "secondsOld": old,
+                })
+            }
+        })
+        .collect()
+}
 const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 /// How many of a room's lines may wait for the child's `posted` before the room's stream is
 /// closed. Lines are dropped only by an acknowledgement, never by a count: a full room stops
@@ -223,6 +264,19 @@ pub(crate) enum ToChild {
     /// Remove stops the relay: what is still queued will not be delivered, so each closing
     /// room's post says so once before its close (#199 I21). Quitting does not send it.
     End {},
+    /// The answer to one `/status` (#206): an error, a room, or the connected rooms.
+    #[serde(rename_all = "camelCase")]
+    Status {
+        request_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        room: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rooms: Option<Vec<serde_json::Value>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hidden_rooms: Option<usize>,
+    },
     /// What became of one `say` (#205): 📨 only on `ok` with a seq.
     #[serde(rename_all = "camelCase")]
     Said {
@@ -392,6 +446,20 @@ enum FromChild {
         /// child remembers of it (#205 r3).
         #[serde(default)]
         quiet: bool,
+    },
+    /// `/status` (#206): answered by the app, after its own checks, from what it holds.
+    #[serde(rename = "status_request")]
+    #[serde(rename_all = "camelCase")]
+    StatusRequest {
+        request_id: String,
+        owner_id: String,
+        #[serde(default)]
+        thread_id: Option<String>,
+        /// A room's current post: that room instance. Absent: every connected room.
+        #[serde(default)]
+        room: Option<String>,
+        #[serde(default)]
+        created_at: Option<u64>,
     },
 }
 
@@ -749,6 +817,8 @@ struct Hub {
     dropped_lines: BTreeMap<String, String>,
     /// The Hub's own handle, for the stdin writer an attach starts.
     me: Weak<Mutex<Hub>>,
+    /// Told the followed room codes whenever one is followed or let go (#211).
+    on_rooms: Option<Arc<dyn Fn(Vec<String>) + Send + Sync>>,
     /// Wakes the stdin writer when the outbox has something.
     wake: Arc<Condvar>,
     /// What the current child is handed next, in order: references, never copies (I18).
@@ -983,6 +1053,7 @@ impl Hub {
         let id = feed.id;
         self.resume.remove(room);
         self.rooms.insert(room.to_string(), feed);
+        self.rooms_changed();
         self.send(&line);
         self.queue_feed(room, id);
         Ok(())
@@ -1265,6 +1336,12 @@ impl Hub {
         }
     }
 
+    fn rooms_changed(&self) {
+        if let Some(on_rooms) = &self.on_rooms {
+            on_rooms(self.rooms.keys().cloned().collect());
+        }
+    }
+
     fn disconnect(&mut self, room: &str, reason: DisconnectReason) -> bool {
         let Some(mut feed) = self.rooms.remove(room) else {
             if reason == DisconnectReason::Closed {
@@ -1272,6 +1349,7 @@ impl Hub {
             }
             return false;
         };
+        self.rooms_changed();
         match reason {
             DisconnectReason::Disconnected => {
                 self.resume.insert(room.to_string(), (feed.created_at, feed.last_seq, feed.seen_through()));
@@ -1937,6 +2015,11 @@ pub(crate) trait RoomSource: Send + Sync {
     fn generation(&self) -> u64;
     /// The bridge's event stream, which says what each session is doing (#205).
     fn events(&self) -> Result<Box<dyn Read + Send>, SourceError>;
+    /// A room's agents with their providers, and each provider's usage as the app last read
+    /// it (#206), on the app's word. Read only.
+    fn status(&self, _room: &str, _app_word: &str) -> Result<serde_json::Value, SourceError> {
+        Err(SourceError::Unavailable)
+    }
 }
 
 /// One message the owner sends, as the bridge is asked to publish it (#205).
@@ -1999,6 +2082,8 @@ pub(crate) struct Core {
     acts: Arc<dyn RoomActs>,
     source: Arc<dyn RoomSource>,
     owners: Arc<dyn OwnerStore>,
+    /// A /status being answered; the next is refused until it is (#206 audit).
+    status_busy: AtomicBool,
 }
 
 pub(crate) struct DiscordState {
@@ -2045,6 +2130,13 @@ fn valid_snowflake(id: &str) -> bool {
 }
 
 impl DiscordState {
+    /// Told the followed room codes now, and every time one is followed or let go.
+    pub(crate) fn on_rooms(&self, on_rooms: Arc<dyn Fn(Vec<String>) + Send + Sync>) {
+        let mut hub = lock(&self.hub);
+        hub.on_rooms = Some(on_rooms);
+        hub.rooms_changed();
+    }
+
     pub(crate) fn with(deps: Deps) -> Self {
         // An owner id an earlier build left in the config never counts; it is deleted.
         if LEGACY_OWNER_KEYS.iter().any(|key| deps.settings.get(key).is_some()) {
@@ -2090,6 +2182,7 @@ impl DiscordState {
             acts: Arc::clone(&deps.acts),
             source: Arc::clone(&deps.source),
             owners: Arc::clone(&deps.owners),
+            status_busy: AtomicBool::new(false),
         });
         Self {
             hub,
@@ -2512,6 +2605,67 @@ impl Core {
         Ok(owner)
     }
 
+    /// `/status` (#206), checked here as a disconnect is: the owner in the Keychain, and for one
+    /// room its own post and the instance it was asked of. Built from what the app holds — the
+    /// roster, what the event stream last said of each agent, the usage the app last read —
+    /// with no turn and no refresh; every age is said, nothing is made up.
+    fn status_requested(&self, request_id: String, owner_id: &str, thread_id: Option<&str>, room: Option<&str>, created_at: Option<u64>) -> ToChild {
+        let refuse = |error: String| ToChild::Status { request_id: request_id.clone(), error: Some(error), room: None, rooms: None, hidden_rooms: None };
+        if let Err(why) = self.keychain_owner(owner_id) {
+            return refuse(why.replace("nothing was sent", "no status was shown"));
+        }
+        let Some(code) = room else {
+            let hub = lock(&self.hub);
+            // Each with its instance, so the child shows no numbers for a room reconnected since.
+            let mut rooms: Vec<(&String, usize, Option<u64>)> = hub.rooms.iter().map(|(code, feed)| (code, feed.agents.len(), feed.created_at)).collect();
+            rooms.sort();
+            let hidden = rooms.len().saturating_sub(STATUS_ROOMS);
+            let rooms = rooms.into_iter().take(STATUS_ROOMS).map(|(code, n, at)| serde_json::json!({ "room": code, "members": n, "createdAt": at })).collect();
+            return ToChild::Status { request_id: request_id.clone(), error: None, room: None, rooms: Some(rooms), hidden_rooms: Some(hidden) };
+        };
+        let now = Instant::now();
+        let (word, agents, connected_at, seen) = {
+            let hub = lock(&self.hub);
+            let Some(feed) = hub.rooms.get(code).filter(|feed| feed.thread_id.is_some() && feed.thread_id.as_deref() == thread_id && feed.created_at == created_at) else {
+                return refuse("That room is no longer connected.".to_string());
+            };
+            let seen: HashMap<String, Seen> = feed.agents.iter().filter_map(|id| hub.presence.get(id).map(|s| (id.clone(), *s))).collect();
+            (feed.word.clone(), feed.agents.clone(), feed.connected_at, seen)
+        };
+        let shown: HashMap<String, String> = self.source.members(code, &relay_member(code)).map(|roster| roster.members.into_iter().map(|m| (m.id, m.shown)).collect()).unwrap_or_default();
+        let status = self.source.status(code, &word).ok();
+        let members: Vec<serde_json::Value> = agents
+            .iter()
+            .take(STATUS_MEMBERS)
+            .map(|id| {
+                let name = shown.get(id).cloned().unwrap_or_else(|| id.clone());
+                // Only what this Connect heard counts, as for the quiet prompt.
+                match seen.get(id).filter(|s| s.at >= connected_at) {
+                    Some(s) => {
+                        let ago = now.saturating_duration_since(s.at);
+                        let state = if s.busy && ago < BUSY_STALE { "working" } else { "idle" };
+                        serde_json::json!({ "name": name, "state": state, "secondsAgo": ago.as_secs() })
+                    }
+                    None => serde_json::json!({ "name": name, "state": "unknown" }),
+                }
+            })
+            .collect();
+        let usage = status.as_ref().map(status_usage).unwrap_or_default();
+        ToChild::Status {
+            request_id,
+            error: None,
+            room: Some(serde_json::json!({
+                "room": code,
+                "createdAt": created_at,
+                "members": members,
+                "hiddenMembers": agents.len().saturating_sub(STATUS_MEMBERS),
+                "usage": usage,
+            })),
+            rooms: None,
+            hidden_rooms: None,
+        }
+    }
+
     /// The child asked, on the owner's ✅: the same disconnect the button runs, with the word
     /// each room was connected with. Checked again here: the owner in the Keychain confirmed
     /// it, and a single room's request came from that room's own post.
@@ -2789,7 +2943,7 @@ fn spawn_child(node: &Path, script: &Path, core: &Arc<Core>, epoch: u64) -> Resu
     Ok((process, ChildChannel::new(Box::new(stdin))))
 }
 
-fn read_child(stdout: impl Read, core: &Core, epoch: u64) {
+fn read_child(stdout: impl Read, core: &Arc<Core>, epoch: u64) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
     loop {
@@ -2814,7 +2968,7 @@ fn read_child(stdout: impl Read, core: &Core, epoch: u64) {
 
 /// What child `epoch` said, with what the hub alone cannot do: a `say` is published and a
 /// `disconnect_request` disconnects, each with the hub unlocked while the bridge answers.
-fn on_core_event_from(core: &Core, epoch: u64, event: FromChild) {
+fn on_core_event_from(core: &Arc<Core>, epoch: u64, event: FromChild) {
     match event {
         FromChild::Say(say) => {
             if lock(&core.hub).epoch == epoch {
@@ -2826,13 +2980,32 @@ fn on_core_event_from(core: &Core, epoch: u64, event: FromChild) {
                 core.disconnect_requested(room, all, &owner_id, thread_id.as_deref(), created_at, quiet);
             }
         }
+        FromChild::StatusRequest { request_id, owner_id, thread_id, room, created_at } => {
+            if lock(&core.hub).epoch != epoch {
+                return;
+            }
+            // Answered off this reader and one at a time: the bridge may be slow, and a say or a
+            // disconnect read after it never waits behind it (#206 audit).
+            if core.status_busy.swap(true, Ordering::SeqCst) {
+                lock(&core.hub).send(&ToChild::Status { request_id, error: Some(STATUS_BUSY.to_string()), room: None, rooms: None, hidden_rooms: None });
+                return;
+            }
+            let core = Arc::clone(core);
+            thread::spawn(move || {
+                let answer = core.status_requested(request_id, &owner_id, thread_id.as_deref(), room.as_deref(), created_at);
+                core.status_busy.store(false, Ordering::SeqCst);
+                if lock(&core.hub).epoch == epoch {
+                    lock(&core.hub).send(&answer);
+                }
+            });
+        }
         other => on_child_event_from(&core.hub, core.owners.as_ref(), epoch, other),
     }
 }
 
 /// What the current child said, through the core; the tests' way in for #205's lines.
 #[cfg(test)]
-fn on_core_event(core: &Core, event: FromChild) {
+fn on_core_event(core: &Arc<Core>, event: FromChild) {
     let epoch = lock(&core.hub).epoch;
     on_core_event_from(core, epoch, event);
 }
@@ -2926,7 +3099,7 @@ fn on_child_event_from(hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64, ev
                 }
             }
         }
-        FromChild::Connected { .. } | FromChild::Say(_) | FromChild::DisconnectRequest { .. } => {}
+        FromChild::Connected { .. } | FromChild::Say(_) | FromChild::DisconnectRequest { .. } | FromChild::StatusRequest { .. } => {}
     }
 }
 
@@ -3701,6 +3874,19 @@ impl RoomSource for BridgeSource {
             created_at: value.get("createdAt").and_then(serde_json::Value::as_u64),
             seq: value.get("seq").and_then(serde_json::Value::as_u64),
         })
+    }
+
+    fn status(&self, room: &str, app_word: &str) -> Result<serde_json::Value, SourceError> {
+        let target = self.target()?;
+        let (status, value) = standalone_bridge::bridge_request_to(&target, "GET", &format!("/sync/rooms/{room}/status"), None, Duration::from_millis(1500), Some(app_word))
+            .map_err(|_| SourceError::Unavailable)?;
+        if status == 404 {
+            return Err(SourceError::Removed);
+        }
+        if !(200..300).contains(&status) {
+            return Err(SourceError::Unavailable);
+        }
+        Ok(value)
     }
 
     fn open(&self, room: &str, as_id: &str, app_word: &str, since: u64) -> Result<Box<dyn Read + Send>, SourceError> {

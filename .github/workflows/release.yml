@@ -11,6 +11,8 @@ permissions:
 jobs:
   release:
     runs-on: macos-latest
+    # Restores, never saves (#313): setup-node's pnpm cache would otherwise save under the tag.
+    cache-mode: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,11 +66,13 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      # Cache the cargo registry + build output so release builds don't recompile
-      # the whole dependency tree from scratch each run (the slow step). Uses the
-      # github-owned actions/cache to satisfy the repo's action allowlist.
-      - name: Cache Rust build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Restore the cargo registry + build output main's runs keep warm, so release builds
+      # don't recompile the whole dependency tree (the slow step). Restore only, never save
+      # (#313): this build runs with the signing secrets and writes the Team ID's
+      # entitlements under target/signing, so nothing it leaves in target/ is ever cached.
+      # Uses the github-owned actions/cache to satisfy the repo's action allowlist.
+      - name: Restore Rust build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index

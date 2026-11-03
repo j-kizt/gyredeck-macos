@@ -69,3 +69,13 @@ test("#288 the signer is the pinned Developer ID certificate, read from the app 
   assert.match(readFileSync(new URL("../scripts/install-desktop.mjs", import.meta.url), "utf8"), /if \(!leafIsPinned\(leafSha256\(sourceApp\)\)\)/, "the install checks it before touching the installed app");
   assert.match(readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8"), /node scripts\/check-signer\.mjs "\$app"/, "CI checks it before publishing");
 });
+
+test("#313 the release build, which holds the signing secrets, restores the Rust cache and never saves one", async () => {
+  const { readFileSync } = await import("node:fs");
+  const release = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
+  const caches = [...release.matchAll(/uses:\s*actions\/cache(\/\w+)?@/g)].map((m) => m[1] ?? "");
+  assert.ok(caches.length > 0, "premise: release.yml restores a cache");
+  assert.deepEqual(caches.filter((kind) => kind !== "/restore"), [], "no actions/cache step that saves");
+  // setup-node's `cache: pnpm` saves on its own: only the job's cache mode stops every save.
+  assert.match(release, /\n  release:\n(?:    .*\n)*?    cache-mode: read\n/, "the release job may restore caches and save none");
+});

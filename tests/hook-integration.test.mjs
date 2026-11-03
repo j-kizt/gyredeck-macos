@@ -162,6 +162,14 @@ const NOTICE_KEYS = ["heavyNotice", "usageNotice"];
 const listedIn = (answer, key) => Array.isArray(answer?.[key]) && answer[key].length > 0;
 const carriesBatch = (answer) => listedIn(answer, "messages") || listedIn(answer, "missed")
   || NOTICE_KEYS.some((key) => typeof answer?.[key] === "string" && answer[key] !== "");
+/** The fake broker listening at each socket path: a test's own broker replaces its fixture's. */
+const brokersAt = new Map();
+const listenBroker = async (server, path, close) => {
+  await brokersAt.get(path)?.();
+  await new Promise((resolve) => server.listen(path, resolve));
+  brokersAt.set(path, close);
+};
+
 const forwardingBroker = async (home, base, { as = null, cli = undefined } = {}) => {
   const dir = join(home, ...CONFIG_DIR, "broker");
   await mkdir(dir, { recursive: true });
@@ -217,7 +225,23 @@ const forwardingBroker = async (home, base, { as = null, cli = undefined } = {})
         if (!as) state.bound = request.bind.conversationId;
         answer = { v: 1, ok: true, bound: { conversationId: as ?? request.bind.conversationId, pid: 1, ...(cli ? { cli } : {}) } };
       } else if (request.collect) answer = await collect(request);
-      else if (request.ack) {
+      else if (request.confirm) {
+        // As the app's broker does (#294): the bound session, never a name in the request.
+        const session = as ?? state.bound;
+        if (!session) answer = { v: 1, ok: false, error: "unbound", message: "bind first" };
+        else {
+          const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+          const response = await bridgeFetch(`${base}/sync/rooms/${request.confirm.room}/confirm`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
+            body: JSON.stringify({ conversationId: session, password: request.confirm.password }),
+          });
+          const body = await response.json().catch(() => null);
+          answer = response.status === 200
+            ? { v: 1, ok: true, boundTo: session, confirmed: body }
+            : { v: 1, ok: false, error: "room", status: response.status, boundTo: session, answer: body, message: `The bridge answered HTTP ${response.status}.` };
+        }
+      } else if (request.ack) {
         acks.push(request.ack.delivery);
         for (const [session, kept] of held) if (kept.id === request.ack.delivery) held.delete(session);
         answer = { v: 1, ok: true, acked: request.ack.delivery };
@@ -225,14 +249,16 @@ const forwardingBroker = async (home, base, { as = null, cli = undefined } = {})
       socket.end(`${JSON.stringify(answer)}\n`);
     });
   });
-  await new Promise((resolve) => server.listen(join(dir, "gyredeck.broker.sock"), resolve));
-  server.unref();
-  openFakeServers.add(server);
   const close = () => new Promise((resolve) => {
     for (const socket of sockets) socket.destroy();
     openFakeServers.delete(server);
+    if (brokersAt.get(join(dir, "gyredeck.broker.sock")) === close) brokersAt.delete(join(dir, "gyredeck.broker.sock"));
+    if (!server.listening) return resolve();
     server.close(resolve);
   });
+  await listenBroker(server, join(dir, "gyredeck.broker.sock"), close);
+  server.unref();
+  openFakeServers.add(server);
   return { requests, bridgeCalls, acks, state, close };
 };
 
@@ -2567,7 +2593,7 @@ test("a password accepted in a turn whose mail is withheld still names the room,
     // 1. The broker refuses the bind (`conflict`), so the drain is withheld.
     const first = "a1960000-0000-4000-8000-000000000001";
     const one = await openRoom(first);
-    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "conflict", message: "two claims" }));
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "conflict", message: "two claims" }), { confirmVia: `http://127.0.0.1:${port}` });
     let told = await paste(first, `here it is ${one.password}`);
     assert.match(told.stderr, /mail withheld this turn — conflict/, "the withholding itself is unchanged");
     assertTold(told.context, one.code, first, "withheld by the broker");
@@ -2582,7 +2608,7 @@ test("a password accepted in a turn whose mail is withheld still names the room,
     broker = await fakeBroker(home, (request) =>
       request.collect
         ? { v: 1, ok: true, delivery: 9, boundTo: second, messages: "not a list" }
-        : request.ack ? { v: 1, ok: true } : { v: 1, ok: true, bound: { conversationId: second, pid: 1 } });
+        : request.ack ? { v: 1, ok: true } : { v: 1, ok: true, bound: { conversationId: second, pid: 1 } }, { confirmVia: `http://127.0.0.1:${port}` });
     told = await paste(second, two.password);
     assertTold(told.context, two.code, second, "an unreadable batch");
     assert.ok(broker.requests.every((request) => !request.ack), "the unreadable batch is not acknowledged");
@@ -2590,7 +2616,7 @@ test("a password accepted in a turn whose mail is withheld still names the room,
     broker = null;
 
     // 3. Control: without a password, a withheld drain stays silent, as it always was.
-    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "conflict", message: "two claims" }));
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "conflict", message: "two claims" }), { confirmVia: `http://127.0.0.1:${port}` });
     told = await paste(first, "hi");
     assert.equal(told.context, "", "no confirmation, nothing to say");
   } finally {
@@ -2630,7 +2656,7 @@ test("a password accepted while the bridge refuses the session's TCP read still 
     };
     const code = (await call("POST", "/sync/rooms", { conversationId: founder })).room;
     const { password } = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
-    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "ineligible", message: "not a CLI this broker binds" }));
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "ineligible", message: "not a CLI this broker binds" }), { confirmVia: `http://127.0.0.1:${port}` });
     const result = await runAdapter(
       "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
       { hook_event_name: "UserPromptSubmit", session_id: founder, cwd: "/tmp/project", prompt: password },
@@ -5321,18 +5347,29 @@ test("a room's password is not handed to whoever asks for it", async () => {
     // the person at the terminal that a wrong password worked.
     assert.equal(guessed.status, 403, "a wrong password is refused, whoever it names");
     assert.equal(guessedBody.ok, false);
-    assert.equal(guessedBody.error, "bad_password");
+    // #294: a stranger's confirm is refused before the password is weighed at all.
+    assert.equal(guessedBody.error, "not_vouched");
     assert.equal(guessedBody.howTo, undefined, "a wrong password earns nothing back");
     assert.ok(!JSON.stringify(guessedBody).includes(password), "and does not leak it another way");
+    // Vouched for by the broker, a wrong password is said as one, and still earns nothing.
+    const wrong = await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password: "f".repeat(32) });
+    assert.equal(wrong.status, 403);
+    assert.equal(wrong.body.error, "bad_password");
+    assert.equal(wrong.body.howTo, undefined);
 
     // What still works: a session that presents the password gets the instructions, which
     // is the whole point of them. The Claude and Antigravity hooks tell their agent to
     // read this answer, so it has to keep carrying the commands.
-    const presented = await asStranger(`/sync/rooms/${code}/confirm`, {
-      conversationId: peer,
-      password,
-    });
-    const presentedBody = await presented.json();
+    // #294: the right password and a member's id, sent by hand, are refused: the bridge
+    // cannot tell whose session sent them. Only the broker's word, for the session it
+    // bound, lets a member in.
+    const byHand = await asStranger(`/sync/rooms/${code}/confirm`, { conversationId: peer, password });
+    const byHandBody = await byHand.json();
+    assert.equal(byHand.status, 403, "the right password sent by hand is refused");
+    assert.equal(byHandBody.error, "not_vouched");
+    assert.ok(!JSON.stringify(byHandBody).includes(password));
+    const presented = await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password });
+    const presentedBody = presented.body;
     assert.ok(presentedBody.howTo, "presenting it is what earns it");
     assert.equal(presentedBody.howTo.credential.value, password);
     assert.match(presentedBody.howTo.send.url, new RegExp(code));
@@ -8837,27 +8874,56 @@ test("a goal turn that began before the session was confirmed, or that spans a r
  * watched choosing between it and TCP. `answer(request)` returns the JSON to send back;
  * every request is recorded.
  */
-const fakeBroker = async (home, answer) => {
+/**
+ * A broker answering every request with `answer(request)`. With `confirmVia` (the bridge's
+ * base URL), a bind is accepted and a confirm is forwarded as the app's broker does (#294),
+ * for the session last bound, so a test can withhold the mail and still let the session in.
+ */
+const fakeBroker = async (home, answer, { confirmVia = null } = {}) => {
   const dir = join(home, ...CONFIG_DIR, "broker");
   await mkdir(dir, { recursive: true });
   const path = join(dir, "gyredeck.broker.sock");
   const requests = [];
+  let bound = null;
+  const forward = async (request) => {
+    if (request.bind) {
+      bound = request.bind.conversationId;
+      return { v: 1, ok: true, bound: { conversationId: bound, pid: 1 } };
+    }
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const response = await bridgeFetch(`${confirmVia}/sync/rooms/${request.confirm.room}/confirm`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
+      body: JSON.stringify({ conversationId: bound, password: request.confirm.password }),
+    });
+    const body = await response.json().catch(() => null);
+    return response.status === 200
+      ? { v: 1, ok: true, boundTo: bound, confirmed: body }
+      : { v: 1, ok: false, error: "room", status: response.status, boundTo: bound, answer: body };
+  };
   const server = createServer((socket) => {
     let text = "";
-    socket.on("data", (chunk) => {
+    socket.on("data", async (chunk) => {
       text += chunk;
       const end = text.indexOf("\n");
       if (end < 0) return;
       const request = JSON.parse(text.slice(0, end));
       requests.push(request);
-      socket.end(`${JSON.stringify(answer(request))}\n`);
+      const reply = confirmVia && (request.bind || request.confirm) ? await forward(request) : answer(request);
+      socket.end(`${JSON.stringify(reply)}\n`);
     });
   });
-  await new Promise((resolve) => server.listen(path, resolve));
+  const close = () => new Promise((resolve) => {
+    openFakeServers.delete(server);
+    if (brokersAt.get(path) === close) brokersAt.delete(path);
+    if (!server.listening) return resolve();
+    server.close(resolve);
+  });
+  await listenBroker(server, path, close);
   // A test that fails before closing it must not keep the run alive (#244 r2).
   server.unref();
   openFakeServers.add(server);
-  return { requests, close: () => new Promise((resolve) => { openFakeServers.delete(server); server.close(resolve); }) };
+  return { requests, close };
 };
 
 test("a hook collects through the broker when it can, and falls back only when the broker is absent or declines", async () => {
@@ -11667,7 +11733,9 @@ test("an unconfirmed Antigravity member sees how to confirm on every invocation,
     // pastes the password into is usually this one.
     const second = await agySteps();
     assert.match(second, /BLOCKED:/, "BLOCKED rides on an invocation with no mail");
-    assert.ok(second.includes(confirmLine) && second.includes(ownId), "with the exact confirm and the session's own id");
+    // #294: the way in is the person pasting it here, never a confirm built by hand.
+    assert.match(second, /pastes it as their next prompt here, and this hook presents it/, "with the way in");
+    assert.ok(!second.includes(confirmLine) && !second.includes(ownId), "and no confirm command to send by hand");
 
     // A confirm with no id, or no password, says what is missing — not "never invited".
     const noId = await call("POST", `/sync/rooms/${code}/confirm`, { password: created.body.password });
@@ -11824,7 +11892,11 @@ const agyPasteFixture = async (tag, { breakInbox = false, inboxBody = null, boun
   });
   assert.equal(probe, "ENOENT", `premise: no broker at this home (tag "${tag}" may be too long)`);
   await waitForHealth(bridgePort, stderrRef);
-  const broker = withBroker ? await forwardingBroker(home, `http://127.0.0.1:${proxy.address().port}`) : null;
+  // Without `withBroker` the reads fall back to TCP, as for a CLI the broker cannot bind; a
+  // confirm still goes through a broker, since the bridge takes one from nobody else (#294).
+  const broker = withBroker
+    ? await forwardingBroker(home, `http://127.0.0.1:${proxy.address().port}`)
+    : await fakeBroker(home, () => ({ v: 1, ok: false, error: "ineligible", message: "not a CLI this broker binds" }), { confirmVia: `http://127.0.0.1:${proxy.address().port}` });
   const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
   const call = async (method, path, body) => {
     const response = await fetch(`http://127.0.0.1:${bridgePort}${path}`, {
@@ -11904,7 +11976,7 @@ test("#250 C1 C3 C4: a pasted password confirms the member once, and the same in
 
 test("#250 C4: the acceptance is said in that invocation even when the broker withholds the mail", async () => {
   const f = await agyPasteFixture("withheld");
-  const broker = await fakeBroker(f.home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" }));
+  const broker = await fakeBroker(f.home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" }), { confirmVia: `http://127.0.0.1:${f.proxyPort}` });
   try {
     const result = await f.invoke(f.password);
     assert.match(result.stderr, /mail withheld this turn/, "premise: the collect was withheld");
@@ -12041,7 +12113,7 @@ const acceptedPastePaths = [
 for (const path of acceptedPastePaths) {
   test(`#255 C1 C2 C4: an accepted agy paste, ${path.name}`, async () => {
     const f = await agyPasteFixture(path.tag, path.options ?? {});
-    const broker = path.broker ? await fakeBroker(f.home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" })) : null;
+    const broker = path.broker ? await fakeBroker(f.home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" }), { confirmVia: `http://127.0.0.1:${f.proxyPort}` }) : null;
     try {
       await path.before?.(f);
       const result = await f.invoke(f.password, path.env ?? {});
@@ -12265,7 +12337,7 @@ const rereadPaths = [
     run: async (f) => {
       await f.confirm();
       await f.say("held back");
-      const broker = await fakeBroker(f.home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" }));
+      const broker = await fakeBroker(f.home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" }), { confirmVia: `http://127.0.0.1:${f.proxyPort}` });
       try {
         const result = await f.invoke();
         assert.ok(broker.requests.length > 0, "premise: the broker was asked");
@@ -12405,7 +12477,7 @@ test("#251 I6: the re-read works for a session the broker holds", async () => {
     const roomCopy = (await (await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}?as=${f.founder}&since=${seq - 1}`, { headers: await memberHeaders(`http://127.0.0.1:${f.bridgePort}`, f.founder, f.token, f.password) })).json()).messages;
     // A broker's collect carries the member's key, as the bridge hands it to the broker (#274).
     const memberKey = await f.agyKey();
-    const broker = await fakeBroker(f.home, () => ({ v: 1, ok: true, boundTo: f.agy, delivery: 1, room: f.code, members: [], memberKey, messages: roomCopy.map((message) => ({ room: f.code, ...message })) }));
+    const broker = await fakeBroker(f.home, () => ({ v: 1, ok: true, boundTo: f.agy, delivery: 1, room: f.code, members: [], memberKey, messages: roomCopy.map((message) => ({ room: f.code, ...message })) }), { confirmVia: `http://127.0.0.1:${f.proxyPort}` });
     try {
       const delivered = await f.invoke();
       assert.ok(broker.requests.some((request) => request.collect), "premise: the broker was asked");
@@ -13531,7 +13603,7 @@ test("#259 C5: a wait's poll, an empty batch to the broker, does not use up the 
 test("#259 C5: a broker that withholds the collect does not use up the line", async () => {
   const f = await agyPasteFixture("h5h");
   try {
-    const broker = await fakeBroker(f.home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" }));
+    const broker = await fakeBroker(f.home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" }), { confirmVia: `http://127.0.0.1:${f.proxyPort}` });
     let held;
     try {
       held = await f.invoke(f.password);

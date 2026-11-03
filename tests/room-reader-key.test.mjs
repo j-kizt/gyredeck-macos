@@ -70,7 +70,7 @@ const twoMembers = async (h) => {
   const created = (await h.call("POST", "/sync/rooms", { conversationId: "member-a" })).body;
   const { room: code, password } = created;
   await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: "member-b" });
-  const confirmed = await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: "member-b", password }, { "content-type": "application/json" });
+  const confirmed = await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: "member-b", password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
   assert.equal(confirmed.status, 200, "premise: b is let in");
   const keyOf = async (as) => (await h.call("GET", `/mail/inbox?as=${as}`, null, { "x-gyredeck-token": password, "x-gyredeck-broker": APP_WORD })).body.memberKey;
   // A member posts with its own key (#294).
@@ -408,7 +408,7 @@ test("C5: a key dies with its membership; coming back mints a new one", async ()
     const old = await r.keyOf("member-b");
     assert.equal((await h.call("DELETE", `/sync/rooms/${r.code}/members/member-b`)).status, 200, "premise: b is taken out");
     await h.call("POST", `/sync/rooms/${r.code}/members`, { conversationId: "member-b" });
-    const again = await h.call("POST", `/sync/rooms/${r.code}/confirm`, { conversationId: "member-b", password: r.password }, { "content-type": "application/json" });
+    const again = await h.call("POST", `/sync/rooms/${r.code}/confirm`, { conversationId: "member-b", password: r.password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
     assert.equal(again.status, 200, "premise: b is back");
     const fresh = await r.keyOf("member-b");
     assert.match(fresh, KEY);
@@ -416,7 +416,7 @@ test("C5: a key dies with its membership; coming back mints a new one", async ()
     assert.equal((await h.raw(`/mail/inbox?as=member-b`, { ...r.pw, "x-gyredeck-member": old })).status, 403, "the old key reads nothing");
     assert.equal((await watch(h, r.code, "member-b", { ...r.pw, "x-gyredeck-member": old })).status, 403, "nor watches");
     assert.equal((await h.raw(`/mail/inbox?as=member-b`, { ...r.pw, "x-gyredeck-member": fresh })).status, 200, "the new one does");
-    const repeat = await h.call("POST", `/sync/rooms/${r.code}/confirm`, { conversationId: "member-b", password: r.password }, { "content-type": "application/json" });
+    const repeat = await h.call("POST", `/sync/rooms/${r.code}/confirm`, { conversationId: "member-b", password: r.password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
     assert.equal(repeat.status, 200);
     assert.equal(await r.keyOf("member-b"), fresh, "a repeated paste does not re-mint: a running watch keeps working");
   } finally {

@@ -5740,13 +5740,10 @@ function startBridge(config) {
               " until that happens.]"
             : "[Gyredeck: you have been put in a room here, but until someone gives you" +
               " its password you can neither read what is said in it nor answer. Ask the" +
-              " person at this terminal for the room's password. When they give it to" +
-              " you, use it yourself: send it as the x-gyredeck-token header on every" +
-              ` call about this room, starting with POST http://127.0.0.1:${config.port}` +
-              `/sync/rooms/${roomName}/confirm with {\"conversationId\":\"${recipient}\",` +
-              ' \"password\":\"THE PASSWORD\"}. Nobody will confirm you; presenting it is' +
-              " what lets you in. Until then, do not retry and do not look for another" +
-              " way in — nothing further will reach you.]";
+              " person at this terminal for the room's password, and to paste it as their" +
+              " next prompt here: your hook presents it and lets you in (#294). Do not send" +
+              " it yourself — a confirm sent by hand is refused. Until then, do not retry" +
+              " and do not look for another way in — nothing further will reach you.]";
         if (provider === "codexCliHook") {
           if (deliverToCodex(recipient, room, notice) === "queued") queued = true;
           else unavailable = true;
@@ -6911,7 +6908,7 @@ function startBridge(config) {
           sendJson(401, {
             ok: false,
             error: "app_only",
-            message: "Only the Gyredeck app can do this. Rooms are opened, joined and closed there; a session takes part by presenting the room's password to /confirm.",
+            message: "Only the Gyredeck app can do this. Rooms are opened, joined and closed there; a session takes part once the person pastes the room's password as a prompt in it.",
           });
           return;
         }
@@ -7073,6 +7070,17 @@ function startBridge(config) {
       // POST /sync/rooms/<code>/confirm — a joined session presents the password its
       // person typed into it, and earns the right to speak in the room.
       if (req.method === "POST" && segments.length === 4 && segments[3] === "confirm") {
+        // Only with the app's word (#294): the broker names the session from the process that
+        // asked. A password and an id the caller wrote would let anyone holding the password
+        // confirm any member, so a confirm sent by hand is refused before anything is read.
+        if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"])) {
+          sendJson(403, {
+            ok: false,
+            error: "not_vouched",
+            message: "A session is let into a room by its own hook, through the Gyredeck app: paste the room's password as your prompt in that session. A confirm sent by hand is not accepted, since nothing here can tell whose session sent it.",
+          });
+          return;
+        }
         const body = await readJsonBody(req);
         const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
         const password = typeof body.password === "string" ? body.password.trim() : "";

@@ -1355,7 +1355,7 @@ fn a_real_bridge_room_reaches_the_child_in_order_named_and_closes() {
     let password = created["password"].as_str().unwrap().to_string();
     for peer in ["peer-a", "peer-b"] {
         assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/members"), serde_json::json!({ "conversationId": peer }), Some(APP_WORD)).0, 200);
-        assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/confirm"), serde_json::json!({ "conversationId": peer, "password": password }), None).0, 200);
+        assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/confirm"), serde_json::json!({ "conversationId": peer, "password": password }), Some(APP_WORD)).0, 200);
     }
 
     let tokens = Arc::new(MemTokens::default());
@@ -4714,7 +4714,7 @@ fn a_real_bridge_takes_the_owners_say_as_you_via_discord_and_no_one_else_can_spe
     let room = created["room"].as_str().unwrap().to_string();
     let password = created["password"].as_str().unwrap().to_string();
     assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/members"), Some(serde_json::json!({ "conversationId": "peer-a" })), Some(APP_WORD)).0, 200);
-    assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/confirm"), Some(serde_json::json!({ "conversationId": "peer-a", "password": password })), None).0, 200);
+    assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/confirm"), Some(serde_json::json!({ "conversationId": "peer-a", "password": password })), Some(APP_WORD)).0, 200);
 
     let tokens = Arc::new(MemTokens::default());
     *tokens.token.lock().unwrap() = Some(BotToken::parse(TOKEN).unwrap());

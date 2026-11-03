@@ -6671,13 +6671,25 @@ pub fn run() {
                         standalone_bridge::bridge_request_vouched("GET", &path, None, &secret).map(|(_, body)| body)
                     })
                 };
-                let report_bound = std::sync::Arc::new(move |session: &str| {
+                let report_bound = {
+                    let secret = secret.clone();
+                    std::sync::Arc::new(move |session: &str| {
                     let body = serde_json::json!({ "conversationId": session }).to_string();
                     standalone_bridge::bridge_request_vouched("POST", "/broker/bound", Some(body), &secret).and_then(
                         |(status, body)| if status == 200 { Ok(()) } else { Err(format!("HTTP {status}: {body}")) },
                     )
-                });
-                if let Err(error) = app.state::<broker::BrokerState>().start_default(collect, report_bound) {
+                    })
+                };
+                // A confirm the broker vouched for (#294): the bound session, never one the
+                // caller named, let into the room with the password it pasted.
+                let confirm = {
+                    let secret = secret.clone();
+                    std::sync::Arc::new(move |session: &str, room: &str, password: &str| {
+                        let body = serde_json::json!({ "conversationId": session, "password": password }).to_string();
+                        standalone_bridge::bridge_request_vouched("POST", &format!("/sync/rooms/{room}/confirm"), Some(body), &secret)
+                    })
+                };
+                if let Err(error) = app.state::<broker::BrokerState>().start_default(collect, report_bound, confirm) {
                     eprintln!("Gyredeck mailbox broker is unavailable: {error}");
                 }
             }

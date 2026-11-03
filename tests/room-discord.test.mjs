@@ -111,7 +111,7 @@ test("an ordinary member's watch is as it was: resume from its stream cursor, a 
   try {
     const { room: code, password } = (await h.call("POST", "/sync/rooms", { conversationId: "founder-1" })).body;
     await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: "peer-a" });
-    await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: "peer-a", password }, { "content-type": "application/json" });
+    await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: "peer-a", password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
     const founder = await asMember(h, "founder-1", password);
     const post = (text) => fetch(`${h.base}/mail/${code}`, {
       method: "POST",
@@ -150,7 +150,7 @@ test("the app's relay joins as Discord, hears the whole room, moves its read pos
 
     for (const peer of ["peer-a", "peer-b"]) {
       assert.equal((await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: peer })).status, 200);
-      assert.equal((await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password }, { "content-type": "application/json" })).status, 200);
+      assert.equal((await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD })).status, 200);
     }
 
     // Only the app says a member is a relay: without its word the join is refused.
@@ -317,7 +317,7 @@ test("T12b: the relay's stream opens with what the room dropped and where the re
   try {
     const { room: code, password } = (await h.call("POST", "/sync/rooms", { conversationId: "founder-1" })).body;
     await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: "peer-a" });
-    await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: "peer-a", password }, { "content-type": "application/json" });
+    await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: "peer-a", password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
     const relayId = `discord-${code}`;
     const joined = await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: relayId, relay: "discord" });
     assert.equal(joined.status, 200);
@@ -345,7 +345,7 @@ test("T12b: the relay's stream opens with what the room dropped and where the re
     for (let i = 0; i < 80; i += 1) {
       const peer = `churn-${i}`;
       await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: peer });
-      await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password }, { "content-type": "application/json" });
+      await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
       await h.call("DELETE", `/sync/rooms/${code}/members/${peer}`);
     }
     const again = await watchUntil(h.base, code, relayId, app, () => false, async () => {}, 500, String(relayFrom));
@@ -376,7 +376,7 @@ const roomWithRelay = async (h, peers = ["peer-a"]) => {
   const { room: code, password } = created.body;
   for (const peer of peers) {
     assert.equal((await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: peer })).status, 200);
-    assert.equal((await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password }, { "content-type": "application/json" })).status, 200);
+    assert.equal((await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD })).status, 200);
   }
   assert.equal((await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: `discord-${code}`, relay: "discord" })).status, 200);
   return { code, password };

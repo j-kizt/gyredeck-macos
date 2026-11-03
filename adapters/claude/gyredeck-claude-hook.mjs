@@ -538,10 +538,14 @@ const confirmRoomPassword = async (endpoint, token, room, prompt) => {
   const membership = await getJson(endpoint, token, `/sync/rooms?as=${room}`);
   const code = typeof membership?.room === "string" ? membership.room : null;
   if (!code) return null;
-  const answer = await postJson(endpoint, token, `/sync/rooms/${code}/confirm`, {
-    conversationId: room,
-    password: match[0],
-  });
+  // Through the broker (#294): it names this session from the process that asked, and the
+  // bridge takes a confirm from nobody else. No broker, or one that cannot vouch for this
+  // process, is no confirm.
+  const bound = judgeBrokerAnswer(await askBroker({ bind: { conversationId: room } }));
+  if (!bound.result) return null;
+  const confirmed = judgeBrokerAnswer(await askBroker({ confirm: { room: code, password: match[0] } }));
+  if (!confirmed.result || confirmed.result.boundTo !== room) return null;
+  const answer = confirmed.result.confirmed;
   if (answer?.ok !== true) return null;
   return { room: code, members: Array.isArray(answer.members) ? answer.members : [] };
 };
@@ -776,14 +780,10 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
         " password — a long line of hex the person copies from the key beside the room" +
         " code in Gyredeck. Ask for it and wait; do not retry without it and do not" +
         " look for another way in.\n" +
-        "When it arrives, present it once and read what comes back:\n" +
-        `  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/sync/rooms/${room_}/confirm` +
-        ' -H \'content-type: application/json\' -H "x-gyredeck-token: THE PASSWORD"' +
-        ` -d '{"conversationId":"${room}","password":"THE PASSWORD"}'\n` +
-        "The response is not optional reading. It carries ok:true when you are in, and a" +
-        " howTo object with the exact commands for posting, watching and waiting in this" +
-        " room, password included. Anything other than ok:true means you are still out —" +
-        " say so rather than acting as though you are in.",
+        "The person pastes it as their next prompt here, and this hook presents it for" +
+        " you (#294): do not send it yourself — a confirm sent by hand is refused. The" +
+        " next turn says whether you are in. Until it says the password was accepted," +
+        " you are still out — say so rather than acting as though you are in.",
     );
   }
 

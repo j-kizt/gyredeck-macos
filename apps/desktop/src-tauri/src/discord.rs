@@ -1946,10 +1946,10 @@ fn lost_lines(record: &journal::Record) -> u64 {
     }
 }
 
-/// The paired owner, read from its store once and then held, so a Keychain the Mac will not
-/// open while its screen is locked never stops the owner's messages (#325). Only an answer
-/// is held: a read that fails is tried again next time. Pairing and Remove go through here,
-/// so what is held is never older than what is stored.
+/// The paired owner, read from its store every time, with the last answer held for when the
+/// store cannot answer (#325). A Mac whose screen is locked refuses the Keychain (-25308): that
+/// is no answer, and the held owner stands in. An answer always wins, "nobody" included, so an
+/// item deleted or replaced is obeyed at once — the copy never speaks over the store.
 pub(crate) struct HeldOwner {
     store: Arc<dyn OwnerStore>,
     held: Mutex<Option<Option<Owner>>>,
@@ -1966,12 +1966,13 @@ impl HeldOwner {
 
 impl OwnerStore for HeldOwner {
     fn read(&self) -> Result<Option<Owner>, String> {
-        if let Some(held) = self.held().clone() {
-            return Ok(held);
+        match self.store.read() {
+            Ok(read) => {
+                *self.held() = Some(read.clone());
+                Ok(read)
+            }
+            Err(why) => self.held().clone().ok_or(why),
         }
-        let read = self.store.read()?;
-        *self.held() = Some(read.clone());
-        Ok(read)
     }
     fn write(&self, owner: &Owner, paired_at: &str) -> Result<(), String> {
         // Whatever the store now holds is not known if the write failed: read it again then.

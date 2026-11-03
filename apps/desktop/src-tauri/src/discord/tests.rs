@@ -4219,8 +4219,8 @@ fn the_owner_is_read_from_the_keychain_at_each_say_never_from_config_or_memory()
     f.state.connect(ROOM, APP_WORD).unwrap();
     connected(&f, ROOM, THREAD);
     on_core_event(&f.state.core, say(ROOM, &msg_id(1), None, None, "from the config's owner", None));
-    // The Keychain held the owner at launch, then could not be read (deleted, locked): the
-    // copy in memory does not speak for it.
+    // The Keychain held the owner at launch, then the item was deleted: the copy in memory does
+    // not speak for it. (A Keychain that cannot be read at all — a locked Mac — is #325's.)
     *f.owners.record.lock().unwrap() = Some((the_owner().unwrap(), "2026-10-27T00:00:00Z".into()));
     lock(&f.state.hub).owner = the_owner();
     *f.owners.record.lock().unwrap() = None;

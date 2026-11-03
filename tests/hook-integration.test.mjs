@@ -5315,7 +5315,11 @@ test("a room's password is not handed to whoever asks for it", async () => {
     const presentedBody = await presented.json();
     assert.ok(presentedBody.howTo, "presenting it is what earns it");
     assert.equal(presentedBody.howTo.credential.value, password);
-    assert.match(presentedBody.howTo.send.command, new RegExp(code));
+    assert.match(presentedBody.howTo.send.url, new RegExp(code));
+    // #294: no ready command, since a post takes the member's own key, which this answer never carries.
+    assert.equal(presentedBody.howTo.send.command, undefined);
+    assert.equal(presentedBody.howTo.watch.command, undefined);
+    assert.match(presentedBody.howTo.send.use, /REPLY command your hook prints/);
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
@@ -10066,10 +10070,12 @@ test("an Antigravity member is told to hear the room with a wait that ends, neve
     assert.doesNotMatch(JSON.stringify(confirmed.body.howTo), /curl -sN/, "no stream anywhere in what it is told");
     assert.match(wait.command, /gyredeck-agy-hook\.mjs wait 60 /);
 
-    // A Claude Code member keeps the stream it can be notified line by line from.
+    // A Claude Code member is pointed at the stream its hook prints, which carries its own key;
+    // the answer itself holds no ready command, since it never carries the key (#294).
     const minted = await call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder });
     const claudeSide = await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: founder, password: minted.body.password });
-    assert.match(claudeSide.body.howTo?.watch?.command ?? "", /curl -sN/, JSON.stringify(claudeSide.body).slice(0, 300));
+    assert.match(claudeSide.body.howTo?.watch?.use ?? "", /HEAR command your hook prints/, JSON.stringify(claudeSide.body).slice(0, 300));
+    assert.equal(claudeSide.body.howTo.watch.command, undefined);
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
@@ -13216,7 +13222,7 @@ test("#258 C1 C2 C3: the Sending section shows the payload and keeps the first l
   for (const line of syntaxLines) assert.ok(line.startsWith("- Codex only"), `C3: on a Codex-only line: ${line}`);
 });
 
-test("#258 C5: the send /confirm hands back carries to and kind, and posting it lands them", async () => {
+test("#258 C5: the send /confirm hands back carries to and kind, and posting them with the member's key lands them", async () => {
   const f = await agyPasteFixture("c5send");
   try {
     const confirmed = await f.call("POST", `/sync/rooms/${f.code}/confirm`, { conversationId: f.agy, password: f.password });
@@ -13226,26 +13232,27 @@ test("#258 C5: the send /confirm hands back carries to and kind, and posting it 
     assert.equal(send.body.kind, "tell");
     assert.ok(!/\[to:|@/.test(send.body.text), "no routing inside text");
     assert.match(send.fields, /never in text/);
-    const post = (command) => {
-      const ran = spawnSync("sh", ["-c", command], { encoding: "utf8" });
-      assert.equal(ran.status, 0, ran.stderr);
-      const answer = JSON.parse(ran.stdout);
-      assert.equal(answer.ok, true, ran.stdout);
+    // #294: no ready command — a post takes the member's own key, which /confirm never
+    // hands out. The fields documented here land when posted with that key.
+    assert.equal(send.command, undefined, "no command that would post without the key");
+    // agy hears through its own hook's wait, which the broker vouches for: no curl, no key.
+    assert.doesNotMatch(confirmed.body.howTo.watch.command, /curl/);
+    assert.ok(!JSON.stringify(confirmed.body.howTo).includes("x-gyredeck-member"), "and never a key");
+    const base = `http://127.0.0.1:${f.bridgePort}`;
+    const post = async (body) => {
+      const answer = await (await fetch(send.url, { method: "POST", headers: { "content-type": "application/json", ...(await memberHeaders(base, f.agy, f.token, f.password)) }, body: JSON.stringify(body) })).json();
+      assert.equal(answer.ok, true, JSON.stringify(answer));
       return answer.seq;
     };
     const landed = async (seq) => {
-      const read = await fetch(`http://127.0.0.1:${f.bridgePort}/mail/${f.code}?as=${f.founder}&since=${seq - 1}`, { headers: await memberHeaders(`http://127.0.0.1:${f.bridgePort}`, f.founder, f.token, f.password) });
+      const read = await fetch(`${base}/mail/${f.code}?as=${f.founder}&since=${seq - 1}`, { headers: await memberHeaders(base, f.founder, f.token, f.password) });
       const message = (await read.json()).messages.find((m) => m.seq === seq);
       assert.ok(message, `premise: seq ${seq} is in the room`);
       return message;
     };
-    // As handed out: the defaults are fields, and they land.
-    assert.ok(send.command.includes('"to":"everyone","kind":"tell"'), "the command carries both");
-    const asIs = await landed(post(send.command.replace("YOUR TEXT", "as handed out")));
+    const asIs = await landed(await post({ ...send.body, text: "as handed out" }));
     assert.deepEqual([asIs.to, asIs.kind, asIs.text], ["everyone", "tell", "as handed out"]);
-    // Addressed: the same command with its fields filled reaches the one member, as an ask.
-    const addressed = send.command.replace("YOUR TEXT", "to the founder").replace('"to":"everyone"', `"to":"${f.founder}"`).replace('"kind":"tell"', '"kind":"ask"');
-    const one = await landed(post(addressed));
+    const one = await landed(await post({ ...send.body, to: f.founder, kind: "ask", text: "to the founder" }));
     assert.deepEqual([one.to, one.kind, one.text], [f.founder, "ask", "to the founder"]);
   } finally {
     await f.close();

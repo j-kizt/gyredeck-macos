@@ -4736,7 +4736,8 @@ function startBridge(config) {
       value: password,
       note:
         "This room's own password, on every call below. Another room's password will not" +
-        " open this one, and reading this room takes this password and nothing else.",
+        " open this one. A read or a post in your name also takes your own key, which only" +
+        " your hook's deliveries carry (#294).",
     },
     identity: {
       as: conversationId,
@@ -4762,13 +4763,12 @@ function startBridge(config) {
         " Set them as these fields, never in text. Answer the member who asked: a tell to" +
         " everyone wakes every session in the room. On your first post, add name — the" +
         " name your own instructions give you; the room calls you by it and keeps the first one.",
-      command:
-        `curl -s -X POST http://${host}:${port}/mail/${name}` +
-        ` -H 'content-type: application/json' -H 'x-gyredeck-token: ${password}'` +
-        ` -d '{"from":"${conversationId}","to":"everyone","kind":"tell","text":"YOUR TEXT","replyTo":"${conversationId}"}'`,
+      // No ready command here: a post in your name takes your own key, and this answer is
+      // not one the broker vouches for, so it is never handed one (#294, #274).
+      use: "Post with the REPLY command your hook prints with this room's mail: it carries your own key beside the password.",
       success: '{"ok":true,"seq":<number>} — the seq is the room-wide sequence of your message.',
       failure: {
-        403: "not_a_member or not_confirmed — you are out of the room, or have not presented its password.",
+        403: "not_a_member or not_confirmed — you are out of the room, or have not presented its password; not_your_key — your own key is missing.",
         400: "invalid_message — from or text missing; message_too_long — over the limit, with limit and length.",
       },
       rule:
@@ -4794,9 +4794,7 @@ function startBridge(config) {
       what: "Be woken when a message arrives, rather than waiting to be typed at.",
       method: "GET",
       url: `http://${host}:${port}/mail/${name}/events?as=${conversationId}`,
-      command:
-        `curl -sN "http://${host}:${port}/mail/${name}/events?as=${conversationId}"` +
-        ` -H 'x-gyredeck-token: ${password}'`,
+      use: "Run the HEAR command your hook prints for this room: it carries your own key beside the password.",
       runner:
         "Run it with a facility that turns each line into a notification while the" +
         " command is still running. A plain background job will not do: most report only" +

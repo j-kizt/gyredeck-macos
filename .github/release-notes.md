@@ -7,10 +7,12 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
 - **`/status` in a room's Discord post** shows that room's agents — working, idle, or not heard
   from since it was connected — and each provider's usage, with how long ago it was read. Only
   you see the answer, and only the Discord account paired with Gyredeck can ask.
-- **`/status` anywhere else** (a DM, another channel) lists every room connected to Discord, with
-  how many agents each has.
-- A usage reading whose time is unknown, or ahead of this Mac's clock, is not shown as current;
-  a room that reconnected while you asked says so instead of showing the old numbers.
+- **`/status` in a DM with the bot, or in a channel outside the room posts**, lists every room
+  connected to Discord, with how many agents each has. In a post that is not a connected room's,
+  it is refused.
+- A usage reading whose time is unknown, or more than five minutes ahead of this Mac's clock, is
+  not shown; one up to five minutes ahead reads as just now. A room that reconnected while you
+  asked says so instead of showing the old numbers.
 
 ## Answer your agents from Discord — (v1.30.0)
 

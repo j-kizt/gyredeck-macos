@@ -1,5 +1,22 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Discord messages reach a locked Mac, and a session posts only as itself — (v1.32.3)
+
+### Fixes
+
+- **What you send from Discord now reaches the room while your Mac is locked.** Before, a
+  locked Mac stopped Gyredeck from reading who the paired owner is in the Keychain, so every
+  message you sent from Discord was refused until you unlocked it. Gyredeck now keeps the
+  paired owner it last read, and uses it only while the Mac is locked. Its Discord items are
+  also readable after the Mac's first unlock. If Gyredeck is started while the Mac is
+  already locked, messages are still refused until the first unlock.
+- **A session can only post in a room under its own name.** Before, anything holding a
+  room's password could post as another member, or present the password on another
+  member's behalf. A post in a member's name now needs that member's own key. For Claude
+  Code and Antigravity sessions, a room's password is accepted only when you paste it as a
+  prompt in that session. The session's hook then presents it through Gyredeck, and a
+  password sent by hand is refused.
+
 ## A Discord post you renamed is found again — (v1.32.2)
 
 ### Fixes

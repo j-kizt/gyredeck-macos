@@ -538,10 +538,14 @@ const confirmRoomPassword = async (endpoint, token, room, prompt) => {
   const membership = await getJson(endpoint, token, `/sync/rooms?as=${room}`);
   const code = typeof membership?.room === "string" ? membership.room : null;
   if (!code) return null;
-  const answer = await postJson(endpoint, token, `/sync/rooms/${code}/confirm`, {
-    conversationId: room,
-    password: match[0],
-  });
+  // Through the broker (#294): it names this session from the process that asked, and the
+  // bridge takes a confirm from nobody else. No broker, or one that cannot vouch for this
+  // process, is no confirm.
+  const bound = judgeBrokerAnswer(await askBroker({ bind: { conversationId: room } }));
+  if (!bound.result) return null;
+  const confirmed = judgeBrokerAnswer(await askBroker({ confirm: { room: code, password: match[0] } }));
+  if (!confirmed.result || confirmed.result.boundTo !== room) return null;
+  const answer = confirmed.result.confirmed;
   if (answer?.ok !== true) return null;
   return { room: code, members: Array.isArray(answer.members) ? answer.members : [] };
 };
@@ -682,6 +686,8 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // What the drain read wins; the confirmation's own answer stands in when the drain read
   // nothing, so the session is told its room either way (#196).
   const room_ = typeof result?.room === "string" ? result.room : (justConfirmed?.room ?? null);
+  // This session's own key, handed with its own deliveries: a post in its name takes it (#294).
+  const memberKey = typeof result?.memberKey === "string" && /^[a-f0-9]{64}$/.test(result.memberKey) ? result.memberKey : null;
   const members = Array.isArray(result?.members)
     ? result.members
     : (justConfirmed?.members ?? []).map((member) => ({ ...member, you: member.conversationId === room }));
@@ -774,14 +780,10 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
         " password — a long line of hex the person copies from the key beside the room" +
         " code in Gyredeck. Ask for it and wait; do not retry without it and do not" +
         " look for another way in.\n" +
-        "When it arrives, present it once and read what comes back:\n" +
-        `  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/sync/rooms/${room_}/confirm` +
-        ' -H \'content-type: application/json\' -H "x-gyredeck-token: THE PASSWORD"' +
-        ` -d '{"conversationId":"${room}","password":"THE PASSWORD"}'\n` +
-        "The response is not optional reading. It carries ok:true when you are in, and a" +
-        " howTo object with the exact commands for posting, watching and waiting in this" +
-        " room, password included. Anything other than ok:true means you are still out —" +
-        " say so rather than acting as though you are in.",
+        "The person pastes it as their next prompt here, and this hook presents it for" +
+        " you (#294): do not send it yourself — a confirm sent by hand is refused. The" +
+        " next turn says whether you are in. Until it says the password was accepted," +
+        " you are still out — say so rather than acting as though you are in.",
     );
   }
 
@@ -862,12 +864,16 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
         ? label(lastAnswerable)
         : "everyone";
     const kind = kindOf(lastAnswerable) === "tell" ? "reaction" : "tell";
-    lines.push(
-      "REPLY — run once, the room's password in place of THE ROOM PASSWORD:\n" +
+    // A post in this session's name takes its own key (#294): with none in this delivery, a
+    // command without it would only be refused, so none is printed, and why is said.
+    lines.push(memberKey
+      ? "REPLY — run once, the room's password in place of THE ROOM PASSWORD:\n" +
         `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${replyTo} ` +
         `-H 'content-type: application/json' -H "x-gyredeck-token: THE ROOM PASSWORD" ` +
+        `-H "x-gyredeck-member: ${memberKey}" ` +
         `-d '${JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''")}'\n` +
-        "It was sent only if you see ok:true and a seq.",
+        "It was sent only if you see ok:true and a seq."
+      : "REPLY — not available in this delivery: a post in your name takes your own key, and the Gyredeck broker could not vouch for this session to hand it over. Tell the person at this terminal; nothing you send by hand would be accepted.",
     );
   } else if (replyTo && !room_) {
     // A plain mailbox takes the machine token, read at send time rather than written in
@@ -912,7 +918,6 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // that does not say is answered as before.
   // The watch reads in this session's name, which takes its own key (#274); the bridge
   // hands it only to a collect the broker made, so without one there is no watch to offer.
-  const memberKey = typeof result?.memberKey === "string" && /^[a-f0-9]{64}$/.test(result.memberKey) ? result.memberKey : null;
   if (room_ && confirmed && result?.watching !== true && !memberKey) {
     lines.push(
       "HEAR — this delivery carries no key for watching the room in this session's name: the room" +

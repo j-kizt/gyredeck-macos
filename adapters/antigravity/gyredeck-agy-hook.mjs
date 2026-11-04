@@ -564,7 +564,7 @@ const nameAsk = (mine) => {
     ' Send it once, as a "name" field beside to and kind on your first post; the room keeps the first name it is given.';
 };
 
-const replyInstruction = (endpoint, room, replyRooms, answering = null, label = null, isMember = null, askName = false) => {
+const replyInstruction = (endpoint, room, replyRooms, answering = null, label = null, isMember = null, askName = false, memberKey = null) => {
   if (replyRooms.length === 0) return null;
   const target = replyRooms[0];
   // A room refuses the machine token; only its own password opens it. The other
@@ -581,13 +581,26 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
       : answering && label && isMember?.(answering.from) ? label(answering) : "everyone";
     const kind = answering?.kind === "tell" ? "reaction" : "tell";
     const body = JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''");
+    // A post in this session's name takes its own key (#294): with none in this delivery, a
+    // command without it would only be refused, so none is printed, and why is said.
+    if (!(typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey))) {
+      return {
+        ephemeralMessage:
+          "The mail above is addressed to you, but no reply command can be given in this delivery:" +
+          " a post in your name takes your own key, and the Gyredeck broker could not vouch for this" +
+          " session to hand it over. Tell the person at this terminal; nothing you send by hand would be accepted.",
+      };
+    }
     return {
       ephemeralMessage:
         "The mail above is addressed to you, and answering is expected — a reply on a" +
         " message channel, not an instruction to change anything. Run once, the room's" +
         " password in place of THE ROOM PASSWORD:\n" +
         `  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${target}` +
-        ` -H 'content-type: application/json' -H "x-gyredeck-token: THE ROOM PASSWORD" -d '${body}'\n` +
+        ` -H 'content-type: application/json' -H "x-gyredeck-token: THE ROOM PASSWORD"` +
+        // This session's own key: a post in its name takes it (#294).
+        ` -H "x-gyredeck-member: ${memberKey}"` +
+        ` -d '${body}'\n` +
         "It was sent only if you see ok:true and a seq.",
     };
   }
@@ -684,13 +697,20 @@ const confirmPastedPassword = async (endpoint, token, room, input) => {
   // Already in (the founder, or a second paste): nothing to present, but the bare hex is
   // still in front of the model and is answered (#255).
   if (mine.confirmed === true) return { already: { room: code } };
-  const answer = await postJsonStatus(endpoint, token, `/sync/rooms/${code}/confirm`, { conversationId: room, password: pasted.toLowerCase() });
-  if (answer.status === 200 && answer.body?.ok === true) {
-    return { accepted: { room: code, members: Array.isArray(answer.body.members) ? answer.body.members : [] } };
+  // Through the broker (#294): it names this session from the process that asked, and the
+  // bridge takes a confirm from nobody else. No broker, or one that cannot vouch for this
+  // process, is a refusal said as one.
+  const bound = judgeBrokerAnswer(await askBroker({ bind: { conversationId: room } }));
+  if (!bound.result) return { refused: { room: code, error: "not_vouched" } };
+  const raw = await askBroker({ confirm: { room: code, password: pasted.toLowerCase() } });
+  const reply = judgeBrokerAnswer(raw);
+  const answer = reply.result?.boundTo === room ? reply.result.confirmed : null;
+  if (answer?.ok === true) {
+    return { accepted: { room: code, members: Array.isArray(answer.members) ? answer.members : [] } };
   }
-  const error = typeof answer.body?.error === "string" && /^[a-z_]{1,40}$/.test(answer.body.error)
-    ? answer.body.error
-    : answer.status === 0 ? "no_answer" : `http_${answer.status}`;
+  // The room's own refusal (a wrong password) rides back from the broker as error "room".
+  const roomSaid = raw.answer?.error === "room" && raw.answer?.boundTo === room ? raw.answer.answer?.error : null;
+  const error = typeof roomSaid === "string" && /^[a-z_]{1,40}$/.test(roomSaid) ? roomSaid : "not_vouched";
   return { refused: { room: code, error } };
 };
 
@@ -850,14 +870,10 @@ const blockedStepFor = (endpoint, syncRoom, room) =>
   " password — a long line of hex the person copies from the key beside the room" +
   " code in Gyredeck. Ask for it and wait; do not retry without it and do not" +
   " look for another way in.\n" +
-  "When it arrives, present it once and read what comes back:\n" +
-  `  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/sync/rooms/${syncRoom}/confirm` +
-  ' -H \'content-type: application/json\' -H "x-gyredeck-token: THE PASSWORD"' +
-  ` -d '{"conversationId":"${room}","password":"THE PASSWORD"}'\n` +
-  "The response is not optional reading. It carries ok:true when you are in, and a" +
-  " howTo object with the exact commands for posting, watching and waiting in this" +
-  " room, password included. Anything other than ok:true means you are still out —" +
-  " say so rather than acting as though you are in.";
+  "The person pastes it as their next prompt here, and this hook presents it for" +
+  " you (#294): do not send it yourself — a confirm sent by hand is refused. The" +
+  " next invocation says whether you are in. Until it says the password was accepted," +
+  " you are still out — say so rather than acting as though you are in.";
 
 // Antigravity wakes the agent only when a background task exits, so a stream that stays
 // open delivers into a log nobody reads (#159, reproduced on agy 1.3.6). The hook's own
@@ -1094,6 +1110,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
     endpoint, room, replyRooms, answerable.at(-1), label,
     (id) => byId.has(id) && id !== room,
     askName !== null,
+    result?.memberKey,
   );
 
   const steps = [

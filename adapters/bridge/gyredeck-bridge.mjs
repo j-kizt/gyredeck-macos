@@ -4736,7 +4736,8 @@ function startBridge(config) {
       value: password,
       note:
         "This room's own password, on every call below. Another room's password will not" +
-        " open this one, and reading this room takes this password and nothing else.",
+        " open this one. A read or a post in your name also takes your own key, which only" +
+        " your hook's deliveries carry (#294).",
     },
     identity: {
       as: conversationId,
@@ -4762,13 +4763,12 @@ function startBridge(config) {
         " Set them as these fields, never in text. Answer the member who asked: a tell to" +
         " everyone wakes every session in the room. On your first post, add name — the" +
         " name your own instructions give you; the room calls you by it and keeps the first one.",
-      command:
-        `curl -s -X POST http://${host}:${port}/mail/${name}` +
-        ` -H 'content-type: application/json' -H 'x-gyredeck-token: ${password}'` +
-        ` -d '{"from":"${conversationId}","to":"everyone","kind":"tell","text":"YOUR TEXT","replyTo":"${conversationId}"}'`,
+      // No ready command here: a post in your name takes your own key, and this answer is
+      // not one the broker vouches for, so it is never handed one (#294, #274).
+      use: "Post with the REPLY command your hook prints with this room's mail: it carries your own key beside the password.",
       success: '{"ok":true,"seq":<number>} — the seq is the room-wide sequence of your message.',
       failure: {
-        403: "not_a_member or not_confirmed — you are out of the room, or have not presented its password.",
+        403: "not_a_member or not_confirmed — you are out of the room, or have not presented its password; not_your_key — your own key is missing.",
         400: "invalid_message — from or text missing; message_too_long — over the limit, with limit and length.",
       },
       rule:
@@ -4794,9 +4794,7 @@ function startBridge(config) {
       what: "Be woken when a message arrives, rather than waiting to be typed at.",
       method: "GET",
       url: `http://${host}:${port}/mail/${name}/events?as=${conversationId}`,
-      command:
-        `curl -sN "http://${host}:${port}/mail/${name}/events?as=${conversationId}"` +
-        ` -H 'x-gyredeck-token: ${password}'`,
+      use: "Run the HEAR command your hook prints for this room: it carries your own key beside the password.",
       runner:
         "Run it with a facility that turns each line into a notification while the" +
         " command is still running. A plain background job will not do: most report only" +
@@ -5111,7 +5109,7 @@ function startBridge(config) {
    */
   const MEMBER_KEY_HEADER = "x-gyredeck-member";
   const MEMBER_KEY_HINT =
-    "A read in a member's name takes that member's own key in x-gyredeck-member, beside the room's password." +
+    "A read or a post in a member's name takes that member's own key in x-gyredeck-member, beside the room's password." +
     " The key arrives with this session's own deliveries, written into the commands they hand you; a session" +
     " the Gyredeck broker cannot vouch for is never given one.";
   const holdsMemberKey = (member, req) =>
@@ -5742,13 +5740,10 @@ function startBridge(config) {
               " until that happens.]"
             : "[Gyredeck: you have been put in a room here, but until someone gives you" +
               " its password you can neither read what is said in it nor answer. Ask the" +
-              " person at this terminal for the room's password. When they give it to" +
-              " you, use it yourself: send it as the x-gyredeck-token header on every" +
-              ` call about this room, starting with POST http://127.0.0.1:${config.port}` +
-              `/sync/rooms/${roomName}/confirm with {\"conversationId\":\"${recipient}\",` +
-              ' \"password\":\"THE PASSWORD\"}. Nobody will confirm you; presenting it is' +
-              " what lets you in. Until then, do not retry and do not look for another" +
-              " way in — nothing further will reach you.]";
+              " person at this terminal for the room's password, and to paste it as their" +
+              " next prompt here: your hook presents it and lets you in (#294). Do not send" +
+              " it yourself — a confirm sent by hand is refused. Until then, do not retry" +
+              " and do not look for another way in — nothing further will reach you.]";
         if (provider === "codexCliHook") {
           if (deliverToCodex(recipient, room, notice) === "queued") queued = true;
           else unavailable = true;
@@ -6913,7 +6908,7 @@ function startBridge(config) {
           sendJson(401, {
             ok: false,
             error: "app_only",
-            message: "Only the Gyredeck app can do this. Rooms are opened, joined and closed there; a session takes part by presenting the room's password to /confirm.",
+            message: "Only the Gyredeck app can do this. Rooms are opened, joined and closed there; a session takes part once the person pastes the room's password as a prompt in it.",
           });
           return;
         }
@@ -7075,6 +7070,17 @@ function startBridge(config) {
       // POST /sync/rooms/<code>/confirm — a joined session presents the password its
       // person typed into it, and earns the right to speak in the room.
       if (req.method === "POST" && segments.length === 4 && segments[3] === "confirm") {
+        // Only with the app's word (#294): the broker names the session from the process that
+        // asked. A password and an id the caller wrote would let anyone holding the password
+        // confirm any member, so a confirm sent by hand is refused before anything is read.
+        if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"])) {
+          sendJson(403, {
+            ok: false,
+            error: "not_vouched",
+            message: "A session is let into a room by its own hook, through the Gyredeck app: paste the room's password as your prompt in that session. A confirm sent by hand is not accepted, since nothing here can tell whose session sent it.",
+          });
+          return;
+        }
         const body = await readJsonBody(req);
         const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
         const password = typeof body.password === "string" ? body.password.trim() : "";
@@ -7847,22 +7853,19 @@ function startBridge(config) {
           }
           return;
         }
-        // This is where the password earns its place. A room with members is one people
-        // were put into deliberately, and the framing tells an agent that a request
-        // from a member is what it is there for — so being able to post as a member has
-        // to be granted, not assumed.
-        // Presenting the room's token is the whole of the authorisation, and it is
-        // presented on every call because that is where a credential already travels.
-        // The first time it arrives from a member, remember it: Codex never posts for
-        // itself — the bridge reads its answer out of its own log and publishes on its
-        // behalf, with no header to carry anything.
-        if (room.members.has(from) && holdsRoomPassword(room, headerToken)) {
-          const member = room.members.get(from);
-          if (member.confirmed !== true) markConfirmed(member);
-        }
+        // A post never lets a member in (#294, the owner's decision): a pending member is
+        // confirmed only by the password it is handed through its hook's /confirm, and a
+        // post in a member's name takes that member's own key, which a pending one has not.
         // The app's own call: the machine token and the app's word together, the pair the
         // app-only routes take. Only it may speak as the room or the person (#205).
         const vouched = holdsMachineToken(headerToken) && holdsBrokerSecret(req.headers["x-gyredeck-broker"]);
+        // A post in a member's name takes that member's own key or the broker's word (#294),
+        // the door #274 set for reads: the password and the machine token are every member's.
+        const notTheirs = refuseToPublish(room, from, vouched) ? null : refuseMemberRead(from, req);
+        if (notTheirs) {
+          sendJson(403, { ok: false, ...notTheirs });
+          return;
+        }
         const refusal = refuseToPublish(room, from, vouched);
         if (refusal) {
           sendJson(403, {

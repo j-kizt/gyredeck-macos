@@ -9,9 +9,10 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   message you sent from Discord was refused until you unlocked it. Gyredeck now saves its
   Discord items so they can be read whenever the Mac has been unlocked at least once since
   it started up. Gyredeck tries to move items an earlier version saved the first time it
-  reads them with the Mac unlocked; if that fails, it tries again on a later read, and until
-  it succeeds a locked Mac still refuses them. Gyredeck also keeps the paired owner it last
-  read, and uses it only when the Keychain refuses because the Mac is locked.
+  reads them with the Mac unlocked, and tries again on a later read if that fails. Until a
+  move succeeds, older items may still be unreadable when Gyredeck starts on a locked Mac.
+  Gyredeck also keeps the paired owner it last read, and uses it only when the Keychain
+  answers that interaction is not allowed, which is how it refuses a locked Mac.
 - **A room's password alone no longer lets anything post as another member, or let another
   member into the room.** A post in a member's name now needs that member's own key, or
   Gyredeck's own authorization. Claude Code and Antigravity sessions join a room when you

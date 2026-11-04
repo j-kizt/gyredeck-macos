@@ -1946,9 +1946,97 @@ fn lost_lines(record: &journal::Record) -> u64 {
     }
 }
 
+/// The paired owner, read from its store every time, with the last answer held for when the
+/// Mac is locked (#325). A locked Mac refuses the Keychain (-25308): the item is there and the
+/// held owner stands in. Any other refusal, a record that is not an owner's included, is said
+/// as it is. An answer always wins, "nobody" included, so an item deleted or replaced is obeyed
+/// at once. A read that began before a write or a delete is not held: it may be the old owner.
+const HELD_OWNER_TRIES: usize = 3;
+
+pub(crate) struct HeldOwner {
+    store: Arc<dyn OwnerStore>,
+    held: Mutex<Held>,
+}
+
+#[derive(Default)]
+struct Held {
+    owner: Option<Option<Owner>>,
+    /// Moved on by every write and delete, before and after the store is touched.
+    generation: u64,
+}
+
+impl HeldOwner {
+    pub(crate) fn new(store: Arc<dyn OwnerStore>) -> Self {
+        Self { store, held: Mutex::new(Held::default()) }
+    }
+    fn held(&self) -> MutexGuard<'_, Held> {
+        self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// Forget what is held, so nothing read before this point can be held after it.
+    fn forget(&self) {
+        let mut held = self.held();
+        held.owner = None;
+        held.generation += 1;
+    }
+    fn hold(&self, owner: Option<Owner>) {
+        let mut held = self.held();
+        held.owner = Some(owner);
+        held.generation += 1;
+    }
+}
+
+impl OwnerStore for HeldOwner {
+    fn read(&self) -> Result<Option<Owner>, Refusal> {
+        // A read a write or a delete overlapped may be the owner before it: read again, and
+        // past a few tries refuse rather than answer with it.
+        for _ in 0..HELD_OWNER_TRIES {
+            let began = self.held().generation;
+            match self.store.read() {
+                Ok(read) => {
+                    let mut held = self.held();
+                    if held.generation == began {
+                        held.owner = Some(read.clone());
+                        return Ok(read);
+                    }
+                }
+                Err(refusal) if refusal.locked => return self.held().owner.clone().ok_or(refusal),
+                Err(refusal) => return Err(refusal),
+            }
+        }
+        Err(Refusal { why: "the paired owner changed while it was read".to_string(), locked: false })
+    }
+    fn write(&self, owner: &Owner, paired_at: &str) -> Result<(), String> {
+        // Whatever the store now holds is not known if the write failed: read it again then.
+        self.forget();
+        self.store.write(owner, paired_at)?;
+        self.hold(Some(owner.clone()));
+        Ok(())
+    }
+    fn delete(&self) -> Result<(), String> {
+        self.forget();
+        self.store.delete()?;
+        self.hold(None);
+        Ok(())
+    }
+}
+
+/// Why the owner could not be read. `locked` is the Mac's lock alone (-25308), the one refusal
+/// a held owner may stand in for (#325).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    pub why: String,
+    pub locked: bool,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
 pub(crate) trait OwnerStore: Send + Sync {
     /// `Ok(None)` only when nobody is paired; an unreadable record is `Err` (#288).
-    fn read(&self) -> Result<Option<Owner>, String>;
+    fn read(&self) -> Result<Option<Owner>, Refusal>;
     /// The whole record in one call.
     fn write(&self, owner: &Owner, paired_at: &str) -> Result<(), String>;
     fn delete(&self) -> Result<(), String>;
@@ -2137,7 +2225,10 @@ impl DiscordState {
         hub.rooms_changed();
     }
 
-    pub(crate) fn with(deps: Deps) -> Self {
+    pub(crate) fn with(mut deps: Deps) -> Self {
+        // The owner is held once read: a Mac whose screen is locked refuses the Keychain, and
+        // every message from Discord asks who the owner is (#325).
+        deps.owners = Arc::new(HeldOwner::new(Arc::clone(&deps.owners)));
         // An owner id an earlier build left in the config never counts; it is deleted.
         if LEGACY_OWNER_KEYS.iter().any(|key| deps.settings.get(key).is_some()) {
             let _ = deps.settings.set(&LEGACY_OWNER_KEYS.map(|key| (key, None)));
@@ -2146,7 +2237,7 @@ impl DiscordState {
         let mut hub = Hub {
             forum_id: text(deps.settings.get(CONFIG_FORUM)),
             owner: owner.clone().ok().flatten(),
-            keychain_refused: owner.err().map(|why| keychain_refused("owner", &why)).into_iter().collect(),
+            keychain_refused: owner.err().map(|refusal| keychain_refused("owner", &refusal.why)).into_iter().collect(),
             losses: Some(Arc::clone(&deps.losses)),
             marks: read_marks(deps.losses.as_ref()),
             ..Hub::default()
@@ -3551,13 +3642,20 @@ impl TeamSlot {
 impl secrets::Slot for TeamSlot {
     fn read(&self) -> Result<Option<Vec<u8>>, i32> {
         match security_framework::passwords::generic_password(self.options()) {
-            Ok(bytes) => Ok(Some(bytes)),
+            Ok(bytes) => {
+                // An item an earlier build wrote can be read only while the Mac is unlocked: moved
+                // to after-first-unlock in place, once per launch, the first time it is read; a refused move is said.
+                if let Err(status) = team_keychain::settle(self.0) {
+                    eprintln!("Gyredeck could not make its Discord {} readable while the Mac is locked: {}", self.0, secrets::describe(status));
+                }
+                Ok(Some(bytes))
+            }
             Err(error) if error.code() == secrets::NOT_FOUND => Ok(None),
             Err(error) => Err(error.code()),
         }
     }
     fn write(&self, value: &[u8]) -> Result<(), i32> {
-        security_framework::passwords::set_generic_password_options(value, self.options()).map_err(|error| error.code())
+        team_keychain::write(self.0, value)
     }
     fn delete(&self) -> Result<(), i32> {
         match security_framework::passwords::delete_generic_password_options(self.options()) {
@@ -3573,6 +3671,117 @@ impl secrets::Slot for TeamSlot {
 /// of this deleted the token it had just saved (found by the migration test on real builds).
 #[cfg(target_os = "macos")]
 struct FileSlot(&'static str);
+
+/// The team's items, readable after the Mac's first unlock — a locked screen included — and on
+/// this Mac only (#325). The crate's own write searches by every attribute it sets, so an item
+/// already there with another accessibility is not found to update; these calls name the item
+/// by class, service, account and keychain alone, and set the accessibility as an attribute.
+#[cfg(target_os = "macos")]
+mod team_keychain {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::data::CFData;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::collections::HashSet;
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        static kSecClass: CFStringRef;
+        static kSecClassGenericPassword: CFStringRef;
+        static kSecAttrService: CFStringRef;
+        static kSecAttrAccount: CFStringRef;
+        static kSecUseDataProtectionKeychain: CFStringRef;
+        static kSecValueData: CFStringRef;
+        static kSecAttrAccessible: CFStringRef;
+        static kSecAttrAccessibleAfterFirstUnlock: CFStringRef;
+        fn SecItemAdd(attributes: *const c_void, result: *mut *const c_void) -> i32;
+        fn SecItemUpdate(query: *const c_void, attributes: *const c_void) -> i32;
+    }
+
+    const NOT_FOUND: i32 = super::secrets::NOT_FOUND;
+    static SETTLED: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
+
+    fn key(name: CFStringRef) -> CFString {
+        unsafe { CFString::wrap_under_get_rule(name) }
+    }
+
+    fn query(account: &str) -> Vec<(CFString, CFType)> {
+        unsafe {
+            vec![
+                (key(kSecClass), key(kSecClassGenericPassword).as_CFType()),
+                (key(kSecAttrService), CFString::new(super::KEYCHAIN_SERVICE).as_CFType()),
+                (key(kSecAttrAccount), CFString::new(account).as_CFType()),
+                (key(kSecUseDataProtectionKeychain), CFBoolean::true_value().as_CFType()),
+            ]
+        }
+    }
+
+    fn after_first_unlock() -> (CFString, CFType) {
+        unsafe { (key(kSecAttrAccessible), key(kSecAttrAccessibleAfterFirstUnlock).as_CFType()) }
+    }
+
+    fn update(account: &str, mut attributes: Vec<(CFString, CFType)>) -> i32 {
+        attributes.push(after_first_unlock());
+        let query = CFDictionary::from_CFType_pairs(&query(account));
+        let attributes = CFDictionary::from_CFType_pairs(&attributes);
+        unsafe { SecItemUpdate(query.as_concrete_TypeRef() as *const c_void, attributes.as_concrete_TypeRef() as *const c_void) }
+    }
+
+    /// Replace the value in place, or add it: never a delete first, so no moment holds nothing.
+    pub(super) fn write(account: &'static str, value: &[u8]) -> Result<(), i32> {
+        let data = (unsafe { key(kSecValueData) }, CFData::from_buffer(value).as_CFType());
+        match update(account, vec![data.clone()]) {
+            0 => {}
+            NOT_FOUND => {
+                let mut attributes = query(account);
+                attributes.push(data);
+                attributes.push(after_first_unlock());
+                let attributes = CFDictionary::from_CFType_pairs(&attributes);
+                let status = unsafe { SecItemAdd(attributes.as_concrete_TypeRef() as *const c_void, std::ptr::null_mut()) };
+                if status != 0 {
+                    return Err(status);
+                }
+            }
+            status => return Err(status),
+        }
+        settled(account);
+        Ok(())
+    }
+
+    /// The accessibility of an item already there, moved once per launch. A refused move is
+    /// said and tried again at the next read: `SecItemUpdate` changes nothing when it fails, so
+    /// the value stays as it was, readable while the Mac is unlocked.
+    pub(super) fn settle(account: &'static str) -> Result<(), i32> {
+        settle_with(account, || update(account, Vec::new()))
+    }
+
+    pub(super) fn settle_with(account: &'static str, update: impl FnOnce() -> i32) -> Result<(), i32> {
+        if is_settled(account) {
+            return Ok(());
+        }
+        // Called once the item was read, so an update that finds nothing has moved nothing.
+        match update() {
+            0 => {
+                settled(account);
+                Ok(())
+            }
+            status => Err(status),
+        }
+    }
+
+    fn is_settled(account: &'static str) -> bool {
+        SETTLED.lock().map(|set| set.as_ref().is_some_and(|set| set.contains(account))).unwrap_or(false)
+    }
+
+    fn settled(account: &'static str) {
+        if let Ok(mut set) = SETTLED.lock() {
+            set.get_or_insert_with(HashSet::new).insert(account);
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod file_keychain {
@@ -3651,11 +3860,12 @@ fn keychain_refused(what: &str, why: &str) -> (String, String) {
 }
 
 #[cfg(target_os = "macos")]
-fn keychain_read(account: &'static str, moved: &'static str) -> Result<Option<Vec<u8>>, String> {
+fn keychain_read(account: &'static str, moved: &'static str) -> Result<Option<Vec<u8>>, Refusal> {
     match secrets::read(&TeamSlot(account), &TeamSlot(moved), &FileSlot(account)) {
         secrets::Read::Found(bytes) => Ok(Some(bytes)),
         secrets::Read::Absent => Ok(None),
-        secrets::Read::Refused(why) => Err(why),
+        secrets::Read::Refused(why) => Err(Refusal { why, locked: false }),
+        secrets::Read::Locked(why) => Err(Refusal { why, locked: true }),
     }
 }
 
@@ -3665,7 +3875,7 @@ impl LossStore for KeychainLosses {
     fn read(&self) -> Result<Option<Vec<u8>>, String> {
         #[cfg(target_os = "macos")]
         {
-            keychain_read(KEYCHAIN_LOSS_ACCOUNT, KEYCHAIN_LOSS_MOVED)
+            keychain_read(KEYCHAIN_LOSS_ACCOUNT, KEYCHAIN_LOSS_MOVED).map_err(|refusal| refusal.why)
         }
         #[cfg(not(target_os = "macos"))]
         Ok(None)
@@ -3696,10 +3906,10 @@ impl LossStore for KeychainLosses {
 struct KeychainOwner;
 
 impl OwnerStore for KeychainOwner {
-    fn read(&self) -> Result<Option<Owner>, String> {
+    fn read(&self) -> Result<Option<Owner>, Refusal> {
         #[cfg(target_os = "macos")]
         {
-            owner_record(keychain_read(KEYCHAIN_OWNER_ACCOUNT, KEYCHAIN_OWNER_MOVED)?)
+            owner_record(keychain_read(KEYCHAIN_OWNER_ACCOUNT, KEYCHAIN_OWNER_MOVED)?).map_err(|why| Refusal { why, locked: false })
         }
         #[cfg(not(target_os = "macos"))]
         Ok(None)
@@ -3736,7 +3946,7 @@ impl TokenStore for KeychainTokens {
     fn read(&self) -> Result<Option<BotToken>, String> {
         #[cfg(target_os = "macos")]
         {
-            let Some(bytes) = keychain_read(KEYCHAIN_ACCOUNT, KEYCHAIN_MOVED)? else {
+            let Some(bytes) = keychain_read(KEYCHAIN_ACCOUNT, KEYCHAIN_MOVED).map_err(|refusal| refusal.why)? else {
                 return Ok(None);
             };
             let text = String::from_utf8(bytes).map_err(|_| "the saved token is not text".to_string())?;

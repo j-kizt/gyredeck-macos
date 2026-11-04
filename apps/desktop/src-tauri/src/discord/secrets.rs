@@ -11,6 +11,8 @@
 pub(crate) const NOT_FOUND: i32 = -25300;
 /// errSecMissingEntitlement: this build has no access group, so it is an ad-hoc one.
 pub(crate) const MISSING_ENTITLEMENT: i32 = -34018;
+/// errSecInteractionNotAllowed: the Mac is locked and the item is not readable until it opens.
+pub(crate) const LOCKED: i32 = -25308;
 
 /// One stored value, as one keychain sees it. `Ok(None)` is errSecItemNotFound and nothing else.
 pub(crate) trait Slot {
@@ -26,6 +28,12 @@ pub(crate) enum Read {
     Found(Vec<u8>),
     Absent,
     Refused(String),
+    /// Refused only because the Mac is locked (#325): the value is there, and readable once it opens.
+    Locked(String),
+}
+
+fn refused(code: i32) -> Read {
+    if code == LOCKED { Read::Locked(describe(code)) } else { Read::Refused(describe(code)) }
 }
 
 pub(crate) fn describe(code: i32) -> String {
@@ -49,18 +57,18 @@ pub(crate) fn read(team: &dyn Slot, moved: &dyn Slot, file: &dyn Slot) -> Read {
         Err(MISSING_ENTITLEMENT) => match file.read() {
             Ok(Some(value)) => Read::Found(value),
             Ok(None) => Read::Absent,
-            Err(code) => Read::Refused(describe(code)),
+            Err(code) => refused(code),
         },
-        Err(code) => Read::Refused(describe(code)),
+        Err(code) => refused(code),
         Ok(None) => match moved.read() {
             Ok(Some(_)) => Read::Absent,
-            Err(code) => Read::Refused(describe(code)),
+            Err(code) => refused(code),
             Ok(None) => match file.read() {
-                Err(code) => Read::Refused(describe(code)),
+                Err(code) => refused(code),
                 Ok(old) => {
                     if let Some(value) = old.as_deref() {
                         if let Err(code) = team.write(value) {
-                            return Read::Refused(describe(code));
+                            return refused(code);
                         }
                     }
                     if moved.write(b"1").is_ok() {
@@ -178,7 +186,8 @@ mod tests {
     #[test]
     fn a_refused_read_of_the_teams_item_is_never_absent() {
         let (team, moved, file) = (Fake { read_err: Some(-25308), ..Fake::default() }, Fake::default(), Fake::holding(b"old"));
-        assert!(matches!(read(&team, &moved, &file), Read::Refused(_)));
+        // The lock is said as the lock (#325), and is no more "absent" than any other refusal.
+        assert!(matches!(read(&team, &moved, &file), Read::Locked(why) if why.contains("-25308")));
         assert_eq!(team.now(), None);
         assert_eq!(*team.writes.borrow(), 0, "nothing is moved over a value that may be there");
     }

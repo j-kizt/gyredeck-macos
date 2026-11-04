@@ -69,7 +69,8 @@ export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDi
             {failure ? <span className="setup-detail" role="status">{failure}</span> : null}
             {confirming ? <span className="setup-detail" role="alert">Remove Discord? The bot stops and its token is deleted. Posts already in Discord stay there.</span> : null}
           </span>
-          {status?.configured && !confirming ? (
+          {/* Also with no token left: a kept warning says Remove clears it, so Remove is there (#282). */}
+          {(status?.configured || Object.keys(status?.journalErrors ?? {}).length > 0) && !confirming ? (
             <button className="pill-btn danger" type="button" disabled={busy} onClick={() => setConfirming(true)} data-tauri-drag-region="false"><Trash2 size={12} strokeWidth={2.3} />Remove</button>
           ) : null}
         </div>
@@ -93,6 +94,17 @@ export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDi
           <span className="setup-copy">
             <span className="setup-title">{message}</span>
             <span className="setup-detail">{what === "owner" ? "Pair again to put it right." : "Paste the bot token again to put it right."}</span>
+          </span>
+        </div>
+      ))}
+      {Object.entries(status?.journalErrors ?? {}).map(([key, error]) => (
+        // Kept in the app until Remove: a loss nothing could record, or a journal the disk
+        // refused or that could not be read, is never only in memory (#282, #199).
+        <div className="setup-row" data-discord="journal-error" key={`journal-${key}`}>
+          <span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span>
+          <span className="setup-copy">
+            <span className="setup-title">{error.message}</span>
+            <span className="setup-detail">{error.code === "journal_blocked" ? "Resumes once the journal is writable." : "Remove Discord clears this."}</span>
           </span>
         </div>
       ))}

@@ -26,7 +26,7 @@ export function readState(path, { now = Date.now } = {}) {
   } catch (error) {
     // Only an absent file is a fresh start. A link, or one that cannot be read, is `blocked`:
     // the caller must not save over what it could not read.
-    if (error?.code === "ENOENT") return { state: empty(), aside: null, blocked: null };
+    if (error?.code === "ENOENT") return { state: empty(), aside: null, blocked: null, fresh: true };
     return { state: empty(), aside: null, blocked: error?.code === "ELOOP" ? "it is a link" : error?.code ?? "unreadable" };
   } finally {
     if (fd !== null) closeSync(fd);
@@ -43,7 +43,7 @@ export function readState(path, { now = Date.now } = {}) {
   } catch {
     return { state: empty(), aside: path, blocked: "it could not be moved aside" };
   }
-  return { state: empty(), aside, blocked: null };
+  return { state: empty(), aside, blocked: null, fresh: true };
 }
 
 export function loadState(path) {

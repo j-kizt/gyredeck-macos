@@ -3242,7 +3242,9 @@ test("a session declares the name it is called by on its first post; the room an
     assert.match(laterContext, /\[from Antigravity · tell\] BEFORE-THE-NAME/, "a message posted before a declaration keeps its sender as shown then");
     assert.match(laterContext, /\[from Antigravity \/ Gyre Assistant · tell\] after the names/);
     assert.match(laterContext, /Antigravity is called Gyre Assistant\./);
-    assert.match(laterContext, /Members changed \(v\d+\):[^]*now [^.]*Antigravity \/ Gyre Assistant/, "#341: the roster moved, so it rides as a difference");
+    // #341: a name declared is the roster moving with nobody joining or leaving, so it rides
+    // whole, with the new names.
+    assert.match(laterContext, /Members now \(v\d+\): [^.]*Antigravity \/ Gyre Assistant/, "#341: the roster moved, so it rides again");
     assert.doesNotMatch(laterContext, /NAME: /);
     assert.doesNotMatch(laterContext, /"name":"YOUR NAME"/);
   } finally {
@@ -14653,7 +14655,7 @@ test("#341 R1 R2 R3 R5: the roster rides only when it moved, whole again after a
     const fourth = "a3410000-0000-4000-8000-000000000444";
     await f.admit(fourth);
     await f.say(f.peer, { to: f.me, kind: "tell", text: "FIFTH" });
-    assert.match(await f.drain(), /Members (now|changed) \(v\d+\)/, "R1: a swap is a change, even under the same label");
+    assert.match(await f.drain(), /Members changed \(v\d+\): joined [^;]+; left [^;]+;/, "R1: a swap is a leave and a join, taken by id, even under the same label");
     // Nothing that asks anything: one line, not the brief.
     await f.say(f.peer, { to: f.me, kind: "reaction", text: "LANDED" });
     const lean = await f.drain();
@@ -14683,6 +14685,36 @@ test("#341 R4: a delivery in the second between the room's five-minute close and
     const gap = await f.drain();
     assert.match(gap, /IN-THE-GAP/, "premise: the delivery");
     assert.doesNotMatch(gap, /HEAR —/, "R4: the routine close is not a lost watch");
+  } finally {
+    await f.close();
+  }
+});
+
+
+test("#341 R7: a Codex push that codex queue refused does not count as handing the roster over", async () => {
+  const f = await codexHeavyFixture("r7");
+  try {
+    // A codex that records every push and refuses the one marked to fail.
+    await writeFile(join(f.home, ".bun", "bin", "codex"), `#!${process.execPath}\nconst a = process.argv.slice(2); require('node:fs').appendFileSync(${JSON.stringify(join(f.home, "queued.log"))}, JSON.stringify(a) + "\\n"); process.exit(a[a.indexOf("--message") + 1].includes("FAIL-ME") ? 1 : 0);\n`);
+    const founder = "a3410000-0000-4000-8000-0000000007f1";
+    const codex = "01a06082-8ef6-7900-ae39-44fe2e463417";
+    const late = "a3410000-0000-4000-8000-0000000007f2";
+    const code = (await f.call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    const { password } = (await f.call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder })).body;
+    await f.ingestCodex(codex);
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: codex });
+    assert.equal((await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: "01a06082-8ef6-7900-ae39-44fe2e463418", password })).body.transitioned, true, "premise: Codex is in");
+    await until(async () => (await f.messagesTo(codex)).some((message) => /you are confirmed in room/.test(message)), "the confirming push");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: late });
+    assert.equal((await f.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: late, password })).status, 200, "premise: the roster moved");
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "FAIL-ME" })).status, 202);
+    const failed = await until(async () => (await f.messagesTo(codex)).find((message) => message.includes("FAIL-ME")), "premise: the failing push was attempted");
+    assert.match(failed, /Members (now|changed)/, "premise: the failed push carried the change");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "AFTER-THE-FAILURE" })).status, 202);
+    const next = await until(async () => (await f.messagesTo(codex)).find((message) => message.includes("AFTER-THE-FAILURE")), "the next push");
+    assert.match(next, /Members (now|changed)/, "R7: the roster is still owed after a refused push");
   } finally {
     await f.close();
   }

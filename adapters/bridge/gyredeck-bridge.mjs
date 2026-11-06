@@ -3514,8 +3514,10 @@ function startBridge(config) {
   const tellConfirmedToCodex = (name, room, conversationId) => {
     const all = heldFor(room, conversationId);
     const delivered =
-      deliverToCodex(conversationId, room, confirmationPayload(room, conversationId, all)) === "queued";
-    if (delivered) rosterFor(room, conversationId).mark();
+      (() => {
+        const roster = rosterFor(room, conversationId);
+        return deliverToCodex(conversationId, room, confirmationPayload(room, conversationId, all), { settled: (ok) => { if (ok) roster.mark(); } });
+      })() === "queued";
     const held = all;
     const member = room.members.get(conversationId);
     if (delivered && member) {
@@ -4643,16 +4645,22 @@ function startBridge(config) {
     }
     const member = as ? room.members.get(as) : null;
     const told = member?.rosterTold ?? null;
-    const before = new Set(told?.names ?? []);
-    const after = new Set(names);
+    // The difference is taken by id (#341 audit r2): a newcomer given a leaver's label is a
+    // leave and a join, though the two read the same.
+    const ids = [...room.members.keys()];
+    const shown = new Map(ids.map((id, index) => [id, names[index]]));
+    const before = new Map(told?.shown ?? []);
+    const version = room.rosterVersion;
     return {
-      version: room.rosterVersion,
-      changed: !told || told.version !== room.rosterVersion,
+      version,
+      changed: !told || told.version !== version,
       first: !told,
-      joined: told ? names.filter((name) => !before.has(name)) : [],
-      left: told ? [...before].filter((name) => !after.has(name)) : [],
+      joined: told ? ids.filter((id) => !before.has(id)).map((id) => shown.get(id)) : [],
+      left: told ? [...before].filter(([id]) => !shown.has(id)).map(([, name]) => name) : [],
       names,
-      mark: () => { if (member) member.rosterTold = { version: room.rosterVersion, names }; },
+      // What this member was handed is what was true when it was built, not when it is marked:
+      // a push is marked once `codex queue` has taken it, and the room may have moved since.
+      mark: () => { if (member && room.members.get(as) === member) member.rosterTold = { version, shown: [...shown] }; },
     };
   };
   const forgetRosterTold = (conversationId) => {
@@ -5731,10 +5739,20 @@ function startBridge(config) {
       stdio: ["ignore", "ignore", "ignore"],
     });
     // The caller has already been told "queued"; a push that could not even start is
-    // one line on stderr, which is more than the silence it used to be.
+    // one line on stderr, which is more than the silence it used to be. `settled` hears
+    // whether `codex queue` actually took it (#341 audit r2), for what may only be counted
+    // as handed over once it was.
+    let pushSettled = false;
+    const settlePush = (ok) => {
+      if (pushSettled) return;
+      pushSettled = true;
+      settled?.(ok);
+    };
     child.on("error", (error) => {
       console.error(`⚠ codex queue could not be started (${error?.code ?? error}): ${binary}`);
+      settlePush(false);
     });
+    child.on("exit", (code) => settlePush(code === 0));
 
     // Without a log to read there is nothing to harvest, but the message was still
     // delivered — the session will show it even if we cannot see the answer.
@@ -6007,9 +6025,10 @@ function startBridge(config) {
           codexRoomTag(fromLabel, kind, from === OWNER_DISCORD_SENDER ? `${OWNER_DISCORD_NOTE}\n${text}` : text),
           { answering: { id: from, kind } },
         );
-        const outcome = deliverToCodex(recipient, room, outgoing);
-        // Handed over only if the push went (#341 audit): a failed push leaves the roster owed.
-        if (outcome === "queued") rosterFor(room, recipient).mark();
+        // Handed over only once `codex queue` took it (#341 audit r2): "queued" is said before the
+        // process has run, and a failed push must leave the roster owed.
+        const roster = rosterFor(room, recipient);
+        const outcome = deliverToCodex(recipient, room, outgoing, { settled: (ok) => { if (ok) roster.mark(); } });
         if (outcome === "queued") {
           queued = true;
           readByPush(recipient);

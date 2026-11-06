@@ -671,6 +671,8 @@ Rules v13 (#199): `## Who a message is for` says a member labelled `Discord` onl
 
 Rules v14 (#274): `## Sending` says a read in your own name also takes your own key, `x-gyredeck-member`, which your deliveries write into the commands they hand you (the watch, a look back); it never goes in a message body and another member's is refused.
 
+Rules v17 (#339): a reaction wakes nobody, and neither does a notice — except that a member leaving wakes whoever is still owed an answer to an ask addressed to it. Both are still published, collected on the member's next wake, and relayed to Discord. The Claude hook's watch brief says the same: the stream never carries a reaction or a notice about who joined, was confirmed or was named.
+
 `limit` caps the batch, and it is applied **by the bridge** rather than by the caller. Whoever advances the position has to be the one that trims: a caller that took the first ten of fourteen would leave four marked as read and never delivered. Only what is actually handed over moves the position, per room.
 
 ### Read position is per member

@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 /**
  * A read in a member's name takes that member's own key (#274). The room's password is
@@ -12,7 +13,7 @@ import test from "node:test";
  * watch or collect as another and move that member's position, and the member silently
  * missed its mail. Each test names the claim it proves, from Gyre Audit's checklist.
  */
-const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+const repoRoot = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 const CONFIG_DIR = [".config", "gyredeck"];
 const APP_WORD = "d3".repeat(32);
 const KEY = /^[0-9a-f]{64}$/;

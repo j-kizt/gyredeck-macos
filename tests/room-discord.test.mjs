@@ -8,13 +8,14 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { OWNER_DISCORD_SENDER, RESERVED_SENDERS, ROOM_RULES_VERSION, isReservedId, roomRules } from "../adapters/bridge/gyredeck-bridge.mjs";
+import { fileURLToPath } from "node:url";
 
 /**
  * The Discord relay member (#199): the app puts it in a room it founded, it is labelled
  * "Discord", it is handed the whole room on its watch and it can never post. The rules
  * tell every agent not to address it.
  */
-const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+const repoRoot = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 const CONFIG_DIR = [".config", "gyredeck"];
 const APP_WORD = "c7".repeat(32);
 
@@ -624,7 +625,7 @@ test("#205 a yes/no flag is a boolean on an ask, kept on the message; anything e
 });
 
 test("rules v16 tell every agent how to mark a yes/no ask, and that ✅ is a yes, never an approval", () => {
-  assert.equal(ROOM_RULES_VERSION, 16);
+  assert.ok(ROOM_RULES_VERSION >= 16, "introduced in v16, kept by every later version");
   const rules = roomRules("http://127.0.0.1:47621");
   assert.match(rules, /"yesNo": true/, "Claude Code and Antigravity: the field");
   assert.match(rules, /invalid_yes_no/, "and what a wrong one gets back");
@@ -666,4 +667,13 @@ test("#206 a room's status is read by the app alone: machine token and broker wo
   } finally {
     await h.stop();
   }
+});
+
+test("#339: rules v17 say a reaction and a notice wake nobody, except a leave for whoever is owed an answer", () => {
+  assert.equal(ROOM_RULES_VERSION, 17);
+  const rules = roomRules("http://127.0.0.1:47621");
+  assert.match(rules, /A reaction wakes nobody/);
+  assert.match(rules, /\*\*notice\*\* is the room speaking about itself\. It needs nothing back, and it wakes nobody/);
+  assert.match(rules, /a member leaves while you are still waiting for its answer to your ask, that notice wakes you/);
+  assert.doesNotMatch(rules, /It interrupts nobody and needs nothing back/, "the v16 sentence is gone");
 });

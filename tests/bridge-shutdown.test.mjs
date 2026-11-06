@@ -6,6 +6,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 /**
  * Every way the bridge is stopped — SIGINT, SIGTERM, and the parent's end of stdin that the
@@ -13,7 +14,7 @@ import test from "node:test";
  * bridge died with a ReferenceError and exit 1, and what the last seconds learnt about
  * sessions was never written (Unexpected fix, #199).
  */
-const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+const repoRoot = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 const CONFIG_DIR = [".config", "gyredeck"];
 const APP_WORD = "d4".repeat(32);
 

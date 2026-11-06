@@ -5,8 +5,9 @@ import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { checkProfile, entitlementsPlist, installDecision, leafIsPinned, pickIdentity, signedBuildConfig, signedWithDeveloperId, teamOf } from "./signing.mjs";
 import { leafSha256 } from "./check-signer.mjs";
+import { fileURLToPath } from "node:url";
 
-const root = resolve(new URL("..", import.meta.url).pathname);
+const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const appName = "Gyredeck.app";
 const builtApp = join(root, "apps/desktop/src-tauri/target/release/bundle/macos", appName);
 const fallbackApp = join(root, "apps/desktop/src-tauri/target/release", appName);

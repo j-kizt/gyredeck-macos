@@ -6,8 +6,9 @@ import { spawn } from "node:child_process";
 import test from "node:test";
 
 import { gyredeckCodexEvents, summariseCodexHooks } from "../adapters/bridge/gyredeck-bridge.mjs";
+import { fileURLToPath } from "node:url";
 
-const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+const repoRoot = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 const CONFIG_DIR = [".config", "gyredeck"];
 const OURS = "/Users/x/.nvm/bin/node /Users/x/.config/gyredeck/gyredeck-codex-hook.mjs --event";
 

@@ -5478,10 +5478,12 @@ function startBridge(config) {
    */
   const streamsTo = (room, message, watcher) =>
     room.members.get(watcher)?.relay === true ? message.from !== watcher : wakesMember(message, watcher);
-  const noteStreamed = (room, watcher, message) => {
+  const noteStreamed = (room, watcher, message, written = true) => {
     const member = watcher ? room.members.get(watcher) : null;
     if (!member) return;
     member.streamSeq = Math.max(member.streamSeq ?? 0, message.seq);
+    // A replay passes over what it does not write; the cursor moves, but the watch carried nothing.
+    if (!written) return;
     // Which messages actually went down this member's watch, one by one (#342): `streamSeq`
     // also moves at join and confirm without a frame, so it cannot say what the watch carried.
     // Bounded: a drain only ever asks about what is still waiting, which is recent.
@@ -8519,7 +8521,8 @@ function startBridge(config) {
             // restated — the two paths were written apart and drifted apart, so a watch
             // that reconnected was handed the acknowledgements and room notices it had
             // just been spared. Every five minutes, for every member.
-            if (streamsTo(room, message, watcher)) {
+            const written = streamsTo(room, message, watcher);
+            if (written) {
               res.write(mailFrame(message));
               replayed = true;
             }
@@ -8528,7 +8531,7 @@ function startBridge(config) {
             // recording that it had, so `since=resume` answered with the same cursor
             // next time and replayed the same backlog — every reconnect, for as long as
             // the room stayed open. A quiet room woke everyone in it every five minutes.
-            noteStreamed(room, watcher, message);
+            noteStreamed(room, watcher, message, written);
           }
         }
 

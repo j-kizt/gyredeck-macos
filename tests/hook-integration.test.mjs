@@ -14780,3 +14780,20 @@ test("#342 W1 W2: a message the watch already carried is a pointer in the drain;
     await f.close();
   }
 });
+
+test("#342 W3: a quiet message a resumed watch passed over without a frame is whole in the drain", async () => {
+  const f = await leanRoomFixture("w3");
+  try {
+    await f.drain();
+    await f.say(f.peer, { to: f.me, kind: "reaction", text: "QUIET-PASSED-OVER" });
+    const key = await memberKeyAt(`http://127.0.0.1:${f.port}`, f.me, (await readFile(join(f.home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim());
+    const watch = await watchRoom(f.port, f.code, f.me, { "x-gyredeck-token": f.password, "x-gyredeck-member": key });
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "AFTER-THE-REPLAY" });
+    await watch.waitFor(/AFTER-THE-REPLAY/, "premise: the replay is done once a later frame arrives");
+    await watch.stop();
+    assert.doesNotMatch(watch.frames(), /QUIET-PASSED-OVER/, "premise: the replay wrote no frame for the reaction");
+    assert.match(await f.drain(), /QUIET-PASSED-OVER/, "W3: never on the watch, so the text itself");
+  } finally {
+    await f.close();
+  }
+});

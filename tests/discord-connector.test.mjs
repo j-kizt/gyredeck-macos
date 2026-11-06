@@ -2572,6 +2572,7 @@ test("#205 discord.js adapter: reaction intents, guild posts, reactions and the 
   client.emit("messageCreate", { id: "D1", channelId: "T1", guildId: "G1", content: "hi", author: { id: OWNER, bot: false }, reference: { messageId: "M9" } });
   client.emit("messageCreate", { id: "D2", channelId: "T1", guildId: "G1", content: "relay", author: { id: "W", bot: true }, webhookId: "W1" });
   client.emit("messageCreate", { id: "D3", channelId: "T1", guildId: "G1", content: "You (via Discord)", author: { id: "W", bot: false }, webhookId: "W1" });
+  client.emit("messageCreate", { id: "D4", channelId: "T1", guildId: "G1", content: "Room sync-exzx (Gyredeck)", author: { id: OWNER, bot: false }, type: 4, system: true });
   client.emit("messageReactionAdd", { emoji: { name: "✅" }, message: { id: "M9", channelId: "T1" } }, { id: OWNER, bot: false });
   client.emit("messageReactionAdd", { emoji: { name: "✅" }, message: { id: "M9", channelId: "T1" } }, { id: "B1", bot: true });
   const replies = [];
@@ -2583,7 +2584,7 @@ test("#205 discord.js adapter: reaction intents, guild posts, reactions and the 
     options: { getBoolean: (n) => (n === "all" ? true : null) },
     reply: async (o) => (replies.push(o), o.withResponse ? { resource: { message: { id: "P1" } } } : undefined),
   });
-  assert.deepEqual(got.map(([e, x]) => [e, x.messageId ?? x.name]), [["post", "D1"], ["reaction", "M9"], ["command", "disconnect"]], "a webhook's or a bot's message is never a post");
+  assert.deepEqual(got.map(([e, x]) => [e, x.messageId ?? x.name]), [["post", "D1"], ["reaction", "M9"], ["command", "disconnect"]], "a webhook's or a bot's message, or a system message such as a post renamed (#356), is never a post");
   assert.deepEqual(got[0][1], { messageId: "D1", channelId: "T1", authorId: OWNER, text: "hi", replyToId: "M9" });
   assert.deepEqual(got[1][1], { messageId: "M9", channelId: "T1", userId: OWNER, emoji: "✅" });
   const cmd = got[2][1];

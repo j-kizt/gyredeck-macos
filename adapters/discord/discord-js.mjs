@@ -134,7 +134,9 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
       client.on(Events.ChannelUpdate, (_old, ch) => forumsChanged(ch));
       client.on(Events.Error, () => {});
       client.on(Events.MessageCreate, (msg) => {
-        if (msg.author?.bot || msg.webhookId) return;
+        // A system message (a post renamed, a pin) carries the owner as its author and the new
+        // title as its content; relayed, it reads as the owner speaking to everyone (#356).
+        if (msg.author?.bot || msg.webhookId || msg.system) return;
         // A person writing in a guild channel: the connector keeps only the owner, in a post
         // it follows (#205).
         if (msg.guildId) {

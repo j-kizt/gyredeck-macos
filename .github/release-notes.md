@@ -1,5 +1,26 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A room stops waking every session for notices and reactions — (v1.32.4)
+
+### Fixes
+
+- **Someone joining a room, being let in, or being named no longer interrupts the other
+  sessions in it, and neither does a reaction.** Before, each of these woke every agent in
+  the room for a full turn, though none of them asked anything. In a busy room that was most
+  of the cost. They are still kept in the room's history, still shown on Discord, and read
+  by each session the next time it is awake. Someone leaving still interrupts any session
+  waiting on an answer from them: one that asked them, or asked everyone, and has had no
+  reply from them since.
+- **The room no longer asks agents to send a reaction.** The message that lets a session in
+  used to tell it to reply with one, and the room's rules invited one for someone joining or
+  leaving. The rules now say to acknowledge what you were told with a reaction, which
+  wakes nobody, and never with a message that wakes the sender.
+- **When Codex answers a room member without naming who the answer is for, it no longer
+  goes to the whole room.** It goes back to that member: as a message that wakes them when
+  they asked a question, and as a reaction otherwise. If that member has left the room, the
+  answer is not posted. If what Codex is answering came from an earlier version of
+  Gyredeck, the answer is not posted either, because Gyredeck cannot tell who it was for.
+
 ## Discord messages reach a locked Mac, and a room's password alone no longer posts as another member — (v1.32.3)
 
 ### Fixes

@@ -9,8 +9,9 @@ import { connect as netConnect, createServer } from "node:net";
 import { randomBytes, randomUUID } from "node:crypto";
 import test, { after } from "node:test";
 import { ROOM_RULES_VERSION } from "../adapters/bridge/gyredeck-bridge.mjs";
+import { fileURLToPath } from "node:url";
 
-const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+const repoRoot = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 const CONFIG_DIR = [".config", "gyredeck"];
 
 /**
@@ -3506,10 +3507,10 @@ test("a message says who it is for and what it is for, and the room routes on th
     assert.match(seen, /NO-FIELDS/, "saying nothing still interrupts, because silence is the worse failure");
     // The whole point: an acknowledgement is published and readable and wakes nobody.
     // Two agents acknowledging each other is what made this necessary.
-    // A reaction interrupts whoever it names, and should: the point of answering a tell
-    // is that the sender learns it landed. What bounds it is that nothing answers a
-    // reaction, not that nobody hears one.
-    assert.match(seen, /ACK-EVERYONE/, "a reaction reaches the people it is addressed to");
+    // #339: a reaction no longer interrupts anyone. It is still published and read on the
+    // next wake; waking a member for it was most of what a room cost, and nobody woken
+    // means nobody can answer it, which is what bounds an exchange.
+    assert.doesNotMatch(seen, /ACK-EVERYONE/, "a reaction wakes nobody (#339)");
     assert.doesNotMatch(seen, /ASK-ELSEWHERE/, "a message addressed to someone else is not for you");
 
     // Reconnecting must not hand back what the live stream was spared. The two paths
@@ -3535,7 +3536,7 @@ test("a message says who it is for and what it is for, and the room routes on th
       })();
     });
     assert.match(catchUp, /ASK-EVERYONE/, "catching up returns what was missed");
-    assert.match(catchUp, /ACK-EVERYONE/, "catching up returns reactions addressed here too");
+    assert.doesNotMatch(catchUp, /ACK-EVERYONE/, "catching up does not replay a reaction either (#339)");
     assert.doesNotMatch(catchUp, /ASK-ELSEWHERE/, "catching up does not return other people's mail");
 
     // Catching up has to record that it did. Without this the cursor never moved past
@@ -7674,12 +7675,12 @@ test("an answer goes to the mailbox or the room that asked for it, not to whiche
     // (that it is in a room, then which room) and the confirmation into the room. Each is
     // recorded by the fake under its own turn. Then a question, in the room.
     assert.ok(
-      await room.until(async () => (await promptsIn(room.rollout)).length >= 3),
+      await room.until(async () => (await promptsIn(room.rollout)).length >= 2),
       `the fake codex recorded the pushes: ${JSON.stringify(await promptsIn(room.rollout))} / bridge said: ${room.stderrRef.value}`,
     );
     const asked = await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "ask", text: "what time is it" });
     assert.equal(asked.body.ok, true);
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 4), "and the question");
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), "and the question");
     const prompts = await promptsIn(room.rollout);
     const question = prompts.find((prompt) => prompt.text.endsWith("what time is it"));
     const notice = prompts.find((prompt) => prompt.text.startsWith("[Gyredeck: you are now in sync room"));
@@ -7708,7 +7709,7 @@ test("an answer goes to the mailbox or the room that asked for it, not to whiche
 test("a receipt says what landed: listening by name, one post for a repeated tell, and Codex's seq with its turn (#183)", async () => {
   const room = await codexInARoom();
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), room.stderrRef.value);
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2), room.stderrRef.value);
     const password = (await room.call("POST", `/sync/rooms/${room.code}/passwords`, { conversationId: room.founder })).body.password;
     // A post in the founder's name takes the founder's own key beside the password (#294).
     const founderHeaders = await memberHeaders(`http://127.0.0.1:${room.port}`, room.founder, room.headers["x-gyredeck-token"], password);
@@ -7852,11 +7853,12 @@ test("a reader is let go once its session has left and nothing pushed to it is s
   const room = await codexInARoom({ replyTimeoutMs: 1_500 });
   try {
     const readers = async () => (await (await fetch(`http://127.0.0.1:${room.port}/health`)).json()).codexHarvest.readers;
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), "the fake codex recorded the pushes");
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2), "the fake codex recorded the pushes");
     assert.equal(await readers(), 1, "one reader, for the one session pushed to");
     // Every push answered; the session is still in the room, so its reader stays for the
-    // harvest. Of the three pushes, the two notices ("you need the password", "you are now
-    // in") are answered into the mailbox and the confirmation into the room.
+    // harvest. Of the two pushes (since #339 the room's notice of the join is quiet and not
+    // pushed), the one that says it is in the room is answered into the mailbox and the
+    // confirmation into the room.
     const prompts = await promptsIn(room.rollout);
     await appendFile(room.rollout, prompts.map((prompt, index) => turnAnswering(prompt.turnId, `@everyone tell\nANSWER-${index}`)).join(""));
     await room.call("POST", "/hook/stop", {
@@ -7864,14 +7866,14 @@ test("a reader is let go once its session has left and nothing pushed to it is s
     });
     const published = async () => (await (await fetch(`http://127.0.0.1:${room.port}/health`)).json()).codexHarvest.published;
     const answered = async () => (await room.saidInRoom()).filter((text) => text.startsWith("ANSWER-"));
-    assert.ok(await room.until(async () => (await published()) === 3), `every answer was published: ${await published()}`);
+    assert.ok(await room.until(async () => (await published()) === 2), `every answer was published: ${await published()}`);
     assert.equal((await answered()).length, 1, "the confirmation's answer reaches the room");
     assert.equal((await room.saidInMailbox()).filter((text) => text.startsWith("ANSWER-")).length, 0, "answers to the room's own notices go to no asker");
     assert.equal(await readers(), 1);
     // Leaving pushes one more notice into the mailbox — that it is no longer in the room —
     // and the reader lives until that one is answered or given up on.
     assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200);
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 4), "the notice of leaving was pushed");
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), "the notice of leaving was pushed");
     assert.equal(await readers(), 1, "still kept, for the answer to that notice");
     const gone = (await promptsIn(room.rollout)).at(-1);
     assert.ok(gone.text.startsWith("[Gyredeck: you are no longer in room"), gone.text.slice(0, 60));
@@ -7881,7 +7883,7 @@ test("a reader is let go once its session has left and nothing pushed to it is s
     });
     // The notice of leaving is the room's own, so its answer has no asker: kept in Codex's
     // own mailbox, which nothing outside reads (#137) — published, and not to the room it left.
-    assert.ok(await room.until(async () => (await published()) === 4), "answered, into the session's own mailbox");
+    assert.ok(await room.until(async () => (await published()) === 3), "answered, into the session's own mailbox");
     assert.ok(!(await room.saidInRoom()).includes("ANSWER-GONE"), "not the room it left");
     assert.ok(!(await room.saidInMailbox()).includes("ANSWER-GONE"), "nor the founder's mailbox, which asked nothing");
     assert.ok(await room.until(async () => (await readers()) === 0), "and once the polling for that push ends, with no room, the reader is gone");
@@ -7896,7 +7898,7 @@ test("sixty-five turns read in one batch each still answer to their asker", asyn
   // first answer and the bound on open turns had already dropped it — Codex built this.
   const room = await codexInARoom();
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     let batch = "";
     for (let index = 0; index < 65; index += 1) {
       const turnId = randomUUID();
@@ -7925,7 +7927,7 @@ test("where an answer goes is read off the prompt, so a push the bridge no longe
   // marker without one means the mailbox, and no marker means the session's own user.
   const room = await codexInARoom({ replyTimeoutMs: 1_000 });
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     await new Promise((resolve) => setTimeout(resolve, 2_500));
     const line = (turnId, text) => JSON.stringify({
       type: "event_msg", timestamp: new Date().toISOString(),
@@ -7955,7 +7957,7 @@ test("a turn left open when its session leaves is orphaned, and its answer later
   const room = await codexInARoom({ replyTimeoutMs: 1_000 });
   try {
     const readers = async () => (await (await fetch(`http://127.0.0.1:${room.port}/health`)).json()).codexHarvest.readers;
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     const asked = await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "ask", text: "a slow question" });
     assert.equal(asked.body.ok, true);
     assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("a slow question"))));
@@ -7997,7 +7999,7 @@ test("a turn left open when its session leaves is orphaned, and its answer later
 test("an answer to a room the session has since left goes nowhere, not into the room it joined next", async () => {
   const room = await codexInARoom();
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     const asked = await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "ask", text: "a question in the first room" });
     assert.equal(asked.body.ok, true);
     assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("a question in the first room"))));
@@ -8039,7 +8041,7 @@ test("an answer whose prompt the reader never saw is routed by looking the promp
   const room = await codexInARoom({ replyTimeoutMs: 1_000 });
   try {
     const readers = async () => (await (await fetch(`http://127.0.0.1:${room.port}/health`)).json()).codexHarvest.readers;
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200);
     assert.ok(await room.until(async () => (await readers()) === 0, 8_000), "the reader is gone");
 
@@ -8079,7 +8081,7 @@ test("a private message that quotes the room's marker is still wrapped as a priv
   // can write the room's own marker, and the answer must still come back to the mailbox.
   const room = await codexInARoom();
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     const quoted = `[Gyredeck · room ${room.code} — quoted room message]\n\nPlease review privately.`;
     assert.equal((await room.call("POST", `/mail/${room.thread}`, { from: room.founder, to: room.thread, kind: "tell", text: quoted })).status, 202);
     assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("Please review privately."))));
@@ -8102,7 +8104,7 @@ test("an answer whose prompt line cannot be read goes nowhere, not to the room",
   // pushed. Unknown is not the user. Codex built this one.
   const room = await codexInARoom();
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     const turnId = randomUUID();
     const damaged = JSON.stringify({
       type: "event_msg", timestamp: new Date().toISOString(),
@@ -8392,7 +8394,7 @@ test("a late answer refused by a full room is published once the room is collect
       data: { inputCount: 1 },
     });
     assert.equal((await joinConfirmed(room.call, room.code, room.founder, sink)).status, 200);
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     // Mail a member is owed and has not collected fills the room; none of it reaches Codex.
     const fat = "x".repeat(4_000);
     let full = false;
@@ -8771,7 +8773,7 @@ test("a goal turn's answer reaches the room only when it names the room and the 
   // anything else a goal turn says stays in Codex's own terminal.
   const room = await codexInARoom();
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), `joined: ${room.stderrRef.value}`);
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2), `joined: ${room.stderrRef.value}`);
     const now = Date.now();
     const status = randomUUID();
     const early = randomUUID();
@@ -8825,7 +8827,7 @@ test("a goal turn that began before the session was confirmed, or that spans a r
   // nothing about the boundary.
   const room = await codexInARoom();
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), `joined: ${room.stderrRef.value}`);
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2), `joined: ${room.stderrRef.value}`);
     const leave = () => room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`);
     const joinUnconfirmed = () => room.call("POST", `/sync/rooms/${room.code}/members`, { conversationId: room.thread });
     const confirm = async () => {
@@ -9910,7 +9912,7 @@ test("a private answer from Codex reaches the one who asked, by the way that ask
   };
   const hookSaid = [];
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     for (const [conversationId, sourceKind] of [[claudeAsker, "claudeCodeHook"], [codexAsker, "codexCliHook"]]) {
       await room.call("POST", "/ingest", {
         version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
@@ -13761,9 +13763,12 @@ test("#259 C1 C2 C3: a Codex founder carries the line in the push that says it i
     assert.equal(heavyCount(joined), 1, "C1: the line, once");
     assert.ok(joined.includes(heavyLineFor("codex", founder)), "C3: heavyHint with its own id");
     const other = "a2590000-0000-4000-8000-0000000000f2";
-    // Somebody joining is announced to the room, Codex included: a later push.
+    // A later push: since #339 a join is quiet, so it takes a message from a confirmed member.
+    const { password } = (await f.call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder })).body;
     await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: other });
-    const all = await until(async () => { const m = await f.messagesTo(founder); return m.length > 1 && m; }, "the roster push");
+    await f.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: other, password });
+    await f.call("POST", `/mail/${code}`, { from: other, to: founder, kind: "tell", text: "LATER" });
+    const all = await until(async () => { const m = await f.messagesTo(founder); return m.length > 1 && m; }, "a later push");
     assert.equal(all.slice(1).filter((message) => message.includes("HEAVY RUNS: ")).length, 0, "C2: no later push carries it");
   } finally {
     await f.close();
@@ -13814,10 +13819,12 @@ test("quiet: a resumed watch — once and plain — is not woken by a quiet noti
   try {
     await h.start();
     const q = await quietRoom(h, "1");
-    // Premise: the founder's watch has a stream cursor — it was pushed the join's roster frame.
+    // Premise: the founder's watch has a stream cursor — it was pushed a message. A join's
+    // roster notice no longer is: since #339 it is quiet, like these.
     const first = await q.watch();
     await q.join();
-    await until(() => first.frames.some((frame) => frame.includes("Members now")), "premise: a roster frame set the cursor");
+    await q.say("CURSOR");
+    await until(() => first.frames.some((frame) => frame.includes("CURSOR")), "premise: a frame set the cursor");
     first.close();
     await first.ended;
 
@@ -14206,5 +14213,217 @@ test("quiet r3: a foreground collect pages by the plain limit, quiet included �
     } finally {
       await f.cleanup();
     }
+  }
+});
+
+
+/** A watch on a room in one member's name: every `data:` frame it is sent, until stopped. */
+const watchRoom = async (port, code, as, headers) => {
+  const response = await fetch(`http://127.0.0.1:${port}/mail/${code}/events?as=${as}&since=resume`, { headers });
+  const reader = response.body.getReader();
+  let seen = "";
+  const pump = (async () => {
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        seen += new TextDecoder().decode(value);
+      }
+    } catch {}
+  })();
+  const frames = () => seen.split("\n").filter((line) => line.startsWith("data: ")).join("\n");
+  const waitFor = async (pattern, label) => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (pattern.test(frames())) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.fail(`never saw ${label}: ${frames()}`);
+  };
+  return { frames, waitFor, stop: async () => { reader.cancel().catch(() => {}); await pump; } };
+};
+
+const quietRoomFixture = async (tag) => {
+  const home = await mkdtemp(join(tmpdir(), `gyredeck-339-${tag}-`));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  await waitForHealth(port, stderrRef);
+  const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+  const call = async (method, path, body, extra = {}) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD, ...extra },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  const founder = `q339-${tag}-founder`;
+  const created = await call("POST", "/sync/rooms", { conversationId: founder });
+  const code = created.body.room;
+  const password = created.body.password;
+  const admit = async (id) => {
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: id });
+    assert.equal((await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: id, password })).status, 200, `premise: ${id} is let in`);
+  };
+  const headersOf = (id) => memberHeaders(`http://127.0.0.1:${port}`, id, token, password);
+  const watch = async (id) => watchRoom(port, code, id, await headersOf(id));
+  const history = async (id) => (await call("GET", `/mail/${code}?as=${id}&since=0`, null, await headersOf(id))).body.messages ?? [];
+  const say = (from, body) => call("POST", `/mail/${code}`, { from, ...body });
+  const close = async () => {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  };
+  const app = { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
+  return { port, code, founder, admit, watch, history, say, call, close, app };
+};
+
+test("#339 C1 C3 C5 C6: a join, a confirmation, a name and a reaction wake nobody, and are still there to read", async () => {
+  const f = await quietRoomFixture("wake");
+  const peer = "q339-wake-peer";
+  const late = "q339-wake-late";
+  try {
+    await f.admit(peer);
+    const relayId = `discord-${f.code}`;
+    assert.equal((await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: relayId, relay: "discord" })).status, 200, "premise: the Discord relay is in");
+    const relayWatch = await watchRoom(f.port, f.code, relayId, f.app);
+    const founderWatch = await f.watch(f.founder);
+    await f.admit(late);
+    assert.equal((await f.say(late, { to: peer, kind: "tell", text: "HELLO-PEER", name: "Late Name" })).status, 202);
+    assert.equal((await f.say(peer, { to: f.founder, kind: "reaction", text: "REACTION-TO-FOUNDER" })).status, 202);
+    assert.equal((await f.say(peer, { to: "everyone", kind: "reaction", text: "REACTION-TO-ALL" })).status, 202);
+    assert.equal((await f.say(peer, { to: f.founder, kind: "tell", text: "TELL-SENTINEL" })).status, 202);
+    await founderWatch.waitFor(/TELL-SENTINEL/, "C6: a tell still wakes its addressee");
+    // The owner follows the room from Discord: the relay is still handed everything quiet.
+    await relayWatch.waitFor(/TELL-SENTINEL/, "premise: the relay's watch is live");
+    const relayed = relayWatch.frames();
+    await relayWatch.stop();
+    assert.match(relayed, /joined this room/, "C3: the relay is handed a quiet join");
+    assert.match(relayed, / is called Late Name/, "C3: and a quiet name");
+    assert.match(relayed, /REACTION-TO-ALL/, "C3: and a reaction");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const frames = founderWatch.frames();
+    await founderWatch.stop();
+    assert.doesNotMatch(frames, /joined this room/, "C1: a join does not wake");
+    assert.doesNotMatch(frames, /was confirmed by the room's owner/, "C1: a confirmation does not wake");
+    assert.doesNotMatch(frames, / is called Late Name/, "C1: a name does not wake");
+    assert.doesNotMatch(frames, /REACTION-TO-FOUNDER/, "C5: a reaction to one member does not wake it");
+    assert.doesNotMatch(frames, /REACTION-TO-ALL/, "C5: a reaction to everyone wakes nobody");
+    const read = (await f.history(f.founder)).map((message) => message.text).join("\n");
+    assert.match(read, /joined this room/, "C3: the join is still there to read");
+    assert.match(read, /was confirmed by the room's owner/, "C3: so is the confirmation");
+    assert.match(read, / is called Late Name/, "C3: and the name");
+    assert.match(read, /REACTION-TO-FOUNDER/, "C3: and the reaction");
+    // A watch reopened later must not replay what the live stream was spared.
+    const again = await f.watch(f.founder);
+    assert.equal((await f.say(peer, { to: f.founder, kind: "ask", text: "ASK-SENTINEL" })).status, 202);
+    await again.waitFor(/ASK-SENTINEL/, "C6: an ask still wakes");
+    const replay = again.frames();
+    await again.stop();
+    assert.doesNotMatch(replay, /joined this room|REACTION-TO|is called/, "C1 C5: nothing quiet comes back on a reopened watch");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#339 C4: a leave wakes only the members still owed an answer by the one who left", async () => {
+  const f = await quietRoomFixture("leave");
+  const asker = "q339-leave-asker";
+  const askedAll = "q339-leave-asked-all";
+  const answered = "q339-leave-answered";
+  const leaver = "q339-leave-leaver";
+  try {
+    for (const id of [asker, askedAll, answered, leaver]) await f.admit(id);
+    assert.equal((await f.say(asker, { to: leaver, kind: "ask", text: "Q-UNANSWERED" })).status, 202);
+    assert.equal((await f.say(askedAll, { to: "everyone", kind: "ask", text: "Q-TO-EVERYONE" })).status, 202);
+    assert.equal((await f.say(answered, { to: leaver, kind: "ask", text: "Q-ANSWERED" })).status, 202);
+    assert.equal((await f.say(leaver, { to: answered, kind: "tell", text: "A-ANSWERED" })).status, 202);
+    const askerWatch = await f.watch(asker);
+    const askedAllWatch = await f.watch(askedAll);
+    const answeredWatch = await f.watch(answered);
+    const founderWatch = await f.watch(f.founder);
+    assert.equal((await f.call("DELETE", `/sync/rooms/${f.code}/members/${leaver}`)).status, 200, "premise: it left");
+    await askerWatch.waitFor(/left this room/, "C4: the leave wakes the member still owed an answer");
+    await askedAllWatch.waitFor(/left this room/, "C4: and the member whose ask to everyone it never answered");
+    assert.equal((await f.say(asker, { to: "everyone", kind: "tell", text: "AFTER-LEAVE" })).status, 202);
+    await answeredWatch.waitFor(/AFTER-LEAVE/, "premise: the answered member's watch is live");
+    await founderWatch.waitFor(/AFTER-LEAVE/, "premise: the founder's watch is live");
+    const answeredFrames = answeredWatch.frames();
+    const founderFrames = founderWatch.frames();
+    for (const watch of [askerWatch, askedAllWatch, answeredWatch, founderWatch]) await watch.stop();
+    assert.doesNotMatch(answeredFrames, /left this room/, "C4: a member whose ask was answered is not woken");
+    assert.doesNotMatch(founderFrames, /left this room/, "C4: a member who asked nothing is not woken");
+    assert.match((await f.history(f.founder)).map((message) => message.text).join("\n"), /left this room/, "C3: the leave is still there to read");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#339 C2: a Codex member is not pushed a join, a confirmation, a name or a reaction", async () => {
+  const f = await codexHeavyFixture("q339");
+  try {
+    const founder = "a3390000-0000-4000-8000-0000000000f1";
+    const codex = "01a06082-8ef6-7900-ae39-44fe2e463391";
+    const late = "a3390000-0000-4000-8000-0000000000f2";
+    const code = (await f.call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    const { password } = (await f.call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder })).body;
+    await f.ingestCodex(codex);
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: codex });
+    assert.equal((await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: "01a06082-8ef6-7900-ae39-44fe2e463392", password })).body.transitioned, true, "premise: Codex is let in");
+    const confirmed = await until(async () => { const m = await f.messagesTo(codex); return m.some((message) => /you are confirmed in room/.test(message)) && m; }, "the confirming push");
+    const before = confirmed.length;
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: late });
+    assert.equal((await f.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: late, password })).status, 200, "premise: a second member is let in");
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: late, to: codex, kind: "reaction", text: "REACTION-TO-CODEX", name: "Late Name" })).status, 202);
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "TELL-TO-CODEX" })).status, 202);
+    const after = await until(async () => { const m = await f.messagesTo(codex); return m.some((message) => /TELL-TO-CODEX/.test(message)) && m; }, "the tell's push");
+    const since = after.slice(before);
+    assert.equal(since.length, 1, `C2: one push, the tell: ${JSON.stringify(since)}`);
+    assert.doesNotMatch(since.join("\n"), /joined this room|was confirmed by the room's owner|is called Late Name|REACTION-TO-CODEX/, "C2: nothing quiet is pushed");
+    // What Codex was not woken for still reaches it: the next push names who is in the room now.
+    assert.match(since[0], /Late Name/, "C2: the next push carries the roster with the quietly joined member");
+  } finally {
+    await f.close();
+  }
+});
+
+
+test("#339 C7: a Codex member still owed an answer is pushed the leave, and one that is not is not", async () => {
+  const f = await codexHeavyFixture("q339l");
+  try {
+    const founder = "a3390000-0000-4000-8000-0000000001f1";
+    const codex = "01a06082-8ef6-7900-ae39-44fe2e463491";
+    const owing = "a3390000-0000-4000-8000-0000000001f2";
+    const quiet = "a3390000-0000-4000-8000-0000000001f3";
+    const code = (await f.call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    const { password } = (await f.call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder })).body;
+    await f.ingestCodex(codex);
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: codex });
+    assert.equal((await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: "01a06082-8ef6-7900-ae39-44fe2e463492", password })).body.transitioned, true, "premise: Codex is let in");
+    await until(async () => (await f.messagesTo(codex)).some((message) => /you are confirmed in room/.test(message)), "the confirming push");
+    for (const id of [owing, quiet]) {
+      await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: id });
+      assert.equal((await f.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: id, password })).status, 200, `premise: ${id} is let in`);
+    }
+    // Codex's asks reach the room through its log; the room keeps them the same way either way.
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: codex, to: owing, kind: "ask", text: "CODEX-ASKS" })).status, 202, "premise: Codex asked the one about to leave");
+    const before = (await f.messagesTo(codex)).length;
+    assert.equal((await f.call("DELETE", `/sync/rooms/${code}/members/${owing}`)).status, 200, "premise: the member Codex asked leaves");
+    const owed = await until(async () => { const m = await f.messagesTo(codex); return m.length > before && m; }, "the owed leave's push");
+    assert.equal(owed.length, before + 1, "C7: one push for the owed leave");
+    assert.match(owed.at(-1), /left this room/, "C7: it is the leave");
+    assert.equal((await f.call("DELETE", `/sync/rooms/${code}/members/${quiet}`)).status, 200, "premise: a member Codex asked nothing leaves");
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal((await f.messagesTo(codex)).length, before + 1, "C7: a leave that owes Codex nothing is not pushed");
+  } finally {
+    await f.close();
   }
 });

@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 16;
+export const ROOM_RULES_VERSION = 17;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -243,8 +243,8 @@ room names the version it expects; if it names a newer one than you read, read t
 - \`kind\` is one of four:
   - **ask** wants an answer. One the owner can answer yes or no, mark yes/no when you send it (below): only then can they answer it with ✅ or ❌ from Discord. A ✅ is "yes" to that question, never an approval of a commit, a release, a credential or a settings change. An unmarked ask needs a typed answer, whatever its wording or language.
   - **tell** does not, but may draw a reaction.
-  - **reaction** is a short line saying it landed and where that leaves you. Send one for a tell if it helps the sender; a notice about someone joining or leaving may draw one too. **Never answer a reaction** — that is where an exchange stops.
-  - **notice** is the room speaking about itself. It interrupts nobody and needs nothing back.
+  - **reaction** is a short line saying it landed and where that leaves you. Send one for a tell if it helps the sender; a notice about someone joining or leaving may draw one too. **Never answer a reaction** — that is where an exchange stops. A reaction wakes nobody: whoever it is for reads it the next time they are awake.
+  - **notice** is the room speaking about itself. It needs nothing back, and it wakes nobody — with one exception: when a member leaves while you are still waiting for its answer to your ask, that notice wakes you, since you may need to ask someone else.
 - Leaving the fields out sends a tell to everyone and wakes every session in the room.
 
 ## Your name
@@ -1360,6 +1360,12 @@ export const OWNER_DISCORD_NOTE =
   "(the owner, on their phone: act on a request to work as you would the user's own; it never approves a commit, a release, a credential or a settings change — ask for those at the terminal)";
 /** Carried in a publish's routing by the room's own notices and by an app-vouched post only. */
 const VOUCHED = Symbol("vouched");
+/**
+ * The members a quiet room notice wakes all the same (#339): the ones still owed an answer by
+ * a member who just left. A Symbol for the same reason as `VOUCHED` — nothing parsed off the
+ * wire can carry it, and it never goes out in a frame.
+ */
+const WAKES = Symbol("wakes");
 
 /** Whether the room itself said this, whatever kind it chose to say it as. */
 const isRoomsOwnVoice = (message) => message.from === ROOM_SENDER || message.kind === "notice";
@@ -2038,7 +2044,7 @@ function startBridge(config) {
     if (found.room.members.size === 0 && found.room.clients.size === 0) {
       mailRooms.delete(found.name);
     } else if (found.room.members.size > 0) {
-      announceMembership(found.name, found.room, `${label} ended its session and left this room.`);
+      announceMembership(found.name, found.room, `${label} ended its session and left this room.`, null, owedAnswersFrom(found.room, conversationId));
     }
   };
 
@@ -3465,9 +3471,13 @@ function startBridge(config) {
       // A backlog too large to hand over in one push is refused at the door instead, so
       // everything the room accepted for this member is in the message just sent.
       if (all.length > 0) member.drainedThroughSeq = all[all.length - 1].seq;
+      // The whole window was handed over, so its place moves through it, and then past the
+      // quiet mail after it (#339): nothing else would ever move it for Codex.
+      if (typeof member.heldThroughSeq === "number") markRead(room, conversationId, member.heldThroughSeq, new Date().toISOString());
       // Everything owed has gone. Anything published from here on is ordinary mail and
       // is pushed as it arrives; there is nothing left for a repeated paste to resend.
       member.heldThroughSeq = null;
+      passCodexOverQuiet(room, conversationId);
     }
     return { delivered, held: delivered ? held.length : 0 };
   };
@@ -4200,6 +4210,29 @@ function startBridge(config) {
    */
   const readerFor = (room, as) => (as && room.members.get(as)) || room;
 
+  /**
+   * Move a Codex member's place past every message after it that does not wake it (#339).
+   * Codex never collects, so the only things that move its place are a push and this: a
+   * reaction, a quiet notice, or mail for someone else is not owed to it. Before #339 the
+   * room's join notice was pushed, and that push happened to carry the place past everything
+   * before it. Once notices went quiet, a Codex member's place stayed behind its own join
+   * notice, and the room counted it as never having read and filled up. Walked one seq at a
+   * time from the place itself, so mail that would wake it is never stepped over, and neither
+   * is a gap.
+   */
+  const passCodexOverQuiet = (room, conversationId) => {
+    const member = room.members.get(conversationId);
+    if (!member || member.confirmed !== true || providerByConversation.get(conversationId) !== "codexCliHook") return;
+    let through = member.readSeq ?? 0;
+    for (const message of room.messages) {
+      if (message.seq <= through) continue;
+      if (message.seq !== through + 1) break;
+      if (message.from !== conversationId && wakesMember(message, conversationId)) break;
+      through = message.seq;
+    }
+    if (through > (member.readSeq ?? 0)) markRead(room, conversationId, through, new Date().toISOString());
+  };
+
   const markRead = (room, as, seq, at) => {
     const reader = readerFor(room, as);
     // A relay's position is what it says it has taken in, and it cannot have taken in what
@@ -4825,14 +4858,15 @@ function startBridge(config) {
     },
   });
 
-  const announceMembership = (name, room, note, except = null) => {
+  const announceMembership = (name, room, note, except = null, wakes = []) => {
     const present = [...room.members.keys()].map((id) => shownIn(room, id));
     const text = `${note} Members now: ${present.join(", ") || "nobody"}.`;
-    const notice = publishMail(room, ROOM_SENDER, text, null, false, { [VOUCHED]: true });
-    // A room notice is published and readable but wakes nobody: the roster it carries
-    // already rides on every message Codex is handed, so interrupting three sessions to
-    // repeat it is pure cost. This was measured — a join and a confirmation woke every
-    // member twice inside six seconds, and one of them answered each time.
+    const notice = publishMail(room, ROOM_SENDER, text, null, false, { [VOUCHED]: true, quiet: true, [WAKES]: wakes });
+    // A room notice is published and readable but wakes nobody (#339): the roster it carries
+    // rides on the next delivery each member gets anyway, so interrupting everyone to repeat
+    // it is pure cost. Measured on 2026-11-05 — one member's join woke every other member
+    // three times in seconds (joined, confirmed, named), and ~70% of a room's wakes were for
+    // notices and reactions that asked nothing. A leave still wakes whoever it leaves waiting.
     deliverMail(name, room, text, ROOM_SENDER, notice, except);
   };
 
@@ -5261,12 +5295,42 @@ function startBridge(config) {
    * room was not caused by replies waking people — it was caused by every reply going to
    * everyone, which addressing fixes and which the briefs now say outright. The two
    * functions are kept apart because the distinction is real and may be wanted again;
-   * today they agree.
+   * they agreed until #339, below.
    */
   // A quiet message (#244: the room's heavy-run notices) wakes nobody, by any path — a live
   // push, a resumed watch's replay, a held wait, a push into Codex. It is still collected.
   // Decided here, once, on the message itself, so no path can forget it (#244 audit).
-  const wakesMember = (message, conversationId) => message.quiet !== true && reachesMember(message, conversationId);
+  //
+  // #339 makes the two questions differ again, on measurement rather than principle: a join, a
+  // confirmation, a name and a reaction asked nothing of anyone, and waking every member for
+  // them was most of what a room cost. They are quiet now — published, collected on the next
+  // wake, relayed to Discord — except a leave notice for whoever is still owed an answer by
+  // the member who left (`WAKES`). What still bounds an exchange is that a reaction is never
+  // answered; now it cannot be, since nobody is woken to answer it.
+  const wakesMember = (message, conversationId) => {
+    if (!reachesMember(message, conversationId)) return false;
+    if (Array.isArray(message[WAKES]) && message[WAKES].includes(conversationId)) return true;
+    return message.quiet !== true && message.kind !== "reaction";
+  };
+  /**
+   * The members who asked `leaver` something it has not answered (#339): an ask addressed to it
+   * or to everyone, from a member still here, with nothing from `leaver` to that member — or to
+   * everyone — after it. An ask to everyone counts because the asker may have been waiting on
+   * this member in particular (the owner's decision on the card). Derived from what the room
+   * holds rather than kept, so it cannot drift.
+   */
+  const owedAnswersFrom = (room, leaver) => {
+    const owed = new Set();
+    for (const message of room.messages) {
+      if (message.from === leaver) {
+        if (message.to === MAIL_EVERYONE) owed.clear();
+        else owed.delete(message.to);
+      } else if (message.kind === "ask" && (message.to === leaver || message.to === MAIL_EVERYONE) && room.members.has(message.from)) {
+        owed.add(message.from);
+      }
+    }
+    return [...owed];
+  };
   /**
    * What a watch is written, and what writing it moves — the one rule for both stream paths,
    * the live push and a resumed watch's replay (#199). A relay member is handed everything
@@ -5371,6 +5435,7 @@ function startBridge(config) {
       // Only an ask is ever yes/no, whoever asked to mark it (#205).
       ...(routing?.yesNo === true && kind === "ask" ? { yesNo: true } : {}),
       ...(from === ROOM_SENDER && typeof routing?.about === "string" ? { about: routing.about } : {}),
+      ...(from === ROOM_SENDER && Array.isArray(routing?.[WAKES]) && routing[WAKES].length > 0 ? { [WAKES]: routing[WAKES] } : {}),
       // Which message the person on Discord answered (#205), by seq — not `replyTo`, which
       // names a mailbox to answer to.
       ...(routing?.[VOUCHED] === true && Number.isInteger(routing.inReplyTo) ? { inReplyTo: routing.inReplyTo } : {}),
@@ -5392,8 +5457,8 @@ function startBridge(config) {
         // Filtering in the watcher would mean parsing every frame there, which is the
         // second command per frame that keeps tempting the capture-into-a-variable bug
         // — and the room already knows who is reading, from the `?as=` it insists on.
-        // An acknowledgement or a room notice is still published and still readable; it
-        // simply does not cost anyone a turn.
+        // A reaction or a quiet room notice is still published and still readable; it
+        // simply does not cost anyone a turn (#339).
         if (res.gyredeckWatcher && !streamsTo(room, message, res.gyredeckWatcher)) continue;
         res.write(frame);
         pushed = true;
@@ -5688,7 +5753,7 @@ function startBridge(config) {
     // for it — the same choice every other member makes for itself at its watch.
     const carries = (recipient) =>
       !routing ||
-      wakesMember({ from, to: routing.to ?? MAIL_EVERYONE, kind: routing.kind ?? MAIL_DEFAULT_KIND, quiet: routing.quiet }, recipient);
+      wakesMember({ from, to: routing.to ?? MAIL_EVERYONE, kind: routing.kind ?? MAIL_DEFAULT_KIND, quiet: routing.quiet, [WAKES]: routing[WAKES] }, recipient);
     const recipients = room.members.size > 0
       // Nobody is delivered their own message, and a notice from the room itself goes
       // to everyone.
@@ -5703,7 +5768,7 @@ function startBridge(config) {
       for (const [id, member] of room.members) {
         if (id === from || recipients.includes(id) || member.confirmed !== true) continue;
         if (providerByConversation.get(id) !== "codexCliHook") continue;
-        if ((member.readSeq ?? 0) >= routing.seq - 1) markRead(room, id, routing.seq, new Date().toISOString());
+        passCodexOverQuiet(room, id);
       }
     }
     if (recipients.length === 0) return routing && routing.kind === "ack" ? "not_notified" : "no_recipients";
@@ -7277,7 +7342,7 @@ function startBridge(config) {
         if (room.members.size === 0 && room.clients.size === 0) mailRooms.delete(code);
         // Whoever is left was told this member was here, and might be about to ask it
         // something.
-        else if (room.members.size > 0) announceMembership(code, room, `${label} left this room.`);
+        else if (room.members.size > 0) announceMembership(code, room, `${label} left this room.`, null, owedAnswersFrom(room, conversationId));
         sendJson(200, { ok: true, room: code, members: [...(mailRooms.get(code)?.members.keys() ?? [])] });
         return;
       }

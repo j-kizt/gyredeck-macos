@@ -6,8 +6,9 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { checkProfile, entitlementsPlist, signedBuildConfig } from "./signing.mjs";
+import { fileURLToPath } from "node:url";
 
-const root = resolve(new URL("..", import.meta.url).pathname);
+const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const teamId = process.env.APPLE_TEAM_ID ?? "";
 const encoded = process.env.APPLE_PROVISIONING_PROFILE ?? "";
 if (!teamId || !encoded) {

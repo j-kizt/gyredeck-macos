@@ -936,8 +936,8 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
         `  sleep 1\n` +
         `done\n` +
         "Anything arriving on it is meant to interrupt you: the room sends only what was" +
-        " addressed to you or to everyone, never an acknowledgement or a notice about its" +
-        " own membership.\n" +
+        " addressed to you or to everyone, never a reaction or a notice about who joined," +
+        " was confirmed or was named.\n" +
         "  · Run it with something that turns each line into a notification while the" +
         " command keeps running. A plain background job is not that — most report only when" +
         " the process exits, so the stream stays open, messages land in a file, and nothing" +

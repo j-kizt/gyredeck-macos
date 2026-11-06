@@ -10,8 +10,8 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   room when it was sent to everyone — though none of them asked anything. In a busy room
   that was most of the cost. They are still kept in the room's history and still shown on
   Discord. A Claude Code or Antigravity session reads them the next time it is awake; a
-  Codex session is not handed them, but the next message it is handed names who is in the
-  room now. Someone leaving still interrupts any session
+  Codex session is not handed them, but the next room message it is handed names who is in
+  the room now. Someone leaving still interrupts any session
   waiting on an answer from them: one that asked them, or asked everyone, and has had no
   reply from them since.
 - **The room no longer asks for a reaction when a session is let in, or when someone joins

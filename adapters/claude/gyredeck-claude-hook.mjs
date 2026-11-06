@@ -841,10 +841,14 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // The kind travels with each message: a session that cannot see that a line was a
   // reaction answers it, which is the loop the kinds exist to stop.
   const kindOf = (message) => (typeof message?.kind === "string" ? message.kind : null);
+  const onWatch = new Set(Array.isArray(result?.onWatch) ? result.onWatch.filter(Number.isInteger) : []);
   const lines = [
     [heading, ...standing].join(" "),
+    // A message the watch already carried is a pointer here, not the text a second time (#342):
+    // both copies landed in the same turn and stayed in the context for good.
     ...delivered.map((message) =>
-      `[from ${shown(message)}${kindOf(message) ? ` · ${kindOf(message)}` : ""}] ${message.text.slice(0, MAIL_MAX_TEXT)}`),
+      `[from ${shown(message)}${kindOf(message) ? ` · ${kindOf(message)}` : ""}] ` +
+        (onWatch.has(message.seq) ? `(already on your watch, seq ${message.seq})` : message.text.slice(0, MAIL_MAX_TEXT))),
   ];
 
   // Something to answer: an ask or a tell from somebody. A reaction ends an exchange and a

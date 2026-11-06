@@ -1641,7 +1641,7 @@ test("an inbox merges a session's mailbox with its sync room, and the cap cannot
       [code, peer],
     ]);
     assert.match(merged.messages[0].text, /you are now in sync room .*you created it/s);
-    assert.match(merged.messages[1].text, /joined this room\. Members now: /);
+    assert.match(merged.messages[1].text, /joined this room\.$/, "#341: no roster tail on a notice");
     assert.match(merged.messages[2].text, /was confirmed by the room's owner/);
     // The same call names the room and who is in it, so a hook with a sub-second
     // budget does not need a second request to know who it is talking to.
@@ -3010,7 +3010,7 @@ test("a session's assigned name shows wherever the room names it, and to still t
     );
     assert.equal(result.code, 0, result.stderr);
     const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
-    assert.match(context, /Antigravity \/ Altrix Agy joined this room\. Members now: Claude Code \/ Altrix Assistant, Antigravity \/ Altrix Agy\./);
+    assert.match(context, /Antigravity \/ Altrix Agy joined this room\./);
     assert.match(context, /Members now \(v\d+\): Claude Code \/ Altrix Assistant, Antigravity \/ Altrix Agy\./, "#341: the roster, with its version");
     assert.match(context, /\[from Antigravity \/ Altrix Agy · tell\] hello from the named one/);
     assert.match(context, /"to":"Antigravity","kind":"reaction"/, "the reply is still addressed by label");
@@ -3217,8 +3217,10 @@ test("a session declares the name it is called by on its first post; the room an
     assert.equal(await routedTo("Claude Code"), founder);
     assert.equal(await routedTo("Antigravity"), agy);
     assert.equal(await routedTo("Antigravity / Gyre Assistant"), agy);
-    assert.notEqual(await routedTo("Gyre Assistant"), founder, "a name two members share addresses neither of them");
-    assert.notEqual(await routedTo("Gyre Assistant"), agy);
+    // A name two members share addresses neither of them: refused, with who is here (#341).
+    const shared = await post(third, { to: "Gyre Assistant", text: "to a shared name" });
+    assert.equal(shared.status, 409, JSON.stringify(shared.body));
+    assert.equal(shared.body.error, "not_in_room");
 
     // Phase 5: control characters and an overlong name are made safe to print.
     await post(third, { to: "everyone", text: "a messy name", name: "\u0007Ops]\u001b\n· reaction[" + "y".repeat(80) });
@@ -3496,6 +3498,9 @@ test("a message says who it is for and what it is for, and the room routes on th
     const acked = await say({ text: "ACK-EVERYONE", kind: "ack", to: "everyone" });
     const direct = await say({ text: "ASK-DIRECT", kind: "ask", to: founder });
     const elsewhere = await say({ text: "ASK-ELSEWHERE", kind: "ask", to: "not-a-member" });
+    // #341: a message to someone not in the room is refused, with who is.
+    assert.equal(elsewhere.status, 409);
+    assert.equal(elsewhere.body.error, "not_in_room");
     // Nothing said at all: the shape every existing caller uses, which has to keep
     // behaving the way it always did.
     const bare = await say({ text: "NO-FIELDS" });
@@ -3566,7 +3571,6 @@ test("a message says who it is for and what it is for, and the room routes on th
     assert.doesNotMatch(nothingLeft, /ASK-EVERYONE/, "a second catch-up has nothing left to give");
 
     assert.equal(acked.body.kind ?? "reaction", "reaction");
-    assert.equal(elsewhere.body.delivery, "no_recipients");
     assert.ok(asked.body.seq < acked.body.seq, "an ack still takes a seq and stays readable");
 
     // A reaction is where an exchange stops, and saying so is an instruction — the kind
@@ -3600,8 +3604,9 @@ test("a message says who it is for and what it is for, and the room routes on th
     // said, so a line to somebody outside the room is in its sender's history and nobody else's.
     const history = await readRoom(peer);
     const texts = history.body.messages.map((message) => message.text);
-    assert.ok(!(await readRoom(founder)).body.messages.some((message) => message.text === "ASK-ELSEWHERE"), "a line to someone else is not in the founder's history");
-    for (const text of ["ASK-EVERYONE", "ACK-EVERYONE", "ASK-DIRECT", "ASK-ELSEWHERE", "NO-FIELDS"]) {
+    assert.ok(!(await readRoom(founder)).body.messages.some((message) => message.text === "ASK-ELSEWHERE"), "a refused line is in nobody's history");
+    assert.ok(!texts.includes("ASK-ELSEWHERE"), "#341: not even the sender's, since it was never published");
+    for (const text of ["ASK-EVERYONE", "ACK-EVERYONE", "ASK-DIRECT", "NO-FIELDS"]) {
       assert.ok(texts.includes(text), `${text} is in the room's history`);
     }
     // Sent as `ack`, stored as `reaction`: the old word is accepted and normalised, so
@@ -3673,8 +3678,10 @@ test("a wait that times out says whether the message was the problem", async () 
       /have not said anything|nobody else in this room/,
     );
     assert.match(
+      // #341: the room refuses a message to someone not in it when it is sent, so there is no
+      // silence to explain afterwards.
       (await scenario("silence-c", ({ code }) => said("silence-c", code, { text: "x", kind: "ask", to: "ghost" }))).reason,
-      /not in this room/,
+      /have not said anything/,
     );
     assert.match(
       (await scenario("silence-d", ({ code }) => said("silence-d", code, { text: "x", kind: "ask" }))).reason,
@@ -14637,8 +14644,16 @@ test("#341 R1 R2 R3 R5: the roster rides only when it moved, whole again after a
       version: 2, id: randomUUID(), type: "conversation_open", timestamp: new Date().toISOString(), conversationId: f.me, cwd: "/tmp/project",
       runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { reason: "compact", previousConversationId: null },
     });
+    // A prompt with nothing waiting prints nothing, so it must not count as handing the roster over.
+    assert.equal(await f.drain(), "", "premise: an empty collect prints nothing");
     await f.say(f.peer, { to: f.me, kind: "tell", text: "FOURTH" });
-    assert.match(await f.drain(), /Members now \(v\d+\): /, "R2: after a compaction the roster is whole again");
+    assert.match(await f.drain(), /Members now \(v\d+\): /, "R2: after a compaction the roster is whole again, even past an empty prompt");
+    // A member swapped for a newcomer shown the same way still moves the version (by id).
+    await f.call("DELETE", `/sync/rooms/${f.code}/members/${third}`);
+    const fourth = "a3410000-0000-4000-8000-000000000444";
+    await f.admit(fourth);
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "FIFTH" });
+    assert.match(await f.drain(), /Members (now|changed) \(v\d+\)/, "R1: a swap is a change, even under the same label");
     // Nothing that asks anything: one line, not the brief.
     await f.say(f.peer, { to: f.me, kind: "reaction", text: "LANDED" });
     const lean = await f.drain();
@@ -14647,7 +14662,8 @@ test("#341 R1 R2 R3 R5: the roster rides only when it moved, whole again after a
     assert.doesNotMatch(lean, /RULES: |NARRATE: |WAIT —|REPLY —/, "R3: no brief");
     // Sending to someone not here answers with who is.
     const stray = await f.say(f.me, { to: "nobody-here", kind: "tell", text: "STRAY" });
-    assert.equal(stray.body.notInRoom, true, "R5: the receipt says the addressee is not here");
+    assert.equal(stray.status, 409, "R5: refused, not published to nobody with an ok");
+    assert.equal(stray.body.error, "not_in_room");
     assert.ok(Array.isArray(stray.body.members) && stray.body.members.length === 3, `R5: and who is: ${JSON.stringify(stray.body)}`);
   } finally {
     await f.close();

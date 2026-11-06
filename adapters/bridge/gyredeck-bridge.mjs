@@ -3515,6 +3515,7 @@ function startBridge(config) {
     const all = heldFor(room, conversationId);
     const delivered =
       deliverToCodex(conversationId, room, confirmationPayload(room, conversationId, all)) === "queued";
+    if (delivered) rosterFor(room, conversationId).mark();
     const held = all;
     const member = room.members.get(conversationId);
     if (delivered && member) {
@@ -4633,7 +4634,9 @@ function startBridge(config) {
    */
   const rosterFor = (room, as) => {
     const names = [...room.members.keys()].map((id) => shownIn(room, id));
-    const key = names.join("\n");
+    // Keyed by who is here, not only by how they are shown (#341 audit): a member that left
+    // and a newcomer given its label read the same, and the version must still move.
+    const key = [...room.members.keys()].map((id, index) => `${id}=${names[index]}`).join("\n");
     if (room.rosterKey !== key) {
       room.rosterVersion = (room.rosterVersion ?? 0) + 1;
       room.rosterKey = key;
@@ -4956,8 +4959,9 @@ function startBridge(config) {
   });
 
   const announceMembership = (name, room, note, except = null, wakes = []) => {
-    const present = [...room.members.keys()].map((id) => shownIn(room, id));
-    const text = `${note} Members now: ${present.join(", ") || "nobody"}.`;
+    // No roster tail (#341): who is here rides each member's next delivery, as a difference
+    // when it changed, so a notice repeating the whole list was the same text a second time.
+    const text = note;
     const notice = publishMail(room, ROOM_SENDER, text, null, false, { [VOUCHED]: true, quiet: true, [WAKES]: wakes });
     // A room notice is published and readable but wakes nobody (#339): the roster it carries
     // rides on the next delivery each member gets anyway, so interrupting everyone to repeat
@@ -5775,7 +5779,6 @@ function startBridge(config) {
     // The short form carries the roster only when it moved since this Codex was last handed
     // it (#341); the full form always does, as the first word on a room.
     const told = rosterFor(room, recipient);
-    told.mark();
     // Asked until it is answered (#182): what the app has on record, and the one place
     // Codex can say what it wants to be called instead.
     const recorded = sessionNameOf(recipient);
@@ -6005,6 +6008,8 @@ function startBridge(config) {
           { answering: { id: from, kind } },
         );
         const outcome = deliverToCodex(recipient, room, outgoing);
+        // Handed over only if the push went (#341 audit): a failed push leaves the roster owed.
+        if (outcome === "queued") rosterFor(room, recipient).mark();
         if (outcome === "queued") {
           queued = true;
           readByPush(recipient);
@@ -7883,7 +7888,9 @@ function startBridge(config) {
           // A collect that found nothing says why the last thing this session said drew
           // nothing, as a timed-out wait does: the hook's `wait` is built from collects.
           ...(collect && collected.length === 0 ? { yourLastMessage: diagnoseSilence(sync) } : {}),
-          ...describeInbox(collected, sync, as, missed, vouched, collect && !wakingOnly),
+          // Marked as handed over only when the hook will print a delivery at all (#341 audit):
+          // a collect with nothing from anyone else prints nothing, roster included.
+          ...describeInbox(collected, sync, as, missed, vouched, collect && !wakingOnly && collected.some((message) => message.from !== as)),
           ...(() => {
             if (collect && sync) noteUsageCollected(sync.name, collected.filter((message) => message.room === sync.name && message.from === ROOM_SENDER), as);
             // Neither notice on a wait's poll (#259): a wait prints only what wakes it and
@@ -8095,6 +8102,19 @@ function startBridge(config) {
           : namesOwnerDiscord(routedTo)
             ? OWNER_DISCORD_SENDER
             : memberByAddress(room, routedTo) ?? routedTo);
+        // Addressed to someone who is not here: refused, with who is, in the answer the sender
+        // is already reading (#341). Published, it reached nobody yet answered ok with a seq;
+        // and sending is how an agent learns the roster without a lookup that costs a turn.
+        if (room.members.size > 0 && addressed !== MAIL_EVERYONE && addressed !== OWNER_DISCORD_SENDER && !room.members.has(addressed)) {
+          const names = rosterFor(room, null).names;
+          sendJson(409, {
+            ok: false,
+            error: "not_in_room",
+            message: `"${routedTo}" does not name exactly one member of this room, so nothing was sent. Members now: ${names.join(", ") || "nobody"}.`,
+            members: names,
+          });
+          return;
+        }
         // Before any capacity check, so a repeat is answered with the seq it already has
         // rather than refused as if it were new (#183 audit). `again: true` is the sender
         // saying it means to say the same thing twice.
@@ -8219,16 +8239,6 @@ function startBridge(config) {
           // wrong whenever a member is pushed to instead of watching, as Codex is (#183).
           listening: [...new Set([...room.clients].map((res) => res.gyredeckWatcher).filter((id) => room.members.has(id)))].map((id) => shownIn(room, id)),
           delivery,
-          // Sent to someone who is not here: say so with who is, in the answer the sender is
-          // already reading (#341). Sending is how an agent learns the roster without looking
-          // it up — a lookup costs it a whole turn, and nothing here needs one.
-          ...(room.members.size > 0 && addressed !== MAIL_EVERYONE && addressed !== OWNER_DISCORD_SENDER && !room.members.has(addressed)
-            ? {
-                notInRoom: true,
-                members: rosterFor(room, null).names,
-                message: `"${routedTo}" is not in this room, so nobody received this. Members now: ${rosterFor(room, null).names.join(", ") || "nobody"}.`,
-              }
-            : {}),
         });
         return;
       }

@@ -4651,6 +4651,9 @@ function startBridge(config) {
     const shown = new Map(ids.map((id, index) => [id, names[index]]));
     const before = new Map(told?.shown ?? []);
     const version = room.rosterVersion;
+    // Which hand-over this is (#341 audit r3): a compaction, resume or clear starts a new one,
+    // so a push begun before it and taken by `codex queue` after cannot mark the new one handed.
+    const generation = member?.rosterGeneration ?? 0;
     return {
       version,
       changed: !told || told.version !== version,
@@ -4660,13 +4663,21 @@ function startBridge(config) {
       names,
       // What this member was handed is what was true when it was built, not when it is marked:
       // a push is marked once `codex queue` has taken it, and the room may have moved since.
-      mark: () => { if (member && room.members.get(as) === member) member.rosterTold = { version, shown: [...shown] }; },
+      mark: () => {
+        if (!member || room.members.get(as) !== member) return;
+        if ((member.rosterGeneration ?? 0) !== generation) return;
+        // Pushes can settle out of order: an older roster never replaces a newer one.
+        if (member.rosterTold && member.rosterTold.version > version) return;
+        member.rosterTold = { version, shown: [...shown] };
+      },
     };
   };
   const forgetRosterTold = (conversationId) => {
     const found = syncRoomFor(conversationId);
     const member = found?.room.members.get(conversationId);
-    if (member) delete member.rosterTold;
+    if (!member) return;
+    delete member.rosterTold;
+    member.rosterGeneration = (member.rosterGeneration ?? 0) + 1;
   };
   /** One line for a roster that changed: in full the first time, as a difference after (#341). */
   const rosterLine = (roster) =>

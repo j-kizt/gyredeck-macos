@@ -14719,3 +14719,42 @@ test("#341 R7: a Codex push that codex queue refused does not count as handing t
     await f.close();
   }
 });
+
+test("#341 R8: a Codex push taken after a compaction began cannot mark the new hand-over, the confirming push included", async () => {
+  const f = await codexHeavyFixture("r8");
+  try {
+    // A codex that records every push, and takes 800 ms over any push marked SLOW or confirming.
+    await writeFile(join(f.home, ".bun", "bin", "codex"), `#!${process.execPath}\nconst a = process.argv.slice(2); const m = a[a.indexOf("--message") + 1]; require('node:fs').appendFileSync(${JSON.stringify(join(f.home, "queued.log"))}, JSON.stringify(a) + "\\n"); setTimeout(() => process.exit(0), /SLOW|you are confirmed/.test(m) ? 800 : 0);\n`);
+    const founder = "a3410000-0000-4000-8000-0000000008f1";
+    const codex = "01a06082-8ef6-7900-ae39-44fe2e463418";
+    const late = "a3410000-0000-4000-8000-0000000008f2";
+    const compact = () => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "compact_start", timestamp: new Date().toISOString(), conversationId: codex, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" }, data: {},
+    });
+    const code = (await f.call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    const { password } = (await f.call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder })).body;
+    await f.ingestCodex(codex);
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: codex });
+    // The confirming push is slow; Codex compacts while it is in flight.
+    assert.equal((await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: "01a06082-8ef6-7900-ae39-44fe2e463419", password })).body.transitioned, true, "premise: Codex is in");
+    await compact();
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "AFTER-CONFIRM-COMPACT" })).status, 202);
+    const afterConfirm = await until(async () => (await f.messagesTo(codex)).find((message) => message.includes("AFTER-CONFIRM-COMPACT")), "the push after the compaction");
+    assert.match(afterConfirm, /Members now \(v\d+\)/, "R8: the confirming push settled after the compaction did not mark it handed");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    // A slow ordinary push, with the roster changed, and a compaction while it is in flight.
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: late });
+    assert.equal((await f.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: late, password })).status, 200);
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "SLOW" })).status, 202);
+    await until(async () => (await f.messagesTo(codex)).some((message) => message.includes("SLOW")), "premise: the slow push started");
+    await compact();
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "AFTER-SLOW-COMPACT" })).status, 202);
+    const afterSlow = await until(async () => (await f.messagesTo(codex)).find((message) => message.includes("AFTER-SLOW-COMPACT")), "the push after");
+    assert.match(afterSlow, /Members now \(v\d+\)/, "R8: a push begun before the compaction did not mark the new hand-over");
+  } finally {
+    await f.close();
+  }
+});

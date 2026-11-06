@@ -752,13 +752,18 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   const standing = [];
   const confirmed = mine?.confirmed === true;
 
-  if (room_ && mine) {
+  // The roster rides only when it changed since this session was last handed it (#341): the
+  // bridge says which, and an older bridge that does not is answered as before.
+  const roster = result?.roster && typeof result.roster.line === "string" ? result.roster : null;
+  if (room_ && mine && (!roster || roster.changed || justConfirmed)) {
     const others = members.filter((member) => !member.you);
     standing.push(
       "WHERE: the person at this terminal put you in this room." +
-        (others.length > 0
-          ? ` Also here: ${others.map(named).join(", ")}.`
-          : " Nobody else is in it yet."),
+        (roster
+          ? ` ${roster.line.slice(0, MAIL_MAX_TEXT)}`
+          : others.length > 0
+            ? ` Also here: ${others.map(named).join(", ")}.`
+            : " Nobody else is in it yet."),
     );
   }
 
@@ -810,19 +815,27 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
     );
   }
 
-  standing.push(
-    "NARRATE: say what came in and who sent it; after you answer, show what you sent —" +
-      " the words themselves, not that you replied — and the seq.",
-  );
-  // The rules that broke live when they were told only once ride on every room delivery,
-  // whether or not it carries anything to answer (#157 audit): a reaction-only delivery
-  // is exactly where "never answer a reaction" is needed.
-  if (room_) {
+  // A delivery with nothing to answer — only reactions and the room's own notices — is told so
+  // in one line instead of the whole brief (#341). The brief rode on every delivery, so a quiet
+  // room put it into a session's context again and again for mail that asked nothing.
+  const asksSomething = (message) => message.from !== ROOM_SENDER && (typeof message?.kind !== "string" || message.kind === "ask" || message.kind === "tell");
+  const lean = Boolean(room_) && !justConfirmed && !delivered.some(asksSomething);
+  if (lean) {
+    standing.push("Nothing here asks anything of you: never answer a reaction, and a notice needs nothing back.");
+  } else {
     standing.push(
-      "RULES: set to (a member, as the room shows it, or everyone) and kind (ask, tell or reaction) as" +
-        " the to and kind fields of anything you send, never in the text; never answer a reaction; a send happened only if you saw" +
-        " ok:true and a seq.",
+      "NARRATE: say what came in and who sent it; after you answer, show what you sent —" +
+        " the words themselves, not that you replied — and the seq.",
     );
+    // The rules that broke live when they were told only once ride on every room delivery
+    // that has something to answer (#157 audit, narrowed by #341).
+    if (room_) {
+      standing.push(
+        "RULES: set to (a member, as the room shows it, or everyone) and kind (ask, tell or reaction) as" +
+          " the to and kind fields of anything you send, never in the text; never answer a reaction; a send happened only if you saw" +
+          " ok:true and a seq.",
+      );
+    }
   }
 
   // The kind travels with each message: a session that cannot see that a line was a
@@ -959,7 +972,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   // tightly: an agent told it "can wait for replies" will wait when nothing is
   // outstanding, and a session blocked on an answer nobody is writing is worse than
   // one that simply ended its turn.
-  if (room_) {
+  if (room_ && !lean) {
     lines.push(
       "WAIT \u2014 only while an answer you need before you can carry on is outstanding:" +
         ` node ${hookCommandPath()} wait 60 ${room}` +

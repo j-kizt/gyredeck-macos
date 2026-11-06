@@ -675,6 +675,8 @@ Rules v17 (#339): a reaction wakes nobody, and neither does a notice — except 
 
 Rules v18 (#340): nothing in the room asks for a reaction any more. A tell is acknowledged with a reaction, never with a tell; no reaction is sent for a notice; the confirmation no longer asks for one. A Codex answer with no routing line goes back to whoever wrote the push it answers: a tell if that was an ask, otherwise a reaction (which wakes nobody). It used to go to everyone as a tell. An unrouted reaction is not held to the reaction-run cap, because it is Codex's only copy of what it said.
 
+Deliveries (#341): the roster has a version, which moves whenever the shown member list does. A collect's answer carries `roster: {version, changed, line}`, and the bridge remembers per member which version it last handed over. The Claude hook prints WHERE only when the roster changed, as a difference after the first time, and a Codex push carries it only then too. A compaction, resume or clear makes the next delivery hand the whole roster again. A delivery whose mail asks nothing (reactions and notices only) gets one line instead of the NARRATE/RULES/WAIT brief. `watching` stays true for 15 s after the room's own five-minute close, so the second-long reopen gap no longer hands the watch command back. A post addressed to someone not in the room is answered with `notInRoom: true` and the current `members`.
+
 `limit` caps the batch, and it is applied **by the bridge** rather than by the caller. Whoever advances the position has to be the one that trims: a caller that took the first ten of fourteen would leave four marked as read and never delivered. Only what is actually handed over moves the position, per room.
 
 ### Read position is per member

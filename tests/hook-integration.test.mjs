@@ -1844,9 +1844,10 @@ test("a room delivery carries only what the session can use, and points at the r
     const reaction = await context();
     assert.match(reaction, /\[from Codex · reaction\] got it/);
     assert.doesNotMatch(reaction, /REPLY —/);
-    // Nothing to answer is exactly where the rules that broke live are needed (#157 audit).
-    assert.match(reaction, /never answer a reaction/);
-    assert.match(reaction, /ok:true and a seq/);
+    // Nothing to answer gets one line instead of the whole brief (#341), and that line still
+    // says the one rule that matters here (#157 audit).
+    assert.match(reaction, /Nothing here asks anything of you: never answer a reaction/);
+    assert.doesNotMatch(reaction, /RULES: |NARRATE: |WAIT —/, "#341: no brief for mail that asks nothing");
 
     // A tell may draw a reaction, addressed to whoever sent it rather than the room.
     await post(`/mail/${code}`, { from: peer, to: me, kind: "tell", text: "build is green" });
@@ -3010,7 +3011,7 @@ test("a session's assigned name shows wherever the room names it, and to still t
     assert.equal(result.code, 0, result.stderr);
     const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
     assert.match(context, /Antigravity \/ Altrix Agy joined this room\. Members now: Claude Code \/ Altrix Assistant, Antigravity \/ Altrix Agy\./);
-    assert.match(context, /Also here: Antigravity \/ Altrix Agy\./);
+    assert.match(context, /Members now \(v\d+\): Claude Code \/ Altrix Assistant, Antigravity \/ Altrix Agy\./, "#341: the roster, with its version");
     assert.match(context, /\[from Antigravity \/ Altrix Agy · tell\] hello from the named one/);
     assert.match(context, /"to":"Antigravity","kind":"reaction"/, "the reply is still addressed by label");
 
@@ -3239,7 +3240,7 @@ test("a session declares the name it is called by on its first post; the room an
     assert.match(laterContext, /\[from Antigravity · tell\] BEFORE-THE-NAME/, "a message posted before a declaration keeps its sender as shown then");
     assert.match(laterContext, /\[from Antigravity \/ Gyre Assistant · tell\] after the names/);
     assert.match(laterContext, /Antigravity is called Gyre Assistant\./);
-    assert.match(laterContext, /Also here: Antigravity \/ Gyre Assistant, /);
+    assert.match(laterContext, /Members changed \(v\d+\):[^]*now [^.]*Antigravity \/ Gyre Assistant/, "#341: the roster moved, so it rides as a difference");
     assert.doesNotMatch(laterContext, /NAME: /);
     assert.doesNotMatch(laterContext, /"name":"YOUR NAME"/);
   } finally {
@@ -3323,8 +3324,9 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     // The briefing leads with where the session is and who is with it, before anything
     // about what to do — a session reading this first should be able to act on it
     // without having read anything else.
-    assert.match(fromRoomMate, /WHERE: the person at this terminal put you in this room/);
-    assert.match(fromRoomMate, /Also here: Codex\./);
+    // #341: the roster was handed with this session's first delivery and has not moved, so
+    // WHERE does not ride again; the rest of the brief still does.
+    assert.doesNotMatch(fromRoomMate, /Members (now|changed)/);
     assert.match(fromRoomMate, /what you are here for/);
     assert.doesNotMatch(fromRoomMate, /information only/);
     assert.match(fromRoomMate, /\[from Codex · /, "labelled by provider");
@@ -4134,7 +4136,9 @@ test("Codex declares its name in its routing line, name=\"<Name>\" after the kin
     const next = (await waitForPrompt(/NEXT-QUESTION/)).at(-1);
     assert.ok(next && (await promptsIn(rollout)).length > before, "premise: a later push arrived");
     assert.doesNotMatch(next.text, /name="<Name>"/);
-    assert.match(next.text, /Members now: Claude Code \/ Gyre Assistant, Codex \/ Gyre Audit\./);
+    // #341: a push carries the roster only when it moved; the last one that did names both as declared.
+    const lastRoster = (await promptsIn(rollout)).map((prompt) => prompt.text).filter((text) => /Members (now|changed) \(v\d+\)/.test(text)).at(-1);
+    assert.match(lastRoster, /Claude Code \/ Gyre Assistant, Codex \/ Gyre Audit\./);
   } finally {
     bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
@@ -6487,7 +6491,8 @@ test("a room password carried in by notify lets that session in, once", async ()
     assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} \\(answering ${founder} tell\\) — how to answer: `));
     assert.match(afterLater.at(-1), /@<member or everyone> ask\|tell\|reaction — never answer a reaction/);
     assert.match(afterLater.at(-1), new RegExp(`Rules v${ROOM_RULES_VERSION}: ~/\\.config/gyredeck/room-rules\\.md`));
-    assert.match(afterLater.at(-1), /Members now: /);
+    // #341: the roster rode on the confirmation and has not moved since, so it is not repeated.
+    assert.doesNotMatch(afterLater.at(-1), /Members (now|changed)/);
     assert.doesNotMatch(afterLater.at(-1), /Do not call Gyredeck/);
     // And says which kind it is: a tell and a reaction with the same words must not
     // arrive identical, or "never answer a reaction" cannot be kept (#157 audit).
@@ -13410,6 +13415,8 @@ for (const provider of ["claude", "agy"]) {
         const claude = "a2580000-0000-4000-8000-000000000003";
         await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: claude });
         assert.equal((await f.call("POST", `/sync/rooms/${f.code}/confirm`, { conversationId: claude, password: f.password })).status, 200);
+        // Something to answer, so the delivery carries the brief at all (#341).
+        await f.call("POST", `/mail/${f.code}`, { from: f.founder, to: claude, kind: "tell", text: "a tell" });
         const result = await runAdapter(
           "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], f.home,
           { hook_event_name: "UserPromptSubmit", session_id: claude, cwd: "/tmp/project", prompt: "hi" },
@@ -14552,5 +14559,115 @@ test("#340 D6: an unrouted answer to a room push from before the sender marker g
     }
   } finally {
     await room.close();
+  }
+});
+
+const leanRoomFixture = async (tag, env = {}) => {
+  const home = await mkdtemp(join(tmpdir(), `gyredeck-341-${tag}-`));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home, ...env }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  await waitForHealth(port, stderrRef);
+  const broker = await forwardingBroker(home, `http://127.0.0.1:${port}`);
+  const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+  const call = async (method, path, body, extra = {}) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method, headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD, ...extra }, body: body ? JSON.stringify(body) : undefined,
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  const me = `a3410000-0000-4000-8000-${tag.padStart(12, "0").slice(-12)}`;
+  const peer = `a3410000-0000-4000-8000-${("p" + tag).padStart(12, "0").slice(-12)}`;
+  for (const id of [me, peer]) {
+    await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: id, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 },
+    });
+  }
+  const created = await call("POST", "/sync/rooms", { conversationId: me });
+  const code = created.body.room;
+  const password = created.body.password;
+  const admit = async (id) => {
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: id });
+    assert.equal((await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: id, password })).status, 200, `premise: ${id} is let in`);
+  };
+  await admit(peer);
+  const drain = async () => {
+    const result = await runAdapter("adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home, {
+      hook_event_name: "UserPromptSubmit", session_id: me, cwd: "/tmp/project", prompt: "next",
+    });
+    assert.equal(result.code, 0, result.stderr);
+    return result.stdout ? JSON.parse(result.stdout).hookSpecificOutput?.additionalContext ?? "" : "";
+  };
+  const say = (from, body) => call("POST", `/mail/${code}`, { from, ...body });
+  const close = async () => {
+    broker?.close?.();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  };
+  return { port, code, password, me, peer, call, admit, drain, say, close, home };
+};
+
+test("#341 R1 R2 R3 R5: the roster rides only when it moved, whole again after a compaction; mail that asks nothing gets one line", async () => {
+  const f = await leanRoomFixture("r1");
+  try {
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "FIRST" });
+    const first = await f.drain();
+    assert.match(first, /Members now \(v\d+\): /, "R1: the first delivery hands the whole roster");
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "SECOND" });
+    const second = await f.drain();
+    assert.match(second, /SECOND/, "premise: a second delivery");
+    assert.doesNotMatch(second, /Members (now|changed)/, "R1: an unchanged roster is not handed again");
+    const third = "a3410000-0000-4000-8000-000000000333";
+    await f.admit(third);
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "THIRD" });
+    const after = await f.drain();
+    assert.match(after, /Members changed \(v\d+\): joined [^;]+;/, "R1: a join rides as a difference");
+    // A compaction drops what the session was handed, so the next delivery hands it whole.
+    await f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "conversation_open", timestamp: new Date().toISOString(), conversationId: f.me, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { reason: "compact", previousConversationId: null },
+    });
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "FOURTH" });
+    assert.match(await f.drain(), /Members now \(v\d+\): /, "R2: after a compaction the roster is whole again");
+    // Nothing that asks anything: one line, not the brief.
+    await f.say(f.peer, { to: f.me, kind: "reaction", text: "LANDED" });
+    const lean = await f.drain();
+    assert.match(lean, /\[from [^\]]*· reaction\] LANDED/, "premise: the reaction is delivered");
+    assert.match(lean, /Nothing here asks anything of you/, "R3: one line");
+    assert.doesNotMatch(lean, /RULES: |NARRATE: |WAIT —|REPLY —/, "R3: no brief");
+    // Sending to someone not here answers with who is.
+    const stray = await f.say(f.me, { to: "nobody-here", kind: "tell", text: "STRAY" });
+    assert.equal(stray.body.notInRoom, true, "R5: the receipt says the addressee is not here");
+    assert.ok(Array.isArray(stray.body.members) && stray.body.members.length === 3, `R5: and who is: ${JSON.stringify(stray.body)}`);
+  } finally {
+    await f.close();
+  }
+});
+
+test("#341 R4: a delivery in the second between the room's five-minute close and the reopen does not hand the watch command again", async () => {
+  const f = await leanRoomFixture("r4", { GYREDECK_MAIL_STREAM_MAX_MS: "400" });
+  try {
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "GET-A-KEY" });
+    assert.match(await f.drain(), /HEAR —/, "premise: with no watch, the command is handed");
+    const key = await memberKeyAt(`http://127.0.0.1:${f.port}`, f.me, (await readFile(join(f.home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim());
+    const stream = await fetch(`http://127.0.0.1:${f.port}/mail/${f.code}/events?as=${f.me}&since=resume`, { headers: { "x-gyredeck-token": f.password, "x-gyredeck-member": key } });
+    assert.equal(stream.status, 200);
+    await stream.text(); // the room closes it after 400 ms
+    await f.say(f.peer, { to: f.me, kind: "ask", text: "IN-THE-GAP" });
+    const gap = await f.drain();
+    assert.match(gap, /IN-THE-GAP/, "premise: the delivery");
+    assert.doesNotMatch(gap, /HEAR —/, "R4: the routine close is not a lost watch");
+  } finally {
+    await f.close();
   }
 });

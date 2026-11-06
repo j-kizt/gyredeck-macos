@@ -14507,7 +14507,7 @@ test("#340 D4 D5: an unrouted answer follows the asker's id — not a new member
       const said = await room.saidInRoomWhole(reader);
       assert.ok(!said.some((message) => message.text === "ANSWER-FOR-THE-GONE"), `D4: ${reader} is not shown it: ${JSON.stringify(said.map((m) => [m.to, m.text]))}`);
     }
-    assert.match(room.stderrRef.value, /answers a member who has left the room and names no one; not published/, "D4: it was read, and dropped on purpose");
+    assert.match(room.stderrRef.value, /names no one and answers a member who has left the room, or a push with no sender the bridge wrote; not published/, "D4: it was read, and dropped on purpose");
     // D5: an asker that left and came back is the same id, and is answered.
     const back = "a3400000-0000-4000-8000-0000000000d6";
     await ingestClaude(back);
@@ -14520,6 +14520,36 @@ test("#340 D4 D5: an unrouted answer follows the asker's id — not a new member
     assert.ok(await room.until(async () => (await room.saidInRoomWhole(back)).some((message) => message.text === "ANSWER-FOR-THE-RETURNED")), `D5: published / bridge said: ${room.stderrRef.value.slice(-1500)}`);
     const returned = (await room.saidInRoomWhole(back)).find((message) => message.text === "ANSWER-FOR-THE-RETURNED");
     assert.deepEqual([returned.to, returned.kind], [back, "tell"], "D5: to the asker by id, as a tell");
+  } finally {
+    await room.close();
+  }
+});
+
+
+test("#340 D6: an unrouted answer to a room push from before the sender marker goes to no one, ask or tell", async () => {
+  const room = await codexInARoom();
+  try {
+    const other = "a3400000-0000-4000-8000-0000000000e6";
+    await room.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: other, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 },
+    });
+    assert.equal((await joinConfirmed(room.call, room.code, room.founder, other)).status, 200, "premise: another member is here to see a leak");
+    // A push as an older bridge wrote it: the room header, and no `(answering <id> <kind>)`.
+    for (const kind of ["ask", "tell"]) {
+      const turnId = randomUUID();
+      const prompt = `[Gyredeck · room ${room.code} — how to answer: as an older bridge said it.]\n\n[from Claude Code · ${kind}] PRE-UPGRADE-${kind}`;
+      await appendFile(room.rollout, JSON.stringify({
+        type: "event_msg", timestamp: new Date().toISOString(),
+        payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: randomUUID(), content: [{ type: "text", text: prompt }] } },
+      }) + "\n" + turnAnswering(turnId, `PRIVATE-ANSWER-PRE-UPGRADE-${kind}`));
+    }
+    await room.call("POST", "/hook/stop", { hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread });
+    assert.ok(await room.until(async () => (room.stderrRef.value.match(/a push with no sender the bridge wrote; not published/g) ?? []).length >= 2), `premise: both were read: ${room.stderrRef.value.slice(-800)}`);
+    for (const reader of [room.founder, other]) {
+      const said = (await room.saidInRoomWhole(reader)).map((message) => message.text);
+      assert.ok(!said.some((text) => text.startsWith("PRIVATE-ANSWER-PRE-UPGRADE")), `D6: ${reader} is shown nothing: ${JSON.stringify(said)}`);
+    }
   } finally {
     await room.close();
   }

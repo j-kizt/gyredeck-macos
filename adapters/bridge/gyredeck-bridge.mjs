@@ -2178,14 +2178,17 @@ function startBridge(config) {
     if (!present) return null;
     return answering.kind === "ask" ? { to: id, kind: "tell" } : { to: id, kind: "reaction" };
   };
-  const routeCodexReply = (room, text, answering = null) => {
+  const routeCodexReply = (room, text, answering = null, unattributed = false) => {
     const [first, ...rest] = text.split("\n");
     const match = CODEX_ROUTING_LINE.exec(first.trim());
     // `explicit` says the line named somebody the room knows — everyone, or a member by id
     // or label. A goal turn's answer is published on that and nothing else; a line that
     // named nobody, or somebody not here, is not a message to this room (#149).
     if (!match) {
-      const routing = unroutedReply(room, answering);
+      // A push from the room that carries no sender the bridge wrote — one made before the
+      // marker existed — has nobody this answer can be proven to be for, so it goes to no
+      // one (#340 audit r2): published to everyone, a private answer would be read by all.
+      const routing = unattributed ? null : unroutedReply(room, answering);
       return routing ? { text, routing, explicit: false } : { text, routing: null, explicit: false, orphaned: true };
     }
     const inline = (match[5] ?? "").trim();
@@ -2693,11 +2696,16 @@ function startBridge(config) {
         handledThrough = reply.endsAt;
         continue;
       }
-      const { text, routing, explicit, name: offeredName, orphaned } = routeCodexReply(destination.room, reply.text, origin?.answering ?? null);
+      const { text, routing, explicit, name: offeredName, orphaned } = routeCodexReply(
+        destination.room,
+        reply.text,
+        origin?.answering ?? null,
+        origin?.kind === "room" && !origin.answering,
+      );
       if (orphaned) {
         console.error(
-          `codex log ${path}: turn ${reply.turnId} answers a member who has left the room and names no one;` +
-            " not published",
+          `codex log ${path}: turn ${reply.turnId} names no one and answers a member who has left the room,` +
+            " or a push with no sender the bridge wrote; not published",
         );
         reader.origins.delete(reply.turnId);
         handledThrough = reply.endsAt;

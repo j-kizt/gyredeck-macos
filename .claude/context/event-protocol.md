@@ -683,6 +683,8 @@ An Antigravity wait answers too (#358): `gyredeck-agy-hook.mjs wait` adds `reply
 
 Owner receipts (#343): a post to `gyredeck-owner-discord` is never delivered to a member, because the room's Discord relay carries it. It used to report `no_recipients` every time while landing every time. It now reports `relayed` when the room's relay holds a watch, and `owner_not_connected` when there is no relay or its watch is down.
 
+One-time join codes (#331, phase 1 — bridge): `POST /sync/rooms/<code>/members/<id>/join-code` (app only) mints a 32-hex code for that one session; minting again kills the last; it lives two minutes (`GYREDECK_JOIN_CODE_TTL_MS`) and works once. Both confirm routes — the broker's `/sync/rooms/<code>/confirm` and Codex's `/hook/sync/confirm` — take it where they took the password, and the shared room password still works for one release as the transition. A code for another session is refused `code_for_another_session`, an old one `code_expired`; every use is announced to the room (quiet, so Discord carries it). A confirmed member's own key (`x-gyredeck-member`) now suffices on its own to read and to post — a session let in by a code never holds the room password. Not yet: the app's copy button (phase 2), and retiring the shared password from the hook's commands (phase 3).
+
 `limit` caps the batch, and it is applied **by the bridge** rather than by the caller. Whoever advances the position has to be the one that trims: a caller that took the first ten of fourteen would leave four marked as read and never delivered. Only what is actually handed over moves the position, per room.
 
 ### Read position is per member

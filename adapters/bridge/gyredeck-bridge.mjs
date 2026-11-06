@@ -793,6 +793,8 @@ export const writeHeavyHelper = (origin, path = HEAVY_HELPER_PATH) => {
  *  stays counted until something is next published to it, so the bridge would report a
  *  session as watching after its watch had died and leave out how to open a new one. */
 const SSE_HEARTBEAT_MS = Number(process.env.GYREDECK_SSE_HEARTBEAT_MS) || 10_000;
+/** How many framed seqs a member's watch remembers (#342). */
+const MEMBER_FRAMED_MEMORY = 256;
 /** How long after a watch closes it still counts as held (#341): the reopen takes about a second. */
 const WATCH_REOPEN_GRACE_MS = Number(process.env.GYREDECK_WATCH_REOPEN_GRACE_MS) || 15_000;
 
@@ -5054,6 +5056,11 @@ function startBridge(config) {
           watching: [...sync.room.clients].some(
             (res) => res.gyredeckWatcher === as && !res.destroyed && !res.writableEnded,
           ) || Date.now() - (sync.room.members.get(as)?.watchEndedAt ?? 0) < WATCH_REOPEN_GRACE_MS,
+          // Which of these messages this member's watch already carried (#342): the drain shows
+          // those as a pointer, not a second copy of the text.
+          onWatch: messages
+            .filter((message) => message.room === sync.name && sync.room.members.get(as)?.framed?.has(message.seq))
+            .map((message) => message.seq),
           // What changed in the roster since this member was last handed it; the members
           // list below stays for older hooks (#341).
           roster: (() => {
@@ -5475,6 +5482,12 @@ function startBridge(config) {
     const member = watcher ? room.members.get(watcher) : null;
     if (!member) return;
     member.streamSeq = Math.max(member.streamSeq ?? 0, message.seq);
+    // Which messages actually went down this member's watch, one by one (#342): `streamSeq`
+    // also moves at join and confirm without a frame, so it cannot say what the watch carried.
+    // Bounded: a drain only ever asks about what is still waiting, which is recent.
+    member.framed ??= new Set();
+    member.framed.add(message.seq);
+    if (member.framed.size > MEMBER_FRAMED_MEMORY) member.framed.delete(member.framed.values().next().value);
   };
 
   /**

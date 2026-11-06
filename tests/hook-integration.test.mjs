@@ -1883,7 +1883,8 @@ test("a room delivery carries only what the session can use, and points at the r
     assert.equal(stream.status, 200);
     await post(`/mail/${code}`, { from: peer, to: me, kind: "ask", text: "and the PR?" });
     const watching = await context();
-    assert.match(watching, /and the PR\?/);
+    // #342: the watch carried it, so the drain points at it rather than repeating the text.
+    assert.match(watching, /\(already on your watch, seq \d+\)/);
     assert.doesNotMatch(watching, /HEAR —/);
     // The rules that broke live when they were told only once stay inline.
     assert.match(watching, /never answer a reaction/);
@@ -14754,6 +14755,27 @@ test("#341 R8: a Codex push taken after a compaction began cannot mark the new h
     assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "AFTER-SLOW-COMPACT" })).status, 202);
     const afterSlow = await until(async () => (await f.messagesTo(codex)).find((message) => message.includes("AFTER-SLOW-COMPACT")), "the push after");
     assert.match(afterSlow, /Members now \(v\d+\)/, "R8: a push begun before the compaction did not mark the new hand-over");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#342 W1 W2: a message the watch already carried is a pointer in the drain; one it never carried is whole", async () => {
+  const f = await leanRoomFixture("w1");
+  try {
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "BEFORE-ANY-WATCH" });
+    const first = await f.drain();
+    assert.match(first, /BEFORE-ANY-WATCH/, "W2: no watch, so the text itself");
+    const key = await memberKeyAt(`http://127.0.0.1:${f.port}`, f.me, (await readFile(join(f.home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim());
+    const watch = await watchRoom(f.port, f.code, f.me, { "x-gyredeck-token": f.password, "x-gyredeck-member": key });
+    await f.say(f.peer, { to: f.me, kind: "ask", text: "CARRIED-ON-THE-WATCH" });
+    await watch.waitFor(/CARRIED-ON-THE-WATCH/, "premise: the watch carried it");
+    await watch.stop();
+    const second = await f.drain();
+    assert.doesNotMatch(second, /CARRIED-ON-THE-WATCH/, "W1: not the text a second time");
+    assert.match(second, /\[from [^\]]*· ask\] \(already on your watch, seq \d+\)/, "W1: a pointer with its seq");
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "AFTER-THE-WATCH" });
+    assert.match(await f.drain(), /AFTER-THE-WATCH/, "W2: with the watch gone, the text itself again");
   } finally {
     await f.close();
   }

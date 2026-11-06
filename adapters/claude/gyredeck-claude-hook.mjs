@@ -605,6 +605,19 @@ const nameAsk = (mine) => {
     ' Send it once, as a "name" field beside to and kind on your first post; the room keeps the first name it is given.';
 };
 
+/**
+ * What a session is told when its mail could not be handed over this turn (#337). Said in its
+ * context, not only on stderr: on stderr alone a withheld turn looked exactly like an empty
+ * mailbox, and a confirmed session went a whole day hearing nothing from its room. The cure
+ * the owner chose is a restart, or a fork when another window holds the session.
+ */
+// The advice is conditional rather than read off the reason: the broker says `conflict` both
+// when another process holds the session and when this one claimed two (#337 audit).
+const withheldNote = (reason) =>
+  `Gyredeck is holding mail for this session that it cannot hand over this turn (${reason}).` +
+  " Tell the person at this terminal: if another window has this session open, close it or open this one with claude --resume <id> --fork-session;" +
+  " otherwise exit this session and start it again (claude --resume <id>).";
+
 const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null, taken = null) => {
   if (!token || !MAIL_ROOM_NAME.test(room)) return null;
   // Known before anything can fail, so a delivery that throws still says it (#196).
@@ -626,7 +639,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   if (viaBroker.result) {
     if (!brokerBatchReadable(viaBroker.result)) {
       process.stderr.write("gyredeck: mail withheld this turn — the broker's answer could not be read as a batch\n");
-      if (!justConfirmed) return null;
+      if (!justConfirmed) return withheldNote("the broker's answer could not be read as a batch");
       heldBack = "the broker's answer could not be read as a batch";
     } else {
       result = viaBroker.result;
@@ -638,15 +651,14 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
     // like an empty mailbox (#178).
     if (answer.status === 403 && typeof answer.body?.error === "string") {
       process.stderr.write(`gyredeck: mail withheld this turn — the broker said ${viaBroker.fallback}, the bridge said ${answer.body.error}\n`);
-      const held = `Gyredeck is holding mail for this session that it cannot hand over: the broker said "${viaBroker.fallback}" and the bridge said "${answer.body.error}". Tell the person at this terminal; restarting this session usually clears it.`;
-      if (!justConfirmed) return held;
+      if (!justConfirmed) return withheldNote(`the broker said "${viaBroker.fallback}" and the bridge said "${answer.body.error}"`);
       heldBack = `the broker said "${viaBroker.fallback}" and the bridge said "${answer.body.error}"; tell the person at this terminal, restarting this session usually clears it`;
     } else {
       result = answer.status === 200 ? answer.body : null;
     }
   } else {
     process.stderr.write(`gyredeck: mail withheld this turn — ${viaBroker.withheld}\n`);
-    if (!justConfirmed) return null;
+    if (!justConfirmed) return withheldNote(viaBroker.withheld);
     heldBack = viaBroker.withheld;
   }
   const messages = Array.isArray(result?.messages) ? result.messages : [];

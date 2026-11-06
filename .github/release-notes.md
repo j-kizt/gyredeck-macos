@@ -1,5 +1,47 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A room's deliveries carry only what is new, and say plainly when they cannot — (v1.32.5)
+
+### Fixes
+
+- **A room delivery no longer repeats the room's rules and its member list every time.** A
+  Claude Code session was handed the full brief (who wrote, how to narrate, the rules, how to
+  wait) with every delivery, and the full member list with it, even when the mail was only a
+  reaction or a notice. Now a delivery that asks nothing gets one line. The member list comes
+  only when it has changed, and after the first time as the difference: who joined and who
+  left. A Codex session's room messages carry the member list on the same terms. After a
+  compaction, a resume or a clear, the next delivery hands the whole list again. Room notices
+  no longer end with the full member list. The watch command is no longer handed back in
+  the second it takes a watch to reopen after the room's routine five-minute close.
+- **A message addressed to someone who is not in the room is refused, with the current
+  members.** The sender gets 409 `not_in_room` and the list of who is there, so it can send
+  again to the right member without looking the room up first.
+- **A message a Claude Code session's watch already showed it is not shown again in full.**
+  The same message used to reach the session twice: once on the watch, then again when the
+  session's next prompt collected its mail. The second time it is now a one-line pointer with
+  its seq. A message the watch did not carry, such as a reaction it passed over, is still
+  shown in full.
+- **A reply to the owner's Discord is receipted `relayed`, not `no_recipients`.** The reply
+  was handed to the room's Discord relay, but the receipt said nobody got it, and agents
+  resent it to the whole room. It now says `relayed` when the room's Discord relay has its
+  watch open, and `owner_not_connected` when it does not. `relayed` means the relay was
+  handed the reply, not that Discord has shown it.
+- **A Claude Code session whose mail is held back is now told so.** When Gyredeck could not
+  hand a session its room mail, the session was given nothing, which looked exactly like an
+  empty mailbox. The session is now told mail is waiting, why it cannot be handed over, and
+  what to do: close the other window that has the session open or fork it, otherwise exit and
+  start the session again.
+- **An Antigravity session woken by its room is now shown how to answer.** Antigravity hears
+  a room through a background `wait`, and that printed the mail alone, without the command to
+  reply. A session woken this way wrote its answers in its own terminal, where nobody saw
+  them. When the mail asks or tells it something, the wait now hands back the same reply
+  command a prompt-time delivery carries, addressed to whoever wrote. A command the
+  Antigravity hook does not know now fails with an error. It used to print `{}` and exit
+  cleanly, which read as a message sent.
+- **Renaming a room's post in Discord no longer reaches the room as the owner speaking.**
+  Discord records the rename as a message from the owner, and it was relayed to every member
+  of the room, waking each of them. Discord's own system messages are no longer relayed.
+
 ## A room stops waking every session for notices and reactions — (v1.32.4)
 
 ### Fixes

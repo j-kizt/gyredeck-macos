@@ -1017,12 +1017,12 @@ export const CODEX_NOTICE_MARKER = "[Gyredeck · notice]";
 export const codexPushTarget = (text) => {
   const room = /^\[Gyredeck · room (sync-[a-z2-9]{4}) /.exec(text);
   if (room) {
-    // Who wrote what this push carries, and as which kind: the bridge's own tag, the first
-    // `[from <shown> · <kind>] ` after the header (`codexRoomTag`). An answer with no routing
-    // line goes back to that sender (#340). A sender's text comes after the tag, so the first
-    // match is always the bridge's.
-    const tag = /\]\n\n\[from ([^\n]+?) · (ask|tell|reaction|notice)\] /.exec(text);
-    return { kind: "room", name: room[1], ...(tag ? { answering: { from: tag[1], kind: tag[2] } } : {}) };
+    // Who this push is from, by id, as the bridge wrote it at the start of its own header
+    // (#340): an answer with no routing line goes back to that id. Read only where the bridge
+    // writes it — straight after the room code — so nothing a sender or a name controls can
+    // plant one; a name is never resolved here, since a label can pass to the next member.
+    const marker = /^\[Gyredeck · room sync-[a-z2-9]{4} \(answering ([A-Za-z0-9_-]{1,64}) (ask|tell|reaction|notice)\) /.exec(text);
+    return { kind: "room", name: room[1], ...(marker ? { answering: { id: marker[1], kind: marker[2] } } : {}) };
   }
   // A message pushed into the session's own mailbox carries where its answer goes — the
   // sender's mailbox or room — at the end of the bridge's bracketed header, as
@@ -2167,13 +2167,16 @@ function startBridge(config) {
    * gets a reaction to everyone: still published, waking nobody.
    */
   const unroutedReply = (room, answering) => {
-    const sender = !answering
-      ? null
-      : namesOwnerDiscord(answering.from)
-        ? OWNER_DISCORD_SENDER
-        : memberByAddress(room, answering.from);
-    if (sender && answering.kind === "ask") return { to: sender, kind: "tell" };
-    return { to: sender ?? MAIL_EVERYONE, kind: "reaction" };
+    if (!answering) return { to: MAIL_EVERYONE, kind: "reaction" };
+    const id = answering.id;
+    // The owner on Discord is not a member and does not leave; anyone else must still be the
+    // confirmed member it was when it wrote (#340 audit) — not a later member given its label.
+    const present = id === OWNER_DISCORD_SENDER || room.members.get(id)?.confirmed === true;
+    if (id === ROOM_SENDER || id === APP_SENDER) return { to: MAIL_EVERYONE, kind: "reaction" };
+    // The one it answers has gone: its answer is for nobody left, so it is published to no one
+    // rather than shown to whoever is here now.
+    if (!present) return null;
+    return answering.kind === "ask" ? { to: id, kind: "tell" } : { to: id, kind: "reaction" };
   };
   const routeCodexReply = (room, text, answering = null) => {
     const [first, ...rest] = text.split("\n");
@@ -2181,7 +2184,10 @@ function startBridge(config) {
     // `explicit` says the line named somebody the room knows — everyone, or a member by id
     // or label. A goal turn's answer is published on that and nothing else; a line that
     // named nobody, or somebody not here, is not a message to this room (#149).
-    if (!match) return { text, routing: unroutedReply(room, answering), explicit: false };
+    if (!match) {
+      const routing = unroutedReply(room, answering);
+      return routing ? { text, routing, explicit: false } : { text, routing: null, explicit: false, orphaned: true };
+    }
     const inline = (match[5] ?? "").trim();
     const target = match[1].trim();
     const named = /^everyone$/i.test(target)
@@ -2687,7 +2693,16 @@ function startBridge(config) {
         handledThrough = reply.endsAt;
         continue;
       }
-      const { text, routing, explicit, name: offeredName } = routeCodexReply(destination.room, reply.text, origin?.answering ?? null);
+      const { text, routing, explicit, name: offeredName, orphaned } = routeCodexReply(destination.room, reply.text, origin?.answering ?? null);
+      if (orphaned) {
+        console.error(
+          `codex log ${path}: turn ${reply.turnId} answers a member who has left the room and names no one;` +
+            " not published",
+        );
+        reader.origins.delete(reply.turnId);
+        handledThrough = reply.endsAt;
+        continue;
+      }
       // A goal turn's answer is a message to the room only when it says so — a first line
       // naming a member or everyone. Status Codex writes for its own terminal while working
       // a goal stays there; the room is not told, and stderr says so once per turn.
@@ -5679,7 +5694,13 @@ function startBridge(config) {
    * that arrived with no rules, no roster and no seq, to a session that has just been let
    * in and has read nothing yet.
    */
-  const codexRoomEnvelope = (roomName, room, recipient, text, { full = false } = {}) => {
+  const codexRoomEnvelope = (roomName, room, recipient, text, { full = false, answering = null } = {}) => {
+    // Who this push is from, by id and kind, written by the bridge at the very start of its own
+    // header (#340 audit): an unrouted answer goes back to that id, never to whoever holds the
+    // name now. Placed before anything a sender or a declared name controls.
+    const marker = answering && /^[A-Za-z0-9_-]{1,64}$/.test(answering.id) && MAIL_KINDS.has(answering.kind)
+      ? ` (answering ${answering.id} ${answering.kind})`
+      : "";
     const roster = [...room.members.keys()].map((id) => shownIn(room, id)).join(", ");
     // Asked until it is answered (#182): what the app has on record, and the one place
     // Codex can say what it wants to be called instead.
@@ -5707,7 +5728,7 @@ function startBridge(config) {
     // is load-bearing in both: `codexPushTarget` reads where the answer goes off it.
     if (!full && roomRulesReady) {
       return (
-        `[Gyredeck · room ${roomName} — how to answer: the last thing you write this turn` +
+        `[Gyredeck · room ${roomName}${marker} — how to answer: the last thing you write this turn` +
         " is posted for you (no curl, no watch). Open it with one line: @<member or" +
         " everyone> ask|tell|reaction — never answer a reaction." +
         nameAsk +
@@ -5720,7 +5741,7 @@ function startBridge(config) {
       );
     }
     return (
-      `[Gyredeck · room ${roomName} — how to answer: write your reply as ordinary` +
+      `[Gyredeck · room ${roomName}${marker} — how to answer: write your reply as ordinary` +
       " text in this turn. Do not call Gyredeck: your sandbox refuses the network" +
       " syscall, so curl fails at connect even for 127.0.0.1, and a failed POST" +
       " looks like nothing at all. The bridge reads what you write from your own" +
@@ -5907,6 +5928,7 @@ function startBridge(config) {
           room,
           recipient,
           codexRoomTag(fromLabel, kind, from === OWNER_DISCORD_SENDER ? `${OWNER_DISCORD_NOTE}\n${text}` : text),
+          { answering: { id: from, kind } },
         );
         const outcome = deliverToCodex(recipient, room, outgoing);
         if (outcome === "queued") {

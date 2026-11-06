@@ -22,9 +22,10 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   its seq. A message the watch did not carry, such as a reaction it passed over, is still
   shown in full.
 - **A reply to the owner's Discord is receipted `relayed`, not `no_recipients`.** The reply
-  did reach Discord, but the receipt said nobody got it, and agents resent it to the whole
-  room. It now says `relayed` when the room's Discord relay is listening, and
-  `owner_not_connected` when it is not.
+  was handed to the room's Discord relay, but the receipt said nobody got it, and agents
+  resent it to the whole room. It now says `relayed` when the room's Discord relay has its
+  watch open, and `owner_not_connected` when it does not. `relayed` means the relay was
+  handed the reply, not that Discord has shown it.
 - **A Claude Code session whose mail is held back is now told so.** When Gyredeck could not
   hand a session its room mail, the session was given nothing, which looked exactly like an
   empty mailbox. The session is now told mail is waiting, why it cannot be handed over, and

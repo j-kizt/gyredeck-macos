@@ -10232,6 +10232,28 @@ test("the Antigravity hook's wait asks the broker, ends on mail, and is refused 
     assert.deepEqual(JSON.parse(waited.stdout).messages.map((m) => m.text), ["for agy"]);
     await broker.close();
 
+    // #358: a wait is how a room wakes agy, so it hands back how to answer — the same REPLY a
+    // prompt-time delivery carries, addressed to who asked, with this session's own key.
+    const key = "c3".repeat(32);
+    broker = await fakeBroker(home, () => ({
+      v: 1, ok: true, boundTo: me, room: "sync-wq7k", memberKey: key,
+      members: [{ conversationId: me, you: true }, { conversationId: "codex-1", you: false }],
+      messages: [{ seq: 5, from: "codex-1", fromShown: "Codex / Gyre Audit", text: "your view?", kind: "ask" }],
+    }));
+    waited = await waitBy(["30", me]);
+    assert.equal(waited.code, 0, waited.stderr);
+    const reply = JSON.parse(waited.stdout).reply ?? "";
+    assert.match(reply, /curl -s -X POST http:\/\/127\.0\.0\.1:\d+\/mail\/sync-wq7k/, "#358: a wait carries the command to answer the room");
+    assert.match(reply, new RegExp(`x-gyredeck-member: ${key}`), "#358: in this session's own name");
+    assert.match(reply, /"to":"Codex \/ Gyre Audit","kind":"tell"/, "#358: addressed to who asked");
+    await broker.close();
+
+    // #358: mail that asks nothing carries no command to answer it.
+    broker = await fakeBroker(home, () => ({ v: 1, ok: true, boundTo: me, room: "sync-wq7k", memberKey: key, members: [], messages: [{ seq: 6, from: "codex-1", text: "ok", kind: "reaction" }] }));
+    waited = await waitBy(["30", me]);
+    assert.equal(JSON.parse(waited.stdout).reply, undefined, "#358: a reaction is not answered");
+    await broker.close();
+
     // Nothing arrives: exit 4, so the loop around it starts it again without waking agy.
     broker = await fakeBroker(home, () => ({ v: 1, ok: true, boundTo: me, messages: [] }));
     const started = Date.now();
@@ -10255,6 +10277,11 @@ test("the Antigravity hook's wait asks the broker, ends on mail, and is refused 
     assert.match(waited.stderr, /wait refused — unbound — bind first/);
     await broker.close();
 
+    // #358: a guessed command fails loudly; it used to print `{}` with exit 0, read as a send.
+    const guessed = await runAdapter("adapters/antigravity/gyredeck-agy-hook.mjs", ["post", "--to", "everyone", "--text", "hi"], home, {});
+    assert.equal(guessed.code, 64, "#358: an unknown command is refused");
+    assert.match(guessed.stderr, /unknown command: post/);
+    assert.equal(guessed.stdout.trim(), "", "#358: and prints nothing that reads as an answer");
     assert.equal((await waitBy(["30"])).code, 3, "an id is required");
     assert.equal((await waitBy(["0", me])).code, 3, "usage");
   } finally {

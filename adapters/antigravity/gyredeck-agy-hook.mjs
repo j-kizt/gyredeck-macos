@@ -386,6 +386,29 @@ const wellFormedCollect = (body) =>
   Boolean(body) && typeof body === "object" && body.ok === true &&
   Array.isArray(body.messages) &&
   (body.missed === undefined || Array.isArray(body.missed));
+/**
+ * What a wait hands back to answer with (#358). A wait is how a room wakes Antigravity, and it
+ * printed the mail alone: a session woken that way was never shown how to send, wrote its
+ * answers in its own terminal, and once guessed a command that does not exist. The same
+ * REPLY a prompt-time delivery carries, addressed to the last message that wants an answer.
+ */
+const replyForWait = async (result) => {
+  const room = typeof result?.room === "string" ? result.room : null;
+  const members = new Map((Array.isArray(result?.members) ? result.members : []).map((m) => [m?.conversationId, m]));
+  const answering = (Array.isArray(result?.messages) ? result.messages : [])
+    .filter((m) => (m.kind === "ask" || m.kind === "tell") && m.from !== ROOM_SENDER && members.get(m.from)?.you !== true)
+    .at(-1);
+  if (!room || !answering) return {};
+  const reply = replyInstruction(
+    await readEndpoint(), room, [room], answering,
+    (m) => m.fromShown ?? m.from,
+    (id) => members.has(id) && members.get(id)?.you !== true,
+    false,
+    result.memberKey,
+  );
+  return reply ? { reply: reply.ephemeralMessage } : {};
+};
+
 const waitForMail = async (secondsArg, expected) => {
   const seconds = Number.parseInt(secondsArg ?? "", 10);
   if (!Number.isInteger(seconds) || seconds < 1 || seconds > WAIT_MAX_SECONDS || !WAIT_ID.test(expected ?? "")) {
@@ -412,7 +435,7 @@ const waitForMail = async (secondsArg, expected) => {
       const reply = await getJsonStatus(endpoint, token, `/mail/wait?as=${expected}&timeout=${remainingSeconds}&collect=1`, remainingMs() + 2_000);
       if (reply.status === 200 && wellFormedCollect(reply.body)) {
         if (reply.body.messages.length === 0 && (reply.body.missed ?? []).length === 0) return 4;
-        process.stdout.write(`${JSON.stringify(reply.body)}\n`);
+        process.stdout.write(`${JSON.stringify({ ...reply.body, ...(await replyForWait(reply.body)) })}\n`);
         return 0;
       }
       if (reply.status === 403) return refused(`the bridge refused the read (${reply.body?.error ?? 403}): ${reply.body?.message ?? ""}`);
@@ -428,7 +451,7 @@ const waitForMail = async (secondsArg, expected) => {
     if (messages.length > 0 || missed.length > 0) {
       // Printed before it is acknowledged: a wait cut short here hands the batch over
       // again next time — a duplicate, never a loss.
-      process.stdout.write(`${JSON.stringify({ ok: true, timedOut: false, ...result })}\n`);
+      process.stdout.write(`${JSON.stringify({ ok: true, timedOut: false, ...result, ...(await replyForWait(result)) })}\n`);
       await ackDelivery(result, remainingMs() + BROKER_DEADLINE_MS);
       return 0;
     }
@@ -1309,6 +1332,11 @@ const main = async () => {
 
 if (process.argv[2] === "wait") {
   waitForMail(process.argv[3], process.argv[4]).then((code) => process.exit(code));
+} else if (process.argv[2] !== undefined && !process.argv[2].startsWith("--")) {
+  // A guessed command (`post …`) used to fall through to the hook path and print `{}` with
+  // exit 0, which an agent read as a send (#358).
+  process.stderr.write(`gyredeck: unknown command: ${process.argv[2]} — the only command is wait; a room is answered with the REPLY command a delivery or a wait prints\n`);
+  process.exit(64);
 } else {
   main();
 }

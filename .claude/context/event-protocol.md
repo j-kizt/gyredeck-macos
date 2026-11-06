@@ -679,6 +679,8 @@ Deliveries (#341): the roster has a version, which moves whenever the shown memb
 
 One copy per message (#342): the bridge records, per member, which seqs its watch actually framed (`framed`, last 256). A collect's answer lists those as `onWatch`, and the Claude hook shows each as `[from X · kind] (already on your watch, seq N)` instead of repeating the text. `streamSeq` is not used for this, because it also moves at join and confirm without a frame. `readSeq` is not used either, because it is not proof of reading (#228).
 
+Owner receipts (#343): a post to `gyredeck-owner-discord` is never delivered to a member, because the room's Discord relay carries it. It used to report `no_recipients` every time while landing every time. It now reports `relayed` when the room's relay holds a watch, and `owner_not_connected` when there is no relay or its watch is down.
+
 `limit` caps the batch, and it is applied **by the bridge** rather than by the caller. Whoever advances the position has to be the one that trims: a caller that took the first ten of fourteen would leave four marked as read and never delivered. Only what is actually handed over moves the position, per room.
 
 ### Read position is per member

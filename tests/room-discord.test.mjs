@@ -677,3 +677,32 @@ test("#339: rules v17 say a reaction and a notice wake nobody, except a leave fo
   assert.match(rules, /a member leaves while you are still waiting for its answer to your ask, that notice wakes you/);
   assert.doesNotMatch(rules, /It interrupts nobody and needs nothing back/, "the v16 sentence is gone");
 });
+
+test("#343: a post to the owner is receipted relayed while the Discord relay watches, owner_not_connected when it does not", async () => {
+  const h = await startBridge();
+  try {
+    const created = await h.call("POST", "/sync/rooms", { conversationId: "founder-343" });
+    const { room: code, password } = created.body;
+    const peer = "peer-343";
+    assert.equal((await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: peer })).status, 200);
+    assert.equal((await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD })).status, 200);
+    const key = await asMember(h, peer, password);
+    const post = (body) => fetch(`${h.base}/mail/${code}`, {
+      method: "POST", headers: { "content-type": "application/json", ...key }, body: JSON.stringify({ from: peer, ...body }),
+    }).then((response) => response.json());
+    // No relay in the room: the owner cannot be reached, and the receipt says so.
+    assert.equal((await post({ to: "gyredeck-owner-discord", kind: "tell", text: "nobody relays this" })).delivery, "owner_not_connected");
+    const relayId = `discord-${code}`;
+    assert.equal((await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: relayId, relay: "discord" })).status, 200);
+    // The relay watching: the post reaches the owner, and the receipt says so.
+    let receipt = null;
+    const app = { "x-gyredeck-token": h.token, "x-gyredeck-broker": APP_WORD };
+    const frames = await watchUntil(h.base, code, relayId, app,
+      (seen) => receipt !== null && seen.some((frame) => frame.text === "for the owner"),
+      async () => { receipt = await post({ to: "gyredeck-owner-discord", kind: "tell", text: "for the owner" }); });
+    assert.ok(frames.some((frame) => frame.text === "for the owner"), "premise: the relay was handed it");
+    assert.equal(receipt.delivery, "relayed", `#343: ${JSON.stringify(receipt)}`);
+  } finally {
+    await h.stop();
+  }
+});

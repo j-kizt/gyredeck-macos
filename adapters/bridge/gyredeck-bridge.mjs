@@ -8264,7 +8264,17 @@ function startBridge(config) {
           // cannot be retried into anything but a new message anyway.
           while (room.ownerKeys.size > MAIL_MAX_MESSAGES) room.ownerKeys.delete(room.ownerKeys.keys().next().value);
         }
-        const delivery = deliverMail(name, room, text, from, message);
+        // The owner on Discord is not a member a message is delivered to: the room's Discord relay
+        // carries everything, so a post to the owner reached them if that relay is watching
+        // (#343). Counted as members only, it read "no_recipients" every time while landing
+        // every time, and an agent that believed it posted the answer again to everyone.
+        const delivered = deliverMail(name, room, text, from, message);
+        const delivery = addressed === OWNER_DISCORD_SENDER && delivered === "no_recipients"
+          ? ([...room.members].some(([id, member]) => member.relay === true &&
+              [...room.clients].some((res) => res.gyredeckWatcher === id && !res.destroyed && !res.writableEnded))
+            ? "relayed"
+            : "owner_not_connected")
+          : delivered;
         // A queued message is in the session's hands whether or not it answers, so it
         // is not still waiting to be collected. Leaving it pending would light the
         // chip on a session that had already been handed the message.

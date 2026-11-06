@@ -3917,14 +3917,16 @@ test("a Codex turn is lifted out of its log, routed by the line it opens with", 
     assert.equal(told.kind, "tell");
     assert.equal("yesNo" in told, false, "yn opens nothing on a tell");
 
-    // A turn that never learned the convention must still be heard, loudly.
+    // A turn that never learned the convention must still be heard — but not loudly (#340):
+    // a turn the room did not push has nobody to go back to, so it is a reaction to everyone,
+    // published and waking nobody.
     await appendFile(rollout, turn("no routing line here"));
     await endTurn();
     await new Promise((resolve) => setTimeout(resolve, 100));
     history = await readRoom();
     const bare = history.find((message) => message.text === "no routing line here");
     assert.ok(bare, "an unlabelled Codex turn is published rather than dropped");
-    assert.equal(bare.kind, "tell");
+    assert.equal(bare.kind, "reaction");
     assert.equal(bare.to, "everyone");
   } finally {
     bridge.kill();
@@ -7646,6 +7648,11 @@ const codexInARoom = async ({ replyTimeoutMs = null } = {}) => {
     const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, { headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, token, created.body.password) });
     return (await response.json()).messages.filter((message) => message.from === thread).map((message) => message.text);
   };
+  /** What Codex said in the room, whole — kind and addressee too (#340). */
+  const saidInRoomWhole = async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/mail/${code}?since=0&as=${founder}`, { headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, token, created.body.password) });
+    return (await response.json()).messages.filter((message) => message.from === thread);
+  };
   // What Codex answered to a private message is delivered where the sender listens — the
   // founder's own mailbox — not kept in Codex's, which nothing outside reads (#137).
   const saidInMailbox = async () => {
@@ -7665,7 +7672,7 @@ const codexInARoom = async ({ replyTimeoutMs = null } = {}) => {
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
-  return { home, rolloutDir, port, call, headers, founder, thread, code, rollout, stderrRef, saidInRoom, saidInMailbox, until, close };
+  return { home, rolloutDir, port, call, headers, founder, thread, code, rollout, stderrRef, saidInRoom, saidInRoomWhole, saidInMailbox, until, close };
 };
 
 test("an answer goes to the mailbox or the room that asked for it, not to whichever poll woke first", async () => {
@@ -14425,5 +14432,46 @@ test("#339 C7: a Codex member still owed an answer is pushed the leave, and one 
     assert.equal((await f.messagesTo(codex)).length, before + 1, "C7: a leave that owes Codex nothing is not pushed");
   } finally {
     await f.close();
+  }
+});
+
+
+test("#340 D1 D2: Codex's answer with no routing line goes back to whoever wrote — a tell to an asker, a reaction otherwise", async () => {
+  const room = await codexInARoom();
+  try {
+    const history = room.saidInRoomWhole;
+    const answerPush = async (marker, answer) => {
+      assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.includes(marker))), `premise: ${marker} was pushed`);
+      const prompt = (await promptsIn(room.rollout)).find((entry) => entry.text.includes(marker));
+      await appendFile(room.rollout, turnAnswering(prompt.turnId, answer));
+      await room.call("POST", "/hook/stop", { hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: room.thread });
+      assert.ok(await room.until(async () => (await history()).some((message) => message.text === answer)), `${answer} was published`);
+      return (await history()).find((message) => message.text === answer);
+    };
+    assert.equal((await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "ask", text: "Q-ASK-340" })).status, 202);
+    const answered = await answerPush("Q-ASK-340", "ANSWER-TO-ASK");
+    assert.equal(answered.kind, "tell", "D1: an ask is answered with a tell, which wakes the asker");
+    assert.equal(answered.to, room.founder, "D1: to the asker, not the room");
+    assert.equal((await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "tell", text: "T-TELL-340" })).status, 202);
+    const acked = await answerPush("T-TELL-340", "ANSWER-TO-TELL");
+    assert.equal(acked.kind, "reaction", "D2: anything else is answered with a reaction, which wakes nobody");
+    assert.equal(acked.to, room.founder, "D2: to its sender");
+  } finally {
+    await room.close();
+  }
+});
+
+test("#340 D3: the confirmation no longer asks for a reaction, and the rules invite none for a notice", async () => {
+  const { roomRules } = await import("../adapters/bridge/gyredeck-bridge.mjs");
+  const rules = roomRules("http://127.0.0.1:47621");
+  assert.doesNotMatch(rules, /may draw one too/, "D3: no reaction for a notice");
+  assert.match(rules, /never send one for a notice/);
+  assert.match(rules, /Acknowledge a tell with a reaction, never with a tell/);
+  assert.match(rules, /Without the line, your message goes back to whoever wrote to you/);
+  const bridge = await readFile(join(repoRoot, "adapters", "bridge", "gyredeck-bridge.mjs"), "utf8");
+  assert.doesNotMatch(bridge, /Reply to this[^]{0,40}with a reaction|Reply to[^]{0,10}this with a reaction/, "D3: no confirmation asks for a reaction");
+  for (const hook of ["claude/gyredeck-claude-hook.mjs", "antigravity/gyredeck-agy-hook.mjs"]) {
+    const text = await readFile(join(repoRoot, "adapters", hook), "utf8");
+    assert.doesNotMatch(text, /send one for a tell or for a notice/, `D3: ${hook} invites no reaction for a notice`);
   }
 });

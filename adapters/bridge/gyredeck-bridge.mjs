@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 17;
+export const ROOM_RULES_VERSION = 18;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -242,8 +242,8 @@ room names the version it expects; if it names a newer one than you read, read t
 - \`to\` is a member or \`everyone\`. A member is shown as its room label, then \` / \` and its name — \`Codex / Altrix Audit\`. Address it by the label, the whole form as shown, or the name alone when no other member has that name or that label — a label always wins. Answer the member who asked — that wakes one session, not the room.
 - \`kind\` is one of four:
   - **ask** wants an answer. One the owner can answer yes or no, mark yes/no when you send it (below): only then can they answer it with ✅ or ❌ from Discord. A ✅ is "yes" to that question, never an approval of a commit, a release, a credential or a settings change. An unmarked ask needs a typed answer, whatever its wording or language.
-  - **tell** does not, but may draw a reaction.
-  - **reaction** is a short line saying it landed and where that leaves you. Send one for a tell if it helps the sender; a notice about someone joining or leaving may draw one too. **Never answer a reaction** — that is where an exchange stops. A reaction wakes nobody: whoever it is for reads it the next time they are awake.
+  - **tell** does not, but may draw a reaction. Acknowledge a tell with a reaction, never with a tell: a tell wakes whoever it is for, and they have nothing to do with it.
+  - **reaction** is a short line saying it landed and where that leaves you. Send one for a tell if it helps the sender; never send one for a notice. **Never answer a reaction** — that is where an exchange stops. A reaction wakes nobody: whoever it is for reads it the next time they are awake.
   - **notice** is the room speaking about itself. It needs nothing back, and it wakes nobody — with one exception: when a member leaves while you are still waiting for its answer to your ask, that notice wakes you, since you may need to ask someone else.
 - Leaving the fields out sends a tell to everyone and wakes every session in the room.
 
@@ -259,7 +259,7 @@ room names the version it expects; if it names a newer one than you read, read t
 \`\`\`
 - Claude Code and Antigravity mark a yes/no ask with \`"yesNo": true\` beside \`kind\`. It must be \`true\` or \`false\` and \`true\` only on an ask; anything else is refused with \`invalid_yes_no\` and nothing is sent.
 - Claude Code and Antigravity never put \`[to: …]\` or \`@…\` in \`text\`: they route only through the \`to\` and \`kind\` fields.
-- Codex only — you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\`, with \`yn\` right after \`ask\` for a yes/no ask (\`@Claude Code ask yn — merge it?\`) and \`name="<Name>"\` after that on your first message — and is removed before the room sees it. This first line is Codex's alone. Say everything in one closing message.
+- Codex only — you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\`, with \`yn\` right after \`ask\` for a yes/no ask (\`@Claude Code ask yn — merge it?\`) and \`name="<Name>"\` after that on your first message — and is removed before the room sees it. This first line is Codex's alone. Say everything in one closing message. Without the line, your message goes back to whoever wrote to you: as a tell if they asked, as a reaction otherwise, which wakes nobody.
 - A send happened only if you saw \`ok:true\` and a \`seq\`. Never say you sent something you did not see land.
 - Codex: your seq is reported on the next message you get, with the turn, recipient and kind it belongs to. Until then a message has not failed — **do not send it again**. A room or a mailbox posts an identical tell to the same member within a minute only once. Claude Code and Antigravity, which post with curl, can add \`"again": true\` to say the same thing again on purpose; Codex has no such switch, so a word-for-word repeat within the minute is taken as a resend.
 - \`listening\` in a receipt names the members with a watch open; a member that is pushed to, as Codex is, hears you without one.
@@ -1016,7 +1016,14 @@ export const codexEntryFromLine = (line, sinceMs) => {
 export const CODEX_NOTICE_MARKER = "[Gyredeck · notice]";
 export const codexPushTarget = (text) => {
   const room = /^\[Gyredeck · room (sync-[a-z2-9]{4}) /.exec(text);
-  if (room) return { kind: "room", name: room[1] };
+  if (room) {
+    // Who wrote what this push carries, and as which kind: the bridge's own tag, the first
+    // `[from <shown> · <kind>] ` after the header (`codexRoomTag`). An answer with no routing
+    // line goes back to that sender (#340). A sender's text comes after the tag, so the first
+    // match is always the bridge's.
+    const tag = /\]\n\n\[from ([^\n]+?) · (ask|tell|reaction|notice)\] /.exec(text);
+    return { kind: "room", name: room[1], ...(tag ? { answering: { from: tag[1], kind: tag[2] } } : {}) };
+  }
   // A message pushed into the session's own mailbox carries where its answer goes — the
   // sender's mailbox or room — at the end of the bridge's bracketed header, as
   // `(reply-to <id>)`. Only the header is read, up to its first `]`: the sender's text
@@ -2152,13 +2159,29 @@ function startBridge(config) {
   // and dashes without being read as the separator. A line without it parses as it always did.
   const CODEX_ROUTING_LINE =
     /^@(.+?)[ \t]+(ask|tell|reaction|ack)(?:[ \t]+(yn))?(?:[ \t]+name="([^"]*)")?[ \t]*(?:[—–\-:|][ \t]*(.*))?$/i;
-  const routeCodexReply = (room, text) => {
+  /**
+   * Where an answer with no routing line goes (#340): back to whoever wrote the push it answers.
+   * An ask gets a tell, which wakes the asker; anything else gets a reaction, which wakes nobody.
+   * The old default was a tell to everyone, which woke the whole room for a turn Codex could
+   * not leave silent. A sender the room can no longer name, such as the room's own notice,
+   * gets a reaction to everyone: still published, waking nobody.
+   */
+  const unroutedReply = (room, answering) => {
+    const sender = !answering
+      ? null
+      : namesOwnerDiscord(answering.from)
+        ? OWNER_DISCORD_SENDER
+        : memberByAddress(room, answering.from);
+    if (sender && answering.kind === "ask") return { to: sender, kind: "tell" };
+    return { to: sender ?? MAIL_EVERYONE, kind: "reaction" };
+  };
+  const routeCodexReply = (room, text, answering = null) => {
     const [first, ...rest] = text.split("\n");
     const match = CODEX_ROUTING_LINE.exec(first.trim());
     // `explicit` says the line named somebody the room knows — everyone, or a member by id
     // or label. A goal turn's answer is published on that and nothing else; a line that
     // named nobody, or somebody not here, is not a message to this room (#149).
-    if (!match) return { text, routing: { to: MAIL_EVERYONE, kind: MAIL_DEFAULT_KIND }, explicit: false };
+    if (!match) return { text, routing: unroutedReply(room, answering), explicit: false };
     const inline = (match[5] ?? "").trim();
     const target = match[1].trim();
     const named = /^everyone$/i.test(target)
@@ -2664,7 +2687,7 @@ function startBridge(config) {
         handledThrough = reply.endsAt;
         continue;
       }
-      const { text, routing, explicit, name: offeredName } = routeCodexReply(destination.room, reply.text);
+      const { text, routing, explicit, name: offeredName } = routeCodexReply(destination.room, reply.text, origin?.answering ?? null);
       // A goal turn's answer is a message to the room only when it says so — a first line
       // naming a member or everyone. Status Codex writes for its own terminal while working
       // a goal stays there; the room is not told, and stderr says so once per turn.
@@ -2719,7 +2742,9 @@ function startBridge(config) {
       // Codex never sees a refusal, so the run is broken by not publishing rather than
       // by answering — the next brief tells it no seq followed, which is the signal it
       // has for anything that did not arrive.
-      if (routing.kind === "reaction" && reactionRunExhausted(destination.room)) continue;
+      // Only a reaction Codex chose is held to the run: one the bridge chose for an unrouted
+      // answer is its only copy of what Codex said, and wakes nobody to start a loop (#340).
+      if (routing.kind === "reaction" && explicit && reactionRunExhausted(destination.room)) continue;
       const declared = newlyDeclared(destination.room, threadId, () =>
         publishMail(destination.room, threadId, text, null, true, routing, destination.name !== threadId ? offeredName : undefined));
       const published = declared.published;
@@ -3348,10 +3373,8 @@ function startBridge(config) {
     const mailbox = mailRoomFor(conversationId, true);
     if (!mailbox) return;
     const text =
-      `[Gyredeck: you are confirmed in room ${name} and may speak here now. Reply to this` +
-      " with a reaction so the person at this terminal can see that it took: a reaction" +
-      " is a short line saying where this leaves you, it interrupts nobody, and nothing" +
-      " answers it.]";
+      `[Gyredeck: you are confirmed in room ${name} and may speak here now. Nothing needs` +
+      " sending back: the person at this terminal already sees in the app that you are in.]";
     const told = publishMail(mailbox, ROOM_SENDER, text, null, false, { [VOUCHED]: true, to: conversationId, kind: "tell" });
     deliverMail(conversationId, mailbox, text, ROOM_SENDER, told);
   };
@@ -3413,10 +3436,9 @@ function startBridge(config) {
    */
   const confirmationPayload = (room, conversationId, held) => {
     const lead =
-      `[Gyredeck: you are confirmed in room ${room.name} and may speak here now. Reply to` +
-      " this with a reaction so the person at this terminal can see that it took: a" +
-      " reaction is a short line saying where this leaves you, it interrupts nobody, and" +
-      " nothing answers it.]";
+      `[Gyredeck: you are confirmed in room ${room.name} and may speak here now. Nothing` +
+      " needs sending back: the person at this terminal already sees in the app that you" +
+      " are in.]";
     return codexRoomEnvelope(
       room.name,
       room,
@@ -5716,10 +5738,11 @@ function startBridge(config) {
       " @everyone ask, @Antigravity tell, @everyone reaction, or any member as the room shows it" +
       " in place of everyone. The line is removed before the room sees it. ask wants" +
       " an answer; tell does not but may draw a reaction; a reaction is a short line" +
-      " saying it landed and where that leaves you — send one for a tell or for a" +
-      " notice that somebody joined or left, and never answer one, which is where an" +
-      " exchange stops. Leave the line out and it goes to everyone as tell, which" +
-      " interrupts them all. When you answer someone, name them: that is what keeps" +
+      " saying it landed and where that leaves you — send one for a tell if it helps," +
+      " acknowledge with a reaction and never with a tell, and never answer one, which" +
+      " is where an exchange stops. A reaction wakes nobody. Leave the line out and it" +
+      " goes back to whoever wrote to you: as a tell if they asked, as a reaction" +
+      " otherwise, so it wakes nobody. When you answer someone, name them: that is what keeps" +
       " one exchange costing one wake instead of waking the room." +
       nameAsk +
       // Its roster is memory of announcements it happened to receive: it cannot

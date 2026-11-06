@@ -670,7 +670,7 @@ test("#206 a room's status is read by the app alone: machine token and broker wo
 });
 
 test("#339: rules v17 say a reaction and a notice wake nobody, except a leave for whoever is owed an answer", () => {
-  assert.equal(ROOM_RULES_VERSION, 17);
+  assert.ok(ROOM_RULES_VERSION >= 17, "introduced in v17, kept by every later version");
   const rules = roomRules("http://127.0.0.1:47621");
   assert.match(rules, /A reaction wakes nobody/);
   assert.match(rules, /\*\*notice\*\* is the room speaking about itself\. It needs nothing back, and it wakes nobody/);

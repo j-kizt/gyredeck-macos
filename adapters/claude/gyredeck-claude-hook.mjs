@@ -611,11 +611,12 @@ const nameAsk = (mine) => {
  * mailbox, and a confirmed session went a whole day hearing nothing from its room. The cure
  * the owner chose is a restart, or a fork when another window holds the session.
  */
+// The advice is conditional rather than read off the reason: the broker says `conflict` both
+// when another process holds the session and when this one claimed two (#337 audit).
 const withheldNote = (reason) =>
   `Gyredeck is holding mail for this session that it cannot hand over this turn (${reason}).` +
-  (/conflict|another|holds/i.test(reason)
-    ? " Another window seems to hold this session: tell the person at this terminal to close it, or to open this one with claude --resume <id> --fork-session."
-    : " Tell the person at this terminal; restarting this session (exit, then claude --resume) usually clears it.");
+  " Tell the person at this terminal: if another window has this session open, close it or open this one with claude --resume <id> --fork-session;" +
+  " otherwise exit this session and start it again (claude --resume <id>).";
 
 const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null, taken = null) => {
   if (!token || !MAIL_ROOM_NAME.test(room)) return null;

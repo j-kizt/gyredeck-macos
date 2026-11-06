@@ -2628,10 +2628,13 @@ test("a password accepted in a turn whose mail is withheld still names the room,
 
     // 3. Without a password, a withheld drain is no longer silent (#337): on stderr alone it
     // looked exactly like an empty mailbox, and a confirmed session heard nothing for a day.
-    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "conflict", message: "two claims" }), { confirmVia: `http://127.0.0.1:${port}` });
+    // The broker's own words for one process claiming two sessions — a `conflict` that no
+    // fork cures, so the advice cannot be read off the code (#337 audit).
+    broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "conflict", message: "Process 4242 claimed two sessions; it is served nothing until it exits." }), { confirmVia: `http://127.0.0.1:${port}` });
     told = await paste(first, "hi");
-    assert.match(told.context, /holding mail for this session that it cannot hand over this turn \(conflict — two claims\)/, "#337: the reason, in context");
-    assert.match(told.context, /--fork-session/, "#337: and, for another window holding it, what to do");
+    assert.match(told.context, /holding mail for this session that it cannot hand over this turn \(conflict — Process 4242 claimed two sessions/, "#337: the reason, in context");
+    assert.match(told.context, /if another window has this session open, close it or open this one with claude --resume <id> --fork-session/, "#337: a fork only if another window holds it");
+    assert.match(told.context, /otherwise exit this session and start it again/, "#337 audit: a conflict that is not another window is told to exit and start again");
     assert.match(told.stderr, /mail withheld this turn — conflict/, "stderr still says it too");
   } finally {
     if (broker) await broker.close();

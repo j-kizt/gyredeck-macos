@@ -10237,15 +10237,17 @@ test("the Antigravity hook's wait asks the broker, ends on mail, and is refused 
     const key = "c3".repeat(32);
     broker = await fakeBroker(home, () => ({
       v: 1, ok: true, boundTo: me, room: "sync-wq7k", memberKey: key,
-      members: [{ conversationId: me, you: true }, { conversationId: "codex-1", you: false }],
-      messages: [{ seq: 5, from: "codex-1", fromShown: "Codex / Gyre Audit", text: "your view?", kind: "ask" }],
+      members: [{ conversationId: me, you: true }, { conversationId: "codex-1", provider: "Codex", name: "New Name", you: false }],
+      // Shown under the name it was sent with; the member has been renamed since.
+      messages: [{ seq: 5, from: "codex-1", fromShown: "Codex / Old Name", text: "your view?", kind: "ask" }],
     }));
     waited = await waitBy(["30", me]);
     assert.equal(waited.code, 0, waited.stderr);
     const reply = JSON.parse(waited.stdout).reply ?? "";
     assert.match(reply, /curl -s -X POST http:\/\/127\.0\.0\.1:\d+\/mail\/sync-wq7k/, "#358: a wait carries the command to answer the room");
     assert.match(reply, new RegExp(`x-gyredeck-member: ${key}`), "#358: in this session's own name");
-    assert.match(reply, /"to":"Codex \/ Gyre Audit","kind":"tell"/, "#358: addressed to who asked");
+    assert.match(reply, /"to":"Codex","kind":"tell"/, "#358: addressed to who asked, by the label the roster gives now");
+    assert.doesNotMatch(reply, /Old Name/, "#358 audit: never by the name the message was sent under");
     await broker.close();
 
     // #358: mail that asks nothing carries no command to answer it.

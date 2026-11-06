@@ -401,7 +401,9 @@ const replyForWait = async (result) => {
   if (!room || !answering) return {};
   const reply = replyInstruction(
     await readEndpoint(), room, [room], answering,
-    (m) => m.fromShown ?? m.from,
+    // The member's label from the roster as it is now, as the prompt-time delivery does: a
+    // message's `fromShown` is the name it was sent under, and may have changed since (#358 audit).
+    (m) => members.get(m.from)?.provider ?? m.from,
     (id) => members.has(id) && members.get(id)?.you !== true,
     false,
     result.memberKey,

@@ -793,6 +793,8 @@ export const writeHeavyHelper = (origin, path = HEAVY_HELPER_PATH) => {
  *  stays counted until something is next published to it, so the bridge would report a
  *  session as watching after its watch had died and leave out how to open a new one. */
 const SSE_HEARTBEAT_MS = Number(process.env.GYREDECK_SSE_HEARTBEAT_MS) || 10_000;
+/** How long after a watch closes it still counts as held (#341): the reopen takes about a second. */
+const WATCH_REOPEN_GRACE_MS = Number(process.env.GYREDECK_WATCH_REOPEN_GRACE_MS) || 15_000;
 
 // ── Token management ──
 
@@ -2064,6 +2066,12 @@ function startBridge(config) {
     tellCodexOfHeavyRuns(payload?.conversationId);
     if (payload.type === "conversation_close" && typeof payload.conversationId === "string") {
       releaseClosedSession(payload.conversationId);
+    }
+    // A session that compacted or resumed no longer holds the roster it was handed, so the next
+    // delivery hands it whole again (#341).
+    if (typeof payload.conversationId === "string" &&
+      (payload.type === "compact_start" || (payload.type === "conversation_open" && ["compact", "resume", "clear"].includes(payload.data?.reason)))) {
+      forgetRosterTold(payload.conversationId);
     }
     recent.push(payload);
     if (recent.length > maxRecent) recent.shift();
@@ -3506,7 +3514,10 @@ function startBridge(config) {
   const tellConfirmedToCodex = (name, room, conversationId) => {
     const all = heldFor(room, conversationId);
     const delivered =
-      deliverToCodex(conversationId, room, confirmationPayload(room, conversationId, all)) === "queued";
+      (() => {
+        const roster = rosterFor(room, conversationId);
+        return deliverToCodex(conversationId, room, confirmationPayload(room, conversationId, all), { settled: (ok) => { if (ok) roster.mark(); } });
+      })() === "queued";
     const held = all;
     const member = room.members.get(conversationId);
     if (delivered && member) {
@@ -4171,7 +4182,8 @@ function startBridge(config) {
   // that is never hung up on outlives the reason it was armed: the room ends, the
   // session moves on, and the connection sits there proving nothing. Ending it on a
   // known schedule makes re-arming a decision someone takes again.
-  const MAIL_STREAM_MAX_MS = 300_000;
+  // Overridable so a test can watch the routine close and reopen (#341); nothing else sets it.
+  const MAIL_STREAM_MAX_MS = Number(process.env.GYREDECK_MAIL_STREAM_MAX_MS) || 300_000;
   const MAIL_WAIT_DEFAULT_MS = 60_000;
   const MAIL_WAIT_MAX_MS = 300_000;
   const MAIL_MAX_WAITERS = 16;
@@ -4614,6 +4626,68 @@ function startBridge(config) {
     return null;
   };
 
+  /**
+   * The room's members as they are shown, with a version that moves whenever that list does,
+   * and what this member was last handed (#341). A delivery carries the roster only when it
+   * changed since then: a roster on every delivery was most of what a quiet room put in a
+   * session's context, turn after turn, and a roster nobody re-sends cannot go stale in a
+   * session that already has it. The version is derived on read, so no membership path can
+   * forget to bump it.
+   */
+  const rosterFor = (room, as) => {
+    const names = [...room.members.keys()].map((id) => shownIn(room, id));
+    // Keyed by who is here, not only by how they are shown (#341 audit): a member that left
+    // and a newcomer given its label read the same, and the version must still move.
+    const key = [...room.members.keys()].map((id, index) => `${id}=${names[index]}`).join("\n");
+    if (room.rosterKey !== key) {
+      room.rosterVersion = (room.rosterVersion ?? 0) + 1;
+      room.rosterKey = key;
+    }
+    const member = as ? room.members.get(as) : null;
+    const told = member?.rosterTold ?? null;
+    // The difference is taken by id (#341 audit r2): a newcomer given a leaver's label is a
+    // leave and a join, though the two read the same.
+    const ids = [...room.members.keys()];
+    const shown = new Map(ids.map((id, index) => [id, names[index]]));
+    const before = new Map(told?.shown ?? []);
+    const version = room.rosterVersion;
+    // Which hand-over this is (#341 audit r3): a compaction, resume or clear starts a new one,
+    // so a push begun before it and taken by `codex queue` after cannot mark the new one handed.
+    const generation = member?.rosterGeneration ?? 0;
+    return {
+      version,
+      changed: !told || told.version !== version,
+      first: !told,
+      joined: told ? ids.filter((id) => !before.has(id)).map((id) => shown.get(id)) : [],
+      left: told ? [...before].filter(([id]) => !shown.has(id)).map(([, name]) => name) : [],
+      names,
+      // What this member was handed is what was true when it was built, not when it is marked:
+      // a push is marked once `codex queue` has taken it, and the room may have moved since.
+      mark: () => {
+        if (!member || room.members.get(as) !== member) return;
+        if ((member.rosterGeneration ?? 0) !== generation) return;
+        // Pushes can settle out of order: an older roster never replaces a newer one.
+        if (member.rosterTold && member.rosterTold.version > version) return;
+        member.rosterTold = { version, shown: [...shown] };
+      },
+    };
+  };
+  const forgetRosterTold = (conversationId) => {
+    const found = syncRoomFor(conversationId);
+    const member = found?.room.members.get(conversationId);
+    if (!member) return;
+    delete member.rosterTold;
+    member.rosterGeneration = (member.rosterGeneration ?? 0) + 1;
+  };
+  /** One line for a roster that changed: in full the first time, as a difference after (#341). */
+  const rosterLine = (roster) =>
+    roster.first || (roster.joined.length === 0 && roster.left.length === 0)
+      ? `Members now (v${roster.version}): ${roster.names.join(", ") || "nobody"}.`
+      : `Members changed (v${roster.version}):` +
+        (roster.joined.length ? ` joined ${roster.joined.join(", ")};` : "") +
+        (roster.left.length ? ` left ${roster.left.join(", ")};` : "") +
+        ` now ${roster.names.join(", ") || "nobody"}.`;
+
   const describeRoom = (name, room, as) => ({
     room: name,
     seq: room.seq,
@@ -4904,8 +4978,9 @@ function startBridge(config) {
   });
 
   const announceMembership = (name, room, note, except = null, wakes = []) => {
-    const present = [...room.members.keys()].map((id) => shownIn(room, id));
-    const text = `${note} Members now: ${present.join(", ") || "nobody"}.`;
+    // No roster tail (#341): who is here rides each member's next delivery, as a difference
+    // when it changed, so a notice repeating the whole list was the same text a second time.
+    const text = note;
     const notice = publishMail(room, ROOM_SENDER, text, null, false, { [VOUCHED]: true, quiet: true, [WAKES]: wakes });
     // A room notice is published and readable but wakes nobody (#339): the roster it carries
     // rides on the next delivery each member gets anyway, so interrupting everyone to repeat
@@ -4950,7 +5025,7 @@ function startBridge(config) {
    * sub-second budget and would otherwise need a second request to know who it is
    * talking to.
    */
-  const describeInbox = (messages, sync, as, missed = [], vouched = false) => ({
+  const describeInbox = (messages, sync, as, missed = [], vouched = false, markRoster = false) => ({
     messages,
     // Handed only to the read the broker vouched for, and only once the member is in (#274).
     ...(vouched && sync?.room.members.get(as)?.confirmed === true && typeof sync.room.members.get(as)?.readKey === "string"
@@ -4973,9 +5048,19 @@ function startBridge(config) {
           // Whether this reader already holds a watch on the room, so the hook can leave
           // out the instructions for opening one — they are the longest part of a
           // delivery and were sent on every turn to sessions already watching (#157).
+          // A watch between the room's five-minute close and its reopen is still a watch (#341):
+          // the gap is about a second, and a delivery that landed in it used to hand the whole
+          // watch command again to a session that was watching all along.
           watching: [...sync.room.clients].some(
             (res) => res.gyredeckWatcher === as && !res.destroyed && !res.writableEnded,
-          ),
+          ) || Date.now() - (sync.room.members.get(as)?.watchEndedAt ?? 0) < WATCH_REOPEN_GRACE_MS,
+          // What changed in the roster since this member was last handed it; the members
+          // list below stays for older hooks (#341).
+          roster: (() => {
+            const roster = rosterFor(sync.room, as);
+            if (markRoster) roster.mark();
+            return { version: roster.version, changed: roster.changed, line: rosterLine(roster) };
+          })(),
           members: (() => {
             return [...sync.room.members].map(([conversationId, member]) => ({
               conversationId,
@@ -5665,10 +5750,20 @@ function startBridge(config) {
       stdio: ["ignore", "ignore", "ignore"],
     });
     // The caller has already been told "queued"; a push that could not even start is
-    // one line on stderr, which is more than the silence it used to be.
+    // one line on stderr, which is more than the silence it used to be. `settled` hears
+    // whether `codex queue` actually took it (#341 audit r2), for what may only be counted
+    // as handed over once it was.
+    let pushSettled = false;
+    const settlePush = (ok) => {
+      if (pushSettled) return;
+      pushSettled = true;
+      settled?.(ok);
+    };
     child.on("error", (error) => {
       console.error(`⚠ codex queue could not be started (${error?.code ?? error}): ${binary}`);
+      settlePush(false);
     });
+    child.on("exit", (code) => settlePush(code === 0));
 
     // Without a log to read there is nothing to harvest, but the message was still
     // delivered — the session will show it even if we cannot see the answer.
@@ -5710,6 +5805,9 @@ function startBridge(config) {
       ? ` (answering ${answering.id} ${answering.kind})`
       : "";
     const roster = [...room.members.keys()].map((id) => shownIn(room, id)).join(", ");
+    // The short form carries the roster only when it moved since this Codex was last handed
+    // it (#341); the full form always does, as the first word on a room.
+    const told = rosterFor(room, recipient);
     // Asked until it is answered (#182): what the app has on record, and the one place
     // Codex can say what it wants to be called instead.
     const recorded = sessionNameOf(recipient);
@@ -5742,7 +5840,7 @@ function startBridge(config) {
         nameAsk +
         ` Rules v${ROOM_RULES_VERSION}: ${ROOM_RULES_DISPLAY_PATH} — read it once per` +
         " conversation and again after a compaction." +
-        ` Members now: ${roster || "nobody"}.` +
+        (told.changed ? ` ${rosterLine(told)}` : "") +
         seqLine +
         " No seq on your next message means it did not arrive.]\n\n" +
         text
@@ -5938,7 +6036,10 @@ function startBridge(config) {
           codexRoomTag(fromLabel, kind, from === OWNER_DISCORD_SENDER ? `${OWNER_DISCORD_NOTE}\n${text}` : text),
           { answering: { id: from, kind } },
         );
-        const outcome = deliverToCodex(recipient, room, outgoing);
+        // Handed over only once `codex queue` took it (#341 audit r2): "queued" is said before the
+        // process has run, and a failed push must leave the roster owed.
+        const roster = rosterFor(room, recipient);
+        const outcome = deliverToCodex(recipient, room, outgoing, { settled: (ok) => { if (ok) roster.mark(); } });
         if (outcome === "queued") {
           queued = true;
           readByPush(recipient);
@@ -7817,7 +7918,9 @@ function startBridge(config) {
           // A collect that found nothing says why the last thing this session said drew
           // nothing, as a timed-out wait does: the hook's `wait` is built from collects.
           ...(collect && collected.length === 0 ? { yourLastMessage: diagnoseSilence(sync) } : {}),
-          ...describeInbox(collected, sync, as, missed, vouched),
+          // Marked as handed over only when the hook will print a delivery at all (#341 audit):
+          // a collect with nothing from anyone else prints nothing, roster included.
+          ...describeInbox(collected, sync, as, missed, vouched, collect && !wakingOnly && collected.some((message) => message.from !== as)),
           ...(() => {
             if (collect && sync) noteUsageCollected(sync.name, collected.filter((message) => message.room === sync.name && message.from === ROOM_SENDER), as);
             // Neither notice on a wait's poll (#259): a wait prints only what wakes it and
@@ -8029,6 +8132,19 @@ function startBridge(config) {
           : namesOwnerDiscord(routedTo)
             ? OWNER_DISCORD_SENDER
             : memberByAddress(room, routedTo) ?? routedTo);
+        // Addressed to someone who is not here: refused, with who is, in the answer the sender
+        // is already reading (#341). Published, it reached nobody yet answered ok with a seq;
+        // and sending is how an agent learns the roster without a lookup that costs a turn.
+        if (room.members.size > 0 && addressed !== MAIL_EVERYONE && addressed !== OWNER_DISCORD_SENDER && !room.members.has(addressed)) {
+          const names = rosterFor(room, null).names;
+          sendJson(409, {
+            ok: false,
+            error: "not_in_room",
+            message: `"${routedTo}" does not name exactly one member of this room, so nothing was sent. Members now: ${names.join(", ") || "nobody"}.`,
+            members: names,
+          });
+          return;
+        }
         // Before any capacity check, so a repeat is answered with the seq it already has
         // rather than refused as if it were new (#183 audit). `again: true` is the sender
         // saying it means to say the same thing twice.
@@ -8328,6 +8444,8 @@ function startBridge(config) {
         const expiry = setTimeout(() => {
           try {
             res.write(`: gyredeck stream expired after ${MAIL_STREAM_MAX_MS / 1000}s\n\n`);
+            // The routine close the watch loop reopens from a second later (#341).
+            res.gyredeckExpired = true;
             res.end();
           } catch {
             // Already gone; the close handler has cleaned up.
@@ -8422,6 +8540,10 @@ function startBridge(config) {
           clearInterval(heartbeat);
           room.clients.delete(res);
           room.touchedAt = Date.now();
+          // Only the room's own five-minute close starts the grace: a watch that went away on
+          // its own end is gone, and the next delivery says how to open one again.
+          const member = watcher && res.gyredeckExpired === true ? room.members.get(watcher) : null;
+          if (member) member.watchEndedAt = Date.now();
         });
         return;
       }

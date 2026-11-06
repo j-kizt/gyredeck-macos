@@ -1641,7 +1641,7 @@ test("an inbox merges a session's mailbox with its sync room, and the cap cannot
       [code, peer],
     ]);
     assert.match(merged.messages[0].text, /you are now in sync room .*you created it/s);
-    assert.match(merged.messages[1].text, /joined this room\. Members now: /);
+    assert.match(merged.messages[1].text, /joined this room\.$/, "#341: no roster tail on a notice");
     assert.match(merged.messages[2].text, /was confirmed by the room's owner/);
     // The same call names the room and who is in it, so a hook with a sub-second
     // budget does not need a second request to know who it is talking to.
@@ -1844,9 +1844,10 @@ test("a room delivery carries only what the session can use, and points at the r
     const reaction = await context();
     assert.match(reaction, /\[from Codex · reaction\] got it/);
     assert.doesNotMatch(reaction, /REPLY —/);
-    // Nothing to answer is exactly where the rules that broke live are needed (#157 audit).
-    assert.match(reaction, /never answer a reaction/);
-    assert.match(reaction, /ok:true and a seq/);
+    // Nothing to answer gets one line instead of the whole brief (#341), and that line still
+    // says the one rule that matters here (#157 audit).
+    assert.match(reaction, /Nothing here asks anything of you: never answer a reaction/);
+    assert.doesNotMatch(reaction, /RULES: |NARRATE: |WAIT —/, "#341: no brief for mail that asks nothing");
 
     // A tell may draw a reaction, addressed to whoever sent it rather than the room.
     await post(`/mail/${code}`, { from: peer, to: me, kind: "tell", text: "build is green" });
@@ -3009,8 +3010,8 @@ test("a session's assigned name shows wherever the room names it, and to still t
     );
     assert.equal(result.code, 0, result.stderr);
     const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
-    assert.match(context, /Antigravity \/ Altrix Agy joined this room\. Members now: Claude Code \/ Altrix Assistant, Antigravity \/ Altrix Agy\./);
-    assert.match(context, /Also here: Antigravity \/ Altrix Agy\./);
+    assert.match(context, /Antigravity \/ Altrix Agy joined this room\./);
+    assert.match(context, /Members now \(v\d+\): Claude Code \/ Altrix Assistant, Antigravity \/ Altrix Agy\./, "#341: the roster, with its version");
     assert.match(context, /\[from Antigravity \/ Altrix Agy · tell\] hello from the named one/);
     assert.match(context, /"to":"Antigravity","kind":"reaction"/, "the reply is still addressed by label");
 
@@ -3216,8 +3217,10 @@ test("a session declares the name it is called by on its first post; the room an
     assert.equal(await routedTo("Claude Code"), founder);
     assert.equal(await routedTo("Antigravity"), agy);
     assert.equal(await routedTo("Antigravity / Gyre Assistant"), agy);
-    assert.notEqual(await routedTo("Gyre Assistant"), founder, "a name two members share addresses neither of them");
-    assert.notEqual(await routedTo("Gyre Assistant"), agy);
+    // A name two members share addresses neither of them: refused, with who is here (#341).
+    const shared = await post(third, { to: "Gyre Assistant", text: "to a shared name" });
+    assert.equal(shared.status, 409, JSON.stringify(shared.body));
+    assert.equal(shared.body.error, "not_in_room");
 
     // Phase 5: control characters and an overlong name are made safe to print.
     await post(third, { to: "everyone", text: "a messy name", name: "\u0007Ops]\u001b\n· reaction[" + "y".repeat(80) });
@@ -3239,7 +3242,9 @@ test("a session declares the name it is called by on its first post; the room an
     assert.match(laterContext, /\[from Antigravity · tell\] BEFORE-THE-NAME/, "a message posted before a declaration keeps its sender as shown then");
     assert.match(laterContext, /\[from Antigravity \/ Gyre Assistant · tell\] after the names/);
     assert.match(laterContext, /Antigravity is called Gyre Assistant\./);
-    assert.match(laterContext, /Also here: Antigravity \/ Gyre Assistant, /);
+    // #341: a name declared is the roster moving with nobody joining or leaving, so it rides
+    // whole, with the new names.
+    assert.match(laterContext, /Members now \(v\d+\): [^.]*Antigravity \/ Gyre Assistant/, "#341: the roster moved, so it rides again");
     assert.doesNotMatch(laterContext, /NAME: /);
     assert.doesNotMatch(laterContext, /"name":"YOUR NAME"/);
   } finally {
@@ -3323,8 +3328,9 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     // The briefing leads with where the session is and who is with it, before anything
     // about what to do — a session reading this first should be able to act on it
     // without having read anything else.
-    assert.match(fromRoomMate, /WHERE: the person at this terminal put you in this room/);
-    assert.match(fromRoomMate, /Also here: Codex\./);
+    // #341: the roster was handed with this session's first delivery and has not moved, so
+    // WHERE does not ride again; the rest of the brief still does.
+    assert.doesNotMatch(fromRoomMate, /Members (now|changed)/);
     assert.match(fromRoomMate, /what you are here for/);
     assert.doesNotMatch(fromRoomMate, /information only/);
     assert.match(fromRoomMate, /\[from Codex · /, "labelled by provider");
@@ -3494,6 +3500,9 @@ test("a message says who it is for and what it is for, and the room routes on th
     const acked = await say({ text: "ACK-EVERYONE", kind: "ack", to: "everyone" });
     const direct = await say({ text: "ASK-DIRECT", kind: "ask", to: founder });
     const elsewhere = await say({ text: "ASK-ELSEWHERE", kind: "ask", to: "not-a-member" });
+    // #341: a message to someone not in the room is refused, with who is.
+    assert.equal(elsewhere.status, 409);
+    assert.equal(elsewhere.body.error, "not_in_room");
     // Nothing said at all: the shape every existing caller uses, which has to keep
     // behaving the way it always did.
     const bare = await say({ text: "NO-FIELDS" });
@@ -3564,7 +3573,6 @@ test("a message says who it is for and what it is for, and the room routes on th
     assert.doesNotMatch(nothingLeft, /ASK-EVERYONE/, "a second catch-up has nothing left to give");
 
     assert.equal(acked.body.kind ?? "reaction", "reaction");
-    assert.equal(elsewhere.body.delivery, "no_recipients");
     assert.ok(asked.body.seq < acked.body.seq, "an ack still takes a seq and stays readable");
 
     // A reaction is where an exchange stops, and saying so is an instruction — the kind
@@ -3598,8 +3606,9 @@ test("a message says who it is for and what it is for, and the room routes on th
     // said, so a line to somebody outside the room is in its sender's history and nobody else's.
     const history = await readRoom(peer);
     const texts = history.body.messages.map((message) => message.text);
-    assert.ok(!(await readRoom(founder)).body.messages.some((message) => message.text === "ASK-ELSEWHERE"), "a line to someone else is not in the founder's history");
-    for (const text of ["ASK-EVERYONE", "ACK-EVERYONE", "ASK-DIRECT", "ASK-ELSEWHERE", "NO-FIELDS"]) {
+    assert.ok(!(await readRoom(founder)).body.messages.some((message) => message.text === "ASK-ELSEWHERE"), "a refused line is in nobody's history");
+    assert.ok(!texts.includes("ASK-ELSEWHERE"), "#341: not even the sender's, since it was never published");
+    for (const text of ["ASK-EVERYONE", "ACK-EVERYONE", "ASK-DIRECT", "NO-FIELDS"]) {
       assert.ok(texts.includes(text), `${text} is in the room's history`);
     }
     // Sent as `ack`, stored as `reaction`: the old word is accepted and normalised, so
@@ -3671,8 +3680,10 @@ test("a wait that times out says whether the message was the problem", async () 
       /have not said anything|nobody else in this room/,
     );
     assert.match(
+      // #341: the room refuses a message to someone not in it when it is sent, so there is no
+      // silence to explain afterwards.
       (await scenario("silence-c", ({ code }) => said("silence-c", code, { text: "x", kind: "ask", to: "ghost" }))).reason,
-      /not in this room/,
+      /have not said anything/,
     );
     assert.match(
       (await scenario("silence-d", ({ code }) => said("silence-d", code, { text: "x", kind: "ask" }))).reason,
@@ -4134,7 +4145,9 @@ test("Codex declares its name in its routing line, name=\"<Name>\" after the kin
     const next = (await waitForPrompt(/NEXT-QUESTION/)).at(-1);
     assert.ok(next && (await promptsIn(rollout)).length > before, "premise: a later push arrived");
     assert.doesNotMatch(next.text, /name="<Name>"/);
-    assert.match(next.text, /Members now: Claude Code \/ Gyre Assistant, Codex \/ Gyre Audit\./);
+    // #341: a push carries the roster only when it moved; the last one that did names both as declared.
+    const lastRoster = (await promptsIn(rollout)).map((prompt) => prompt.text).filter((text) => /Members (now|changed) \(v\d+\)/.test(text)).at(-1);
+    assert.match(lastRoster, /Claude Code \/ Gyre Assistant, Codex \/ Gyre Audit\./);
   } finally {
     bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
@@ -6487,7 +6500,8 @@ test("a room password carried in by notify lets that session in, once", async ()
     assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} \\(answering ${founder} tell\\) — how to answer: `));
     assert.match(afterLater.at(-1), /@<member or everyone> ask\|tell\|reaction — never answer a reaction/);
     assert.match(afterLater.at(-1), new RegExp(`Rules v${ROOM_RULES_VERSION}: ~/\\.config/gyredeck/room-rules\\.md`));
-    assert.match(afterLater.at(-1), /Members now: /);
+    // #341: the roster rode on the confirmation and has not moved since, so it is not repeated.
+    assert.doesNotMatch(afterLater.at(-1), /Members (now|changed)/);
     assert.doesNotMatch(afterLater.at(-1), /Do not call Gyredeck/);
     // And says which kind it is: a tell and a reaction with the same words must not
     // arrive identical, or "never answer a reaction" cannot be kept (#157 audit).
@@ -13410,6 +13424,8 @@ for (const provider of ["claude", "agy"]) {
         const claude = "a2580000-0000-4000-8000-000000000003";
         await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: claude });
         assert.equal((await f.call("POST", `/sync/rooms/${f.code}/confirm`, { conversationId: claude, password: f.password })).status, 200);
+        // Something to answer, so the delivery carries the brief at all (#341).
+        await f.call("POST", `/mail/${f.code}`, { from: f.founder, to: claude, kind: "tell", text: "a tell" });
         const result = await runAdapter(
           "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], f.home,
           { hook_event_name: "UserPromptSubmit", session_id: claude, cwd: "/tmp/project", prompt: "hi" },
@@ -14552,5 +14568,193 @@ test("#340 D6: an unrouted answer to a room push from before the sender marker g
     }
   } finally {
     await room.close();
+  }
+});
+
+const leanRoomFixture = async (tag, env = {}) => {
+  const home = await mkdtemp(join(tmpdir(), `gyredeck-341-${tag}-`));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home, ...env }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  await waitForHealth(port, stderrRef);
+  const broker = await forwardingBroker(home, `http://127.0.0.1:${port}`);
+  const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+  const call = async (method, path, body, extra = {}) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method, headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD, ...extra }, body: body ? JSON.stringify(body) : undefined,
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  const me = `a3410000-0000-4000-8000-${tag.padStart(12, "0").slice(-12)}`;
+  const peer = `a3410000-0000-4000-8000-${("p" + tag).padStart(12, "0").slice(-12)}`;
+  for (const id of [me, peer]) {
+    await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: id, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 },
+    });
+  }
+  const created = await call("POST", "/sync/rooms", { conversationId: me });
+  const code = created.body.room;
+  const password = created.body.password;
+  const admit = async (id) => {
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: id });
+    assert.equal((await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: id, password })).status, 200, `premise: ${id} is let in`);
+  };
+  await admit(peer);
+  const drain = async () => {
+    const result = await runAdapter("adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home, {
+      hook_event_name: "UserPromptSubmit", session_id: me, cwd: "/tmp/project", prompt: "next",
+    });
+    assert.equal(result.code, 0, result.stderr);
+    return result.stdout ? JSON.parse(result.stdout).hookSpecificOutput?.additionalContext ?? "" : "";
+  };
+  const say = (from, body) => call("POST", `/mail/${code}`, { from, ...body });
+  const close = async () => {
+    broker?.close?.();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  };
+  return { port, code, password, me, peer, call, admit, drain, say, close, home };
+};
+
+test("#341 R1 R2 R3 R5: the roster rides only when it moved, whole again after a compaction; mail that asks nothing gets one line", async () => {
+  const f = await leanRoomFixture("r1");
+  try {
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "FIRST" });
+    const first = await f.drain();
+    assert.match(first, /Members now \(v\d+\): /, "R1: the first delivery hands the whole roster");
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "SECOND" });
+    const second = await f.drain();
+    assert.match(second, /SECOND/, "premise: a second delivery");
+    assert.doesNotMatch(second, /Members (now|changed)/, "R1: an unchanged roster is not handed again");
+    const third = "a3410000-0000-4000-8000-000000000333";
+    await f.admit(third);
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "THIRD" });
+    const after = await f.drain();
+    assert.match(after, /Members changed \(v\d+\): joined [^;]+;/, "R1: a join rides as a difference");
+    // A compaction drops what the session was handed, so the next delivery hands it whole.
+    await f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "conversation_open", timestamp: new Date().toISOString(), conversationId: f.me, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { reason: "compact", previousConversationId: null },
+    });
+    // A prompt with nothing waiting prints nothing, so it must not count as handing the roster over.
+    assert.equal(await f.drain(), "", "premise: an empty collect prints nothing");
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "FOURTH" });
+    assert.match(await f.drain(), /Members now \(v\d+\): /, "R2: after a compaction the roster is whole again, even past an empty prompt");
+    // A member swapped for a newcomer shown the same way still moves the version (by id).
+    await f.call("DELETE", `/sync/rooms/${f.code}/members/${third}`);
+    const fourth = "a3410000-0000-4000-8000-000000000444";
+    await f.admit(fourth);
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "FIFTH" });
+    assert.match(await f.drain(), /Members changed \(v\d+\): joined [^;]+; left [^;]+;/, "R1: a swap is a leave and a join, taken by id, even under the same label");
+    // Nothing that asks anything: one line, not the brief.
+    await f.say(f.peer, { to: f.me, kind: "reaction", text: "LANDED" });
+    const lean = await f.drain();
+    assert.match(lean, /\[from [^\]]*· reaction\] LANDED/, "premise: the reaction is delivered");
+    assert.match(lean, /Nothing here asks anything of you/, "R3: one line");
+    assert.doesNotMatch(lean, /RULES: |NARRATE: |WAIT —|REPLY —/, "R3: no brief");
+    // Sending to someone not here answers with who is.
+    const stray = await f.say(f.me, { to: "nobody-here", kind: "tell", text: "STRAY" });
+    assert.equal(stray.status, 409, "R5: refused, not published to nobody with an ok");
+    assert.equal(stray.body.error, "not_in_room");
+    assert.ok(Array.isArray(stray.body.members) && stray.body.members.length === 3, `R5: and who is: ${JSON.stringify(stray.body)}`);
+  } finally {
+    await f.close();
+  }
+});
+
+test("#341 R4: a delivery in the second between the room's five-minute close and the reopen does not hand the watch command again", async () => {
+  const f = await leanRoomFixture("r4", { GYREDECK_MAIL_STREAM_MAX_MS: "400" });
+  try {
+    await f.say(f.peer, { to: f.me, kind: "tell", text: "GET-A-KEY" });
+    assert.match(await f.drain(), /HEAR —/, "premise: with no watch, the command is handed");
+    const key = await memberKeyAt(`http://127.0.0.1:${f.port}`, f.me, (await readFile(join(f.home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim());
+    const stream = await fetch(`http://127.0.0.1:${f.port}/mail/${f.code}/events?as=${f.me}&since=resume`, { headers: { "x-gyredeck-token": f.password, "x-gyredeck-member": key } });
+    assert.equal(stream.status, 200);
+    await stream.text(); // the room closes it after 400 ms
+    await f.say(f.peer, { to: f.me, kind: "ask", text: "IN-THE-GAP" });
+    const gap = await f.drain();
+    assert.match(gap, /IN-THE-GAP/, "premise: the delivery");
+    assert.doesNotMatch(gap, /HEAR —/, "R4: the routine close is not a lost watch");
+  } finally {
+    await f.close();
+  }
+});
+
+
+test("#341 R7: a Codex push that codex queue refused does not count as handing the roster over", async () => {
+  const f = await codexHeavyFixture("r7");
+  try {
+    // A codex that records every push and refuses the one marked to fail.
+    await writeFile(join(f.home, ".bun", "bin", "codex"), `#!${process.execPath}\nconst a = process.argv.slice(2); require('node:fs').appendFileSync(${JSON.stringify(join(f.home, "queued.log"))}, JSON.stringify(a) + "\\n"); process.exit(a[a.indexOf("--message") + 1].includes("FAIL-ME") ? 1 : 0);\n`);
+    const founder = "a3410000-0000-4000-8000-0000000007f1";
+    const codex = "01a06082-8ef6-7900-ae39-44fe2e463417";
+    const late = "a3410000-0000-4000-8000-0000000007f2";
+    const code = (await f.call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    const { password } = (await f.call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder })).body;
+    await f.ingestCodex(codex);
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: codex });
+    assert.equal((await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: "01a06082-8ef6-7900-ae39-44fe2e463418", password })).body.transitioned, true, "premise: Codex is in");
+    await until(async () => (await f.messagesTo(codex)).some((message) => /you are confirmed in room/.test(message)), "the confirming push");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: late });
+    assert.equal((await f.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: late, password })).status, 200, "premise: the roster moved");
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "FAIL-ME" })).status, 202);
+    const failed = await until(async () => (await f.messagesTo(codex)).find((message) => message.includes("FAIL-ME")), "premise: the failing push was attempted");
+    assert.match(failed, /Members (now|changed)/, "premise: the failed push carried the change");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "AFTER-THE-FAILURE" })).status, 202);
+    const next = await until(async () => (await f.messagesTo(codex)).find((message) => message.includes("AFTER-THE-FAILURE")), "the next push");
+    assert.match(next, /Members (now|changed)/, "R7: the roster is still owed after a refused push");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#341 R8: a Codex push taken after a compaction began cannot mark the new hand-over, the confirming push included", async () => {
+  const f = await codexHeavyFixture("r8");
+  try {
+    // A codex that records every push, and takes 800 ms over any push marked SLOW or confirming.
+    await writeFile(join(f.home, ".bun", "bin", "codex"), `#!${process.execPath}\nconst a = process.argv.slice(2); const m = a[a.indexOf("--message") + 1]; require('node:fs').appendFileSync(${JSON.stringify(join(f.home, "queued.log"))}, JSON.stringify(a) + "\\n"); setTimeout(() => process.exit(0), /SLOW|you are confirmed/.test(m) ? 800 : 0);\n`);
+    const founder = "a3410000-0000-4000-8000-0000000008f1";
+    const codex = "01a06082-8ef6-7900-ae39-44fe2e463418";
+    const late = "a3410000-0000-4000-8000-0000000008f2";
+    const compact = () => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "compact_start", timestamp: new Date().toISOString(), conversationId: codex, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" }, data: {},
+    });
+    const code = (await f.call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    const { password } = (await f.call("POST", `/sync/rooms/${code}/passwords`, { conversationId: founder })).body;
+    await f.ingestCodex(codex);
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: codex });
+    // The confirming push is slow; Codex compacts while it is in flight.
+    assert.equal((await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: "01a06082-8ef6-7900-ae39-44fe2e463419", password })).body.transitioned, true, "premise: Codex is in");
+    await compact();
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "AFTER-CONFIRM-COMPACT" })).status, 202);
+    const afterConfirm = await until(async () => (await f.messagesTo(codex)).find((message) => message.includes("AFTER-CONFIRM-COMPACT")), "the push after the compaction");
+    assert.match(afterConfirm, /Members now \(v\d+\)/, "R8: the confirming push settled after the compaction did not mark it handed");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    // A slow ordinary push, with the roster changed, and a compaction while it is in flight.
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: late });
+    assert.equal((await f.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: late, password })).status, 200);
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "SLOW" })).status, 202);
+    await until(async () => (await f.messagesTo(codex)).some((message) => message.includes("SLOW")), "premise: the slow push started");
+    await compact();
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "AFTER-SLOW-COMPACT" })).status, 202);
+    const afterSlow = await until(async () => (await f.messagesTo(codex)).find((message) => message.includes("AFTER-SLOW-COMPACT")), "the push after");
+    assert.match(afterSlow, /Members now \(v\d+\)/, "R8: a push begun before the compaction did not mark the new hand-over");
+  } finally {
+    await f.close();
   }
 });

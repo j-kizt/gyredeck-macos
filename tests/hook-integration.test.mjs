@@ -2626,10 +2626,13 @@ test("a password accepted in a turn whose mail is withheld still names the room,
     await broker.close();
     broker = null;
 
-    // 3. Control: without a password, a withheld drain stays silent, as it always was.
+    // 3. Without a password, a withheld drain is no longer silent (#337): on stderr alone it
+    // looked exactly like an empty mailbox, and a confirmed session heard nothing for a day.
     broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "conflict", message: "two claims" }), { confirmVia: `http://127.0.0.1:${port}` });
     told = await paste(first, "hi");
-    assert.equal(told.context, "", "no confirmation, nothing to say");
+    assert.match(told.context, /holding mail for this session that it cannot hand over this turn \(conflict — two claims\)/, "#337: the reason, in context");
+    assert.match(told.context, /--fork-session/, "#337: and, for another window holding it, what to do");
+    assert.match(told.stderr, /mail withheld this turn — conflict/, "stderr still says it too");
   } finally {
     if (broker) await broker.close();
     bridge.stdin.end();
@@ -9037,13 +9040,16 @@ test("a hook collects through the broker when it can, and falls back only when t
     await send("WITHHELD");
     broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "conflict", message: "two claims" }));
     delivered = await prompt();
-    assert.equal(delivered.context, "", "nothing reached the prompt");
+    // #337: the mail does not reach the prompt, but why it did not does.
+    assert.doesNotMatch(delivered.context, /WITHHELD/, "the mail did not reach the prompt");
+    assert.match(delivered.context, /holding mail for this session that it cannot hand over this turn \(conflict/, "#337: the reason did");
     assert.match(delivered.stderr, /mail withheld this turn — conflict/);
     assert.deepEqual(await unread(), ["WITHHELD"], "and nothing was taken over TCP");
     await broker.close();
     broker = await fakeBroker(home, () => ({ v: 1, ok: false, error: "unbound", message: "bind first" }));
     delivered = await prompt();
-    assert.equal(delivered.context, "");
+    assert.match(delivered.context, /cannot hand over this turn \(unbound — bind first\)/, "#337: said in context");
+    assert.doesNotMatch(delivered.context, /WITHHELD/);
     assert.deepEqual(await unread(), ["WITHHELD"]);
     await broker.close();
 
@@ -9171,7 +9177,8 @@ test("a hook believes the broker only when the answer is for it, and never colle
         ? { v: 1, ok: false, error: "conflict", message: "held by another" }
         : { v: 1, ok: true, messages: [message("SOMEBODY-ELSES-MAIL")], boundTo: "another-session" });
     let delivered = await prompt();
-    assert.equal(delivered.context, "", delivered.stderr);
+    assert.doesNotMatch(delivered.context, /SOMEBODY-ELSES-MAIL/, delivered.stderr);
+    assert.match(delivered.context, /cannot hand over this turn \(conflict — held by another\)/, "#337: the refusal is said in context");
     assert.match(delivered.stderr, /mail withheld this turn — conflict/);
     assert.deepEqual(broker.requests.map((r) => Object.keys(r).filter((k) => k !== "v")), [["bind"]], "no collect after a refused bind");
     assert.deepEqual(await unread(), ["ON-TCP"]);
@@ -9181,7 +9188,7 @@ test("a hook believes the broker only when the answer is for it, and never colle
     broker = await fakeBroker(home, (request) =>
       request.bind ? { v: 1, ok: true, bound: { conversationId, pid: 1 } } : { v: 999, ok: true, messages: [message("FUTURE-PROTOCOL")], boundTo: conversationId });
     delivered = await prompt();
-    assert.equal(delivered.context, "", delivered.stderr);
+    assert.match(delivered.context, /^Gyredeck is holding mail for this session that it cannot hand over this turn \(/, delivered.stderr); assert.doesNotMatch(delivered.context, /\[from /, "#337: the reason only, never the mail");
     assert.match(delivered.stderr, /mail withheld this turn/);
     assert.deepEqual(await unread(), ["ON-TCP"]);
     await broker.close();
@@ -9190,7 +9197,7 @@ test("a hook believes the broker only when the answer is for it, and never colle
     broker = await fakeBroker(home, (request) =>
       request.bind ? { v: 1, ok: true, bound: { conversationId, pid: 1 } } : { v: 1, ok: true, messages: [message("NOT-MINE")], boundTo: "another-session" });
     delivered = await prompt();
-    assert.equal(delivered.context, "", delivered.stderr);
+    assert.match(delivered.context, /^Gyredeck is holding mail for this session that it cannot hand over this turn \(/, delivered.stderr); assert.doesNotMatch(delivered.context, /\[from /, "#337: the reason only, never the mail");
     assert.match(delivered.stderr, /mail withheld this turn/);
     assert.deepEqual(await unread(), ["ON-TCP"]);
     await broker.close();
@@ -9212,7 +9219,7 @@ test("a hook believes the broker only when the answer is for it, and never colle
       const started = Date.now();
       delivered = await prompt();
       const took = Date.now() - started;
-      assert.equal(delivered.context, "", delivered.stderr);
+      assert.match(delivered.context, /^Gyredeck is holding mail for this session that it cannot hand over this turn \(/, delivered.stderr); assert.doesNotMatch(delivered.context, /\[from /, "#337: the reason only, never the mail");
       assert.match(delivered.stderr, /mail withheld this turn — the broker did not answer in time/);
       assert.ok(took < 2_600, `cut off at the deadline, not when the broker felt like closing (${took} ms)`);
       assert.deepEqual(await unread(), ["ON-TCP"], "and not fetched over TCP");

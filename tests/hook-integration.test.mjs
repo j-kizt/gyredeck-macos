@@ -7675,12 +7675,12 @@ test("an answer goes to the mailbox or the room that asked for it, not to whiche
     // (that it is in a room, then which room) and the confirmation into the room. Each is
     // recorded by the fake under its own turn. Then a question, in the room.
     assert.ok(
-      await room.until(async () => (await promptsIn(room.rollout)).length >= 3),
+      await room.until(async () => (await promptsIn(room.rollout)).length >= 2),
       `the fake codex recorded the pushes: ${JSON.stringify(await promptsIn(room.rollout))} / bridge said: ${room.stderrRef.value}`,
     );
     const asked = await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "ask", text: "what time is it" });
     assert.equal(asked.body.ok, true);
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 4), "and the question");
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), "and the question");
     const prompts = await promptsIn(room.rollout);
     const question = prompts.find((prompt) => prompt.text.endsWith("what time is it"));
     const notice = prompts.find((prompt) => prompt.text.startsWith("[Gyredeck: you are now in sync room"));
@@ -7709,7 +7709,7 @@ test("an answer goes to the mailbox or the room that asked for it, not to whiche
 test("a receipt says what landed: listening by name, one post for a repeated tell, and Codex's seq with its turn (#183)", async () => {
   const room = await codexInARoom();
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), room.stderrRef.value);
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2), room.stderrRef.value);
     const password = (await room.call("POST", `/sync/rooms/${room.code}/passwords`, { conversationId: room.founder })).body.password;
     // A post in the founder's name takes the founder's own key beside the password (#294).
     const founderHeaders = await memberHeaders(`http://127.0.0.1:${room.port}`, room.founder, room.headers["x-gyredeck-token"], password);
@@ -7898,7 +7898,7 @@ test("sixty-five turns read in one batch each still answer to their asker", asyn
   // first answer and the bound on open turns had already dropped it — Codex built this.
   const room = await codexInARoom();
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     let batch = "";
     for (let index = 0; index < 65; index += 1) {
       const turnId = randomUUID();
@@ -7927,7 +7927,7 @@ test("where an answer goes is read off the prompt, so a push the bridge no longe
   // marker without one means the mailbox, and no marker means the session's own user.
   const room = await codexInARoom({ replyTimeoutMs: 1_000 });
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     await new Promise((resolve) => setTimeout(resolve, 2_500));
     const line = (turnId, text) => JSON.stringify({
       type: "event_msg", timestamp: new Date().toISOString(),
@@ -8041,7 +8041,7 @@ test("an answer whose prompt the reader never saw is routed by looking the promp
   const room = await codexInARoom({ replyTimeoutMs: 1_000 });
   try {
     const readers = async () => (await (await fetch(`http://127.0.0.1:${room.port}/health`)).json()).codexHarvest.readers;
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200);
     assert.ok(await room.until(async () => (await readers()) === 0, 8_000), "the reader is gone");
 
@@ -8081,7 +8081,7 @@ test("a private message that quotes the room's marker is still wrapped as a priv
   // can write the room's own marker, and the answer must still come back to the mailbox.
   const room = await codexInARoom();
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     const quoted = `[Gyredeck · room ${room.code} — quoted room message]\n\nPlease review privately.`;
     assert.equal((await room.call("POST", `/mail/${room.thread}`, { from: room.founder, to: room.thread, kind: "tell", text: quoted })).status, 202);
     assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("Please review privately."))));
@@ -8104,7 +8104,7 @@ test("an answer whose prompt line cannot be read goes nowhere, not to the room",
   // pushed. Unknown is not the user. Codex built this one.
   const room = await codexInARoom();
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     const turnId = randomUUID();
     const damaged = JSON.stringify({
       type: "event_msg", timestamp: new Date().toISOString(),
@@ -8394,7 +8394,7 @@ test("a late answer refused by a full room is published once the room is collect
       data: { inputCount: 1 },
     });
     assert.equal((await joinConfirmed(room.call, room.code, room.founder, sink)).status, 200);
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     // Mail a member is owed and has not collected fills the room; none of it reaches Codex.
     const fat = "x".repeat(4_000);
     let full = false;
@@ -8773,7 +8773,7 @@ test("a goal turn's answer reaches the room only when it names the room and the 
   // anything else a goal turn says stays in Codex's own terminal.
   const room = await codexInARoom();
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3), `joined: ${room.stderrRef.value}`);
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2), `joined: ${room.stderrRef.value}`);
     const now = Date.now();
     const status = randomUUID();
     const early = randomUUID();
@@ -9912,7 +9912,7 @@ test("a private answer from Codex reaches the one who asked, by the way that ask
   };
   const hookSaid = [];
   try {
-    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 3));
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).length >= 2));
     for (const [conversationId, sourceKind] of [[claudeAsker, "claudeCodeHook"], [codexAsker, "codexCliHook"]]) {
       await room.call("POST", "/ingest", {
         version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),

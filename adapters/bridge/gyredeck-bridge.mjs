@@ -3471,9 +3471,13 @@ function startBridge(config) {
       // A backlog too large to hand over in one push is refused at the door instead, so
       // everything the room accepted for this member is in the message just sent.
       if (all.length > 0) member.drainedThroughSeq = all[all.length - 1].seq;
+      // The whole window was handed over, so its place moves through it, and then past the
+      // quiet mail after it (#339): nothing else would ever move it for Codex.
+      if (typeof member.heldThroughSeq === "number") markRead(room, conversationId, member.heldThroughSeq, new Date().toISOString());
       // Everything owed has gone. Anything published from here on is ordinary mail and
       // is pushed as it arrives; there is nothing left for a repeated paste to resend.
       member.heldThroughSeq = null;
+      passCodexOverQuiet(room, conversationId);
     }
     return { delivered, held: delivered ? held.length : 0 };
   };
@@ -4205,6 +4209,29 @@ function startBridge(config) {
    * what the shipped adapters still expect.
    */
   const readerFor = (room, as) => (as && room.members.get(as)) || room;
+
+  /**
+   * Move a Codex member's place past every message after it that does not wake it (#339).
+   * Codex never collects, so the only things that move its place are a push and this: a
+   * reaction, a quiet notice, or mail for someone else is not owed to it. Before #339 the
+   * room's join notice was pushed, and that push happened to carry the place past everything
+   * before it. Once notices went quiet, a Codex member's place stayed behind its own join
+   * notice, and the room counted it as never having read and filled up. Walked one seq at a
+   * time from the place itself, so mail that would wake it is never stepped over, and neither
+   * is a gap.
+   */
+  const passCodexOverQuiet = (room, conversationId) => {
+    const member = room.members.get(conversationId);
+    if (!member || member.confirmed !== true || providerByConversation.get(conversationId) !== "codexCliHook") return;
+    let through = member.readSeq ?? 0;
+    for (const message of room.messages) {
+      if (message.seq <= through) continue;
+      if (message.seq !== through + 1) break;
+      if (message.from !== conversationId && wakesMember(message, conversationId)) break;
+      through = message.seq;
+    }
+    if (through > (member.readSeq ?? 0)) markRead(room, conversationId, through, new Date().toISOString());
+  };
 
   const markRead = (room, as, seq, at) => {
     const reader = readerFor(room, as);
@@ -5741,7 +5768,7 @@ function startBridge(config) {
       for (const [id, member] of room.members) {
         if (id === from || recipients.includes(id) || member.confirmed !== true) continue;
         if (providerByConversation.get(id) !== "codexCliHook") continue;
-        if ((member.readSeq ?? 0) >= routing.seq - 1) markRead(room, id, routing.seq, new Date().toISOString());
+        passCodexOverQuiet(room, id);
       }
     }
     if (recipients.length === 0) return routing && routing.kind === "ack" ? "not_notified" : "no_recipients";

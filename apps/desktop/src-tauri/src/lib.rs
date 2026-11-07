@@ -53,8 +53,6 @@ use objc2::{msg_send, rc::Retained, MainThreadMarker};
 use objc2_app_kit::{NSScreen, NSWindow};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSPoint, NSRect, NSSize, NSString};
-#[cfg(target_os = "macos")]
-use security_framework::passwords::set_generic_password;
 
 const TRAY_ID: &str = "gyredeck";
 const TRAY_SHOW: &str = "show";
@@ -64,8 +62,6 @@ const DISPLAY_PREFERENCE_FILE: &str = "display-preference.json";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_RESET_CREDITS_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
-const CODEX_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
-const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const CODEX_CREDIT_USD_RATE: f64 = 0.04;
 const CCUSAGE_PACKAGE: &str = "ccusage@20.0.18";
@@ -81,20 +77,10 @@ const AGY_CLOUD_CODE_BASE_URLS: [&str; 2] = [
 ];
 const AGY_CLOUD_QUOTA_SUMMARY_PATH: &str = "/v1internal:retrieveUserQuotaSummary";
 const AGY_CLOUD_LOAD_CODE_ASSIST_PATH: &str = "/v1internal:loadCodeAssist";
-const AGY_GOOGLE_OAUTH_URL: &str = "https://oauth2.googleapis.com/token";
-const AGY_GOOGLE_CLIENT_ID_ENV: &str = "GYREDECK_AGY_GOOGLE_CLIENT_ID";
-const AGY_GOOGLE_CLIENT_SECRET_ENV: &str = "GYREDECK_AGY_GOOGLE_CLIENT_SECRET";
-const AGY_GOOGLE_OAUTH_CONFIG_PATH: &str = ".config/gyredeck/agy-google-oauth.json";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const CLAUDE_REFRESH_URL: &str = "https://platform.claude.com/v1/oauth/token";
-const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const CLAUDE_NON_PROD_CLIENT_ID: &str = "22422756-60c9-4084-8eb7-27705fd5cf9a";
-const CLAUDE_SCOPES: &str =
-    "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const CLAUDE_KEYCHAIN_SERVICE_PREFIX: &str = "Claude Code";
 const CLAUDE_DEFAULT_HOME: &str = ".claude";
 const CLAUDE_CREDENTIALS_FILE: &str = ".credentials.json";
-const CLAUDE_REFRESH_BUFFER_MS: i64 = 5 * 60 * 1000;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DisplayPreference {
@@ -162,19 +148,17 @@ fn preferred_display_index(
                 .position(|display| display.fingerprint == preference.fingerprint)
         })
 }
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct CodexAuthFile {
     #[serde(rename = "OPENAI_API_KEY")]
     openai_api_key: Option<String>,
     tokens: Option<CodexAuthTokens>,
-    last_refresh: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct CodexAuthTokens {
     access_token: Option<String>,
     refresh_token: Option<String>,
-    id_token: Option<String>,
     account_id: Option<String>,
 }
 
@@ -358,6 +342,8 @@ struct CcusageCacheEntry {
 
 static CLAUDE_LAST_GOOD_USAGE: OnceLock<Mutex<HashMap<String, CodexUsageSnapshot>>> =
     OnceLock::new();
+static CODEX_LAST_GOOD_USAGE: OnceLock<Mutex<HashMap<String, CodexUsageSnapshot>>> =
+    OnceLock::new();
 
 /// When Claude's usage endpoint said to come back, per account. A refresh before then asks
 /// nothing and answers from the last good reading: asking again inside Retry-After is what
@@ -373,20 +359,13 @@ static CODEX_CCUSAGE_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new
 static CLAUDE_CCUSAGE_CACHE: OnceLock<Mutex<Option<CcusageCacheEntry>>> = OnceLock::new();
 static CLAUDE_CCUSAGE_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-#[derive(Debug, Deserialize)]
-struct CodexRefreshResponse {
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    id_token: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ClaudeCredentialsFile {
     #[serde(rename = "claudeAiOauth")]
     claude_ai_oauth: Option<ClaudeOauth>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ClaudeOauth {
     #[serde(rename = "accessToken")]
     access_token: Option<String>,
@@ -413,16 +392,7 @@ struct ClaudeAuthState {
 #[derive(Debug, Clone)]
 struct ClaudeOauthConfig {
     usage_url: String,
-    refresh_url: String,
-    client_id: String,
     oauth_file_suffix: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OAuthRefreshResponse {
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    expires_in: Option<i64>,
 }
 
 fn claude_hook_install_path() -> Result<PathBuf, String> {
@@ -1389,62 +1359,81 @@ fn relay_usage(snapshot: &CodexUsageSnapshot) {
 
 #[tauri::command]
 async fn codex_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(|| codex_usage_blocking().inspect(relay_usage))
-        .await
-        .map_err(|error| format!("Codex usage task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(|| {
+        codex_usage_blocking().map(|reading| relay_if_fresh(reading, relay_usage))
+    })
+    .await
+    .map_err(|error| format!("Codex usage task failed: {error}"))?
 }
 
-fn codex_usage_blocking() -> Result<CodexUsageSnapshot, String> {
+/// Gyredeck only reads the CLI's login and never renews it: a refresh token is single-use,
+/// so one spent here logs out the `codex` that still holds it (#361). An expired login answers
+/// with the last good reading, marked, until the CLI writes a new one.
+fn codex_usage_blocking() -> Result<UsageReading, String> {
     let auth_candidates = load_codex_auth_candidates()?;
     let client = usage_client("Codex")?;
 
-    let mut last_auth_error = None;
-    for mut auth_state in auth_candidates {
-        if codex_access_token_needs_refresh(&auth_state) {
-            if let Err(message) = refresh_codex_auth(&client, &mut auth_state) {
-                last_auth_error = Some(message);
-                continue;
-            }
+    let mut expired = None;
+    for auth_state in auth_candidates {
+        if codex_access_token_expired(&auth_state) {
+            expired.get_or_insert(auth_state);
+            continue;
         }
 
         match fetch_codex_usage_snapshot(&client, &auth_state) {
-            Ok(snapshot) => return Ok(snapshot),
+            Ok(snapshot) => return Ok(fresh_codex_reading(&auth_state, snapshot)),
             Err(CodexUsageFetchError::Auth) => {
-                let previous_fingerprint = codex_auth_fingerprint(&auth_state);
-                let refreshed_source = match reload_codex_auth_source(&auth_state) {
-                    Ok(source) => source,
-                    Err(message) => {
-                        last_auth_error = Some(message);
-                        continue;
-                    }
-                };
-                if codex_auth_fingerprint(&refreshed_source) != previous_fingerprint {
-                    match fetch_codex_usage_snapshot(&client, &refreshed_source) {
-                        Ok(snapshot) => return Ok(snapshot),
-                        Err(CodexUsageFetchError::Auth) => {}
-                        Err(error) => return Err(format_codex_usage_error(error)),
+                // The CLI may have written a new login since this one was read.
+                if let Ok(reread) = reload_codex_auth_source(&auth_state) {
+                    if codex_auth_fingerprint(&reread) != codex_auth_fingerprint(&auth_state) {
+                        match fetch_codex_usage_snapshot(&client, &reread) {
+                            Ok(snapshot) => return Ok(fresh_codex_reading(&reread, snapshot)),
+                            Err(CodexUsageFetchError::Auth) => {}
+                            Err(error) => return Err(format_codex_usage_error(error)),
+                        }
                     }
                 }
-                auth_state = refreshed_source;
-                if let Err(message) = refresh_codex_auth(&client, &mut auth_state) {
-                    last_auth_error = Some(message);
-                    continue;
-                }
-                match fetch_codex_usage_snapshot(&client, &auth_state) {
-                    Ok(snapshot) => return Ok(snapshot),
-                    Err(CodexUsageFetchError::Auth) => {
-                        last_auth_error =
-                            Some(format_codex_usage_error(CodexUsageFetchError::Auth));
-                    }
-                    Err(error) => return Err(format_codex_usage_error(error)),
-                }
+                expired.get_or_insert(auth_state);
             }
             Err(error) => return Err(format_codex_usage_error(error)),
         }
     }
 
-    Err(last_auth_error
-        .unwrap_or_else(|| "Codex session expired. Run `codex` to log in again.".to_string()))
+    match expired {
+        Some(auth_state) => expired_login_reading(read_codex_last_good(&auth_state), "Codex", "codex"),
+        None => Err("Codex session expired. Run `codex` to log in again.".to_string()),
+    }
+}
+
+fn fresh_codex_reading(auth_state: &CodexAuthState, snapshot: CodexUsageSnapshot) -> UsageReading {
+    if let Ok(mut guard) = CODEX_LAST_GOOD_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        guard.insert(codex_auth_fingerprint(auth_state), snapshot.clone());
+    }
+    UsageReading { snapshot, fresh: true }
+}
+
+fn read_codex_last_good(auth_state: &CodexAuthState) -> Option<CodexUsageSnapshot> {
+    CODEX_LAST_GOOD_USAGE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&codex_auth_fingerprint(auth_state)).cloned())
+}
+
+/// The last good reading, marked as kept and never relayed, or an error when there is none.
+fn expired_login_reading(
+    kept: Option<CodexUsageSnapshot>,
+    name: &str,
+    cli: &str,
+) -> Result<UsageReading, String> {
+    let Some(mut snapshot) = kept else {
+        return Err(format!("{name} login expired. Run `{cli}` to renew it."));
+    };
+    snapshot.lines.push(CodexMetricLine::Text {
+        label: "Status".to_string(),
+        value: format!("Login expired; showing last good values. Run `{cli}` to renew it."),
+    });
+    Ok(UsageReading { snapshot, fresh: false })
 }
 
 fn fetch_codex_usage_snapshot(
@@ -1501,21 +1490,11 @@ fn agy_usage_fallback() -> Result<CodexUsageSnapshot, String> {
 
     let client = usage_client("Antigravity")?;
     let mut has_local_credentials = false;
-    if let Some(mut auth) = load_antigravity_auth() {
+    // Read only, never renewed: renewing is agy's own job (#361, as for Claude and Codex).
+    if let Some(auth) = load_antigravity_auth() {
         has_local_credentials = true;
-        if auth.access_token.is_none() {
-            let _ = refresh_antigravity_auth(&client, &mut auth);
-        }
-        match fetch_antigravity_cloud_snapshot(&client, &auth) {
-            Ok(Some(snapshot)) => return Ok(snapshot),
-            Err(AntigravityCloudError::Auth) => {
-                if refresh_antigravity_auth(&client, &mut auth).is_ok() {
-                    if let Ok(Some(snapshot)) = fetch_antigravity_cloud_snapshot(&client, &auth) {
-                        return Ok(snapshot);
-                    }
-                }
-            }
-            Ok(None) | Err(AntigravityCloudError::Unavailable) => {}
+        if let Ok(Some(snapshot)) = fetch_antigravity_cloud_snapshot(&client, &auth) {
+            return Ok(snapshot);
         }
     }
 
@@ -1549,8 +1528,9 @@ async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
     .map_err(|error| format!("Claude usage task failed: {error}"))?
 }
 
-/// A Claude usage answer, and whether it was read just now or kept from before a 429.
-struct ClaudeUsageReading {
+/// A usage answer, and whether it was read just now or kept: from before a 429, or from
+/// before the login expired.
+struct UsageReading {
     snapshot: CodexUsageSnapshot,
     fresh: bool,
 }
@@ -1559,44 +1539,13 @@ struct ClaudeUsageReading {
 /// one, so the numbers froze there and a limit crossing 10 % while they were frozen was
 /// never announced (#192).
 fn relay_if_fresh(
-    reading: ClaudeUsageReading,
+    reading: UsageReading,
     relay: impl FnOnce(&CodexUsageSnapshot),
 ) -> CodexUsageSnapshot {
     if reading.fresh {
         relay(&reading.snapshot);
     }
     reading.snapshot
-}
-
-/// Refresh the token, and carry what is known about this account over to the new one. The
-/// wait and the last good reading are keyed by the token pair, which a refresh replaces. They
-/// move only when the refresh began from the very pair they belong to. A refresh re-reads the
-/// credential first, and a pair that changed underneath may be another account the person
-/// switched to; its numbers must not show up as theirs (#192 audit).
-fn refresh_claude_token_keeping_state(
-    client: &reqwest::blocking::Client,
-    auth: &mut ClaudeAuthState,
-) -> Result<(), String> {
-    let before = claude_auth_fingerprint(auth);
-    let refreshed_from = refresh_claude_token(client, auth)?;
-    carry_claude_state(&before, &refreshed_from, &claude_auth_fingerprint(auth));
-    Ok(())
-}
-
-fn carry_claude_state(before: &str, refreshed_from: &str, after: &str) {
-    if before != refreshed_from || before == after {
-        return;
-    }
-    if let Ok(mut guard) = CLAUDE_RETRY_NOT_BEFORE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
-        if let Some(not_before) = guard.remove(before) {
-            guard.insert(after.to_string(), not_before);
-        }
-    }
-    if let Ok(mut guard) = CLAUDE_LAST_GOOD_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
-        if let Some(snapshot) = guard.remove(before) {
-            guard.insert(after.to_string(), snapshot);
-        }
-    }
 }
 
 /// Seconds left before this account may be asked again, if it was told to wait.
@@ -1612,7 +1561,7 @@ fn claude_rate_limited_reading(
     auth: &ClaudeAuthState,
     retry_after_seconds: Option<u64>,
     now: Instant,
-) -> ClaudeUsageReading {
+) -> UsageReading {
     // Honoured as sent. Only a wait the clock cannot even represent (a u64 parse of a
     // nonsense header) falls back, rather than overflowing (#192 audit).
     let asked = retry_after_seconds.unwrap_or(CLAUDE_RETRY_FALLBACK_SECONDS);
@@ -1628,75 +1577,62 @@ fn claude_rate_limited_reading(
             guard.insert(claude_auth_fingerprint(auth), not_before);
         }
     }
-    ClaudeUsageReading {
+    UsageReading {
         snapshot: claude_rate_limited_snapshot(auth, Some(wait)),
         fresh: false,
     }
 }
 
-fn claude_usage_blocking() -> Result<ClaudeUsageReading, String> {
+fn claude_usage_blocking() -> Result<UsageReading, String> {
     let candidates = load_claude_auth_candidates();
     if candidates.is_empty() {
         return Err("Claude Code auth not found. Run `claude` to log in.".to_string());
     }
     let client = usage_client("Claude Code")?;
     let mut last_error = None;
+    let mut expired = None;
 
-    for mut auth in candidates {
+    for auth in candidates {
         if !claude_can_fetch_live_usage(&auth) {
             last_error =
                 Some("Re-login for live usage. Run `claude` and sign in again.".to_string());
             continue;
         }
 
-        // Before any refresh: a refresh is a call too, and waiting means asking nothing.
-        if let Some(wait) = claude_retry_remaining(&auth, Instant::now()) {
-            return Ok(ClaudeUsageReading {
-                snapshot: claude_rate_limited_snapshot(&auth, Some(wait)),
-                fresh: false,
-            });
-        }
-
-        if claude_needs_refresh(&auth) {
-            if let Err(message) = refresh_claude_token_keeping_state(&client, &mut auth) {
-                last_error = Some(message);
+        match claude_gate(&auth, Instant::now()) {
+            ClaudeGate::Expired => {
+                expired.get_or_insert(auth);
                 continue;
             }
+            ClaudeGate::Wait(wait) => {
+                return Ok(UsageReading {
+                    snapshot: claude_rate_limited_snapshot(&auth, Some(wait)),
+                    fresh: false,
+                });
+            }
+            ClaudeGate::Ask => {}
         }
 
         match fetch_claude_usage(&client, &auth) {
-            Ok(usage) => {
-                return Ok(ClaudeUsageReading {
-                    snapshot: store_claude_last_good(&auth, build_claude_usage_snapshot(usage, &auth)),
-                    fresh: true,
-                })
-            }
+            Ok(usage) => return Ok(fresh_claude_reading(&auth, usage)),
             Err(CodexUsageFetchError::Auth) => {
-                if let Err(message) = refresh_claude_token_keeping_state(&client, &mut auth) {
-                    last_error = Some(message);
-                    continue;
+                // The CLI may have written a new login since this one was read.
+                if let Ok(reread) = reload_claude_auth_source(&auth) {
+                    if claude_auth_fingerprint(&reread) != claude_auth_fingerprint(&auth) {
+                        match fetch_claude_usage(&client, &reread) {
+                            Ok(usage) => return Ok(fresh_claude_reading(&reread, usage)),
+                            Err(CodexUsageFetchError::Auth) => {}
+                            Err(CodexUsageFetchError::RateLimited(retry_after)) => {
+                                return Ok(claude_rate_limited_reading(&reread, retry_after, Instant::now()));
+                            }
+                            Err(CodexUsageFetchError::Other(message)) => {
+                                last_error = Some(message);
+                                continue;
+                            }
+                        }
+                    }
                 }
-                match fetch_claude_usage(&client, &auth) {
-                    Ok(usage) => {
-                        return Ok(ClaudeUsageReading {
-                            snapshot: store_claude_last_good(
-                                &auth,
-                                build_claude_usage_snapshot(usage, &auth),
-                            ),
-                            fresh: true,
-                        })
-                    }
-                    Err(CodexUsageFetchError::Auth) => {
-                        last_error = Some(
-                            "Claude Code session expired. Run `claude` to log in again."
-                                .to_string(),
-                        );
-                    }
-                    Err(CodexUsageFetchError::RateLimited(retry_after)) => {
-                        return Ok(claude_rate_limited_reading(&auth, retry_after, Instant::now()));
-                    }
-                    Err(CodexUsageFetchError::Other(message)) => last_error = Some(message),
-                }
+                expired.get_or_insert(auth);
             }
             Err(CodexUsageFetchError::RateLimited(retry_after)) => {
                 return Ok(claude_rate_limited_reading(&auth, retry_after, Instant::now()));
@@ -1705,9 +1641,40 @@ fn claude_usage_blocking() -> Result<ClaudeUsageReading, String> {
         }
     }
 
+    if let Some(auth) = expired {
+        return expired_login_reading(read_claude_last_good(&auth), "Claude Code", "claude");
+    }
     Err(last_error.unwrap_or_else(|| {
         "Claude Code usage unavailable. Run `claude` to log in again.".to_string()
     }))
+}
+
+#[derive(Debug, PartialEq)]
+enum ClaudeGate {
+    Expired,
+    Wait(u64),
+    Ask,
+}
+
+/// What to do before asking. Expiry comes first: renewing is the CLI's job alone (#361, as for
+/// Codex above), and a login that expired inside a long Retry-After must say so rather than
+/// keep saying "rate limited" until the wait ends (#361 audit).
+fn claude_gate(auth: &ClaudeAuthState, now: Instant) -> ClaudeGate {
+    if claude_token_expired(auth) {
+        return ClaudeGate::Expired;
+    }
+    // Before any call: waiting means asking nothing.
+    match claude_retry_remaining(auth, now) {
+        Some(wait) => ClaudeGate::Wait(wait),
+        None => ClaudeGate::Ask,
+    }
+}
+
+fn fresh_claude_reading(auth: &ClaudeAuthState, usage: Value) -> UsageReading {
+    UsageReading {
+        snapshot: store_claude_last_good(auth, build_claude_usage_snapshot(usage, auth)),
+        fresh: true,
+    }
 }
 
 #[tauri::command]
@@ -1899,7 +1866,7 @@ fn codex_access_token(auth_state: &CodexAuthState) -> Result<String, String> {
         .ok_or_else(|| "Codex access token missing. Run `codex` to authenticate.".to_string())
 }
 
-fn codex_access_token_needs_refresh(auth_state: &CodexAuthState) -> bool {
+fn codex_access_token_expired(auth_state: &CodexAuthState) -> bool {
     let Some(token) = auth_state
         .auth
         .tokens
@@ -1911,7 +1878,7 @@ fn codex_access_token_needs_refresh(auth_state: &CodexAuthState) -> bool {
     let Some(expires_at) = jwt_expiry_seconds(token) else {
         return false;
     };
-    expires_at <= time::OffsetDateTime::now_utc().unix_timestamp() + 5 * 60
+    expires_at <= time::OffsetDateTime::now_utc().unix_timestamp()
 }
 
 fn jwt_expiry_seconds(token: &str) -> Option<i64> {
@@ -1999,59 +1966,6 @@ fn fetch_codex_reset_credits_best_effort(
     response.json::<CodexResetCreditsEnvelope>().ok()
 }
 
-fn refresh_codex_auth(
-    client: &reqwest::blocking::Client,
-    auth_state: &mut CodexAuthState,
-) -> Result<(), String> {
-    let source_fingerprint = codex_auth_fingerprint(auth_state);
-    let refresh_token = auth_state
-        .auth
-        .tokens
-        .as_ref()
-        .and_then(|tokens| tokens.refresh_token.as_deref())
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| "Codex refresh token missing. Run `codex` to log in again.".to_string())?;
-
-    let response = client
-        .post(CODEX_REFRESH_URL)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("client_id", CODEX_CLIENT_ID),
-            ("refresh_token", refresh_token.as_str()),
-        ])
-        .send()
-        .map_err(|error| format_http_send_error("Codex token refresh", &error))?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "Codex token refresh failed (HTTP {}). Run `codex` to log in again.",
-            response.status().as_u16()
-        ));
-    }
-
-    let refreshed = response
-        .json::<CodexRefreshResponse>()
-        .map_err(|error| format!("Codex token refresh response invalid: {error}"))?;
-    let tokens = auth_state
-        .auth
-        .tokens
-        .as_mut()
-        .ok_or_else(|| "Codex OAuth token missing. Run `codex` to authenticate.".to_string())?;
-
-    tokens.access_token = refreshed
-        .access_token
-        .or_else(|| tokens.access_token.clone());
-    tokens.refresh_token = refreshed
-        .refresh_token
-        .or_else(|| tokens.refresh_token.clone());
-    tokens.id_token = refreshed.id_token.or_else(|| tokens.id_token.clone());
-    auth_state.auth.last_refresh = Some(now_iso());
-    save_codex_auth(auth_state, &source_fingerprint)?;
-    Ok(())
-}
-
 fn reload_codex_auth_source(auth_state: &CodexAuthState) -> Result<CodexAuthState, String> {
     let auth = match &auth_state.source {
         CodexAuthSource::File(path) => {
@@ -2082,39 +1996,6 @@ fn reload_codex_auth_source(auth_state: &CodexAuthState) -> Result<CodexAuthStat
         auth,
         source: auth_state.source.clone(),
     })
-}
-
-fn save_codex_auth(
-    auth_state: &CodexAuthState,
-    expected_source_fingerprint: &str,
-) -> Result<(), String> {
-    if codex_source_fingerprint(auth_state).as_deref() != Some(expected_source_fingerprint) {
-        return Err(
-            "Codex credentials changed while refreshing; retry usage to use the newest login."
-                .to_string(),
-        );
-    }
-    let text = serde_json::to_string_pretty(&auth_state.auth)
-        .map_err(|error| format!("Failed to encode refreshed Codex credentials: {error}"))?;
-    match &auth_state.source {
-        CodexAuthSource::File(path) => fs::write(path, text).map_err(|error| {
-            format!(
-                "Failed to save refreshed Codex credentials to {}: {error}",
-                path.display()
-            )
-        }),
-        CodexAuthSource::Keychain(service) => {
-            write_keychain_password(service, &text).map_err(|error| {
-                format!("Failed to save refreshed Codex Keychain credentials: {error}")
-            })
-        }
-    }
-}
-
-fn codex_source_fingerprint(auth_state: &CodexAuthState) -> Option<String> {
-    reload_codex_auth_source(auth_state)
-        .ok()
-        .map(|state| codex_auth_fingerprint(&state))
 }
 
 fn codex_auth_fingerprint(auth_state: &CodexAuthState) -> String {
@@ -3308,48 +3189,6 @@ fn read_keychain_password(service: &str, account: Option<&str>) -> Option<String
     }
 }
 
-fn write_keychain_password(service: &str, value: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let account = keychain_account_for_service(service)?;
-        set_generic_password(service, &account, value.as_bytes())
-            .map_err(|error| format!("Keychain update failed: {error}"))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (service, value);
-        Err("Keychain writes require macOS".to_string())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_account_for_service(service: &str) -> Result<String, String> {
-    let output = Command::new("security")
-        .args(["find-generic-password", "-s", service])
-        .output()
-        .map_err(|error| format!("could not inspect Keychain item: {error}"))?;
-    if !output.status.success() {
-        return Err(
-            "Keychain item is unavailable; run the provider CLI to log in again.".to_string(),
-        );
-    }
-    let metadata = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    metadata
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("\"acct\"<blob>=\""))
-        .and_then(|value| value.strip_suffix('"'))
-        .filter(|account| !account.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            "Keychain item account is unavailable; refusing to overwrite credentials.".to_string()
-        })
-}
-
 fn parse_json_or_hex<T: for<'de> Deserialize<'de>>(text: &str) -> Option<T> {
     if let Ok(value) = serde_json::from_str::<T>(text) {
         return Some(value);
@@ -3516,8 +3355,6 @@ fn claude_oauth_config() -> ClaudeOauthConfig {
         .strip_suffix("/api/oauth/usage")
         .unwrap_or("https://api.anthropic.com")
         .to_string();
-    let mut refresh_url = CLAUDE_REFRESH_URL.to_string();
-    let mut client_id = CLAUDE_CLIENT_ID.to_string();
     let mut oauth_file_suffix = String::new();
 
     let is_ant_user = env_text("USER_TYPE").as_deref() == Some("ant");
@@ -3527,24 +3364,19 @@ fn claude_oauth_config() -> ClaudeOauthConfig {
             .unwrap_or_else(|| "http://localhost:8000".to_string())
             .trim_end_matches('/')
             .to_string();
-        refresh_url = format!("{base_api}/v1/oauth/token");
-        client_id = CLAUDE_NON_PROD_CLIENT_ID.to_string();
         oauth_file_suffix = "-local-oauth".to_string();
     } else if is_ant_user && env_flag("USE_STAGING_OAUTH") {
         base_api = "https://api-staging.anthropic.com".to_string();
-        refresh_url = "https://platform.staging.ant.dev/v1/oauth/token".to_string();
-        client_id = CLAUDE_NON_PROD_CLIENT_ID.to_string();
         oauth_file_suffix = "-staging-oauth".to_string();
     }
 
-    // A refresh token and a bearer token go over this URL, so a plaintext override is
+    // A bearer token goes over this URL, so a plaintext override is
     // refused outright rather than honoured. Loopback is allowed: it never leaves the
     // machine, and the local OAuth path above already relies on it.
     if let Some(custom) = env_text("CLAUDE_CODE_CUSTOM_OAUTH_URL") {
         let custom = custom.trim_end_matches('/').to_string();
         if is_confidential_oauth_url(&custom) {
             base_api = custom;
-            refresh_url = format!("{base_api}/v1/oauth/token");
             oauth_file_suffix = "-custom-oauth".to_string();
         } else {
             eprintln!(
@@ -3552,14 +3384,9 @@ fn claude_oauth_config() -> ClaudeOauthConfig {
             );
         }
     }
-    if let Some(override_client_id) = env_text("CLAUDE_CODE_OAUTH_CLIENT_ID") {
-        client_id = override_client_id;
-    }
 
     ClaudeOauthConfig {
         usage_url: format!("{base_api}/api/oauth/usage"),
-        refresh_url,
-        client_id,
         oauth_file_suffix,
     }
 }
@@ -3641,7 +3468,7 @@ fn claude_can_fetch_live_usage(auth: &ClaudeAuthState) -> bool {
     scopes.is_empty() || scopes.iter().any(|scope| scope == "user:profile")
 }
 
-fn claude_needs_refresh(auth: &ClaudeAuthState) -> bool {
+fn claude_token_expired(auth: &ClaudeAuthState) -> bool {
     let Some(expires_at) = auth
         .credentials
         .claude_ai_oauth
@@ -3651,7 +3478,7 @@ fn claude_needs_refresh(auth: &ClaudeAuthState) -> bool {
         return false;
     };
     let now_ms = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
-    expires_at - now_ms <= CLAUDE_REFRESH_BUFFER_MS
+    expires_at <= now_ms
 }
 
 fn fetch_claude_usage(
@@ -3757,59 +3584,6 @@ fn parse_http_date(value: &str, this_year: i32) -> Option<time::OffsetDateTime> 
     Some(time::PrimitiveDateTime::new(date, at).assume_utc())
 }
 
-/// Returns the fingerprint of the credential the refresh started from, as re-read.
-fn refresh_claude_token(
-    client: &reqwest::blocking::Client,
-    auth: &mut ClaudeAuthState,
-) -> Result<String, String> {
-    *auth = reload_claude_auth_source(auth)?;
-    let source_fingerprint = claude_auth_fingerprint(auth);
-    let oauth = auth
-        .credentials
-        .claude_ai_oauth
-        .as_mut()
-        .ok_or_else(|| "Claude Code OAuth data missing. Run `claude` to log in.".to_string())?;
-    let refresh_token = oauth
-        .refresh_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| {
-            "Claude Code refresh token missing. Run `claude` to log in again.".to_string()
-        })?;
-    let response = client
-        .post(&auth.oauth_config.refresh_url)
-        .json(&serde_json::json!({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": auth.oauth_config.client_id,
-            "scope": CLAUDE_SCOPES,
-        }))
-        .send()
-        .map_err(|error| format_http_send_error("Claude Code token refresh", &error))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Claude Code token refresh failed (HTTP {})",
-            response.status().as_u16()
-        ));
-    }
-    let refreshed = response
-        .json::<OAuthRefreshResponse>()
-        .map_err(|error| format!("Claude Code token refresh response invalid: {error}"))?;
-    oauth.access_token = refreshed
-        .access_token
-        .or_else(|| oauth.access_token.clone());
-    oauth.refresh_token = refreshed
-        .refresh_token
-        .or_else(|| oauth.refresh_token.clone());
-    if let Some(expires_in) = refreshed.expires_in {
-        oauth.expires_at =
-            Some((time::OffsetDateTime::now_utc().unix_timestamp() + expires_in) * 1000);
-    }
-    save_claude_auth(auth, &source_fingerprint)?;
-    Ok(source_fingerprint)
-}
-
 fn reload_claude_auth_source(auth: &ClaudeAuthState) -> Result<ClaudeAuthState, String> {
     let credentials = if let Some(path) = &auth.file_path {
         let text = fs::read_to_string(path).map_err(|error| {
@@ -3835,9 +3609,7 @@ fn reload_claude_auth_source(auth: &ClaudeAuthState) -> Result<ClaudeAuthState, 
                     .to_string()
             })?
     } else {
-        return Err(
-            "Claude Code environment token cannot be refreshed for live usage.".to_string(),
-        );
+        return Err("Claude Code environment token cannot be re-read.".to_string());
     };
 
     Ok(ClaudeAuthState {
@@ -3847,51 +3619,6 @@ fn reload_claude_auth_source(auth: &ClaudeAuthState) -> Result<ClaudeAuthState, 
         inference_only: auth.inference_only,
         oauth_config: auth.oauth_config.clone(),
     })
-}
-
-fn save_claude_auth(
-    auth: &ClaudeAuthState,
-    expected_source_fingerprint: &str,
-) -> Result<(), String> {
-    if auth.inference_only {
-        return Err(
-            "Claude Code environment token cannot be refreshed for live usage.".to_string(),
-        );
-    }
-    if claude_source_fingerprint(auth).as_deref() != Some(expected_source_fingerprint) {
-        return Err("Claude Code credentials changed while refreshing; retry usage to use the newest login.".to_string());
-    }
-    let text = serde_json::to_string(&auth.credentials)
-        .map_err(|error| format!("Failed to encode refreshed Claude Code credentials: {error}"))?;
-    if let Some(path) = &auth.file_path {
-        fs::write(path, text).map_err(|error| {
-            format!(
-                "Failed to save refreshed Claude Code credentials to {}: {error}",
-                path.display()
-            )
-        })?;
-    } else if let Some(service) = &auth.service_name {
-        write_keychain_password(service, &text).map_err(|error| {
-            format!("Failed to save refreshed Claude Code Keychain credentials: {error}")
-        })?;
-    } else {
-        return Err("Claude Code credential source is unavailable for persistence.".to_string());
-    }
-    Ok(())
-}
-
-fn claude_source_fingerprint(auth: &ClaudeAuthState) -> Option<String> {
-    let credentials = if let Some(path) = &auth.file_path {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|text| parse_json_or_hex::<ClaudeCredentialsFile>(&text))
-    } else if let Some(service) = &auth.service_name {
-        read_keychain_password(service, None)
-            .and_then(|text| parse_json_or_hex::<ClaudeCredentialsFile>(&text))
-    } else {
-        None
-    }?;
-    Some(claude_credentials_fingerprint(&credentials))
 }
 
 fn claude_credentials_fingerprint(credentials: &ClaudeCredentialsFile) -> String {
@@ -4073,7 +3800,6 @@ struct AntigravityLsDiscovery {
 #[derive(Debug, Clone, Default)]
 struct AntigravityAuth {
     access_token: Option<String>,
-    refresh_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4107,16 +3833,12 @@ fn load_antigravity_auth() -> Option<AntigravityAuth> {
             let text = text.strip_prefix("Bearer ").unwrap_or(&text).trim();
             (!text.is_empty()).then(|| text.to_string())
         });
-    let refresh_token = value
-        .as_ref()
-        .and_then(|value| find_antigravity_auth_string(value, &["refresh_token", "refreshToken"]));
-    if access_token.is_none() && refresh_token.is_none() {
-        return None;
-    }
-    Some(AntigravityAuth {
-        access_token,
-        refresh_token,
-    })
+    let signed_in = access_token.is_some()
+        || value
+            .as_ref()
+            .and_then(|value| find_antigravity_auth_string(value, &["refresh_token", "refreshToken"]))
+            .is_some();
+    signed_in.then_some(AntigravityAuth { access_token })
 }
 
 fn unwrap_go_keyring(raw: &str) -> Option<String> {
@@ -4246,70 +3968,6 @@ fn read_antigravity_cloud_plan(value: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(format_plan_label)
         })
-}
-
-fn refresh_antigravity_auth(
-    client: &reqwest::blocking::Client,
-    auth: &mut AntigravityAuth,
-) -> Result<(), AntigravityCloudError> {
-    let refresh_token = auth
-        .refresh_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .ok_or(AntigravityCloudError::Auth)?;
-    let (client_id, client_secret) =
-        load_antigravity_oauth_client().ok_or(AntigravityCloudError::Unavailable)?;
-    let response = client
-        .post(AGY_GOOGLE_OAUTH_URL)
-        .form(&[
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
-            ("refresh_token", refresh_token),
-            ("grant_type", "refresh_token"),
-        ])
-        .send()
-        .map_err(|_| AntigravityCloudError::Unavailable)?;
-    if response.status().is_success() {
-        let body = response
-            .json::<Value>()
-            .map_err(|_| AntigravityCloudError::Unavailable)?;
-        auth.access_token = body
-            .get("access_token")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-            .map(ToOwned::to_owned);
-        return auth
-            .access_token
-            .as_ref()
-            .map(|_| ())
-            .ok_or(AntigravityCloudError::Unavailable);
-    }
-    if response.status().is_client_error() {
-        Err(AntigravityCloudError::Auth)
-    } else {
-        Err(AntigravityCloudError::Unavailable)
-    }
-}
-
-fn load_antigravity_oauth_client() -> Option<(String, String)> {
-    let client_id = env_text(AGY_GOOGLE_CLIENT_ID_ENV);
-    let client_secret = env_text(AGY_GOOGLE_CLIENT_SECRET_ENV);
-    if let (Some(client_id), Some(client_secret)) = (client_id, client_secret) {
-        return Some((client_id, client_secret));
-    }
-
-    let path = home_path(AGY_GOOGLE_OAUTH_CONFIG_PATH)?;
-    let text = fs::read_to_string(path).ok()?;
-    let value = serde_json::from_str::<Value>(&text).ok()?;
-    parse_antigravity_oauth_client(&value)
-}
-
-fn parse_antigravity_oauth_client(value: &Value) -> Option<(String, String)> {
-    let client_id = maybe_string(value.get("client_id"))?;
-    let client_secret = maybe_string(value.get("client_secret"))?;
-    Some((client_id, client_secret))
 }
 
 fn probe_antigravity_ls_usage() -> Option<CodexUsageSnapshot> {
@@ -6901,8 +6559,6 @@ mod display_selection_tests {
             inference_only: false,
             oauth_config: ClaudeOauthConfig {
                 usage_url: CLAUDE_USAGE_URL.to_string(),
-                refresh_url: CLAUDE_REFRESH_URL.to_string(),
-                client_id: CLAUDE_CLIENT_ID.to_string(),
                 oauth_file_suffix: String::new(),
             },
         }
@@ -7012,53 +6668,6 @@ mod display_selection_tests {
     }
 
     #[test]
-    fn a_refreshed_claude_token_keeps_its_wait_and_its_last_good_reading() {
-        // #192 audit: both are keyed by the token pair, which a refresh replaces. Without
-        // carrying them over, a token refreshed inside Retry-After asked again at once and
-        // had no reading to show.
-        let before = claude_auth("carry-before-access", "carry-before-refresh");
-        let after = claude_auth("carry-after-access", "carry-after-refresh");
-        let now = Instant::now();
-        store_claude_last_good(
-            &before,
-            CodexUsageSnapshot {
-                provider_id: "claude".to_string(),
-                display_name: "Claude Code".to_string(),
-                plan: None,
-                lines: vec![],
-                fetched_at: "2026-10-24T01:00:00Z".to_string(),
-            },
-        );
-        claude_rate_limited_reading(&before, Some(300), now);
-        assert_eq!(claude_retry_remaining(&after, now), None, "the premise: the new token knows nothing yet");
-
-        // Another account switched in underneath: the refresh began from a pair that is not
-        // the one the wait and the reading belong to, so nothing moves.
-        let switched = claude_auth("carry-switched-access", "carry-switched-refresh");
-        carry_claude_state(
-            &claude_auth_fingerprint(&before),
-            &claude_auth_fingerprint(&switched),
-            &claude_auth_fingerprint(&after),
-        );
-        assert_eq!(claude_retry_remaining(&after, now), None, "a switched account inherits no wait");
-        assert!(read_claude_last_good(&after).is_none(), "and no numbers");
-
-        carry_claude_state(
-            &claude_auth_fingerprint(&before),
-            &claude_auth_fingerprint(&before),
-            &claude_auth_fingerprint(&after),
-        );
-
-        assert_eq!(claude_retry_remaining(&after, now), Some(300), "the wait moved to the refreshed token");
-        assert_eq!(claude_retry_remaining(&before, now), None);
-        assert_eq!(
-            read_claude_last_good(&after).map(|snapshot| snapshot.fetched_at),
-            Some("2026-10-24T01:00:00Z".to_string()),
-            "and so did the last good reading"
-        );
-    }
-
-    #[test]
     fn retry_after_is_read_as_seconds_or_as_an_http_date() {
         let now = parse_http_date("Sat, 24 Oct 2026 01:00:00 GMT", 2026).unwrap();
         assert_eq!(parse_retry_after("120", now), Some(120));
@@ -7101,10 +6710,84 @@ mod display_selection_tests {
             fetched_at: "2026-10-24T01:00:00Z".to_string(),
         };
         let mut relayed = 0;
-        relay_if_fresh(ClaudeUsageReading { snapshot: snapshot(), fresh: true }, |_| relayed += 1);
+        relay_if_fresh(UsageReading { snapshot: snapshot(), fresh: true }, |_| relayed += 1);
         assert_eq!(relayed, 1, "the premise: a fresh reading is relayed");
-        relay_if_fresh(ClaudeUsageReading { snapshot: snapshot(), fresh: false }, |_| relayed += 1);
+        relay_if_fresh(UsageReading { snapshot: snapshot(), fresh: false }, |_| relayed += 1);
         assert_eq!(relayed, 1, "a kept reading is not");
+    }
+
+    fn codex_auth(access_token: &str) -> CodexAuthState {
+        CodexAuthState {
+            auth: CodexAuthFile {
+                openai_api_key: None,
+                tokens: Some(CodexAuthTokens {
+                    access_token: Some(access_token.to_string()),
+                    refresh_token: Some("refresh".to_string()),
+                    account_id: None,
+                }),
+            },
+            source: CodexAuthSource::File(PathBuf::from("/tmp/codex-361/auth.json")),
+        }
+    }
+
+    fn jwt_expiring_at(exp: i64) -> String {
+        format!("h.{}.s", URL_SAFE_NO_PAD.encode(serde_json::json!({ "exp": exp }).to_string()))
+    }
+
+    #[test]
+    fn a_login_counts_as_expired_only_once_it_has_expired() {
+        // #361: with nothing renewing it, a login a minute from expiry still works and must be
+        // used; one a minute past it is the CLI's to renew.
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        assert!(!codex_access_token_expired(&codex_auth(&jwt_expiring_at(now + 60))));
+        assert!(codex_access_token_expired(&codex_auth(&jwt_expiring_at(now - 60))));
+
+        let mut claude = claude_auth("expiry-access", "expiry-refresh");
+        claude.credentials.claude_ai_oauth.as_mut().unwrap().expires_at = Some((now + 60) * 1000);
+        assert!(!claude_token_expired(&claude));
+        claude.credentials.claude_ai_oauth.as_mut().unwrap().expires_at = Some((now - 60) * 1000);
+        assert!(claude_token_expired(&claude));
+    }
+
+    #[test]
+    fn a_login_that_expires_inside_a_wait_says_it_expired() {
+        let now_s = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = Instant::now();
+        let mut auth = claude_auth("gate-access", "gate-refresh");
+        auth.credentials.claude_ai_oauth.as_mut().unwrap().expires_at = Some((now_s + 60) * 1000);
+        claude_rate_limited_reading(&auth, Some(3_600), now);
+        assert_eq!(claude_gate(&auth, now), ClaudeGate::Wait(3_600), "the premise: a live login waits");
+
+        auth.credentials.claude_ai_oauth.as_mut().unwrap().expires_at = Some((now_s - 60) * 1000);
+        assert_eq!(claude_gate(&auth, now), ClaudeGate::Expired, "an expired one says so, wait or not");
+    }
+
+    #[test]
+    fn an_expired_login_shows_the_last_good_reading_as_kept_and_never_as_news() {
+        let reading = |fetched_at: &str| CodexUsageSnapshot {
+            provider_id: "codex".to_string(),
+            display_name: "Codex".to_string(),
+            plan: None,
+            lines: vec![],
+            fetched_at: fetched_at.to_string(),
+        };
+        let mine = codex_auth("codex-361-mine");
+        let other = codex_auth("codex-361-other");
+        assert!(fresh_codex_reading(&mine, reading("2026-11-08T01:00:00Z")).fresh);
+
+        let kept = expired_login_reading(read_codex_last_good(&mine), "Codex", "codex").unwrap();
+        assert!(!kept.fresh, "a kept reading is not relayed as a fresh one");
+        assert_eq!(kept.snapshot.fetched_at, "2026-11-08T01:00:00Z", "and keeps its own time");
+        assert!(
+            matches!(kept.snapshot.lines.last(), Some(CodexMetricLine::Text { label, value }) if label == "Status" && value.contains("Login expired")),
+            "and says it is kept"
+        );
+
+        assert!(read_codex_last_good(&other).is_none(), "another login inherits no numbers");
+        assert_eq!(
+            expired_login_reading(None, "Codex", "codex").err().as_deref(),
+            Some("Codex login expired. Run `codex` to renew it.")
+        );
     }
 
     #[test]
@@ -7114,10 +6797,8 @@ mod display_selection_tests {
             tokens: Some(CodexAuthTokens {
                 access_token: Some("access".to_string()),
                 refresh_token: Some("refresh".to_string()),
-                id_token: None,
                 account_id: Some("account-a".to_string()),
             }),
-            last_refresh: None,
         };
         let first = CodexAuthState {
             auth: base_auth.clone(),
@@ -7287,26 +6968,6 @@ mod display_selection_tests {
             find_antigravity_auth_string(&value, &["refresh_token"]),
             Some("refresh".to_string())
         );
-    }
-
-    #[test]
-    fn antigravity_oauth_client_reads_local_config_shape_without_bundled_secret() {
-        let value = serde_json::json!({
-            "client_id": "local-client-id",
-            "client_secret": "local-client-secret"
-        });
-
-        assert_eq!(
-            parse_antigravity_oauth_client(&value),
-            Some((
-                "local-client-id".to_string(),
-                "local-client-secret".to_string()
-            ))
-        );
-        assert!(parse_antigravity_oauth_client(&serde_json::json!({
-            "client_id": "local-client-id"
-        }))
-        .is_none());
     }
 
     #[test]

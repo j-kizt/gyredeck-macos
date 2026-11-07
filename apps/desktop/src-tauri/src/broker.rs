@@ -2018,13 +2018,13 @@ mod tests {
         let _ = slow.set_read_timeout(Some(Duration::from_secs(8)));
         let mut reader = BufReader::new(slow.try_clone().unwrap());
         let dribble = std::thread::spawn(move || {
-            let mut written = 0;
+            let mut last_write = Duration::ZERO;
             while slow_started.elapsed() < Duration::from_secs(7) {
                 if slow.write_all(b" ").is_err() { break; }
-                written += 1;
+                last_write = slow_started.elapsed();
                 std::thread::sleep(Duration::from_millis(100));
             }
-            written
+            last_write
         });
         let mut answer = String::new();
         reader.read_line(&mut answer).unwrap();
@@ -2032,8 +2032,10 @@ mod tests {
         let answer: Value = serde_json::from_str(answer.trim()).unwrap();
         assert_eq!(answer["error"], "timeout", "{answer}");
         assert!(answered_at >= Duration::from_millis(4_500) && answered_at < Duration::from_secs(7), "answered at the deadline ({answered_at:?}), not at an idle gap and not later");
-        let written = dribble.join().unwrap();
-        assert!(written >= 30, "the client really was writing all along ({written} writes)");
+        // When it last wrote, not how often: a loaded CI runner sleeps past 100 ms and made 26
+        // writes where 30 were counted on (#329).
+        let last_write = dribble.join().unwrap();
+        assert!(last_write + Duration::from_millis(250) >= answered_at, "the client really was writing all along (last at {last_write:?}, answered at {answered_at:?})");
 
         state.stop();
         assert!(!path.exists(), "stopping removes the socket");

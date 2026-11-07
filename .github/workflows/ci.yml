@@ -79,6 +79,53 @@ jobs:
       - name: Bundle size budget
         run: pnpm test:budget
 
+  # The Rust unit tests ran only on a developer's machine (#314). Their own job, so they
+  # run beside `check` rather than after it and a merge round does not get longer.
+  rust:
+    name: rust
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      # Its own key: the shared one holds release-profile builds, which a debug test
+      # build cannot reuse. Only CI runs write it, and none of them holds a secret.
+      - name: Cache Rust test build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            apps/desktop/src-tauri/target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+
+      - name: Install dependencies
+        run: pnpm install
+
+      # tauri-build fails on a missing resource, and gyredeck-discord.mjs is built, not
+      # committed (adapters/discord/build.mjs), so it must exist before cargo runs.
+      - name: Build Discord connector
+        run: pnpm discord:build
+
+      - name: Rust unit tests
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked --lib
+
   test:
     name: test
     runs-on: macos-latest

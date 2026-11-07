@@ -8300,28 +8300,32 @@ test("a stop that arrives while a read is under way still counts as a turn endin
   // and the stop all land while that read is still going, and the polling window ends
   // before the read does. The read that follows has no open turn to go on and no window
   // left — only the stop says there is something to read for.
-  const session = await codexInNoRoom({ replyTimeoutMs: 1_500, records: false });
+  // The bridge holds the poll's read after it has taken the log's size, until the test
+  // lets it go (#333): a 160 MB log written inside a second stood in for a long read, and
+  // a loaded CI runner could not write it in time while a fast disk read it before the stop.
+  const gateDir = await mkdtemp(join(tmpdir(), "gyredeck-read-gate-"));
+  const gate = join(gateDir, "gate");
+  await writeFile(gate, "");
+  const session = await codexInNoRoom({ replyTimeoutMs: 1_500, records: false, env: { GYREDECK_TEST_CODEX_READ_GATE: gate } });
   try {
     const pushedAt = Date.now();
     assert.equal((await session.call("POST", `/mail/${session.thread}`, { from: session.sender, to: session.thread, kind: "ask", text: "a question before a long tool run" })).status, 202);
-    // Written after the push (the cursor sits at the push) and before the poll fires one
-    // second after it, so the poll's read is long.
-    const filler = JSON.stringify({
-      type: "event_msg", timestamp: new Date().toISOString(),
-      payload: { type: "token_count", info: { total_token_usage: { input_tokens: 1 } }, padding: "x".repeat(120) },
-    }) + "\n";
-    await appendFile(session.rollout, filler.repeat(Math.ceil((160 * 1024 * 1024) / filler.length)));
-    assert.ok(Date.now() - pushedAt < 1_000, "the log was written before the poll fired");
-    await new Promise((resolve) => setTimeout(resolve, Math.max(0, pushedAt + 1_150 - Date.now())));
+    assert.ok(await session.until(async () => existsSync(`${gate}.reading`), 5_000), "the poll's read is under way, held after its size was taken");
     const turnId = randomUUID();
     await appendFile(session.rollout, JSON.stringify({
       type: "event_msg", timestamp: new Date().toISOString(),
       payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: randomUUID(), content: [{ type: "text", text: mailboxEnvelope(session.sender, "a question before a long tool run") }] } },
     }) + "\n" + turnAnswering(turnId, "@everyone tell\nANSWER-DURING-A-LONG-READ"));
     await session.endTurn();
-    assert.ok(await session.until(async () => (await session.saidInMailbox()).includes("ANSWER-DURING-A-LONG-READ"), 20_000), "the answer reaches the mailbox");
+    const stoppedAt = Date.now();
+    // Held past the polling window and past the five seconds a stop keeps reading for
+    // (#181), so the read that follows has only the stop's word to go on.
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.max(pushedAt + 1_500, stoppedAt + 5_000) + 500 - Date.now())));
+    await rm(gate);
+    assert.ok(await session.until(async () => (await session.saidInMailbox()).includes("ANSWER-DURING-A-LONG-READ"), 8_000), "the answer reaches the mailbox");
   } finally {
     await session.close();
+    await rm(gateDir, { recursive: true, force: true });
   }
 });
 

@@ -5212,10 +5212,13 @@ fn a_slow_status_never_holds_up_a_say_read_after_it_and_a_second_waits_its_turn(
     read_child(Cursor::new(lines.join("\n") + "\n"), &f.state.core, epoch);
     assert!(started.elapsed() < Duration::from_millis(1000), "the reader waited {:?}", started.elapsed());
     assert_eq!(posted_texts(&f), vec!["after the status".to_string()]);
-    let lines = buffer.lines();
-    let answers = of_kind(&lines, "status");
-    let busy: Vec<&str> = answers.iter().filter(|a| a["error"] == STATUS_BUSY).map(|a| a["requestId"].as_str().unwrap()).collect();
-    assert_eq!(busy, vec!["s2", "s3"]);
+    // Sent through the outbox, which a writer thread drains: s3's answer could still be
+    // queued when the reader returned (#314, on a CI runner).
+    let busy = || -> Vec<String> {
+        of_kind(&buffer.lines(), "status").iter().filter(|a| a["error"] == STATUS_BUSY).map(|a| a["requestId"].as_str().unwrap().to_string()).collect()
+    };
+    wait_until("both refused as busy", || busy().len() >= 2);
+    assert_eq!(busy(), vec!["s2", "s3"]);
     wait_until("the first status answered", || of_kind(&buffer.lines(), "status").iter().any(|a| a["requestId"] == "s1" && a["error"].is_null()));
     // Answered, the next one is taken.
     let again = status_ask(&f, &buffer, ask("s4"));

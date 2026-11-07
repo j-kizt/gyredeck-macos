@@ -4197,3 +4197,11 @@ fn parse_members(value: &serde_json::Value) -> Vec<RoomMember> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod ci_red_proof_314 {
+    #[test]
+    fn deliberately_fails() {
+        assert_eq!(1, 2, "#314: rust job must go red");
+    }
+}

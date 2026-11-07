@@ -4,19 +4,21 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
 
 ### Fixes
 
-- **Gyredeck no longer logs Claude Code or Codex out.** To keep usage live, Gyredeck renewed
-  the CLI's sign-in itself when it was about to expire or was refused. It then saved the new
-  one over the CLI's own, in the Keychain or the credentials file. A sign-in can be renewed
-  only once, so a `claude` or `codex` already running was left holding a spent one, and its
-  next renewal failed as "not logged in". Each save also dropped whatever Gyredeck did not
-  know about, including other entries in Claude Code's credentials such as MCP sign-ins. Gyredeck
+- **Gyredeck no longer renews or rewrites Claude Code's and Codex's sign-ins.** To keep usage
+  live, Gyredeck renewed the CLI's sign-in itself when it was about to expire or was refused,
+  then saved the new one over the CLI's own, in the Keychain or the credentials file. A
+  sign-in's renewal token is meant to be used once, so a `claude` or `codex` already running
+  could be left holding a spent one, which fits the repeated "not logged in" seen here; that
+  log-out has not been reproduced on demand. Each save to Claude Code's credentials also dropped
+  every field Gyredeck did not know about, `refreshTokenExpiresAt` among them. Gyredeck
   now reads the sign-in again on every refresh, and never renews or writes it.
 - **An expired sign-in shows the last usage, marked as old.** Until the CLI renews it, the
   panel keeps the last reading taken with that sign-in. A Status line under it says the login
   expired and names the command that renews it. Agents in a room are not sent that reading as
   a new one. With no earlier reading, the panel says the login expired and names the command.
-  This means that while neither CLI is running, usage stays at its last reading until one is
-  started.
+  The kept reading lives only while Gyredeck runs, so while Gyredeck stays open and the CLI is
+  not started, usage stays at that reading; after Gyredeck restarts, it shows the message
+  instead.
 - **Antigravity's sign-in is only read, too.** Gyredeck used to renew it in memory when given a
   Google OAuth client, in `~/.config/gyredeck/agy-google-oauth.json` or in
   `GYREDECK_AGY_GOOGLE_CLIENT_ID` and `GYREDECK_AGY_GOOGLE_CLIENT_SECRET`. Those settings are

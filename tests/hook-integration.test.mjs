@@ -13779,7 +13779,10 @@ const codexHeavyFixture = async (tag) => {
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
-  return { home, call, pushes, messagesTo, ingestCodex, close };
+  // Each push is a `codex queue` child of the bridge; with none left, every push it has
+  // started is on record, whatever order the processes finished in (#329 audit).
+  const settled = () => until(async () => spawnSync("pgrep", ["-P", String(bridge.pid)]).status === 1, "no codex queue still running");
+  return { home, call, pushes, messagesTo, ingestCodex, settled, close };
 };
 
 test("#259 C1 C2 C3 C7: Codex confirmed through notify carries the line in its confirming push, and no other", async () => {
@@ -13799,9 +13802,14 @@ test("#259 C1 C2 C3 C7: Codex confirmed through notify carries the line in its c
     const accepted = await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: "01a06082-8ef6-7900-ae39-44fe2e462592", password });
     assert.equal(accepted.body.transitioned, true, "premise: this let it in");
     const confirmed = /you are confirmed in room/;
-    const after = await until(async () => { const m = await f.messagesTo(codex); return m.some((message) => confirmed.test(message)) && m; }, "the confirming push");
-    assert.equal(after.length, before + 1, "C7: one push, the confirmation");
-    const confirming = after.at(-1);
+    await until(async () => (await f.messagesTo(codex)).some((message) => confirmed.test(message)), "the confirming push");
+    await f.settled();
+    const after = await f.messagesTo(codex);
+    const confirming = after.find((message) => confirmed.test(message));
+    // Each push is its own `codex queue` process, so one the join sent late lands after the
+    // count above and reads as a second confirmation push (#329: before #339, a join also
+    // pushed the password notice). Shown by its words, so a failure names the extra push.
+    assert.deepEqual(after.slice(before).map((message) => message.slice(0, 60)), [confirming.slice(0, 60)], "C7: one push, the confirmation");
     assert.match(confirming, confirmed, "premise: the confirming push");
     assert.equal(heavyCount(confirming), 1, "C1: the line, once");
     assert.ok(confirming.includes(heavyLineFor("codex", codex)), "C3: heavyHint with its own id");
@@ -13811,6 +13819,8 @@ test("#259 C1 C2 C3 C7: Codex confirmed through notify carries the line in its c
     const later = await until(async () => { const m = await f.messagesTo(codex); return m.length > after.length && m; }, "the later push");
     assert.match(later.at(-1), /later/);
     assert.equal(heavyCount(later.at(-1)), 0, "C2: not again");
+    await f.settled();
+    assert.equal((await f.messagesTo(codex)).filter((message) => /you have been put in a room here/.test(message)).length, 0, "#339: the quiet join notice pushes nothing to the member still waiting for the password");
   } finally {
     await f.close();
   }

@@ -1226,6 +1226,17 @@ export const CODEX_LINE_MAX_BYTES = 1024 * 1024;
  * between chunks. Lines are cut on the raw bytes, not on decoded text, because a chunk
  * boundary can land inside a multi-byte character and only a whole line decodes safely.
  */
+// A test holds a read open by hand, after its size is taken, so "a stop arrives while a
+// read is under way" is a state the test makes rather than one it times (#333). A 160 MB
+// log written inside one second stood in for it, and a loaded CI runner could not write it
+// in time while a fast disk read it before the stop arrived.
+const CODEX_READ_GATE = process.env.GYREDECK_TEST_CODEX_READ_GATE || null;
+const holdCodexReadForTest = async () => {
+  if (!CODEX_READ_GATE || !existsSync(CODEX_READ_GATE)) return;
+  writeFileSync(`${CODEX_READ_GATE}.reading`, "");
+  while (existsSync(CODEX_READ_GATE)) await new Promise((resolve) => setTimeout(resolve, 20));
+};
+
 export const readCodexLog = async (
   rolloutPath,
   offset,
@@ -1235,6 +1246,7 @@ export const readCodexLog = async (
   const nothing = (at) => ({ entries: [], replies: [], prompts: [], offset: at, from: at, skipped: 0, skipping: false });
   let size = 0;
   try { size = statSync(rolloutPath).size; } catch { return nothing(offset); }
+  await holdCodexReadForTest();
   // A file **smaller** than its cursor was truncated or rewritten shorter, and the cursor
   // now points past the end of a log that no longer holds what it was counting.
   //

@@ -16,9 +16,9 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   panel keeps the last reading taken with that sign-in. A Status line under it says the login
   expired and names the command that renews it. Agents in a room are not sent that reading as
   a new one. With no earlier reading, the panel says the login expired and names the command.
-  The kept reading lives only while Gyredeck runs, so while Gyredeck stays open and the CLI is
-  not started, usage stays at that reading; after Gyredeck restarts, it shows the message
-  instead.
+  Once a sign-in expires, Gyredeck can keep that reading while it remains open; after a
+  restart, it has no kept reading and shows the expired-login message until the CLI renews the
+  sign-in.
 - **Antigravity's sign-in is only read, too.** Gyredeck used to renew it in memory when given a
   Google OAuth client, in `~/.config/gyredeck/agy-google-oauth.json` or in
   `GYREDECK_AGY_GOOGLE_CLIENT_ID` and `GYREDECK_AGY_GOOGLE_CLIENT_SECRET`. Those settings are

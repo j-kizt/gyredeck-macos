@@ -13800,8 +13800,11 @@ test("#259 C1 C2 C3 C7: Codex confirmed through notify carries the line in its c
     assert.equal(accepted.body.transitioned, true, "premise: this let it in");
     const confirmed = /you are confirmed in room/;
     const after = await until(async () => { const m = await f.messagesTo(codex); return m.some((message) => confirmed.test(message)) && m; }, "the confirming push");
-    assert.equal(after.length, before + 1, "C7: one push, the confirmation");
     const confirming = after.at(-1);
+    // Each push is its own `codex queue` process, so one the join sent late lands after the
+    // count above and reads as a second confirmation push (#329: before #339, a join also
+    // pushed the password notice). Shown by its words, so a failure names the extra push.
+    assert.deepEqual(after.slice(before).map((message) => message.slice(0, 60)), [confirming.slice(0, 60)], "C7: one push, the confirmation");
     assert.match(confirming, confirmed, "premise: the confirming push");
     assert.equal(heavyCount(confirming), 1, "C1: the line, once");
     assert.ok(confirming.includes(heavyLineFor("codex", codex)), "C3: heavyHint with its own id");
@@ -13811,6 +13814,8 @@ test("#259 C1 C2 C3 C7: Codex confirmed through notify carries the line in its c
     const later = await until(async () => { const m = await f.messagesTo(codex); return m.length > after.length && m; }, "the later push");
     assert.match(later.at(-1), /later/);
     assert.equal(heavyCount(later.at(-1)), 0, "C2: not again");
+    // By now any push the join sent has long landed, so this holds or fails by the code.
+    assert.equal(later.filter((message) => /you have been put in a room here/.test(message)).length, 0, "#339: the quiet join notice pushes nothing to the member still waiting for the password");
   } finally {
     await f.close();
   }

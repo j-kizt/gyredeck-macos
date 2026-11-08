@@ -71,12 +71,19 @@ const assetRoot = join(distRoot, "assets");
  * Dependabot #367 (@types/node, discord.js, lucide-react, @vitejs/plugin-react) measured
  * 120,368 on main's 120,353 (+15); 120,370 keeps main's 2. Raised by the owner at the
  * terminal on 2026-11-08 ("raise the ceiling").
+ *
+ * #207 (approval codes from Discord: the Settings row that sets them up, shows the QR once and unlocks
+ * them) measured 121,022 / 124,098 locally (Node 22.16), +654 on main's 120,368, and 121,036 /
+ * 124,115 on CI (Node 22.23): gzip output differs between Node versions on the same build, and
+ * CI's is the one that gates. 121,038 and 124,117 leave 2 each on CI.
+ * Raised by the owner's decision, "A" from Discord on 2026-11-08, and to CI's measure at the
+ * terminal the same day.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 120_370,
-  jsTotalGzipBytes: 123_454,
+  jsGzipBytes: 121_038,
+  jsTotalGzipBytes: 124_117,
 };
 
 const walk = async (directory) => {

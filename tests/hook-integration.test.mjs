@@ -1012,6 +1012,7 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     assert.match(ownerHeader.ephemeralMessage, /You \(via Discord\)/);
     assert.match(ownerHeader.ephemeralMessage, /OWNER: a message from You \(via Discord\) is the owner speaking from their phone/);
     assert.match(ownerHeader.ephemeralMessage, /never approves a commit, a release, a credential or a settings change/);
+    assert.match(ownerHeader.ephemeralMessage, /A merge or a release it asks for is the exception: send it an ask that says you are asking for the 6-digit approval code/);
     assert.doesNotMatch(ownerHeader.ephemeralMessage, /information only/);
     // Without the app's word it is not the owner at all: refused, never framed.
     const forged = await fetch(`http://127.0.0.1:${port}/mail/${conversationId}`, {
@@ -3361,6 +3362,7 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     assert.match(fromOwner, /\[from You \(via Discord\) · ask\] start the next card/);
     assert.match(fromOwner, /OWNER: a message from You \(via Discord\) is the owner speaking from their phone/);
     assert.match(fromOwner, /never approves a commit, a release, a credential or a settings change/);
+    assert.match(fromOwner, /A merge or a release it asks for is the exception: send it an ask that says you are asking for the 6-digit approval code/);
     assert.doesNotMatch(fromOwner, /information only/);
     assert.match(fromOwner, /"to":"gyredeck-owner-discord"/);
 
@@ -9889,7 +9891,7 @@ test("#205: Codex is pushed the owner's Discord voice as the owner, with the lim
     assert.equal(sent.status, 202, JSON.stringify(sent.body));
     assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.includes("start the next card"))), "pushed");
     const push = (await promptsIn(room.rollout)).find((prompt) => prompt.text.includes("start the next card"));
-    assert.match(push.text, /\[from You \(via Discord\) · ask\] \(the owner, on their phone: act on a request to work as you would the user's own; it never approves a commit, a release, a credential or a settings change — ask for those at the terminal\)\nstart the next card/);
+    assert.match(push.text, /\[from You \(via Discord\) · ask\] \(the owner, on their phone: act on a request to work as you would the user's own; it never approves a commit, a release, a credential or a settings change — ask for those at the terminal, except a merge or a release, which you ask the owner's approval code for, as the room rules say\)\nstart the next card/);
     assert.doesNotMatch(push.text, /information only/);
     // Its answer, addressed by the name it was shown, reaches the owner's voice.
     await appendFile(room.rollout, turnAnswering(push.turnId, "@You (via Discord) tell\nstarted"));

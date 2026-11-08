@@ -35,8 +35,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::standalone_bridge::{self, SupervisorLog};
 
+mod approvals;
 mod journal;
 mod secrets;
+mod totp;
+
+use approvals::{Approval, Requested};
 
 pub(crate) const KEYCHAIN_SERVICE: &str = "Gyredeck Discord";
 pub(crate) const KEYCHAIN_ACCOUNT: &str = "bot-token";
@@ -45,6 +49,10 @@ const CONFIG_FORUM: &str = "discordForumId";
 /// any process of this user can write: the owner is who #205 lets give commands. These are
 /// the config keys earlier builds kept it under; they are never read, and deleted on start.
 const KEYCHAIN_OWNER_ACCOUNT: &str = "owner";
+/// The approval code's secret and its use (#207): one JSON record, [`totp::Record`].
+const KEYCHAIN_APPROVAL_ACCOUNT: &str = "approval-code";
+#[cfg(target_os = "macos")]
+const KEYCHAIN_APPROVAL_MOVED: &str = "moved-approval-code";
 /// Set once the token and owner left by an ad-hoc build were moved to the team's group (#288).
 #[cfg(target_os = "macos")]
 const KEYCHAIN_MOVED: &str = "moved-bot-token";
@@ -258,6 +266,14 @@ pub(crate) enum ToChild {
         /// The asker marked this ask yes/no: ✅/❌ on Discord answers it (#205).
         #[serde(rename = "yesNo", skip_serializing_if = "std::ops::Not::not")]
         yes_no: bool,
+        /// An ask to the owner for an approval code (#207): the child asks for the code on it.
+        /// Never journalled, so a request relayed again after a relaunch takes no code.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval: Option<Approval>,
+        /// The request came while [`approvals::REQUESTS_MAX`] were open: its text says it cannot be
+        /// approved from Discord, the child adds no ask for the code, and still keeps one off the room.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        withheld: bool,
     },
     /// `id` names this close, so `closed` clears this one and not another of the instance.
     Disconnect { room: String, reason: DisconnectReason, id: String },
@@ -427,6 +443,8 @@ enum FromChild {
     Error { code: String, message: String },
     /// The owner typed in a followed post, or reacted to a relayed message (#205).
     Say(Say),
+    /// The owner replied to an approval request with six digits (#207).
+    Approve(Approve),
     #[serde(rename = "disconnect_request")]
     #[serde(rename_all = "camelCase")]
     DisconnectRequest {
@@ -482,6 +500,56 @@ struct Say {
     /// Sent again by a child that found it saved without a receipt.
     #[serde(default)]
     retry: bool,
+}
+
+/// Six digits or more in all, whatever separates them: a code typed with words or marks around
+/// it is still a code, so no separator can carry one into the room (#207, Gyre Audit r1–r2).
+fn holds_code(text: &str) -> bool {
+    text.chars().filter(|ch| ch.is_numeric()).count() >= 6
+}
+
+/// What Settings shows once while the approval code is set up (#207).
+#[derive(Debug, Serialize)]
+pub(crate) struct ApprovalSetup {
+    pub svg: String,
+    /// The same secret in base32, for an app that cannot scan.
+    pub secret: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ApprovalState {
+    Off,
+    SettingUp,
+    On,
+    Locked,
+    Unreadable,
+}
+
+/// The six digits, kept out of every `Debug` print.
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct Code(String);
+
+impl fmt::Debug for Code {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Code(…)")
+    }
+}
+
+/// The connector is trusted to say which request a reply answered (`replyToSeq`); `approval`
+/// is what it remembers that request asked for, and must equal what this side relayed, so a
+/// reply mapped to the wrong request is refused rather than approving it (#207).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Approve {
+    room: String,
+    thread_id: String,
+    discord_message_id: String,
+    owner_id: String,
+    reply_to_seq: u64,
+    code: Code,
+    approval: serde_json::Value,
 }
 
 // ── the shared state ──
@@ -591,6 +659,9 @@ struct RoomFeed {
     /// When this Connect began: only what is heard after it counts toward quiet.
     connected_at: Instant,
     quiet_said: bool,
+    /// The approval requests relayed from this instance, by seq (#207): a code is checked only
+    /// against one of these, so a closed or reconnected room takes none.
+    approvals: HashMap<u64, Requested>,
 }
 
 /// What the bridge's event stream last said of a session (#205).
@@ -645,6 +716,7 @@ impl RoomFeed {
             agents: Vec::new(),
             connected_at: Instant::now(),
             quiet_said: false,
+            approvals: HashMap::new(),
         }
     }
 
@@ -718,6 +790,8 @@ fn notice(room: &str, seq: u64, text: String) -> ToChild {
         sender_id: None,
         to_owner: false,
         yes_no: false,
+        approval: None,
+        withheld: false,
     }
 }
 
@@ -735,9 +809,15 @@ fn loss_text(n: u64, label: &str) -> String {
     format!("{n} line{} {} {label}", plural(n), if n == 1 { "was" } else { "were" })
 }
 
+const RELAYED_AGAIN: &str = "It was relayed again after Gyredeck restarted";
+const TOO_MANY_OPEN: &str = "Too many approval requests are open in this room";
+
+/// A request is journalled as its act alone: relayed again after a relaunch it takes no code, so
+/// the asker's words asking for one are not what is shown (#207).
 fn line_record(line: &ToChild) -> Option<journal::Record> {
     match line.clone() {
-        ToChild::Message { seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, .. } => {
+        ToChild::Message { seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, approval, .. } => {
+            let text = approval.map_or(text, |approval| approval.not_approvable(RELAYED_AGAIN));
             Some(journal::Record::Line { seq, sender, to, kind, text, ts, through: None, sender_id, to_owner, yes_no })
         }
         _ => None,
@@ -747,7 +827,7 @@ fn line_record(line: &ToChild) -> Option<journal::Record> {
 fn item_line(room: &str, item: journal::Item) -> ToChild {
     match item {
         journal::Item::Line { seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, .. } => {
-            ToChild::Message { room: room.to_string(), seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no }
+            ToChild::Message { room: room.to_string(), seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, approval: None, withheld: false }
         }
         journal::Item::Loss { seq, n, label, .. } => notice(room, seq, loss_text(n, &label)),
     }
@@ -2119,6 +2199,8 @@ pub(crate) struct OwnerPost {
     pub kind: String,
     pub text: String,
     pub in_reply_to: Option<u64>,
+    /// What an approval code approved (#207); the bridge takes it only from the app.
+    pub approved: Option<Approval>,
 }
 
 /// Why the bridge did not publish an owner post, and who could have been written to.
@@ -2142,6 +2224,8 @@ pub(crate) struct Deps {
     pub settings: Arc<dyn SettingsStore>,
     pub owners: Arc<dyn OwnerStore>,
     pub losses: Arc<dyn LossStore>,
+    /// The approval code's record (#207), one JSON value like the losses'.
+    pub approvals: Arc<dyn LossStore>,
     pub source: Arc<dyn RoomSource>,
     pub acts: Arc<dyn RoomActs>,
     pub state_path: PathBuf,
@@ -2172,6 +2256,10 @@ pub(crate) struct Core {
     owners: Arc<dyn OwnerStore>,
     /// A /status being answered; the next is refused until it is (#206 audit).
     status_busy: AtomicBool,
+    approvals: Arc<dyn LossStore>,
+    /// Held from reading the approval record to the stamp, so two codes are never checked at
+    /// once (#207). Holds the secret being set up, in hex, until a code from it verifies.
+    approval_gate: Mutex<Option<String>>,
 }
 
 pub(crate) struct DiscordState {
@@ -2192,6 +2280,7 @@ impl Default for DiscordState {
             settings: Arc::new(ConfigSettings),
             owners: Arc::new(KeychainOwner),
             losses: Arc::new(KeychainLosses),
+            approvals: Arc::new(KeychainApprovals),
             source: Arc::new(BridgeSource { target: None }),
             acts: Arc::new(BridgeActs),
             state_path: crate::home_dir()
@@ -2274,6 +2363,8 @@ impl DiscordState {
             source: Arc::clone(&deps.source),
             owners: Arc::clone(&deps.owners),
             status_busy: AtomicBool::new(false),
+            approvals: Arc::clone(&deps.approvals),
+            approval_gate: Mutex::new(None),
         });
         Self {
             hub,
@@ -2519,6 +2610,7 @@ impl DiscordState {
         self.deps.owners.delete()?;
         // Remove is the one way a kept loss is let go unsaid.
         self.deps.losses.delete()?;
+        self.core.forget_approvals()?;
         self.deps.settings.set(&[(CONFIG_FORUM, None)])?;
         let mut hub = lock(&self.hub);
         let leaving = std::mem::take(&mut hub.leaving);
@@ -2538,6 +2630,22 @@ impl DiscordState {
             return Err(format!("Discord was removed, but {}", failed.join("; ")));
         }
         Ok(self.status())
+    }
+
+    pub(crate) fn setup_approvals(&self) -> Result<ApprovalSetup, String> {
+        self.core.setup_approvals()
+    }
+
+    pub(crate) fn confirm_approvals(&self, code: &str) -> Result<(), String> {
+        self.core.confirm_approvals(code)
+    }
+
+    pub(crate) fn unlock_approvals(&self) -> Result<(), String> {
+        self.core.unlock_approvals()
+    }
+
+    pub(crate) fn approvals_state(&self) -> Result<ApprovalState, String> {
+        self.core.approvals_state()
     }
 
     /// Follow a room this app founded on Discord: join it as the relay, then read it.
@@ -2861,7 +2969,165 @@ impl Core {
             _ if to == "everyone" => "tell".to_string(),
             _ => "ask".to_string(),
         };
-        Ok((word, OwnerPost { discord_message_id: say.discord_message_id.clone(), to, kind, text: say.text.clone(), in_reply_to: say.reply_to_seq }))
+        // A code that reached here as text never enters the room (#207).
+        if let Some(seq) = say.reply_to_seq {
+            let request = lock(&self.hub).rooms.get(&say.room).is_some_and(|feed| feed.approvals.contains_key(&seq));
+            if request && holds_code(&say.text) {
+                return Err("That looks like it holds an approval code, so it was not sent to the room. Reply with the 6 digits alone".to_string());
+            }
+        }
+        Ok((word, OwnerPost { discord_message_id: say.discord_message_id.clone(), to, kind, text: say.text.clone(), in_reply_to: say.reply_to_seq, approved: None }))
+    }
+
+    /// The owner's approval code (#207): checked as a `say` is, then against the request it
+    /// answers and the secret in the Keychain. The code goes no further than this: the room
+    /// gets the stamp, and the child only whether it held.
+    fn approve(&self, approve: Approve) {
+        let id = approve.discord_message_id.clone();
+        let answer = match self.check_approve(&approve) {
+            Ok(seq) => ToChild::Said { discord_message_id: id, ok: true, seq: Some(seq), error: None, names: None },
+            Err(error) => ToChild::Said { discord_message_id: id, ok: false, seq: None, error: Some(error), names: None },
+        };
+        lock(&self.hub).send(&answer);
+    }
+
+    fn check_approve(&self, approve: &Approve) -> Result<u64, String> {
+        const GONE: &str = "This room is no longer connected to Discord, so the code was not checked";
+        const STALE: &str = "That approval request has expired or was already answered, so the code was not checked. Ask for the approval again";
+        if !valid_snowflake(&approve.discord_message_id) {
+            return Err("That is not a Discord message, so the code was not checked".to_string());
+        }
+        let now_ms = unix_ms();
+        if !approvals::snowflake_age_ms(&approve.discord_message_id, now_ms).is_some_and(|age| age <= approvals::CODE_FRESH_MS) {
+            return Err("That code was sent too long ago, so it was not checked. Ask for the approval again".to_string());
+        }
+        let echo = Approval::parse(&approve.approval).ok_or(STALE)?;
+        let (word, thread) = {
+            let hub = lock(&self.hub);
+            let feed = hub.rooms.get(&approve.room).ok_or(GONE)?;
+            (feed.word.clone(), feed.thread_id.clone())
+        };
+        if thread.as_deref() != Some(approve.thread_id.as_str()) {
+            return Err("This is not the room's post, so the code was not checked".to_string());
+        }
+        if word.is_empty() {
+            return Err(GONE.to_string());
+        }
+        self.keychain_owner(&approve.owner_id)?;
+        let gate = self.approval_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Read under the gate: a code checked a moment ago may have used this request.
+        let requested = lock(&self.hub)
+            .rooms
+            .get(&approve.room)
+            .and_then(|feed| feed.approvals.get(&approve.reply_to_seq))
+            .filter(|requested| requested.live(Instant::now()) && requested.approval == echo)
+            .cloned()
+            .ok_or(STALE)?;
+        let mut record = match self.approvals.read() {
+            Ok(Some(bytes)) => serde_json::from_slice::<totp::Record>(&bytes)
+                .map_err(|_| "The saved approval code cannot be read, so nothing was approved. Set it up again in Settings → Permission".to_string())?,
+            Ok(None) => return Err("Approval codes are not set up, so nothing was approved. Set one up in Gyredeck's Settings → Permission".to_string()),
+            Err(why) => return Err(format!("Gyredeck could not read the approval code from the Keychain ({why}), so nothing was approved")),
+        };
+        let verdict = record.check(&approve.code.0, now_ms / 1000);
+        if matches!(verdict, totp::Verdict::Approved | totp::Verdict::Wrong { .. }) {
+            // The use is saved before anything is approved, so a relaunch cannot approve twice.
+            let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+            self.approvals
+                .write(&bytes)
+                .map_err(|why| format!("Gyredeck could not save the approval code's use in the Keychain ({why}), so nothing was approved"))?;
+        }
+        match verdict {
+            totp::Verdict::Approved => {}
+            totp::Verdict::Reused => return Err("That code was already used, so nothing was approved. Wait for the next one".to_string()),
+            totp::Verdict::Wrong { locked: false } => {
+                let left = totp::LOCK_AFTER - record.failures;
+                return Err(format!("That code is not right, so nothing was approved. {left} more wrong code{} lock{} approvals", plural(u64::from(left)), if left == 1 { "s" } else { "" }));
+            }
+            totp::Verdict::Wrong { locked: true } | totp::Verdict::Locked => {
+                return Err("Approvals are locked after three wrong codes. Unlock them in Gyredeck's Settings → Permission on the Mac".to_string());
+            }
+            totp::Verdict::Malformed => return Err("That is not a 6-digit code, so it was not checked".to_string()),
+        }
+        if let Some(entry) = lock(&self.hub).rooms.get_mut(&approve.room).and_then(|feed| feed.approvals.get_mut(&approve.reply_to_seq)) {
+            entry.used = true;
+        }
+        let post = OwnerPost {
+            discord_message_id: approve.discord_message_id.clone(),
+            to: requested.requester,
+            kind: "tell".to_string(),
+            text: format!("Approved with the code: {}", echo.describe()),
+            in_reply_to: Some(approve.reply_to_seq),
+            approved: Some(echo),
+        };
+        let posted = self.acts.post_owner(&approve.room, &post, &word);
+        drop(gate);
+        posted.map_err(|refused| format!("The code was right, but the room did not take the approval ({}). Ask for the approval again", refused.message))
+    }
+
+    /// Starts setting up the approval code (#207), or again: the saved record is deleted first,
+    /// and nothing new is shown unless it went, so a relaunch before the new code verifies
+    /// leaves approvals off rather than the old secret working (Gyre Audit, seq 18).
+    fn setup_approvals(&self) -> Result<ApprovalSetup, String> {
+        let mut gate = self.approval_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *gate = None;
+        self.approvals.delete()?;
+        let secret_hex = random_hex(totp::SECRET_BYTES)?;
+        let secret = totp::from_hex(&secret_hex).ok_or("No randomness for an approval code")?;
+        let uri = totp::otpauth_uri(&secret);
+        let qr = qrcode::QrCode::new(uri.as_bytes()).map_err(|error| error.to_string())?;
+        let svg = qr.render::<qrcode::render::svg::Color<'_>>().min_dimensions(192, 192).quiet_zone(true).build();
+        *gate = Some(secret_hex);
+        Ok(ApprovalSetup { svg, secret: totp::base32(&secret) })
+    }
+
+    /// The first code from the secret being set up turns approvals on; its step is used.
+    fn confirm_approvals(&self, code: &str) -> Result<(), String> {
+        let mut gate = self.approval_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let secret_hex = gate.clone().ok_or("Start the setup again: there is no code being set up")?;
+        let mut record = totp::Record::new(secret_hex);
+        match record.check(code.trim(), unix_ms() / 1000) {
+            totp::Verdict::Approved => {}
+            totp::Verdict::Malformed => return Err("Type the 6 digits your authenticator app shows".to_string()),
+            _ => return Err("That code is not right. Check the time on your phone and try the next one".to_string()),
+        }
+        let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+        self.approvals.write(&bytes).map_err(|why| format!("Could not save the approval code in the Keychain: {why}"))?;
+        *gate = None;
+        Ok(())
+    }
+
+    fn unlock_approvals(&self) -> Result<(), String> {
+        let _gate = self.approval_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(bytes) = self.approvals.read()? else {
+            return Err("Approval codes are not set up".to_string());
+        };
+        let mut record: totp::Record = serde_json::from_slice(&bytes).map_err(|_| "The saved approval code cannot be read. Set it up again".to_string())?;
+        record.unlock();
+        let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+        self.approvals.write(&bytes).map_err(|why| format!("Could not save the approval code in the Keychain: {why}"))
+    }
+
+    fn approvals_state(&self) -> Result<ApprovalState, String> {
+        let gate = self.approval_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if gate.is_some() {
+            return Ok(ApprovalState::SettingUp);
+        }
+        Ok(match self.approvals.read()? {
+            None => ApprovalState::Off,
+            Some(bytes) => match serde_json::from_slice::<totp::Record>(&bytes) {
+                Ok(record) if record.locked => ApprovalState::Locked,
+                Ok(_) => ApprovalState::On,
+                Err(_) => ApprovalState::Unreadable,
+            },
+        })
+    }
+
+    /// Remove's part (#207): the record goes, and a setup in progress with it.
+    fn forget_approvals(&self) -> Result<(), String> {
+        let mut gate = self.approval_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *gate = None;
+        self.approvals.delete()
     }
 }
 
@@ -2892,6 +3158,13 @@ fn not_relayed<'a>(lines: impl IntoIterator<Item = &'a ToChild>) -> Option<Strin
         index += 1;
     }
     (!ranges.is_empty()).then(|| format!("{} from {}", ranges.join(", "), senders.join(", ")))
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|at| u64::try_from(at.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 fn random_hex(bytes: usize) -> Result<String, String> {
@@ -3066,6 +3339,11 @@ fn on_core_event_from(core: &Arc<Core>, epoch: u64, event: FromChild) {
                 core.say(say);
             }
         }
+        FromChild::Approve(approve) => {
+            if lock(&core.hub).epoch == epoch {
+                core.approve(approve);
+            }
+        }
         FromChild::DisconnectRequest { room, all, owner_id, thread_id, created_at, quiet } => {
             if lock(&core.hub).epoch == epoch {
                 core.disconnect_requested(room, all, &owner_id, thread_id.as_deref(), created_at, quiet);
@@ -3190,7 +3468,7 @@ fn on_child_event_from(hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64, ev
                 }
             }
         }
-        FromChild::Connected { .. } | FromChild::Say(_) | FromChild::DisconnectRequest { .. } | FromChild::StatusRequest { .. } => {}
+        FromChild::Connected { .. } | FromChild::Say(_) | FromChild::Approve(_) | FromChild::DisconnectRequest { .. } | FromChild::StatusRequest { .. } => {}
     }
 }
 
@@ -3244,6 +3522,8 @@ struct WireMessage {
     /// Kept only when it is `true` on an ask; any other value is no flag (#205).
     #[serde(default, rename = "yesNo")]
     yes_no: Option<serde_json::Value>,
+    #[serde(default)]
+    approval: Option<serde_json::Value>,
 }
 
 impl RoomReader {
@@ -3502,18 +3782,37 @@ impl RoomReader {
         // The person, by either of their voices: an ask to them is the one that pings (#205).
         let to_owner = kind == "ask" && matches!(message.to.as_deref(), Some(OWNER_SENDER | APP_SENDER));
         let yes_no = kind == "ask" && message.yes_no == Some(serde_json::Value::Bool(true));
-        let forwarded = lock(&self.hub).forward(ToChild::Message {
+        let approval = if kind == "ask" && message.to.as_deref() == Some(OWNER_SENDER) {
+            message.approval.as_ref().and_then(Approval::parse)
+        } else {
+            None
+        };
+        let mut hub = lock(&self.hub);
+        let withheld = approval.is_some() && !hub.rooms.get_mut(&self.room).is_some_and(|feed| approvals::make_room(&mut feed.approvals, Instant::now()));
+        let requested = approval.clone().map(|approval| Requested { approval, requester: message.from.clone(), read_at: Instant::now(), used: withheld });
+        let text = match &approval {
+            Some(approval) if withheld => approval.not_approvable(TOO_MANY_OPEN),
+            _ => message.text,
+        };
+        let forwarded = hub.forward(ToChild::Message {
             room: self.room.clone(),
             seq: message.seq,
             sender,
             to,
             kind,
-            text: message.text,
+            text,
             ts: message.ts.unwrap_or_default(),
             sender_id: Some(message.from),
             to_owner,
             yes_no,
+            approval,
+            withheld,
         });
+        // Only a line taken now is a request: a seq seen before keeps what it had, used or not.
+        if let (Forwarded::Taken, Some(requested), Some(feed)) = (&forwarded, requested, hub.rooms.get_mut(&self.room)) {
+            feed.approvals.insert(message.seq, requested);
+        }
+        drop(hub);
         // The room's notices are where joins and departures are said.
         if from_room {
             self.refresh_names();
@@ -3903,6 +4202,41 @@ impl LossStore for KeychainLosses {
     }
 }
 
+struct KeychainApprovals;
+
+impl LossStore for KeychainApprovals {
+    fn read(&self) -> Result<Option<Vec<u8>>, String> {
+        #[cfg(target_os = "macos")]
+        {
+            keychain_read(KEYCHAIN_APPROVAL_ACCOUNT, KEYCHAIN_APPROVAL_MOVED).map_err(|refusal| refusal.why)
+        }
+        #[cfg(not(target_os = "macos"))]
+        Ok(None)
+    }
+
+    fn write(&self, value: &[u8]) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            secrets::write(&TeamSlot(KEYCHAIN_APPROVAL_ACCOUNT), &TeamSlot(KEYCHAIN_APPROVAL_MOVED), &FileSlot(KEYCHAIN_APPROVAL_ACCOUNT), value)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = value;
+            Err("Keychain writes require macOS".to_string())
+        }
+    }
+
+    fn delete(&self) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            secrets::delete(&TeamSlot(KEYCHAIN_APPROVAL_ACCOUNT), &TeamSlot(KEYCHAIN_APPROVAL_MOVED), &FileSlot(KEYCHAIN_APPROVAL_ACCOUNT))
+                .map_err(|why| format!("Could not remove the approval code from the Keychain: {why}"))
+        }
+        #[cfg(not(target_os = "macos"))]
+        Ok(())
+    }
+}
+
 struct KeychainOwner;
 
 impl OwnerStore for KeychainOwner {
@@ -4028,6 +4362,9 @@ pub(crate) fn post_owner_to(target: &standalone_bridge::BridgeTarget, room: &str
     });
     if let Some(seq) = post.in_reply_to {
         body["inReplyTo"] = serde_json::Value::from(seq);
+    }
+    if let Some(approved) = &post.approved {
+        body["approved"] = serde_json::to_value(approved).unwrap_or_default();
     }
     let (status, value) = standalone_bridge::bridge_request_to(target, "POST", &format!("/mail/{room}"), Some(body.to_string()), Duration::from_secs(3), Some(app_word))
         .map_err(|error| Refused { message: format!("Gyredeck could not reach its bridge: {error}"), names: None })?;

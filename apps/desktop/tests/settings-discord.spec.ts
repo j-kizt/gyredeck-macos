@@ -26,6 +26,8 @@ type Status = {
   droppedLines?: Record<string, string>;
   /** The mock's own switch: a leave the bridge refuses. */
   failLeave?: boolean;
+  /** The mock's own: what `discord_approvals` answers (#207). */
+  approvals?: string;
 };
 type Call = { command: string; args?: Record<string, unknown> };
 
@@ -102,6 +104,14 @@ const mock = async (page: Page, status: Status) => {
           delete state.leaving?.[String(args?.code)];
           return after();
         }
+        if (command === "discord_approvals") return state.approvals ?? "off";
+        if (command === "discord_approvals_setup") { state.approvals = "settingUp"; return { svg: "<svg xmlns='http://www.w3.org/2000/svg' width='192' height='192'><rect width='192' height='192'/></svg>", secret: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" }; }
+        if (command === "discord_approvals_confirm") {
+          if (args?.code !== "287082") throw new Error("That code is not right. Type the code your authenticator app shows now");
+          state.approvals = "on";
+          return null;
+        }
+        if (command === "discord_approvals_unlock") { state.approvals = "on"; return null; }
         if (command === "discord_connect") { state.connectedRooms.push(String(args?.code)); return after(); }
         if (command === "discord_disconnect") { state.connectedRooms = state.connectedRooms.filter((code) => code !== args?.code); return after(); }
         throw new Error(`${command} unavailable`);
@@ -467,4 +477,85 @@ test("an unrecorded loss is shown even with no token saved, and goes with Remove
   await page.getByRole("button", { name: "Remove" }).first().click();
   await page.getByRole("button", { name: "Remove Discord" }).click();
   await expect(rows).toHaveCount(0);
+});
+
+// #207: the approval code is set up here, once, and only for a paired owner.
+const SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+test("approval code: shown only once an owner is paired", async ({ page }) => {
+  await open(page, withBot({ forums: [FORUM], forumId: FORUM.id, pairingCode: "482913" }));
+  await expect(row(page, "owner")).toBeVisible();
+  await expect(row(page, "approvals")).toHaveCount(0);
+});
+
+test("approval code: Set up shows the QR and the secret once, a wrong code keeps them, the right one turns it on", async ({ page }) => {
+  await open(page, paired());
+  const approvals = row(page, "approvals");
+  await expect(approvals.locator(".setup-detail").first()).toHaveText("Approve a merge or a release from Discord with a code from an authenticator app");
+  await approvals.getByRole("button", { name: "Set up" }).click();
+  await expect(approvals.getByRole("img", { name: "Approval code QR" })).toBeVisible();
+  await expect(approvals.getByLabel("Approval code secret")).toHaveText(SECRET);
+  const field = approvals.getByLabel("Approval code", { exact: true });
+  await field.fill("111111");
+  await approvals.getByRole("button", { name: "Turn on" }).click();
+  await expect(row(page, "bot").getByRole("status")).toContainText("That code is not right");
+  await expect(field).toHaveValue("");
+  await expect(approvals.getByLabel("Approval code secret")).toHaveText(SECRET);
+  await field.fill("287082");
+  await approvals.getByRole("button", { name: "Turn on" }).click();
+  await expect(approvals.locator(".setup-detail").first()).toHaveText("On. A merge or a release asked for in Discord waits for a code");
+  await expect(approvals.getByRole("button", { name: "Reset" })).toBeVisible();
+  expect(await page.content()).not.toContain(SECRET);
+  expect((await commands(page, "discord_approvals_confirm")).map((call) => call.args)).toEqual([{ code: "111111" }, { code: "287082" }]);
+});
+
+test("approval code: locked offers Unlock and nothing else", async ({ page }) => {
+  await open(page, paired({ approvals: "locked" }));
+  const approvals = row(page, "approvals");
+  await expect(approvals.locator(".setup-detail").first()).toHaveText("Locked after three wrong codes. Nothing can be approved from Discord until you unlock it");
+  await expect(approvals.getByRole("button")).toHaveText(["Unlock"]);
+  await approvals.getByRole("button", { name: "Unlock" }).click();
+  await expect(approvals.getByRole("button", { name: "Reset" })).toBeVisible();
+  expect(await commands(page, "discord_approvals_unlock")).toHaveLength(1);
+});
+
+test("approval code: a setup left unfinished, as after a relaunch, offers Set up and no secret", async ({ page }) => {
+  await open(page, paired({ approvals: "settingUp" }));
+  const approvals = row(page, "approvals");
+  await expect(approvals.locator(".setup-detail").first()).toHaveText("Setup was not finished. Set it up again");
+  await expect(approvals.getByRole("button")).toHaveText(["Set up"]);
+  await expect(approvals.locator(".setup-qr, .setup-secret")).toHaveCount(0);
+});
+
+test.describe("approval code at 444 × 560", () => {
+  test.use({ viewport: { width: 444, height: 560 } });
+
+  test("the setup row with its QR, secret and code field stays inside its box, below the owner row", async ({ page }) => {
+    await open(page, paired({ owner: { id: "u1", username: LONG_BOT.username } }));
+    const approvals = row(page, "approvals");
+    await approvals.getByRole("button", { name: "Set up" }).click();
+    await expect(approvals.getByRole("img", { name: "Approval code QR" })).toBeVisible();
+    await approvals.scrollIntoViewIfNeeded();
+    const boxes = await approvals.evaluate((element) => {
+      const rect = (node: Element | null) => {
+        if (!node) throw new Error("not laid out");
+        const { x, y, width, height } = node.getBoundingClientRect();
+        return { x, y, width, height };
+      };
+      return {
+        row: rect(element),
+        owner: rect(document.querySelector(".setup-row[data-discord='owner']")),
+        parts: [".setup-copy", ".setup-qr", ".setup-secret", ".setup-input", ".setup-row-actions .pill-btn"].map((selector) => ({ name: selector, ...rect(element.querySelector(selector)) })),
+        overflow: [element, ...element.querySelectorAll<HTMLElement>("*")].filter((node) => !(node instanceof SVGElement) && node.scrollWidth > node.clientWidth).map((node) => node.className),
+      };
+    });
+    expect(boxes.row.y).toBeGreaterThanOrEqual(boxes.owner.y + boxes.owner.height);
+    for (const part of boxes.parts) {
+      expect(part.x, part.name).toBeGreaterThanOrEqual(boxes.row.x);
+      expect(part.x + part.width, part.name).toBeLessThanOrEqual(boxes.row.x + boxes.row.width + 0.5);
+      expect(part.y, part.name).toBeGreaterThanOrEqual(boxes.row.y);
+      expect(part.y + part.height, part.name).toBeLessThanOrEqual(boxes.row.y + boxes.row.height + 0.5);
+    }
+    expect(boxes.overflow).toEqual([]);
+  });
 });

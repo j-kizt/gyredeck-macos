@@ -95,10 +95,28 @@ export function formatMessage(m, delayed, mention = null) {
   if (m.kind === "notice") {
     return { username: "Room", content: delayed ? `(delayed)\n${m.text}` : m.text };
   }
+  const ask = m.approval && !m.withheld ? `\n\n${approvalAsk(m.approval)}` : "";
   return {
     username: webhookName(m.sender),
-    content: `${mention ? `<@${mention}> ` : ""}→ ${m.to} · ${m.kind}${delayed ? " (delayed)" : ""}\n${m.text}`,
+    content: `${mention ? `<@${mention}> ` : ""}→ ${m.to} · ${m.kind}${delayed ? " (delayed)" : ""}\n${m.text}${ask}`,
   };
+}
+
+/** What an approval request asks the owner to approve (#207), in the one form the app checks,
+ *  or null for anything else. */
+export function approvalOf(a) {
+  if (!a || typeof a !== "object" || typeof a.sha !== "string" || !/^[0-9a-f]{40}$/.test(a.sha)) return null;
+  if (a.action === "merge" && Number.isInteger(a.pr) && a.pr > 0) return { action: "merge", pr: a.pr, sha: a.sha };
+  if (a.action === "release" && typeof a.version === "string" && /^(0|[1-9]\d{0,4})(\.(0|[1-9]\d{0,4})){2}$/.test(a.version)) {
+    return { action: "release", version: a.version, sha: a.sha };
+  }
+  return null;
+}
+
+/** The line under an approval request that says outright it asks for the code (#207). */
+export function approvalAsk(a) {
+  const act = a.action === "merge" ? `merge PR #${a.pr}` : `release v${a.version}`;
+  return `Reply to this message with the 6-digit approval code to ${act} at ${a.sha.slice(0, 12)}.`;
 }
 
 export function postName(code) {
@@ -158,6 +176,9 @@ export function createConnector({ discord, out, clock = realClock }) {
   let gatewayEpoch = 0;
   // Owner messages sent to the room, by Discord id → whether the "edits" note was posted.
   const spoken = new Map();
+  // Approval codes sent to the app, by Discord id, for where its answer goes. Memory only:
+  // nothing about a code is saved (#207).
+  const approving = new Map();
   // Rooms whose saved says this child has sent again since it started.
   const resaid = new Set();
 
@@ -285,6 +306,19 @@ export function createConnector({ discord, out, clock = realClock }) {
     const rs = state.rooms[code];
     const body = String(p.text ?? "").trim();
     const relayed = p.replyToId ? (rs.relayed ?? []).find((r) => r.id === p.replyToId) : null;
+    // A code answering an approval request goes to the app to check and nowhere else: never
+    // saved, never said to the room (#207).
+    const typed = body.replace(/[\s-]/g, "");
+    if (relayed?.approval && /^[0-9]{6}$/.test(typed)) {
+      approving.set(p.messageId, { room: code, threadId: p.channelId });
+      while (approving.size > SPOKEN_MAX) approving.delete(approving.keys().next().value);
+      return send({ t: "approve", room: code, threadId: p.channelId, discordMessageId: p.messageId, ownerId, replyToSeq: relayed.seq, code: typed, approval: relayed.approval });
+    }
+    // Six digits or more in all, whatever separates them, may be a code with words or marks
+    // around it: refused unsaved rather than carried into the room (Gyre Audit r1–r2).
+    if (relayed?.approval && (body.match(/\p{N}/gu) ?? []).length >= 6) {
+      return botReply(p.channelId, p.messageId, "Not sent: that looks like it holds an approval code. Reply with the 6 digits alone.");
+    }
     // A Reply to something not in the map (too old, or not a room line) is never sent to
     // everyone instead: who it answers cannot be told (#205 audit).
     if (p.replyToId && !relayed) {
@@ -643,6 +677,12 @@ export function createConnector({ discord, out, clock = realClock }) {
   // Discord that is down holds the receipt instead of losing it.
   function said(msg) {
     const id = String(msg.discordMessageId ?? "");
+    const asked = approving.get(id);
+    if (asked) {
+      approving.delete(id);
+      if (!workers.get(asked.room)) return;
+      return enqueue(worker(asked.room), { op: "receipt", id, ok: msg.ok === true && Number.isInteger(msg.seq), error: msg.error, line: { threadId: asked.threadId } });
+    }
     const code = Object.keys(state.rooms).find((c) => !c.includes("@") && (state.rooms[c].saying ?? []).some((l) => l.discordMessageId === id));
     if (!code) return;
     enqueue(worker(code), { op: "receipt", id, ok: msg.ok === true && Number.isInteger(msg.seq), error: msg.error, names: msg.names });
@@ -651,8 +691,8 @@ export function createConnector({ discord, out, clock = realClock }) {
   async function receipt(w, item) {
     const rs = state.rooms[w.code];
     const at = (rs?.saying ?? []).findIndex((l) => l.discordMessageId === item.id);
-    if (at < 0) return;
-    const line = rs.saying[at];
+    if (!rs || (at < 0 && !item.line)) return;
+    const line = item.line ?? rs.saying[at];
     try {
       if (item.ok) {
         await discord.react({ threadId: line.threadId, messageId: item.id, emoji: SENT });
@@ -677,6 +717,7 @@ export function createConnector({ discord, out, clock = realClock }) {
       if (e?.kind === "network" || e?.kind === "rate") throw e;
       fail(e?.kind === "permission" ? "missing_permission" : "internal", `Could not answer in Discord: ${e?.message}`, w.code);
     }
+    if (at < 0) return;
     rs.saying.splice(at, 1);
     save();
   }
@@ -1182,7 +1223,7 @@ export function createConnector({ discord, out, clock = realClock }) {
         // Each part's Discord id, in the same save as its acceptance, so a Reply or a
         // reaction to any part names this seq and its sender (#205).
         if (id && item.m.kind !== "notice") {
-          (r.relayed ??= []).push({ id, seq, senderId: item.m.senderId ?? null, sender: item.m.sender, kind: item.m.kind, yn: item.m.yesNo === true });
+          (r.relayed ??= []).push({ id, seq, senderId: item.m.senderId ?? null, sender: item.m.sender, kind: item.m.kind, yn: item.m.yesNo === true, ...(item.m.approval ? { approval: item.m.approval } : {}) });
           if (r.relayed.length > RELAYED_MAX) r.relayed.splice(0, r.relayed.length - RELAYED_MAX);
         }
         if (last) finished(r);
@@ -1383,6 +1424,13 @@ export function createConnector({ discord, out, clock = realClock }) {
           kind: String(msg.kind ?? "tell"),
           text: String(msg.text ?? ""),
         };
+        // Only an ask carries an approval request; a malformed one is relayed as plain text,
+        // with no line asking for a code (#207).
+        const approval = m.kind === "ask" ? approvalOf(msg.approval) : null;
+        if (approval) {
+          m.approval = approval;
+          if (msg.withheld === true) m.withheld = true;
+        }
         // Held since the room said it, not since this child was handed it: a line kept over a
         // quit reaches Discord at the next launch marked "(delayed)" (#199 I3).
         const said = typeof msg.ts === "string" ? Date.parse(msg.ts) : NaN;

@@ -1216,6 +1216,36 @@ async fn discord_disconnect(app: tauri::AppHandle, code: String) -> Result<disco
     .map_err(|error| format!("Disconnecting the room did not finish: {error}"))?
 }
 
+/// The approval code (#207). Each asks the Keychain, so each runs off the main thread.
+#[tauri::command]
+async fn discord_approvals(app: tauri::AppHandle) -> Result<discord::ApprovalState, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<discord::DiscordState>().approvals_state())
+        .await
+        .map_err(|error| format!("Reading the approval code did not finish: {error}"))?
+}
+
+/// A new secret, shown once as a QR code; the saved one is deleted first.
+#[tauri::command]
+async fn discord_approvals_setup(app: tauri::AppHandle) -> Result<discord::ApprovalSetup, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<discord::DiscordState>().setup_approvals())
+        .await
+        .map_err(|error| format!("Setting up the approval code did not finish: {error}"))?
+}
+
+#[tauri::command]
+async fn discord_approvals_confirm(app: tauri::AppHandle, code: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<discord::DiscordState>().confirm_approvals(&code))
+        .await
+        .map_err(|error| format!("Checking the code did not finish: {error}"))?
+}
+
+#[tauri::command]
+async fn discord_approvals_unlock(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<discord::DiscordState>().unlock_approvals())
+        .await
+        .map_err(|error| format!("Unlocking approvals did not finish: {error}"))?
+}
+
 /// Take the Discord member out of a room again after a leave the bridge refused. Needs only
 /// the broker's word, so it works after Remove, with no token kept.
 #[tauri::command]
@@ -6189,6 +6219,10 @@ pub fn run() {
             discord_connect,
             discord_disconnect,
             discord_retry_leave,
+            discord_approvals,
+            discord_approvals_setup,
+            discord_approvals_confirm,
+            discord_approvals_unlock,
             heavy_status,
             heavy_stop,
             heavy_patterns,

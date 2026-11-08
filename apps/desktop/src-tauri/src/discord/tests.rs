@@ -349,6 +349,7 @@ struct Fixture {
     settings: Arc<MemSettings>,
     owners: Arc<MemOwner>,
     losses: Arc<MemLoss>,
+    approvals: Arc<MemLoss>,
     source: Arc<FakeSource>,
     acts: Arc<FakeActs>,
     dir: PathBuf,
@@ -379,6 +380,7 @@ fn fixture_owned(name: &str, token: Option<&str>, saved: &[(&str, &str)], owner:
 fn fixture_built(name: &str, token: Option<&str>, saved: &[(&str, &str)], owner: Option<Owner>, refuse_owner: bool) -> Fixture {
     let owners = Arc::new(MemOwner::default());
     let losses = Arc::new(MemLoss::default());
+    let approvals = Arc::new(MemLoss::default());
     owners.refuse_read.store(refuse_owner, Ordering::SeqCst);
     *owners.record.lock().unwrap() = owner.map(|owner| (owner, "2026-10-27T00:00:00Z".to_string()));
     let tokens = Arc::new(MemTokens::default());
@@ -397,12 +399,13 @@ fn fixture_built(name: &str, token: Option<&str>, saved: &[(&str, &str)], owner:
         settings: Arc::clone(&settings) as Arc<dyn SettingsStore>,
         owners: Arc::clone(&owners) as Arc<dyn OwnerStore>,
         losses: Arc::clone(&losses) as Arc<dyn LossStore>,
+        approvals: Arc::clone(&approvals) as Arc<dyn LossStore>,
         source: Arc::new(Arc::clone(&source)),
         acts: Arc::new(Arc::clone(&acts)),
         state_path: dir.join("discord-state.json"),
         log: SupervisorLog::at(Some(dir.join("supervisor.log"))),
     });
-    Fixture { state, tokens, settings, owners, losses, source, acts, dir }
+    Fixture { state, tokens, settings, owners, losses, approvals, source, acts, dir }
 }
 
 impl Fixture {
@@ -502,6 +505,8 @@ fn nothing_is_read_or_forwarded_for_a_room_that_is_not_connected() {
         sender_id: None,
         to_owner: false,
         yes_no: false,
+        approval: None,
+        withheld: false,
     });
     thread::sleep(Duration::from_millis(200));
     assert!(f.source.opens.lock().unwrap().iter().all(|(room, ..)| room == ROOM), "only the connected room is read");
@@ -810,6 +815,7 @@ fn the_paired_owner_and_its_name_survive_a_relaunch() {
         settings: Arc::clone(&f.settings) as Arc<dyn SettingsStore>,
         owners: Arc::clone(&f.owners) as Arc<dyn OwnerStore>,
         losses: Arc::clone(&f.losses) as Arc<dyn LossStore>,
+        approvals: Arc::clone(&f.approvals) as Arc<dyn LossStore>,
         source: Arc::new(Arc::clone(&f.source)),
         acts: Arc::new(Arc::clone(&f.acts)),
         state_path: f.dir.join("discord-state.json"),
@@ -851,7 +857,7 @@ fn an_ack_trims_exactly_the_seqs_it_names() {
     lock(&f.state.hub).connect(ROOM, vec![], Some(CREATED)).unwrap();
     for seq in 1..=5 {
         lock(&f.state.hub).forward(ToChild::Message {
-            room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false,
+            room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false,
         });
     }
     assert_eq!(f.state.status().behind.get(ROOM), Some(&5));
@@ -955,7 +961,7 @@ fn what_discord_accepted_is_told_to_the_bridge_coalesced_on_the_apps_word() {
 fn a_late_ack_for_a_codes_earlier_room_never_trims_its_new_room() {
     let f = fixture("stale-ack", Some(TOKEN));
     let _buffer = f.attach_buffer();
-    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false };
+    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false };
     {
         let mut hub = lock(&f.state.hub);
         hub.connect(ROOM, vec![], Some(100)).unwrap();
@@ -1018,7 +1024,7 @@ fn a_disconnect_keeps_what_discord_has_not_taken_and_a_new_child_gets_it() {
 fn a_second_disconnect_before_the_first_was_taken_keeps_both() {
     let f = fixture("two-disconnects", Some(TOKEN));
     let _first = f.attach_buffer();
-    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false };
+    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false };
     {
         let mut hub = lock(&f.state.hub);
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
@@ -1141,6 +1147,7 @@ fn relaunch(f: &Fixture) -> DiscordState {
         settings: Arc::clone(&f.settings) as Arc<dyn SettingsStore>,
         owners: Arc::clone(&f.owners) as Arc<dyn OwnerStore>,
         losses: Arc::clone(&f.losses) as Arc<dyn LossStore>,
+        approvals: Arc::clone(&f.approvals) as Arc<dyn LossStore>,
         source: Arc::new(Arc::clone(&f.source)),
         acts: Arc::new(Arc::clone(&f.acts)),
         state_path: f.dir.join("discord-state.json"),
@@ -1375,6 +1382,7 @@ fn a_real_bridge_room_reaches_the_child_in_order_named_and_closes() {
         settings: Arc::new(MemSettings::default()),
         owners: Arc::new(MemOwner::default()),
         losses: Arc::new(MemLoss::default()),
+        approvals: Arc::new(MemLoss::default()),
         source: Arc::new(BridgeSource { target: Some(app.clone()) }),
         acts: Arc::new(LiveActs { target: app.clone(), password: password.clone(), room: room.clone() }),
         state_path: home.join("discord-state.json"),
@@ -1438,7 +1446,7 @@ fn standin_a_room_closed_while_no_child_runs_is_still_closed_by_the_next_child()
     {
         let mut hub = lock(&f.state.hub);
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
-        hub.forward(ToChild::Message { room: ROOM.into(), seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "m1".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false });
+        hub.forward(ToChild::Message { room: ROOM.into(), seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "m1".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false });
         hub.ack(ROOM, 1, Some(CREATED), None);
         assert_eq!(hub.backlog(ROOM), Some(0), "premise: nothing owed to Discord");
         // The child is gone (died, or its pipe filled) and the room ends before the next is up.
@@ -1463,7 +1471,7 @@ fn standin_remove_keeps_the_child_epoch() {
 }
 
 fn audit_line(seq: u64) -> ToChild {
-    ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false }
+    ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false }
 }
 
 #[test]
@@ -1604,7 +1612,7 @@ fn a_storage_refusal_stays_shown_through_ready() {
 // ── #199 r7: the invariants the audit found open (199-invariants.md §5), one proof each ──
 
 fn held_line(seq: u64, sender: &str) -> ToChild {
-    ToChild::Message { room: ROOM.to_string(), seq, sender: sender.into(), to: "everyone".into(), kind: "tell".into(), text: "x".repeat(1024), ts: String::new(), sender_id: None, to_owner: false, yes_no: false }
+    ToChild::Message { room: ROOM.to_string(), seq, sender: sender.into(), to: "everyone".into(), kind: "tell".into(), text: "x".repeat(1024), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false }
 }
 
 /// I18: an attach hands a fresh child everything held, however much, at the pace it reads.
@@ -1781,7 +1789,7 @@ fn recovered_hub(path: &Path, window: usize) -> Arc<Mutex<Hub>> {
 }
 
 fn line_in(room: &str, seq: u64) -> ToChild {
-    ToChild::Message { room: room.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: "2026-10-27T10:00:00.000Z".into(), sender_id: None, to_owner: false, yes_no: false }
+    ToChild::Message { room: room.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: "2026-10-27T10:00:00.000Z".into(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false }
 }
 
 fn held_seqs(hub: &Hub, room: &str) -> Vec<u64> {
@@ -1902,7 +1910,7 @@ fn audit_repeated_disconnect_cycles_stay_inside_the_one_budget() {
     for cycle in 0..4_u64 {
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
         for seq in cycle * 3 + 1..=cycle * 3 + 3 {
-            hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false });
+            hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false });
         }
         hub.disconnect(ROOM, DisconnectReason::Disconnected);
     }
@@ -1940,7 +1948,7 @@ fn attach_holds_references_not_lines() {
         hub.cap = held as usize + 1;
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
         for seq in 1..=held {
-            assert_eq!(hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "a".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false }), Forwarded::Taken);
+            assert_eq!(hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "a".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false }), Forwarded::Taken);
         }
         hub.disconnect(ROOM, DisconnectReason::Disconnected);
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
@@ -4212,8 +4220,8 @@ fn a_say_is_posted_as_the_owner_only_for_a_connected_room_its_own_post_and_the_k
     assert_eq!(
         f.acts.posts.lock().unwrap().clone(),
         vec![
-            (ROOM.to_string(), OwnerPost { discord_message_id: msg_id(5), to: "everyone".into(), kind: "tell".into(), text: "hello room".into(), in_reply_to: None }, APP_WORD.to_string()),
-            (ROOM.to_string(), OwnerPost { discord_message_id: msg_id(6), to: "peer-a".into(), kind: "ask".into(), text: "and you?".into(), in_reply_to: Some(3) }, APP_WORD.to_string()),
+            (ROOM.to_string(), OwnerPost { discord_message_id: msg_id(5), to: "everyone".into(), kind: "tell".into(), text: "hello room".into(), in_reply_to: None, approved: None }, APP_WORD.to_string()),
+            (ROOM.to_string(), OwnerPost { discord_message_id: msg_id(6), to: "peer-a".into(), kind: "ask".into(), text: "and you?".into(), in_reply_to: Some(3), approved: None }, APP_WORD.to_string()),
         ],
         "only the two in the right place reached the bridge, with the word the room was connected with"
     );
@@ -4735,6 +4743,7 @@ fn a_real_bridge_takes_the_owners_say_as_you_via_discord_and_no_one_else_can_spe
         settings: Arc::new(MemSettings::default()),
         owners: owners as Arc<dyn OwnerStore>,
         losses: Arc::new(MemLoss::default()),
+        approvals: Arc::new(MemLoss::default()),
         source: Arc::new(BridgeSource { target: Some(app.clone()) }),
         acts: Arc::new(LiveActs { target: app.clone(), password: password.clone(), room: room.clone() }),
         state_path: home.join("discord-state.json"),
@@ -5392,4 +5401,330 @@ fn c325_a_read_overlapped_every_time_is_refused_never_answered_stale() {
     churn.held.set(Arc::downgrade(&held)).unwrap();
     let refusal = held.read().unwrap_err();
     assert!(!refusal.locked && refusal.why.contains("changed while it was read"), "{refusal:?}");
+}
+
+// ── approval codes (#207) ──
+
+const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const APPROVAL_SECRET: &[u8] = b"12345678901234567890";
+
+fn approval_frame(seq: u64, kind: &str, to: &str, approval: serde_json::Value) -> serde_json::Value {
+    let mut frame = mail(seq, "peer-a", to, kind, &format!("may I? {seq}"));
+    frame["approval"] = approval;
+    frame
+}
+
+fn merge(pr: u64, sha: &str) -> serde_json::Value {
+    serde_json::json!({ "action": "merge", "pr": pr, "sha": sha })
+}
+
+/// A Discord id sent `ago_ms` before now, so its age is what the check reads.
+fn sent_id(ago_ms: u64, n: u64) -> String {
+    ((unix_ms() - ago_ms - 1_420_070_400_000) << 22 | n).to_string()
+}
+
+fn code_now(offset_steps: i64) -> String {
+    let step = (unix_ms() / 1000 / totp::STEP_SECS).checked_add_signed(offset_steps).unwrap();
+    format!("{:06}", totp::code_at(APPROVAL_SECRET, step))
+}
+
+fn saved_record(f: &Fixture) -> Option<totp::Record> {
+    f.approvals.bytes.lock().unwrap().as_ref().map(|bytes| serde_json::from_slice(bytes).unwrap())
+}
+
+fn set_up_codes(f: &Fixture) {
+    let hex: String = APPROVAL_SECRET.iter().map(|byte| format!("{byte:02x}")).collect();
+    *f.approvals.bytes.lock().unwrap() = Some(serde_json::to_vec(&totp::Record::new(hex)).unwrap());
+}
+
+fn approve_with(id: &str, reply_to_seq: u64, code: &str, approval: serde_json::Value) -> Approve {
+    Approve {
+        room: ROOM.into(),
+        thread_id: THREAD.into(),
+        discord_message_id: id.into(),
+        owner_id: OWNER_ID.into(),
+        reply_to_seq,
+        code: Code(code.into()),
+        approval,
+    }
+}
+
+/// A room with approvals set up, followed on Discord, and the two requests seq 1 (PR 370 at A)
+/// and seq 2 (PR 371 at B) relayed to the child.
+fn approvals_room(name: &str) -> (Fixture, SharedBuf) {
+    let f = fixture_owned(name, Some(TOKEN), &[], the_owner());
+    set_up_codes(&f);
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    f.stream(ROOM, &[approval_frame(1, "ask", OWNER_SENDER, merge(370, SHA_A)), approval_frame(2, "ask", OWNER_SENDER, merge(371, SHA_B))]);
+    wait_until("both requests", || of_kind(&buffer.lines(), "message").len() == 2);
+    (f, buffer)
+}
+
+fn answer(f: &Fixture, buffer: &SharedBuf, approve: Approve) -> serde_json::Value {
+    let id = approve.discord_message_id.clone();
+    on_core_event(&f.state.core, FromChild::Approve(approve));
+    wait_until("the answer", || said(&buffer.lines(), &id).is_some());
+    said(&buffer.lines(), &id).unwrap().clone()
+}
+
+#[test]
+fn only_an_ask_to_the_owner_with_a_well_formed_approval_reaches_the_child_as_a_request() {
+    let f = fixture("approval-wire", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.stream(ROOM, &[
+        approval_frame(1, "ask", OWNER_SENDER, merge(370, SHA_A)),
+        approval_frame(2, "tell", OWNER_SENDER, merge(370, SHA_A)),
+        approval_frame(3, "ask", "everyone", merge(370, SHA_A)),
+        approval_frame(4, "ask", OWNER_SENDER, merge(370, &SHA_A[..39])),
+        approval_frame(5, "ask", OWNER_SENDER, serde_json::json!({ "action": "push", "sha": SHA_A })),
+    ]);
+    wait_until("five lines", || of_kind(&buffer.lines(), "message").len() == 5);
+    let lines = buffer.lines();
+    let carried = |seq: u64| of_kind(&lines, "message").iter().find(|line| line["seq"] == seq).unwrap().get("approval").cloned();
+    assert_eq!(carried(1), Some(merge(370, SHA_A)));
+    for seq in 2..=5 {
+        assert_eq!(carried(seq), None, "seq {seq}");
+    }
+    let hub = lock(&f.state.hub);
+    let keys: Vec<u64> = hub.rooms[ROOM].approvals.keys().copied().collect();
+    assert_eq!(keys, vec![1], "only the request the child was asked about takes a code");
+}
+
+#[test]
+fn a_request_past_the_open_cap_is_said_unapprovable_and_still_keeps_a_code_off_the_room() {
+    let f = fixture_owned("approval-full", Some(TOKEN), &[], the_owner());
+    set_up_codes(&f);
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let last = approvals::REQUESTS_MAX as u64 + 1;
+    let frames: Vec<serde_json::Value> = (1..=last).map(|seq| approval_frame(seq, "ask", OWNER_SENDER, merge(seq, SHA_A))).collect();
+    f.stream(ROOM, &frames);
+    wait_until("every line", || of_kind(&buffer.lines(), "message").len() == last as usize);
+    let lines = buffer.lines();
+    let line = |seq: u64| of_kind(&lines, "message").into_iter().find(|line| line["seq"] == seq).unwrap().clone();
+    assert_eq!(line(last - 1).get("approval").cloned(), Some(merge(last - 1, SHA_A)));
+    assert_eq!(line(last - 1).get("withheld"), None);
+    assert_eq!(line(last).get("approval").cloned(), Some(merge(last, SHA_A)), "still a request, so the child routes a code to the app");
+    assert_eq!(line(last)["withheld"], true, "said to be one Discord cannot approve");
+    assert_eq!(
+        line(last)["text"],
+        format!("Asked to merge PR #{last} at aaaaaaaaaaaa. Too many approval requests are open in this room, so this cannot be approved from Discord. Do not reply with a code."),
+        "the asker's words, which ask for the code, are not shown"
+    );
+    assert_eq!(line(last - 1)["text"], format!("may I? {}", last - 1));
+    // The right code, in time, typed under it: refused unchecked, nothing posted.
+    let code = code_now(0);
+    let reply = answer(&f, &buffer, approve_with(&sent_id(1_000, 1), last, &code, merge(last, SHA_A)));
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert!(f.acts.posts.lock().unwrap().is_empty());
+    let record = saved_record(&f).unwrap();
+    assert_eq!((record.last_step, record.failures), (0, 0), "the code was never checked");
+    // Typed as text, it is refused before the room.
+    on_core_event(&f.state.core, say(ROOM, &msg_id(2), Some("peer-a"), None, &code, Some(last)));
+    wait_until("the say answered", || said(&buffer.lines(), &msg_id(2)).is_some());
+    assert_eq!(said(&buffer.lines(), &msg_id(2)).unwrap()["ok"], false);
+    assert!(f.acts.posts.lock().unwrap().is_empty(), "the code never reached the room");
+}
+
+#[test]
+fn a_request_is_journalled_as_its_act_so_relayed_again_it_asks_for_no_code() {
+    let line = |approval: Option<Approval>| ToChild::Message { room: ROOM.into(), seq: 1, sender: "Gyre".into(), to: OWNER_SENDER.into(), kind: "ask".into(), text: "Reply with the 6-digit code".into(), ts: String::new(), sender_id: None, to_owner: true, yes_no: false, approval, withheld: false };
+    let text = |record: Option<journal::Record>| match record {
+        Some(journal::Record::Line { text, .. }) => text,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        text(line_record(&line(Some(Approval::Merge { pr: 370, sha: SHA_A.into() })))),
+        "Asked to merge PR #370 at aaaaaaaaaaaa. It was relayed again after Gyredeck restarted, so this cannot be approved from Discord. Do not reply with a code."
+    );
+    assert_eq!(text(line_record(&line(None))), "Reply with the 6-digit code", "a plain line keeps its words");
+}
+
+#[test]
+fn c5_c7_c8_a_right_code_on_its_request_posts_the_stamp_to_the_requester_and_never_the_code() {
+    let (f, buffer) = approvals_room("approve-right");
+    let code = code_now(0);
+    let id = sent_id(1_000, 1);
+    let reply = answer(&f, &buffer, approve_with(&id, 1, &code, merge(370, SHA_A)));
+    assert_eq!(reply["ok"], true, "{reply}");
+    let posts = f.acts.posts.lock().unwrap().clone();
+    assert_eq!(
+        posts,
+        vec![(
+            ROOM.to_string(),
+            OwnerPost {
+                discord_message_id: id,
+                to: "peer-a".into(),
+                kind: "tell".into(),
+                text: "Approved with the code: merge PR #370 at aaaaaaaaaaaa".into(),
+                in_reply_to: Some(1),
+                approved: Some(Approval::Merge { pr: 370, sha: SHA_A.into() }),
+            },
+            APP_WORD.to_string(),
+        )]
+    );
+    assert!(!format!("{posts:?}").contains(&code), "C8: the code is in nothing posted");
+    assert!(!buffer.text().lines().any(|line| line.contains(&code)), "C8: nor in anything said to the child");
+    let record = saved_record(&f).unwrap();
+    assert_eq!(record.last_step, unix_ms() / 1000 / totp::STEP_SECS, "the step is saved as used");
+}
+
+#[test]
+fn c5_c6_c7_a_code_not_answering_a_live_request_of_this_post_by_the_owner_is_never_checked() {
+    let (f, buffer) = approvals_room("approve-unchecked");
+    let wrong = format!("{:06}", (code_now(0).parse::<u32>().unwrap() + 1) % 1_000_000);
+    let mut cases: Vec<(&str, Approve)> = vec![
+        ("no such request", approve_with(&sent_id(1_000, 1), 9, &wrong, merge(370, SHA_A))),
+        ("another room", Approve { room: OTHER.into(), ..approve_with(&sent_id(1_000, 2), 1, &wrong, merge(370, SHA_A)) }),
+        ("another post", Approve { thread_id: OTHER_THREAD.into(), ..approve_with(&sent_id(1_000, 3), 1, &wrong, merge(370, SHA_A)) }),
+        ("not the owner", Approve { owner_id: "999999999999999999".into(), ..approve_with(&sent_id(1_000, 4), 1, &wrong, merge(370, SHA_A)) }),
+        ("typed too long ago", approve_with(&sent_id(approvals::CODE_FRESH_MS + 5_000, 5), 1, &wrong, merge(370, SHA_A))),
+        ("mapped to B with A's approval", approve_with(&sent_id(1_000, 6), 2, &wrong, merge(370, SHA_A))),
+        ("an approval that is no approval", approve_with(&sent_id(1_000, 7), 1, &wrong, serde_json::json!({ "action": "merge" }))),
+    ];
+    for (what, approve) in cases.drain(..) {
+        let reply = answer(&f, &buffer, approve);
+        assert_eq!(reply["ok"], false, "{what}: {reply}");
+    }
+    assert_eq!(saved_record(&f).unwrap().failures, 0, "nothing was checked, so nothing counted");
+    assert!(f.acts.posts.lock().unwrap().is_empty());
+    // The same wrong code on the live request is checked, and counts: the refusals above were
+    // not the code's.
+    let reply = answer(&f, &buffer, approve_with(&sent_id(1_000, 8), 1, &wrong, merge(370, SHA_A)));
+    assert!(reply["error"].as_str().unwrap().contains("not right"), "{reply}");
+    assert_eq!(saved_record(&f).unwrap().failures, 1);
+}
+
+#[test]
+fn c5_a_request_takes_one_code_and_expires_after_thirty_minutes() {
+    let (f, buffer) = approvals_room("approve-once");
+    assert_eq!(answer(&f, &buffer, approve_with(&sent_id(1_000, 1), 1, &code_now(0), merge(370, SHA_A)))["ok"], true);
+    let again = answer(&f, &buffer, approve_with(&sent_id(1_000, 2), 1, &code_now(1), merge(370, SHA_A)));
+    assert!(again["error"].as_str().unwrap().contains("already answered"), "{again}");
+    lock(&f.state.hub).rooms.get_mut(ROOM).unwrap().approvals.get_mut(&2).unwrap().read_at -= approvals::REQUEST_LIVES;
+    let late = answer(&f, &buffer, approve_with(&sent_id(1_000, 3), 2, &code_now(1), merge(371, SHA_B)));
+    assert!(late["error"].as_str().unwrap().contains("expired"), "{late}");
+    assert_eq!(f.acts.posts.lock().unwrap().len(), 1);
+    assert_eq!(saved_record(&f).unwrap().failures, 0);
+}
+
+#[test]
+fn c3_one_code_approves_one_of_two_requests() {
+    let (f, buffer) = approvals_room("approve-two");
+    let code = code_now(0);
+    assert_eq!(answer(&f, &buffer, approve_with(&sent_id(1_000, 1), 1, &code, merge(370, SHA_A)))["ok"], true);
+    let second = answer(&f, &buffer, approve_with(&sent_id(1_000, 2), 2, &code, merge(371, SHA_B)));
+    assert!(second["error"].as_str().unwrap().contains("already used"), "{second}");
+    assert_eq!(f.acts.posts.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn c4_wrong_codes_lock_and_only_the_mac_unlocks() {
+    let (f, buffer) = approvals_room("approve-lock");
+    let wrong = format!("{:06}", (code_now(0).parse::<u32>().unwrap() + 1) % 1_000_000);
+    for n in 1..=3 {
+        answer(&f, &buffer, approve_with(&sent_id(1_000, n), 1, &wrong, merge(370, SHA_A)));
+    }
+    let locked = answer(&f, &buffer, approve_with(&sent_id(1_000, 4), 1, &code_now(0), merge(370, SHA_A)));
+    assert!(locked["error"].as_str().unwrap().contains("locked"), "{locked}");
+    assert_eq!(f.state.approvals_state(), Ok(ApprovalState::Locked));
+    f.state.unlock_approvals().unwrap();
+    assert_eq!(answer(&f, &buffer, approve_with(&sent_id(1_000, 5), 1, &code_now(0), merge(370, SHA_A)))["ok"], true);
+}
+
+#[test]
+fn a_use_the_keychain_will_not_save_approves_nothing() {
+    let (f, buffer) = approvals_room("approve-unsaved");
+    f.approvals.refuse_write.store(true, Ordering::SeqCst);
+    let reply = answer(&f, &buffer, approve_with(&sent_id(1_000, 1), 1, &code_now(0), merge(370, SHA_A)));
+    assert!(reply["error"].as_str().unwrap().contains("could not save"), "{reply}");
+    assert!(f.acts.posts.lock().unwrap().is_empty());
+}
+
+#[test]
+fn c8_six_digits_typed_as_a_reply_to_a_request_never_reach_the_room_as_text() {
+    let (f, buffer) = approvals_room("approve-say");
+    on_core_event(&f.state.core, say(ROOM, &msg_id(1), Some("peer-a"), None, " 123456 ", Some(1)));
+    on_core_event(&f.state.core, say(ROOM, &msg_id(2), Some("peer-a"), None, "123456", Some(7)));
+    // With words around it, spaced or dashed, it is still a code (Gyre Audit r1).
+    for (n, text) in [(3, "284913 please"), (4, "ok 284 913 go"), (5, "use 28-49-13 now"), (7, "284.913 please"), (8, "284/913"), (9, "284_913 ok"), (10, "２８４９１３")] {
+        on_core_event(&f.state.core, say(ROOM, &msg_id(n), Some("peer-a"), None, text, Some(1)));
+    }
+    on_core_event(&f.state.core, say(ROOM, &msg_id(6), Some("peer-a"), None, "wait, not yet for v1.33.0", Some(1)));
+    wait_until("ten answers", || of_kind(&buffer.lines(), "said").len() == 10);
+    for n in [1, 3, 4, 5, 7, 8, 9, 10] {
+        assert_eq!(said(&buffer.lines(), &msg_id(n)).unwrap()["ok"], false, "say {n}");
+    }
+    assert_eq!(posted_texts(&f), vec!["123456".to_string(), "wait, not yet for v1.33.0".to_string()], "premise: six digits not answering a request, and words with no code, are text");
+}
+
+#[test]
+fn holds_code_counts_six_digits_whatever_separates_them() {
+    for text in ["123456", "284913 please", "ok 284 913", "28-49-13", "284.913", "284/913", "284_913", "1a2b3c4d5e6", "２８４９１３"] {
+        assert!(super::holds_code(text), "{text}");
+    }
+    for text in ["12345", "v1.33.0", "PR #370", "1.2.3 then 4.5", "wait"] {
+        assert!(!super::holds_code(text), "{text}");
+    }
+}
+
+#[test]
+fn c11_setup_shows_a_secret_once_and_turns_approvals_on_only_with_a_code_from_it() {
+    let f = fixture_owned("approve-setup", Some(TOKEN), &[], the_owner());
+    set_up_codes(&f);
+    assert_eq!(f.state.approvals_state(), Ok(ApprovalState::On));
+    // Reset deletes the old record before anything new is shown.
+    f.approvals.refuse_delete.store(true, Ordering::SeqCst);
+    assert!(f.state.setup_approvals().is_err());
+    assert_eq!(f.state.approvals_state(), Ok(ApprovalState::On), "the old record stays; nothing new was shown");
+    f.approvals.refuse_delete.store(false, Ordering::SeqCst);
+    let setup = f.state.setup_approvals().unwrap();
+    assert!(setup.svg.starts_with("<?xml") && setup.svg.contains("<svg"), "{}", &setup.svg[..60]);
+    assert_eq!(setup.secret.len(), 32);
+    assert_eq!(f.state.approvals_state(), Ok(ApprovalState::SettingUp));
+    assert!(saved_record(&f).is_none(), "the old secret is gone at once");
+    // A relaunch before a code verifies: approvals are off, not back on the old secret.
+    let relaunched = relaunch(&f);
+    assert_eq!(relaunched.approvals_state(), Ok(ApprovalState::Off));
+    // The new secret, from what was shown: a wrong code keeps it off, the right one turns it on.
+    let secret = base32_decode(&setup.secret);
+    assert!(f.state.confirm_approvals(&code_now(0)).is_err(), "the old secret's code");
+    assert!(saved_record(&f).is_none());
+    let step = unix_ms() / 1000 / totp::STEP_SECS;
+    f.state.confirm_approvals(&format!("{:06}", totp::code_at(&secret, step))).unwrap();
+    assert_eq!(f.state.approvals_state(), Ok(ApprovalState::On));
+    assert_eq!(saved_record(&f).unwrap().last_step, step, "the setup's code is used too");
+    // Remove takes the record.
+    f.state.remove(Some(APP_WORD)).unwrap();
+    assert!(saved_record(&f).is_none());
+}
+
+fn base32_decode(text: &str) -> Vec<u8> {
+    let (mut buffer, mut bits, mut out) = (0_u32, 0_u32, Vec::new());
+    for char in text.bytes() {
+        let value = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".iter().position(|&c| c == char).unwrap() as u32;
+        buffer = (buffer << 5) | value;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    out
+}
+
+#[test]
+fn a_request_heard_again_keeps_its_use() {
+    let (f, buffer) = approvals_room("approve-replay");
+    assert_eq!(answer(&f, &buffer, approve_with(&sent_id(1_000, 1), 1, &code_now(0), merge(370, SHA_A)))["ok"], true);
+    // The stream opens again from an older point and hears seq 1, and a new seq 3 after it.
+    f.stream(ROOM, &[approval_frame(1, "ask", OWNER_SENDER, merge(370, SHA_A)), approval_frame(3, "ask", OWNER_SENDER, merge(372, SHA_A))]);
+    wait_until("seq 3", || lock(&f.state.hub).rooms[ROOM].approvals.contains_key(&3));
+    let again = answer(&f, &buffer, approve_with(&sent_id(1_000, 2), 1, &code_now(1), merge(370, SHA_A)));
+    assert!(again["error"].as_str().unwrap().contains("already answered"), "{again}");
 }

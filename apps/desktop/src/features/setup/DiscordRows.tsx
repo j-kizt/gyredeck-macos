@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { Check, ExternalLink, KeyRound, MessageSquareDashed, RefreshCw, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Check, ExternalLink, KeyRound, MessageSquareDashed, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import type { IUseDiscord } from "./useDiscord";
 
@@ -23,6 +23,71 @@ const ERROR_COPY: Record<string, string> = {
 
 const errorCopy = (error: { code: string; message: string }) =>
   ERROR_COPY[error.code] ?? `The Discord connector stopped on an error: ${error.message}`;
+
+type ApprovalState = "off" | "settingUp" | "on" | "locked" | "unreadable";
+
+const APPROVAL_DETAIL: Record<ApprovalState, string> = {
+  off: "Approve a merge or a release from Discord with a code from an authenticator app",
+  settingUp: "Setup was not finished. Set it up again",
+  on: "On. A merge or a release asked for in Discord waits for a code",
+  locked: "Locked after three wrong codes. Nothing can be approved from Discord until you unlock it",
+  unreadable: "The saved approval code cannot be read. Set it up again",
+};
+
+/** The approval code (#207): set up here once with a QR code, checked by the app when the owner
+ *  answers an approval request in Discord. The secret is shown only while setting up. */
+const ApprovalRow = ({ run, busy }: Pick<IUseDiscord, "run" | "busy">) => {
+  const [state, setState] = useState<ApprovalState | null>(null);
+  const [setup, setSetup] = useState<{ svg: string; secret: string } | null>(null);
+  const [code, setCode] = useState("");
+
+  const read = useCallback(async () => {
+    setState(await invoke<ApprovalState>("discord_approvals").catch(() => null));
+  }, []);
+  useEffect(() => { void read(); }, [read]);
+
+  const start = async () => {
+    setSetup(((await run("discord_approvals_setup")) as { svg: string; secret: string } | undefined) ?? null);
+    await read();
+  };
+  const confirm = async () => {
+    const value = code.trim();
+    setCode("");
+    if ((await run("discord_approvals_confirm", { code: value })) !== undefined) setSetup(null);
+    await read();
+  };
+  const unlock = async () => {
+    await run("discord_approvals_unlock");
+    await read();
+  };
+
+  return (
+    <div className="setup-row setup-row-stack" data-discord="approvals">
+      <div className="setup-row-main">
+        <span className="status-slot setup-icon"><ShieldCheck size={14} strokeWidth={2.3} /></span>
+        <span className="setup-copy">
+          <span className="setup-title">Approval code</span>
+          <span className="setup-detail">{setup ? "Scan this with an authenticator app, then type the code it shows. It is shown only now" : state ? APPROVAL_DETAIL[state] : "Checking…"}</span>
+        </span>
+        {setup || !state ? null : state === "locked" ? (
+          <button className="pill-btn" type="button" disabled={busy} onClick={() => void unlock()} data-tauri-drag-region="false">Unlock</button>
+        ) : (
+          <button className="pill-btn" type="button" disabled={busy} onClick={() => void start()} data-tauri-drag-region="false">{state === "on" ? "Reset" : "Set up"}</button>
+        )}
+      </div>
+      {setup ? (
+        <>
+          <img className="setup-qr" src={`data:image/svg+xml;utf8,${encodeURIComponent(setup.svg)}`} width={192} height={192} alt="Approval code QR" />
+          <span className="setup-detail setup-secret" aria-label="Approval code secret">{setup.secret}</span>
+          <span className="setup-row-actions full">
+            <input className="setup-input" value={code} onChange={(event) => setCode(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void confirm(); }} disabled={busy} inputMode="numeric" autoComplete="one-time-code" spellCheck={false} placeholder="6-digit code" aria-label="Approval code" data-tauri-drag-region="false" />
+            <button className="pill-btn accent" type="button" disabled={busy || !code.trim()} onClick={() => void confirm()} data-tauri-drag-region="false"><Check size={12} strokeWidth={2.3} />Turn on</button>
+          </span>
+        </>
+      ) : null}
+    </div>
+  );
+};
 
 /** Settings → Permission → Remote access (#199): a bot that follows sync rooms into a Discord forum. */
 export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDiscord; canUseNativeControls: boolean }) => {
@@ -163,6 +228,7 @@ export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDi
               <button className="pill-btn accent" type="button" disabled={busy} onClick={() => void run("discord_start_pairing")} data-tauri-drag-region="false">{busy ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}{status.pairingCode ? "New code" : "Pair"}</button>
             )}
           </div>
+          {status.owner ? <ApprovalRow run={run} busy={busy} /> : null}
         </>
       ) : null}
     </>

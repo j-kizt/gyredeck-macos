@@ -679,3 +679,17 @@
     transform: rotate(360deg);
   }
 }
+
+/* The approval code's QR (#207): dark modules need a light ground in either theme to scan. */
+.setup-qr {
+  align-self: center;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.setup-secret {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-align: center;
+  overflow-wrap: anywhere;
+  user-select: text;
+}

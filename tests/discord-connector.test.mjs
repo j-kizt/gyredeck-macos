@@ -2968,3 +2968,112 @@ test("#305 a renamed post is adopted after the state file is lost, so no second 
   assert.ok(!fake.log.some((e) => e.op === "createPost"), "no second post");
   await c.close();
 });
+
+// ── #207: approval codes ──
+
+const SHA = "0123456789abcdef0123456789abcdef01234567";
+const MERGE = { action: "merge", pr: 370, sha: SHA };
+
+test("#207 an approval request is relayed with the line asking for the code; anything else is relayed without one", async () => {
+  const { c, fake, threadId, statePath } = await ownerRoom();
+  c.handle(message("sync-abcd", 1, { kind: "ask", senderId: "conv-gyre", text: "merge it?", approval: MERGE }));
+  c.handle(message("sync-abcd", 2, { kind: "ask", text: "release it?", approval: { action: "release", version: "1.33.0", sha: SHA } }));
+  c.handle(message("sync-abcd", 3, { kind: "tell", text: "told", approval: MERGE }));
+  c.handle(message("sync-abcd", 4, { kind: "ask", text: "bad sha", approval: { ...MERGE, sha: SHA.toUpperCase() } }));
+  c.handle(message("sync-abcd", 5, { kind: "ask", text: "extra", approval: { action: "push", sha: SHA } }));
+  await flush();
+  const posted = fake.sent.filter((s) => s.threadId === threadId).map((s) => s.content.split("\n").slice(1).join("\n"));
+  assert.deepEqual(posted.slice(-5), [
+    "merge it?\n\nReply to this message with the 6-digit approval code to merge PR #370 at 0123456789ab.",
+    "release it?\n\nReply to this message with the 6-digit approval code to release v1.33.0 at 0123456789ab.",
+    "told",
+    "bad sha",
+    "extra",
+  ]);
+  const kept = saved(statePath).relayed;
+  assert.deepEqual(kept.map((r) => r.approval ?? null), [MERGE, { action: "release", version: "1.33.0", sha: SHA }, null, null, null]);
+  await c.close();
+});
+
+test("#207 a code answering an approval request goes to the app as approve, and is never saved or said", async () => {
+  const { c, fake, of, threadId, statePath, lines } = await ownerRoom();
+  c.handle(message("sync-abcd", 7, { kind: "ask", senderId: "conv-gyre", text: "merge it?", approval: MERGE }));
+  c.handle(message("sync-abcd", 8, { kind: "ask", senderId: "conv-gyre", text: "m8" }));
+  await flush();
+  const request = fake.sent.find((s) => s.content.includes("merge it?")).id;
+  const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: " 284 913 ", replyToId: request });
+  assert.deepEqual(of("approve"), [{ t: "approve", room: "sync-abcd", threadId, discordMessageId: id, ownerId: OWNER, replyToSeq: 7, code: "284913", approval: MERGE }]);
+  assert.deepEqual(of("say"), [], "the code is not said to the room");
+  const file = readFileSync(statePath, "utf8");
+  assert.ok(!file.includes("284913") && !file.includes("284 913"), "the code is not saved");
+  assert.equal(lines.filter((l) => l.includes("284913")).length, 1, "the approve line is the only place the code goes");
+  // Words in Reply to the request, and digits in Reply to a plain ask, are says as before.
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "wait, not yet", replyToId: request });
+  const [plain] = relayedIds(fake, 8);
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "123456", replyToId: plain });
+  assert.deepEqual(of("say").map((s) => [s.replyToSeq, s.text]), [[7, "wait, not yet"], [8, "123456"]]);
+  assert.equal(of("approve").length, 1);
+  await c.close();
+});
+
+test("#207 a request the app withheld is posted as the app worded it, with no ask for a code, and a code typed under it still never reaches the room (Gyre Audit r5–r6)", async () => {
+  const { c, fake, of, threadId, statePath } = await ownerRoom();
+  const text = "Asked to merge PR #370 at 0123456789ab. Too many approval requests are open in this room, so this cannot be approved from Discord. Do not reply with a code.";
+  c.handle(message("sync-abcd", 7, { kind: "ask", senderId: "conv-gyre", text, approval: MERGE, withheld: true }));
+  c.handle(message("sync-abcd", 8, { kind: "ask", senderId: "conv-gyre", text: "plain", withheld: true }));
+  await flush();
+  const line = fake.sent.find((s) => s.content.includes("Too many approval requests"));
+  assert.equal(line.content, `→ everyone · ask\n${text}`, "the whole post: nothing asks for a code");
+  assert.equal(fake.sent.find((s) => s.content.includes("plain")).content, "→ everyone · ask\nplain");
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "284913", replyToId: line.id });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "284.913 ok", replyToId: line.id });
+  assert.deepEqual(of("approve").map((a) => [a.replyToSeq, a.code]), [[7, "284913"]], "to the app, which refuses it unchecked");
+  assert.deepEqual(of("say"), [], "never said to the room");
+  assert.ok(!readFileSync(statePath, "utf8").includes("284"), "nor saved");
+  await c.close();
+});
+
+test("#207 the app's answer to a code is a 📨 or its reason in Reply, and touches no saved say", async () => {
+  const { c, fake, threadId, statePath } = await ownerRoom();
+  c.handle(message("sync-abcd", 7, { kind: "ask", senderId: "conv-gyre", text: "merge it?", approval: MERGE }));
+  await flush();
+  const request = fake.sent.find((s) => s.content.includes("merge it?")).id;
+  const good = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "111111", replyToId: request });
+  const bad = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "222222", replyToId: request });
+  const kept = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "a say in flight" });
+  c.handle({ t: "said", discordMessageId: good, ok: true, seq: 9 });
+  c.handle({ t: "said", discordMessageId: bad, ok: false, error: "That code is not right, so nothing was approved. 2 more wrong codes lock approvals" });
+  await flush();
+  assert.deepEqual(fake.reactions, [{ threadId, messageId: good, emoji: "📨" }]);
+  assert.equal(fake.bot.at(-1).replyTo, bad);
+  assert.match(fake.bot.at(-1).content, /^That code is not right/);
+  assert.deepEqual(saved(statePath).saying.map((l) => l.discordMessageId), [kept]);
+  c.handle({ t: "said", discordMessageId: good, ok: true, seq: 9 });
+  await flush();
+  assert.equal(fake.reactions.length, 1, "an answer is used once");
+  await c.close();
+});
+
+test("#207 a Reply to an approval request with six digits among words or marks is refused unsaved, and words with fewer are a say (Gyre Audit r1–r2)", async () => {
+  const { c, fake, of, threadId, statePath, lines } = await ownerRoom();
+  c.handle(message("sync-abcd", 7, { kind: "ask", senderId: "conv-gyre", text: "merge it?", approval: MERGE }));
+  await flush();
+  const request = fake.sent.find((s) => s.content.includes("merge it?")).id;
+  const tries = ["284913 please", "ok 284 913 go", "use 28-49-13 now", "284.913 please", "284/913", "284_913 ok", "２８４９１３"];
+  for (const text of tries) {
+    const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text, replyToId: request });
+    await flush();
+    assert.equal(fake.bot.at(-1).replyTo, id, text);
+    assert.match(fake.bot.at(-1).content, /^Not sent: that looks like it holds an approval code/, text);
+  }
+  assert.deepEqual(of("say"), []);
+  assert.deepEqual(of("approve"), []);
+  const file = readFileSync(statePath, "utf8");
+  for (const digits of ["284913", "284 913", "28-49-13", "284.913", "284/913", "284_913", "２８４９１３"]) {
+    assert.ok(!file.includes(digits), `not saved: ${digits}`);
+    assert.ok(!lines.some((l) => l.includes(digits)), `not sent: ${digits}`);
+  }
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "not yet, wait for v1.33.0", replyToId: request });
+  assert.deepEqual(of("say").map((s) => s.text), ["not yet, wait for v1.33.0"]);
+  await c.close();
+});

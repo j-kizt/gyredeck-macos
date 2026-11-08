@@ -423,7 +423,7 @@ fn crash_helper() {
         let mut hub = super::super::Hub { journal_dir: Some(dir), ..Default::default() };
         hub.channel = Some(super::super::ChildChannel::new(Box::new(std::io::sink())));
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
-        hub.forward(super::super::ToChild::Message { room: ROOM.into(), seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "m1".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false });
+        hub.forward(super::super::ToChild::Message { room: ROOM.into(), seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "m1".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false });
         fail_appends(1);
         hub.disconnect(ROOM, DisconnectReason::Closed);
         point("close_pending");

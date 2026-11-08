@@ -2170,7 +2170,7 @@ function startBridge(config) {
    * default, because a Codex turn that was never taught this must still be heard.
    */
   // Either the line is only the routing, or it carries the message after a separator.
-  // Codex wrote `@Antigravity reaction — รับทราบครับ` every time, which is the natural
+  // Codex wrote `@Antigravity reaction — <acknowledgement>` every time, which is the natural
   // way to write it and which the first version of this refused: the line did not match,
   // so the message fell through to the loud default and went to the whole room as a
   // tell. Silently, and with an ok and a seq, so nothing looked wrong from either end.

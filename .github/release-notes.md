@@ -1,5 +1,17 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## The approval code's QR shows in the app — (v1.33.1)
+
+### Fixes
+
+- **Setting up an approval code shows its QR code.** In v1.33.0 the app's own security
+  policy blocked the QR image, so Settings → Permission → Remote access showed an empty box with
+  the words "Approval code QR". The text form of the secret under it was shown and worked when
+  typed into an authenticator app by hand. The QR is now allowed and shown.
+- **A setup can be started over.** While the QR is on screen, **Start over** discards the secret being
+  set up and shows a new one; confirmation checks only the new secret. Before, the row had no
+  button until Settings was closed and opened again.
+
 ## Approve a merge or a release from Discord with a code — (v1.33.0)
 
 ### Added

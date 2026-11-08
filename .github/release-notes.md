@@ -1,5 +1,29 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Gyredeck leaves Claude Code's and Codex's sign-ins to them — (v1.32.6)
+
+### Fixes
+
+- **Gyredeck no longer renews or rewrites Claude Code's and Codex's sign-ins.** To keep usage
+  live, Gyredeck renewed the CLI's sign-in itself when it was about to expire or was refused,
+  then saved the new one over the CLI's own, in the Keychain or the credentials file. A
+  sign-in's renewal token is meant to be used once, so a `claude` or `codex` already running
+  could be left holding a spent one, which fits the repeated "not logged in" seen here; that
+  log-out has not been reproduced on demand. Each save to Claude Code's credentials also dropped
+  every field Gyredeck did not know about, `refreshTokenExpiresAt` among them. Gyredeck
+  now reads the sign-in again on every refresh, and never renews or writes it.
+- **An expired sign-in shows the last usage, marked as old.** Until the CLI renews it, the
+  panel keeps the last reading taken with that sign-in. A Status line under it says the login
+  expired and names the command that renews it. Agents in a room are not sent that reading as
+  a new one. With no earlier reading, the panel says the login expired and names the command.
+  Once a sign-in expires, Gyredeck can keep that reading while it remains open; after a
+  restart, it has no kept reading and shows the expired-login message until the CLI renews the
+  sign-in.
+- **Antigravity's sign-in is only read, too.** Gyredeck used to renew it in memory when given a
+  Google OAuth client, in `~/.config/gyredeck/agy-google-oauth.json` or in
+  `GYREDECK_AGY_GOOGLE_CLIENT_ID` and `GYREDECK_AGY_GOOGLE_CLIENT_SECRET`. Those settings are
+  no longer read.
+
 ## A room's deliveries carry only what is new, and say plainly when they cannot — (v1.32.5)
 
 ### Fixes

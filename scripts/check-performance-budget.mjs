@@ -78,12 +78,16 @@ const assetRoot = join(distRoot, "assets");
  * CI's is the one that gates. 121,038 and 124,117 leave 2 each on CI.
  * Raised by the owner's decision, "A" from Discord on 2026-11-08, and to CI's measure at the
  * terminal the same day.
+ *
+ * #371 (the approval QR's Start over button) measured 121,045 / 124,121 on CI, +9 / +6 on #207's
+ * 121,036 / 124,115; 121,047 and 124,123 leave 2 each. Raised by the owner at the terminal on
+ * 2026-11-08 ("set it from CI's measure").
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 121_038,
-  jsTotalGzipBytes: 124_117,
+  jsGzipBytes: 121_047,
+  jsTotalGzipBytes: 124_123,
 };
 
 const walk = async (directory) => {

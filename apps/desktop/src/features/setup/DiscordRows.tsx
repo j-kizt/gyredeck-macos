@@ -69,10 +69,10 @@ const ApprovalRow = ({ run, busy }: Pick<IUseDiscord, "run" | "busy">) => {
           <span className="setup-title">Approval code</span>
           <span className="setup-detail">{setup ? "Scan this with an authenticator app, then type the code it shows. It is shown only now" : state ? APPROVAL_DETAIL[state] : "Checking…"}</span>
         </span>
-        {setup || !state ? null : state === "locked" ? (
+        {!state ? null : state === "locked" && !setup ? (
           <button className="pill-btn" type="button" disabled={busy} onClick={() => void unlock()} data-tauri-drag-region="false">Unlock</button>
         ) : (
-          <button className="pill-btn" type="button" disabled={busy} onClick={() => void start()} data-tauri-drag-region="false">{state === "on" ? "Reset" : "Set up"}</button>
+          <button className="pill-btn" type="button" disabled={busy} onClick={() => void start()} data-tauri-drag-region="false">{setup ? "Start over" : state === "on" ? "Reset" : "Set up"}</button>
         )}
       </div>
       {setup ? (

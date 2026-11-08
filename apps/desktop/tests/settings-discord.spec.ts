@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { expect, test, type Page } from "@playwright/test";
 
 /**
@@ -507,6 +508,38 @@ test("approval code: Set up shows the QR and the secret once, a wrong code keeps
   await expect(approvals.getByRole("button", { name: "Reset" })).toBeVisible();
   expect(await page.content()).not.toContain(SECRET);
   expect((await commands(page, "discord_approvals_confirm")).map((call) => call.args)).toEqual([{ code: "111111" }, { code: "287082" }]);
+});
+
+// #371: the dev server sends no CSP, and a blocked image still shows its alt text, so the test above
+// passed while the installed app showed a blank QR. This one serves the page under the app's own
+// image policy and checks the QR decodes.
+const APP_CSP: string = JSON.parse(readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8")).app.security.csp;
+const APP_IMAGE_POLICY = (() => {
+  const parts = APP_CSP.split(";").map((part) => part.trim());
+  return parts.find((part) => part.startsWith("img-src ")) ?? parts.find((part) => part.startsWith("default-src "))!.replace("default-src", "img-src");
+})();
+
+test("approval code: the QR decodes under the app's own image policy", async ({ page }) => {
+  await page.route((url) => url.pathname === "/", async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({ response, headers: { ...response.headers(), "content-security-policy": APP_IMAGE_POLICY } });
+  });
+  await open(page, paired());
+  const approvals = row(page, "approvals");
+  await approvals.getByRole("button", { name: "Set up" }).click();
+  const qr = approvals.getByRole("img", { name: "Approval code QR" });
+  await expect(qr).toBeVisible();
+  await expect.poll(() => qr.evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth)).toBe(192);
+});
+
+test("approval code: Start over during setup asks for a new secret", async ({ page }) => {
+  await open(page, paired());
+  const approvals = row(page, "approvals");
+  await approvals.getByRole("button", { name: "Set up" }).click();
+  await expect(approvals.getByRole("button")).toHaveText(["Start over", "Turn on"]);
+  await approvals.getByRole("button", { name: "Start over" }).click();
+  await expect(approvals.getByLabel("Approval code secret")).toHaveText(SECRET);
+  expect(await commands(page, "discord_approvals_setup")).toHaveLength(2);
 });
 
 test("approval code: locked offers Unlock and nothing else", async ({ page }) => {

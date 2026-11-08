@@ -70,7 +70,7 @@ const assetRoot = join(distRoot, "assets");
  *
  * Dependabot #367 (@types/node, discord.js, lucide-react, @vitejs/plugin-react) measured
  * 120,368 on main's 120,353 (+15); 120,370 keeps main's 2. Raised by the owner at the
- * terminal on 2026-11-08 ("ขยับเพดาน").
+ * terminal on 2026-11-08 ("raise the ceiling").
  */
 const BUDGETS = {
   coreDistBytes: 575_500,

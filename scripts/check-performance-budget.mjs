@@ -67,11 +67,15 @@ const assetRoot = join(distRoot, "assets");
  * 119,692 / 122,769 before #205, and 120,257 / 123,337 on main's 120,033 / 123,109 after it;
  * 120,355 and 123,454 keep main's 98 / 117.
  * Raised by the owner's decision, "A" at the terminal on 2026-11-03.
+ *
+ * Dependabot #367 (@types/node, discord.js, lucide-react, @vitejs/plugin-react) measured
+ * 120,368 on main's 120,353 (+15); 120,370 keeps main's 2. Raised by the owner at the
+ * terminal on 2026-11-08 ("ขยับเพดาน").
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 120_355,
+  jsGzipBytes: 120_370,
   jsTotalGzipBytes: 123_454,
 };
 

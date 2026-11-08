@@ -1,5 +1,29 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Approve a merge or a release from Discord with a code — (v1.33.0)
+
+### Added
+
+- **A merge or a release can be approved from Discord with a 6-digit code from a compatible
+  authenticator app.** Turn it on under Settings → Permission → Remote access. Set up shows a
+  QR code and its text form; approvals turn on only after one code from it is typed back. When
+  an assistant asks you on Discord to approve a merge or a release, the bot adds a line asking
+  for the code, naming the PR or version and the commit. Reply to that message with the code
+  alone. Gyredeck checks it on the Mac and tells the assistant it was approved. The room rules
+  then require the assistant to confirm the approval with the bridge and to merge or release
+  only that exact commit. Nothing else can be approved from Discord, and installing a release
+  is still done at the terminal. Codex cannot ask for a code yet, so it still asks at the
+  terminal.
+- **What a code is accepted for.** A code is checked only when it is a Reply to the request it
+  answers, sent no more than 90 seconds before Gyredeck reads it, from the paired account,
+  while the request is less than 30 minutes old and not yet answered. A code that has approved
+  cannot approve again. Three wrong codes lock approvals until you unlock them in Settings.
+- **A code replied to a request stays off the room.** It is sent to Gyredeck for checking,
+  without being saved or posted to the room. A Reply to that request that holds six or more
+  digits among other text is refused. The secret behind the codes is kept in the Keychain once
+  setup is confirmed. Reset stops the old secret at once; approvals stay off until a code from
+  the new one is confirmed.
+
 ## Gyredeck leaves Claude Code's and Codex's sign-ins to them — (v1.32.6)
 
 ### Fixes

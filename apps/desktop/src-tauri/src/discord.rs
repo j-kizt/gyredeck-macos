@@ -2167,7 +2167,7 @@ pub(crate) enum SourceError {
 
 /// The bridge, as the reader needs it.
 pub(crate) trait RoomSource: Send + Sync {
-    /// On the app's word: without it the bridge shows a non-member only its own row (#344).
+    /// On the app's word: without it the bridge refuses the roster (#344).
     fn members(&self, room: &str, as_id: &str, app_word: &str) -> Result<Roster, SourceError>;
     /// The room's stream after `since`, the last seq this side fully read and queued. The
     /// bridge takes it as the relay's read position, and never goes back before the relay

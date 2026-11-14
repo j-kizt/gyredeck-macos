@@ -1230,7 +1230,7 @@ pub(crate) fn sync_room(conversation_id: &str, app_word: &str) -> Result<SyncRoo
     if !valid_room(conversation_id) {
         return Err("Not a valid session id".to_string());
     }
-    // On the app's word: without it the bridge answers with this session's own row only (#344).
+    // On the app's word: without it the bridge refuses the lookup (#344).
     let (status, value) = bridge_request_vouched("GET", &format!("/sync/rooms?as={conversation_id}"), None, app_word)?;
     if !(200..300).contains(&status) {
         return Err(sync_error(status, &value));

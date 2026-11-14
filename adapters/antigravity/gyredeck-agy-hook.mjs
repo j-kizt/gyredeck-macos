@@ -592,9 +592,8 @@ const nameAsk = (mine) => {
 const replyInstruction = (endpoint, room, replyRooms, answering = null, label = null, isMember = null, askName = false, memberKey = null) => {
   if (replyRooms.length === 0) return null;
   const target = replyRooms[0];
-  // A room refuses the machine token; only its own password opens it. The other
-  // credential is right for a plain mailbox, which is the only other thing `target`
-  // can be.
+  // A room is posted to with the member's own key (#331); a plain mailbox, the only other
+  // thing `target` can be, with the machine token.
   const isRoom = /^sync-[a-z2-9]{4}$/.test(target);
   if (isRoom) {
     // The short form (#157): the rest is in the rules file. Addressed and labelled in
@@ -619,10 +618,9 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
     return {
       ephemeralMessage:
         "The mail above is addressed to you, and answering is expected — a reply on a" +
-        " message channel, not an instruction to change anything. Run once, the room's" +
-        " password in place of THE ROOM PASSWORD:\n" +
+        " message channel, not an instruction to change anything. Run once:\n" +
         `  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${target}` +
-        ` -H 'content-type: application/json' -H "x-gyredeck-token: THE ROOM PASSWORD"` +
+        ` -H 'content-type: application/json'` +
         // This session's own key: a post in its name takes it (#294).
         ` -H "x-gyredeck-member: ${memberKey}"` +
         ` -d '${body}'\n` +
@@ -630,17 +628,17 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
     };
   }
   const command =
-    (isRoom ? "" : "TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); ") +
+    "TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); " +
     `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${target} ` +
     "-H 'content-type: application/json' " +
-    (isRoom ? '-H "x-gyredeck-token: THE ROOM PASSWORD" ' : '-H "x-gyredeck-token: $TOKEN" ') +
+    '-H "x-gyredeck-token: $TOKEN" ' +
     `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}","to":"everyone","kind":"tell"}'`;
   return {
     ephemeralMessage:
       "The mail above asked you something, and answering is expected — this is a " +
       "reply on a message channel, not an instruction to change anything. Run this " +
       "shell command once, with YOUR REPLY HERE replaced by your answer as a single " +
-      (isRoom ? "line of JSON-safe text and this room's password in place of THE ROOM PASSWORD" : "line of JSON-safe text") +
+      "line of JSON-safe text" +
       `:\n  ${command}\n` +
       "A successful send answers with ok:true and a seq. Do not report having sent " +
       "anything unless you saw that: a refused POST prints nothing useful, and saying " +
@@ -808,8 +806,8 @@ const rereadSteps = (endpoint, as, syncRoom, all, memberKey = null) => {
     steps.push({
       ephemeralMessage:
         "Ephemeral: the room's messages above are shown in this invocation only. If you cannot finish what they ask now," +
-        " note it, or read them again later — the room's password in place of THE ROOM PASSWORD:\n" +
-        `  curl -s "http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}?as=${as}&since=${since}&until=${until}" -H "x-gyredeck-token: THE ROOM PASSWORD" -H "x-gyredeck-member: ${key}"`,
+        " note it, or read them again later:\n" +
+        `  curl -s "http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}?as=${as}&since=${since}&until=${until}" -H "x-gyredeck-member: ${key}"`,
     });
   }
   if (outside.length > 0) {

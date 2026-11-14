@@ -86,12 +86,16 @@ const assetRoot = join(distRoot, "assets");
  * Dependabot #382 (@playwright/test, lucide-react, @vitejs/plugin-react, vite) measured
  * 121,066 / 124,141 on CI, +19 / +18 on #371's 121,045 / 124,121; 121,068 and 124,143 leave 2
  * each. Raised by the owner from Discord on 2026-11-14 ("yes" to setting it from CI's measure).
+ *
+ * #331 (the key that copies a session's one-time join code, the founder's crown and close-room
+ * button) measured 121,498 / 124,576 on CI, +430 / +433 on #382's 121,068 / 124,143; 121,500 and
+ * 124,578 leave 2 each. Raised by the owner from Discord on 2026-11-14 ("yes", sync-z8er seq 140).
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 121_068,
-  jsTotalGzipBytes: 124_143,
+  jsGzipBytes: 121_500,
+  jsTotalGzipBytes: 124_578,
 };
 
 const walk = async (directory) => {

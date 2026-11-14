@@ -31,8 +31,8 @@ export interface ISyncRoomState {
   loadedFor: string | null;
   /** True when this session created the room, which is who may invite. */
   isFounder: boolean;
-  /** Read the room's password, to hand to a session being let in. */
-  issuePassword: () => Promise<string | null>;
+  /** Mint this session's one-time join code, to paste into its own terminal (#331). */
+  issueJoinCode: () => Promise<string | null>;
   create: () => Promise<void>;
   join: (code: string) => Promise<void>;
   leave: () => Promise<void>;
@@ -148,12 +148,12 @@ export const useSyncRoom = ({
     // reach the bridge still has to say so rather than look like an empty room.
     error: error ?? readFailure,
     isFounder: founder !== null && founder === conversationId,
-    issuePassword: async () => {
+    issueJoinCode: async () => {
       if (!conversationId || !canUseNativeControls || !room) return null;
       setBusy(true);
       setError(null);
       try {
-        return await invoke<string>("sync_issue_password", { code: room, conversationId });
+        return await invoke<string>("sync_issue_join_code", { code: room, conversationId });
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : String(cause));
         return null;

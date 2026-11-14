@@ -5548,7 +5548,10 @@ fn a_request_is_journalled_as_its_act_so_relayed_again_it_asks_for_no_code() {
 #[test]
 fn c5_c7_c8_a_right_code_on_its_request_posts_the_stamp_to_the_requester_and_never_the_code() {
     let (f, buffer) = approvals_room("approve-right");
-    let code = code_now(0);
+    // The step the code is minted for, not the clock at the assertion: a step boundary
+    // crossed in between failed CI once (59822628 saved, 59822629 read).
+    let step = unix_ms() / 1000 / totp::STEP_SECS;
+    let code = format!("{:06}", totp::code_at(APPROVAL_SECRET, step));
     let id = sent_id(1_000, 1);
     let reply = answer(&f, &buffer, approve_with(&id, 1, &code, merge(370, SHA_A)));
     assert_eq!(reply["ok"], true, "{reply}");
@@ -5571,7 +5574,7 @@ fn c5_c7_c8_a_right_code_on_its_request_posts_the_stamp_to_the_requester_and_nev
     assert!(!format!("{posts:?}").contains(&code), "C8: the code is in nothing posted");
     assert!(!buffer.text().lines().any(|line| line.contains(&code)), "C8: nor in anything said to the child");
     let record = saved_record(&f).unwrap();
-    assert_eq!(record.last_step, unix_ms() / 1000 / totp::STEP_SECS, "the step is saved as used");
+    assert_eq!(record.last_step, step, "the step is saved as used");
 }
 
 #[test]

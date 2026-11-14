@@ -563,15 +563,18 @@ const AGY_SYNC_REPLY_TEMPLATES: [&str; 4] = [
     r#"command(regex:^while :; do node ~/\.config/gyredeck/gyredeck-agy-hook\.mjs wait 300 $ID; rc=\$\?; \[ \$rc -eq 4 \] \|\| break; done$)"#,
     // WAIT, as the bridge's howTo prints it.
     r#"command(regex:^node ~/\.config/gyredeck/gyredeck-agy-hook\.mjs wait 60 $ID$)"#,
-    // REPLY, as the hook prints it: the poster's own key beside the password (#294).
-    r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H "x-gyredeck-token: $PW" -H "x-gyredeck-member: $KEY" -d '$BODY'$)"#,
-    // READ again, as the hook prints it: the reader's own key beside the password (#274).
-    r#"command(regex:^curl -s "http://$HOST:$PORT/mail/$ROOM\?as=$ID&since=[0-9]+&until=[0-9]+" -H "x-gyredeck-token: $PW" -H "x-gyredeck-member: $KEY"$)"#,
+    // REPLY, as the hook prints it: the poster's own key, and no room password (#331).
+    r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H "x-gyredeck-member: $KEY" -d '$BODY'$)"#,
+    // READ again, as the hook prints it: the reader's own key, and no room password (#331).
+    r#"command(regex:^curl -s "http://$HOST:$PORT/mail/$ROOM\?as=$ID&since=[0-9]+&until=[0-9]+" -H "x-gyredeck-member: $KEY"$)"#,
 ];
 
 /// Rules no longer written but still ours to remove: READ before it took a key (#274), REPLY
-/// before it did, and the howTo's SEND, which no longer prints a ready command (#294).
-const AGY_RETIRED_TEMPLATES: [&str; 3] = [
+/// before it did, the howTo's SEND, which no longer prints a ready command (#294), and REPLY
+/// and READ while they still carried the room's password beside the key (#331).
+const AGY_RETIRED_TEMPLATES: [&str; 5] = [
+    r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H "x-gyredeck-token: $PW" -H "x-gyredeck-member: $KEY" -d '$BODY'$)"#,
+    r#"command(regex:^curl -s "http://$HOST:$PORT/mail/$ROOM\?as=$ID&since=[0-9]+&until=[0-9]+" -H "x-gyredeck-token: $PW" -H "x-gyredeck-member: $KEY"$)"#,
     r#"command(regex:^curl -s "http://$HOST:$PORT/mail/$ROOM\?as=$ID&since=[0-9]+&until=[0-9]+" -H "x-gyredeck-token: $PW"$)"#,
     r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H "x-gyredeck-token: $PW" -d '$BODY'$)"#,
     r#"command(regex:^curl -s -X POST http://$HOST:$PORT/mail/$ROOM -H 'content-type: application/json' -H 'x-gyredeck-token: $PW' -d '$BODY'$)"#,
@@ -1097,6 +1100,11 @@ fn sync_create(broker: tauri::State<'_, broker::BrokerState>, conversation_id: S
 #[tauri::command]
 fn sync_close(broker: tauri::State<'_, broker::BrokerState>, code: String, conversation_id: String) -> Result<(), String> {
     standalone_bridge::sync_close(&code, &conversation_id, &broker.secret()?)
+}
+
+#[tauri::command]
+fn sync_issue_join_code(broker: tauri::State<'_, broker::BrokerState>, code: String, conversation_id: String) -> Result<String, String> {
+    standalone_bridge::sync_issue_join_code(&code, &conversation_id, &broker.secret()?)
 }
 
 #[tauri::command]
@@ -6206,6 +6214,7 @@ pub fn run() {
             sync_create,
             sync_join,
             sync_issue_password,
+            sync_issue_join_code,
             session_names,
             codex_hook_trust,
             set_session_name,
@@ -7697,19 +7706,19 @@ mod agy_sync_reply_tests {
             ),
             (
                 "reply",
-                format!("curl -s -X POST http://{HOST}:{port}/mail/sync-ab2c -H 'content-type: application/json' -H \"x-gyredeck-token: {PASSWORD}\" -H \"x-gyredeck-member: {MEMBER_KEY}\" -d '{{\"from\":\"{id}\",\"text\":\"Done, see #261\",\"replyTo\":\"{id}\",\"to\":\"Codex\",\"kind\":\"tell\"}}'"),
+                format!("curl -s -X POST http://{HOST}:{port}/mail/sync-ab2c -H 'content-type: application/json' -H \"x-gyredeck-member: {MEMBER_KEY}\" -d '{{\"from\":\"{id}\",\"text\":\"Done, see #261\",\"replyTo\":\"{id}\",\"to\":\"Codex\",\"kind\":\"tell\"}}'"),
                 HOOK,
                 vec![
                     "`  curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${target}` +",
-                    "` -H 'content-type: application/json' -H \"x-gyredeck-token: THE ROOM PASSWORD\"` +",
+                    "` -H 'content-type: application/json'` +",
                     "` -H \"x-gyredeck-member: ${memberKey}\"`",
                 ],
             ),
             (
                 "read again",
-                format!("curl -s \"http://{HOST}:{port}/mail/sync-ab2c?as={id}&since=4&until=9\" -H \"x-gyredeck-token: {PASSWORD}\" -H \"x-gyredeck-member: {MEMBER_KEY}\""),
+                format!("curl -s \"http://{HOST}:{port}/mail/sync-ab2c?as={id}&since=4&until=9\" -H \"x-gyredeck-member: {MEMBER_KEY}\""),
                 HOOK,
-                vec!["`  curl -s \"http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}?as=${as}&since=${since}&until=${until}\" -H \"x-gyredeck-token: THE ROOM PASSWORD\" -H \"x-gyredeck-member: ${key}\"`"],
+                vec!["`  curl -s \"http://${endpoint.hostname}:${endpoint.port}/mail/${syncRoom}?as=${as}&since=${since}&until=${until}\" -H \"x-gyredeck-member: ${key}\"`"],
             ),
         ]
     }

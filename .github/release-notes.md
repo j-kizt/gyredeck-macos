@@ -6,14 +6,17 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
 
 - **A Claude Code session in a sync room can ask the owner to approve one exact Bash command from
   Discord.** Discord shows the whole command. The owner's 6-digit approval code approves those
-  exact characters once, within 30 minutes. When the session then runs that command verbatim, its
-  Claude Code hook allows it. A different command, a second run, another session, an expired
-  approval, or an answer the hook cannot read gets no allow from the hook; Claude Code then
-  decides as it would without Gyredeck.
-- **Some commands stay terminal-only, even with a code:** a command that mentions the Keychain or
-  credentials, the Discord pairing or the approval secret, installing on the Mac, or an agent's
-  hooks or settings cannot be approved from Discord. This matches text in the command; it is a
-  guard against mistakes, not a sandbox.
+  exact characters once, within 30 minutes. When the session then runs that command verbatim, with
+  no Bash options other than a description or a timeout, its Claude Code hook allows it. A
+  different command, a second run, another session, an expired approval, any other option (such
+  as running in the background or outside the sandbox), or an answer the hook cannot read gets no
+  allow from the hook; Claude Code then decides as it would without Gyredeck.
+- **A command holding any word or path on a fixed list cannot be approved from Discord.** The list
+  includes `security`, `keychain`, `gh auth`, `token`, `credential`, `secret`, `pairing`, `.dmg`,
+  `.pkg`, `/applications`, `.claude`, `.codex` and `settings.json`, matched as text without regard
+  to case. It is a guard against mistakes, not a sandbox: a command that reaches credentials,
+  installs, or an agent's settings without one of those words is not caught, and a harmless command
+  that holds one is refused.
 
 Known limits: Codex sessions cannot ask for this, and Antigravity sessions can ask but have no hook
 that lets the command through. The approval binds the command's text, not the folder it runs in.

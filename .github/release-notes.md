@@ -1,5 +1,21 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A Codex update no longer drops it from its room — (v1.33.2)
+
+### Fixes
+
+- **A session whose end may be a restart keeps its place in its sync room for 15 seconds.** When
+  Codex updated itself, it ended its live thread and resumed it a few seconds later. Gyredeck took
+  the session out of its room at the end, and the session had to be put back by hand. Now an end
+  with a reason that may be a restart (Codex's only reason, `other`, and any end with no reason)
+  waits 15 seconds. If the session opens again or starts a turn in that time, it keeps its place.
+  Only the session's own events count, by the time its hook stamped on them; room mail sent to it
+  does not count, and neither does the end of the turn it was in. An end the person chose (`/clear`,
+  `/resume`, logout, quitting the prompt, turning bypass permissions off) still takes it out at once.
+- **A session taken out of a room that is still open is told so.** The notice used to say the room
+  was closed from its end. It now says the room itself is still open for the others. A room that
+  really closes is worded as before.
+
 ## The approval code's QR shows in the app — (v1.33.1)
 
 ### Fixes

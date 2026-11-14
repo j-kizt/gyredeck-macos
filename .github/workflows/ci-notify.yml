@@ -1,0 +1,65 @@
+name: CI to Discord
+
+# The repo's GitHub webhook posts pushes and pull requests to #gyredeck-activity but never a
+# CI result (#384). This posts one line per finished CI or Release run.
+#
+# workflow_run runs main's copy of this file with the repo's secrets, even for a run started
+# by a fork's pull request. So it checks nothing out, downloads no artifact and runs no code
+# from the run it reports, and every value from the event (branch, title, actor) is
+# attacker-controlled text: it reaches the shell only through env and jq, never through
+# ${{ }} inside run.
+
+on:
+  workflow_run:
+    workflows: [CI, Release]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Post the result
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_CI_WEBHOOK }}
+          RUN: ${{ toJSON(github.event.workflow_run) }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "::notice::DISCORD_CI_WEBHOOK is not set - nothing posted"
+            exit 0
+          fi
+          conclusion=$(jq -r '.conclusion // "unknown"' <<<"$RUN")
+          case "$conclusion" in
+            success) mark="🟢 passed" ;;
+            failure) mark="🔴 failed" ;;
+            timed_out) mark="🔴 timed out" ;;
+            action_required) mark="🟡 waiting for approval" ;;
+            cancelled|skipped|neutral|stale)
+              echo "::notice::$conclusion - nothing posted"
+              exit 0 ;;
+            *) mark="⚪ $conclusion" ;;
+          esac
+          # Only fixed words, numbers and GitHub's own link reach Discord: a commit title or a
+          # branch name is free text its author chose, and could carry something not meant to
+          # be posted (Gyre Audit, #384).
+          payload=$(jq -n --arg mark "$mark" --argjson run "$RUN" '
+            ($run.pull_requests[0].number // null) as $pr
+            | ($run.head_branch // "") as $ref
+            | (if $run.name == "Release" then
+                 if ($ref | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) then "Release build of \($ref)" else "Release build of a tag" end
+               elif $pr then "Checks on PR #\($pr)"
+               elif $run.event == "pull_request" then "Checks on a pull request"
+               elif $ref == "main" then "Checks on main after a push"
+               else "Checks on a \($run.event) run" end) as $what
+            | {
+                content: "**\($run.name)** \($mark)\n\($what)\n\($run.html_url)",
+                allowed_mentions: {parse: []}
+              }')
+          status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+            -H 'content-type: application/json' --data-binary "$payload" "$WEBHOOK" || true)
+          case "$status" in
+            2??) echo "posted ($status)" ;;
+            *) echo "::warning::Discord answered $status - not posted"; exit 1 ;;
+          esac

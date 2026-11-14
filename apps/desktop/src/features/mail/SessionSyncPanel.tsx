@@ -1,6 +1,7 @@
 import { Check, Copy, Crown, DoorClosed, KeyRound, Link2, Link2Off } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ISessionSummary } from "../session/types";
+import { copyJoinCode } from "./copyJoinCode";
 import type { ISyncRoomState } from "./useSyncRoom";
 
 /**
@@ -30,6 +31,10 @@ export const SessionSyncPanel = ({
   const [code, setCode] = useState("");
   const [copied, setCopied] = useState(false);
   const [invited, setInvited] = useState(false);
+  const shownRef = useRef(session.conversationId);
+  shownRef.current = session.conversationId;
+
+  useEffect(() => setInvited(false), [session.conversationId]);
 
   useEffect(() => {
     if (!room) return;
@@ -42,16 +47,17 @@ export const SessionSyncPanel = ({
   // it is from where it lives, not from another window. The code works once, for two
   // minutes, and a new press kills the last one.
   const copyInvite = async () => {
-    const joinCode = await issueJoinCode();
-    if (!joinCode) return;
-    try {
-      await navigator.clipboard.writeText(joinCode);
+    const result = await copyJoinCode({
+      forSession: session.conversationId,
+      shownSession: () => shownRef.current,
+      mint: issueJoinCode,
+      write: (text) => navigator.clipboard.writeText(text),
+    });
+    if (result === "copied") {
       setInvited(true);
       window.setTimeout(() => setInvited(false), 1_600);
-    } catch {
-      // Denied clipboard access would leave the code minted and unusable, so say so
-      // rather than pretending it was copied.
-      window.prompt("Copy this session's join code and paste it into its terminal", joinCode);
+    } else if (typeof result === "object") {
+      window.prompt("Copy this session's join code and paste it into its terminal", result.fallback);
     }
   };
 

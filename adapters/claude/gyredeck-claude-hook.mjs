@@ -552,6 +552,8 @@ const confirmRoomPassword = async (endpoint, token, room, prompt) => {
   return { room: code, members: Array.isArray(answer.members) ? answer.members : [] };
 };
 
+const APPROVED_BASH_KEYS = new Set(["command", "description"]);
+
 /**
  * Whether the owner approved exactly this Bash command from Discord with their code (#374).
  * Claude Code's auto mode refuses some commands whatever the room allows; a PreToolUse
@@ -567,6 +569,9 @@ const approvedCommand = async (endpoint, token, conversationId, input) => {
   if (input.tool_name !== "Bash" || !token || !conversationId) return null;
   const command = input.tool_input?.command;
   if (typeof command !== "string" || command.length === 0) return null;
+  // The allow covers the whole call, so a call carrying anything the owner never saw (out of
+  // the sandbox, in the background) is not the act approved, and the approval is not spent.
+  if (!Object.keys(input.tool_input).every((key) => APPROVED_BASH_KEYS.has(key))) return null;
   const bound = judgeBrokerAnswer(await askBroker({ bind: { conversationId } }));
   if (!bound.result) return null;
   // No room: the app finds the bound session's own, which the machine token alone cannot (#344).

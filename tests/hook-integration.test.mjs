@@ -14905,7 +14905,7 @@ test("#380: mail to a session waiting out its grace, or a late event of its own,
       runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: {},
     })).status, 202, "premise: a turn that ended before the close lands after it");
     await pause(2000);
-    assert.equal(await inRoom(), false, "only the session opening again brings it back");
+    assert.equal(await inRoom(), false, "only the session opening or starting a turn after the close brings it back");
   } finally {
     await f.close();
   }
@@ -14942,6 +14942,30 @@ test("#380: decided by the session's own stamps, never by arrival order or by wh
     await event("conversation_open", { reason: "resume" }, openedAt);
     await pause(2000);
     assert.equal(await inRoom(), false, "O3: an open stamped before the close does not keep it");
+
+    // The dying process's own last hook, stamped after its close.
+    await f.admit(f.peer);
+    await event("conversation_close", { reason: "other" });
+    await event("tool_end", { toolName: "Bash" }, new Date(Date.now() + 5));
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O4: only an open or a new turn says it is back");
+
+    // A clock far ahead is held to the bridge's now.
+    await f.admit(f.peer);
+    await event("turn_start", { inputCount: 1 }, new Date(Date.now() + 60_000));
+    await pause(20);
+    await event("conversation_close", { reason: "other" });
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O5: a stamp from the future does not keep it for good");
+
+    // A real end, then an older close of an earlier process landing late.
+    await f.admit(f.peer);
+    const earlier = new Date(Date.now() - 3_000);
+    await event("conversation_open", { reason: "resume" }, new Date(Date.now() - 2_000));
+    await event("conversation_close", { reason: "other" });
+    await event("conversation_close", { reason: "other" }, earlier);
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O6: an older close landing late does not cancel the newer one");
   } finally {
     await f.close();
   }

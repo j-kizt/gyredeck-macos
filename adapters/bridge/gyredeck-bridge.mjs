@@ -2116,19 +2116,24 @@ function startBridge(config) {
 
   // Sessions that ended without meaning to, each waiting out CLOSE_GRACE_MS before it leaves
   // its room (#380). Whether it came back is decided by the session's own clock, never by the
-  // order things land in: it stays if any /ingest event of its own is stamped after the close.
-  // Room mail, /hook/stop and /hook/attention are stamped by the bridge on arrival, so they say
-  // nothing about when the session acted and never count. The stamps live on the member object,
-  // and the timer evicts only the membership it was started for, so a member taken out and put
-  // back, or moved, starts clean and is not evicted by an old timer.
+  // order things land in: it stays if it opened or started a turn, stamped by its own hook,
+  // after the close. Other events can come from the dying process's last hooks, and room mail,
+  // /hook/stop and /hook/attention are stamped by the bridge on arrival, so none of them count.
+  // A stamp is never later than the bridge's now, so one skewed clock cannot keep it for good.
+  // The stamps are kept per member object, and the timer evicts only the membership it was
+  // started for, so a member taken out and put back, or moved, starts clean. An older close
+  // landing after a newer one changes nothing.
+  const BACK_EVENTS = new Set(["conversation_open", "turn_start"]);
   const closingSessions = new Map();
   const seenAtByMember = new WeakMap();
   const seenSince = (member, closedAt) => (seenAtByMember.get(member) ?? -Infinity) > closedAt;
   const closeSessionLater = (conversationId, reason, stampedAt) => {
-    clearTimeout(closingSessions.get(conversationId));
+    const closedAt = Number.isFinite(stampedAt) ? Math.min(stampedAt, Date.now()) : Date.now();
+    const armed = closingSessions.get(conversationId);
+    if (armed && armed.closedAt > closedAt) return;
+    clearTimeout(armed?.timer);
     closingSessions.delete(conversationId);
     const held = syncRoomFor(conversationId)?.room.members.get(conversationId);
-    const closedAt = Number.isFinite(stampedAt) ? stampedAt : Date.now();
     if (!held || seenSince(held, closedAt)) return;
     if (DELIBERATE_ENDS.has(reason)) {
       releaseClosedSession(conversationId);
@@ -2141,7 +2146,7 @@ function startBridge(config) {
       }
     }, CLOSE_GRACE_MS);
     timer.unref?.();
-    closingSessions.set(conversationId, timer);
+    closingSessions.set(conversationId, { timer, closedAt });
   };
 
   const emitLocal = (payload, { stampedBySession = false } = {}) => {
@@ -2155,9 +2160,9 @@ function startBridge(config) {
       const stampedAt = Date.parse(payload.timestamp);
       if (payload.type === "conversation_close") {
         closeSessionLater(payload.conversationId, payload.data?.reason, stampedAt);
-      } else if (Number.isFinite(stampedAt)) {
+      } else if (BACK_EVENTS.has(payload.type) && Number.isFinite(stampedAt)) {
         const member = syncRoomFor(payload.conversationId)?.room.members.get(payload.conversationId);
-        if (member) seenAtByMember.set(member, Math.max(seenAtByMember.get(member) ?? -Infinity, stampedAt));
+        if (member) seenAtByMember.set(member, Math.max(seenAtByMember.get(member) ?? -Infinity, Math.min(stampedAt, Date.now())));
       }
     }
     // A session that compacted or resumed no longer holds the roster it was handed, so the next

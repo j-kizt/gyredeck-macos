@@ -1,5 +1,16 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A session keeps its room when a hook's input arrives late — (v1.33.4)
+
+### Fixes
+
+- **Each hook now stamps its event at the moment the agent fired it.** The bridge decides whether a
+  session's end came before or after its next open or turn by these stamps. A hook that started
+  before the end but finished reading its input after it used to be stamped late, so the bridge
+  could count the end as the last word and take the session out of its sync room. The Claude Code,
+  Codex and Antigravity hooks now stamp their events with the time the hook process started.
+  A hook delayed before its process starts is not covered by this change.
+
 ## The room lookup answers only the session itself or the app — (v1.33.3)
 
 ### Fixes

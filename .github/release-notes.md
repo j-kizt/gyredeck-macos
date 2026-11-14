@@ -1,5 +1,21 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## The room lookup answers only its own member or the app — (v1.33.3)
+
+### Fixes
+
+- **Which room a session is in, and who is in it with it, is told only to that session or the app.**
+  Any local program holding the machine's ingest token could ask the bridge which sync room a
+  session was in and list its members, and could read the whole table of rooms. Now the lookup
+  for one session answers only to that session's own member key or to the app, and refuses
+  everyone else the same way whether or not the session is in a room. The table of every room
+  answers only to the app.
+- **A pasted room password still lets a session in.** The hooks used to look up their own room
+  before confirming a password. They now confirm through the app without naming the room, and
+  the app finds the session's room itself.
+- Still open, and tracked as its own card (#391): the bridge's live event stream and snapshot
+  need no token, and show room messages in short.
+
 ## A Codex session keeps its room through a Codex update — (v1.33.2)
 
 ### Fixes

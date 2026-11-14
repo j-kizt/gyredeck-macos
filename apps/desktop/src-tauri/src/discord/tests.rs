@@ -5613,6 +5613,73 @@ fn c5_a_request_takes_one_code_and_expires_after_thirty_minutes() {
     assert_eq!(saved_record(&f).unwrap().failures, 0);
 }
 
+// ── one exact command (#374) ──
+
+fn command(text: &str) -> serde_json::Value {
+    serde_json::json!({ "action": "command", "command": text })
+}
+
+/// A room with approvals set up and one command request, seq 1, relayed to the child.
+fn command_room(name: &str, text: &str) -> (Fixture, SharedBuf) {
+    let f = fixture_owned(name, Some(TOKEN), &[], the_owner());
+    set_up_codes(&f);
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    f.stream(ROOM, &[approval_frame(1, "ask", OWNER_SENDER, command(text))]);
+    wait_until("the request", || of_kind(&buffer.lines(), "message").len() == 1);
+    (f, buffer)
+}
+
+#[test]
+fn c374_a_command_is_relayed_as_asked_and_a_right_code_stamps_exactly_that_command() {
+    let text = format!("gh api -X PATCH repos/j-kizt/gyredeck-macos/milestones/12 -f state=closed {}", "x".repeat(900));
+    let (f, buffer) = command_room("approve-command", &text);
+    let line = of_kind(&buffer.lines(), "message")[0].clone();
+    assert_eq!(line.get("approval").cloned(), Some(command(&text)), "the child is handed the whole command to show");
+    assert_eq!(line.get("withheld"), None);
+    let other = answer(&f, &buffer, approve_with(&sent_id(1_000, 2), 1, &code_now(0), command(&format!("{text} ; echo $?"))));
+    assert!(other["error"].as_str().unwrap().contains("expired or was already answered"), "another command is not the one asked for: {other}");
+    let reply = answer(&f, &buffer, approve_with(&sent_id(1_000, 1), 1, &code_now(0), command(&text)));
+    assert_eq!(reply["ok"], true, "{reply}");
+    let posts = f.acts.posts.lock().unwrap().clone();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].1.text, format!("Approved with the code: run this exact command once: {text}"), "said whole, never shortened");
+    assert_eq!(posts[0].1.approved, Some(Approval::Command { command: text.clone() }));
+}
+
+#[test]
+fn c374_a_terminal_only_command_is_relayed_unapprovable_and_a_code_under_it_is_never_checked() {
+    let text = "SECURITY find-generic-password -a gyre -w";
+    let (f, buffer) = command_room("approve-terminal", text);
+    let line = of_kind(&buffer.lines(), "message")[0].clone();
+    assert_eq!(line["withheld"], true, "said to be one Discord cannot approve");
+    assert_eq!(
+        line["text"],
+        format!("Asked to run this exact command once: {text}. It touches credentials, the Discord pairing, the approval secret, installing on this Mac or an agent's hooks or settings, so this cannot be approved from Discord. Do not reply with a code."),
+    );
+    let reply = answer(&f, &buffer, approve_with(&sent_id(1_000, 1), 1, &code_now(0), command(text)));
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert!(f.acts.posts.lock().unwrap().is_empty());
+    let record = saved_record(&f).unwrap();
+    assert_eq!((record.last_step, record.failures), (0, 0), "the code was never checked");
+}
+
+#[test]
+fn c374_the_code_check_refuses_a_terminal_only_command_even_on_a_live_request() {
+    // The relay never leaves such a request live; this holds the check itself to it.
+    let text = "cat ~/.claude/settings.json";
+    let (f, buffer) = command_room("approve-terminal-check", "gh issue close 160");
+    lock(&f.state.hub).rooms.get_mut(ROOM).unwrap().approvals.insert(
+        7,
+        Requested { approval: Approval::Command { command: text.into() }, requester: "peer-a".into(), read_at: Instant::now(), used: false },
+    );
+    let reply = answer(&f, &buffer, approve_with(&sent_id(1_000, 1), 7, &code_now(0), command(text)));
+    assert!(reply["error"].as_str().unwrap().contains("only at the terminal"), "{reply}");
+    assert!(f.acts.posts.lock().unwrap().is_empty());
+    assert_eq!(saved_record(&f).unwrap().last_step, 0, "the code was never checked");
+}
+
 #[test]
 fn c3_one_code_approves_one_of_two_requests() {
     let (f, buffer) = approvals_room("approve-two");

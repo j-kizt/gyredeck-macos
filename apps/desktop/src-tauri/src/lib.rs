@@ -6381,7 +6381,25 @@ pub fn run() {
                         standalone_bridge::bridge_request_vouched("POST", &format!("/sync/rooms/{room}/confirm"), Some(body), &secret)
                     })
                 };
-                if let Err(error) = app.state::<broker::BrokerState>().start_default(collect, report_bound, confirm) {
+                // A use the broker vouched for (#374): the bound session spends its own approval
+                // of one exact command, never one another session asked for.
+                let use_approval = {
+                    let secret = secret.clone();
+                    std::sync::Arc::new(move |session: &str, room: &str, command: &str| {
+                        let room = if room.is_empty() {
+                            let (_, found) = standalone_bridge::bridge_request_vouched("GET", &format!("/sync/rooms?as={session}"), None, &secret)?;
+                            match found.get("room").and_then(serde_json::Value::as_str) {
+                                Some(room) => room.to_string(),
+                                None => return Ok((404, serde_json::json!({ "ok": false, "error": "no_live_approval", "message": "This session is in no room." }))),
+                            }
+                        } else {
+                            room.to_string()
+                        };
+                        let body = serde_json::json!({ "as": session, "command": command }).to_string();
+                        standalone_bridge::bridge_request_vouched("POST", &format!("/mail/{room}/approval/use"), Some(body), &secret)
+                    })
+                };
+                if let Err(error) = app.state::<broker::BrokerState>().start_default(collect, report_bound, confirm, use_approval) {
                     eprintln!("Gyredeck mailbox broker is unavailable: {error}");
                 }
             }

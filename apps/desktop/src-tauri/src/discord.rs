@@ -811,6 +811,7 @@ fn loss_text(n: u64, label: &str) -> String {
 
 const RELAYED_AGAIN: &str = "It was relayed again after Gyredeck restarted";
 const TOO_MANY_OPEN: &str = "Too many approval requests are open in this room";
+const TERMINAL_ONLY: &str = "It touches credentials, the Discord pairing, the approval secret, installing on this Mac or an agent's hooks or settings";
 
 /// A request is journalled as its act alone: relayed again after a relaunch it takes no code, so
 /// the asker's words asking for one are not what is shown (#207).
@@ -3003,6 +3004,10 @@ impl Core {
             return Err("That code was sent too long ago, so it was not checked. Ask for the approval again".to_string());
         }
         let echo = Approval::parse(&approve.approval).ok_or(STALE)?;
+        // Checked before anything else is read: no code is ever weighed against such a command (#374).
+        if echo.terminal_only().is_some() {
+            return Err("That command can be approved only at the terminal, so the code was not checked".to_string());
+        }
         let (word, thread) = {
             let hub = lock(&self.hub);
             let feed = hub.rooms.get(&approve.room).ok_or(GONE)?;
@@ -3789,9 +3794,14 @@ impl RoomReader {
             None
         };
         let mut hub = lock(&self.hub);
-        let withheld = approval.is_some() && !hub.rooms.get_mut(&self.room).is_some_and(|feed| approvals::make_room(&mut feed.approvals, Instant::now()));
+        let open = approval.is_some() && hub.rooms.get_mut(&self.room).is_some_and(|feed| approvals::make_room(&mut feed.approvals, Instant::now()));
+        // A command only the terminal approves (#374) is withheld like one past the open cap: shown
+        // as its act, asking for no code, and remembered as used so a code under it is refused.
+        let terminal_only = approval.as_ref().and_then(Approval::terminal_only);
+        let withheld = approval.is_some() && (!open || terminal_only.is_some());
         let requested = approval.clone().map(|approval| Requested { approval, requester: message.from.clone(), read_at: Instant::now(), used: withheld });
         let text = match &approval {
+            Some(approval) if terminal_only.is_some() => approval.not_approvable(TERMINAL_ONLY),
             Some(approval) if withheld => approval.not_approvable(TOO_MANY_OPEN),
             _ => message.text,
         };

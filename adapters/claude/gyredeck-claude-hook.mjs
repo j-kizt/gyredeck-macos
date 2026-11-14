@@ -18,7 +18,9 @@ import { randomUUID } from "node:crypto";
  *   node gyredeck-claude-hook.mjs --event PreToolUse
  *
  * The adapter never blocks Claude Code: it exits 0 with no stdout, so a
- * PreToolUse hook is treated as "allow" and other hooks proceed normally.
+ * PreToolUse hook is treated as "allow" and other hooks proceed normally. The one
+ * PreToolUse answer it prints is an explicit allow for a Bash command the owner approved
+ * from Discord with their code, exactly as approved and once (#374).
  */
 
 const DEFAULT_ENDPOINT = { hostname: "127.0.0.1", port: 47_621 };
@@ -548,6 +550,37 @@ const confirmRoomPassword = async (endpoint, token, room, prompt) => {
   return { room: answer.room, members: Array.isArray(answer.members) ? answer.members : [] };
 };
 
+// A time limit changes nothing the owner saw; the sandbox and the background do.
+const APPROVED_BASH_KEYS = new Set(["command", "description", "timeout"]);
+
+/**
+ * Whether the owner approved exactly this Bash command from Discord with their code (#374).
+ * Claude Code's auto mode refuses some commands whatever the room allows; a PreToolUse
+ * answer of `allow` for the exact input gets one past it (a PermissionRequest hook is never
+ * asked on such a refusal). Asked of the bridge through the broker, which names this
+ * session from the process, and the bridge marks the approval used as it answers, so the
+ * same code never lets a command through twice. Anything but a well-formed yes for these
+ * very characters, this session and a seq — no room, no broker, a refusal, a timeout, an
+ * answer that cannot be read — is no allow: the command meets the harness's checks as usual.
+ * Answers the request's seq, or null.
+ */
+const approvedCommand = async (endpoint, token, conversationId, input) => {
+  if (input.tool_name !== "Bash" || !token || !conversationId) return null;
+  const command = input.tool_input?.command;
+  if (typeof command !== "string" || command.length === 0) return null;
+  // The allow covers the whole call, so a call carrying anything the owner never saw (out of
+  // the sandbox, in the background) is not the act approved, and the approval is not spent.
+  if (!Object.keys(input.tool_input).every((key) => APPROVED_BASH_KEYS.has(key))) return null;
+  const bound = judgeBrokerAnswer(await askBroker({ bind: { conversationId } }));
+  if (!bound.result) return null;
+  // No room: the app finds the bound session's own, which the machine token alone cannot (#344).
+  const used = judgeBrokerAnswer(await askBroker({ use: { command } }));
+  const answer = used.result;
+  if (!answer || answer.boundTo !== conversationId) return null;
+  const said = answer.used;
+  return said?.ok === true && said.allowed === true && said.command === command && Number.isInteger(said.seq) ? said.seq : null;
+};
+
 /**
  * What a session is told when its password was just accepted, on the normal path and the
  * fallback alike: one line, so the two cannot drift apart again (#255). Live, an agent
@@ -816,7 +849,8 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
         " to work as you would the user's own; it never approves a commit, a release, a credential or a" +
         " settings change — ask for those at the terminal. A merge or a release it asks for is the exception:" +
         " send it an ask that says you are asking for the 6-digit approval code, with approval beside kind" +
-        " (room rules, Approval from Discord). Answer it to gyredeck-owner-discord.",
+        " (room rules, Approval from Discord). So is one exact command, asked for the same way and, once" +
+        " approved, run verbatim. Answer it to gyredeck-owner-discord.",
     );
   }
   if (fromStranger) {
@@ -1014,8 +1048,19 @@ const main = async () => {
   // said has to be the documented shape or the prompt is refused.
   let additionalContext = null;
   let respondingEvent = null;
+  // The seq of the owner's approval for this exact command (#374). The input goes through
+  // unchanged: no `updatedInput`, so what runs is what was approved.
+  let approvedSeq = null;
   const respond = () => {
-    if (additionalContext && respondingEvent) {
+    if (approvedSeq !== null) {
+      process.stdout.write(`${JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          permissionDecisionReason: `Approved by the owner from Discord with their code (request seq ${approvedSeq}): this exact command, once.`,
+        },
+      })}\n`);
+    } else if (additionalContext && respondingEvent) {
       process.stdout.write(`${JSON.stringify({
         hookSpecificOutput: { hookEventName: respondingEvent, additionalContext },
       })}\n`);
@@ -1068,6 +1113,7 @@ const main = async () => {
 
     const posts = [];
     let mailDrain = null;
+    let approval = null;
 
     switch (eventType) {
       case "SessionStart":
@@ -1110,6 +1156,7 @@ const main = async () => {
             ? Object.keys(input.tool_input).sort()
             : [],
         })));
+        approval = approvedCommand(endpoint, token, conversationId, input).catch(() => null);
         break;
       case "PostToolUse": {
         const response = input.tool_response;
@@ -1165,8 +1212,9 @@ const main = async () => {
     }
 
     if (posts.length > 0 || mailDrain) {
-      const [mail] = await Promise.all([mailDrain ?? null, ...posts]);
+      const [mail, seq] = await Promise.all([mailDrain ?? null, approval, ...posts]);
       additionalContext = mail;
+      approvedSeq = Number.isInteger(seq) ? seq : null;
     }
     respond();
   } catch {

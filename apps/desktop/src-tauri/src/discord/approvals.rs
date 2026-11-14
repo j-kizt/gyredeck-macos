@@ -1,7 +1,7 @@
 //! What one approval code approves (#207), and how long a request for one stays answerable.
 //!
-//! An assistant asks the owner with an `approval` naming one act: merge PR N at a commit, or
-//! release a version at a commit. The bridge checks the shape before it publishes; this side
+//! An assistant asks the owner with an `approval` naming one act: merge PR N at a commit,
+//! release a version at a commit, or (#374) run one exact shell command once. The bridge checks the shape before it publishes; this side
 //! checks it again before handing it to the child, and keeps what it handed per room and seq,
 //! so a code is only checked against a request this side relayed itself.
 
@@ -27,7 +27,40 @@ const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
 pub(crate) enum Approval {
     Merge { pr: u64, sha: String },
     Release { version: String, sha: String },
+    /// One shell command, character for character (#374).
+    Command { command: String },
 }
+
+/// The longest command one code approves, in characters: the bridge's `APPROVAL_COMMAND_MAX`.
+pub(crate) const COMMAND_MAX: usize = 1000;
+
+/// What a code never approves, even as one exact command (#374): the Keychain and credentials,
+/// the Discord pairing and the approval secret, installing a release on the Mac, and an agent's
+/// hooks or settings — those are the gate itself. A command holding any of these, in any case, is
+/// refused by the bridge when it is asked for and again here. The same list as the bridge's
+/// `TERMINAL_ONLY`, held equal by a test on each side. A guard against honest mistakes and casual
+/// misuse, not a sandbox: a command can reach any of these in ways no list spells.
+pub(crate) const TERMINAL_ONLY: [&str; 19] = [
+    "security",
+    "keychain",
+    "gh auth",
+    "token",
+    "credential",
+    "secret",
+    "totp",
+    "pairing",
+    "com.j-kizt.gyredeck",
+    "installer",
+    ".dmg",
+    ".pkg",
+    "/applications",
+    ".claude",
+    ".codex",
+    ".gemini",
+    "settings.json",
+    "hooks.json",
+    ".config/gyredeck",
+];
 
 impl Approval {
     /// Taken only when every field is in the one form the bridge accepts.
@@ -46,16 +79,50 @@ impl Approval {
         match self {
             Self::Merge { pr, sha } => *pr > 0 && valid_sha(sha),
             Self::Release { version, sha } => valid_version(version) && valid_sha(sha),
+            Self::Command { command } => valid_command(command),
         }
     }
 
-    /// "merge PR #370 at abc1234def56": what the code approves, said the same way everywhere.
+    /// "merge PR #370 at abc1234def56": what the code approves, said the same way everywhere. A
+    /// command is said whole, never shortened: the owner approves what will run.
     pub(crate) fn describe(&self) -> String {
         match self {
             Self::Merge { pr, sha } => format!("merge PR #{pr} at {}", &sha[..12]),
             Self::Release { version, sha } => format!("release v{version} at {}", &sha[..12]),
+            Self::Command { command } => format!("run this exact command once: {command}"),
         }
     }
+
+    /// The entry of [`TERMINAL_ONLY`] a command holds, if any: such a request is relayed as one
+    /// that cannot be approved from Discord, and a code is never checked against it.
+    pub(crate) fn terminal_only(&self) -> Option<&'static str> {
+        let Self::Command { command } = self else { return None };
+        let lower = command.to_lowercase();
+        TERMINAL_ONLY.into_iter().find(|entry| lower.contains(entry))
+    }
+}
+
+/// One line of 1 to [`COMMAND_MAX`] characters, nothing at either end the eye would miss, and no
+/// ``` that would end the code block Discord shows it in: the bridge's `approvableCommand`. The
+/// ends are refused for Rust's whitespace and U+FEFF, which together are what JS's `\s` and
+/// U+0085 cover, so the parsers agree.
+fn valid_command(command: &str) -> bool {
+    let edge = |c: char| c.is_whitespace() || c == '\u{feff}';
+    !command.is_empty()
+        && command.chars().count() <= COMMAND_MAX
+        && !command.contains(['\0', '\r', '\n'])
+        && !command.chars().any(hidden_in_command)
+        && !command.starts_with(edge)
+        && !command.ends_with(edge)
+        && !command.contains("```")
+}
+
+/// A character the owner would not see in the command Discord shows (#374): control characters,
+/// the bidi overrides and isolates, and the zero-width and invisible format characters. The
+/// bridge's `HIDDEN_IN_COMMAND` is the same set (`char::is_control` is JS's `\p{Cc}`).
+fn hidden_in_command(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{ad}' | '\u{61c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}')
 }
 
 fn valid_sha(sha: &str) -> bool {
@@ -138,10 +205,49 @@ mod tests {
         }
     }
 
+    /// The shapes the bridge and the connector are held to as well (#374): one fixture, read by
+    /// all three, so no parser can drift from the others.
+    #[test]
+    fn c374_the_shapes_every_parser_shares() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../tests/approval-shapes.json");
+        let fixture: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let accept = fixture["accept"].as_array().unwrap();
+        let refuse = fixture["refuse"].as_array().unwrap();
+        assert!(accept.len() >= 9 && refuse.len() >= 30, "premise: the fixture was read");
+        for shape in accept {
+            let approval = Approval::parse(shape).unwrap_or_else(|| panic!("refused {shape}"));
+            assert_eq!(&serde_json::to_value(&approval).unwrap(), shape, "taken as written");
+        }
+        for shape in refuse {
+            assert_eq!(Approval::parse(shape), None, "{shape}");
+        }
+    }
+
+    #[test]
+    fn c374_the_terminal_only_list_is_the_bridges() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../adapters/bridge/gyredeck-bridge.mjs")).unwrap();
+        let line = source.lines().find(|line| line.starts_with("export const TERMINAL_ONLY = [")).expect("TERMINAL_ONLY in the bridge");
+        let bridge: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
+        assert_eq!(bridge, TERMINAL_ONLY.to_vec());
+    }
+
+    #[test]
+    fn c374_a_command_holding_any_terminal_only_entry_in_any_case_is_terminal_only() {
+        for entry in TERMINAL_ONLY {
+            for text in [format!("echo {entry}"), format!("echo {}", entry.to_uppercase())] {
+                assert_eq!(Approval::Command { command: text.clone() }.terminal_only(), Some(entry), "{text}");
+            }
+        }
+        assert_eq!(Approval::Command { command: "gh issue close 160".into() }.terminal_only(), None);
+        assert_eq!(Approval::Merge { pr: 1, sha: SHA.into() }.terminal_only(), None);
+    }
+
     #[test]
     fn describes_the_act_and_its_commit() {
         assert_eq!(Approval::Merge { pr: 370, sha: SHA.to_string() }.describe(), "merge PR #370 at 0123456789ab");
         assert_eq!(Approval::Release { version: "1.33.0".to_string(), sha: SHA.to_string() }.describe(), "release v1.33.0 at 0123456789ab");
+        let long = format!("gh issue close 160 {}", "y".repeat(980));
+        assert_eq!(Approval::Command { command: long.clone() }.describe(), format!("run this exact command once: {long}"), "a command whole, never shortened");
     }
 
     #[test]

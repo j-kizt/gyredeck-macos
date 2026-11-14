@@ -898,9 +898,9 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
     // A post in this session's name takes its own key (#294): with none in this delivery, a
     // command without it would only be refused, so none is printed, and why is said.
     lines.push(memberKey
-      ? "REPLY — run once, the room's password in place of THE ROOM PASSWORD:\n" +
+      ? "REPLY — run once:\n" +
         `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${replyTo} ` +
-        `-H 'content-type: application/json' -H "x-gyredeck-token: THE ROOM PASSWORD" ` +
+        `-H 'content-type: application/json' ` +
         `-H "x-gyredeck-member: ${memberKey}" ` +
         `-d '${JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''")}'\n` +
         "It was sent only if you see ok:true and a seq."
@@ -959,9 +959,9 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   if (room_ && confirmed && result?.watching !== true && memberKey) {
     lines.push(
       `HEAR — so a message reaches you without waiting to be typed at, keep one watch on` +
-        " this room. Run this, with the room's password in place of THE ROOM PASSWORD:\n" +
+        " this room. Run this:\n" +
         `while :; do\n` +
-        `  { curl -sN --fail "http://${endpoint.hostname}:${endpoint.port}/mail/${room_}/events?as=${room}&since=resume" -H "x-gyredeck-token: THE ROOM PASSWORD" -H "x-gyredeck-member: ${memberKey}"; echo $? > /tmp/gy-${room_}.st; } \\\n` +
+        `  { curl -sN --fail "http://${endpoint.hostname}:${endpoint.port}/mail/${room_}/events?as=${room}&since=resume" -H "x-gyredeck-member: ${memberKey}"; echo $? > /tmp/gy-${room_}.st; } \\\n` +
         `    | grep --line-buffered '^data: '\n` +
         `  [ "$(cat /tmp/gy-${room_}.st)" = "22" ] && { echo "gyredeck: room ${room_} is gone - watch ended"; break; }\n` +
         `  sleep 1\n` +

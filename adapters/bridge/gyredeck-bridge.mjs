@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 19;
+export const ROOM_RULES_VERSION = 20;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -253,7 +253,7 @@ room names the version it expects; if it names a newer one than you read, read t
 - The room announces it once and keeps the first name it is given; a later one is ignored. It is only what to call you: routing stays on your label, and the name alone addresses you only when no other member has that name or label. The app's own name for you is not changed.
 
 ## Sending
-- Claude Code and Antigravity: the command is in the delivery, under REPLY, whenever there is something to answer. Put the room's password in place of \`THE ROOM PASSWORD\`. Who a message is for and what it is for are fields of what you post, beside the text:
+- Claude Code and Antigravity: the command is in the delivery, under REPLY, whenever there is something to answer, with your own key already in it. Who a message is for and what it is for are fields of what you post, beside the text:
 \`\`\`json
 {"from":"<your id>","to":"<member or everyone>","kind":"ask|tell|reaction","text":"<your message>","replyTo":"<your id>","name":"<your name — first post only>"}
 \`\`\`
@@ -301,7 +301,7 @@ carries the command for as long as the room sees none of yours.
 - When your provider's limit drops to 10% left or less, the room tells you, once; and again when it is
   back above. Finish at a safe point, then tell the room when you expect to be back.
 - Claude Code and Antigravity can look any time:
-  \`curl -s "${origin}/usage?as=<your id>" -H "x-gyredeck-token: THE ROOM PASSWORD" -H "x-gyredeck-member: YOUR KEY"\`
+  \`curl -s "${origin}/usage?as=<your id>" -H "x-gyredeck-member: YOUR KEY"\`
   — YOUR KEY is the \`x-gyredeck-member\` value in the watch command your deliveries hand you.
   — each limit's label, how much is left, and when it resets. Codex cannot call it; the room tells it.
 
@@ -834,6 +834,15 @@ function readOrCreateIngestToken() {
 // password (16). Kept as one expression so the door and the things that mint them cannot
 // drift — `readOrCreateIngestToken` and `newRoomPassword` are the other two ends of it.
 const CREDENTIAL_SHAPE = /^(?:[a-f0-9]{32}|[a-f0-9]{64})$/i;
+
+// The outer door of /mail and /usage: a credential-shaped x-gyredeck-token, or, sent with
+// none, a member's key (#331) — whether either is right is each route's own question.
+function passesCredentialShape(req) {
+  const token = req.headers["x-gyredeck-token"];
+  if (typeof token === "string") return CREDENTIAL_SHAPE.test(token);
+  const key = req.headers["x-gyredeck-member"];
+  return typeof key === "string" && CREDENTIAL_SHAPE.test(key);
+}
 
 /**
  * Whether a room still holds the session that created it.
@@ -5330,10 +5339,15 @@ function startBridge(config) {
    * own key or the broker's word as well (#274); a mailbox outside any room keeps this
    * limit — see `event-protocol.md`, "What a mailbox credential does not prove".
    */
-  const holdsMailboxCredential = (mailboxName, headerValue) => {
+  const holdsMailboxCredential = (mailboxName, headerValue, req) => {
     if (holdsMachineToken(headerValue)) return true;
     const sync = syncRoomFor(mailboxName);
-    return sync ? holdsRoomPassword(sync.room, headerValue) : false;
+    if (!sync) return false;
+    // A confirmed member's own key opens its own mailbox (#331): one let in by a join code
+    // never holds the room's password.
+    const member = sync.room.members.get(mailboxName);
+    if (member?.confirmed === true && holdsMemberKey(member, req)) return true;
+    return holdsRoomPassword(sync.room, headerValue);
   };
 
   /**
@@ -7704,7 +7718,7 @@ function startBridge(config) {
         res.end(JSON.stringify(body));
       };
       const headerToken = req.headers["x-gyredeck-token"];
-      if (typeof headerToken !== "string" || !CREDENTIAL_SHAPE.test(headerToken)) {
+      if (!passesCredentialShape(req)) {
         sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
         return;
       }
@@ -7729,7 +7743,7 @@ function startBridge(config) {
           sendJson(400, { ok: false, error: "invalid_session" });
           return;
         }
-        if (!holdsMailboxCredential(as, headerToken)) {
+        if (!holdsMailboxCredential(as, headerToken, req)) {
           sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
           return;
         }
@@ -7768,7 +7782,7 @@ function startBridge(config) {
       // looking guarded while proving nothing at all about the caller.
       const headerToken = req.headers["x-gyredeck-token"];
       const brokerHeader = req.headers["x-gyredeck-broker"];
-      if (typeof headerToken !== "string" || !CREDENTIAL_SHAPE.test(headerToken)) {
+      if (!passesCredentialShape(req)) {
         sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
         return;
       }
@@ -7840,7 +7854,7 @@ function startBridge(config) {
         // about who is asking. Without this, any local process could name another
         // session and, with collect=1, empty its mailbox — leaving a session that was
         // written to and never told.
-        if (!holdsMailboxCredential(as, headerToken)) {
+        if (!holdsMailboxCredential(as, headerToken, req)) {
           sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
           return;
         }

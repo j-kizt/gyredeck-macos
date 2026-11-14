@@ -1859,7 +1859,9 @@ test("a room delivery carries only what the session can use, and points at the r
     const reply = tell.split("\n").find((line) => line.startsWith("curl -s -X POST"));
     assert.match(reply, /-H "x-gyredeck-member: [a-f0-9]{64}"/, "the REPLY carries the member's own key");
     // Sent as printed, read off the line rather than run by a shell: its URL, headers and body.
-    const printed = reply.replace("THE ROOM PASSWORD", minted.password).replace("YOUR REPLY HERE", "seen");
+    // #331: the key alone, no room password to fill in.
+    assert.doesNotMatch(reply, /x-gyredeck-token/, "the REPLY carries no room password");
+    const printed = reply.replace("YOUR REPLY HERE", "seen");
     const url = printed.match(/curl -s -X POST (\S+)/)[1];
     const sent = Object.fromEntries([...printed.matchAll(/-H (?:"([^"]*)"|'([^']*)')/g)].map((m) => (m[1] ?? m[2]).split(/:\s*/, 2)));
     const data = printed.match(/-d '((?:[^']|'\\'')*)'/)[1].replace(/'\\''/g, "'");
@@ -14900,6 +14902,39 @@ test("#331 J1-J4: a one-time join code is for one session, works once, dies when
     // Without its key, the spent code is nothing.
     const bare = await fetch(`http://127.0.0.1:${f.port}/mail/${f.code}?as=${a}&since=0`, { headers: { "x-gyredeck-token": second } });
     assert.notEqual(bare.status, 200, "J3: a spent code is no credential");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#331 K1-K3: a confirmed member makes every room call with its own key and no room password; another's key opens nothing of its", async () => {
+  const f = await leanRoomFixture("k1");
+  try {
+    const base = `http://127.0.0.1:${f.port}`;
+    const token = (await readFile(join(f.home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const keyPeer = await memberKeyAt(base, f.peer, token);
+    const keyMe = await memberKeyAt(base, f.me, token);
+    const asPeer = { "x-gyredeck-member": keyPeer };
+    const posted = await fetch(`${base}/mail/${f.code}`, { method: "POST", headers: { "content-type": "application/json", ...asPeer }, body: JSON.stringify({ from: f.peer, to: "everyone", kind: "tell", text: "KEY-ONLY" }) });
+    assert.equal(posted.status, 202, `K1: posts: ${await posted.text()}`);
+    assert.equal((await fetch(`${base}/mail/${f.code}?as=${f.peer}&since=0`, { headers: asPeer })).status, 200, "K1: reads the room");
+    const stream = new AbortController();
+    const events = await fetch(`${base}/mail/${f.code}/events?as=${f.peer}&since=resume`, { headers: asPeer, signal: stream.signal });
+    assert.equal(events.status, 200, "K1: hears the room");
+    stream.abort();
+    assert.equal((await fetch(`${base}/mail/inbox?as=${f.peer}`, { headers: asPeer })).status, 200, "K2: opens its own inbox");
+    const usage = await fetch(`${base}/usage?as=${f.peer}`, { headers: asPeer });
+    assert.equal(usage.status, 200, `K2: reads its usage: ${await usage.text()}`);
+    // Its key is its own: another member's mailbox, usage and name stay shut.
+    assert.notEqual((await fetch(`${base}/mail/inbox?as=${f.me}`, { headers: asPeer })).status, 200, "K3: not another's inbox");
+    assert.notEqual((await fetch(`${base}/usage?as=${f.me}`, { headers: asPeer })).status, 200, "K3: not another's usage");
+    const forged = await fetch(`${base}/mail/${f.code}`, { method: "POST", headers: { "content-type": "application/json", ...asPeer }, body: JSON.stringify({ from: f.me, to: "everyone", kind: "tell", text: "FORGED" }) });
+    assert.notEqual(forged.status, 202, "K3: not a post in another's name");
+    // A key-shaped value that is nobody's is nothing.
+    const nobody = { "x-gyredeck-member": "0".repeat(64) };
+    assert.notEqual((await fetch(`${base}/usage?as=${f.peer}`, { headers: nobody })).status, 200, "K3: a key that is nobody's");
+    assert.notEqual((await fetch(`${base}/mail/${f.code}?as=${f.peer}&since=0`, { headers: nobody })).status, 200, "K3: reads nothing with it");
+    assert.ok(keyMe !== keyPeer, "premise: two members, two keys");
   } finally {
     await f.close();
   }

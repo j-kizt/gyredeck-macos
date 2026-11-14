@@ -3417,7 +3417,7 @@ test("a session that ends is taken out of its sync room", async () => {
         version: 2, id: randomUUID(), type: "conversation_close", timestamp: new Date().toISOString(),
         conversationId, cwd: "/tmp/project",
         runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
-        data: { reason: "quit" },
+        data: { reason: "prompt_input_exit" },
       });
     const roomFor = (as) => fetch(`${base}/sync/rooms?as=${as}`, { headers }).then((r) => r.json());
 
@@ -5294,7 +5294,7 @@ test("a room does not outlive the founder that made it", async () => {
       version: 2, id: randomUUID(), type: "conversation_close", timestamp: new Date().toISOString(),
       conversationId: founder, cwd: "/tmp/project",
       runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
-      data: { reason: "quit" },
+      data: { reason: "prompt_input_exit" },
     })).status, 202);
     assert.equal((await call("GET", `/sync/rooms?as=${peer}`)).body.room, null, "the peer is out of it too");
     const afterClose = await call("GET", `/mail/inbox?as=${peer}&collect=1`);
@@ -14848,6 +14848,152 @@ test("#342 W3: a quiet message a resumed watch passed over without a frame is wh
     await watch.stop();
     assert.doesNotMatch(watch.frames(), /QUIET-PASSED-OVER/, "premise: the replay wrote no frame for the reaction");
     assert.match(await f.drain(), /QUIET-PASSED-OVER/, "W3: never on the watch, so the text itself");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#380: a session that ends without meaning to keeps its place for a grace, comes back into it, and when it does leave is told the room is still open", async () => {
+  const f = await leanRoomFixture("g380", { GYREDECK_CLOSE_GRACE_MS: "800" });
+  try {
+    const event = (type, data) => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type, timestamp: new Date().toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data,
+    });
+    const inRoom = async () => (await f.call("GET", `/sync/rooms?as=${f.peer}`)).body.room === f.code;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // The way a Codex self-update ends a live thread: `other`, then a resume seconds later. The
+    // grace turns on the reason, so a Claude session stands in, whose mailbox the test can read.
+    await event("conversation_close", { reason: "other" });
+    assert.equal(await inRoom(), true, "G1: an end that may be a restart does not take the member out at once");
+    await event("conversation_open", { reason: "resume" });
+    await pause(2000);
+    assert.equal(await inRoom(), true, "G2: back within the grace, it keeps its place");
+
+    // Ended for good this time.
+    await event("conversation_close", { reason: "other" });
+    await pause(2000);
+    assert.equal(await inRoom(), false, "G3: still gone after the grace, it leaves");
+    const inbox = await f.call("GET", `/mail/inbox?as=${f.peer}&collect=1`);
+    assert.ok(Array.isArray(inbox.body.messages), JSON.stringify(inbox));
+    const told = inbox.body.messages.find((message) => /no longer in room/.test(message.text));
+    assert.ok(told, "G4: and is told");
+    assert.match(told.text, /The room itself is still open for the others/, "G4: that the room did not close");
+    assert.equal((await f.call("GET", `/sync/rooms?as=${f.me}`)).body.room, f.code, "G4: which it did not");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#380: mail to a session waiting out its grace, or a late event of its own, does not keep it in the room", async () => {
+  const f = await leanRoomFixture("m380", { GYREDECK_CLOSE_GRACE_MS: "800" });
+  try {
+    const close = () => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "conversation_close", timestamp: new Date().toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { reason: "other" },
+    });
+    const inRoom = async () => (await f.call("GET", `/sync/rooms?as=${f.peer}`)).body.room === f.code;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    await close();
+    assert.equal(await inRoom(), true, "premise: the grace is running");
+    assert.equal((await f.say(f.me, { to: f.peer, kind: "tell", text: "PING" })).status, 202, "premise: a tell to it");
+    assert.equal((await f.say(f.me, { to: "everyone", kind: "ask", text: "ANYONE" })).status, 202, "premise: an ask to everyone");
+    assert.equal((await f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_complete", timestamp: new Date(Date.now() - 5_000).toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: {},
+    })).status, 202, "premise: a turn that ended before the close lands after it");
+    await pause(2000);
+    assert.equal(await inRoom(), false, "only the session opening or starting a turn after the close brings it back");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#380: decided by the session's own stamps, never by arrival order or by what the bridge stamps on arrival", async () => {
+  const f = await leanRoomFixture("o380", { GYREDECK_CLOSE_GRACE_MS: "800" });
+  try {
+    const event = (type, data, at = new Date()) => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type, timestamp: at.toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data,
+    });
+    const inRoom = async () => (await f.call("GET", `/sync/rooms?as=${f.peer}`)).body.room === f.code;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // The adapters' default reason, after which the turn's own Stop hook lands late.
+    await event("conversation_close", { reason: "quit" });
+    await pause(20);
+    assert.equal((await f.call("POST", "/hook/stop", { hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: f.peer })).status, 202, "premise: a late stop");
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O1: a stop the bridge stamps on arrival does not keep an ended session");
+
+    await f.admit(f.peer);
+    // The new process's SessionStart lands before the old one's SessionEnd.
+    const closedAt = new Date(Date.now() - 3_000);
+    await event("conversation_open", { reason: "resume" });
+    await event("conversation_close", { reason: "other" }, closedAt);
+    await pause(2000);
+    assert.equal(await inRoom(), true, "O2: a resume stamped after the close keeps its place, whichever lands first");
+
+    // An open from before the close, landing after it, says nothing about coming back.
+    const openedAt = new Date(Date.now() - 3_000);
+    await event("conversation_close", { reason: "other" });
+    await event("conversation_open", { reason: "resume" }, openedAt);
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O3: an open stamped before the close does not keep it");
+
+    // The dying process's own last hook, stamped after its close.
+    await f.admit(f.peer);
+    await event("conversation_close", { reason: "other" });
+    await event("tool_end", { toolName: "Bash" }, new Date(Date.now() + 5));
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O4: only an open or a new turn says it is back");
+
+    // A clock far ahead is held to the bridge's now.
+    await f.admit(f.peer);
+    await event("turn_start", { inputCount: 1 }, new Date(Date.now() + 60_000));
+    await pause(20);
+    await event("conversation_close", { reason: "other" });
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O5: a stamp from the future does not keep it for good");
+
+    // A real end, then an older close of an earlier process landing late.
+    await f.admit(f.peer);
+    const earlier = new Date(Date.now() - 3_000);
+    await event("conversation_open", { reason: "resume" }, new Date(Date.now() - 2_000));
+    await event("conversation_close", { reason: "other" });
+    await event("conversation_close", { reason: "other" }, earlier);
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O6: an older close landing late does not cancel the newer one");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#380: back by anything of its own stamped after the close; an old timer never evicts a member put back", async () => {
+  const f = await leanRoomFixture("t380", { GYREDECK_CLOSE_GRACE_MS: "800" });
+  try {
+    const event = (type, data, at = new Date()) => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type, timestamp: at.toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data,
+    });
+    const inRoom = async () => (await f.call("GET", `/sync/rooms?as=${f.peer}`)).body.room === f.code;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // Its SessionStart lost, the resumed session's first turn still says it is back.
+    await event("conversation_close", { reason: "other" });
+    await pause(50);
+    await event("turn_start", { inputCount: 1 });
+    await pause(2000);
+    assert.equal(await inRoom(), true, "a turn of its own after the close keeps its place");
+
+    // Taken out and put back inside the grace: the wait was for the membership that is gone.
+    await event("conversation_close", { reason: "other" });
+    assert.equal((await f.call("DELETE", `/sync/rooms/${f.code}/members/${f.peer}`)).status, 200, "premise: taken out");
+    await f.admit(f.peer);
+    await pause(2000);
+    assert.equal(await inRoom(), true, "an old timer does not evict the member put back");
   } finally {
     await f.close();
   }

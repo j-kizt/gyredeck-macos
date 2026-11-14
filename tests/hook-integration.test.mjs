@@ -15046,3 +15046,45 @@ test("#380: back by anything of its own stamped after the close; an old timer ne
     await f.close();
   }
 });
+
+test("#380: every hook stamps its event when the agent fired it, not when its input finished arriving", async () => {
+  // A hook whose stdin lands late (a busy machine, or the old process's hook still running
+  // after SessionEnd) must not stamp a turn_start after a close that came later.
+  const home = await mkdtemp(join(tmpdir(), "gd380s-"));
+  const seen = [];
+  const sink = createHttpServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      if (req.url === "/ingest") seen.push(JSON.parse(body));
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    });
+  });
+  await new Promise((resolve) => sink.listen(0, "127.0.0.1", resolve));
+  try {
+    await mkdir(join(home, ".config", "gyredeck"), { recursive: true });
+    await writeFile(join(home, ".config", "gyredeck", "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port: sink.address().port }));
+    await writeFile(join(home, ".config", "gyredeck", "gyredeck.ingest-token"), "c3".repeat(32));
+    const late = (adapterPath, args, payload) => new Promise((resolve) => {
+      const child = spawn(process.execPath, [adapterPath, ...args], { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] });
+      let writtenAt = null;
+      setTimeout(() => { writtenAt = Date.now(); child.stdin.end(JSON.stringify(payload)); }, 1_000);
+      child.on("close", () => resolve(writtenAt));
+    });
+    const cases = [
+      ["codex", "adapters/codex/gyredeck-codex-hook.mjs", ["--event", "UserPromptSubmit"], { hook_event_name: "UserPromptSubmit", session_id: "s380-codex", cwd: "/tmp/p380" }],
+      ["claude", "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], { hook_event_name: "UserPromptSubmit", session_id: "s380-claude", cwd: "/tmp/p380" }],
+      ["agy", "adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], { conversationId: "s380-agy", invocationNum: 1, workspacePaths: ["/tmp/p380"] }],
+    ];
+    for (const [name, adapterPath, args, payload] of cases) {
+      const writtenAt = await late(adapterPath, args, payload);
+      const id = payload.session_id ?? payload.conversationId;
+      const start = seen.find((event) => event.type === "turn_start" && event.conversationId === id);
+      assert.ok(start, `${name}: the hook posted a turn_start`);
+      assert.ok(Date.parse(start.timestamp) < writtenAt, `${name}: stamped ${start.timestamp}, after its input arrived at ${new Date(writtenAt).toISOString()}`);
+    }
+  } finally {
+    sink.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});

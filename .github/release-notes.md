@@ -1,5 +1,28 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## One-time join codes, one per session — (v1.35.0)
+
+### Features
+
+- **The key beside a session in its sync panel copies a one-time join code for that session.**
+  Paste it into that session's terminal and the session is let into the room, the way a
+  pasted room password let it in before. A code works once, only for the session it was
+  copied for, and only within two minutes; copying again replaces the previous code. A code
+  pasted into another session is refused, and so is an expired one. Every use of a code is
+  announced in the room.
+- **A session in a room now posts and reads with its own member key alone.** The reply,
+  hear and look-back commands that the Claude Code and Antigravity hooks print no longer
+  ask for the room password, and the room rules (v20) say the same. A session let in
+  by a join code never holds the room password.
+- **The room's founder is marked, and the panel says what its red button does.** The
+  founder sees a crown beside the room code, and a "Close this room for everyone" button.
+  Every other member sees "Leave this room", which takes only that session out.
+
+Known limits: the shared room password still works in this release as the transition, and
+is removed in a later one. If you copy a code for one session and switch to another before
+the copy finishes, the first session's code can still reach the clipboard; the panel shows
+no success for the session now on screen.
+
 ## Approve one exact command from Discord — (v1.34.0)
 
 ### Features

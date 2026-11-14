@@ -6377,6 +6377,16 @@ pub fn run() {
                 let confirm = {
                     let secret = secret.clone();
                     std::sync::Arc::new(move |session: &str, room: &str, password: &str| {
+                        // No room named (#344): the session's own, read with the app's word.
+                        let room = if room.is_empty() {
+                            let (_, found) = standalone_bridge::bridge_request_vouched("GET", &format!("/sync/rooms?as={session}"), None, &secret)?;
+                            match found.get("room").and_then(serde_json::Value::as_str) {
+                                Some(room) => room.to_string(),
+                                None => return Ok((404, serde_json::json!({ "ok": false, "error": "not_a_member", "message": "This session is in no room." }))),
+                            }
+                        } else {
+                            room.to_string()
+                        };
                         let body = serde_json::json!({ "conversationId": session, "password": password }).to_string();
                         standalone_bridge::bridge_request_vouched("POST", &format!("/sync/rooms/{room}/confirm"), Some(body), &secret)
                     })

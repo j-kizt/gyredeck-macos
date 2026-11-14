@@ -7232,27 +7232,21 @@ function startBridge(config) {
           sendJson(400, { ok: false, error: "invalid_session" });
           return;
         }
-        // Who else is in a room is for its members and the app (#344). A session that has
-        // not joined yet holds neither, so it is told its own room and its own row, which is
-        // all a hook needs to present a pasted code, and nothing about anyone else.
+        // Which room a session is in, and who else is, is for that session and the app (#344):
+        // the app's word, or the member's own key. The machine token is every agent's and `as`
+        // is only a claim, so neither says anything — not even whether the session is in a
+        // room. A hook that holds no key yet lets the broker find its room on confirm.
         if (!holdsMachineToken(req.headers["x-gyredeck-token"])) {
           sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
           return;
         }
         const found = syncRoomFor(as);
-        if (!found) {
-          sendJson(200, { ok: true, room: null, members: [], you: null });
+        const member = found?.room.members.get(as);
+        if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"]) && !(member?.confirmed === true && holdsMemberKey(member, req))) {
+          sendJson(403, { ok: false, error: "not_your_key", message: MEMBER_KEY_HINT });
           return;
         }
-        const described = describeRoom(found.name, found.room, as);
-        const member = found.room.members.get(as);
-        const whole = holdsBrokerSecret(req.headers["x-gyredeck-broker"]) || (member?.confirmed === true && holdsMemberKey(member, req));
-        sendJson(200, {
-          ok: true,
-          ...(whole
-            ? described
-            : { ...described, members: described.members.filter((row) => row.conversationId === as), founder: described.founder === as ? as : null }),
-        });
+        sendJson(200, found ? { ok: true, ...describeRoom(found.name, found.room, as) } : { ok: true, room: null, members: [], you: null });
         return;
       }
 
@@ -7441,6 +7435,10 @@ function startBridge(config) {
             ok: false,
             error: "bad_password",
             message: "That is not this room's password. It is 32 hex characters, copied from Gyredeck by the person who made the room — a room code is not it, and neither is the machine's ingest token.",
+            // The session's own standing, to the broker that named it (#344): a member already
+            // in is not told it is shut out by a value that was not the password.
+            room: code,
+            confirmed: room.members.get(conversationId).confirmed === true,
           });
           return;
         }
@@ -7450,6 +7448,7 @@ function startBridge(config) {
           // password a second time is asking the same question and gets the same answer.
           sendJson(200, {
             ok: true,
+            already: true,
             ...describeRoom(code, room, conversationId),
             howTo: howToUseRoom(code, password, conversationId, BRIDGE_HOST, config.port),
           });

@@ -30,6 +30,10 @@ jobs:
             echo "::notice::DISCORD_CI_WEBHOOK is not set - nothing posted"
             exit 0
           fi
+          # The repo's own GitHub webhook needs /github on the same URL; this one posts Discord's
+          # own format, which /github answers with 400 (#384, the first post on main).
+          WEBHOOK=${WEBHOOK%/}
+          WEBHOOK=${WEBHOOK%/github}
           conclusion=$(jq -r '.conclusion // "unknown"' <<<"$RUN")
           case "$conclusion" in
             success) mark="🟢 passed" ;;
@@ -57,9 +61,12 @@ jobs:
                 content: "**\($run.name)** \($mark)\n\($what)\n\($run.html_url)",
                 allowed_mentions: {parse: []}
               }')
-          status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+          status=$(curl -sS -o reply.json -w '%{http_code}' --max-time 20 \
             -H 'content-type: application/json' --data-binary "$payload" "$WEBHOOK" || true)
           case "$status" in
             2??) echo "posted ($status)" ;;
-            *) echo "::warning::Discord answered $status - not posted"; exit 1 ;;
+            *)
+              reason=$(jq -r '.message // empty' reply.json 2>/dev/null | head -c 200 || true)
+              echo "::warning::Discord answered $status${reason:+: $reason} - not posted"
+              exit 1 ;;
           esac

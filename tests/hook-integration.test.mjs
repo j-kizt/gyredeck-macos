@@ -5007,11 +5007,13 @@ test("every mutation and every room read needs a credential that verifies", asyn
     // Every room and every roster, which is the app's view rather than a member's. The
     // door admits a room's password too, so this route has to say which of the two it
     // takes: passing the shape check is not being the app.
-    const listing = async (credential) =>
-      (await fetch(`${base}/mail`, { headers: { "x-gyredeck-token": credential } })).status;
+    const listing = async (credential, extra = {}) =>
+      (await fetch(`${base}/mail`, { headers: { "x-gyredeck-token": credential, ...extra } })).status;
     assert.equal(await listing(WRONG), 401, "a wrong token of the right shape sees no rooms");
     assert.equal(await listing(password), 401, "nor does a room's own password: it is not the app");
-    assert.equal(await listing(token), 200, "the app's token does");
+    // #344: every agent reads the machine token, so the app's word is asked as well.
+    assert.equal(await listing(token), 401, "nor the machine token alone");
+    assert.equal(await listing(token, { "x-gyredeck-broker": TEST_APP_WORD }), 200, "the app's token and word do");
 
     // ── The three calls that change who may do what ──
     // Each was authorised on `?as=` alone, which is a name a caller writes rather than

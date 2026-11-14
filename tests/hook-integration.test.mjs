@@ -173,16 +173,12 @@ const listenBroker = async (server, path, close) => {
 
 /**
  * A confirm as the app's broker sends it (#294): for the bound session, and, when the hook
- * names no room (#344), in the room the app finds for that session with its own word.
+ * names no room (#344), to the session's own room, which the bridge finds.
  */
 const confirmAsApp = async (home, base, session, confirm) => {
   const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
   const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
-  let room = confirm.room;
-  if (room === undefined) {
-    room = (await (await bridgeFetch(`${base}/sync/rooms?as=${encodeURIComponent(session)}`, { headers })).json()).room;
-    if (typeof room !== "string") return { status: 404, body: { ok: false, error: "not_a_member", message: "This session is in no room." } };
-  }
+  const room = confirm.room ?? "own";
   const response = await bridgeFetch(`${base}/sync/rooms/${room}/confirm`, {
     method: "POST", headers, body: JSON.stringify({ conversationId: session, password: confirm.password }),
   });
@@ -12049,7 +12045,7 @@ test("#250 C1 C3 C4: a pasted password confirms the member once, and the same in
     // Pasted with the whitespace a terminal adds, and in capitals: the trimmed input is what counts.
     const first = await f.invoke(`  ${f.password.toUpperCase()}\n`);
     assert.equal(await f.confirmed(), true, "the member's own id was confirmed in its own room");
-    assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`]);
+    assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"]);
     assert.match(first.text, new RegExp(`NEW: the password you were just given was accepted for sync room ${f.code} — you may now read and post here\\.`));
     assert.ok(first.text.includes(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`), "with the way to hear the room");
     assert.equal(first.text.split(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`).length - 1, 1, "said once");
@@ -12212,7 +12208,7 @@ for (const path of acceptedPastePaths) {
       if (broker) assert.ok(broker.requests.length > 0, "premise: the broker was asked");
       else assert.doesNotMatch(result.stderr, /mail withheld/, "premise: the collect went to the bridge");
       assert.equal(await f.confirmed(), true, "premise: accepted");
-      assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "premise: presented once");
+      assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "premise: presented once");
       path.premise?.(result);
       assert.equal(timesIn(result.text, PASTE_USED), 1, "C1/C2: the no-repeat line, once");
       assert.equal(result.steps.filter((text) => text.startsWith(`NEW: the password you were just given was accepted for sync room ${f.code}`)).length, 1, "C2: one lead");
@@ -12256,7 +12252,7 @@ for (const [label, tag, env, who] of [
       assert.equal(members.find((member) => member.conversationId === as)?.confirmed, true, "premise: already confirmed");
       const result = await f.invoke(f.password, env, as);
       // #344: presented through the broker; the bridge, having checked it, says already in.
-      assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "presented once, through the broker");
+      assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "presented once, through the broker");
       assert.equal(timesIn(result.text, PASTE_ALREADY), 1, "one line");
       assert.ok(result.steps.some((text) => text === `You are already in sync room ${f.code}. ${PASTE_ALREADY}`), "naming the room");
       assert.equal(timesIn(result.text, PASTE_USED), 0);
@@ -12282,7 +12278,7 @@ test("#255 r2: agy, already in, a 32-hex value that is not the password is never
     assert.match(value, /^[0-9a-f]{32}$/, "premise: it is a paste the hook presents");
     const result = await f.invoke(value);
     // #344: presented, as Claude's is, and refused by the bridge for the wrong value.
-    assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "premise: presented through the broker");
+    assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "premise: presented through the broker");
     assert.equal(timesIn(result.text, PASTE_ALREADY), 0, "not said to be already in on a value that was not checked as the password");
     assert.match(result.text, new RegExp(`refused \\(bad_password\\); you are still in sync room ${f.code}\\.`), "said refused, and still in");
     assert.doesNotMatch(result.text, /BLOCKED:/, "a member already in is not told it is shut out");
@@ -12308,7 +12304,7 @@ test("#255 r2: Claude, already in, a 32-hex value that is not the password is ne
       { hook_event_name: "UserPromptSubmit", session_id: claude, cwd: "/tmp/project", prompt: value },
     );
     assert.equal(result.code, 0, result.stderr);
-    assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "premise: it was presented, through /confirm");
+    assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "premise: it was presented, through /confirm");
     const context = result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
     assert.doesNotMatch(context, NOT_THE_PASSWORD, "never claims it is this room's password");
     valueNowhere(result, value, "r2 claude");
@@ -12337,7 +12333,7 @@ for (const [label, tag, fault] of [["normal", "c3norm", false], ["delivery fault
         delete process.env.GYREDECK_TEST_FAULT;
       }
       assert.equal(result.code, 0, result.stderr);
-      assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "premise: presented once");
+      assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "premise: presented once");
       const confirmed = (await f.call("GET", `/sync/rooms?as=${claude}`)).body.members.find((member) => member.conversationId === claude)?.confirmed;
       assert.equal(confirmed, true, "premise: accepted");
       const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;

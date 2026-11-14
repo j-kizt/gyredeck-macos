@@ -4242,6 +4242,8 @@ function startBridge(config) {
 
   /** A room code, as opposed to a conversation id used as a mailbox name. */
   const SYNC_CODE = /^sync-[a-z2-9]{4}$/;
+  /** In place of a room code on a broker confirm: the session's own room (#344). */
+  const OWN_ROOM = "own";
   const mailRooms = new Map();
 
   // Rooms are created by whoever speaks first, so they need an upper bound and a way
@@ -7382,7 +7384,14 @@ function startBridge(config) {
         const body = await readJsonBody(req);
         const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
         const password = typeof body.password === "string" ? body.password.trim() : "";
-        const room = mailRooms.get(code);
+        // No room named (#344): the session's own, found here rather than by a lookup the app
+        // makes first, so a confirm is one call inside the hook's deadline.
+        const roomCode = code === OWN_ROOM ? syncRoomFor(conversationId)?.name ?? null : code;
+        if (roomCode === null) {
+          sendJson(404, { ok: false, error: "not_a_member", message: "This session is in no room." });
+          return;
+        }
+        const room = mailRooms.get(roomCode);
         // Two very different situations answered by the same bare word, and a live
         // session met both: holding a password for a room it had never been added to,
         // and holding one for a room that had ended. Neither is something the session
@@ -7437,7 +7446,7 @@ function startBridge(config) {
             message: "That is not this room's password. It is 32 hex characters, copied from Gyredeck by the person who made the room — a room code is not it, and neither is the machine's ingest token.",
             // The session's own standing, to the broker that named it (#344): a member already
             // in is not told it is shut out by a value that was not the password.
-            room: code,
+            room: roomCode,
             confirmed: room.members.get(conversationId).confirmed === true,
           });
           return;
@@ -7449,21 +7458,21 @@ function startBridge(config) {
           sendJson(200, {
             ok: true,
             already: true,
-            ...describeRoom(code, room, conversationId),
-            howTo: howToUseRoom(code, password, conversationId, BRIDGE_HOST, config.port),
+            ...describeRoom(roomCode, room, conversationId),
+            howTo: howToUseRoom(roomCode, password, conversationId, BRIDGE_HOST, config.port),
           });
           return;
         }
-        confirmRoomMember(code, room, conversationId);
+        confirmRoomMember(roomCode, room, conversationId);
         sendJson(200, {
           ok: true,
-          ...describeRoom(code, room, conversationId),
+          ...describeRoom(roomCode, room, conversationId),
           // Reached only past the password check above, so this caller has already proved
           // it holds what it is being handed back. The answer to a call the session made
           // itself, and so the one place an instruction is certain to be read —
           // everything a hook injects lands a turn later, by which point the session has
           // usually guessed.
-          howTo: howToUseRoom(code, password, conversationId, BRIDGE_HOST, config.port),
+          howTo: howToUseRoom(roomCode, password, conversationId, BRIDGE_HOST, config.port),
         });
         return;
       }

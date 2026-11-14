@@ -6377,16 +6377,8 @@ pub fn run() {
                 let confirm = {
                     let secret = secret.clone();
                     std::sync::Arc::new(move |session: &str, room: &str, password: &str| {
-                        // No room named (#344): the session's own, read with the app's word.
-                        let room = if room.is_empty() {
-                            let (status, found) = standalone_bridge::bridge_request_vouched("GET", &format!("/sync/rooms?as={session}"), None, &secret)?;
-                            match room_to_confirm(status, found) {
-                                Ok(room) => room,
-                                Err(answer) => return Ok(answer),
-                            }
-                        } else {
-                            room.to_string()
-                        };
+                        // No room named (#344): the bridge finds the session's own, in the same call.
+                        let room = if room.is_empty() { "own" } else { room };
                         let body = serde_json::json!({ "conversationId": session, "password": password }).to_string();
                         standalone_bridge::bridge_request_vouched("POST", &format!("/sync/rooms/{room}/confirm"), Some(body), &secret)
                     })
@@ -6482,33 +6474,6 @@ pub fn run() {
         }
         _ => {}
     });
-}
-
-/// The room a broker confirm with no room named goes to (#344), from the bridge's answer to
-/// `GET /sync/rooms?as=`. A lookup the bridge refused is passed on as that refusal, never as
-/// "in no room", which the hooks keep quiet about.
-fn room_to_confirm(status: u16, found: serde_json::Value) -> Result<String, (u16, serde_json::Value)> {
-    if status != 200 {
-        return Err((status, found));
-    }
-    match found.get("room").and_then(serde_json::Value::as_str) {
-        Some(room) => Ok(room.to_string()),
-        None => Err((404, serde_json::json!({ "ok": false, "error": "not_a_member", "message": "This session is in no room." }))),
-    }
-}
-
-#[cfg(test)]
-mod room_to_confirm_tests {
-    use super::*;
-
-    #[test]
-    fn c344_a_refused_lookup_stays_a_refusal() {
-        let refused = serde_json::json!({ "ok": false, "error": "not_your_key" });
-        assert_eq!(room_to_confirm(403, refused.clone()), Err((403, refused)));
-        assert_eq!(room_to_confirm(200, serde_json::json!({ "room": "sync-ab12" })), Ok("sync-ab12".to_string()));
-        let (status, body) = room_to_confirm(200, serde_json::json!({ "room": null })).unwrap_err();
-        assert_eq!((status, body["error"].as_str()), (404, Some("not_a_member")));
-    }
 }
 
 #[cfg(test)]

@@ -768,8 +768,10 @@ const confirmLead = (confirm) => {
     if (confirm.refused.stillIn) {
       return [{ ephemeralMessage: `The pasted value was refused (${confirm.refused.error}); you are still in sync room ${confirm.refused.room}. Do not repeat the value you pasted.` }];
     }
-    const where = confirm.refused.room ? `you are still not in sync room ${confirm.refused.room}` : "it let you into no room";
-    return [{ ephemeralMessage: `The pasted room password was refused (${confirm.refused.error}) — ${where}. Do not repeat the value you pasted.` }];
+    if (!confirm.refused.room) {
+      return [{ ephemeralMessage: `The pasted value could not be checked (${confirm.refused.error}). Do not repeat it.` }];
+    }
+    return [{ ephemeralMessage: `The pasted room password was refused (${confirm.refused.error}) — you are still not in sync room ${confirm.refused.room}. Do not repeat the value you pasted.` }];
   }
   return [];
 };
@@ -829,7 +831,9 @@ const rereadSteps = (endpoint, as, syncRoom, all, memberKey = null) => {
 const confirmOnlySteps = (endpoint, room, confirm) => {
   if (confirm?.accepted) return [...confirmLead(confirm), hearStep(room)];
   if (confirm?.already) return confirmLead(confirm);
-  if (confirm?.refused?.stillIn) return confirmLead(confirm);
+  // Still in, or no room known to be shut out of (#344: a broker that failed cannot say which):
+  // a BLOCKED step would tell a member it is out.
+  if (confirm?.refused?.stillIn || (confirm?.refused && !confirm.refused.room)) return confirmLead(confirm);
   if (confirm?.refused) return [...confirmLead(confirm), { ephemeralMessage: blockedStepFor(endpoint, confirm.refused.room, room) }];
   return [];
 };

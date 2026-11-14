@@ -102,9 +102,26 @@ export function formatMessage(m, delayed, mention = null) {
   };
 }
 
+/** The Discord messages one line is sent as. A line too long for one keeps its ask for a code
+ *  whole, in a message of its own, so a command is never cut through its code block (#374). */
+export function messageParts(m, delayed, mention = null) {
+  const { username, content } = formatMessage(m, delayed, mention);
+  if (content.length <= MESSAGE_LIMIT || !m.approval || m.withheld) return { username, parts: splitContent(content) };
+  const ask = approvalAsk(m.approval);
+  return { username, parts: [...splitContent(content.slice(0, content.length - ask.length).trimEnd()), ask] };
+}
+
 /** What an approval request asks the owner to approve (#207), in the one form the app checks,
- *  or null for anything else. */
+ *  or null for anything else. One exact command since #374, in the bridge's form
+ *  (`parseApproval`); the app alone refuses a command that only the terminal approves. */
 export function approvalOf(a) {
+  if (a && typeof a === "object" && a.action === "command") {
+    const c = a.command;
+    const keys = Object.keys(a).sort().join(",");
+    const ok = keys === "action,command" && typeof c === "string" && c.length > 0 && [...c].length <= 1000 &&
+      !/[\0\r\n]/.test(c) && !/[\p{Cc}\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF]/u.test(c) && !/^[\s\u0085]|[\s\u0085]$/.test(c) && !c.includes("```");
+    return ok ? { action: "command", command: c } : null;
+  }
   if (!a || typeof a !== "object" || typeof a.sha !== "string" || !/^[0-9a-f]{40}$/.test(a.sha)) return null;
   if (a.action === "merge" && Number.isInteger(a.pr) && a.pr > 0) return { action: "merge", pr: a.pr, sha: a.sha };
   if (a.action === "release" && typeof a.version === "string" && /^(0|[1-9]\d{0,4})(\.(0|[1-9]\d{0,4})){2}$/.test(a.version)) {
@@ -115,6 +132,8 @@ export function approvalOf(a) {
 
 /** The line under an approval request that says outright it asks for the code (#207). */
 export function approvalAsk(a) {
+  // The whole command, never shortened, in a code block so nothing in it renders as markup.
+  if (a.action === "command") return `Reply to this message with the 6-digit approval code to run this exact command once:\n\`\`\`\n${a.command}\n\`\`\``;
   const act = a.action === "merge" ? `merge PR #${a.pr}` : `release v${a.version}`;
   return `Reply to this message with the 6-digit approval code to ${act} at ${a.sha.slice(0, 12)}.`;
 }
@@ -1197,12 +1216,12 @@ export function createConnector({ discord, out, clock = realClock }) {
       // "(delayed)": the copy Discord holds is looked for under the other mark too, and when
       // found that is the text the line keeps (#199 I9c).
       if (!intent && !resumed && rs.pending?.key === "replay") {
-        const other = formatMessage(item.m, !delayed, mention);
-        if (await readBack(rs, other.username, splitContent(other.content)[0])) delayed = !delayed;
+        const other = messageParts(item.m, !delayed, mention);
+        if (await readBack(rs, other.username, other.parts[0])) delayed = !delayed;
       }
-      const { username, content } = formatMessage(item.m, delayed, mention);
+      const { username, parts } = messageParts(item.m, delayed, mention);
       item.username = username;
-      item.parts = splitContent(content);
+      item.parts = parts;
       item.delayed = delayed;
       if (intent) item.sent = Math.min(intent.part, item.parts.length);
       else if (resumed) item.sent = Math.min(rs.lastPart, item.parts.length);

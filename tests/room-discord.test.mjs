@@ -813,7 +813,7 @@ test("#207: rules v19 say a merge or a release from Discord needs the owner's co
   assert.ok(ROOM_RULES_VERSION >= 19, "introduced in v19, kept by every later version");
   const rules = roomRules("http://127.0.0.1:47621");
   assert.match(rules, /never to approve a commit, a release, a credential or a settings change: ask for those at the terminal\. The one exception is a merge or a release approved with the owner's code/);
-  assert.match(rules, /## Approval from Discord \(merge and release only\)/);
+  assert.match(rules, /## Approval from Discord \(a merge, a release, or one exact command\)/);
   assert.match(rules, /whose text says outright that you are asking for the 6-digit approval code/);
   assert.match(rules, /GET \/mail\/<room>\/approval\?as=<your id>&seq=<your ask's seq>/);
   assert.match(rules, /gh pr merge --match-head-commit <sha>/);

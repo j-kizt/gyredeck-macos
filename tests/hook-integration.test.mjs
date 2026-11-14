@@ -171,6 +171,20 @@ const listenBroker = async (server, path, close) => {
   brokersAt.set(path, close);
 };
 
+/**
+ * A confirm as the app's broker sends it (#294): for the bound session, and, when the hook
+ * names no room (#344), to the session's own room, which the bridge finds.
+ */
+const confirmAsApp = async (home, base, session, confirm) => {
+  const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+  const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
+  const room = confirm.room ?? "own";
+  const response = await bridgeFetch(`${base}/sync/rooms/${room}/confirm`, {
+    method: "POST", headers, body: JSON.stringify({ conversationId: session, password: confirm.password }),
+  });
+  return { status: response.status, body: await response.json().catch(() => null) };
+};
+
 const forwardingBroker = async (home, base, { as = null, cli = undefined } = {}) => {
   const dir = join(home, ...CONFIG_DIR, "broker");
   await mkdir(dir, { recursive: true });
@@ -231,13 +245,8 @@ const forwardingBroker = async (home, base, { as = null, cli = undefined } = {})
         const session = as ?? state.bound;
         if (!session) answer = { v: 1, ok: false, error: "unbound", message: "bind first" };
         else {
-          const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-          const response = await bridgeFetch(`${base}/sync/rooms/${request.confirm.room}/confirm`, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
-            body: JSON.stringify({ conversationId: session, password: request.confirm.password }),
-          });
-          const body = await response.json().catch(() => null);
+          const response = await confirmAsApp(home, base, session, request.confirm);
+          const body = response.body;
           answer = response.status === 200
             ? { v: 1, ok: true, boundTo: session, confirmed: body }
             : { v: 1, ok: false, error: "room", status: response.status, boundTo: session, answer: body, message: `The bridge answered HTTP ${response.status}.` };
@@ -2743,7 +2752,7 @@ test("only the app's word opens, joins, invites into, empties and closes a room 
     assert.equal(r.body.password, undefined, "and hands out no password");
     r = await call("POST", "/sync/rooms", { conversationId: founder }, { "x-gyredeck-broker": "0f".repeat(32) });
     assert.equal(r.status, 401, "a wrong word is no word");
-    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, null, "the session's room slot stays empty");
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`, null, app)).body.room, null, "the session's room slot stays empty");
 
     // (g) the app's word does all of it.
     r = await call("POST", "/sync/rooms", { conversationId: founder }, app);
@@ -2753,7 +2762,7 @@ test("only the app's word opens, joins, invites into, empties and closes a room 
     // (d) join without the word is refused, and leaves the session free.
     r = await call("POST", `/sync/rooms/${code}/members`, { conversationId: other });
     assert.equal(r.status, 401, "join without the app's word is refused");
-    assert.equal((await call("GET", `/sync/rooms?as=${other}`)).body.room, null);
+    assert.equal((await call("GET", `/sync/rooms?as=${other}`, null, app)).body.room, null);
     assert.equal((await call("POST", `/sync/rooms/${code}/members`, { conversationId: other }, app)).status, 200);
 
     // (e) passwords and removing a member need the word too.
@@ -2764,11 +2773,11 @@ test("only the app's word opens, joins, invites into, empties and closes a room 
     // (c) #221: close with the machine token and `as` left out is refused…
     r = await call("DELETE", `/sync/rooms/${code}`);
     assert.equal(r.status, 401, "close without the app's word is refused, `as` or not");
-    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, code, "the room is still open");
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`, null, app)).body.room, code, "the room is still open");
     // …and the app may close it, whoever founded it (close contract A).
     r = await call("DELETE", `/sync/rooms/${code}?as=${other}`, undefined, app);
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, null, "closed");
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`, null, app)).body.room, null, "closed");
   } finally {
     await live.stop();
   }
@@ -2780,7 +2789,8 @@ test("only the app's word opens, joins, invites into, empties and closes a room 
     const r = await bare.call("POST", "/sync/rooms", { conversationId: founder }, app);
     assert.equal(r.status, 503, "no handshake, no rooms");
     assert.equal(r.body.error, "app_word_unavailable");
-    assert.equal((await bare.call("GET", `/sync/rooms?as=${founder}`)).body.room, null);
+    const lookup = await bare.call("GET", `/sync/rooms?as=${founder}`, null, app);
+    assert.deepEqual([lookup.status, lookup.body.error, lookup.body.room], [403, "not_your_key", undefined], "nor tells whose room is whose");
   } finally {
     await bare.stop();
   }
@@ -3419,7 +3429,7 @@ test("a session that ends is taken out of its sync room", async () => {
         version: 2, id: randomUUID(), type: "conversation_close", timestamp: new Date().toISOString(),
         conversationId, cwd: "/tmp/project",
         runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
-        data: { reason: "quit" },
+        data: { reason: "prompt_input_exit" },
       });
     const roomFor = (as) => fetch(`${base}/sync/rooms?as=${as}`, { headers }).then((r) => r.json());
 
@@ -5013,11 +5023,13 @@ test("every mutation and every room read needs a credential that verifies", asyn
     // Every room and every roster, which is the app's view rather than a member's. The
     // door admits a room's password too, so this route has to say which of the two it
     // takes: passing the shape check is not being the app.
-    const listing = async (credential) =>
-      (await fetch(`${base}/mail`, { headers: { "x-gyredeck-token": credential } })).status;
+    const listing = async (credential, extra = {}) =>
+      (await fetch(`${base}/mail`, { headers: { "x-gyredeck-token": credential, ...extra } })).status;
     assert.equal(await listing(WRONG), 401, "a wrong token of the right shape sees no rooms");
     assert.equal(await listing(password), 401, "nor does a room's own password: it is not the app");
-    assert.equal(await listing(token), 200, "the app's token does");
+    // #344: every agent reads the machine token, so the app's word is asked as well.
+    assert.equal(await listing(token), 401, "nor the machine token alone");
+    assert.equal(await listing(token, { "x-gyredeck-broker": TEST_APP_WORD }), 200, "the app's token and word do");
 
     // ── The three calls that change who may do what ──
     // Each was authorised on `?as=` alone, which is a name a caller writes rather than
@@ -5300,7 +5312,7 @@ test("a room does not outlive the founder that made it", async () => {
       version: 2, id: randomUUID(), type: "conversation_close", timestamp: new Date().toISOString(),
       conversationId: founder, cwd: "/tmp/project",
       runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
-      data: { reason: "quit" },
+      data: { reason: "prompt_input_exit" },
     })).status, 202);
     assert.equal((await call("GET", `/sync/rooms?as=${peer}`)).body.room, null, "the peer is out of it too");
     const afterClose = await call("GET", `/mail/inbox?as=${peer}&collect=1`);
@@ -8941,13 +8953,8 @@ const fakeBroker = async (home, answer, { confirmVia = null } = {}) => {
       bound = request.bind.conversationId;
       return { v: 1, ok: true, bound: { conversationId: bound, pid: 1 } };
     }
-    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const response = await bridgeFetch(`${confirmVia}/sync/rooms/${request.confirm.room}/confirm`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
-      body: JSON.stringify({ conversationId: bound, password: request.confirm.password }),
-    });
-    const body = await response.json().catch(() => null);
+    const response = await confirmAsApp(home, confirmVia, bound, request.confirm);
+    const body = response.body;
     return response.status === 200
       ? { v: 1, ok: true, boundTo: bound, confirmed: body }
       : { v: 1, ok: false, error: "room", status: response.status, boundTo: bound, answer: body };
@@ -12044,15 +12051,18 @@ test("#250 C1 C3 C4: a pasted password confirms the member once, and the same in
     // Pasted with the whitespace a terminal adds, and in capitals: the trimmed input is what counts.
     const first = await f.invoke(`  ${f.password.toUpperCase()}\n`);
     assert.equal(await f.confirmed(), true, "the member's own id was confirmed in its own room");
-    assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`]);
+    assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"]);
     assert.match(first.text, new RegExp(`NEW: the password you were just given was accepted for sync room ${f.code} — you may now read and post here\\.`));
     assert.ok(first.text.includes(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`), "with the way to hear the room");
     assert.equal(first.text.split(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`).length - 1, 1, "said once");
     assert.doesNotMatch(first.text, /BLOCKED:/);
-    // PreInvocation fires on every invocation of the turn, with the same message: nothing more is sent.
+    // PreInvocation fires on every invocation of the turn, with the same message. The hook
+    // cannot ask the bridge whether it is already in (#344), so it presents it again and is
+    // answered as already in, never as newly accepted.
     const again = await f.invoke(f.password);
-    assert.equal(f.confirms.length, 1, "an already-confirmed member sends no confirm");
+    assert.equal(f.confirms.length, 2, "presented again, through the broker");
     assert.doesNotMatch(again.text, /NEW: the password/);
+    assert.equal(timesIn(again.text, PASTE_ALREADY), 1, "answered as already in");
   } finally {
     await f.close();
   }
@@ -12157,10 +12167,10 @@ test("#250 r4: mail quoting the wait command does not stand in for the hook's ow
 //      answered as already in, not accepted.
 //  C6  agy: a refused paste says not to repeat it (in #250 C5 above).
 //  C7  agy, already confirmed (the founder, or the person confirmed it): one line, no
-//      confirm request sent.
+//      confirm presented through the broker and answered as already in (#344).
 
 const PASTE_USED = "The hex you just pasted was this room's password and has been used: do not repeat it, and do not ask about it.";
-const PASTE_ALREADY = "No confirmation was attempted for the hex you pasted; do not repeat it or ask about it.";
+const PASTE_ALREADY = "The hex you pasted is this room's password and was already used for you; do not repeat it or ask about it.";
 const PASTE_REFUSED = "Do not repeat the value you pasted.";
 const timesIn = (text, needle) => text.split(needle).length - 1;
 const valueNowhere = (result, password, label) => {
@@ -12204,7 +12214,7 @@ for (const path of acceptedPastePaths) {
       if (broker) assert.ok(broker.requests.length > 0, "premise: the broker was asked");
       else assert.doesNotMatch(result.stderr, /mail withheld/, "premise: the collect went to the bridge");
       assert.equal(await f.confirmed(), true, "premise: accepted");
-      assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "premise: presented once");
+      assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "premise: presented once");
       path.premise?.(result);
       assert.equal(timesIn(result.text, PASTE_USED), 1, "C1/C2: the no-repeat line, once");
       assert.equal(result.steps.filter((text) => text.startsWith(`NEW: the password you were just given was accepted for sync room ${f.code}`)).length, 1, "C2: one lead");
@@ -12227,7 +12237,7 @@ test("#255 C5: after the accepted paste, no paste says nothing, and the same pas
     assert.equal(timesIn(again.text, PASTE_USED), 0, "not said as accepted again");
     assert.doesNotMatch(again.text, /NEW: the password/);
     assert.equal(timesIn(again.text, PASTE_ALREADY), 1, "answered as already in");
-    assert.equal(f.confirms.length, 1, "and nothing more was sent");
+    assert.equal(f.confirms.length, 2, "presented again (#344), and answered by the bridge as already in");
     valueNowhere(again, f.password, "the repeat");
   } finally {
     await f.close();
@@ -12247,7 +12257,8 @@ for (const [label, tag, env, who] of [
       const members = (await f.call("GET", `/sync/rooms?as=${as}`)).body.members;
       assert.equal(members.find((member) => member.conversationId === as)?.confirmed, true, "premise: already confirmed");
       const result = await f.invoke(f.password, env, as);
-      assert.deepEqual(f.confirms, [], "no confirm request is sent");
+      // #344: presented through the broker; the bridge, having checked it, says already in.
+      assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "presented once, through the broker");
       assert.equal(timesIn(result.text, PASTE_ALREADY), 1, "one line");
       assert.ok(result.steps.some((text) => text === `You are already in sync room ${f.code}. ${PASTE_ALREADY}`), "naming the room");
       assert.equal(timesIn(result.text, PASTE_USED), 0);
@@ -12272,8 +12283,11 @@ test("#255 r2: agy, already in, a 32-hex value that is not the password is never
     assert.notEqual(value, f.password, "premise: the value is not the password");
     assert.match(value, /^[0-9a-f]{32}$/, "premise: it is a paste the hook presents");
     const result = await f.invoke(value);
-    assert.deepEqual(f.confirms, [], "premise: no confirm request is sent");
-    assert.equal(timesIn(result.text, PASTE_ALREADY), 1, "premise: the already line was said");
+    // #344: presented, as Claude's is, and refused by the bridge for the wrong value.
+    assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "premise: presented through the broker");
+    assert.equal(timesIn(result.text, PASTE_ALREADY), 0, "not said to be already in on a value that was not checked as the password");
+    assert.match(result.text, new RegExp(`refused \\(bad_password\\); you are still in sync room ${f.code}\\.`), "said refused, and still in");
+    assert.doesNotMatch(result.text, /BLOCKED:/, "a member already in is not told it is shut out");
     assert.doesNotMatch(result.text, NOT_THE_PASSWORD, "never claims it is this room's password");
     valueNowhere(result, value, "r2 agy");
   } finally {
@@ -12296,7 +12310,7 @@ test("#255 r2: Claude, already in, a 32-hex value that is not the password is ne
       { hook_event_name: "UserPromptSubmit", session_id: claude, cwd: "/tmp/project", prompt: value },
     );
     assert.equal(result.code, 0, result.stderr);
-    assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "premise: it was presented, through /confirm");
+    assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "premise: it was presented, through /confirm");
     const context = result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
     assert.doesNotMatch(context, NOT_THE_PASSWORD, "never claims it is this room's password");
     valueNowhere(result, value, "r2 claude");
@@ -12325,7 +12339,7 @@ for (const [label, tag, fault] of [["normal", "c3norm", false], ["delivery fault
         delete process.env.GYREDECK_TEST_FAULT;
       }
       assert.equal(result.code, 0, result.stderr);
-      assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "premise: presented once");
+      assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "premise: presented once");
       const confirmed = (await f.call("GET", `/sync/rooms?as=${claude}`)).body.members.find((member) => member.conversationId === claude)?.confirmed;
       assert.equal(confirmed, true, "premise: accepted");
       const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
@@ -14984,5 +14998,227 @@ test("#331 J5: a code is spent even on a member already in, dies with its member
     assert.equal((await confirm(x, before)).body.error, "bad_password", "J5: a removed member's code dies with the removal");
   } finally {
     await f.close();
+  }
+});
+
+test("#344: which room a session is in, and its roster, are read only by its members and the app", async () => {
+  const f = await leanRoomFixture("r344");
+  try {
+    const a = "a3440000-0000-4000-8000-0000000000a1";
+    await f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: a, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 },
+    });
+    assert.equal((await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: a })).status, 200);
+    const roster = (as, extra) => f.call("GET", `/sync/rooms?as=${as}`, null, extra);
+    const ids = (answer) => answer.body.members.map((row) => row.conversationId).sort();
+    const notApp = { "x-gyredeck-broker": "" };
+
+    assert.equal((await roster(a, { ...notApp, "x-gyredeck-token": "" })).status, 401, "R1: no token, no answer");
+    // The machine token and a claimed id say nothing: not the room, not a row, not even
+    // whether the session is in a room — one answer for all three (Gyre Audit, #344 r1).
+    const nobody = "a3440000-0000-4000-8000-0000000000c3";
+    for (const [as, who] of [[a, "a session not yet confirmed"], [f.me, "a confirmed member"], [nobody, "a session in no room"]]) {
+      const answer = await roster(as, notApp);
+      assert.deepEqual([answer.status, answer.body.error, answer.body.room, answer.body.members], [403, "not_your_key", undefined, undefined], `R2/R3: ${who}, named with the machine token alone`);
+    }
+    const token = (await readFile(join(f.home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const key = await memberKeyAt(`http://127.0.0.1:${f.port}`, f.me, token);
+    assert.ok(ids(await roster(f.me, { ...notApp, "x-gyredeck-member": key })).includes(a), "R4: a confirmed member reads the whole roster by its own key");
+    assert.equal((await roster(a, { ...notApp, "x-gyredeck-member": key })).status, 403, "R4: another member's key is not a's");
+    assert.ok(ids(await roster(a)).includes(f.me), "R5: the app reads the whole roster");
+
+    assert.equal((await f.call("GET", "/mail", null, notApp)).status, 401, "R6: every room's roster is the app's alone");
+    assert.ok((await f.call("GET", "/mail")).body.rooms.some((room) => room.room === f.code), "R6: and the app still lists them");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#380: a session that ends without meaning to keeps its place for a grace, comes back into it, and when it does leave is told the room is still open", async () => {
+  const f = await leanRoomFixture("g380", { GYREDECK_CLOSE_GRACE_MS: "800" });
+  try {
+    const event = (type, data) => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type, timestamp: new Date().toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data,
+    });
+    const inRoom = async () => (await f.call("GET", `/sync/rooms?as=${f.peer}`)).body.room === f.code;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // The way a Codex self-update ends a live thread: `other`, then a resume seconds later. The
+    // grace turns on the reason, so a Claude session stands in, whose mailbox the test can read.
+    await event("conversation_close", { reason: "other" });
+    assert.equal(await inRoom(), true, "G1: an end that may be a restart does not take the member out at once");
+    await event("conversation_open", { reason: "resume" });
+    await pause(2000);
+    assert.equal(await inRoom(), true, "G2: back within the grace, it keeps its place");
+
+    // Ended for good this time.
+    await event("conversation_close", { reason: "other" });
+    await pause(2000);
+    assert.equal(await inRoom(), false, "G3: still gone after the grace, it leaves");
+    const inbox = await f.call("GET", `/mail/inbox?as=${f.peer}&collect=1`);
+    assert.ok(Array.isArray(inbox.body.messages), JSON.stringify(inbox));
+    const told = inbox.body.messages.find((message) => /no longer in room/.test(message.text));
+    assert.ok(told, "G4: and is told");
+    assert.match(told.text, /The room itself is still open for the others/, "G4: that the room did not close");
+    assert.equal((await f.call("GET", `/sync/rooms?as=${f.me}`)).body.room, f.code, "G4: which it did not");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#380: mail to a session waiting out its grace, or a late event of its own, does not keep it in the room", async () => {
+  const f = await leanRoomFixture("m380", { GYREDECK_CLOSE_GRACE_MS: "800" });
+  try {
+    const close = () => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "conversation_close", timestamp: new Date().toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { reason: "other" },
+    });
+    const inRoom = async () => (await f.call("GET", `/sync/rooms?as=${f.peer}`)).body.room === f.code;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    await close();
+    assert.equal(await inRoom(), true, "premise: the grace is running");
+    assert.equal((await f.say(f.me, { to: f.peer, kind: "tell", text: "PING" })).status, 202, "premise: a tell to it");
+    assert.equal((await f.say(f.me, { to: "everyone", kind: "ask", text: "ANYONE" })).status, 202, "premise: an ask to everyone");
+    assert.equal((await f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_complete", timestamp: new Date(Date.now() - 5_000).toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: {},
+    })).status, 202, "premise: a turn that ended before the close lands after it");
+    await pause(2000);
+    assert.equal(await inRoom(), false, "only the session opening or starting a turn after the close brings it back");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#380: decided by the session's own stamps, never by arrival order or by what the bridge stamps on arrival", async () => {
+  const f = await leanRoomFixture("o380", { GYREDECK_CLOSE_GRACE_MS: "800" });
+  try {
+    const event = (type, data, at = new Date()) => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type, timestamp: at.toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data,
+    });
+    const inRoom = async () => (await f.call("GET", `/sync/rooms?as=${f.peer}`)).body.room === f.code;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // The adapters' default reason, after which the turn's own Stop hook lands late.
+    await event("conversation_close", { reason: "quit" });
+    await pause(20);
+    assert.equal((await f.call("POST", "/hook/stop", { hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: f.peer })).status, 202, "premise: a late stop");
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O1: a stop the bridge stamps on arrival does not keep an ended session");
+
+    await f.admit(f.peer);
+    // The new process's SessionStart lands before the old one's SessionEnd.
+    const closedAt = new Date(Date.now() - 3_000);
+    await event("conversation_open", { reason: "resume" });
+    await event("conversation_close", { reason: "other" }, closedAt);
+    await pause(2000);
+    assert.equal(await inRoom(), true, "O2: a resume stamped after the close keeps its place, whichever lands first");
+
+    // An open from before the close, landing after it, says nothing about coming back.
+    const openedAt = new Date(Date.now() - 3_000);
+    await event("conversation_close", { reason: "other" });
+    await event("conversation_open", { reason: "resume" }, openedAt);
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O3: an open stamped before the close does not keep it");
+
+    // The dying process's own last hook, stamped after its close.
+    await f.admit(f.peer);
+    await event("conversation_close", { reason: "other" });
+    await event("tool_end", { toolName: "Bash" }, new Date(Date.now() + 5));
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O4: only an open or a new turn says it is back");
+
+    // A clock far ahead is held to the bridge's now.
+    await f.admit(f.peer);
+    await event("turn_start", { inputCount: 1 }, new Date(Date.now() + 60_000));
+    await pause(20);
+    await event("conversation_close", { reason: "other" });
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O5: a stamp from the future does not keep it for good");
+
+    // A real end, then an older close of an earlier process landing late.
+    await f.admit(f.peer);
+    const earlier = new Date(Date.now() - 3_000);
+    await event("conversation_open", { reason: "resume" }, new Date(Date.now() - 2_000));
+    await event("conversation_close", { reason: "other" });
+    await event("conversation_close", { reason: "other" }, earlier);
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O6: an older close landing late does not cancel the newer one");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#380: back by anything of its own stamped after the close; an old timer never evicts a member put back", async () => {
+  const f = await leanRoomFixture("t380", { GYREDECK_CLOSE_GRACE_MS: "800" });
+  try {
+    const event = (type, data, at = new Date()) => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type, timestamp: at.toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data,
+    });
+    const inRoom = async () => (await f.call("GET", `/sync/rooms?as=${f.peer}`)).body.room === f.code;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // Its SessionStart lost, the resumed session's first turn still says it is back.
+    await event("conversation_close", { reason: "other" });
+    await pause(50);
+    await event("turn_start", { inputCount: 1 });
+    await pause(2000);
+    assert.equal(await inRoom(), true, "a turn of its own after the close keeps its place");
+
+    // Taken out and put back inside the grace: the wait was for the membership that is gone.
+    await event("conversation_close", { reason: "other" });
+    assert.equal((await f.call("DELETE", `/sync/rooms/${f.code}/members/${f.peer}`)).status, 200, "premise: taken out");
+    await f.admit(f.peer);
+    await pause(2000);
+    assert.equal(await inRoom(), true, "an old timer does not evict the member put back");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#380: every hook stamps its event when the agent fired it, not when its input finished arriving", async () => {
+  // A hook whose stdin lands late (a busy machine, or the old process's hook still running
+  // after SessionEnd) must not stamp a turn_start after a close that came later.
+  const home = await mkdtemp(join(tmpdir(), "gd380s-"));
+  const seen = [];
+  const sink = createHttpServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      if (req.url === "/ingest") seen.push(JSON.parse(body));
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    });
+  });
+  await new Promise((resolve) => sink.listen(0, "127.0.0.1", resolve));
+  try {
+    await mkdir(join(home, ".config", "gyredeck"), { recursive: true });
+    await writeFile(join(home, ".config", "gyredeck", "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port: sink.address().port }));
+    await writeFile(join(home, ".config", "gyredeck", "gyredeck.ingest-token"), "c3".repeat(32));
+    const late = (adapterPath, args, payload) => new Promise((resolve) => {
+      const child = spawn(process.execPath, [adapterPath, ...args], { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] });
+      let writtenAt = null;
+      setTimeout(() => { writtenAt = Date.now(); child.stdin.end(JSON.stringify(payload)); }, 1_000);
+      child.on("close", () => resolve(writtenAt));
+    });
+    const cases = [
+      ["codex", "adapters/codex/gyredeck-codex-hook.mjs", ["--event", "UserPromptSubmit"], { hook_event_name: "UserPromptSubmit", session_id: "s380-codex", cwd: "/tmp/p380" }],
+      ["claude", "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], { hook_event_name: "UserPromptSubmit", session_id: "s380-claude", cwd: "/tmp/p380" }],
+      ["agy", "adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], { conversationId: "s380-agy", invocationNum: 1, workspacePaths: ["/tmp/p380"] }],
+    ];
+    for (const [name, adapterPath, args, payload] of cases) {
+      const writtenAt = await late(adapterPath, args, payload);
+      const id = payload.session_id ?? payload.conversationId;
+      const start = seen.find((event) => event.type === "turn_start" && event.conversationId === id);
+      assert.ok(start, `${name}: the hook posted a turn_start`);
+      assert.ok(Date.parse(start.timestamp) < writtenAt, `${name}: stamped ${start.timestamp}, after its input arrived at ${new Date(writtenAt).toISOString()}`);
+    }
+  } finally {
+    sink.close();
+    await rm(home, { recursive: true, force: true });
   }
 });

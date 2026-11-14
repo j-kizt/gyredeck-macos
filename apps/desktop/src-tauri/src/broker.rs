@@ -184,6 +184,12 @@ pub(crate) type BoundReporter = Arc<dyn Fn(&str) -> Result<(), String> + Send + 
 /// (session, room, password) -> (HTTP status, the bridge's answer). The session is the
 /// broker's binding, never a name the caller wrote.
 pub(crate) type Confirmer = Arc<dyn Fn(&str, &str, &str) -> Result<(u16, Value), String> + Send + Sync>;
+/// What a use does once the broker has decided whose session it is (#374): the bridge call
+/// that lets one exact command the owner approved from Discord through, once, as
+/// (session, room, command) -> (HTTP status, the bridge's answer). The session is the
+/// broker's binding, never a name the caller wrote, so one session's approval cannot be
+/// spent by another.
+pub(crate) type ApprovalUser = Arc<dyn Fn(&str, &str, &str) -> Result<(u16, Value), String> + Send + Sync>;
 
 /// Everything a running broker needs that is not the socket.
 #[derive(Clone)]
@@ -194,6 +200,7 @@ pub(crate) struct Policy {
     pub collect: Collector,
     pub report_bound: BoundReporter,
     pub confirm: Confirmer,
+    pub use_approval: ApprovalUser,
 }
 
 /// The sessions bound to processes, both ways, and the rules that govern them.
@@ -610,45 +617,77 @@ pub(crate) fn handle_request(
     }
 
     if let Some(confirm) = request.get("confirm") {
-        let room = confirm.get("room").and_then(Value::as_str).filter(|room| is_room_code(room));
+        // The room may be left out (#344): the app finds the bound session's own room, so a
+        // hook never has to ask the bridge which room a session is in before it holds a key.
+        let room = match confirm.get("room") {
+            None => Some(""),
+            Some(room) => room.as_str().filter(|room| is_room_code(room)),
+        };
         let password = confirm.get("password").and_then(Value::as_str).filter(|password| is_password(password));
         let (Some(room), Some(password)) = (room, password) else {
-            return refused("invalid", "A confirm names the room and the password it was given.".to_string());
+            return refused("invalid", "A confirm carries the password it was given, and the room if it names one.".to_string());
         };
-        let session = {
-            let Ok(mut table) = bindings.lock() else {
-                return refused("busy", "The broker's table is unavailable.".to_string());
-            };
-            table.sweep(&*policy.alive);
-            if table.is_ambiguous(peer.ancestor) {
-                return refused("conflict", format!("Process {} claimed two sessions; it is served nothing until it exits.", peer.ancestor.pid));
-            }
-            match table.session_of(peer.ancestor) {
-                Some(session) if !table.is_acknowledged(session) => {
-                    return refused("bridge", format!("The bridge has not acknowledged that {session} is bound; bind again before confirming."));
-                }
-                Some(session) => session.to_string(),
-                None => return refused("unbound", format!("Process {} ({}) is bound to no session; bind first, from a hook of the same process.", peer.ancestor.pid, cli.label())),
-            }
+        return for_bound_session(peer, cli, bindings, policy, "confirm", "confirmed", |session| (policy.confirm)(session, room, password));
+    }
+
+    // One exact command the owner approved from Discord, let through once (#374): for the
+    // session this process is bound to, never one the request names.
+    if let Some(using) = request.get("use") {
+        // No room is "the room the app finds the bound session in": the hook cannot look that up
+        // itself once the machine token alone no longer reads another session's room (#344).
+        let room = match using.get("room") { None => Some(""), Some(room) => room.as_str().filter(|room| is_room_code(room)) };
+        let command = using.get("command").and_then(Value::as_str).filter(|command| !command.is_empty() && command.len() <= 4 * 1024);
+        let (Some(room), Some(command)) = (room, command) else {
+            return refused("invalid", "A use names the command it would run, and the room if it names one.".to_string());
         };
-        // Asked again after the call, as a collect is: a requester whose binding or chain
-        // changed meanwhile is not told it was let in.
-        let answered = (policy.confirm)(&session, room, password);
+        return for_bound_session(peer, cli, bindings, policy, "use", "used", |session| (policy.use_approval)(session, room, command));
+    }
+
+    refused("invalid", "A request is {\"v\":1,\"bind\":{\"conversationId\"}}, {\"v\":1,\"collect\":{\"limit\"}}, {\"v\":1,\"ack\":{\"delivery\"}}, {\"v\":1,\"confirm\":{\"password\"}} or {\"v\":1,\"use\":{\"command\"}}.".to_string())
+}
+
+/// A bridge call made for the session this process is bound to and the bridge acknowledged:
+/// a confirm (#294) or a use (#374). The answer is `key` beside `boundTo`. Asked again after
+/// the call, as a collect is: a requester whose binding or chain changed meanwhile is not told
+/// the call went through.
+fn for_bound_session(
+    peer: &Peer,
+    cli: KnownCli,
+    bindings: &Mutex<Bindings>,
+    policy: &Policy,
+    verb: &str,
+    key: &str,
+    call: impl FnOnce(&str) -> Result<(u16, Value), String>,
+) -> Value {
+    let session = {
         let Ok(mut table) = bindings.lock() else {
             return refused("busy", "The broker's table is unavailable.".to_string());
         };
         table.sweep(&*policy.alive);
-        if table.session_of(peer.ancestor) != Some(session.as_str()) || !(policy.chain_holds)(peer) {
-            return refused("unattested", "The process that asked changed while its confirm ran.".to_string());
+        if table.is_ambiguous(peer.ancestor) {
+            return refused("conflict", format!("Process {} claimed two sessions; it is served nothing until it exits.", peer.ancestor.pid));
         }
-        return match answered {
-            Ok((200, answer)) => json!({ "v": PROTOCOL_VERSION, "ok": true, "boundTo": session, "confirmed": answer }),
-            Ok((status, answer)) => json!({ "v": PROTOCOL_VERSION, "ok": false, "error": "room", "status": status, "boundTo": session, "answer": answer, "message": format!("The bridge answered HTTP {status}.") }),
-            Err(message) => refused("bridge", message),
-        };
+        match table.session_of(peer.ancestor) {
+            Some(session) if !table.is_acknowledged(session) => {
+                return refused("bridge", format!("The bridge has not acknowledged that {session} is bound; bind again before asking to {verb}."));
+            }
+            Some(session) => session.to_string(),
+            None => return refused("unbound", format!("Process {} ({}) is bound to no session; bind first, from a hook of the same process.", peer.ancestor.pid, cli.label())),
+        }
+    };
+    let answered = call(&session);
+    let Ok(mut table) = bindings.lock() else {
+        return refused("busy", "The broker's table is unavailable.".to_string());
+    };
+    table.sweep(&*policy.alive);
+    if table.session_of(peer.ancestor) != Some(session.as_str()) || !(policy.chain_holds)(peer) {
+        return refused("unattested", format!("The process that asked changed while its {verb} ran."));
     }
-
-    refused("invalid", "A request is {\"v\":1,\"bind\":{\"conversationId\"}}, {\"v\":1,\"collect\":{\"limit\"}}, {\"v\":1,\"ack\":{\"delivery\"}} or {\"v\":1,\"confirm\":{\"room\",\"password\"}}.".to_string())
+    match answered {
+        Ok((200, answer)) => json!({ "v": PROTOCOL_VERSION, "ok": true, "boundTo": session, key: answer }),
+        Ok((status, answer)) => json!({ "v": PROTOCOL_VERSION, "ok": false, "error": "room", "status": status, "boundTo": session, "answer": answer, "message": format!("The bridge answered HTTP {status}.") }),
+        Err(message) => refused("bridge", message),
+    }
 }
 
 /// The session the broker has bound to this live process, if any: how an observed heavy run
@@ -712,7 +751,7 @@ impl BrokerState {
     }
 
     /// The production policy: the OS answers eligibility and liveness, the bridge collects.
-    pub(crate) fn start_default(&self, collect: Collector, report_bound: BoundReporter, confirm: Confirmer) -> Result<(), String> {
+    pub(crate) fn start_default(&self, collect: Collector, report_bound: BoundReporter, confirm: Confirmer, use_approval: ApprovalUser) -> Result<(), String> {
         let path = broker_socket_path().ok_or_else(|| "HOME is not set".to_string())?;
         self.start(
             path,
@@ -723,6 +762,7 @@ impl BrokerState {
                 collect,
                 report_bound,
                 confirm,
+                use_approval,
             },
         )
     }
@@ -1193,6 +1233,7 @@ mod tests {
     fn policy_accepting_everything() -> Policy {
         Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|p: &Peer| KnownCli::from_executable_name(&p.ancestor_name).ok_or_else(|| Ineligible::UnknownExecutable(p.ancestor_name.clone()))),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1339,6 +1380,40 @@ mod tests {
     }
 
     #[test]
+    fn c374_a_use_spends_the_bound_sessions_approval_and_never_one_the_caller_named() {
+        let bindings = Mutex::new(Bindings::default());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let mut policy = policy_accepting_everything();
+        policy.use_approval = Arc::new({
+            let asked = Arc::clone(&asked);
+            move |session: &str, room: &str, command: &str| {
+                asked.lock().unwrap().push((session.to_string(), room.to_string(), command.to_string()));
+                if command == "gh issue close 160" { Ok((200, json!({ "ok": true, "allowed": true, "seq": 4, "command": command }))) } else { Ok((404, json!({ "ok": false, "allowed": false }))) }
+            }
+        });
+        let claude = peer(42, 40, "claude");
+        let use_ = |command: &str| json!({ "v": 1, "use": { "room": "sync-pz2p", "command": command, "conversationId": "sess-b", "as": "sess-b" } });
+        assert_eq!(ask(use_("gh issue close 160"), Some(&claude), &bindings, &policy)["error"], "unbound", "nothing is spent for a process bound to no session");
+        assert!(asked.lock().unwrap().is_empty());
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "sess-a" } }), Some(&claude), &bindings, &policy)["ok"], true, "premise: bound");
+        let used = ask(use_("gh issue close 160"), Some(&claude), &bindings, &policy);
+        assert_eq!(used["ok"], true, "{used}");
+        assert_eq!(used["boundTo"], "sess-a");
+        assert_eq!(used["used"]["allowed"], true);
+        let refused = ask(use_("gh issue close 161"), Some(&claude), &bindings, &policy);
+        assert_eq!((refused["ok"].clone(), refused["error"].clone(), refused["status"].clone()), (json!(false), json!("room"), json!(404)), "{refused}");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![("sess-a".to_string(), "sync-pz2p".to_string(), "gh issue close 160".to_string()), ("sess-a".to_string(), "sync-pz2p".to_string(), "gh issue close 161".to_string())],
+            "the bound session, never the one written"
+        );
+        for bad in [json!({ "room": "sync-pz2p" }), json!({ "room": 7, "command": "ls" }), json!({ "room": "has space", "command": "ls" }), json!({ "room": "sync-pz2p", "command": "" })] {
+            assert_eq!(ask(json!({ "v": 1, "use": bad }), Some(&claude), &bindings, &policy)["error"], "invalid", "{bad}");
+        }
+        assert_eq!(asked.lock().unwrap().len(), 2, "nothing malformed reached the bridge");
+    }
+
+    #[test]
     fn c294_a_confirm_lets_in_the_session_the_broker_bound_and_no_name_the_caller_wrote() {
         let bindings = Mutex::new(Bindings::default());
         let (policy, asked) = policy_confirming(200);
@@ -1348,6 +1423,17 @@ mod tests {
         assert_eq!(confirmed["ok"], true, "{confirmed}");
         assert_eq!(confirmed["boundTo"], "sess-a");
         assert_eq!(*asked.lock().unwrap(), vec![("sess-a".to_string(), "sync-pz2p".to_string(), "0b36".to_string())], "the bound session, never the one written");
+    }
+
+    #[test]
+    fn c344_a_confirm_without_a_room_leaves_the_room_to_the_app() {
+        let bindings = Mutex::new(Bindings::default());
+        let (policy, asked) = policy_confirming(200);
+        let claude = peer(42, 40, "claude");
+        ask(json!({ "v": 1, "bind": { "conversationId": "sess-a" } }), Some(&claude), &bindings, &policy);
+        let confirmed = ask(json!({ "v": 1, "confirm": { "password": "0b36" } }), Some(&claude), &bindings, &policy);
+        assert_eq!(confirmed["ok"], true, "{confirmed}");
+        assert_eq!(*asked.lock().unwrap(), vec![("sess-a".to_string(), String::new(), "0b36".to_string())]);
     }
 
     #[test]
@@ -1369,7 +1455,7 @@ mod tests {
         ask(json!({ "v": 1, "bind": { "conversationId": "sess-a" } }), Some(&claude), &bindings, &policy);
         let refused = ask(json!({ "v": 1, "confirm": { "room": "sync-pz2p", "password": "wrong" } }), Some(&claude), &bindings, &policy);
         assert_eq!((refused["ok"].clone(), refused["error"].clone(), refused["status"].clone()), (json!(false), json!("room"), json!(403)), "{refused}");
-        for bad in [json!({ "room": "sync pz2p", "password": "x" }), json!({ "room": "sync-pz2p", "password": "has space" }), json!({ "room": "sync-pz2p" })] {
+        for bad in [json!({ "room": "sync pz2p", "password": "x" }), json!({ "room": "sync-pz2p", "password": "has space" }), json!({ "room": "sync-pz2p" }), json!({ "room": 7, "password": "x" })] {
             assert_eq!(ask(json!({ "v": 1, "confirm": bad }), Some(&claude), &bindings, &policy)["error"], "invalid", "{bad}");
         }
     }
@@ -1416,6 +1502,7 @@ mod tests {
         let bindings = Mutex::new(Bindings::default());
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             // The chain broke while it was being looked at — the hook exited, or a shell in
@@ -1436,6 +1523,7 @@ mod tests {
         let fail_next = Arc::new(Mutex::new(false));
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1474,6 +1562,7 @@ mod tests {
         let bridge_up = Arc::new(Mutex::new(false));
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1502,6 +1591,7 @@ mod tests {
         let heard = Arc::new(Mutex::new(Vec::new()));
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1572,6 +1662,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(0_u32));
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1620,6 +1711,7 @@ mod tests {
         let full = Arc::new(Mutex::new(false));
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new({ let alive = Arc::clone(&alive); move |_| *alive.lock().unwrap() }),
             chain_holds: Arc::new(|_| true),
@@ -1669,6 +1761,7 @@ mod tests {
         let round = Arc::new(Mutex::new(0u32));
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Antigravity)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new({ let chain = Arc::clone(&chain); move |_| *chain.lock().unwrap() }),
@@ -1718,6 +1811,7 @@ mod tests {
         let round = Arc::new(Mutex::new(0u32));
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new({ let chain = Arc::clone(&chain); move |_| *chain.lock().unwrap() }),
@@ -1750,6 +1844,7 @@ mod tests {
         let bindings = Mutex::new(Bindings::default());
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1776,6 +1871,7 @@ mod tests {
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let policy = Arc::new(Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1814,6 +1910,7 @@ mod tests {
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let policy = Arc::new(Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1861,6 +1958,7 @@ mod tests {
         let bindings = Mutex::new(table);
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1883,6 +1981,7 @@ mod tests {
         let drained = Arc::new(Mutex::new(false));
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1942,6 +2041,7 @@ mod tests {
         let verdicts = Arc::new(Mutex::new(vec![Ok(KnownCli::Claude), Err(Ineligible::UnverifiedCode { cli: "claude", reason: "replaced".into() })]));
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new({
                 let verdicts = Arc::clone(&verdicts);
                 move |_: &Peer| verdicts.lock().unwrap().remove(0)
@@ -1974,6 +2074,7 @@ mod tests {
         // real check is exercised below.
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|key: ProcessKey| platform::process_key(key.pid).is_some_and(|now| now == key)),
             chain_holds: Arc::new(platform::chain_holds),
@@ -2131,6 +2232,7 @@ mod tests {
         let path = dir.join("broker").join("broker.sock");
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -2178,6 +2280,7 @@ mod tests {
         let state = BrokerState::default();
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
+            use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),

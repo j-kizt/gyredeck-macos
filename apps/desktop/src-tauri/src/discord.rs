@@ -811,6 +811,7 @@ fn loss_text(n: u64, label: &str) -> String {
 
 const RELAYED_AGAIN: &str = "It was relayed again after Gyredeck restarted";
 const TOO_MANY_OPEN: &str = "Too many approval requests are open in this room";
+const TERMINAL_ONLY: &str = "It touches credentials, the Discord pairing, the approval secret, installing on this Mac or an agent's hooks or settings";
 
 /// A request is journalled as its act alone: relayed again after a relaunch it takes no code, so
 /// the asker's words asking for one are not what is shown (#207).
@@ -2167,7 +2168,8 @@ pub(crate) enum SourceError {
 
 /// The bridge, as the reader needs it.
 pub(crate) trait RoomSource: Send + Sync {
-    fn members(&self, room: &str, as_id: &str) -> Result<Roster, SourceError>;
+    /// On the app's word: without it the bridge refuses the roster (#344).
+    fn members(&self, room: &str, as_id: &str, app_word: &str) -> Result<Roster, SourceError>;
     /// The room's stream after `since`, the last seq this side fully read and queued. The
     /// bridge takes it as the relay's read position, and never goes back before the relay
     /// joined, so 0 means "from when it joined".
@@ -2444,10 +2446,10 @@ impl DiscordState {
     /// counted as a `loss`; every close is journalled; all of it is synced before the child is
     /// stopped. No `End`: these lines are late, not lost (#199 C3, d18).
     pub(crate) fn shutdown(&self) {
-        let rooms: Vec<String> = lock(&self.hub).rooms.keys().cloned().collect();
+        let rooms: Vec<(String, String)> = lock(&self.hub).rooms.iter().map(|(room, feed)| (room.clone(), feed.word.clone())).collect();
         self.stop_readers();
-        for room in rooms {
-            let room_seq = self.deps.source.members(&room, &relay_member(&room)).ok().and_then(|roster| roster.seq);
+        for (room, word) in rooms {
+            let room_seq = self.deps.source.members(&room, &relay_member(&room), &word).ok().and_then(|roster| roster.seq);
             let mut hub = lock(&self.hub);
             hub.lose_unread(&room, room_seq);
             hub.disconnect(&room, DisconnectReason::Closed);
@@ -2681,7 +2683,7 @@ impl DiscordState {
         // The room's members and, above all, which room instance it is: without that, a code
         // reused after a restart could be posted into the earlier room's post. No guess is
         // made — the relay is taken out again and the connect fails (#199 r4).
-        let roster = match self.deps.source.members(room, &member) {
+        let roster = match self.deps.source.members(room, &member, app_word) {
             Ok(roster) if roster.created_at.is_some() => roster,
             _ => {
                 if let Err(error) = self.deps.acts.leave(room, &member, app_word) {
@@ -2831,7 +2833,7 @@ impl Core {
             let seen: HashMap<String, Seen> = feed.agents.iter().filter_map(|id| hub.presence.get(id).map(|s| (id.clone(), *s))).collect();
             (feed.word.clone(), feed.agents.clone(), feed.connected_at, seen)
         };
-        let shown: HashMap<String, String> = self.source.members(code, &relay_member(code)).map(|roster| roster.members.into_iter().map(|m| (m.id, m.shown)).collect()).unwrap_or_default();
+        let shown: HashMap<String, String> = self.source.members(code, &relay_member(code), &word).map(|roster| roster.members.into_iter().map(|m| (m.id, m.shown)).collect()).unwrap_or_default();
         let status = self.source.status(code, &word).ok();
         let members: Vec<serde_json::Value> = agents
             .iter()
@@ -3002,6 +3004,10 @@ impl Core {
             return Err("That code was sent too long ago, so it was not checked. Ask for the approval again".to_string());
         }
         let echo = Approval::parse(&approve.approval).ok_or(STALE)?;
+        // Checked before anything else is read: no code is ever weighed against such a command (#374).
+        if echo.terminal_only().is_some() {
+            return Err("That command can be approved only at the terminal, so the code was not checked".to_string());
+        }
         let (word, thread) = {
             let hub = lock(&self.hub);
             let feed = hub.rooms.get(&approve.room).ok_or(GONE)?;
@@ -3716,7 +3722,7 @@ impl RoomReader {
 
     /// Whether the roster could be read: a failed read leaves the names as they were.
     fn refresh_names(&mut self) -> bool {
-        let Ok(roster) = self.source.members(&self.room, &self.member) else {
+        let Ok(roster) = self.source.members(&self.room, &self.member, &self.app_word) else {
             return false;
         };
         if let Some(seq) = roster.seq {
@@ -3788,9 +3794,14 @@ impl RoomReader {
             None
         };
         let mut hub = lock(&self.hub);
-        let withheld = approval.is_some() && !hub.rooms.get_mut(&self.room).is_some_and(|feed| approvals::make_room(&mut feed.approvals, Instant::now()));
+        let open = approval.is_some() && hub.rooms.get_mut(&self.room).is_some_and(|feed| approvals::make_room(&mut feed.approvals, Instant::now()));
+        // A command only the terminal approves (#374) is withheld like one past the open cap: shown
+        // as its act, asking for no code, and remembered as used so a code under it is refused.
+        let terminal_only = approval.as_ref().and_then(Approval::terminal_only);
+        let withheld = approval.is_some() && (!open || terminal_only.is_some());
         let requested = approval.clone().map(|approval| Requested { approval, requester: message.from.clone(), read_at: Instant::now(), used: withheld });
         let text = match &approval {
+            Some(approval) if terminal_only.is_some() => approval.not_approvable(TERMINAL_ONLY),
             Some(approval) if withheld => approval.not_approvable(TOO_MANY_OPEN),
             _ => message.text,
         };
@@ -4399,7 +4410,7 @@ impl BridgeSource {
 }
 
 impl RoomSource for BridgeSource {
-    fn members(&self, room: &str, as_id: &str) -> Result<Roster, SourceError> {
+    fn members(&self, room: &str, as_id: &str, app_word: &str) -> Result<Roster, SourceError> {
         let target = self.target()?;
         let (status, value) = standalone_bridge::bridge_request_to(
             &target,
@@ -4407,7 +4418,7 @@ impl RoomSource for BridgeSource {
             &format!("/sync/rooms?as={as_id}"),
             None,
             Duration::from_millis(1500),
-            None,
+            Some(app_word),
         )
         .map_err(|_| SourceError::Unavailable)?;
         if !(200..300).contains(&status) {

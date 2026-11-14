@@ -2754,7 +2754,7 @@ test("only the app's word opens, joins, invites into, empties and closes a room 
     assert.equal(r.body.password, undefined, "and hands out no password");
     r = await call("POST", "/sync/rooms", { conversationId: founder }, { "x-gyredeck-broker": "0f".repeat(32) });
     assert.equal(r.status, 401, "a wrong word is no word");
-    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, null, "the session's room slot stays empty");
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`, null, app)).body.room, null, "the session's room slot stays empty");
 
     // (g) the app's word does all of it.
     r = await call("POST", "/sync/rooms", { conversationId: founder }, app);
@@ -2764,7 +2764,7 @@ test("only the app's word opens, joins, invites into, empties and closes a room 
     // (d) join without the word is refused, and leaves the session free.
     r = await call("POST", `/sync/rooms/${code}/members`, { conversationId: other });
     assert.equal(r.status, 401, "join without the app's word is refused");
-    assert.equal((await call("GET", `/sync/rooms?as=${other}`)).body.room, null);
+    assert.equal((await call("GET", `/sync/rooms?as=${other}`, null, app)).body.room, null);
     assert.equal((await call("POST", `/sync/rooms/${code}/members`, { conversationId: other }, app)).status, 200);
 
     // (e) passwords and removing a member need the word too.
@@ -2775,11 +2775,11 @@ test("only the app's word opens, joins, invites into, empties and closes a room 
     // (c) #221: close with the machine token and `as` left out is refused…
     r = await call("DELETE", `/sync/rooms/${code}`);
     assert.equal(r.status, 401, "close without the app's word is refused, `as` or not");
-    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, code, "the room is still open");
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`, null, app)).body.room, code, "the room is still open");
     // …and the app may close it, whoever founded it (close contract A).
     r = await call("DELETE", `/sync/rooms/${code}?as=${other}`, undefined, app);
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, null, "closed");
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`, null, app)).body.room, null, "closed");
   } finally {
     await live.stop();
   }
@@ -2791,7 +2791,8 @@ test("only the app's word opens, joins, invites into, empties and closes a room 
     const r = await bare.call("POST", "/sync/rooms", { conversationId: founder }, app);
     assert.equal(r.status, 503, "no handshake, no rooms");
     assert.equal(r.body.error, "app_word_unavailable");
-    assert.equal((await bare.call("GET", `/sync/rooms?as=${founder}`)).body.room, null);
+    const lookup = await bare.call("GET", `/sync/rooms?as=${founder}`, null, app);
+    assert.deepEqual([lookup.status, lookup.body.error, lookup.body.room], [403, "not_your_key", undefined], "nor tells whose room is whose");
   } finally {
     await bare.stop();
   }

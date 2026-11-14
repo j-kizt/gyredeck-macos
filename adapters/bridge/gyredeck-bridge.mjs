@@ -2115,23 +2115,29 @@ function startBridge(config) {
   };
 
   // Sessions that ended without meaning to, each waiting out CLOSE_GRACE_MS before it leaves
-  // its room; only the session opening again in that time means it is back (#380). Anything
-  // else is no proof: mail the bridge announces to it is someone else speaking, and a turn
-  // event stamped before the close can land after it.
+  // its room (#380). Back in that time means the session itself said something stamped after
+  // the close: mail the bridge announces to it is someone else speaking, and a turn event
+  // stamped before the close can land after it. The wait holds the very membership it was
+  // started for, so a member taken out and put back, or moved, is not evicted by an old timer.
   const closingSessions = new Map();
-  const closeSessionLater = (conversationId, reason) => {
-    clearTimeout(closingSessions.get(conversationId));
+  const stopClosing = (conversationId) => {
+    clearTimeout(closingSessions.get(conversationId)?.timer);
     closingSessions.delete(conversationId);
+  };
+  const closeSessionLater = (conversationId, reason, stampedAt) => {
+    stopClosing(conversationId);
+    const held = syncRoomFor(conversationId)?.room.members.get(conversationId);
+    if (!held) return;
     if (DELIBERATE_ENDS.has(reason)) {
       releaseClosedSession(conversationId);
       return;
     }
     const timer = setTimeout(() => {
       closingSessions.delete(conversationId);
-      releaseClosedSession(conversationId);
+      if (syncRoomFor(conversationId)?.room.members.get(conversationId) === held) releaseClosedSession(conversationId);
     }, CLOSE_GRACE_MS);
     timer.unref?.();
-    closingSessions.set(conversationId, timer);
+    closingSessions.set(conversationId, { timer, closedAt: Number.isFinite(stampedAt) ? stampedAt : Date.now() });
   };
 
   const emitLocal = (payload, { fromSession = false } = {}) => {
@@ -2141,13 +2147,11 @@ function startBridge(config) {
     tracker.rememberScope(payload);
     rememberProvider(payload);
     tellCodexOfHeavyRuns(payload?.conversationId);
-    if (!fromSession) {
-      // A bridge-made event never ends a session or brings one back.
-    } else if (payload.type === "conversation_close" && typeof payload.conversationId === "string") {
-      closeSessionLater(payload.conversationId, payload.data?.reason);
-    } else if (payload.type === "conversation_open" && closingSessions.has(payload.conversationId)) {
-      clearTimeout(closingSessions.get(payload.conversationId));
-      closingSessions.delete(payload.conversationId);
+    const closing = fromSession ? closingSessions.get(payload.conversationId) : undefined;
+    if (fromSession && payload.type === "conversation_close" && typeof payload.conversationId === "string") {
+      closeSessionLater(payload.conversationId, payload.data?.reason, Date.parse(payload.timestamp));
+    } else if (closing && (payload.type === "conversation_open" || Date.parse(payload.timestamp) > closing.closedAt)) {
+      stopClosing(payload.conversationId);
     }
     // A session that compacted or resumed no longer holds the roster it was handed, so the next
     // delivery hands it whole again (#341).

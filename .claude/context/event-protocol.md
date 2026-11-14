@@ -592,7 +592,7 @@ Membership is the whole of the arrangement. There is no role attached to a membe
 
 Rooms with members are exempt from the idle sweep — they were set up deliberately and last until the final member leaves, at which point the room goes too.
 
-A `conversation_close` takes that session out of its room. An ended session can never collect its mail, so leaving it listed would tell everyone else it is still there, and an agent handing work to it would wait for an answer that cannot come; its `pending` would also climb forever with nothing to reclaim it. Sessions are resumable and keep their id, so a resumed one finds itself out of the room and has to be put back — one action for the person, against a peer that silently is not there.
+A `conversation_close` takes that session out of its room: at once when the end was deliberate (`clear`, `resume`, `logout`, `prompt_input_exit`, `bypass_permissions_disabled`), otherwise after a 15 s grace (#380), which anything the session itself sends stamped after the close, or a `conversation_open`, cancels. Mail the bridge announces to it does not, and a member taken out and put back in that time is not evicted by the old wait. An ended session can never collect its mail, so leaving it listed would tell everyone else it is still there, and an agent handing work to it would wait for an answer that cannot come; its `pending` would also climb forever with nothing to reclaim it. Sessions are resumable and keep their id, so a resumed one finds itself out of the room and has to be put back — one action for the person, against a peer that silently is not there.
 
 ### Usage (#158)
 

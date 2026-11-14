@@ -14868,12 +14868,12 @@ test("#380: a session that ends without meaning to keeps its place for a grace, 
     await event("conversation_close", { reason: "other" });
     assert.equal(await inRoom(), true, "G1: an end that may be a restart does not take the member out at once");
     await event("conversation_open", { reason: "resume" });
-    await pause(1200);
+    await pause(2000);
     assert.equal(await inRoom(), true, "G2: back within the grace, it keeps its place");
 
     // Ended for good this time.
     await event("conversation_close", { reason: "other" });
-    await pause(1200);
+    await pause(2000);
     assert.equal(await inRoom(), false, "G3: still gone after the grace, it leaves");
     const inbox = await f.call("GET", `/mail/inbox?as=${f.peer}&collect=1`);
     assert.ok(Array.isArray(inbox.body.messages), JSON.stringify(inbox));
@@ -14904,8 +14904,36 @@ test("#380: mail to a session waiting out its grace, or a late event of its own,
       version: 2, id: randomUUID(), type: "turn_complete", timestamp: new Date(Date.now() - 5_000).toISOString(), conversationId: f.peer, cwd: "/tmp/project",
       runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: {},
     })).status, 202, "premise: a turn that ended before the close lands after it");
-    await pause(1200);
+    await pause(2000);
     assert.equal(await inRoom(), false, "only the session opening again brings it back");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#380: back by anything of its own stamped after the close; an old timer never evicts a member put back", async () => {
+  const f = await leanRoomFixture("t380", { GYREDECK_CLOSE_GRACE_MS: "800" });
+  try {
+    const event = (type, data, at = new Date()) => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type, timestamp: at.toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data,
+    });
+    const inRoom = async () => (await f.call("GET", `/sync/rooms?as=${f.peer}`)).body.room === f.code;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // Its SessionStart lost, the resumed session's first turn still says it is back.
+    await event("conversation_close", { reason: "other" });
+    await pause(50);
+    await event("turn_start", { inputCount: 1 });
+    await pause(2000);
+    assert.equal(await inRoom(), true, "a turn of its own after the close keeps its place");
+
+    // Taken out and put back inside the grace: the wait was for the membership that is gone.
+    await event("conversation_close", { reason: "other" });
+    assert.equal((await f.call("DELETE", `/sync/rooms/${f.code}/members/${f.peer}`)).status, 200, "premise: taken out");
+    await f.admit(f.peer);
+    await pause(2000);
+    assert.equal(await inRoom(), true, "an old timer does not evict the member put back");
   } finally {
     await f.close();
   }

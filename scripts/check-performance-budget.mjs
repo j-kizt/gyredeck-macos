@@ -82,12 +82,16 @@ const assetRoot = join(distRoot, "assets");
  * #371 (the approval QR's Start over button) measured 121,045 / 124,121 on CI, +9 / +6 on #207's
  * 121,036 / 124,115; 121,047 and 124,123 leave 2 each. Raised by the owner at the terminal on
  * 2026-11-08 ("set it from CI's measure").
+ *
+ * Dependabot #382 (@playwright/test, lucide-react, @vitejs/plugin-react, vite) measured
+ * 121,066 / 124,141 on CI, +19 / +18 on #371's 121,045 / 124,121; 121,068 and 124,143 leave 2
+ * each. Raised by the owner from Discord on 2026-11-14 ("yes" to setting it from CI's measure).
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 121_047,
-  jsTotalGzipBytes: 124_123,
+  jsGzipBytes: 121_068,
+  jsTotalGzipBytes: 124_143,
 };
 
 const walk = async (directory) => {

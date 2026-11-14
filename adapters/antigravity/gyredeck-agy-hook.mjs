@@ -714,29 +714,29 @@ const confirmPastedPassword = async (endpoint, token, room, input) => {
   if (!token || !MAIL_ROOM_NAME.test(room) || typeof input?.lastUserInput !== "string") return null;
   const pasted = input.lastUserInput.trim();
   if (!PASTED_PASSWORD.test(pasted)) return null;
-  const membership = await getJsonStatus(endpoint, token, `/sync/rooms?as=${room}`);
-  const code = typeof membership.body?.room === "string" ? membership.body.room : null;
-  if (membership.status !== 200 || !code) return null;
-  const mine = Array.isArray(membership.body.members) ? membership.body.members.find((member) => member?.conversationId === room) : null;
-  if (!mine) return null;
-  // Already in (the founder, or a second paste): nothing to present, but the bare hex is
-  // still in front of the model and is answered (#255).
-  if (mine.confirmed === true) return { already: { room: code } };
   // Through the broker (#294): it names this session from the process that asked, and the
   // bridge takes a confirm from nobody else. No broker, or one that cannot vouch for this
-  // process, is a refusal said as one.
+  // process, is a refusal said as one. The broker also finds the session's room (#344): the
+  // bridge tells no caller holding only the machine token which room a session is in.
   const bound = judgeBrokerAnswer(await askBroker({ bind: { conversationId: room } }));
-  if (!bound.result) return { refused: { room: code, error: "not_vouched" } };
-  const raw = await askBroker({ confirm: { room: code, password: pasted.toLowerCase() } });
+  if (!bound.result) return { refused: { room: null, error: "not_vouched" } };
+  const raw = await askBroker({ confirm: { password: pasted.toLowerCase() } });
   const reply = judgeBrokerAnswer(raw);
   const answer = reply.result?.boundTo === room ? reply.result.confirmed : null;
-  if (answer?.ok === true) {
+  const code = typeof answer?.room === "string" ? answer.room : null;
+  if (answer?.ok === true && code) {
+    // Already in (the founder, or a second paste): answered all the same (#255).
+    if (answer.already === true) return { already: { room: code } };
     return { accepted: { room: code, members: Array.isArray(answer.members) ? answer.members : [] } };
   }
+  // A session in no room: the hex was nobody's password, and nothing is said.
   // The room's own refusal (a wrong password) rides back from the broker as error "room".
   const roomSaid = raw.answer?.error === "room" && raw.answer?.boundTo === room ? raw.answer.answer?.error : null;
+  if (roomSaid === "not_a_member") return null;
   const error = typeof roomSaid === "string" && /^[a-z_]{1,40}$/.test(roomSaid) ? roomSaid : "not_vouched";
-  return { refused: { room: code, error } };
+  const said = roomSaid ? raw.answer.answer : null;
+  const roomOf = typeof said?.room === "string" && MAIL_ROOM_NAME.test(said.room) ? said.room : null;
+  return { refused: { room: roomOf, error, stillIn: roomOf !== null && said.confirmed === true } };
 };
 
 /** What this invocation says about a pasted password, before anything else. */
@@ -754,8 +754,8 @@ const hearStep = (room) => ({ ephemeralMessage: hearText(room), [SAYS_HEAR]: roo
  * back in its reply and asked whether to join a room it was already in. Never the value.
  */
 const PASTE_USED = "The hex you just pasted was this room's password and has been used: do not repeat it, and do not ask about it.";
-// Already in, the value is never presented, so nothing here may say what it is (#255 r1).
-const PASTE_ALREADY = "No confirmation was attempted for the hex you pasted; do not repeat it or ask about it.";
+// Already in: said only once the bridge checked the value against the room's password (#344).
+const PASTE_ALREADY = "The hex you pasted is this room's password and was already used for you; do not repeat it or ask about it.";
 
 const confirmLead = (confirm) => {
   if (confirm?.accepted) {
@@ -765,6 +765,12 @@ const confirmLead = (confirm) => {
     return [{ ephemeralMessage: `You are already in sync room ${confirm.already.room}. ${PASTE_ALREADY}`, [SAYS_ACCEPTED]: true }];
   }
   if (confirm?.refused) {
+    if (confirm.refused.stillIn) {
+      return [{ ephemeralMessage: `The pasted value was refused (${confirm.refused.error}); you are still in sync room ${confirm.refused.room}. Do not repeat the value you pasted.` }];
+    }
+    if (!confirm.refused.room) {
+      return [{ ephemeralMessage: `The pasted value could not be checked (${confirm.refused.error}). Do not repeat it.` }];
+    }
     return [{ ephemeralMessage: `The pasted room password was refused (${confirm.refused.error}) — you are still not in sync room ${confirm.refused.room}. Do not repeat the value you pasted.` }];
   }
   return [];
@@ -825,6 +831,9 @@ const rereadSteps = (endpoint, as, syncRoom, all, memberKey = null) => {
 const confirmOnlySteps = (endpoint, room, confirm) => {
   if (confirm?.accepted) return [...confirmLead(confirm), hearStep(room)];
   if (confirm?.already) return confirmLead(confirm);
+  // Still in, or no room known to be shut out of (#344: a broker that failed cannot say which):
+  // a BLOCKED step would tell a member it is out.
+  if (confirm?.refused?.stillIn || (confirm?.refused && !confirm.refused.room)) return confirmLead(confirm);
   if (confirm?.refused) return [...confirmLead(confirm), { ephemeralMessage: blockedStepFor(endpoint, confirm.refused.room, room) }];
   return [];
 };

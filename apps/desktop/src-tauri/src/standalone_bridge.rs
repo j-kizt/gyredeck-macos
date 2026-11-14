@@ -1150,16 +1150,6 @@ fn dechunk(payload: &str) -> Option<String> {
     }
 }
 
-/// A bridge call where anything but success is a failure, which is every mail read.
-fn mail_request(method: &str, path: &str, body: Option<String>) -> Result<serde_json::Value, String> {
-    let (status, value) = bridge_request(method, path, body)?;
-    if !(200..300).contains(&status) {
-        // A bridge predating mail rooms answers 404 here; an unauthorized read is 401.
-        return Err(format!("Bridge declined the mail request: HTTP {status}"));
-    }
-    Ok(value)
-}
-
 /// One member of a sync room.
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct SyncMember {
@@ -1236,11 +1226,12 @@ fn sync_error(status: u16, value: &serde_json::Value) -> String {
 }
 
 /// Which room a session is in. Absence is an answer, not a failure.
-pub(crate) fn sync_room(conversation_id: &str) -> Result<SyncRoom, String> {
+pub(crate) fn sync_room(conversation_id: &str, app_word: &str) -> Result<SyncRoom, String> {
     if !valid_room(conversation_id) {
         return Err("Not a valid session id".to_string());
     }
-    let (status, value) = bridge_request("GET", &format!("/sync/rooms?as={conversation_id}"), None)?;
+    // On the app's word: without it the bridge refuses the lookup (#344).
+    let (status, value) = bridge_request_vouched("GET", &format!("/sync/rooms?as={conversation_id}"), None, app_word)?;
     if !(200..300).contains(&status) {
         return Err(sync_error(status, &value));
     }
@@ -1429,9 +1420,13 @@ fn valid_room(room: &str) -> bool {
 }
 
 /// Ask the bridge which mail rooms exist and how much is waiting in each.
-pub(crate) fn mail_rooms() -> Result<Vec<MailRoom>, String> {
+pub(crate) fn mail_rooms(app_word: &str) -> Result<Vec<MailRoom>, String> {
     let asked_at = room_passwords().generation();
-    let parsed = mail_request("GET", "/mail", None)?;
+    // Every room's roster is the app's to read, not any holder of the machine token (#344).
+    let (status, parsed) = bridge_request_vouched("GET", "/mail", None, app_word)?;
+    if !(200..300).contains(&status) {
+        return Err(format!("Bridge declined the mail request: HTTP {status}"));
+    }
     let Some(rooms) = parsed.get("rooms").and_then(|value| value.as_array()) else {
         return Ok(Vec::new());
     };

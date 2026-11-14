@@ -171,6 +171,20 @@ const listenBroker = async (server, path, close) => {
   brokersAt.set(path, close);
 };
 
+/**
+ * A confirm as the app's broker sends it (#294): for the bound session, and, when the hook
+ * names no room (#344), to the session's own room, which the bridge finds.
+ */
+const confirmAsApp = async (home, base, session, confirm) => {
+  const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+  const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
+  const room = confirm.room ?? "own";
+  const response = await bridgeFetch(`${base}/sync/rooms/${room}/confirm`, {
+    method: "POST", headers, body: JSON.stringify({ conversationId: session, password: confirm.password }),
+  });
+  return { status: response.status, body: await response.json().catch(() => null) };
+};
+
 const forwardingBroker = async (home, base, { as = null, cli = undefined } = {}) => {
   const dir = join(home, ...CONFIG_DIR, "broker");
   await mkdir(dir, { recursive: true });
@@ -231,13 +245,8 @@ const forwardingBroker = async (home, base, { as = null, cli = undefined } = {})
         const session = as ?? state.bound;
         if (!session) answer = { v: 1, ok: false, error: "unbound", message: "bind first" };
         else {
-          const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-          const response = await bridgeFetch(`${base}/sync/rooms/${request.confirm.room}/confirm`, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
-            body: JSON.stringify({ conversationId: session, password: request.confirm.password }),
-          });
-          const body = await response.json().catch(() => null);
+          const response = await confirmAsApp(home, base, session, request.confirm);
+          const body = response.body;
           answer = response.status === 200
             ? { v: 1, ok: true, boundTo: session, confirmed: body }
             : { v: 1, ok: false, error: "room", status: response.status, boundTo: session, answer: body, message: `The bridge answered HTTP ${response.status}.` };
@@ -2741,7 +2750,7 @@ test("only the app's word opens, joins, invites into, empties and closes a room 
     assert.equal(r.body.password, undefined, "and hands out no password");
     r = await call("POST", "/sync/rooms", { conversationId: founder }, { "x-gyredeck-broker": "0f".repeat(32) });
     assert.equal(r.status, 401, "a wrong word is no word");
-    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, null, "the session's room slot stays empty");
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`, null, app)).body.room, null, "the session's room slot stays empty");
 
     // (g) the app's word does all of it.
     r = await call("POST", "/sync/rooms", { conversationId: founder }, app);
@@ -2751,7 +2760,7 @@ test("only the app's word opens, joins, invites into, empties and closes a room 
     // (d) join without the word is refused, and leaves the session free.
     r = await call("POST", `/sync/rooms/${code}/members`, { conversationId: other });
     assert.equal(r.status, 401, "join without the app's word is refused");
-    assert.equal((await call("GET", `/sync/rooms?as=${other}`)).body.room, null);
+    assert.equal((await call("GET", `/sync/rooms?as=${other}`, null, app)).body.room, null);
     assert.equal((await call("POST", `/sync/rooms/${code}/members`, { conversationId: other }, app)).status, 200);
 
     // (e) passwords and removing a member need the word too.
@@ -2762,11 +2771,11 @@ test("only the app's word opens, joins, invites into, empties and closes a room 
     // (c) #221: close with the machine token and `as` left out is refused…
     r = await call("DELETE", `/sync/rooms/${code}`);
     assert.equal(r.status, 401, "close without the app's word is refused, `as` or not");
-    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, code, "the room is still open");
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`, null, app)).body.room, code, "the room is still open");
     // …and the app may close it, whoever founded it (close contract A).
     r = await call("DELETE", `/sync/rooms/${code}?as=${other}`, undefined, app);
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.equal((await call("GET", `/sync/rooms?as=${founder}`)).body.room, null, "closed");
+    assert.equal((await call("GET", `/sync/rooms?as=${founder}`, null, app)).body.room, null, "closed");
   } finally {
     await live.stop();
   }
@@ -2778,7 +2787,8 @@ test("only the app's word opens, joins, invites into, empties and closes a room 
     const r = await bare.call("POST", "/sync/rooms", { conversationId: founder }, app);
     assert.equal(r.status, 503, "no handshake, no rooms");
     assert.equal(r.body.error, "app_word_unavailable");
-    assert.equal((await bare.call("GET", `/sync/rooms?as=${founder}`)).body.room, null);
+    const lookup = await bare.call("GET", `/sync/rooms?as=${founder}`, null, app);
+    assert.deepEqual([lookup.status, lookup.body.error, lookup.body.room], [403, "not_your_key", undefined], "nor tells whose room is whose");
   } finally {
     await bare.stop();
   }
@@ -5007,11 +5017,13 @@ test("every mutation and every room read needs a credential that verifies", asyn
     // Every room and every roster, which is the app's view rather than a member's. The
     // door admits a room's password too, so this route has to say which of the two it
     // takes: passing the shape check is not being the app.
-    const listing = async (credential) =>
-      (await fetch(`${base}/mail`, { headers: { "x-gyredeck-token": credential } })).status;
+    const listing = async (credential, extra = {}) =>
+      (await fetch(`${base}/mail`, { headers: { "x-gyredeck-token": credential, ...extra } })).status;
     assert.equal(await listing(WRONG), 401, "a wrong token of the right shape sees no rooms");
     assert.equal(await listing(password), 401, "nor does a room's own password: it is not the app");
-    assert.equal(await listing(token), 200, "the app's token does");
+    // #344: every agent reads the machine token, so the app's word is asked as well.
+    assert.equal(await listing(token), 401, "nor the machine token alone");
+    assert.equal(await listing(token, { "x-gyredeck-broker": TEST_APP_WORD }), 200, "the app's token and word do");
 
     // ── The three calls that change who may do what ──
     // Each was authorised on `?as=` alone, which is a name a caller writes rather than
@@ -8935,13 +8947,8 @@ const fakeBroker = async (home, answer, { confirmVia = null } = {}) => {
       bound = request.bind.conversationId;
       return { v: 1, ok: true, bound: { conversationId: bound, pid: 1 } };
     }
-    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
-    const response = await bridgeFetch(`${confirmVia}/sync/rooms/${request.confirm.room}/confirm`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
-      body: JSON.stringify({ conversationId: bound, password: request.confirm.password }),
-    });
-    const body = await response.json().catch(() => null);
+    const response = await confirmAsApp(home, confirmVia, bound, request.confirm);
+    const body = response.body;
     return response.status === 200
       ? { v: 1, ok: true, boundTo: bound, confirmed: body }
       : { v: 1, ok: false, error: "room", status: response.status, boundTo: bound, answer: body };
@@ -12038,15 +12045,18 @@ test("#250 C1 C3 C4: a pasted password confirms the member once, and the same in
     // Pasted with the whitespace a terminal adds, and in capitals: the trimmed input is what counts.
     const first = await f.invoke(`  ${f.password.toUpperCase()}\n`);
     assert.equal(await f.confirmed(), true, "the member's own id was confirmed in its own room");
-    assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`]);
+    assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"]);
     assert.match(first.text, new RegExp(`NEW: the password you were just given was accepted for sync room ${f.code} — you may now read and post here\\.`));
     assert.ok(first.text.includes(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`), "with the way to hear the room");
     assert.equal(first.text.split(`gyredeck-agy-hook.mjs wait 300 ${f.agy}`).length - 1, 1, "said once");
     assert.doesNotMatch(first.text, /BLOCKED:/);
-    // PreInvocation fires on every invocation of the turn, with the same message: nothing more is sent.
+    // PreInvocation fires on every invocation of the turn, with the same message. The hook
+    // cannot ask the bridge whether it is already in (#344), so it presents it again and is
+    // answered as already in, never as newly accepted.
     const again = await f.invoke(f.password);
-    assert.equal(f.confirms.length, 1, "an already-confirmed member sends no confirm");
+    assert.equal(f.confirms.length, 2, "presented again, through the broker");
     assert.doesNotMatch(again.text, /NEW: the password/);
+    assert.equal(timesIn(again.text, PASTE_ALREADY), 1, "answered as already in");
   } finally {
     await f.close();
   }
@@ -12151,10 +12161,10 @@ test("#250 r4: mail quoting the wait command does not stand in for the hook's ow
 //      answered as already in, not accepted.
 //  C6  agy: a refused paste says not to repeat it (in #250 C5 above).
 //  C7  agy, already confirmed (the founder, or the person confirmed it): one line, no
-//      confirm request sent.
+//      confirm presented through the broker and answered as already in (#344).
 
 const PASTE_USED = "The hex you just pasted was this room's password and has been used: do not repeat it, and do not ask about it.";
-const PASTE_ALREADY = "No confirmation was attempted for the hex you pasted; do not repeat it or ask about it.";
+const PASTE_ALREADY = "The hex you pasted is this room's password and was already used for you; do not repeat it or ask about it.";
 const PASTE_REFUSED = "Do not repeat the value you pasted.";
 const timesIn = (text, needle) => text.split(needle).length - 1;
 const valueNowhere = (result, password, label) => {
@@ -12198,7 +12208,7 @@ for (const path of acceptedPastePaths) {
       if (broker) assert.ok(broker.requests.length > 0, "premise: the broker was asked");
       else assert.doesNotMatch(result.stderr, /mail withheld/, "premise: the collect went to the bridge");
       assert.equal(await f.confirmed(), true, "premise: accepted");
-      assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "premise: presented once");
+      assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "premise: presented once");
       path.premise?.(result);
       assert.equal(timesIn(result.text, PASTE_USED), 1, "C1/C2: the no-repeat line, once");
       assert.equal(result.steps.filter((text) => text.startsWith(`NEW: the password you were just given was accepted for sync room ${f.code}`)).length, 1, "C2: one lead");
@@ -12221,7 +12231,7 @@ test("#255 C5: after the accepted paste, no paste says nothing, and the same pas
     assert.equal(timesIn(again.text, PASTE_USED), 0, "not said as accepted again");
     assert.doesNotMatch(again.text, /NEW: the password/);
     assert.equal(timesIn(again.text, PASTE_ALREADY), 1, "answered as already in");
-    assert.equal(f.confirms.length, 1, "and nothing more was sent");
+    assert.equal(f.confirms.length, 2, "presented again (#344), and answered by the bridge as already in");
     valueNowhere(again, f.password, "the repeat");
   } finally {
     await f.close();
@@ -12241,7 +12251,8 @@ for (const [label, tag, env, who] of [
       const members = (await f.call("GET", `/sync/rooms?as=${as}`)).body.members;
       assert.equal(members.find((member) => member.conversationId === as)?.confirmed, true, "premise: already confirmed");
       const result = await f.invoke(f.password, env, as);
-      assert.deepEqual(f.confirms, [], "no confirm request is sent");
+      // #344: presented through the broker; the bridge, having checked it, says already in.
+      assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "presented once, through the broker");
       assert.equal(timesIn(result.text, PASTE_ALREADY), 1, "one line");
       assert.ok(result.steps.some((text) => text === `You are already in sync room ${f.code}. ${PASTE_ALREADY}`), "naming the room");
       assert.equal(timesIn(result.text, PASTE_USED), 0);
@@ -12266,8 +12277,11 @@ test("#255 r2: agy, already in, a 32-hex value that is not the password is never
     assert.notEqual(value, f.password, "premise: the value is not the password");
     assert.match(value, /^[0-9a-f]{32}$/, "premise: it is a paste the hook presents");
     const result = await f.invoke(value);
-    assert.deepEqual(f.confirms, [], "premise: no confirm request is sent");
-    assert.equal(timesIn(result.text, PASTE_ALREADY), 1, "premise: the already line was said");
+    // #344: presented, as Claude's is, and refused by the bridge for the wrong value.
+    assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "premise: presented through the broker");
+    assert.equal(timesIn(result.text, PASTE_ALREADY), 0, "not said to be already in on a value that was not checked as the password");
+    assert.match(result.text, new RegExp(`refused \\(bad_password\\); you are still in sync room ${f.code}\\.`), "said refused, and still in");
+    assert.doesNotMatch(result.text, /BLOCKED:/, "a member already in is not told it is shut out");
     assert.doesNotMatch(result.text, NOT_THE_PASSWORD, "never claims it is this room's password");
     valueNowhere(result, value, "r2 agy");
   } finally {
@@ -12290,7 +12304,7 @@ test("#255 r2: Claude, already in, a 32-hex value that is not the password is ne
       { hook_event_name: "UserPromptSubmit", session_id: claude, cwd: "/tmp/project", prompt: value },
     );
     assert.equal(result.code, 0, result.stderr);
-    assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "premise: it was presented, through /confirm");
+    assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "premise: it was presented, through /confirm");
     const context = result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
     assert.doesNotMatch(context, NOT_THE_PASSWORD, "never claims it is this room's password");
     valueNowhere(result, value, "r2 claude");
@@ -12319,7 +12333,7 @@ for (const [label, tag, fault] of [["normal", "c3norm", false], ["delivery fault
         delete process.env.GYREDECK_TEST_FAULT;
       }
       assert.equal(result.code, 0, result.stderr);
-      assert.deepEqual(f.confirms, [`/sync/rooms/${f.code}/confirm`], "premise: presented once");
+      assert.deepEqual(f.confirms, ["/sync/rooms/own/confirm"], "premise: presented once");
       const confirmed = (await f.call("GET", `/sync/rooms?as=${claude}`)).body.members.find((member) => member.conversationId === claude)?.confirmed;
       assert.equal(confirmed, true, "premise: accepted");
       const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
@@ -14848,6 +14862,40 @@ test("#342 W3: a quiet message a resumed watch passed over without a frame is wh
     await watch.stop();
     assert.doesNotMatch(watch.frames(), /QUIET-PASSED-OVER/, "premise: the replay wrote no frame for the reaction");
     assert.match(await f.drain(), /QUIET-PASSED-OVER/, "W3: never on the watch, so the text itself");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#344: which room a session is in, and its roster, are read only by its members and the app", async () => {
+  const f = await leanRoomFixture("r344");
+  try {
+    const a = "a3440000-0000-4000-8000-0000000000a1";
+    await f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: a, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 },
+    });
+    assert.equal((await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: a })).status, 200);
+    const roster = (as, extra) => f.call("GET", `/sync/rooms?as=${as}`, null, extra);
+    const ids = (answer) => answer.body.members.map((row) => row.conversationId).sort();
+    const notApp = { "x-gyredeck-broker": "" };
+
+    assert.equal((await roster(a, { ...notApp, "x-gyredeck-token": "" })).status, 401, "R1: no token, no answer");
+    // The machine token and a claimed id say nothing: not the room, not a row, not even
+    // whether the session is in a room — one answer for all three (Gyre Audit, #344 r1).
+    const nobody = "a3440000-0000-4000-8000-0000000000c3";
+    for (const [as, who] of [[a, "a session not yet confirmed"], [f.me, "a confirmed member"], [nobody, "a session in no room"]]) {
+      const answer = await roster(as, notApp);
+      assert.deepEqual([answer.status, answer.body.error, answer.body.room, answer.body.members], [403, "not_your_key", undefined, undefined], `R2/R3: ${who}, named with the machine token alone`);
+    }
+    const token = (await readFile(join(f.home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const key = await memberKeyAt(`http://127.0.0.1:${f.port}`, f.me, token);
+    assert.ok(ids(await roster(f.me, { ...notApp, "x-gyredeck-member": key })).includes(a), "R4: a confirmed member reads the whole roster by its own key");
+    assert.equal((await roster(a, { ...notApp, "x-gyredeck-member": key })).status, 403, "R4: another member's key is not a's");
+    assert.ok(ids(await roster(a)).includes(f.me), "R5: the app reads the whole roster");
+
+    assert.equal((await f.call("GET", "/mail", null, notApp)).status, 401, "R6: every room's roster is the app's alone");
+    assert.ok((await f.call("GET", "/mail")).body.rooms.some((room) => room.room === f.code), "R6: and the app still lists them");
   } finally {
     await f.close();
   }

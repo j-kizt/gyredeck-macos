@@ -67,7 +67,7 @@ Bound to `127.0.0.1:47621`.
 | GET | `/sync/rooms?as=<id>` | Which room a session is in, and who else — to the app's word or that member's own key only (#344); the machine token alone is `403 not_your_key`, whether or not the session is in a room. A hook with no key yet confirms through the broker without naming the room, and the app finds it. |
 | GET | `/mail/wait?as=<id>` | Long poll: the inbox, held until something arrives. |
 | POST | `/sync/rooms/<code>/passwords` | Whether the caller is the founder: `{ ok, room }`, no password. The bridge keeps only a sha256 of it (#124) and hands the plaintext over once, in the `201` from `POST /sync/rooms`; the app holds it in memory and shows it from there. Reading it out lets nobody in. |
-| POST | `/sync/rooms/<code>/confirm` | A joined session presents it and may then speak. |
+| POST | `/sync/rooms/<code>/confirm` | A joined session presents it and may then speak. The broker sends `own` in place of the code, and the bridge finds the session's room itself (#344). |
 | DELETE | `/sync/rooms/<code>?as=<id>` | The founder ends the room for everyone. |
 | GET | `/heavy` | The machine's heavy-run slot: holder, queue, 1-minute load (#223). |
 | POST | `/heavy/acquire` · `wait` · `activate` · `heartbeat` · `release` · `cancel` · `adopt` | The heavy-run queue, spoken by `~/.config/gyredeck/gyredeck-heavy.mjs`; see [Heavy runs](#heavy-runs-223). |
@@ -174,12 +174,12 @@ Two credentials reach `/mail` and they mean different things:
 
 | | proves | opens |
 | --- | --- | --- |
-| the machine's ingest token | this call is local | `GET /mail` (the app's own listing), and a session's own mailbox: `GET /mail/inbox`, `GET /mail/wait`, `GET|POST /mail/<session>` |
+| the machine's ingest token | this call is local | a session's own mailbox: `GET /mail/inbox`, `GET /mail/wait`, `GET|POST /mail/<session>` |
 | a room's password | a person let this session into this room | that room's **reads**, beside the reader's own key (#274): `GET /mail/<code>?since=`, `GET /mail/<code>/events`. Also its sends, `POST /mail/<code>` — but see below, sends take the machine token too |
 
 A session already in a room may use that room's password for its own mailbox too — it is the credential it was handed, and asking it to hold a second one buys nothing.
 
-`GET /mail` — the whole table, every room and its roster — takes the machine token alone: it is the app's view, not a member's. Creating a room, joining one, issuing its password, taking a member out and closing it take the machine token **and** the app's word (`x-gyredeck-broker`, the per-run secret the app hands the bridge on stdin; #220, #221) — the machine token alone is something every local agent reads. Missing or wrong word → `401 app_only`; a bridge started with no secret refuses all five with `503 app_word_unavailable` rather than falling back to the machine token. Close takes no founder check (close contract A): the app may close any room, because only the app holds the word.
+`GET /mail` — the whole table, every room and its roster — takes the machine token **and** the app's word (#344): it is the app's view, not a member's. Creating a room, joining one, issuing its password, taking a member out and closing it take the machine token **and** the app's word (`x-gyredeck-broker`, the per-run secret the app hands the bridge on stdin; #220, #221) — the machine token alone is something every local agent reads. Missing or wrong word → `401 app_only`; a bridge started with no secret refuses all five with `503 app_word_unavailable` rather than falling back to the machine token. Close takes no founder check (close contract A): the app may close any room, because only the app holds the word.
 
 ### Which pages may call the bridge at all
 

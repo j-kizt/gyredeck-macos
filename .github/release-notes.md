@@ -12,11 +12,12 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   announced in the room.
 - **A session in a room now posts and reads with its own member key alone.** The reply,
   hear and look-back commands that the Claude Code and Antigravity hooks print no longer
-  ask for the room password, and the room rules (v20) say the same. A session let in
-  by a join code never holds the room password.
+  ask for the room password, and the room rules (v20) say the same. Letting a session in
+  with a join code does not give it the room password.
 - **The room's founder is marked, and the panel says what its red button does.** The
-  founder sees a crown beside the room code, and a "Close this room for everyone" button.
-  Every other member sees "Leave this room", which takes only that session out.
+  founder sees a crown beside the room code, and the red button's tooltip reads "Close
+  this room for everyone". For every other member it reads "Leave this room", which takes
+  only that session out.
 
 Known limits: the shared room password still works in this release as the transition, and
 is removed in a later one. If you copy a code for one session and switch to another before

@@ -14478,8 +14478,11 @@ test("#339 C2: a Codex member is not pushed a join, a confirmation, a name or a 
     await f.ingestCodex(codex);
     await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: codex });
     assert.equal((await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: "01a06082-8ef6-7900-ae39-44fe2e463392", password })).body.transitioned, true, "premise: Codex is let in");
-    const confirmed = await until(async () => { const m = await f.messagesTo(codex); return m.some((message) => /you are confirmed in room/.test(message)) && m; }, "the confirming push");
-    const before = confirmed.length;
+    await until(async () => (await f.messagesTo(codex)).some((message) => /you are confirmed in room/.test(message)), "the confirming push");
+    // Each push is its own `codex queue` process, so the placement notice can land after
+    // the confirmation; the count starts once every push started so far is on record.
+    await f.settled();
+    const before = (await f.messagesTo(codex)).length;
     await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: late });
     assert.equal((await f.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: late, password })).status, 200, "premise: a second member is let in");
     assert.equal((await f.call("POST", `/mail/${code}`, { from: late, to: codex, kind: "reaction", text: "REACTION-TO-CODEX", name: "Late Name" })).status, 202);

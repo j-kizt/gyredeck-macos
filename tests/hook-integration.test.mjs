@@ -14959,3 +14959,31 @@ test("#331 J4: Codex is let in by its own one-time code through notify, and the 
     await f.close();
   }
 });
+
+test("#331 J5: a code is spent even on a member already in, dies with its member's removal, and is never handed back as a credential", async () => {
+  const f = await leanRoomFixture("j5");
+  try {
+    const mint = (id) => f.call("POST", `/sync/rooms/${f.code}/members/${id}/join-code`, {});
+    const confirm = (id, password) => f.call("POST", `/sync/rooms/${f.code}/confirm`, { conversationId: id, password });
+    // f.peer is already confirmed by the fixture.
+    const again = (await mint(f.peer)).body.code;
+    const first = await confirm(f.peer, again);
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    assert.equal(first.body.howTo.credential.value, null, "J5: the spent code is not offered as the room's password");
+    assert.equal(first.body.howTo.credential.header, "x-gyredeck-member", "J5: the member's own key is");
+    assert.equal((await confirm(f.peer, again)).body.error, "bad_password", "J5: a code works once, a member already in included");
+    // Taken out and put back: the code minted before is gone.
+    const x = "a3310000-0000-4000-8000-0000000000c5";
+    await f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: x, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 },
+    });
+    assert.equal((await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: x })).status, 200);
+    const before = (await mint(x)).body.code;
+    assert.equal((await f.call("DELETE", `/sync/rooms/${f.code}/members/${x}`)).status, 200, "premise: taken out");
+    assert.equal((await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: x })).status, 200, "premise: put back");
+    assert.equal((await confirm(x, before)).body.error, "bad_password", "J5: a removed member's code dies with the removal");
+  } finally {
+    await f.close();
+  }
+});

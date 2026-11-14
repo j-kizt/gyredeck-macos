@@ -14951,10 +14951,9 @@ test("#331 J4: Codex is let in by its own one-time code through notify, and the 
     const joinCode = (await f.call("POST", `/sync/rooms/${code}/members/${codex}/join-code`, {})).body.code;
     const first = await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: "01a06082-8ef6-7900-ae39-44fe2e463312", password: joinCode });
     assert.equal(first.body.transitioned, true, `J4: let in by its code: ${JSON.stringify(first.body)}`);
-    await f.call("DELETE", `/sync/rooms/${code}/members/${codex}`);
-    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: codex });
+    // Retried with nothing in between: a removal would delete the code and prove nothing about the spend.
     const again = await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: "01a06082-8ef6-7900-ae39-44fe2e463313", password: joinCode });
-    assert.equal(again.body.confirmed, false, "J4: the code was spent");
+    assert.equal(again.body.confirmed, false, `J4: the code was spent: ${JSON.stringify(again.body)}`);
   } finally {
     await f.close();
   }

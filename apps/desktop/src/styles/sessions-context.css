@@ -954,6 +954,7 @@
 .session-sync-code {
   display: inline-flex;
   align-items: center;
+  gap: 5px;
   height: 26px;
   padding: 0 8px;
   border-radius: 5px;
@@ -964,6 +965,10 @@
   font-weight: 650;
   letter-spacing: 0;
   text-transform: none;
+}
+
+.session-sync-crown {
+  color: #e5b53a;
 }
 
 .session-sync-icon {

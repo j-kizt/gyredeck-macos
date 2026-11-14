@@ -1103,6 +1103,11 @@ fn sync_close(broker: tauri::State<'_, broker::BrokerState>, code: String, conve
 }
 
 #[tauri::command]
+fn sync_issue_join_code(broker: tauri::State<'_, broker::BrokerState>, code: String, conversation_id: String) -> Result<String, String> {
+    standalone_bridge::sync_issue_join_code(&code, &conversation_id, &broker.secret()?)
+}
+
+#[tauri::command]
 fn sync_issue_password(broker: tauri::State<'_, broker::BrokerState>, code: String, conversation_id: String) -> Result<String, String> {
     standalone_bridge::sync_issue_password(&code, &conversation_id, &broker.secret()?)
 }
@@ -6209,6 +6214,7 @@ pub fn run() {
             sync_create,
             sync_join,
             sync_issue_password,
+            sync_issue_join_code,
             session_names,
             codex_hook_trust,
             set_session_name,

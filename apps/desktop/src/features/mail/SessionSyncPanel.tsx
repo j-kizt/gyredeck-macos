@@ -1,4 +1,4 @@
-import { Check, Copy, KeyRound, Link2, Link2Off } from "lucide-react";
+import { Check, Copy, Crown, DoorClosed, KeyRound, Link2, Link2Off } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { ISessionSummary } from "../session/types";
 import type { ISyncRoomState } from "./useSyncRoom";
@@ -25,7 +25,7 @@ export const SessionSyncPanel = ({
   /** Whether this session's own agent has the Gyredeck hook. Null while unknown. */
   hookInstalled: boolean | null;
 }) => {
-  const { room, busy, error, canAct, isFounder, issuePassword, create, join, leave, clearError } = sync;
+  const { room, busy, error, canAct, isFounder, issueJoinCode, create, join, leave, clearError } = sync;
   const [mode, setMode] = useState<"idle" | "joining">("idle");
   const [code, setCode] = useState("");
   const [copied, setCopied] = useState(false);
@@ -37,22 +37,21 @@ export const SessionSyncPanel = ({
     setCode("");
   }, [room]);
 
-  // The key copies the room's password. It has to be typed into the terminal of the
-  // session being let in — which is the point: the person authorises where the session
-  // lives, not from another window. From then on that session presents it in the
-  // x-gyredeck-token header of every read and every send: password and token are one
-  // thing said two ways, so authorising and authenticating are the same act.
+  // The key copies a one-time join code for this session alone (#331). It has to be typed
+  // into this session's own terminal — which is the point: the person proves which session
+  // it is from where it lives, not from another window. The code works once, for two
+  // minutes, and a new press kills the last one.
   const copyInvite = async () => {
-    const password = await issuePassword();
-    if (!password) return;
+    const joinCode = await issueJoinCode();
+    if (!joinCode) return;
     try {
-      await navigator.clipboard.writeText(password);
+      await navigator.clipboard.writeText(joinCode);
       setInvited(true);
       window.setTimeout(() => setInvited(false), 1_600);
     } catch {
-      // Denied clipboard access would leave the password minted and unusable, so say so
+      // Denied clipboard access would leave the code minted and unusable, so say so
       // rather than pretending it was copied.
-      window.prompt("Copy this room's password and paste it into the joining session", password);
+      window.prompt("Copy this session's join code and paste it into its terminal", joinCode);
     }
   };
 
@@ -91,7 +90,10 @@ export const SessionSyncPanel = ({
           // Create already puts this session in the room, so there is nothing left to
           // confirm: the code and the two things worth doing with it are all there is.
           <span className="session-sync-room">
-            <span className="session-sync-code">{room}</span>
+            <span className="session-sync-code" title={isFounder ? "You own this room" : undefined}>
+              {isFounder ? <Crown size={11} strokeWidth={2.3} className="session-sync-crown" /> : null}
+              {room}
+            </span>
             <button
               className="session-sync-icon"
               type="button"
@@ -102,29 +104,28 @@ export const SessionSyncPanel = ({
             >
               {copied ? <Check size={13} strokeWidth={2.6} /> : <Copy size={13} strokeWidth={2.3} />}
             </button>
-            {isFounder ? (
-              <button
-                className="session-sync-icon"
-                type="button"
-                onClick={() => void copyInvite()}
-                disabled={busy}
-                data-tauri-drag-region="false"
-                title="Copy this room's password for a session you are inviting"
-                aria-label="Copy this room's password"
-              >
-                {invited ? <Check size={13} strokeWidth={2.6} /> : <KeyRound size={13} strokeWidth={2.3} />}
-              </button>
-            ) : null}
+            <button
+              className="session-sync-icon"
+              type="button"
+              onClick={() => void copyInvite()}
+              disabled={busy}
+              data-tauri-drag-region="false"
+              title="Copy a one-time join code for this session"
+              aria-label="Copy this session's join code"
+            >
+              {invited ? <Check size={13} strokeWidth={2.6} /> : <KeyRound size={13} strokeWidth={2.3} />}
+            </button>
+            {/* A room does not outlive its founder, so the founder's leave closes it for everyone. */}
             <button
               className="session-sync-icon danger"
               type="button"
               onClick={() => void leave()}
               disabled={busy}
               data-tauri-drag-region="false"
-              title="Disconnect from this room"
+              title={isFounder ? "Close this room for everyone" : "Leave this room"}
               aria-label="Disconnect from sync room"
             >
-              <Link2Off size={13} strokeWidth={2.3} />
+              {isFounder ? <DoorClosed size={13} strokeWidth={2.3} /> : <Link2Off size={13} strokeWidth={2.3} />}
             </button>
           </span>
         ) : null}
@@ -184,10 +185,10 @@ export const SessionSyncPanel = ({
           ? error
           : room
             ? invited
-              ? "Password copied — paste it into the joining session's terminal."
+              ? "Join code copied — paste it into this session's terminal within two minutes."
               : isFounder
-                ? "Key copies this room's password. Paste it into a joining session to let it read and speak here."
-                : "Messages between members arrive in each session's own terminal."
+                ? "You own this room. Closing it ends it for every member. Key copies a one-time join code for this session only."
+                : "Leaving takes only this session out. The room stays open for the others. Key copies a one-time join code for this session only."
             : "Put this session in a room with another, then say what each is for."}
       </p>
     </section>

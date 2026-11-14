@@ -1296,6 +1296,29 @@ pub(crate) fn sync_issue_password(code: &str, conversation_id: &str, app_word: &
         .ok_or_else(|| "This app no longer holds the room's password. Close the room and create a new one".to_string())
 }
 
+/// Mint a one-time join code for one member of a room (#331), to paste into that session's
+/// own terminal. Each press kills the session's last code; the code works once, for that
+/// session only, and for two minutes. Only the app may mint, so the bridge takes its word.
+pub(crate) fn sync_issue_join_code(code: &str, conversation_id: &str, app_word: &str) -> Result<String, String> {
+    if !valid_room(code) || !valid_room(conversation_id) {
+        return Err("Not a valid room".to_string());
+    }
+    let (status, value) = bridge_request_vouched(
+        "POST",
+        &format!("/sync/rooms/{code}/members/{conversation_id}/join-code"),
+        Some("{}".to_string()),
+        app_word,
+    )?;
+    if !(200..300).contains(&status) {
+        return Err(sync_error(status, &value));
+    }
+    value
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "The bridge minted no join code".to_string())
+}
+
 /// Close a room for everyone in it.
 ///
 /// Different from leaving: every member is told, every stream is cut, and the room is

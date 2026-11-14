@@ -7232,8 +7232,27 @@ function startBridge(config) {
           sendJson(400, { ok: false, error: "invalid_session" });
           return;
         }
+        // Who else is in a room is for its members and the app (#344). A session that has
+        // not joined yet holds neither, so it is told its own room and its own row, which is
+        // all a hook needs to present a pasted code, and nothing about anyone else.
+        if (!holdsMachineToken(req.headers["x-gyredeck-token"])) {
+          sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+          return;
+        }
         const found = syncRoomFor(as);
-        sendJson(200, { ok: true, ...(found ? describeRoom(found.name, found.room, as) : { room: null, members: [], you: null }) });
+        if (!found) {
+          sendJson(200, { ok: true, room: null, members: [], you: null });
+          return;
+        }
+        const described = describeRoom(found.name, found.room, as);
+        const member = found.room.members.get(as);
+        const whole = holdsBrokerSecret(req.headers["x-gyredeck-broker"]) || (member?.confirmed === true && holdsMemberKey(member, req));
+        sendJson(200, {
+          ok: true,
+          ...(whole
+            ? described
+            : { ...described, members: described.members.filter((row) => row.conversationId === as), founder: described.founder === as ? as : null }),
+        });
         return;
       }
 
@@ -7687,6 +7706,12 @@ function startBridge(config) {
       if (req.method === "GET" && segments.length === 1) {
         if (!holdsMachineToken(headerToken)) {
           sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+          return;
+        }
+        // Every agent can read the machine token from disk, so it is no proof of being the
+        // app; the table is the app's alone, like a room's status (#206, #344).
+        if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"])) {
+          sendJson(401, { ok: false, error: "app_only", message: "Only the Gyredeck app can list every room." });
           return;
         }
         sendJson(200, {

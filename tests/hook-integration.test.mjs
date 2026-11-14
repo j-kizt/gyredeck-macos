@@ -14852,3 +14852,36 @@ test("#342 W3: a quiet message a resumed watch passed over without a frame is wh
     await f.close();
   }
 });
+
+test("#344: a room's roster is read only by its members and the app; anyone else holding the machine token sees its own row", async () => {
+  const f = await leanRoomFixture("r344");
+  try {
+    const a = "a3440000-0000-4000-8000-0000000000a1";
+    await f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: a, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 },
+    });
+    assert.equal((await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: a })).status, 200);
+    const roster = (as, extra) => f.call("GET", `/sync/rooms?as=${as}`, null, extra);
+    const ids = (answer) => answer.body.members.map((row) => row.conversationId).sort();
+    const notApp = { "x-gyredeck-broker": "" };
+
+    assert.equal((await roster(a, { ...notApp, "x-gyredeck-token": "" })).status, 401, "R1: no token, no answer");
+    const joining = await roster(a, notApp);
+    assert.equal(joining.status, 200);
+    assert.equal(joining.body.room, f.code, "R2: a session not yet in learns its own room, which its hook needs to present a pasted code");
+    assert.deepEqual(ids(joining), [a], "R2: and its own row, nobody else's");
+    assert.equal(joining.body.founder, null, "R2: the founder is someone else, so not named");
+    assert.deepEqual(ids(await roster(f.me, notApp)), [f.me], "R3: a member's id with the machine token alone is not that member");
+    const token = (await readFile(join(f.home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const key = await memberKeyAt(`http://127.0.0.1:${f.port}`, f.me, token);
+    assert.ok(ids(await roster(f.me, { ...notApp, "x-gyredeck-member": key })).includes(a), "R4: a confirmed member reads the whole roster by its own key");
+    assert.deepEqual(ids(await roster(a, { ...notApp, "x-gyredeck-member": key })), [a], "R4: another member's key is not a's");
+    assert.ok(ids(await roster(a)).includes(f.me), "R5: the app reads the whole roster");
+
+    assert.equal((await f.call("GET", "/mail", null, notApp)).status, 401, "R6: every room's roster is the app's alone");
+    assert.ok((await f.call("GET", "/mail")).body.rooms.some((room) => room.room === f.code), "R6: and the app still lists them");
+  } finally {
+    await f.close();
+  }
+});

@@ -2167,7 +2167,8 @@ pub(crate) enum SourceError {
 
 /// The bridge, as the reader needs it.
 pub(crate) trait RoomSource: Send + Sync {
-    fn members(&self, room: &str, as_id: &str) -> Result<Roster, SourceError>;
+    /// On the app's word: without it the bridge shows a non-member only its own row (#344).
+    fn members(&self, room: &str, as_id: &str, app_word: &str) -> Result<Roster, SourceError>;
     /// The room's stream after `since`, the last seq this side fully read and queued. The
     /// bridge takes it as the relay's read position, and never goes back before the relay
     /// joined, so 0 means "from when it joined".
@@ -2444,10 +2445,10 @@ impl DiscordState {
     /// counted as a `loss`; every close is journalled; all of it is synced before the child is
     /// stopped. No `End`: these lines are late, not lost (#199 C3, d18).
     pub(crate) fn shutdown(&self) {
-        let rooms: Vec<String> = lock(&self.hub).rooms.keys().cloned().collect();
+        let rooms: Vec<(String, String)> = lock(&self.hub).rooms.iter().map(|(room, feed)| (room.clone(), feed.word.clone())).collect();
         self.stop_readers();
-        for room in rooms {
-            let room_seq = self.deps.source.members(&room, &relay_member(&room)).ok().and_then(|roster| roster.seq);
+        for (room, word) in rooms {
+            let room_seq = self.deps.source.members(&room, &relay_member(&room), &word).ok().and_then(|roster| roster.seq);
             let mut hub = lock(&self.hub);
             hub.lose_unread(&room, room_seq);
             hub.disconnect(&room, DisconnectReason::Closed);
@@ -2681,7 +2682,7 @@ impl DiscordState {
         // The room's members and, above all, which room instance it is: without that, a code
         // reused after a restart could be posted into the earlier room's post. No guess is
         // made — the relay is taken out again and the connect fails (#199 r4).
-        let roster = match self.deps.source.members(room, &member) {
+        let roster = match self.deps.source.members(room, &member, app_word) {
             Ok(roster) if roster.created_at.is_some() => roster,
             _ => {
                 if let Err(error) = self.deps.acts.leave(room, &member, app_word) {
@@ -2831,7 +2832,7 @@ impl Core {
             let seen: HashMap<String, Seen> = feed.agents.iter().filter_map(|id| hub.presence.get(id).map(|s| (id.clone(), *s))).collect();
             (feed.word.clone(), feed.agents.clone(), feed.connected_at, seen)
         };
-        let shown: HashMap<String, String> = self.source.members(code, &relay_member(code)).map(|roster| roster.members.into_iter().map(|m| (m.id, m.shown)).collect()).unwrap_or_default();
+        let shown: HashMap<String, String> = self.source.members(code, &relay_member(code), &word).map(|roster| roster.members.into_iter().map(|m| (m.id, m.shown)).collect()).unwrap_or_default();
         let status = self.source.status(code, &word).ok();
         let members: Vec<serde_json::Value> = agents
             .iter()
@@ -3716,7 +3717,7 @@ impl RoomReader {
 
     /// Whether the roster could be read: a failed read leaves the names as they were.
     fn refresh_names(&mut self) -> bool {
-        let Ok(roster) = self.source.members(&self.room, &self.member) else {
+        let Ok(roster) = self.source.members(&self.room, &self.member, &self.app_word) else {
             return false;
         };
         if let Some(seq) = roster.seq {
@@ -4399,7 +4400,7 @@ impl BridgeSource {
 }
 
 impl RoomSource for BridgeSource {
-    fn members(&self, room: &str, as_id: &str) -> Result<Roster, SourceError> {
+    fn members(&self, room: &str, as_id: &str, app_word: &str) -> Result<Roster, SourceError> {
         let target = self.target()?;
         let (status, value) = standalone_bridge::bridge_request_to(
             &target,
@@ -4407,7 +4408,7 @@ impl RoomSource for BridgeSource {
             &format!("/sync/rooms?as={as_id}"),
             None,
             Duration::from_millis(1500),
-            None,
+            Some(app_word),
         )
         .map_err(|_| SourceError::Unavailable)?;
         if !(200..300).contains(&status) {

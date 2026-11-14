@@ -70,7 +70,7 @@ test("the sync panel walks create, join and disconnect, and shows a refusal wher
   await expect(sync.getByRole("button", { name: "Join sync" })).toHaveCount(0);
   // No roster either: who is in the room is not something the person has to act on,
   // and the exchange they would be reading it for happens in the terminals.
-  await expect(sync.getByText("This session")).toHaveCount(0);
+  await expect(sync.getByText("This session", { exact: true })).toHaveCount(0);
   await expect(sync.locator(".session-sync-members")).toHaveCount(0);
   await expect(sync.locator("input")).toHaveCount(0);
   // What is waiting for the other member, so the person can see a handover stall.

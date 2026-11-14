@@ -14886,7 +14886,7 @@ test("#380: a session that ends without meaning to keeps its place for a grace, 
   }
 });
 
-test("#380: mail to a session waiting out its grace does not keep it in the room", async () => {
+test("#380: mail to a session waiting out its grace, or a late event of its own, does not keep it in the room", async () => {
   const f = await leanRoomFixture("m380", { GYREDECK_CLOSE_GRACE_MS: "800" });
   try {
     const close = () => f.call("POST", "/ingest", {
@@ -14900,8 +14900,12 @@ test("#380: mail to a session waiting out its grace does not keep it in the room
     assert.equal(await inRoom(), true, "premise: the grace is running");
     assert.equal((await f.say(f.me, { to: f.peer, kind: "tell", text: "PING" })).status, 202, "premise: a tell to it");
     assert.equal((await f.say(f.me, { to: "everyone", kind: "ask", text: "ANYONE" })).status, 202, "premise: an ask to everyone");
+    assert.equal((await f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_complete", timestamp: new Date(Date.now() - 5_000).toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: {},
+    })).status, 202, "premise: a turn that ended before the close lands after it");
     await pause(1200);
-    assert.equal(await inRoom(), false, "the bridge announcing mail to it is not the session coming back");
+    assert.equal(await inRoom(), false, "only the session opening again brings it back");
   } finally {
     await f.close();
   }

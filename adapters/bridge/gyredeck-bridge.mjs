@@ -2115,8 +2115,9 @@ function startBridge(config) {
   };
 
   // Sessions that ended without meaning to, each waiting out CLOSE_GRACE_MS before it leaves
-  // its room; anything else it sends in that time means it is back (#380). Only what the
-  // session sends itself counts: mail the bridge announces to it is someone else speaking.
+  // its room; only the session opening again in that time means it is back (#380). Anything
+  // else is no proof: mail the bridge announces to it is someone else speaking, and a turn
+  // event stamped before the close can land after it.
   const closingSessions = new Map();
   const closeSessionLater = (conversationId, reason) => {
     clearTimeout(closingSessions.get(conversationId));
@@ -2144,7 +2145,7 @@ function startBridge(config) {
       // A bridge-made event never ends a session or brings one back.
     } else if (payload.type === "conversation_close" && typeof payload.conversationId === "string") {
       closeSessionLater(payload.conversationId, payload.data?.reason);
-    } else if (closingSessions.has(payload.conversationId)) {
+    } else if (payload.type === "conversation_open" && closingSessions.has(payload.conversationId)) {
       clearTimeout(closingSessions.get(payload.conversationId));
       closingSessions.delete(payload.conversationId);
     }

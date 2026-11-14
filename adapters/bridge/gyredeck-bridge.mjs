@@ -808,6 +808,13 @@ const SSE_HEARTBEAT_MS = Number(process.env.GYREDECK_SSE_HEARTBEAT_MS) || 10_000
 const MEMBER_FRAMED_MEMORY = 256;
 /** How long after a watch closes it still counts as held (#341): the reopen takes about a second. */
 const WATCH_REOPEN_GRACE_MS = Number(process.env.GYREDECK_WATCH_REOPEN_GRACE_MS) || 15_000;
+/** How long a session that ended without meaning to keeps its place in a room (#380): a Codex
+ *  self-update ends a live thread with `other` and resumes it 3–4 s later (log 11-10 → 11-13,
+ *  max 4.4 s; real ends were ≥ 65 s apart from any resume). */
+const CLOSE_GRACE_MS = Number(process.env.GYREDECK_CLOSE_GRACE_MS) || 15_000;
+/** SessionEnd reasons that are someone leaving on purpose (Claude Code hooks reference): the
+ *  session is not coming back under this id, so it leaves at once. Anything else waits. */
+const DELIBERATE_ENDS = new Set(["clear", "resume", "logout", "prompt_input_exit", "bypass_permissions_disabled"]);
 
 // ── Token management ──
 
@@ -2161,7 +2168,7 @@ function startBridge(config) {
     found.room.touchedAt = Date.now();
     // A session that has ended cannot read the notice, but its stream is still open
     // until something closes it, and this is that something.
-    partWithMember(found.name, found.room, conversationId, "its session ended");
+    partWithMember(found.name, found.room, conversationId, "its session ended", { roomOpen: true });
     if (found.room.members.size === 0 && found.room.clients.size === 0) {
       mailRooms.delete(found.name);
     } else if (found.room.members.size > 0) {
@@ -2169,15 +2176,56 @@ function startBridge(config) {
     }
   };
 
-  const emitLocal = (payload) => {
+  // Sessions that ended without meaning to, each waiting out CLOSE_GRACE_MS before it leaves
+  // its room (#380). Whether it came back is decided by the session's own clock, never by the
+  // order things land in: it stays if it opened or started a turn, stamped by its own hook,
+  // after the close. Other events can come from the dying process's last hooks, and room mail,
+  // /hook/stop and /hook/attention are stamped by the bridge on arrival, so none of them count.
+  // A stamp is never later than the bridge's now, so one skewed clock cannot keep it for good.
+  // The stamps are kept per member object, and the timer evicts only the membership it was
+  // started for, so a member taken out and put back, or moved, starts clean. An older close
+  // landing after a newer one changes nothing.
+  const BACK_EVENTS = new Set(["conversation_open", "turn_start"]);
+  const closingSessions = new Map();
+  const seenAtByMember = new WeakMap();
+  const seenSince = (member, closedAt) => (seenAtByMember.get(member) ?? -Infinity) > closedAt;
+  const closeSessionLater = (conversationId, reason, stampedAt) => {
+    const closedAt = Number.isFinite(stampedAt) ? Math.min(stampedAt, Date.now()) : Date.now();
+    const armed = closingSessions.get(conversationId);
+    if (armed && armed.closedAt > closedAt) return;
+    clearTimeout(armed?.timer);
+    closingSessions.delete(conversationId);
+    const held = syncRoomFor(conversationId)?.room.members.get(conversationId);
+    if (!held || seenSince(held, closedAt)) return;
+    if (DELIBERATE_ENDS.has(reason)) {
+      releaseClosedSession(conversationId);
+      return;
+    }
+    const timer = setTimeout(() => {
+      closingSessions.delete(conversationId);
+      if (syncRoomFor(conversationId)?.room.members.get(conversationId) === held && !seenSince(held, closedAt)) {
+        releaseClosedSession(conversationId);
+      }
+    }, CLOSE_GRACE_MS);
+    timer.unref?.();
+    closingSessions.set(conversationId, { timer, closedAt });
+  };
+
+  const emitLocal = (payload, { stampedBySession = false } = {}) => {
     // A voice that is not a session is never one (#205 audit): no event makes it a
     // provider, a presence, or a Codex thread to harvest.
     if (isReservedId(payload?.conversationId)) return;
     tracker.rememberScope(payload);
     rememberProvider(payload);
     tellCodexOfHeavyRuns(payload?.conversationId);
-    if (payload.type === "conversation_close" && typeof payload.conversationId === "string") {
-      releaseClosedSession(payload.conversationId);
+    if (stampedBySession && typeof payload.conversationId === "string") {
+      const stampedAt = Date.parse(payload.timestamp);
+      if (payload.type === "conversation_close") {
+        closeSessionLater(payload.conversationId, payload.data?.reason, stampedAt);
+      } else if (BACK_EVENTS.has(payload.type) && Number.isFinite(stampedAt)) {
+        const member = syncRoomFor(payload.conversationId)?.room.members.get(payload.conversationId);
+        if (member) seenAtByMember.set(member, Math.max(seenAtByMember.get(member) ?? -Infinity, Math.min(stampedAt, Date.now())));
+      }
     }
     // A session that compacted or resumed no longer holds the roster it was handed, so the next
     // delivery hands it whole again (#341).
@@ -4304,6 +4352,8 @@ function startBridge(config) {
 
   /** A room code, as opposed to a conversation id used as a mailbox name. */
   const SYNC_CODE = /^sync-[a-z2-9]{4}$/;
+  /** In place of a room code on a broker confirm: the session's own room (#344). */
+  const OWN_ROOM = "own";
   const mailRooms = new Map();
 
   // Rooms are created by whoever speaks first, so they need an upper bound and a way
@@ -4871,7 +4921,7 @@ function startBridge(config) {
     mailRooms.delete(name);
   };
 
-  const partWithMember = (name, room, conversationId, why) => {
+  const partWithMember = (name, room, conversationId, why, { roomOpen = false } = {}) => {
     for (const res of [...room.clients]) {
       if (res.gyredeckWatcher !== conversationId) continue;
       try {
@@ -4888,7 +4938,9 @@ function startBridge(config) {
       `[Gyredeck: you are no longer in room ${name} — ${why}. You can neither read it` +
       " nor post to it now, and its password will not let you back in. This is one of" +
       " the two messages that end a watch on that room: stop yours and do not open" +
-      " another, since it has been closed from this end and re-opening will be refused." +
+      " another, since this end closed your watch and re-opening will be refused." +
+      // Only you left (#380): told the room was closed, a member stops looking for it.
+      (roomOpen ? " The room itself is still open for the others." : "") +
       " Nothing about this room will reach you again unless someone puts you back in" +
       " it.]";
     const told = publishMail(mailbox, ROOM_SENDER, text, null, false, { [VOUCHED]: true, to: conversationId, kind: "tell" });
@@ -6678,7 +6730,7 @@ function startBridge(config) {
         return;
       }
       if (body && typeof body === "object" && typeof body.type === "string" && typeof body.id === "string") {
-        emitLocal(body);
+        emitLocal(body, { stampedBySession: true });
         res.writeHead(202, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
         res.end(JSON.stringify({ ok: true, type: body.type }));
         return;
@@ -7294,8 +7346,21 @@ function startBridge(config) {
           sendJson(400, { ok: false, error: "invalid_session" });
           return;
         }
+        // Which room a session is in, and who else is, is for that session and the app (#344):
+        // the app's word, or the member's own key. The machine token is every agent's and `as`
+        // is only a claim, so neither says anything — not even whether the session is in a
+        // room. A hook that holds no key yet lets the broker find its room on confirm.
+        if (!holdsMachineToken(req.headers["x-gyredeck-token"])) {
+          sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+          return;
+        }
         const found = syncRoomFor(as);
-        sendJson(200, { ok: true, ...(found ? describeRoom(found.name, found.room, as) : { room: null, members: [], you: null }) });
+        const member = found?.room.members.get(as);
+        if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"]) && !(member?.confirmed === true && holdsMemberKey(member, req))) {
+          sendJson(403, { ok: false, error: "not_your_key", message: MEMBER_KEY_HINT });
+          return;
+        }
+        sendJson(200, found ? { ok: true, ...describeRoom(found.name, found.room, as) } : { ok: true, room: null, members: [], you: null });
         return;
       }
 
@@ -7431,7 +7496,14 @@ function startBridge(config) {
         const body = await readJsonBody(req);
         const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
         const password = typeof body.password === "string" ? body.password.trim() : "";
-        const room = mailRooms.get(code);
+        // No room named (#344): the session's own, found here rather than by a lookup the app
+        // makes first, so a confirm is one call inside the hook's deadline.
+        const roomCode = code === OWN_ROOM ? syncRoomFor(conversationId)?.name ?? null : code;
+        if (roomCode === null) {
+          sendJson(404, { ok: false, error: "not_a_member", message: "This session is in no room." });
+          return;
+        }
+        const room = mailRooms.get(roomCode);
         // Two very different situations answered by the same bare word, and a live
         // session met both: holding a password for a room it had never been added to,
         // and holding one for a room that had ended. Neither is something the session
@@ -7484,6 +7556,10 @@ function startBridge(config) {
             ok: false,
             error: "bad_password",
             message: "That is not this room's password. It is 32 hex characters, copied from Gyredeck by the person who made the room — a room code is not it, and neither is the machine's ingest token.",
+            // The session's own standing, to the broker that named it (#344): a member already
+            // in is not told it is shut out by a value that was not the password.
+            room: roomCode,
+            confirmed: room.members.get(conversationId).confirmed === true,
           });
           return;
         }
@@ -7493,21 +7569,22 @@ function startBridge(config) {
           // password a second time is asking the same question and gets the same answer.
           sendJson(200, {
             ok: true,
-            ...describeRoom(code, room, conversationId),
-            howTo: howToUseRoom(code, password, conversationId, BRIDGE_HOST, config.port),
+            already: true,
+            ...describeRoom(roomCode, room, conversationId),
+            howTo: howToUseRoom(roomCode, password, conversationId, BRIDGE_HOST, config.port),
           });
           return;
         }
-        confirmRoomMember(code, room, conversationId);
+        confirmRoomMember(roomCode, room, conversationId);
         sendJson(200, {
           ok: true,
-          ...describeRoom(code, room, conversationId),
+          ...describeRoom(roomCode, room, conversationId),
           // Reached only past the password check above, so this caller has already proved
           // it holds what it is being handed back. The answer to a call the session made
           // itself, and so the one place an instruction is certain to be read —
           // everything a hook injects lands a turn later, by which point the session has
           // usually guessed.
-          howTo: howToUseRoom(code, password, conversationId, BRIDGE_HOST, config.port),
+          howTo: howToUseRoom(roomCode, password, conversationId, BRIDGE_HOST, config.port),
         });
         return;
       }
@@ -7620,7 +7697,7 @@ function startBridge(config) {
         retireLabel(room, conversationId);
         room.touchedAt = Date.now();
         // The one leaving is told first, while the room object is still here to name.
-        partWithMember(code, room, conversationId, "someone disconnected it from the app");
+        partWithMember(code, room, conversationId, "someone disconnected it from the app", { roomOpen: true });
         if (room.members.size === 0 && room.clients.size === 0) mailRooms.delete(code);
         // Whoever is left was told this member was here, and might be about to ask it
         // something.
@@ -7749,6 +7826,12 @@ function startBridge(config) {
       if (req.method === "GET" && segments.length === 1) {
         if (!holdsMachineToken(headerToken)) {
           sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
+          return;
+        }
+        // Every agent can read the machine token from disk, so it is no proof of being the
+        // app; the table is the app's alone, like a room's status (#206, #344).
+        if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"])) {
+          sendJson(401, { ok: false, error: "app_only", message: "Only the Gyredeck app can list every room." });
           return;
         }
         sendJson(200, {

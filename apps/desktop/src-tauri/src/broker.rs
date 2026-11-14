@@ -617,10 +617,15 @@ pub(crate) fn handle_request(
     }
 
     if let Some(confirm) = request.get("confirm") {
-        let room = confirm.get("room").and_then(Value::as_str).filter(|room| is_room_code(room));
+        // The room may be left out (#344): the app finds the bound session's own room, so a
+        // hook never has to ask the bridge which room a session is in before it holds a key.
+        let room = match confirm.get("room") {
+            None => Some(""),
+            Some(room) => room.as_str().filter(|room| is_room_code(room)),
+        };
         let password = confirm.get("password").and_then(Value::as_str).filter(|password| is_password(password));
         let (Some(room), Some(password)) = (room, password) else {
-            return refused("invalid", "A confirm names the room and the password it was given.".to_string());
+            return refused("invalid", "A confirm carries the password it was given, and the room if it names one.".to_string());
         };
         return for_bound_session(peer, cli, bindings, policy, "confirm", "confirmed", |session| (policy.confirm)(session, room, password));
     }
@@ -638,7 +643,7 @@ pub(crate) fn handle_request(
         return for_bound_session(peer, cli, bindings, policy, "use", "used", |session| (policy.use_approval)(session, room, command));
     }
 
-    refused("invalid", "A request is {\"v\":1,\"bind\":{\"conversationId\"}}, {\"v\":1,\"collect\":{\"limit\"}}, {\"v\":1,\"ack\":{\"delivery\"}}, {\"v\":1,\"confirm\":{\"room\",\"password\"}} or {\"v\":1,\"use\":{\"room\",\"command\"}}.".to_string())
+    refused("invalid", "A request is {\"v\":1,\"bind\":{\"conversationId\"}}, {\"v\":1,\"collect\":{\"limit\"}}, {\"v\":1,\"ack\":{\"delivery\"}}, {\"v\":1,\"confirm\":{\"password\"}} or {\"v\":1,\"use\":{\"command\"}}.".to_string())
 }
 
 /// A bridge call made for the session this process is bound to and the bridge acknowledged:
@@ -1421,6 +1426,17 @@ mod tests {
     }
 
     #[test]
+    fn c344_a_confirm_without_a_room_leaves_the_room_to_the_app() {
+        let bindings = Mutex::new(Bindings::default());
+        let (policy, asked) = policy_confirming(200);
+        let claude = peer(42, 40, "claude");
+        ask(json!({ "v": 1, "bind": { "conversationId": "sess-a" } }), Some(&claude), &bindings, &policy);
+        let confirmed = ask(json!({ "v": 1, "confirm": { "password": "0b36" } }), Some(&claude), &bindings, &policy);
+        assert_eq!(confirmed["ok"], true, "{confirmed}");
+        assert_eq!(*asked.lock().unwrap(), vec![("sess-a".to_string(), String::new(), "0b36".to_string())]);
+    }
+
+    #[test]
     fn c294_a_confirm_from_no_bound_or_no_eligible_process_reaches_no_bridge() {
         let bindings = Mutex::new(Bindings::default());
         let (policy, asked) = policy_confirming(200);
@@ -1439,7 +1455,7 @@ mod tests {
         ask(json!({ "v": 1, "bind": { "conversationId": "sess-a" } }), Some(&claude), &bindings, &policy);
         let refused = ask(json!({ "v": 1, "confirm": { "room": "sync-pz2p", "password": "wrong" } }), Some(&claude), &bindings, &policy);
         assert_eq!((refused["ok"].clone(), refused["error"].clone(), refused["status"].clone()), (json!(false), json!("room"), json!(403)), "{refused}");
-        for bad in [json!({ "room": "sync pz2p", "password": "x" }), json!({ "room": "sync-pz2p", "password": "has space" }), json!({ "room": "sync-pz2p" })] {
+        for bad in [json!({ "room": "sync pz2p", "password": "x" }), json!({ "room": "sync-pz2p", "password": "has space" }), json!({ "room": "sync-pz2p" }), json!({ "room": 7, "password": "x" })] {
             assert_eq!(ask(json!({ "v": 1, "confirm": bad }), Some(&claude), &bindings, &policy)["error"], "invalid", "{bad}");
         }
     }

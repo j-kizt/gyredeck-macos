@@ -142,7 +142,9 @@ const main = async () => {
       version: 2,
       id: randomUUID(),
       type,
-      timestamp: new Date().toISOString(),
+      // When the agent fired this hook, not when stdin was read: the bridge orders a
+      // session's close against its open/turn_start by these stamps (#380).
+      timestamp: new Date(HOST_STARTED_AT_MS).toISOString(),
       agentId: null,
       agentName: null,
       conversationId,

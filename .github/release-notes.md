@@ -1,5 +1,55 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A hook's late input no longer reorders a session's end — (v1.33.4)
+
+### Fixes
+
+- **Each hook now stamps its event with the time its own process started.** The bridge orders a
+  session's end against its open or turn start by these stamps. A hook that started before the
+  end but finished reading its input after it used to be stamped after the end, so the bridge
+  could take its turn start as the newer event and keep a session that had ended in its sync room.
+  The Claude Code, Codex and Antigravity hooks now stamp their events with the hook process's start
+  time instead of the time its input finished arriving. A hook whose process itself starts late
+  is not covered by this change.
+
+## The room lookup answers only the session itself or the app — (v1.33.3)
+
+### Fixes
+
+- **The bridge's room lookup answers only the session itself or the app.** Any local program,
+  with no token at all, could ask the bridge which sync room a session was in and list its
+  members, and any program holding the machine token could read the whole table of
+  rooms. Now the lookup for one session answers only to that session's own member key or to the
+  app, and refuses every other caller the same way whether or not the session is in a room. The
+  table of every room answers only to the app.
+- **A pasted room password still lets a session in.** The Claude Code and Antigravity hooks used
+  to look up their own room before confirming a password. They now confirm through the app
+  without naming the room, and the room is found for them. Codex sessions confirm as before.
+
+Known limit, tracked as #391: the bridge's live event stream and snapshot need no token, and
+show which room a session is in, who writes to it, and the start of each question or message
+that wakes it there. Other reads made in a session's name still answer differently for a
+session in a room and one in none.
+
+## A Codex session keeps its room through a Codex update — (v1.33.2)
+
+### Fixes
+
+- **A session whose end may be a restart keeps its place in its sync room for 15 seconds.** When
+  Codex updated itself, it ended its live thread and resumed it a few seconds later. Gyredeck took
+  the session out of its room at the end, and the session had to be put back by hand. Now a session
+  that ends for any reason other than one the person chose waits 15 seconds before it leaves. That
+  includes every Codex end, since Codex gives `other` as its reason, and Claude Code's `other`. If
+  the session opens again or starts a turn in that time, it keeps its place. Only the session's own
+  events count, by the time its own hook gave them; room mail sent to it does not count, and neither
+  does the end of the turn it was in. A Claude Code session ended with `/clear`, `/resume`, logout,
+  quitting at its prompt, or bypass permissions being turned off still leaves at once. A Codex
+  session you quit leaves after the 15 seconds.
+- **A session taken out of a room that is still open is told so.** The notice said only that "it
+  has been closed from this end", which read as the room being closed. It now says this end closed
+  the session's watch, and that the room itself is still open for the others. A room that really
+  closes sends the same notice without that last line.
+
 ## The approval code's QR shows in the app — (v1.33.1)
 
 ### Fixes

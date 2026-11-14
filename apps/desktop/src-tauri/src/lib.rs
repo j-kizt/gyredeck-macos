@@ -1078,15 +1078,15 @@ fn bridge_health() -> bool {
 /// Mail rooms and how much is waiting in each, so a session card can show that a
 /// message arrived without the webview holding the ingest token.
 #[tauri::command]
-fn mail_rooms() -> Result<Vec<standalone_bridge::MailRoom>, String> {
-    standalone_bridge::mail_rooms()
+fn mail_rooms(broker: tauri::State<'_, broker::BrokerState>) -> Result<Vec<standalone_bridge::MailRoom>, String> {
+    standalone_bridge::mail_rooms(&broker.secret()?)
 }
 
 /// Which sync room a session is in, so its panel can show the room instead of the
 /// buttons that would put it in one.
 #[tauri::command]
-fn sync_room(conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
-    standalone_bridge::sync_room(&conversation_id)
+fn sync_room(broker: tauri::State<'_, broker::BrokerState>, conversation_id: String) -> Result<standalone_bridge::SyncRoom, String> {
+    standalone_bridge::sync_room(&conversation_id, &broker.secret()?)
 }
 
 #[tauri::command]
@@ -6377,6 +6377,8 @@ pub fn run() {
                 let confirm = {
                     let secret = secret.clone();
                     std::sync::Arc::new(move |session: &str, room: &str, password: &str| {
+                        // No room named (#344): the bridge finds the session's own, in the same call.
+                        let room = if room.is_empty() { "own" } else { room };
                         let body = serde_json::json!({ "conversationId": session, "password": password }).to_string();
                         standalone_bridge::bridge_request_vouched("POST", &format!("/sync/rooms/{room}/confirm"), Some(body), &secret)
                     })

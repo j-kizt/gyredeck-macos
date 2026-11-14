@@ -271,7 +271,7 @@ impl RoomSource for Arc<FakeSource> {
         thread::sleep(*self.status_delay.lock().unwrap());
         Ok(serde_json::json!({ "ok": true, "members": [], "usage": {} }))
     }
-    fn members(&self, room: &str, _as_id: &str) -> Result<Roster, SourceError> {
+    fn members(&self, room: &str, _as_id: &str, _app_word: &str) -> Result<Roster, SourceError> {
         if self.roster_fails.load(Ordering::SeqCst) {
             return Err(SourceError::Unavailable);
         }

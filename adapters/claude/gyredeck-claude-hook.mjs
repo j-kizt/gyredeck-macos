@@ -537,19 +537,17 @@ const confirmRoomPassword = async (endpoint, token, room, prompt) => {
   if (!token || typeof prompt !== "string") return null;
   const match = prompt.match(ROOM_PASSWORD);
   if (!match) return null;
-  const membership = await getJson(endpoint, token, `/sync/rooms?as=${room}`);
-  const code = typeof membership?.room === "string" ? membership.room : null;
-  if (!code) return null;
   // Through the broker (#294): it names this session from the process that asked, and the
   // bridge takes a confirm from nobody else. No broker, or one that cannot vouch for this
-  // process, is no confirm.
+  // process, is no confirm. It also finds the session's room (#344), which the bridge tells
+  // no caller holding only the machine token.
   const bound = judgeBrokerAnswer(await askBroker({ bind: { conversationId: room } }));
   if (!bound.result) return null;
-  const confirmed = judgeBrokerAnswer(await askBroker({ confirm: { room: code, password: match[0] } }));
+  const confirmed = judgeBrokerAnswer(await askBroker({ confirm: { password: match[0] } }));
   if (!confirmed.result || confirmed.result.boundTo !== room) return null;
   const answer = confirmed.result.confirmed;
-  if (answer?.ok !== true) return null;
-  return { room: code, members: Array.isArray(answer.members) ? answer.members : [] };
+  if (answer?.ok !== true || typeof answer.room !== "string") return null;
+  return { room: answer.room, members: Array.isArray(answer.members) ? answer.members : [] };
 };
 
 // A time limit changes nothing the owner saw; the sandbox and the background do.
@@ -1095,7 +1093,9 @@ const main = async () => {
       version: 2,
       id: randomUUID(),
       type,
-      timestamp: new Date().toISOString(),
+      // When the agent fired this hook, not when stdin was read: the bridge orders a
+      // session's close against its open/turn_start by these stamps (#380).
+      timestamp: new Date(HOST_STARTED_AT_MS).toISOString(),
       agentId: null,
       agentName: null,
       conversationId,

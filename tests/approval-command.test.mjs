@@ -335,7 +335,7 @@ test("#374 I1: the hook allows the exact approved Bash command once, unchanged, 
       [{ ...preToolUse(command), tool_input: { command, description: "x", dangerouslyDisableSandbox: true } }, "out of the sandbox"],
       [{ ...preToolUse(command), tool_input: { command, description: "x", run_in_background: true } }, "in the background"],
     ]) assert.equal(allowOf(await runHook(h.home, payload)), null, why);
-    const stdout = await runHook(h.home, preToolUse(command));
+    const stdout = await runHook(h.home, { ...preToolUse(command), tool_input: { command, description: "x", timeout: 120000 } });
     assert.deepEqual(JSON.parse(stdout.trim()), {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",

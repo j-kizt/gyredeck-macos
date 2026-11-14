@@ -552,7 +552,8 @@ const confirmRoomPassword = async (endpoint, token, room, prompt) => {
   return { room: code, members: Array.isArray(answer.members) ? answer.members : [] };
 };
 
-const APPROVED_BASH_KEYS = new Set(["command", "description"]);
+// A time limit changes nothing the owner saw; the sandbox and the background do.
+const APPROVED_BASH_KEYS = new Set(["command", "description", "timeout"]);
 
 /**
  * Whether the owner approved exactly this Bash command from Discord with their code (#374).

@@ -2115,43 +2115,50 @@ function startBridge(config) {
   };
 
   // Sessions that ended without meaning to, each waiting out CLOSE_GRACE_MS before it leaves
-  // its room (#380). Back in that time means the session itself said something stamped after
-  // the close: mail the bridge announces to it is someone else speaking, and a turn event
-  // stamped before the close can land after it. The wait holds the very membership it was
-  // started for, so a member taken out and put back, or moved, is not evicted by an old timer.
+  // its room (#380). Whether it came back is decided by the session's own clock, never by the
+  // order things land in: it stays if any /ingest event of its own is stamped after the close.
+  // Room mail, /hook/stop and /hook/attention are stamped by the bridge on arrival, so they say
+  // nothing about when the session acted and never count. The stamps live on the member object,
+  // and the timer evicts only the membership it was started for, so a member taken out and put
+  // back, or moved, starts clean and is not evicted by an old timer.
   const closingSessions = new Map();
-  const stopClosing = (conversationId) => {
-    clearTimeout(closingSessions.get(conversationId)?.timer);
-    closingSessions.delete(conversationId);
-  };
+  const seenAtByMember = new WeakMap();
+  const seenSince = (member, closedAt) => (seenAtByMember.get(member) ?? -Infinity) > closedAt;
   const closeSessionLater = (conversationId, reason, stampedAt) => {
-    stopClosing(conversationId);
+    clearTimeout(closingSessions.get(conversationId));
+    closingSessions.delete(conversationId);
     const held = syncRoomFor(conversationId)?.room.members.get(conversationId);
-    if (!held) return;
+    const closedAt = Number.isFinite(stampedAt) ? stampedAt : Date.now();
+    if (!held || seenSince(held, closedAt)) return;
     if (DELIBERATE_ENDS.has(reason)) {
       releaseClosedSession(conversationId);
       return;
     }
     const timer = setTimeout(() => {
       closingSessions.delete(conversationId);
-      if (syncRoomFor(conversationId)?.room.members.get(conversationId) === held) releaseClosedSession(conversationId);
+      if (syncRoomFor(conversationId)?.room.members.get(conversationId) === held && !seenSince(held, closedAt)) {
+        releaseClosedSession(conversationId);
+      }
     }, CLOSE_GRACE_MS);
     timer.unref?.();
-    closingSessions.set(conversationId, { timer, closedAt: Number.isFinite(stampedAt) ? stampedAt : Date.now() });
+    closingSessions.set(conversationId, timer);
   };
 
-  const emitLocal = (payload, { fromSession = false } = {}) => {
+  const emitLocal = (payload, { stampedBySession = false } = {}) => {
     // A voice that is not a session is never one (#205 audit): no event makes it a
     // provider, a presence, or a Codex thread to harvest.
     if (isReservedId(payload?.conversationId)) return;
     tracker.rememberScope(payload);
     rememberProvider(payload);
     tellCodexOfHeavyRuns(payload?.conversationId);
-    const closing = fromSession ? closingSessions.get(payload.conversationId) : undefined;
-    if (fromSession && payload.type === "conversation_close" && typeof payload.conversationId === "string") {
-      closeSessionLater(payload.conversationId, payload.data?.reason, Date.parse(payload.timestamp));
-    } else if (closing && (payload.type === "conversation_open" || Date.parse(payload.timestamp) > closing.closedAt)) {
-      stopClosing(payload.conversationId);
+    if (stampedBySession && typeof payload.conversationId === "string") {
+      const stampedAt = Date.parse(payload.timestamp);
+      if (payload.type === "conversation_close") {
+        closeSessionLater(payload.conversationId, payload.data?.reason, stampedAt);
+      } else if (Number.isFinite(stampedAt)) {
+        const member = syncRoomFor(payload.conversationId)?.room.members.get(payload.conversationId);
+        if (member) seenAtByMember.set(member, Math.max(seenAtByMember.get(member) ?? -Infinity, stampedAt));
+      }
     }
     // A session that compacted or resumed no longer holds the roster it was handed, so the next
     // delivery hands it whole again (#341).
@@ -3158,7 +3165,7 @@ function startBridge(config) {
             ? codexUsageFor(scope.conversationId)
             : null,
       },
-    }, { fromSession: true });
+    });
 
     // A Codex turn ending is the only signal that it has said something, and until now
     // its words were only collected while a harvest happened to be running — which
@@ -3187,7 +3194,7 @@ function startBridge(config) {
         toolName: typeof data.toolName === "string" ? data.toolName : null,
         message: typeof data.message === "string" ? data.message : null,
       },
-    }, { fromSession: true });
+    });
   };
 
   /**
@@ -6654,7 +6661,7 @@ function startBridge(config) {
         return;
       }
       if (body && typeof body === "object" && typeof body.type === "string" && typeof body.id === "string") {
-        emitLocal(body, { fromSession: true });
+        emitLocal(body, { stampedBySession: true });
         res.writeHead(202, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
         res.end(JSON.stringify({ ok: true, type: body.type }));
         return;

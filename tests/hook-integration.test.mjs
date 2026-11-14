@@ -14911,6 +14911,42 @@ test("#380: mail to a session waiting out its grace, or a late event of its own,
   }
 });
 
+test("#380: decided by the session's own stamps, never by arrival order or by what the bridge stamps on arrival", async () => {
+  const f = await leanRoomFixture("o380", { GYREDECK_CLOSE_GRACE_MS: "800" });
+  try {
+    const event = (type, data, at = new Date()) => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type, timestamp: at.toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data,
+    });
+    const inRoom = async () => (await f.call("GET", `/sync/rooms?as=${f.peer}`)).body.room === f.code;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // The adapters' default reason, after which the turn's own Stop hook lands late.
+    await event("conversation_close", { reason: "quit" });
+    await pause(20);
+    assert.equal((await f.call("POST", "/hook/stop", { hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: f.peer })).status, 202, "premise: a late stop");
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O1: a stop the bridge stamps on arrival does not keep an ended session");
+
+    await f.admit(f.peer);
+    // The new process's SessionStart lands before the old one's SessionEnd.
+    const closedAt = new Date(Date.now() - 3_000);
+    await event("conversation_open", { reason: "resume" });
+    await event("conversation_close", { reason: "other" }, closedAt);
+    await pause(2000);
+    assert.equal(await inRoom(), true, "O2: a resume stamped after the close keeps its place, whichever lands first");
+
+    // An open from before the close, landing after it, says nothing about coming back.
+    const openedAt = new Date(Date.now() - 3_000);
+    await event("conversation_close", { reason: "other" });
+    await event("conversation_open", { reason: "resume" }, openedAt);
+    await pause(2000);
+    assert.equal(await inRoom(), false, "O3: an open stamped before the close does not keep it");
+  } finally {
+    await f.close();
+  }
+});
+
 test("#380: back by anything of its own stamped after the close; an old timer never evicts a member put back", async () => {
   const f = await leanRoomFixture("t380", { GYREDECK_CLOSE_GRACE_MS: "800" });
   try {

@@ -3417,7 +3417,7 @@ test("a session that ends is taken out of its sync room", async () => {
         version: 2, id: randomUUID(), type: "conversation_close", timestamp: new Date().toISOString(),
         conversationId, cwd: "/tmp/project",
         runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
-        data: { reason: "quit" },
+        data: { reason: "prompt_input_exit" },
       });
     const roomFor = (as) => fetch(`${base}/sync/rooms?as=${as}`, { headers }).then((r) => r.json());
 
@@ -5294,7 +5294,7 @@ test("a room does not outlive the founder that made it", async () => {
       version: 2, id: randomUUID(), type: "conversation_close", timestamp: new Date().toISOString(),
       conversationId: founder, cwd: "/tmp/project",
       runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" },
-      data: { reason: "quit" },
+      data: { reason: "prompt_input_exit" },
     })).status, 202);
     assert.equal((await call("GET", `/sync/rooms?as=${peer}`)).body.room, null, "the peer is out of it too");
     const afterClose = await call("GET", `/mail/inbox?as=${peer}&collect=1`);
@@ -14848,6 +14848,39 @@ test("#342 W3: a quiet message a resumed watch passed over without a frame is wh
     await watch.stop();
     assert.doesNotMatch(watch.frames(), /QUIET-PASSED-OVER/, "premise: the replay wrote no frame for the reaction");
     assert.match(await f.drain(), /QUIET-PASSED-OVER/, "W3: never on the watch, so the text itself");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#380: a session that ends without meaning to keeps its place for a grace, comes back into it, and when it does leave is told the room is still open", async () => {
+  const f = await leanRoomFixture("g380", { GYREDECK_CLOSE_GRACE_MS: "800" });
+  try {
+    const event = (type, data) => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type, timestamp: new Date().toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data,
+    });
+    const inRoom = async () => (await f.call("GET", `/sync/rooms?as=${f.peer}`)).body.room === f.code;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // The way a Codex self-update ends a live thread: `other`, then a resume seconds later. The
+    // grace turns on the reason, so a Claude session stands in, whose mailbox the test can read.
+    await event("conversation_close", { reason: "other" });
+    assert.equal(await inRoom(), true, "G1: an end that may be a restart does not take the member out at once");
+    await event("conversation_open", { reason: "resume" });
+    await pause(1200);
+    assert.equal(await inRoom(), true, "G2: back within the grace, it keeps its place");
+
+    // Ended for good this time.
+    await event("conversation_close", { reason: "other" });
+    await pause(1200);
+    assert.equal(await inRoom(), false, "G3: still gone after the grace, it leaves");
+    const inbox = await f.call("GET", `/mail/inbox?as=${f.peer}&collect=1`);
+    assert.ok(Array.isArray(inbox.body.messages), JSON.stringify(inbox));
+    const told = inbox.body.messages.find((message) => /no longer in room/.test(message.text));
+    assert.ok(told, "G4: and is told");
+    assert.match(told.text, /The room itself is still open for the others/, "G4: that the room did not close");
+    assert.equal((await f.call("GET", `/sync/rooms?as=${f.me}`)).body.room, f.code, "G4: which it did not");
   } finally {
     await f.close();
   }

@@ -804,6 +804,13 @@ const SSE_HEARTBEAT_MS = Number(process.env.GYREDECK_SSE_HEARTBEAT_MS) || 10_000
 const MEMBER_FRAMED_MEMORY = 256;
 /** How long after a watch closes it still counts as held (#341): the reopen takes about a second. */
 const WATCH_REOPEN_GRACE_MS = Number(process.env.GYREDECK_WATCH_REOPEN_GRACE_MS) || 15_000;
+/** How long a session that ended without meaning to keeps its place in a room (#380): a Codex
+ *  self-update ends a live thread with `other` and resumes it 3–4 s later (log 11-10 → 11-13,
+ *  max 4.4 s; real ends were ≥ 65 s apart from any resume). */
+const CLOSE_GRACE_MS = Number(process.env.GYREDECK_CLOSE_GRACE_MS) || 15_000;
+/** SessionEnd reasons that are someone leaving on purpose (Claude Code hooks reference): the
+ *  session is not coming back under this id, so it leaves at once. Anything else waits. */
+const DELIBERATE_ENDS = new Set(["clear", "resume", "logout", "prompt_input_exit"]);
 
 // ── Token management ──
 
@@ -2099,12 +2106,30 @@ function startBridge(config) {
     found.room.touchedAt = Date.now();
     // A session that has ended cannot read the notice, but its stream is still open
     // until something closes it, and this is that something.
-    partWithMember(found.name, found.room, conversationId, "its session ended");
+    partWithMember(found.name, found.room, conversationId, "its session ended", { roomOpen: true });
     if (found.room.members.size === 0 && found.room.clients.size === 0) {
       mailRooms.delete(found.name);
     } else if (found.room.members.size > 0) {
       announceMembership(found.name, found.room, `${label} ended its session and left this room.`, null, owedAnswersFrom(found.room, conversationId));
     }
+  };
+
+  // Sessions that ended without meaning to, each waiting out CLOSE_GRACE_MS before it leaves
+  // its room; anything else it sends in that time means it is back (#380).
+  const closingSessions = new Map();
+  const closeSessionLater = (conversationId, reason) => {
+    clearTimeout(closingSessions.get(conversationId));
+    closingSessions.delete(conversationId);
+    if (DELIBERATE_ENDS.has(reason)) {
+      releaseClosedSession(conversationId);
+      return;
+    }
+    const timer = setTimeout(() => {
+      closingSessions.delete(conversationId);
+      releaseClosedSession(conversationId);
+    }, CLOSE_GRACE_MS);
+    timer.unref?.();
+    closingSessions.set(conversationId, timer);
   };
 
   const emitLocal = (payload) => {
@@ -2115,7 +2140,10 @@ function startBridge(config) {
     rememberProvider(payload);
     tellCodexOfHeavyRuns(payload?.conversationId);
     if (payload.type === "conversation_close" && typeof payload.conversationId === "string") {
-      releaseClosedSession(payload.conversationId);
+      closeSessionLater(payload.conversationId, payload.data?.reason);
+    } else if (closingSessions.has(payload.conversationId)) {
+      clearTimeout(closingSessions.get(payload.conversationId));
+      closingSessions.delete(payload.conversationId);
     }
     // A session that compacted or resumed no longer holds the roster it was handed, so the next
     // delivery hands it whole again (#341).
@@ -4809,7 +4837,7 @@ function startBridge(config) {
     mailRooms.delete(name);
   };
 
-  const partWithMember = (name, room, conversationId, why) => {
+  const partWithMember = (name, room, conversationId, why, { roomOpen = false } = {}) => {
     for (const res of [...room.clients]) {
       if (res.gyredeckWatcher !== conversationId) continue;
       try {
@@ -4826,7 +4854,9 @@ function startBridge(config) {
       `[Gyredeck: you are no longer in room ${name} — ${why}. You can neither read it` +
       " nor post to it now, and its password will not let you back in. This is one of" +
       " the two messages that end a watch on that room: stop yours and do not open" +
-      " another, since it has been closed from this end and re-opening will be refused." +
+      " another, since this end closed it and re-opening will be refused." +
+      // Only you left (#380): told the room was closed, a member stops looking for it.
+      (roomOpen ? " The room itself is still open for the others." : "") +
       " Nothing about this room will reach you again unless someone puts you back in" +
       " it.]";
     const told = publishMail(mailbox, ROOM_SENDER, text, null, false, { [VOUCHED]: true, to: conversationId, kind: "tell" });
@@ -7558,7 +7588,7 @@ function startBridge(config) {
         retireLabel(room, conversationId);
         room.touchedAt = Date.now();
         // The one leaving is told first, while the room object is still here to name.
-        partWithMember(code, room, conversationId, "someone disconnected it from the app");
+        partWithMember(code, room, conversationId, "someone disconnected it from the app", { roomOpen: true });
         if (room.members.size === 0 && room.clients.size === 0) mailRooms.delete(code);
         // Whoever is left was told this member was here, and might be about to ask it
         // something.

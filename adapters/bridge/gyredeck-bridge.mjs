@@ -810,7 +810,7 @@ const WATCH_REOPEN_GRACE_MS = Number(process.env.GYREDECK_WATCH_REOPEN_GRACE_MS)
 const CLOSE_GRACE_MS = Number(process.env.GYREDECK_CLOSE_GRACE_MS) || 15_000;
 /** SessionEnd reasons that are someone leaving on purpose (Claude Code hooks reference): the
  *  session is not coming back under this id, so it leaves at once. Anything else waits. */
-const DELIBERATE_ENDS = new Set(["clear", "resume", "logout", "prompt_input_exit"]);
+const DELIBERATE_ENDS = new Set(["clear", "resume", "logout", "prompt_input_exit", "bypass_permissions_disabled"]);
 
 // ── Token management ──
 
@@ -2115,7 +2115,8 @@ function startBridge(config) {
   };
 
   // Sessions that ended without meaning to, each waiting out CLOSE_GRACE_MS before it leaves
-  // its room; anything else it sends in that time means it is back (#380).
+  // its room; anything else it sends in that time means it is back (#380). Only what the
+  // session sends itself counts: mail the bridge announces to it is someone else speaking.
   const closingSessions = new Map();
   const closeSessionLater = (conversationId, reason) => {
     clearTimeout(closingSessions.get(conversationId));
@@ -2132,14 +2133,16 @@ function startBridge(config) {
     closingSessions.set(conversationId, timer);
   };
 
-  const emitLocal = (payload) => {
+  const emitLocal = (payload, { fromSession = false } = {}) => {
     // A voice that is not a session is never one (#205 audit): no event makes it a
     // provider, a presence, or a Codex thread to harvest.
     if (isReservedId(payload?.conversationId)) return;
     tracker.rememberScope(payload);
     rememberProvider(payload);
     tellCodexOfHeavyRuns(payload?.conversationId);
-    if (payload.type === "conversation_close" && typeof payload.conversationId === "string") {
+    if (!fromSession) {
+      // A bridge-made event never ends a session or brings one back.
+    } else if (payload.type === "conversation_close" && typeof payload.conversationId === "string") {
       closeSessionLater(payload.conversationId, payload.data?.reason);
     } else if (closingSessions.has(payload.conversationId)) {
       clearTimeout(closingSessions.get(payload.conversationId));
@@ -3150,7 +3153,7 @@ function startBridge(config) {
             ? codexUsageFor(scope.conversationId)
             : null,
       },
-    });
+    }, { fromSession: true });
 
     // A Codex turn ending is the only signal that it has said something, and until now
     // its words were only collected while a harvest happened to be running — which
@@ -3179,7 +3182,7 @@ function startBridge(config) {
         toolName: typeof data.toolName === "string" ? data.toolName : null,
         message: typeof data.message === "string" ? data.message : null,
       },
-    });
+    }, { fromSession: true });
   };
 
   /**
@@ -4854,7 +4857,7 @@ function startBridge(config) {
       `[Gyredeck: you are no longer in room ${name} — ${why}. You can neither read it` +
       " nor post to it now, and its password will not let you back in. This is one of" +
       " the two messages that end a watch on that room: stop yours and do not open" +
-      " another, since this end closed it and re-opening will be refused." +
+      " another, since this end closed your watch and re-opening will be refused." +
       // Only you left (#380): told the room was closed, a member stops looking for it.
       (roomOpen ? " The room itself is still open for the others." : "") +
       " Nothing about this room will reach you again unless someone puts you back in" +
@@ -6646,7 +6649,7 @@ function startBridge(config) {
         return;
       }
       if (body && typeof body === "object" && typeof body.type === "string" && typeof body.id === "string") {
-        emitLocal(body);
+        emitLocal(body, { fromSession: true });
         res.writeHead(202, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
         res.end(JSON.stringify({ ok: true, type: body.type }));
         return;

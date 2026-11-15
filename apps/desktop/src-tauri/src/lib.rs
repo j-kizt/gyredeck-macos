@@ -926,19 +926,26 @@ fn node_hook_command(installed_path: &str, event: &str) -> String {
     format!("{node} {installed_path} --event {event}")
 }
 
-/// Whether a command line runs `--event <event>`, and not `--event <event>Something`.
-fn runs_event(command: &str, event: &str) -> bool {
-    let needle = format!("--event {event}");
-    let mut from = 0;
-    while let Some(at) = command[from..].find(&needle) {
-        let end = from + at + needle.len();
-        match command[end..].chars().next() {
-            None => return true,
-            Some(next) if next.is_whitespace() => return true,
-            Some(_) => from = end,
-        }
-    }
-    false
+/// The event a command runs our adapter for, when it is one the installer wrote for
+/// `installed_path`: exactly `{node} {installed_path} --event {event}`, `{node}` either `node`
+/// or an absolute path to `…/node` with no whitespace, quote, escape, or character the shell
+/// would expand or split on (`; & | < > ( ) $` backtick `* ? [ ] { } !`), `{event}` an event
+/// name (ASCII letters only). Starting at `/` also rules out a leading `~`, `#` or `X=`. Every installer
+/// since the first wrote that shape and nothing else.
+///
+/// Anything else is theirs: a `.backup` of our script, a path that ends with ours, a quoted
+/// path, a script of someone's handed ours as an argument, a runner that is not `node`, or
+/// shell before the runner or after the event (`true;/usr/bin/node …`, `--event Stop;true`).
+/// This decides what an install replaces or removes and whether it may skip adding ours, so
+/// what it cannot prove is ours it leaves alone and does not count (#77, #121).
+fn our_hook_event<'a>(command: &'a str, installed_path: &str) -> Option<&'a str> {
+    let (head, event) = command.rsplit_once(" --event ")?;
+    let node = head.strip_suffix(installed_path)?.strip_suffix(' ')?;
+    let literal = |c: char| !c.is_whitespace() && !c.is_control() && !"\\'\";&|<>()$`*?[]{}!".contains(c);
+    let runner = node == "node"
+        || (node.starts_with('/') && node.ends_with("/node") && node.chars().all(literal));
+    let named = !event.is_empty() && event.chars().all(|c| c.is_ascii_alphabetic());
+    (runner && named).then_some(event)
 }
 
 /// Whether one of our hooks for this event is already registered.
@@ -950,37 +957,11 @@ fn runs_event(command: &str, event: &str) -> bool {
 /// Comparing the strings whole made all three of those look like "not installed", which
 /// is worse than it sounds: the hook goes on working and delivering events, while the
 /// app reports the agent unhooked and hides the sync panel entirely.
-/// Whether a command line runs the file at `installed_path`, and not one whose name merely
-/// contains it.
-///
-/// `contains` alone accepted `…/gyredeck-agy-hook.mjs.bak` and a path that happened to end
-/// with ours, both of which are a different file. The installer writes
-/// `{node} {path} --event {event}` with no quoting, so whitespace or the edge of the string
-/// on each side is exactly the boundary it produces. A registration written by hand in some
-/// other shape is reported as not installed, which is the safe way round: the button then
-/// says Install, and pressing it writes the form the app can vouch for.
-fn runs_installed_path(command: &str, installed_path: &str) -> bool {
-    let bounded = |index: usize| {
-        let before = command[..index].chars().next_back();
-        let after = command[index + installed_path.len()..].chars().next();
-        before.is_none_or(char::is_whitespace) && after.is_none_or(char::is_whitespace)
-    };
-    let mut from = 0;
-    while let Some(at) = command[from..].find(installed_path) {
-        let index = from + at;
-        if bounded(index) {
-            return true;
-        }
-        from = index + installed_path.len();
-    }
-    false
-}
-
 fn commands_installed_hook(entry: &serde_json::Value, event: &str, installed_path: &str) -> bool {
     entry
         .get("command")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|command| runs_installed_path(command, installed_path) && runs_event(command, event))
+        .is_some_and(|command| our_hook_event(command, installed_path) == Some(event))
 }
 
 /// Whether an agent's own config will run *this* installation's adapter for `event`.
@@ -1047,10 +1028,13 @@ fn hook_entry_present(
         })
 }
 
-/// Remove any hook entries whose command contains `needle` (e.g. an old brand's
-/// adapter path), pruning emptied matcher groups and events. Used to clean up a
-/// prior install so it can't fire alongside the current one.
-fn prune_hook_entries(hooks: &mut serde_json::Map<String, serde_json::Value>, needle: &str) {
+/// Remove any hook entries whose command `matches` (e.g. an old brand's adapter path),
+/// pruning emptied matcher groups and events. Used to clean up a prior install so it
+/// can't fire alongside the current one.
+fn prune_hook_entries(
+    hooks: &mut serde_json::Map<String, serde_json::Value>,
+    matches: impl Fn(&str) -> bool,
+) {
     let events: Vec<String> = hooks.keys().cloned().collect();
     for event in events {
         let Some(groups) = hooks.get_mut(&event).and_then(serde_json::Value::as_array_mut) else {
@@ -1063,12 +1047,94 @@ fn prune_hook_entries(hooks: &mut serde_json::Map<String, serde_json::Value>, ne
             list.retain(|hook| {
                 hook.get("command")
                     .and_then(serde_json::Value::as_str)
-                    .map(|command| !command.contains(needle))
+                    .map(|command| !matches(command))
                     .unwrap_or(true)
             });
             !list.is_empty()
         });
         if groups.is_empty() {
+            hooks.remove(&event);
+        }
+    }
+}
+
+/// Write each of our entries where the last install left it, and append only to an event we
+/// were never in. Codex keys an approval by position (`<event>:<group>:<handler>`), so
+/// pruning ours and appending again moved it behind a person's own hook on the same event
+/// and shifted theirs into our old slot: both lost their approval though neither had
+/// changed (#121). Every other copy of ours — a duplicate, an event we no longer
+/// register — is still removed; the first copy is the one kept, so removing the rest
+/// never shifts it. Ours is only what `our_hook_event` proves is ours.
+fn place_hook_entries(
+    hooks: &mut serde_json::Map<String, serde_json::Value>,
+    installed_path: &str,
+    wanted: &[(&str, serde_json::Value)],
+) {
+    let is_ours = |hook: &serde_json::Value| {
+        hook.get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|command| our_hook_event(command, installed_path).is_some())
+    };
+    let mut kept: HashSet<(String, usize, usize)> = HashSet::new();
+    for (event, entry) in wanted {
+        let groups = hooks
+            .entry((*event).to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        if !groups.is_array() {
+            *groups = serde_json::json!([]);
+        }
+        let groups = groups.as_array_mut().expect("event is an array");
+        let found = groups.iter().enumerate().find_map(|(g, group)| {
+            group
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|list| list.iter().position(|hook| is_ours(hook)))
+                .map(|h| (g, h))
+        });
+        let place = match found {
+            // Alone in its group, the whole group is ours and is rewritten; sharing one,
+            // only our handler is, so the other handlers and the matcher stay as they were.
+            Some((g, h)) if groups[g]["hooks"].as_array().is_some_and(|list| list.len() == 1) => {
+                groups[g] = entry.clone();
+                (g, h)
+            }
+            Some((g, h)) => {
+                groups[g]["hooks"][h] = entry["hooks"][0].clone();
+                (g, h)
+            }
+            None => {
+                groups.push(entry.clone());
+                (groups.len() - 1, 0)
+            }
+        };
+        kept.insert(((*event).to_string(), place.0, place.1));
+    }
+
+    let events: Vec<String> = hooks.keys().cloned().collect();
+    for event in events {
+        let Some(groups) = hooks.get_mut(&event).and_then(serde_json::Value::as_array_mut) else {
+            continue;
+        };
+        // Only what removing ours emptied goes: a group or an event someone left empty keeps its
+        // slot, or everything after it would move and lose its approval too.
+        let before = groups.len();
+        let mut g = 0;
+        groups.retain_mut(|group| {
+            let here = g;
+            g += 1;
+            let Some(list) = group.get_mut("hooks").and_then(serde_json::Value::as_array_mut) else {
+                return true;
+            };
+            let had = list.len();
+            let mut h = 0;
+            list.retain(|hook| {
+                let at = h;
+                h += 1;
+                !is_ours(hook) || kept.contains(&(event.clone(), here, at))
+            });
+            list.len() == had || !list.is_empty()
+        });
+        if groups.is_empty() && groups.len() < before {
             hooks.remove(&event);
         }
     }
@@ -4586,7 +4652,7 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
 
     // Upgrading from the previous brand (agent-activity) left its hook registered;
     // strip it so it doesn't fire alongside Gyredeck and double every event.
-    prune_hook_entries(hooks, "agent-activity");
+    prune_hook_entries(hooks, |command| command.contains("agent-activity"));
 
     // Strip our own entries before registering. "Already registered" was decided by
     // comparing the whole command string, so the day the command changed — switching
@@ -4594,7 +4660,7 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
     // installing again added a second entry beside the first, and every event was
     // relayed twice from then on. Pruning by script path means the command can change
     // shape again without leaving a duplicate behind.
-    prune_hook_entries(hooks, &installed_path);
+    prune_hook_entries(hooks, |command| our_hook_event(command, &installed_path).is_some());
 
     let mut register = |event: &str, entry: serde_json::Value| {
         if hook_entry_present(hooks, event, &installed_path) {
@@ -4991,8 +5057,8 @@ fn install_codex_hook(app: tauri::AppHandle) -> Result<String, String> {
     let installed_path = install_path.to_string_lossy().to_string();
 
     // Unlike Antigravity's file, ~/.codex/hooks.json has no per-tool namespace — the
-    // user's own hooks sit in the same event arrays. Entries are appended, never
-    // replaced, and a refusal to overwrite unparsable JSON keeps a hand-written file
+    // user's own hooks sit in the same event arrays. Theirs are never touched or moved,
+    // and a refusal to overwrite unparsable JSON keeps a hand-written file
     // from being destroyed by a mis-click.
     let mut hooks_root: serde_json::Value = if hooks_json_path.exists() {
         let content = fs::read_to_string(&hooks_json_path)
@@ -5020,28 +5086,6 @@ fn install_codex_hook(app: tauri::AppHandle) -> Result<String, String> {
     }
     let hooks = hooks_value.as_object_mut().expect("hooks is object");
 
-    // Strip our own entries before registering. "Already registered" was decided by
-    // comparing the whole command string, so the day the command changed — switching
-    // from `node` to an absolute path so a GUI-launched agent could find it —
-    // installing again added a second entry beside the first, and every event was
-    // relayed twice from then on. Pruning by script path means the command can change
-    // shape again without leaving a duplicate behind.
-    prune_hook_entries(hooks, &installed_path);
-
-    let mut register = |event: &str, entry: serde_json::Value| {
-        if hook_entry_present(hooks, event, &installed_path) {
-            return;
-        }
-        let list = hooks
-            .entry(event.to_string())
-            .or_insert_with(|| serde_json::json!([]));
-        if let Some(arr) = list.as_array_mut() {
-            arr.push(entry);
-        } else {
-            *list = serde_json::json!([entry]);
-        }
-    };
-
     // async so Codex never waits on this. It only reports — it returns no decision on
     // PreToolUse or PermissionRequest — so blocking the agent on a localhost POST would
     // buy nothing and cost latency on every event.
@@ -5059,15 +5103,19 @@ fn install_codex_hook(app: tauri::AppHandle) -> Result<String, String> {
         })
     };
 
-    for event in CODEX_HOOK_MATCHED_EVENTS {
-        register(
-            event,
-            serde_json::json!({ "matcher": ".*", "hooks": [handler(event)] }),
-        );
-    }
-    for event in CODEX_HOOK_PLAIN_EVENTS {
-        register(event, serde_json::json!({ "hooks": [handler(event)] }));
-    }
+    // Matched by script path, not the whole command, so the day the command changed shape
+    // — `node` to an absolute path — replaced the old entry instead of adding a second
+    // one that relayed every event twice.
+    let wanted: Vec<(&str, serde_json::Value)> = CODEX_HOOK_MATCHED_EVENTS
+        .iter()
+        .map(|event| (*event, serde_json::json!({ "matcher": ".*", "hooks": [handler(event)] })))
+        .chain(
+            CODEX_HOOK_PLAIN_EVENTS
+                .iter()
+                .map(|event| (*event, serde_json::json!({ "hooks": [handler(event)] }))),
+        )
+        .collect();
+    place_hook_entries(hooks, &installed_path, &wanted);
 
     let Some(hooks_parent) = hooks_json_path.parent() else {
         return Err("Failed to resolve Codex config directory".to_string());
@@ -7212,7 +7260,8 @@ mod agy_discovery_tests {
 mod hook_registration_tests {
     use super::{
         agy_registration_present, codex_home_from, codex_hook_registration_complete, hook_entry_present,
-        runs_event, CODEX_HOOK_MATCHED_EVENTS, CODEX_HOOK_PLAIN_EVENTS,
+        place_hook_entries, prune_hook_entries,
+        our_hook_event, CODEX_HOOK_MATCHED_EVENTS, CODEX_HOOK_PLAIN_EVENTS,
     };
     use std::path::PathBuf;
 
@@ -7228,10 +7277,12 @@ mod hook_registration_tests {
 
     #[test]
     fn an_event_is_not_matched_by_one_that_ends_with_it() {
-        assert!(runs_event("node x.mjs --event Stop", "Stop"));
-        assert!(runs_event("node x.mjs --event Stop --quiet", "Stop"));
-        assert!(!runs_event("node x.mjs --event SubagentStop", "Stop"));
-        assert!(!runs_event("node x.mjs --event Stopping", "Stop"));
+        let hooks = settings(&format!("node {SCRIPT} --event SubagentStop"));
+        assert!(!hook_entry_present(&hooks, "Stop", SCRIPT));
+        let hooks = settings(&format!("node {SCRIPT} --event Stopping"));
+        assert!(!hook_entry_present(&hooks, "Stop", SCRIPT));
+        let hooks = settings(&format!("node {SCRIPT} --event Stop"));
+        assert!(hook_entry_present(&hooks, "Stop", SCRIPT), "control");
     }
 
     #[test]
@@ -7308,6 +7359,255 @@ mod hook_registration_tests {
         let hooks = settings(&format!("node {SCRIPT} --event Stop"));
         assert!(hook_entry_present(&hooks, "Stop", SCRIPT));
         assert!(!codex_hook_registration_complete(&hooks, SCRIPT));
+    }
+
+    // #121: Codex keys an approval by position, `<event>:<group>:<handler>`. A reinstall
+    // that moves our entry, or shifts someone else's into its slot, costs both their
+    // approval though neither changed.
+    const THEIRS: &str = "/usr/bin/python3 /Users/someone/.codex/hooks/thai-guard.py";
+
+    fn ours(event: &str, version: &str) -> serde_json::Value {
+        serde_json::json!({"type": "command", "command": format!("/{version}/node {SCRIPT} --event {event}")})
+    }
+
+    fn theirs() -> serde_json::Value {
+        serde_json::json!({"type": "command", "command": THEIRS})
+    }
+
+    fn install(hooks: &mut serde_json::Map<String, serde_json::Value>, version: &str) {
+        let wanted: Vec<(&str, serde_json::Value)> = ["Stop", "UserPromptSubmit"]
+            .iter()
+            .map(|event| (*event, serde_json::json!({"hooks": [ours(event, version)]})))
+            .collect();
+        place_hook_entries(hooks, SCRIPT, &wanted);
+    }
+
+    fn hooks_of(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().expect("an object").clone()
+    }
+
+    #[test]
+    fn c121_a_reinstall_keeps_ours_first_when_it_was_first() {
+        let mut hooks = hooks_of(serde_json::json!({
+            "Stop": [{"hooks": [ours("Stop", "old")]}, {"hooks": [theirs()]}],
+            "UserPromptSubmit": [{"hooks": [ours("UserPromptSubmit", "old")]}, {"hooks": [theirs()]}]
+        }));
+        install(&mut hooks, "new");
+        for event in ["Stop", "UserPromptSubmit"] {
+            assert_eq!(
+                serde_json::Value::Array(hooks[event].as_array().unwrap().clone()),
+                serde_json::json!([{"hooks": [ours(event, "new")]}, {"hooks": [theirs()]}]),
+                "{event}"
+            );
+        }
+    }
+
+    #[test]
+    fn c121_a_reinstall_keeps_ours_second_when_it_was_second() {
+        let mut hooks = hooks_of(serde_json::json!({
+            "Stop": [{"hooks": [theirs()]}, {"hooks": [ours("Stop", "old")]}]
+        }));
+        install(&mut hooks, "new");
+        assert_eq!(
+            hooks["Stop"],
+            serde_json::json!([{"hooks": [theirs()]}, {"hooks": [ours("Stop", "new")]}])
+        );
+        // Not there before: appended, the only place that moves nobody.
+        assert_eq!(hooks["UserPromptSubmit"], serde_json::json!([{"hooks": [ours("UserPromptSubmit", "new")]}]));
+    }
+
+    #[test]
+    fn c121_in_a_shared_group_only_our_handler_changes_and_their_matcher_stays() {
+        let mut hooks = hooks_of(serde_json::json!({
+            "Stop": [{"matcher": "x", "hooks": [theirs(), ours("Stop", "old"), theirs()]}]
+        }));
+        install(&mut hooks, "new");
+        assert_eq!(
+            hooks["Stop"],
+            serde_json::json!([{"matcher": "x", "hooks": [theirs(), ours("Stop", "new"), theirs()]}])
+        );
+    }
+
+    #[test]
+    fn c121_installing_again_and_again_changes_nothing_more() {
+        let mut hooks = hooks_of(serde_json::json!({
+            "Stop": [{"hooks": [ours("Stop", "old")]}, {"hooks": [theirs()]}]
+        }));
+        install(&mut hooks, "new");
+        let once = hooks.clone();
+        install(&mut hooks, "new");
+        install(&mut hooks, "new");
+        assert_eq!(hooks, once);
+    }
+
+    #[test]
+    fn c121_a_second_copy_and_an_event_we_left_are_still_removed() {
+        let mut hooks = hooks_of(serde_json::json!({
+            "Stop": [{"hooks": [theirs()]}, {"hooks": [ours("Stop", "old")]}, {"hooks": [ours("Stop", "older")]}],
+            "Notification": [{"hooks": [ours("Notification", "old")]}, {"hooks": [theirs()]}]
+        }));
+        install(&mut hooks, "new");
+        assert_eq!(
+            hooks["Stop"],
+            serde_json::json!([{"hooks": [theirs()]}, {"hooks": [ours("Stop", "new")]}])
+        );
+        assert_eq!(hooks["Notification"], serde_json::json!([{"hooks": [theirs()]}]));
+    }
+
+    // The one cost left, pinned so it stays a decision: an extra copy of ours (left by an
+    // older version or a hand edit; this installer never writes one) is removed, and what
+    // follows it moves up a slot. Keeping it would relay every event twice.
+    #[test]
+    fn c121_removing_an_extra_copy_of_ours_moves_what_follows_it() {
+        let mut hooks = hooks_of(serde_json::json!({
+            "Stop": [{"hooks": [ours("Stop", "old")]}, {"hooks": [ours("Stop", "older")]}, {"hooks": [theirs()]}],
+            "UserPromptSubmit": [{"hooks": [ours("UserPromptSubmit", "old"), ours("UserPromptSubmit", "older"), theirs()]}],
+            "Notification": [{"hooks": [ours("Notification", "old")]}, {"hooks": [theirs()]}]
+        }));
+        install(&mut hooks, "new");
+        assert_eq!(hooks["Stop"], serde_json::json!([{"hooks": [ours("Stop", "new")]}, {"hooks": [theirs()]}]));
+        assert_eq!(
+            hooks["UserPromptSubmit"],
+            serde_json::json!([{"hooks": [ours("UserPromptSubmit", "new"), theirs()]}])
+        );
+        assert_eq!(hooks["Notification"], serde_json::json!([{"hooks": [theirs()]}]));
+    }
+
+    // Gyre Audit's r2 finding: an empty group someone left before theirs and ours was dropped,
+    // and both moved up a slot. Only what removing ours empties may go.
+    #[test]
+    fn c121_an_empty_group_or_event_we_did_not_empty_keeps_its_slot() {
+        let mut hooks = hooks_of(serde_json::json!({
+            "Stop": [{"hooks": []}, {"hooks": [theirs()]}, {"hooks": [ours("Stop", "old")]}],
+            "UserPromptSubmit": [{"hooks": [ours("UserPromptSubmit", "old")]}],
+            "SessionStart": []
+        }));
+        install(&mut hooks, "new");
+        assert_eq!(
+            hooks["Stop"],
+            serde_json::json!([{"hooks": []}, {"hooks": [theirs()]}, {"hooks": [ours("Stop", "new")]}])
+        );
+        assert_eq!(hooks["SessionStart"], serde_json::json!([]));
+    }
+
+    // Gyre Audit's r3 finding: ours was any command containing our path, so a person's
+    // `.backup` of the script was replaced as if it were ours.
+    #[test]
+    fn c121_a_command_that_only_contains_our_path_is_theirs() {
+        let command = |c: &str| serde_json::json!({"type": "command", "command": c});
+        let lookalikes = [
+            format!("node {SCRIPT}.backup --event Stop"),
+            format!("node /elsewhere{SCRIPT} --event Stop"),
+            format!("node \"{SCRIPT}\" --event Stop"),
+            format!("node /tmp/other-hook.js {SCRIPT} --event Stop"),
+            format!("/usr/bin/env node {SCRIPT} --event Stop"),
+            format!("python3 {SCRIPT} --event Stop"),
+            format!("node {SCRIPT} --event Stop --quiet"),
+            format!("node {SCRIPT} --event Stop; rm -rf ~/x"),
+        ];
+        for lookalike in &lookalikes {
+            let mut hooks = hooks_of(serde_json::json!({
+                "Stop": [{"hooks": [command(lookalike)]}, {"hooks": [ours("Stop", "old")]}],
+                "UserPromptSubmit": [{"hooks": [command(lookalike)]}]
+            }));
+            install(&mut hooks, "new");
+            assert_eq!(
+                hooks["Stop"],
+                serde_json::json!([{"hooks": [command(lookalike)]}, {"hooks": [ours("Stop", "new")]}]),
+                "{lookalike}"
+            );
+            assert_eq!(
+                hooks["UserPromptSubmit"],
+                serde_json::json!([{"hooks": [command(lookalike)]}, {"hooks": [ours("UserPromptSubmit", "new")]}]),
+                "{lookalike}"
+            );
+        }
+    }
+
+    #[test]
+    fn c121_only_the_shape_the_installer_writes_is_ours() {
+        for ours in [
+            format!("node {SCRIPT} --event Stop"),
+            format!("/opt/homebrew/bin/node {SCRIPT} --event SessionStart"),
+            format!("/Users/someone/.nvm/versions/node/v22.11.0/bin/node {SCRIPT} --event PreToolUse"),
+            format!("/usr/local/node:versions/node {SCRIPT} --event Stop"),
+            format!("/opt/n,o%d^e#1=~/node {SCRIPT} --event Stop"),
+        ] {
+            assert!(our_hook_event(&ours, SCRIPT).is_some(), "{ours}");
+        }
+        for theirs in [
+            format!("node {SCRIPT}"),
+            format!("node {SCRIPT} --event "),
+            format!("{SCRIPT} --event Stop"),
+            format!(" {SCRIPT} --event Stop"),
+            format!("nodejs {SCRIPT} --event Stop"),
+            format!("sh /tmp/wrap /usr/bin/node {SCRIPT} --event Stop"),
+            format!("node {SCRIPT} --event Stop;true"),
+            format!("node {SCRIPT} --event Stop&&true"),
+            format!("node {SCRIPT} --event Stop|tee"),
+            format!("node {SCRIPT} --event $(id)"),
+            format!("true;/usr/bin/node {SCRIPT} --event Stop"),
+            format!("$(id)/node {SCRIPT} --event Stop"),
+            format!("/usr/bin/$X/node {SCRIPT} --event Stop"),
+            format!("`id`/node {SCRIPT} --event Stop"),
+            format!("bin/node {SCRIPT} --event Stop"),
+            format!("~/bin/node {SCRIPT} --event Stop"),
+            format!("/a{{b,c}}/node {SCRIPT} --event Stop"),
+            format!("/a*/node {SCRIPT} --event Stop"),
+            format!("/a\\ b/node {SCRIPT} --event Stop"),
+            format!("/a'b/node {SCRIPT} --event Stop"),
+            format!("/a>b/node {SCRIPT} --event Stop"),
+            format!("/a&/node {SCRIPT} --event Stop"),
+            format!("/a|b/node {SCRIPT} --event Stop"),
+            format!("/a\tb/node {SCRIPT} --event Stop"),
+            format!("node /tmp/other-hook.js {SCRIPT} --event Stop"),
+        ] {
+            assert_eq!(our_hook_event(&theirs, SCRIPT), None, "{theirs}");
+        }
+        for c in "\\'\";&|<>()$`*?[]{}! \t\n\u{1}".chars() {
+            let theirs = format!("/a{c}b/node {SCRIPT} --event Stop");
+            assert_eq!(our_hook_event(&theirs, SCRIPT), None, "{theirs:?}");
+        }
+    }
+
+    // Gyre Audit's r7 finding: a runner path the shell reads literally but the check refused
+    // made every reinstall add another copy.
+    #[test]
+    fn c121_a_reinstall_over_a_literal_runner_path_adds_nothing() {
+        let mut hooks = serde_json::Map::new();
+        install(&mut hooks, "usr/local/node:versions");
+        let first = hooks.clone();
+        install(&mut hooks, "usr/local/node:versions");
+        assert_eq!(hooks, first);
+        install(&mut hooks, "opt/homebrew/bin");
+        for event in ["Stop", "UserPromptSubmit"] {
+            assert_eq!(hooks[event], serde_json::json!([{"hooks": [ours(event, "opt/homebrew/bin")]}]), "{event}");
+        }
+    }
+
+    // The Claude install strips ours by the same rule before registering again.
+    #[test]
+    fn c121_the_claude_prune_leaves_a_lookalike_alone() {
+        let backup = format!("node /tmp/other-hook.js {SCRIPT} --event Stop");
+        let mut hooks = hooks_of(serde_json::json!({
+            "Stop": [{"hooks": [{"type": "command", "command": backup}, ours("Stop", "old")]}]
+        }));
+        prune_hook_entries(&mut hooks, |command| our_hook_event(command, SCRIPT).is_some());
+        assert_eq!(hooks["Stop"], serde_json::json!([{"hooks": [{"type": "command", "command": backup}]}]));
+    }
+
+    // Gyre Audit's r5 finding: kept as theirs, but still counted as ours being installed, so
+    // the Claude install skipped adding the real one.
+    #[test]
+    fn c121_a_command_that_is_not_ours_never_counts_as_installed() {
+        for theirs in [
+            format!("node /tmp/other-hook.js {SCRIPT} --event Stop"),
+            format!("node {SCRIPT} --event Stop;true"),
+            format!("node {SCRIPT}.backup --event Stop"),
+            format!("true;/usr/bin/node {SCRIPT} --event Stop"),
+        ] {
+            assert!(!hook_entry_present(&settings(&theirs), "Stop", SCRIPT), "{theirs}");
+        }
     }
 
     #[test]

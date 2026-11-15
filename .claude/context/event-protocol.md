@@ -1146,7 +1146,8 @@ registration copied into a throwaway `CODEX_HOME`:
 | --- | --- |
 | Reinstall, with ours the only hook on each event | still `trusted` — the same entry is written back in the same place |
 | A newer installer writing a different entry (e.g. another timeout) | `modified` |
-| Our entry moving in its event's list — the installer prunes ours and appends, so it moves when another tool's hook shares the event | `untrusted`: the key carries the position (`stop:0:0`), so a moved entry is a new one |
+| An entry moving in its event's list | `untrusted` if nothing was approved at its new slot, `modified` if another entry was: the key carries the position (`stop:0:0`), so a moved entry is a new one. On 2026-11-16 the owner's own `thai-guard.py` and ours swapped slots on Stop and UserPromptSubmit, and both read `modified` |
+| Reinstall, sharing an event with someone else's hook | since #121's reopen, no entry moves: `place_hook_entries` rewrites ours at the group and handler index it held and appends only to an event we were never in (Rust tests `c121_*`). Theirs keeps its slot and its approval; ours keeps it unless its entry changed. Until then the installer pruned ours and appended, which caused the row above. One cost is kept on purpose (accepted by the owner on 2026-11-16, sync-r5j3 seq 68, after Gyre Audit raised it at seq 40): an extra copy of ours, left by an older version or a hand edit, is removed, and the hooks after it move up a slot and need approving again; keeping it would relay every event twice. In a group a person shares with our handler, their matcher is kept: only a hand edit makes such a group |
 | The script at the installed path changing | no effect — approval is of the entry, not the file |
 
 So Reinstall is never the fix for an unapproved hook, and usually not the cause of one. **Gyredeck never writes `trusted_hash` itself**,

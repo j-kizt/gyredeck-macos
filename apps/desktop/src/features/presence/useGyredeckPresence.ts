@@ -8,6 +8,9 @@ import {
   type IGyredeckBridgeCapabilities,
   type IGyredeckPresence,
 } from "@gyredeck/protocol";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { createAppEventFeed, type INumberedAppEvent } from "./appEventFeed";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { LLM_STALE_AFTER_MS, MAX_RECENT_EVENTS, STALE_AFTER_MS } from "../session/constants";
 import {
@@ -46,6 +49,8 @@ export interface IGyredeckPresenceResult {
   connection: IConnectionState;
   lastLiveEvent: GyredeckEvent | null;
   now: Date;
+  /** Every room message seen this run, up to 200, so a replayed burst is not reduced to its last. */
+  roomMessages: GyredeckEvent[];
   presence: IGyredeckPresence;
   recentEvents: GyredeckEvent[];
   refreshCapabilities: () => Promise<boolean>;
@@ -563,6 +568,8 @@ export const useGyredeckPresence = ({
   const [presence, setPresence] = useState<IGyredeckPresence>(() => createInitialPresence());
   const [recentEvents, setRecentEvents] = useState<GyredeckEvent[]>([]);
   const [lastLiveEvent, setLastLiveEvent] = useState<GyredeckEvent | null>(null);
+  // Every room message, not only the last event (#391): a replay arrives as a burst.
+  const [roomMessages, setRoomMessages] = useState<GyredeckEvent[]>([]);
   // Empty until the stored registry is read (#280: a file in the desktop app, read once).
   const [sessionEventRegistry, setSessionEventRegistry] = useState<SessionEventRegistry>({});
   // Sticky per-conversation context usage. Derived from events but never evicted with
@@ -746,6 +753,7 @@ export const useGyredeckPresence = ({
         const event = normalizeSessionEventIdentity(JSON.parse(message.data) as GyredeckEvent);
         liveEventVersionRef.current += 1;
         setLastLiveEvent(event);
+        if (event.type === "room_message") setRoomMessages((current) => [...current, event].slice(-200));
         setPresence((current) => reducePresence(current, event));
         setRecentEvents((current) => appendRecentEvent(current, event));
         store([event]);
@@ -758,10 +766,27 @@ export const useGyredeckPresence = ({
     for (const type of GYREDECK_EVENT_TYPES) {
       source.addEventListener(type, handle as EventListener);
     }
+    // Room messages are the app's alone (#391): its Rust side reads them from the bridge with
+    // the app's word, which an EventSource cannot carry, and hands each one over here. What
+    // came before this listened — launch, a reload — is read back from what it kept, first.
+    let stopAppEvents: (() => void) | null = null;
+    const appEvents = createAppEventFeed((payload) => handle({ data: JSON.stringify(payload) } as MessageEvent<string>));
+    listen<INumberedAppEvent>("app_event", (event) => appEvents.live(event.payload)).then(
+      (stop) => {
+        if (disposed) return stop();
+        stopAppEvents = stop;
+        invoke<INumberedAppEvent[]>("app_events").then(
+          (kept) => { if (!disposed) appEvents.kept(kept); },
+          () => { if (!disposed) appEvents.kept([]); },
+        );
+      },
+      () => {},
+    );
 
     return () => {
       disposed = true;
       source?.close();
+      stopAppEvents?.();
       flushRegistryWrite();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -788,6 +813,7 @@ export const useGyredeckPresence = ({
     connection,
     lastLiveEvent,
     now,
+    roomMessages,
     presence,
     recentEvents,
     refreshCapabilities,

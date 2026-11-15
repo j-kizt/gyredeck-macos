@@ -5,7 +5,7 @@ const module = new URL(
   "../apps/desktop/src/features/mail/useRoomInbox.ts",
   import.meta.url,
 );
-const { recordMessage, retainedRegistry, retainOpenRooms, unreadIn } = await import(module.href);
+const { recordMessage, recordRoomMessages, retainedRegistry, retainOpenRooms, unreadIn } = await import(module.href);
 
 /** Any listing taken after the fixtures below, which all sit at 10:00:00Z. */
 const LATER = Date.parse("2026-09-15T11:00:00Z");
@@ -166,4 +166,26 @@ test("the newest message is what counts, not the oldest", () => {
   };
   const between = Date.parse("2026-09-15T10:00:00Z");
   assert.equal(retainOpenRooms(registry, new Set(), between), registry);
+});
+
+test("c391 a burst of room messages is recorded whole, each once", () => {
+  // A reconnect hands back what was missed in one burst; the inbox used to see only the last.
+  const event = (seq, room = "sync-a1b2") => ({
+    version: 1,
+    id: `e${seq}-${room}`,
+    type: "room_message",
+    timestamp: "2026-09-15T10:00:00Z",
+    conversationId: "s1",
+    data: { seq, room, from: "codex-1", fromLabel: "Codex", kind: "ask", preview: `m${seq}` },
+  });
+  const recorded = new Set();
+  const burst = [event(1), event(2), { ...event(9), type: "turn_start" }, event(3)];
+  const once = recordRoomMessages({}, burst, recorded);
+  assert.deepEqual(once.s1.messages.map((m) => m.seq), [1, 2, 3]);
+
+  // The list grows and is handed over again; an old room's message must not reset the inbox.
+  const moved = recordRoomMessages(once, [...burst, event(1, "sync-c3d4")], recorded);
+  assert.equal(moved.s1.room, "sync-c3d4");
+  const again = recordRoomMessages(moved, [...burst, event(1, "sync-c3d4")], recorded);
+  assert.equal(again, moved, "what was already recorded is not recorded twice");
 });

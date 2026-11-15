@@ -90,12 +90,17 @@ const assetRoot = join(distRoot, "assets");
  * #331 (the key that copies a session's one-time join code, the founder's crown and close-room
  * button) measured 121,498 / 124,576 on CI, +430 / +433 on #382's 121,068 / 124,143; 121,500 and
  * 124,578 leave 2 each. Raised by the owner from Discord on 2026-11-14 ("yes", sync-z8er seq 140).
+ *
+ * #391 (room messages replayed to the webview in arrival order: the numbered app-event feed and
+ * the inbox's burst handling) measured 121,724 / 124,801 on CI, +226 / +225 on #331's
+ * 121,498 / 124,576; 121,726 and 124,803 leave 2 each. Raised by the owner from Discord on
+ * 2026-11-16 ("yes", sync-r5j3 seq 19).
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 121_500,
-  jsTotalGzipBytes: 124_578,
+  jsGzipBytes: 121_726,
+  jsTotalGzipBytes: 124_803,
 };
 
 const walk = async (directory) => {

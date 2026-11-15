@@ -123,7 +123,7 @@ const getGroupRemovalId = (groupKey: string, group: IWorkspaceSessionGroup) => [
 const App = () => {
   const [bridgePort, setBridgePort] = useState(DEFAULT_BRIDGE_PORT);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-  const { capabilities, connection, contextUsage, lastLiveEvent, now, presence, recentEvents, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, registryProblem, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO, bridgePort, keepConversationId: selectedSessionId });
+  const { capabilities, connection, contextUsage, lastLiveEvent, now, presence, recentEvents, roomMessages, refreshCapabilities, sessionEventRegistry, setSessionEventRegistry, registryProblem, view } = useGyredeckPresence({ demoMode: DEMO_MODE, demoScenario: DEMO_SCENARIO, bridgePort, keepConversationId: selectedSessionId });
   const [usageSettings, setUsageSettings] = useState<IUsageSettings>(readUsageSettings);
   const { refresh: refreshAgentUsage, refreshing: agentUsageRefreshing, usages: agentUsages } = useAgentUsageList(usageSettings, DEMO_MODE);
   const [acknowledgedConversationId, setAcknowledgedConversationId] = useState<string | null>(null);
@@ -267,7 +267,7 @@ const App = () => {
   // Kept from the event stream, not from the poller above: that poller stops while a
   // session detail or another tab is open, which is exactly when a reply nobody has seen
   // arrives.
-  const roomInbox = useRoomInbox({ lastLiveEvent });
+  const roomInbox = useRoomInbox({ roomMessages });
   const sessionMessages = selectedSessionId
     ? roomInbox.inbox[selectedSessionId]?.messages ?? []
     : [];

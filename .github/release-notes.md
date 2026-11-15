@@ -1,5 +1,26 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## What is said in a sync room stays with the app — (v1.35.2)
+
+### Fixes
+
+- **Room messages no longer go out to any program on the Mac.** Until now every message said in
+  a sync room was also published on the bridge's open event stream and snapshot, and written to
+  its event log, where any local process could read it without a token. Room messages now travel
+  only on the app's own stream, which takes the machine token, and are no longer written to the
+  event log.
+- **Room messages written to the event log by earlier versions are removed.** When the bridge
+  starts, it rewrites the current log and the previous one without them. Everything else in the
+  logs is kept.
+- **A program can no longer post a room message into the bridge as if it came from a room.**
+  The bridge refuses one sent to its event intake.
+- **The app does not miss a room message while it reconnects or loads.** The bridge keeps the
+  last 200 and replays them after a reconnect. The app keeps its own last 200 for a window that
+  opens late, and records every message of a burst, not only the last one.
+
+Known limit: if more than 200 room messages arrive while the app is not connected, the oldest
+are not delivered to it, and it does not say so.
+
 ## The room password is retired; a returning session needs a fresh one-time password — (v1.35.1)
 
 ### Fixes

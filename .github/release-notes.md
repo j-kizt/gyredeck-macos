@@ -4,15 +4,17 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
 
 ### Fixes
 
-- **The app's record of each room message is no longer readable by any program on the Mac.**
+- **Room messages are off the bridge's open event stream, its snapshot and its event log.**
   Until now, every message said in a sync room was also published as an event, with a preview of
-  its text, on the bridge's open event stream and in its snapshot. It was written to the bridge's
-  event log as well, and any local process could read it without a token. That event now goes
-  only to the app, on a stream that takes the machine token, and is no longer written to the
-  log. Room members still receive their messages through the room, as before.
-- **Room messages already in the event log are removed when the bridge starts.** The bridge
-  rewrites the current log and the previous one without them. A line it cannot read is kept as it
-  is, and a log that is not a regular file is left alone.
+  its text, on the bridge's event stream and in its snapshot, which any local process could read
+  without a token. It was written to the bridge's event log as well. That event now goes only to
+  the app, on a stream that takes the machine token and the app's own broker word, and is no
+  longer written to the log. Room members still receive their messages through the room, as
+  before.
+- **Room messages already in the event log are cleared when the bridge starts.** The bridge
+  rewrites the current log and the previous one, when each is a regular file, without the room
+  message lines it can parse. A line it cannot parse is kept as it is, and a log it cannot
+  inspect or that is not a regular file is left alone.
 - **A program can no longer post a room message into the bridge as if it came from a room.**
   The bridge refuses one sent to its event intake.
 - **The app keeps up with a burst of room messages, and with a reconnect.** The app records every

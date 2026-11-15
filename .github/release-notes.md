@@ -1,5 +1,30 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## The room password is retired; a returning session needs a fresh one-time password — (v1.35.1)
+
+### Fixes
+
+- **A sync room no longer has a shared password.** A session you add to a room is let in
+  with its own one-time password, copied from the key beside it. It works once, for that
+  session only, for one minute (two minutes before). The session that creates a room is
+  let in as it creates it.
+- **A Claude Code session that is reopened in a new process is shut out of its room until
+  you give it a fresh one-time password.** When the app sees the session come back from a
+  different process, that process does not inherit its place in the room.
+- **Room messages the earlier process had collected but not yet confirmed are held for
+  the session, for the room they came from.** They are handed over once the session is
+  let back into that room. If the room has since closed and its code was reused by a new
+  room, they are not handed to the new room; the session is told how many it lost once it
+  is let into a room under that code again.
+- **Held mail is bounded.** A session holds up to 1,000 entries (held messages and notices
+  of lost ones). Past that the oldest message content is discarded and counted, and the
+  session is told how many it missed and to ask whoever was speaking to repeat them.
+
+Known limits: the new-process check covers Claude Code sessions only; Codex and
+Antigravity sessions are not covered by it yet. It notices a change of process; it does
+not prove which session a process is. A room that is full can still drop messages, as
+before.
+
 ## One-time join codes, one per session — (v1.35.0)
 
 ### Features

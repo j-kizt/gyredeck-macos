@@ -1,6 +1,6 @@
 // Gyredeck's Discord connector: a child of the app, spoken to over stdin/stdout in
 // newline-delimited JSON (protocol v1, see #199). It talks only to Discord, never to the
-// bridge, and never holds a room password, the broker secret or the machine token. The bot
+// bridge, and never holds a session's password, the broker secret or the machine token. The bot
 // token arrives on the first stdin line and nowhere else.
 import { createInterface } from "node:readline";
 import { createConnector, realClock } from "./connector.mjs";

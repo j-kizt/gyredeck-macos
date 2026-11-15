@@ -12,21 +12,18 @@ use std::{
 
 pub(crate) const BRIDGE_HOST: &str = "127.0.0.1";
 
-/// The password of each room this app created, by code (#124). The bridge keeps only a hash
-/// and hands the plaintext over once, at create. It is held here in memory and never written
-/// to disk or the Keychain: a room lives only as long as the bridge, which lives only as long
-/// as this app (`--parent-stdio`), and a Keychain item would ask for permission again after
-/// every update that changes the app's signature.
-static ROOM_PASSWORDS: LazyLock<Mutex<RoomPasswords>> = LazyLock::new(|| Mutex::new(RoomPasswords::default()));
+/// Each room this app founded, by code (#124, #332). Founding is what lets the app follow a
+/// room on Discord; the bridge hands no shared password back since #332, so nothing secret
+/// is held here. A room lives only as long as the bridge, which lives only as long as this app.
+static FOUNDED_ROOMS: LazyLock<Mutex<FoundedRooms>> = LazyLock::new(|| Mutex::new(FoundedRooms::default()));
 
-fn room_passwords() -> std::sync::MutexGuard<'static, RoomPasswords> {
-    ROOM_PASSWORDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+fn founded_rooms() -> std::sync::MutexGuard<'static, FoundedRooms> {
+    FOUNDED_ROOMS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The password of a room this app founded, for the app's own reader of it (#199). `None`
-/// for every other room: a room this app did not create is one it holds no password for.
-pub(crate) fn room_password(code: &str) -> Option<String> {
-    room_passwords().get(code)
+/// Whether this app founded the room (#199): only such a room may be followed on Discord.
+pub(crate) fn founded_room(code: &str) -> bool {
+    founded_rooms().contains(code)
 }
 
 /// How many bridges this app has spawned. Every room lives in one bridge's memory, so a
@@ -37,21 +34,21 @@ pub(crate) fn bridge_generation() -> u64 {
     BRIDGE_GENERATION.load(Ordering::SeqCst)
 }
 
-/// Each password with the generation it was stored at, so a list of rooms read before a room
-/// was created cannot be taken as proof that room has ended (#124 audit).
+/// Each founded room with the generation it was stored at, so a list of rooms read before a
+/// room was created cannot be taken as proof that room has ended (#124 audit).
 #[derive(Default)]
-struct RoomPasswords {
+struct FoundedRooms {
     generation: u64,
-    by_code: HashMap<String, (String, u64)>,
+    by_code: HashMap<String, u64>,
 }
 
-impl RoomPasswords {
-    fn insert(&mut self, code: &str, password: &str) {
+impl FoundedRooms {
+    fn insert(&mut self, code: &str) {
         self.generation += 1;
-        self.by_code.insert(code.to_owned(), (password.to_owned(), self.generation));
+        self.by_code.insert(code.to_owned(), self.generation);
     }
-    fn get(&self, code: &str) -> Option<String> {
-        self.by_code.get(code).map(|(password, _)| password.clone())
+    fn contains(&self, code: &str) -> bool {
+        self.by_code.contains_key(code)
     }
     fn remove(&mut self, code: &str) {
         self.by_code.remove(code);
@@ -63,13 +60,12 @@ impl RoomPasswords {
     fn generation(&self) -> u64 {
         self.generation
     }
-    /// Forget the password of every room the bridge no longer has. A room can end without this
-    /// app closing it — its founder left, its founder's session ended, it sat empty — and its
-    /// password is not kept past it. Only what was stored before the list was asked for is
-    /// judged by it.
+    /// Forget every room the bridge no longer has. A room can end without this app closing
+    /// it — its founder left, its founder's session ended, it sat empty. Only what was stored
+    /// before the list was asked for is judged by it.
     fn forget_ended_rooms(&mut self, live: &[String], asked_at: u64) {
         self.by_code
-            .retain(|code, (_, stored)| *stored > asked_at || live.iter().any(|name| name == code));
+            .retain(|code, stored| *stored > asked_at || live.iter().any(|name| name == code));
     }
 }
 pub(crate) const BRIDGE_PORT: u16 = 47_621;
@@ -550,8 +546,8 @@ pub(crate) struct BrokerHandshake {
 }
 
 impl BrokerHandshake {
-    /// The lines written to the bridge's stdin: the secret, one line per bound session,
-    /// then `broker-ready`, which is what lets the bridge start listening.
+    /// The lines written to the bridge's stdin: the secret, one line per bound session
+    /// (with its live binding's generation when it has one, #332), then `broker-ready`, which is what lets the bridge start listening.
     fn lines(&self) -> Result<String, String> {
         let mut out = format!("broker-secret {}\n", self.secret);
         for session in (self.protected)()? {
@@ -829,7 +825,7 @@ fn spawn_bridge(
     // Read the ledger before anything is spawned: a ledger that cannot be read is a
     // bridge that does not start, with the reason, not a bridge protecting nobody.
     // A new bridge holds none of the old one's rooms.
-    room_passwords().clear();
+    founded_rooms().clear();
     BRIDGE_GENERATION.fetch_add(1, Ordering::SeqCst);
     let lines = match handshake {
         Some(handshake) => Some(handshake.lines().map_err(|reason| {
@@ -1249,47 +1245,15 @@ pub(crate) fn sync_create(conversation_id: &str, app_word: &str) -> Result<SyncR
     if !(200..300).contains(&status) {
         return Err(sync_error(status, &value));
     }
-    if let (Some(code), Some(password)) = (
-        value.get("room").and_then(serde_json::Value::as_str),
-        value.get("password").and_then(serde_json::Value::as_str),
-    ) {
-        room_passwords().insert(code, password);
+    if let Some(code) = value.get("room").and_then(serde_json::Value::as_str) {
+        founded_rooms().insert(code);
     }
     Ok(parse_sync_room(&value, conversation_id))
 }
 
-/// Read the room's password, so the founder can copy it out.
-///
-/// Only the founder may: handing out a room's credential is the act of whoever set it up,
-/// not something a member can pass along. Reading it out grants nothing by itself — the
-/// session that holds it earns the right to speak by presenting it, and until then it is
-/// in the room and silent. Password and token are one thing said two ways — a password to
-/// the person copying it, a token to the header that carries it on every read and send.
-pub(crate) fn sync_issue_password(code: &str, conversation_id: &str, app_word: &str) -> Result<String, String> {
-    if !valid_room(code) || !valid_room(conversation_id) {
-        return Err("Not a valid room".to_string());
-    }
-    let body = serde_json::json!({ "conversationId": conversation_id }).to_string();
-    let (status, value) = bridge_request_vouched("POST", &format!("/sync/rooms/{code}/passwords"), Some(body), app_word)?;
-    if !(200..300).contains(&status) {
-        return Err(match value.get("error").and_then(serde_json::Value::as_str) {
-            Some("not_the_founder") => "Only the session that created this room can invite".to_string(),
-            Some("no_such_room") => {
-                room_passwords().remove(code);
-                sync_error(status, &value)
-            }
-            _ => sync_error(status, &value),
-        });
-    }
-    // The bridge said this is the founder; the password itself is only here (#124).
-    room_passwords()
-        .get(code)
-        .ok_or_else(|| "This app no longer holds the room's password. Close the room and create a new one".to_string())
-}
-
 /// Mint a one-time join code for one member of a room (#331), to paste into that session's
 /// own terminal. Each press kills the session's last code; the code works once, for that
-/// session only, and for two minutes. Only the app may mint, so the bridge takes its word.
+/// session only, and for one minute. Only the app may mint, so the bridge takes its word.
 pub(crate) fn sync_issue_join_code(code: &str, conversation_id: &str, app_word: &str) -> Result<String, String> {
     if !valid_room(code) || !valid_room(conversation_id) {
         return Err("Not a valid room".to_string());
@@ -1331,7 +1295,7 @@ pub(crate) fn sync_close(code: &str, conversation_id: &str, app_word: &str) -> R
             _ => sync_error(status, &value),
         });
     }
-    room_passwords().remove(code);
+    founded_rooms().remove(code);
     Ok(())
 }
 
@@ -1426,7 +1390,7 @@ pub(crate) fn sync_leave(code: &str, conversation_id: &str, app_word: &str) -> R
     if status == 404 || (200..300).contains(&status) {
         // The founder leaving ends the room, and so does the last member.
         if value.get("closed").and_then(serde_json::Value::as_bool) == Some(true) {
-            room_passwords().remove(code);
+            founded_rooms().remove(code);
         }
         return Ok(());
     }
@@ -1444,7 +1408,7 @@ fn valid_room(room: &str) -> bool {
 
 /// Ask the bridge which mail rooms exist and how much is waiting in each.
 pub(crate) fn mail_rooms(app_word: &str) -> Result<Vec<MailRoom>, String> {
-    let asked_at = room_passwords().generation();
+    let asked_at = founded_rooms().generation();
     // Every room's roster is the app's to read, not any holder of the machine token (#344).
     let (status, parsed) = bridge_request_vouched("GET", "/mail", None, app_word)?;
     if !(200..300).contains(&status) {
@@ -1457,7 +1421,7 @@ pub(crate) fn mail_rooms(app_word: &str) -> Result<Vec<MailRoom>, String> {
         .iter()
         .filter_map(|room| room.get("room")?.as_str().map(ToOwned::to_owned))
         .collect();
-    room_passwords().forget_ended_rooms(&live, asked_at);
+    founded_rooms().forget_ended_rooms(&live, asked_at);
 
     Ok(rooms
         .iter()
@@ -1561,20 +1525,20 @@ pub(crate) fn find_node_binary() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_room_that_ended_leaves_no_password_behind() {
-        let mut passwords = super::RoomPasswords::default();
-        passwords.insert("sync-live", &"a".repeat(32));
-        passwords.insert("sync-gone", &"b".repeat(32));
-        let asked_at = passwords.generation();
-        passwords.forget_ended_rooms(&["sync-live".to_string(), "conv-1".to_string()], asked_at);
-        assert!(passwords.get("sync-gone").is_none());
-        assert!(passwords.get("sync-live").is_some());
+    fn a_room_that_ended_is_no_longer_founded() {
+        let mut founded = super::FoundedRooms::default();
+        founded.insert("sync-live");
+        founded.insert("sync-gone");
+        let asked_at = founded.generation();
+        founded.forget_ended_rooms(&["sync-live".to_string(), "conv-1".to_string()], asked_at);
+        assert!(!founded.contains("sync-gone"));
+        assert!(founded.contains("sync-live"));
         // A room created while the list was being read is not in it, and is not forgotten.
-        let asked_at = passwords.generation();
-        passwords.insert("sync-new", &"c".repeat(32));
-        passwords.forget_ended_rooms(&[], asked_at);
-        assert!(passwords.get("sync-live").is_none());
-        assert_eq!(passwords.get("sync-new"), Some("c".repeat(32)));
+        let asked_at = founded.generation();
+        founded.insert("sync-new");
+        founded.forget_ended_rooms(&[], asked_at);
+        assert!(!founded.contains("sync-live"));
+        assert!(founded.contains("sync-new"));
     }
 
     use super::*;

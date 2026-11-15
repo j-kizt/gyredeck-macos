@@ -1107,11 +1107,6 @@ fn sync_issue_join_code(broker: tauri::State<'_, broker::BrokerState>, code: Str
     standalone_bridge::sync_issue_join_code(&code, &conversation_id, &broker.secret()?)
 }
 
-#[tauri::command]
-fn sync_issue_password(broker: tauri::State<'_, broker::BrokerState>, code: String, conversation_id: String) -> Result<String, String> {
-    standalone_bridge::sync_issue_password(&code, &conversation_id, &broker.secret()?)
-}
-
 /// Every name the person has given a session, keyed by conversation id.
 #[tauri::command]
 fn session_names() -> Result<serde_json::Value, String> {
@@ -6213,7 +6208,6 @@ pub fn run() {
             sync_room,
             sync_create,
             sync_join,
-            sync_issue_password,
             sync_issue_join_code,
             session_names,
             codex_hook_trust,
@@ -6327,7 +6321,7 @@ pub fn run() {
                     protected: std::sync::Arc::new(move || {
                         bindings
                             .lock()
-                            .map(|table| table.protected())
+                            .map(|table| table.ledger_lines())
                             .map_err(|_| "the ledger's lock is poisoned".to_string())
                     }),
                 });
@@ -6374,8 +6368,8 @@ pub fn run() {
                 };
                 let report_bound = {
                     let secret = secret.clone();
-                    std::sync::Arc::new(move |session: &str| {
-                    let body = serde_json::json!({ "conversationId": session }).to_string();
+                    std::sync::Arc::new(move |session: &str, generation: u64| {
+                    let body = serde_json::json!({ "conversationId": session, "generation": generation }).to_string();
                     standalone_bridge::bridge_request_vouched("POST", "/broker/bound", Some(body), &secret).and_then(
                         |(status, body)| if status == 200 { Ok(()) } else { Err(format!("HTTP {status}: {body}")) },
                     )

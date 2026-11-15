@@ -98,17 +98,17 @@ const main = async () => {
     const cwd = typeof input.cwd === "string" && input.cwd.length > 0 ? input.cwd : process.cwd();
     const threadId = typeof input["thread-id"] === "string" ? input["thread-id"] : "";
 
-    // A room password the person typed at the Codex prompt, on its way to the bridge.
+    // A session's one-time password the person typed at the Codex prompt, on its way to the bridge.
     //
     // Codex's own hook never sees a prompt — it forwards `{inputCount: 1}` and nothing
     // else, deliberately — and Codex cannot call the bridge itself from inside its
     // sandbox. So until now the password a person was told to paste did nothing at all,
     // and the session sat waiting for a confirmation that could never come.
     //
-    // Only a string that is already the exact shape of a room password is sent, and only
+    // Only a string that is already the exact shape of a one-time password is sent, and only
     // the last thing typed. Everything else the person writes stays here, which is the
-    // same promise the hook makes; the bridge still has to recognise the value as the
-    // room's own password before it lets anybody in. Never logged, never echoed — it
+    // same promise the hook makes; the bridge still has to recognise the value as this
+    // session's own unspent password before it lets anybody in. Never logged, never echoed — it
     // goes straight into the request.
     const typed = Array.isArray(input["input-messages"]) ? input["input-messages"] : [];
     const last = typeof typed.at(-1) === "string" ? typed.at(-1).trim() : "";

@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 const CONFIG_DIR = [".config", "gyredeck"];
 const APP_WORD = "c7".repeat(32);
+const STALE_PW = "5a".repeat(16);
 
 const freePort = async () => {
   const probe = createServer();
@@ -59,11 +60,16 @@ const startBridge = async () => {
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
-  return { base, call, stop, token };
+  const joinRoom = async (code, conversationId) => {
+    const minted = await call("POST", `/sync/rooms/${code}/members/${conversationId}/join-code`, {});
+    assert.equal(minted.status, 200, JSON.stringify(minted.body));
+    return call("POST", `/sync/rooms/${code}/confirm`, { conversationId, password: minted.body.code }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
+  };
+  return { base, call, stop, token, joinRoom };
 };
 
 /** Read a room's watch until a frame with `seq` arrives, or fail after `ms`. */
-/** `credential` is a room password, or the headers the app reads with. */
+/** `credential` is the headers a read goes with, or a bare token. */
 /** `frames` holds the mail; `frames.events` every data frame in order, with its event name. */
 // A member's own read key (#274), as the broker's collect hands it: the app's word, no collect.
 const keyOf = async (h, as) => (await h.call("GET", `/mail/inbox?as=${as}`)).body.memberKey;
@@ -110,9 +116,10 @@ const watchUntil = async (base, code, as, credential, done, onOpen = async () =>
 test("an ordinary member's watch is as it was: resume from its stream cursor, a push is not a read", async () => {
   const h = await startBridge();
   try {
-    const { room: code, password } = (await h.call("POST", "/sync/rooms", { conversationId: "founder-1" })).body;
+    const { room: code } = (await h.call("POST", "/sync/rooms", { conversationId: "founder-1" })).body;
+    const password = h.token;
     await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: "peer-a" });
-    await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: "peer-a", password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
+    await h.joinRoom(code, "peer-a");
     const founder = await asMember(h, "founder-1", password);
     const post = (text) => fetch(`${h.base}/mail/${code}`, {
       method: "POST",
@@ -146,12 +153,13 @@ test("the app's relay joins as Discord, hears the whole room, moves its read pos
   try {
     const created = await h.call("POST", "/sync/rooms", { conversationId: "founder-1" });
     assert.equal(created.status, 201);
-    const { room: code, password } = created.body;
+    const { room: code } = created.body;
+    const password = h.token;
     const relayId = `discord-${code}`;
 
     for (const peer of ["peer-a", "peer-b"]) {
       assert.equal((await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: peer })).status, 200);
-      assert.equal((await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD })).status, 200);
+      assert.equal((await h.joinRoom(code, peer)).status, 200);
     }
 
     // Only the app says a member is a relay: without its word the join is refused.
@@ -215,17 +223,17 @@ test("the app's relay joins as Discord, hears the whole room, moves its read pos
     assert.equal(await pendingOf(relayId), 0);
 
     // Reading as the relay moves the room's floor, so it is the app's act alone: a member
-    // holding the room's password — or the machine token, or either without the other — is
+    // holding a retired room password — or the machine token, or either without the other — is
     // refused on every read path, and the relay's position does not move.
     const third = await post("peer-a", { to: "everyone", kind: "tell", text: "not yet on Discord" });
     assert.equal(third.status, 202);
     const held = await pendingOf(relayId);
     assert.equal(held, 1, "premise: one message the relay has not taken in");
     const tries = [
-      [`/mail/${code}/events?as=${relayId}&since=999999`, { "x-gyredeck-token": password }],
-      [`/mail/${code}/events?as=${relayId}&since=999999`, { "x-gyredeck-token": password, "x-gyredeck-broker": APP_WORD }],
+      [`/mail/${code}/events?as=${relayId}&since=999999`, { "x-gyredeck-token": STALE_PW }],
+      [`/mail/${code}/events?as=${relayId}&since=999999`, { "x-gyredeck-token": STALE_PW, "x-gyredeck-broker": APP_WORD }],
       [`/mail/${code}/events?as=${relayId}&since=999999`, { "x-gyredeck-token": h.token }],
-      [`/mail/${code}?as=${relayId}&since=999999&collect=1`, { "x-gyredeck-token": password }],
+      [`/mail/${code}?as=${relayId}&since=999999&collect=1`, { "x-gyredeck-token": STALE_PW }],
       [`/mail/${code}?as=${relayId}&since=0&collect=1`, { "x-gyredeck-token": h.token }],
       [`/mail/inbox?as=${relayId}&collect=1`, { "x-gyredeck-token": h.token }],
       [`/mail/wait?as=${relayId}&timeout=1`, { "x-gyredeck-token": h.token }],
@@ -245,7 +253,7 @@ test("the app's relay joins as Discord, hears the whole room, moves its read pos
     assert.equal((await post("peer-b", { to: "everyone", kind: "tell", text: "after the clamp" })).status, 202);
     assert.equal(await pendingOf(relayId), 1, "a message after the clamped ACK is still owed to the relay");
 
-    // It never speaks, with the password or without.
+    // It never speaks, with a token or without.
     const spoke = await post(relayId, { to: "everyone", kind: "tell", text: "hello" });
     assert.equal(spoke.status, 403);
     assert.equal(spoke.body.error, "relay_only");
@@ -257,16 +265,17 @@ test("the app's relay joins as Discord, hears the whole room, moves its read pos
 test("the app's ACK keeps a busy room open within one stream; nobody else may ACK", async () => {
   const h = await startBridge();
   try {
-    const { room: code, password } = (await h.call("POST", "/sync/rooms", { conversationId: "founder-1" })).body;
+    const { room: code } = (await h.call("POST", "/sync/rooms", { conversationId: "founder-1" })).body;
+    const password = h.token;
     const relayId = `discord-${code}`;
     assert.equal((await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: relayId, relay: "discord" })).status, 200);
     // The founder takes in what the room said so far, so the relay alone holds the floor.
-    await fetch(`${h.base}/mail/${code}?as=founder-1&since=0&collect=1`, { headers: { "x-gyredeck-token": password } });
+    await fetch(`${h.base}/mail/${code}?as=founder-1&since=0&collect=1`, { headers: { "x-gyredeck-token": h.token } });
     const app = { "content-type": "application/json", "x-gyredeck-token": h.token, "x-gyredeck-broker": APP_WORD };
     const ack = (seq, headers = app) => fetch(`${h.base}/mail/${code}/relay-ack`, { method: "POST", headers, body: JSON.stringify({ as: relayId, seq }) });
 
-    // Not the room's password, not the machine token alone.
-    assert.equal((await ack(1, { "content-type": "application/json", "x-gyredeck-token": password })).status, 403);
+    // Not a retired room password, not the machine token alone.
+    assert.equal((await ack(1, { "content-type": "application/json", "x-gyredeck-token": STALE_PW })).status, 403);
     assert.equal((await ack(1, { "content-type": "application/json", "x-gyredeck-token": h.token })).status, 403);
     // The app's own ACK past the room's end is clamped to what exists.
     const roomSeq = (await h.call("GET", `/sync/rooms?as=${relayId}`)).body.seq;
@@ -316,9 +325,10 @@ test("the app's ACK keeps a busy room open within one stream; nobody else may AC
 test("T12b: the relay's stream opens with what the room dropped and where the relay joined; a member's never does", async () => {
   const h = await startBridge();
   try {
-    const { room: code, password } = (await h.call("POST", "/sync/rooms", { conversationId: "founder-1" })).body;
+    const { room: code } = (await h.call("POST", "/sync/rooms", { conversationId: "founder-1" })).body;
+    const password = h.token;
     await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: "peer-a" });
-    await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: "peer-a", password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
+    await h.joinRoom(code, "peer-a");
     const relayId = `discord-${code}`;
     const joined = await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: relayId, relay: "discord" });
     assert.equal(joined.status, 200);
@@ -346,7 +356,7 @@ test("T12b: the relay's stream opens with what the room dropped and where the re
     for (let i = 0; i < 80; i += 1) {
       const peer = `churn-${i}`;
       await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: peer });
-      await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
+      await h.joinRoom(code, peer);
       await h.call("DELETE", `/sync/rooms/${code}/members/${peer}`);
     }
     const again = await watchUntil(h.base, code, relayId, app, () => false, async () => {}, 500, String(relayFrom));
@@ -374,10 +384,11 @@ test("rules v15 tell every agent what the owner's Discord voice may ask, and nev
 /** A room the app founded, a confirmed peer in it, and the app's relay (#205). */
 const roomWithRelay = async (h, peers = ["peer-a"]) => {
   const created = await h.call("POST", "/sync/rooms", { conversationId: "founder-1" });
-  const { room: code, password } = created.body;
+  const { room: code } = created.body;
+    const password = h.token;
   for (const peer of peers) {
     assert.equal((await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: peer })).status, 200);
-    assert.equal((await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD })).status, 200);
+    assert.equal((await h.joinRoom(code, peer)).status, 200);
   }
   assert.equal((await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: `discord-${code}`, relay: "discord" })).status, 200);
   return { code, password };
@@ -391,9 +402,9 @@ test("a reserved sender is refused on POST /mail unless the app vouches, in a ro
     const { code, password } = await roomWithRelay(h);
     const json = { "content-type": "application/json" };
     const outside = [
-      ["the room's password", { ...json, "x-gyredeck-token": password }],
+      ["the retired room password", { ...json, "x-gyredeck-token": STALE_PW }],
       ["the machine token", { ...json, "x-gyredeck-token": h.token }],
-      ["the room's password and the app's word", { ...json, "x-gyredeck-token": password, "x-gyredeck-broker": APP_WORD }],
+      ["the retired room password and the app's word", { ...json, "x-gyredeck-token": STALE_PW, "x-gyredeck-broker": APP_WORD }],
       ["the machine token and a wrong word", { ...json, "x-gyredeck-token": h.token, "x-gyredeck-broker": "d8".repeat(32) }],
       ["a member's own key", { ...json, "x-gyredeck-token": password, "x-gyredeck-member": await keyOf(h, "peer-a") }],
     ];
@@ -402,12 +413,12 @@ test("a reserved sender is refused on POST /mail unless the app vouches, in a ro
         for (const [holding, headers] of credentials) {
           const said = await h.call("POST", `/mail/${mailbox}`, { from, to: "everyone", kind: "tell", text: `forged as ${from}` }, headers);
           assert.equal(said.status, 403, `${from} into ${mailbox} with ${holding}: ${JSON.stringify(said.body)}`);
-          assert.equal(said.body.error, "reserved_sender");
+          assert.equal(said.body.error, headers["x-gyredeck-token"] === STALE_PW ? "not_confirmed" : "reserved_sender");
         }
       }
     }
     assert.ok((await readRoom(h, code)).every((message) => !message.text.startsWith("forged")));
-    // Premise: an ordinary member with the same password is heard, and the app's own call is.
+    // Premise: an ordinary member with its own key is heard, and the app's own call is.
     assert.equal((await h.call("POST", `/mail/${code}`, { from: "peer-a", text: "a member speaks" }, { ...json, ...(await asMember(h, "peer-a", password)) })).status, 202);
     for (const from of RESERVED_SENDERS) {
       const vouched = await h.call("POST", "/mail/peer-b", { from, to: "peer-b", kind: "tell", text: `vouched as ${from}` });
@@ -554,14 +565,14 @@ test("a lookalike of a reserved voice is refused too, even from the app (#205 au
 test("a reserved voice, or a lookalike, is never a session: not founded, joined, confirmed or reported (#205 audit)", async () => {
   const h = await startBridge();
   try {
-    const { code, password } = await roomWithRelay(h);
+    const { code } = await roomWithRelay(h);
     for (const id of [...RESERVED_SENDERS, ...LOOKALIKES]) {
       const founded = await h.call("POST", "/sync/rooms", { conversationId: id });
       assert.equal(founded.status, 400, `found as ${JSON.stringify(id)}: ${JSON.stringify(founded.body)}`);
       assert.equal(founded.body.error, /^[A-Za-z0-9_-]{1,64}$/.test(id) ? "reserved_id" : "invalid_session", JSON.stringify(id));
       const joined = await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: id });
       assert.equal(joined.status, 400, `join as ${JSON.stringify(id)}: ${JSON.stringify(joined.body)}`);
-      const confirmed = await h.call("POST", "/hook/sync/confirm", { conversationId: id, turnId: "t1", password });
+      const confirmed = await h.call("POST", "/hook/sync/confirm", { conversationId: id, turnId: "t1", password: STALE_PW });
       assert.equal(confirmed.body.confirmed, false);
       const ingested = await h.call("POST", "/ingest", {
         version: 2, id: `e-${Math.random()}`, type: "turn_start", timestamp: new Date().toISOString(), conversationId: id, cwd: "/tmp/project",
@@ -636,7 +647,7 @@ test("rules v16 tell every agent how to mark a yes/no ask, and that ✅ is a yes
 
 // #206: /status reads a room's members and the providers' usage through a door only the app
 // holds — the machine token and the broker word together. Nothing is posted, nobody is woken.
-test("#206 a room's status is read by the app alone: machine token and broker word both, never a room password or a member key", async () => {
+test("#206 a room's status is read by the app alone: machine token and broker word both, never a retired room password or a member key", async () => {
   const h = await startBridge();
   try {
     const { code, password } = await roomWithRelay(h);
@@ -648,9 +659,9 @@ test("#206 a room's status is read by the app alone: machine token and broker wo
     assert.equal(typeof ok.body.usage, "object");
     const tokenOnly = { "content-type": "application/json", "x-gyredeck-token": h.token };
     const brokerOnly = { "content-type": "application/json", "x-gyredeck-broker": APP_WORD };
-    const roomWord = { "content-type": "application/json", "x-gyredeck-token": password, "x-gyredeck-broker": APP_WORD };
+    const roomWord = { "content-type": "application/json", "x-gyredeck-token": STALE_PW, "x-gyredeck-broker": APP_WORD };
     const member = { ...(await asMember(h, "peer-a", password)), "content-type": "application/json" };
-    for (const [headers, who] of [[tokenOnly, "the token alone"], [brokerOnly, "the broker word alone"], [roomWord, "the room password"], [member, "a member's key"]]) {
+    for (const [headers, who] of [[tokenOnly, "the token alone"], [brokerOnly, "the broker word alone"], [roomWord, "the retired room password"], [member, "a member's key"]]) {
       const refused = await h.call("GET", `/sync/rooms/${code}/status`, undefined, headers);
       assert.ok([401, 403].includes(refused.status), `${who}: ${refused.status}`);
     }
@@ -682,10 +693,11 @@ test("#343: a post to the owner is receipted relayed while the Discord relay wat
   const h = await startBridge();
   try {
     const created = await h.call("POST", "/sync/rooms", { conversationId: "founder-343" });
-    const { room: code, password } = created.body;
+    const { room: code } = created.body;
+    const password = h.token;
     const peer = "peer-343";
     assert.equal((await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: peer })).status, 200);
-    assert.equal((await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD })).status, 200);
+    assert.equal((await h.joinRoom(code, peer)).status, 200);
     const key = await asMember(h, peer, password);
     const post = (body) => fetch(`${h.base}/mail/${code}`, {
       method: "POST", headers: { "content-type": "application/json", ...key }, body: JSON.stringify({ from: peer, ...body }),

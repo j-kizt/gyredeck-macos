@@ -71,17 +71,23 @@ const startBridge = async (home = null) => {
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
   const moveClock = (ms) => writeFile(clock, String(ms));
-  return { home, base, call, halt, stop, token, app, moveClock };
+  const joinRoom = async (code, conversationId) => {
+    const minted = await call("POST", `/sync/rooms/${code}/members/${conversationId}/join-code`, {});
+    assert.equal(minted.status, 200, JSON.stringify(minted.body));
+    return call("POST", `/sync/rooms/${code}/confirm`, { conversationId, password: minted.body.code }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
+  };
+  return { home, base, call, halt, stop, token, app, moveClock, joinRoom };
 };
 
 const keyOf = async (h, as) => (await h.call("GET", `/mail/inbox?as=${as}`)).body.memberKey;
 const asMember = async (h, as, password) => ({ "content-type": "application/json", "x-gyredeck-token": password, "x-gyredeck-member": await keyOf(h, as) });
 
 const roomWithRelay = async (h, peers = ["peer-a", "peer-b"]) => {
-  const { room: code, password } = (await h.call("POST", "/sync/rooms", { conversationId: "founder-1" })).body;
+  const { room: code } = (await h.call("POST", "/sync/rooms", { conversationId: "founder-1" })).body;
+  const password = h.token;
   for (const peer of peers) {
     assert.equal((await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: peer })).status, 200);
-    assert.equal((await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD })).status, 200);
+    assert.equal((await h.joinRoom(code, peer)).status, 200);
   }
   assert.equal((await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: `discord-${code}`, relay: "discord" })).status, 200);
   return { code, password };
@@ -178,7 +184,7 @@ test("#374 I2 I3 I5: the use route lets exactly the stamped command through once
     const machine = { "content-type": "application/json", "x-gyredeck-token": h.token };
     assert.equal((await useAs(h, code, "peer-a", command, machine)).status, 403, "the machine token alone");
     assert.equal((await useAs(h, code, "peer-a", command, b)).status, 403, "another member's key");
-    assert.equal((await useAs(h, code, "peer-a", command, { "content-type": "application/json", "x-gyredeck-token": password })).status, 403, "the password with no key");
+    assert.equal((await useAs(h, code, "peer-a", command, { "content-type": "application/json", "x-gyredeck-token": "5a".repeat(16) })).status, 403, "a retired room password with no key");
     const other = await useAs(h, code, "peer-b", command, h.app);
     assert.deepEqual([other.status, other.body.allowed], [404, false], "another session, vouched for by the broker");
     const otherOwn = await useAs(h, code, "peer-b", command, b);

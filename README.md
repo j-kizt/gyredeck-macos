@@ -40,10 +40,12 @@ Two agent sessions on this machine, put in a room so either can ask the other fo
 something. One has been through work the other now needs; the asking happens between
 them, and nobody carries answers back and forth by hand.
 
-Open a session's detail and press **Create sync**. The room's code appears with three
-buttons: copy the code, copy the room's **password** (founder only), and disconnect.
-Put another session in the same room with **Join sync**, then paste the password into
-*that session's own terminal*. Joining is what the app can do; letting a session speak
+Open a session's detail and press **Create sync**. The room's code appears with two
+buttons: copy the code and disconnect. Put another session in the same room with
+**Join sync**, then press the key button beside that session: it copies that session's
+**one-time password**, which you paste into *that session's own terminal*. It works once,
+for that session only, for one minute; pressing the key again makes a fresh one and kills
+the last. Joining is what the app can do; letting a session speak
 is what you do, in the place where that session lives.
 
 From then on the exchange happens in the agents' own terminals. There is no message
@@ -62,18 +64,18 @@ usable:
 The first two are handed a watch command to run when they are let in — a command rather
 than a description of one, because three sessions once wrote three broken loops from the
 description in a single day. It stops itself when the room is gone. Disconnecting a
-session tells it so, closes its watch, and stops the room's password working for it.
+session tells it so, closes its watch, and takes its place in the room away.
 
 **Answering without a prompt each time** is a switch per agent under Settings →
 Permission. Claude Code's is on by default; its rules are prefix rules, and Claude Code
 checks each part of a chained command on its own. Antigravity's is **off** by default. Its
 rules are `command(regex:…)` patterns anchored at both ends, one for each command the hook
 prints. The only parts that vary are the session id (a UUID), the room code, the
-password (32 hex digits) and the message body. The body is a single-quoted JSON object
+session's own key (32 hex digits) and the message body. The body is a single-quoted JSON object
 that may not contain `'`, `;`, `&`, `|`, a backtick, `$` or a line break. A reply with
 one of those characters is asked about as usual. Nothing in front of or behind a printed
 command matches. Moving Antigravity's switch either way also removes any Antigravity allow
-rule that holds a room password. Rules you added yourself are left alone, broad ones
+rule that holds a session key. Rules you added yourself are left alone, broad ones
 included.
 
 **A message says who it is for and what it is for**, so being in a room does not mean
@@ -97,7 +99,7 @@ all: the loud default, because a message nobody hears is the worse mistake.
 ## Privacy
 
 - Everything runs locally on `127.0.0.1`; nothing is uploaded.
-- A sync room's password is held in memory only and dies with the room. **Reading** that room takes it and nothing else: the machine's own token is not accepted, because every agent can read that file and it says nothing about who you let in. **Speaking** takes the password or the machine token — a founder is confirmed by pressing Create and holds no password until somebody reads one out, so requiring it would silence the session that made the room.
+- A sync room has no shared password (retired in v1.35.1). The only way in is a session's one-time password: made when you press its key, good for one minute, once, for that session alone. Once let in, a session holds its own key, and **reading** the room in its name takes that key and nothing else: the machine's own token is not accepted, because every agent can read that file and it says nothing about who you let in. **Speaking** takes the key or the machine token — a founder is confirmed by pressing Create and may hold no key yet, so requiring one would silence the session that made the room. A session reopened in a new process is shut out until you give it a fresh one-time password; Codex and Antigravity are not covered by that check.
 - The bridge stores tool status and output length, not raw tool output; user-text previews are off by default.
 - Git accounts are stored locally under `~/.config/gyredeck` (OAuth device-flow tokens, or imported from `gh`/`glab`); the optional built-in credential helper serves `git push`/`pull` without needing those CLIs. Switching accounts can optionally sync your global git identity (toggle in **Settings → Git**).
 

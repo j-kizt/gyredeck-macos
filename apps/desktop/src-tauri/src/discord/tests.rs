@@ -10,7 +10,6 @@ use std::{
 // A made-up token in a real token's shape, put together from parts so a secret scanner does
 // not take the test file for a leak.
 const TOKEN: &str = concat!("MTIzNDU2Nzg5MDEyMzQ1Njc4", ".", "GaBcDe", ".", "abcdefghijklmnopqrstuvwxyz0123456789AB");
-const PASSWORD: &str = "0123456789abcdef0123456789abcdef";
 const APP_WORD: &str = "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5";
 const ROOM: &str = "sync-ab23";
 /// The room instance the fake bridge reports.
@@ -186,8 +185,8 @@ impl Default for FakeActs {
 }
 
 impl RoomActs for Arc<FakeActs> {
-    fn password(&self, room: &str) -> Option<String> {
-        self.founded.lock().unwrap().iter().any(|code| code == room).then(|| PASSWORD.to_string())
+    fn founded(&self, room: &str) -> bool {
+        self.founded.lock().unwrap().iter().any(|code| code == room)
     }
     fn join_relay(&self, room: &str, member: &str, app_word: &str) -> Result<(), String> {
         self.joins.lock().unwrap().push((room.to_string(), member.to_string(), app_word.to_string()));
@@ -473,7 +472,7 @@ fn a_room_this_app_did_not_found_cannot_be_connected() {
     let buffer = f.attach_buffer();
 
     let refused = f.state.connect(OTHER, APP_WORD);
-    assert!(refused.is_err(), "a room whose password this app does not hold is refused");
+    assert!(refused.is_err(), "a room this app did not found is refused");
     assert!(f.acts.joins.lock().unwrap().is_empty(), "nothing joined");
     assert!(f.source.opens.lock().unwrap().is_empty(), "nothing read");
     assert!(of_kind(&buffer.lines(), "connect").is_empty(), "nothing told to the child");
@@ -573,8 +572,7 @@ fn order_is_kept_across_a_stream_reconnect_without_duplicates() {
     let lines = buffer.lines();
     let seqs: Vec<u64> = of_kind(&lines, "message").iter().map(|m| m["seq"].as_u64().unwrap()).collect();
     assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
-    // Both opens read as the relay, on the app's word — not on the room's password, which
-    // every member holds.
+    // Both opens read as the relay, on the app's word.
     for (room, as_id, word) in f.source.opens.lock().unwrap().iter() {
         assert_eq!((room.as_str(), as_id.as_str(), word.as_str()), (ROOM, relay_member(ROOM).as_str(), APP_WORD));
     }
@@ -608,7 +606,7 @@ fn a_gap_in_the_room_is_said_once_as_a_count() {
 }
 
 #[test]
-fn no_line_to_the_child_carries_a_room_password_or_the_apps_word() {
+fn no_line_to_the_child_carries_the_apps_word() {
     let f = fixture("secrets", Some(TOKEN));
     let buffer = f.attach_buffer();
     f.members(ROOM, &[("founder-1", "Claude Code"), ("peer-a", "Codex")]);
@@ -628,7 +626,6 @@ fn no_line_to_the_child_carries_a_room_password_or_the_apps_word() {
     }
     assert_eq!(of_kind(&lines, "pair")[0]["code"], code);
     for (index, line) in buffer.text().lines().enumerate() {
-        assert!(!line.contains(PASSWORD), "line {index} carries the room password: {line}");
         assert!(!line.contains(APP_WORD), "line {index} carries the app's word: {line}");
         assert_eq!(line.contains(TOKEN), index == 0 && lines[0]["t"] == "hello", "the token rides in hello alone: {line}");
     }
@@ -1302,13 +1299,12 @@ fn a_token_is_checked_for_shape_before_it_is_kept() {
 /// The app's acts against a bridge this test started.
 struct LiveActs {
     target: standalone_bridge::BridgeTarget,
-    password: String,
     room: String,
 }
 
 impl RoomActs for LiveActs {
-    fn password(&self, room: &str) -> Option<String> {
-        (room == self.room).then(|| self.password.clone())
+    fn founded(&self, room: &str) -> bool {
+        room == self.room
     }
     fn join_relay(&self, room: &str, member: &str, app_word: &str) -> Result<(), String> {
         standalone_bridge::sync_join_relay_to(&self.target, room, member, app_word).map(|_| ())
@@ -1369,10 +1365,13 @@ fn a_real_bridge_room_reaches_the_child_in_order_named_and_closes() {
     let (status, created) = call(&app, "POST", "/sync/rooms", serde_json::json!({ "conversationId": "founder-1" }), Some(APP_WORD));
     assert_eq!(status, 201, "{created}");
     let room = created["room"].as_str().unwrap().to_string();
-    let password = created["password"].as_str().unwrap().to_string();
     for peer in ["peer-a", "peer-b"] {
         assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/members"), serde_json::json!({ "conversationId": peer }), Some(APP_WORD)).0, 200);
-        assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/confirm"), serde_json::json!({ "conversationId": peer, "password": password }), Some(APP_WORD)).0, 200);
+        // Each peer is let in by its own one-time password, minted on the app's word (#331, #332).
+        let (status, minted) = call(&app, "POST", &format!("/sync/rooms/{room}/members/{peer}/join-code"), serde_json::json!({}), Some(APP_WORD));
+        assert_eq!(status, 200, "{minted}");
+        let code = minted["code"].as_str().unwrap();
+        assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/confirm"), serde_json::json!({ "conversationId": peer, "password": code }), Some(APP_WORD)).0, 200);
     }
 
     let tokens = Arc::new(MemTokens::default());
@@ -1384,7 +1383,7 @@ fn a_real_bridge_room_reaches_the_child_in_order_named_and_closes() {
         losses: Arc::new(MemLoss::default()),
         approvals: Arc::new(MemLoss::default()),
         source: Arc::new(BridgeSource { target: Some(app.clone()) }),
-        acts: Arc::new(LiveActs { target: app.clone(), password: password.clone(), room: room.clone() }),
+        acts: Arc::new(LiveActs { target: app.clone(), room: room.clone() }),
         state_path: home.join("discord-state.json"),
         log: SupervisorLog::at(None),
     });
@@ -1399,7 +1398,7 @@ fn a_real_bridge_room_reaches_the_child_in_order_named_and_closes() {
     assert_eq!(connect["members"], serde_json::json!(["Agent", "Agent #peer-a", "Agent #peer-b", "Discord"]));
     assert!(connect["createdAt"].as_u64().is_some());
 
-    let speaker = standalone_bridge::BridgeTarget { port, token: password.clone() };
+    let speaker = app.clone();
     let post = |from: &str, to: &str, kind: &str, text: &str| {
         // In a member's name: the broker's word stands in for its own key (#294).
         let (status, body) = call(&speaker, "POST", &format!("/mail/{room}"), serde_json::json!({ "from": from, "to": to, "kind": kind, "text": text }), Some(APP_WORD));
@@ -4226,7 +4225,7 @@ fn a_say_is_posted_as_the_owner_only_for_a_connected_room_its_own_post_and_the_k
         "only the two in the right place reached the bridge, with the word the room was connected with"
     );
     for (index, line) in buffer.text().lines().enumerate() {
-        assert!(!line.contains(APP_WORD) && !line.contains(PASSWORD), "line {index}: {line}");
+        assert!(!line.contains(APP_WORD), "line {index}: {line}");
     }
 }
 
@@ -4730,9 +4729,11 @@ fn a_real_bridge_takes_the_owners_say_as_you_via_discord_and_no_one_else_can_spe
     let (status, created) = call(&app, "POST", "/sync/rooms", Some(serde_json::json!({ "conversationId": "founder-1" })), Some(APP_WORD));
     assert_eq!(status, 201, "{created}");
     let room = created["room"].as_str().unwrap().to_string();
-    let password = created["password"].as_str().unwrap().to_string();
     assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/members"), Some(serde_json::json!({ "conversationId": "peer-a" })), Some(APP_WORD)).0, 200);
-    assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/confirm"), Some(serde_json::json!({ "conversationId": "peer-a", "password": password })), Some(APP_WORD)).0, 200);
+    let (status, minted) = call(&app, "POST", &format!("/sync/rooms/{room}/members/peer-a/join-code"), Some(serde_json::json!({})), Some(APP_WORD));
+    assert_eq!(status, 200, "{minted}");
+    let code = minted["code"].as_str().unwrap();
+    assert_eq!(call(&app, "POST", &format!("/sync/rooms/{room}/confirm"), Some(serde_json::json!({ "conversationId": "peer-a", "password": code })), Some(APP_WORD)).0, 200);
 
     let tokens = Arc::new(MemTokens::default());
     *tokens.token.lock().unwrap() = Some(BotToken::parse(TOKEN).unwrap());
@@ -4745,7 +4746,7 @@ fn a_real_bridge_takes_the_owners_say_as_you_via_discord_and_no_one_else_can_spe
         losses: Arc::new(MemLoss::default()),
         approvals: Arc::new(MemLoss::default()),
         source: Arc::new(BridgeSource { target: Some(app.clone()) }),
-        acts: Arc::new(LiveActs { target: app.clone(), password: password.clone(), room: room.clone() }),
+        acts: Arc::new(LiveActs { target: app.clone(), room: room.clone() }),
         state_path: home.join("discord-state.json"),
         log: SupervisorLog::at(None),
     });
@@ -4757,7 +4758,7 @@ fn a_real_bridge_takes_the_owners_say_as_you_via_discord_and_no_one_else_can_spe
     state.connect(&room, APP_WORD).expect("connect through the real join");
     on_core_event(&state.core, FromChild::Connected { room: Some(room.clone()), thread_id: Some(THREAD.into()), created_at: None });
 
-    let speaker = standalone_bridge::BridgeTarget { port, token: password.clone() };
+    let speaker = app.clone();
     // In a member's name: the broker's word stands in for its own key (#294).
     let (status, asked) = call(&speaker, "POST", &format!("/mail/{room}"), Some(serde_json::json!({ "from": "peer-a", "to": OWNER_SENDER, "kind": "ask", "text": "may I start?" })), Some(APP_WORD));
     assert_eq!(status, 202, "{asked}");
@@ -4832,11 +4833,9 @@ fn a_real_bridge_takes_the_owners_say_as_you_via_discord_and_no_one_else_can_spe
     let pings = read()["messages"].as_array().unwrap().iter().filter(|m| m["from"] == OWNER_SENDER && m["text"] == "ping").count();
     assert_eq!(pings, 2);
 
-    // Nobody else speaks as the owner: not with the room's password, nor the machine token alone.
-    for target in [&speaker, &app] {
-        let (status, body) = call(target, "POST", &format!("/mail/{room}"), Some(serde_json::json!({ "from": OWNER_SENDER, "to": "everyone", "text": "forged" })), None);
-        assert_eq!((status, body["error"].as_str()), (403, Some("reserved_sender")), "{body}");
-    }
+    // Nobody else speaks as the owner: not on the machine token alone.
+    let (status, body) = call(&app, "POST", &format!("/mail/{room}"), Some(serde_json::json!({ "from": OWNER_SENDER, "to": "everyone", "text": "forged" })), None);
+    assert_eq!((status, body["error"].as_str()), (403, Some("reserved_sender")), "{body}");
     drop(state);
     drop(bridge);
 }

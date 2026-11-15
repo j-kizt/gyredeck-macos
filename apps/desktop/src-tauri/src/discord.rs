@@ -1,11 +1,11 @@
 //! Following a sync room on the owner's Discord (#199).
 //!
 //! The connector is a child process (`gyredeck-discord.mjs --parent-stdio`) that talks only
-//! to Discord. This side holds everything the child must never see — each room's password,
-//! the broker's secret, the machine token — reads every connected room's `/events` itself and
+//! to Discord. This side holds everything the child must never see — the broker's secret,
+//! the machine token — reads every connected room's `/events` itself and
 //! hands the child finished lines. The one way anything reaches the child's stdin is
 //! [`ChildChannel::send`], which takes a [`ToChild`] and nothing else, and no variant of it
-//! has a field a password could travel in. The bot token rides only in `hello`.
+//! has a field a secret could travel in. The bot token rides only in `hello`.
 //!
 //! The guarantee (#199, option B): every line Rust takes from a room is written to a disk
 //! journal ([`journal`]) before the child can be handed it, and stays there until Discord has
@@ -2160,7 +2160,7 @@ pub(crate) struct RoomMember {
 pub(crate) enum SourceError {
     /// The room has ended.
     Gone,
-    /// The relay is no longer in it, or its password no longer opens it.
+    /// The relay is no longer in it.
     Removed,
     /// Not reachable just now; try again.
     Unavailable,
@@ -2175,8 +2175,7 @@ pub(crate) trait RoomSource: Send + Sync {
     /// joined, so 0 means "from when it joined".
     ///
     /// Read as the relay, which the bridge allows only on the app's word (`app_word`) with the
-    /// machine token: the relay's position is the room's trim floor, and every member holds
-    /// the room's password.
+    /// machine token: the relay's position is the room's trim floor, which no member may move.
     fn open(&self, room: &str, as_id: &str, app_word: &str, since: u64) -> Result<Box<dyn Read + Send>, SourceError>;
     /// Tell the bridge Discord holds the room up to `seq`, so the relay's read position — the
     /// room's trim floor — follows Discord within a stream, not only at the next open.
@@ -2214,7 +2213,7 @@ pub(crate) struct Refused {
 
 /// The app's own acts on a room, which take the broker's secret.
 pub(crate) trait RoomActs: Send + Sync {
-    fn password(&self, room: &str) -> Option<String>;
+    fn founded(&self, room: &str) -> bool;
     fn join_relay(&self, room: &str, member: &str, app_word: &str) -> Result<(), String>;
     fn leave(&self, room: &str, member: &str, app_word: &str) -> Result<(), String>;
     /// Publish as [`OWNER_SENDER`], vouched by the app's word. Answers the seq.
@@ -2658,9 +2657,8 @@ impl DiscordState {
         if !self.configured.load(Ordering::SeqCst) {
             return Err("Discord is not set up. Add a bot token in Settings → Permission".to_string());
         }
-        // Holding the password is how this app knows it founded the room; the reader itself
-        // reads on the app's word, not the password.
-        if self.deps.acts.password(room).is_none() {
+        // The reader reads on the app's word; founding the room is what lets it follow one.
+        if !self.deps.acts.founded(room) {
             return Err("Only a room this app created can be followed on Discord".to_string());
         }
         {
@@ -4340,8 +4338,8 @@ impl SettingsStore for ConfigSettings {
 struct BridgeActs;
 
 impl RoomActs for BridgeActs {
-    fn password(&self, room: &str) -> Option<String> {
-        standalone_bridge::room_password(room)
+    fn founded(&self, room: &str) -> bool {
+        standalone_bridge::founded_room(room)
     }
 
     fn join_relay(&self, room: &str, member: &str, app_word: &str) -> Result<(), String> {
@@ -4478,7 +4476,7 @@ impl RoomSource for BridgeSource {
                 let _ = stream.set_read_timeout(Some(READER_POLL));
                 Ok(Box::new(stream))
             }
-            // A room with members answers a password it does not hold with 403; 401 is the
+            // A room with members answers a reader it does not let in with 403; 401 is the
             // answer for a code with no room behind it, which is how a closed room is met.
             401 | 404 => Err(SourceError::Gone),
             403 => Err(SourceError::Removed),

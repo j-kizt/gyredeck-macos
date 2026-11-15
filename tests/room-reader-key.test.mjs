@@ -63,20 +63,32 @@ const startBridge = async () => {
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
-  return { base, call, raw, stop, token, app, log };
+  const confirm = (code, conversationId, password) => call("POST", `/sync/rooms/${code}/confirm`, { conversationId, password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
+  const joinRoom = async (code, conversationId) => {
+    const minted = await call("POST", `/sync/rooms/${code}/members/${conversationId}/join-code`, {});
+    assert.equal(minted.status, 200, JSON.stringify(minted.body));
+    const confirmed = await confirm(code, conversationId, minted.body.code);
+    return { ...confirmed, code: minted.body.code };
+  };
+  return { base, call, raw, stop, token, app, log, confirm, joinRoom };
 };
 
-/** A room founded by `a`, with `b` let in by the password: both confirmed. */
+const STALE_PW = "5a".repeat(16);
+// The retired room password is no token at all now: a read that checks the token first answers 401, not 403.
+const refusalOf = (headers) => (headers["x-gyredeck-token"] === STALE_PW ? 401 : 403);
+
+/** A room founded by `a`, with `b` let in by a one-time join code (#332): both confirmed. */
 const twoMembers = async (h) => {
   const created = (await h.call("POST", "/sync/rooms", { conversationId: "member-a" })).body;
-  const { room: code, password } = created;
+  const { room: code } = created;
+  const password = h.token;
   await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: "member-b" });
-  const confirmed = await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: "member-b", password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
+  const confirmed = await h.joinRoom(code, "member-b");
   assert.equal(confirmed.status, 200, "premise: b is let in");
   const keyOf = async (as) => (await h.call("GET", `/mail/inbox?as=${as}`, null, { "x-gyredeck-token": password, "x-gyredeck-broker": APP_WORD })).body.memberKey;
   // A member posts with its own key (#294).
   const post = async (from, to, text) => h.call("POST", `/mail/${code}`, { from, to, kind: "tell", text }, { "content-type": "application/json", "x-gyredeck-token": password, "x-gyredeck-member": await keyOf(from) });
-  return { code, password, created, confirmed, keyOf, post, pw: { "x-gyredeck-token": password } };
+  return { code, password, created, confirmed, keyOf, post, pw: { "x-gyredeck-token": password }, stale: { "x-gyredeck-token": STALE_PW }, stalePw: STALE_PW };
 };
 
 const pendingOf = async (h, as) => (await h.call("GET", `/sync/rooms?as=${as}`)).body.members.find((m) => m.conversationId === as).pending;
@@ -113,8 +125,8 @@ test("C1: a watch in another member's name is refused and moves nothing; the mem
     const sent = (await r.post("member-a", "member-b", "for b only")).body;
     assert.equal(typeof sent.seq, "number", "premise: posted");
     for (const [why, headers] of [
-      ["password alone", r.pw],
-      ["password and a's key", { ...r.pw, "x-gyredeck-member": keyA }],
+      ["the retired room password alone", r.stale],
+      ["the retired room password and a's key", { ...r.stale, "x-gyredeck-member": keyA }],
       ["password and a key-shaped guess", { ...r.pw, "x-gyredeck-member": "0".repeat(64) }],
       ["password and an empty key", { ...r.pw, "x-gyredeck-member": "" }],
     ]) {
@@ -149,13 +161,13 @@ test("C1: every read and take in another member's name is refused before anythin
     ];
     for (const path of paths) {
       for (const [why, headers] of [
-        ["password alone", r.pw],
-        ["password and a's key", { ...r.pw, "x-gyredeck-member": keyA }],
+        ["the retired room password alone", r.stale],
+        ["the retired room password and a's key", { ...r.stale, "x-gyredeck-member": keyA }],
         ["machine token alone", { "x-gyredeck-token": h.token }],
         ["machine token and a's key", { "x-gyredeck-token": h.token, "x-gyredeck-member": keyA }],
       ]) {
         const answer = await h.raw(path, headers);
-        assert.equal(answer.status, 403, `${path}, ${why}: ${answer.text}`);
+        assert.equal(answer.status, path.startsWith(`/mail/${r.code}`) ? 403 : refusalOf(headers), `${path}, ${why}: ${answer.text}`);
         assert.doesNotMatch(answer.text, /for b only/, `${path}, ${why}: nothing handed over`);
       }
     }
@@ -267,21 +279,21 @@ test("C1 table: every read in a room member's own name — inbox, wait, private 
       ["mailbox take, no as", "/mail/member-b?since=0&collect=1"],
     ];
     const credentials = [
-      ["password alone", r.pw],
+      ["the retired room password alone", r.stale],
       ["machine token alone", { "x-gyredeck-token": h.token }],
-      ["password and a's key", { ...r.pw, "x-gyredeck-member": keyA }],
+      ["the retired room password and a's key", { ...r.stale, "x-gyredeck-member": keyA }],
       ["machine token and a's key", { "x-gyredeck-token": h.token, "x-gyredeck-member": keyA }],
     ];
     for (const [route, path] of routes) {
       for (const [why, headers] of credentials) {
         const answer = await h.raw(path, headers);
-        assert.equal(answer.status, 403, `${route}, ${why}: ${answer.text}`);
+        assert.equal(answer.status, refusalOf(headers), `${route}, ${why}: ${answer.text}`);
         assert.doesNotMatch(answer.text, /private to b/, `${route}, ${why}`);
       }
     }
     for (const [why, headers] of credentials) {
       const stream = await watch(h, "member-b", "member-b", headers);
-      assert.equal(stream.status, 403, `mailbox stream, ${why}`);
+      assert.equal(stream.status, refusalOf(headers), `mailbox stream, ${why}`);
       assert.doesNotMatch(stream.text, /private to b/, `mailbox stream, ${why}`);
     }
     const own = await h.call("GET", "/mail/inbox?as=member-b&collect=1", null, { "x-gyredeck-token": r.password, "x-gyredeck-broker": APP_WORD });
@@ -300,13 +312,13 @@ test("C1 table: a room member's usage is read in its name, by the same door", as
     const r = await twoMembers(h);
     const keyA = await r.keyOf("member-a");
     for (const [why, headers] of [
-      ["password alone", r.pw],
+      ["password alone", r.stale],
       ["machine token alone", { "x-gyredeck-token": h.token }],
-      ["password and a's key", { ...r.pw, "x-gyredeck-member": keyA }],
+      ["the retired room password and a's key", { ...r.stale, "x-gyredeck-member": keyA }],
     ]) {
       const answer = await h.raw("/usage?as=member-b", headers);
-      assert.equal(answer.status, 403, `${why}: ${answer.text}`);
-      assert.match(answer.text, /not_your_key/, why);
+      assert.equal(answer.status, refusalOf(headers), `${why}: ${answer.text}`);
+      assert.match(answer.text, headers === r.stale || headers["x-gyredeck-token"] === STALE_PW ? /unauthorized/ : /not_your_key/, why);
     }
     assert.equal((await h.raw("/usage?as=member-b", { ...r.pw, "x-gyredeck-member": await r.keyOf("member-b") })).status, 200, "b's own key");
     assert.equal((await h.raw("/usage?as=member-b", { "x-gyredeck-token": h.token, "x-gyredeck-broker": APP_WORD })).status, 200, "the broker's word");
@@ -367,8 +379,8 @@ test("C2/C4: the key is handed only to a read the broker vouches for, and never 
       "b's own keyed look": (await h.raw(`/mail/${r.code}?as=member-b&since=0`, { ...r.pw, "x-gyredeck-member": keyB })).text,
       "b's own keyed inbox": (await h.raw(`/mail/inbox?as=member-b`, { ...r.pw, "x-gyredeck-member": keyB })).text,
       "b's own keyed watch": (await watch(h, r.code, "member-b", { ...r.pw, "x-gyredeck-member": keyB })).text,
-      "a refused read": (await h.raw(`/mail/inbox?as=member-a`, r.pw)).text,
-      "a refused watch": (await watch(h, r.code, "member-a", r.pw)).text,
+      "a refused read": (await h.raw(`/mail/inbox?as=member-a`, r.stale)).text,
+      "a refused watch": (await watch(h, r.code, "member-a", r.stale)).text,
       "b's broker read": JSON.stringify((await h.call("GET", `/mail/inbox?as=member-b`, null, { "x-gyredeck-token": r.password, "x-gyredeck-broker": APP_WORD })).body),
       "bridge stderr": h.log.stderr,
       "bridge stdout": h.log.stdout,
@@ -378,10 +390,10 @@ test("C2/C4: the key is handed only to a read the broker vouches for, and never 
       if (!where.startsWith("b's broker read")) assert.ok(!text.includes(keyB), `b's key in ${where}`);
     }
     assert.ok(surfaces["b's broker read"].includes(keyB), "premise: the broker's read for b carries b's key");
-    // Over TCP, with the shared password and no broker word, there is nothing to take a key from.
-    for (const headers of [r.pw, { "x-gyredeck-token": h.token }, { "x-gyredeck-token": r.password, "x-gyredeck-broker": "e4".repeat(32) }]) {
+    // Over TCP, with a retired room password and no broker word, there is nothing to take a key from.
+    for (const headers of [r.stale, { "x-gyredeck-token": h.token }, { "x-gyredeck-token": r.stalePw, "x-gyredeck-broker": "e4".repeat(32) }]) {
       const answer = await h.raw(`/mail/inbox?as=member-b`, headers);
-      assert.equal(answer.status, 403, answer.text);
+      assert.equal(answer.status, refusalOf(headers), answer.text);
       assert.ok(!answer.text.includes(keyB), "no key over an unvouched read");
     }
   } finally {
@@ -409,7 +421,7 @@ test("C5: a key dies with its membership; coming back mints a new one", async ()
     const old = await r.keyOf("member-b");
     assert.equal((await h.call("DELETE", `/sync/rooms/${r.code}/members/member-b`)).status, 200, "premise: b is taken out");
     await h.call("POST", `/sync/rooms/${r.code}/members`, { conversationId: "member-b" });
-    const again = await h.call("POST", `/sync/rooms/${r.code}/confirm`, { conversationId: "member-b", password: r.password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
+    const again = await h.joinRoom(r.code, "member-b");
     assert.equal(again.status, 200, "premise: b is back");
     const fresh = await r.keyOf("member-b");
     assert.match(fresh, KEY);
@@ -417,9 +429,9 @@ test("C5: a key dies with its membership; coming back mints a new one", async ()
     assert.equal((await h.raw(`/mail/inbox?as=member-b`, { ...r.pw, "x-gyredeck-member": old })).status, 403, "the old key reads nothing");
     assert.equal((await watch(h, r.code, "member-b", { ...r.pw, "x-gyredeck-member": old })).status, 403, "nor watches");
     assert.equal((await h.raw(`/mail/inbox?as=member-b`, { ...r.pw, "x-gyredeck-member": fresh })).status, 200, "the new one does");
-    const repeat = await h.call("POST", `/sync/rooms/${r.code}/confirm`, { conversationId: "member-b", password: r.password }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD });
-    assert.equal(repeat.status, 200);
-    assert.equal(await r.keyOf("member-b"), fresh, "a repeated paste does not re-mint: a running watch keeps working");
+    const spent = await h.confirm(r.code, "member-b", again.code);
+    assert.equal(spent.status, 403, "a spent join code confirms nothing");
+    assert.equal(await r.keyOf("member-b"), fresh, "a refused repeat does not re-mint: a running watch keeps working");
   } finally {
     await h.stop();
   }
@@ -434,10 +446,10 @@ test("C6: the relay still reads by the app's word alone, and a member's key neve
     const keyA = await r.keyOf("member-a");
     assert.equal((await watch(h, r.code, relayId, h.app)).status, 200, "the app reads as its relay");
     for (const [why, headers] of [
-      ["password", r.pw],
-      ["password and a member's key", { ...r.pw, "x-gyredeck-member": keyA }],
+      ["the retired room password", r.stale],
+      ["the retired room password and a member's key", { ...r.stale, "x-gyredeck-member": keyA }],
       ["machine token without the word", { "x-gyredeck-token": h.token }],
-      ["the word without the machine token", { "x-gyredeck-token": r.password, "x-gyredeck-broker": APP_WORD }],
+      ["the word without the machine token", { "x-gyredeck-token": r.stalePw, "x-gyredeck-broker": APP_WORD }],
     ]) {
       const refused = await watch(h, r.code, relayId, headers);
       assert.equal(refused.status, 403, why);
@@ -458,10 +470,10 @@ test("#294 C1–C5: a post in another member's name is refused without that memb
     const keyB = await r.keyOf("member-b");
     const send = (headers, text) => h.call("POST", `/mail/${r.code}`, { from: "member-b", to: "member-a", kind: "tell", text }, { "content-type": "application/json", ...headers });
     const said = async () => (await h.call("GET", `/mail/${r.code}?as=member-a&since=0`, null, { ...r.pw, "x-gyredeck-member": keyA })).body.messages.filter((m) => m.from === "member-b").map((m) => m.text);
-    for (const [headers, who] of [[r.pw, "the password alone"], [{ "x-gyredeck-token": h.token }, "the machine token alone"], [{ ...r.pw, "x-gyredeck-member": keyA }, "another member's key"]]) {
+    for (const [headers, who] of [[r.stale, "the retired password alone"], [{ "x-gyredeck-token": h.token }, "the machine token alone"], [{ ...r.pw, "x-gyredeck-member": keyA }, "another member's key"]]) {
       const refused = await send(headers, `as b, by ${who}`);
       assert.equal(refused.status, 403, `${who}: ${JSON.stringify(refused.body)}`);
-      assert.equal(refused.body.error, "not_your_key", who);
+      assert.equal(refused.body.error, who === "the retired password alone" ? "not_confirmed" : "not_your_key", who);
     }
     assert.deepEqual(await said(), [], "nothing was published in b's name");
     assert.equal((await send({ ...r.pw, "x-gyredeck-member": keyB }, "b, by its own key")).status, 202);

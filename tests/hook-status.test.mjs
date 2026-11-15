@@ -32,12 +32,12 @@ test("nothing installed is nothing to reinstall", () => {
 const { codexCanSync } = await import(module.href);
 const notify = (installed, stale) => ({ path: "/Users/x/.config/gyredeck/notify.mjs", installed, stale });
 
-test("Codex is offered sync only when the adapter that carries the password is current", () => {
+test("Codex is offered sync only when the adapter that carries the one-time password is current", () => {
   assert.equal(codexCanSync(status(true, false), notify(true, false)), true);
 });
 
 test("a Codex hook alone is not enough", () => {
-  // The hook never sees a prompt. Without notify there is no way for a typed password to
+  // The hook never sees a prompt. Without notify there is no way for a typed one-time password to
   // reach the bridge, and the room the person opens would never let the session speak.
   assert.equal(codexCanSync(status(true, false), notify(false, null)), false);
 });

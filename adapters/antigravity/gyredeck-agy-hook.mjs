@@ -71,7 +71,7 @@ const readIngestToken = async () => {
  *
  * Shapes, not contents: key paths with types, numbers kept whole because numbers are the
  * point, and every string as its length alone (#249). Short strings used to be kept whole,
- * and a room password the person pasted is short: it reached this file verbatim. Records
+ * and a one-time password the person pasted is short: it reached this file verbatim. Records
  * carry `v: 2`; a log written before that is emptied the next time the switch is on.
  */
 const SHAPE_SWITCH = join(CONFIG_DIR, "agy-payload-shape.on");
@@ -373,7 +373,7 @@ const brokerBatchReadable = (result) =>
  * `node <this file> wait <seconds> <conversationId>` — the HEAR an Antigravity session runs
  * as a background task (#228). Antigravity wakes the agent only when a background task
  * exits, so this ends with the first mail for the session rather than streaming. It asks
- * the broker, which knows which process is asking, so no room password is on the command
+ * the broker, which knows which process is asking, so no password is on the command
  * line; the id given only validates `boundTo`. TCP is used only where the drain would use
  * it (no broker, `unsupported`, `ineligible`), and a `403` there is withheld mail, never an
  * empty timeout. Exit 0 with the mail as JSON, 4 when the time ran out with nothing (the
@@ -689,14 +689,14 @@ const postJsonStatus = (endpoint, token, path, payload, deadlineMs = 750) =>
   });
 
 /**
- * A room password pasted on its own (#250): the person's whole message, trimmed, is the 32
+ * A session's one-time password pasted on its own (#250, #332): the person's whole message, trimmed, is the 32
  * hex characters the key button copies. Exact on purpose — a password inside prose is left
  * to BLOCKED, where the agent presents it.
  */
 const PASTED_PASSWORD = /^[0-9a-f]{32}$/i;
 
 /**
- * Confirm a room password the person pasted into this session's terminal, as the Claude
+ * Confirm a one-time password the person pasted into this session's terminal, as the Claude
  * hook does (#250): agy's PreInvocation carries the person's message as `lastUserInput`.
  * Only for a member of a room that has not confirmed yet, and only its own id in its own
  * room. Answers `{ accepted: { room, members } }`, `{ refused: { room, error } }`,
@@ -751,9 +751,9 @@ const hearStep = (room) => ({ ephemeralMessage: hearText(room), [SAYS_HEAR]: roo
  * Said with every answer to a paste (#255): live, the model repeated an accepted password
  * back in its reply and asked whether to join a room it was already in. Never the value.
  */
-const PASTE_USED = "The hex you just pasted was this room's password and has been used: do not repeat it, and do not ask about it.";
-// Already in: said only once the bridge checked the value against the room's password (#344).
-const PASTE_ALREADY = "The hex you pasted is this room's password and was already used for you; do not repeat it or ask about it.";
+const PASTE_USED = "The hex you just pasted was this session's one-time password and is spent: do not repeat it, and do not ask about it.";
+// Already in: said only once the bridge checked the value against this session's password (#344).
+const PASTE_ALREADY = "The hex you pasted is a password already used for you; do not repeat it or ask about it.";
 
 const confirmLead = (confirm) => {
   if (confirm?.accepted) {
@@ -769,7 +769,7 @@ const confirmLead = (confirm) => {
     if (!confirm.refused.room) {
       return [{ ephemeralMessage: `The pasted value could not be checked (${confirm.refused.error}). Do not repeat it.` }];
     }
-    return [{ ephemeralMessage: `The pasted room password was refused (${confirm.refused.error}) — you are still not in sync room ${confirm.refused.room}. Do not repeat the value you pasted.` }];
+    return [{ ephemeralMessage: `The pasted password was refused (${confirm.refused.error}) — you are still not in sync room ${confirm.refused.room}. Do not repeat the value you pasted.` }];
   }
   return [];
 };
@@ -898,10 +898,11 @@ const plainSteps = async (taken) => {
  * built the confirm by hand and left out its own id.
  */
 const blockedStepFor = (endpoint, syncRoom, room) =>
-  "BLOCKED: you cannot read or post in this room yet. It needs the room's own" +
-  " password — a long line of hex the person copies from the key beside the room" +
-  " code in Gyredeck. Ask for it and wait; do not retry without it and do not" +
-  " look for another way in.\n" +
+  "BLOCKED: you cannot read or post in this room yet. It needs this session's own" +
+  " one-time password — a long line of hex the person copies from the key beside" +
+  " this session in Gyredeck's room. It works once, for this session only, and for" +
+  " one minute. Ask for it and wait; do not retry without it and do not look for" +
+  " another way in.\n" +
   "The person pastes it as their next prompt here, and this hook presents it for" +
   " you (#294): do not send it yourself — a confirm sent by hand is refused. The" +
   " next invocation says whether you are in. Until it says the password was accepted," +
@@ -910,7 +911,7 @@ const blockedStepFor = (endpoint, syncRoom, room) =>
 // Antigravity wakes the agent only when a background task exits, so a stream that stays
 // open delivers into a log nobody reads (#159, reproduced on agy 1.3.6). The hook's own
 // `wait` ends with the first mail for this session and prints it; it asks the broker, so
-// the room's password never sits in a command line (#228).
+// no password ever sits in a command line (#228).
 const hearText = (room) =>
   "HEAR — so a message reaches you without anyone typing, keep one wait running as a" +
   " background task. It ends as soon as mail for you arrives, printing it, which is" +
@@ -1305,7 +1306,7 @@ const main = async () => {
       // process, the hook only names the session, and a broker that restarted has forgotten.
       if (conversationId) {
         const taken = {};
-        // A pasted room password is presented first, so the drain after it sees the member
+        // A pasted password is presented first, so the drain after it sees the member
         // confirmed and this invocation can say so (#250).
         mailDrain = confirmPastedPassword(endpoint, token, conversationId, input)
           .catch(() => null)

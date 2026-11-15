@@ -230,7 +230,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 20;
+export const ROOM_RULES_VERSION = 21;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -264,7 +264,7 @@ room names the version it expects; if it names a newer one than you read, read t
 - A send happened only if you saw \`ok:true\` and a \`seq\`. Never say you sent something you did not see land.
 - Codex: your seq is reported on the next message you get, with the turn, recipient and kind it belongs to. Until then a message has not failed — **do not send it again**. A room or a mailbox posts an identical tell to the same member within a minute only once. Claude Code and Antigravity, which post with curl, can add \`"again": true\` to say the same thing again on purpose; Codex has no such switch, so a word-for-word repeat within the minute is taken as a resend.
 - \`listening\` in a receipt names the members with a watch open; a member that is pushed to, as Codex is, hears you without one.
-- Never put the room's password in a message body.
+- Never put a session's one-time password in a message body.
 - Reading the room in your name also takes your own key, \`x-gyredeck-member\`. Your deliveries write it into the commands they hand you (the watch, a look back): run those as given. Never put it in a message body, and never use another member's — the room refuses a read whose key is not the reader's.
 
 ## Narrate
@@ -805,7 +805,7 @@ export const writeHeavyHelper = (origin, path = HEAVY_HELPER_PATH) => {
  *  session as watching after its watch had died and leave out how to open a new one. */
 const SSE_HEARTBEAT_MS = Number(process.env.GYREDECK_SSE_HEARTBEAT_MS) || 10_000;
 /** How long a one-time join code lives unused (#331). Overridable so a test can watch one expire. */
-const JOIN_CODE_TTL_MS = Number(process.env.GYREDECK_JOIN_CODE_TTL_MS) || 120_000;
+const JOIN_CODE_TTL_MS = Number(process.env.GYREDECK_JOIN_CODE_TTL_MS) || 60_000;
 /** How many framed seqs a member's watch remembers (#342). */
 const MEMBER_FRAMED_MEMORY = 256;
 /** How long after a watch closes it still counts as held (#341): the reopen takes about a second. */
@@ -841,9 +841,9 @@ function readOrCreateIngestToken() {
   }
 }
 
-// The two credentials that reach /mail: the machine's token (32 bytes) and a room's
-// password (16). Kept as one expression so the door and the things that mint them cannot
-// drift — `readOrCreateIngestToken` and `newRoomPassword` are the other two ends of it.
+// The credential that reaches /mail in x-gyredeck-token: the machine's token (32 bytes), or
+// 16 bytes from a client still sending the retired room password, which every route then
+// refuses by name rather than at this door. `readOrCreateIngestToken` is the other end of it.
 const CREDENTIAL_SHAPE = /^(?:[a-f0-9]{32}|[a-f0-9]{64})$/i;
 
 // The outer door of /mail and /usage: a credential-shaped x-gyredeck-token, or, sent with
@@ -858,9 +858,8 @@ function passesCredentialShape(req) {
 /**
  * Whether a room still holds the session that created it.
  *
- * A room without its founder is over, whoever else is still in it: nobody left can be let
- * in (`/passwords` answers `not_the_founder` to them) and nobody can close it either,
- * since the app asks as itself and gets the same refusal. What remains is a code nobody
+ * A room without its founder is over, whoever else is still in it: the founder's app is
+ * the one that lets sessions in and closes the room. What remains is a code nobody
  * can use for anything.
  *
  * A mailbox has no founder — `createdBy` is null — and is not judged by this.
@@ -1621,8 +1620,7 @@ export const ORPHANED_ROOM_REASON =
 export const sweepRooms = (rooms, now, { close, idleMs }) => {
   for (const [name, room] of rooms) {
     // A room without the session that made it is over, whoever else is still in it:
-    // nobody left can be let in (`/passwords` answers `not_the_founder` to them) and
-    // nobody can close it either. Checked before the members test below, or the case
+    // the founder's app is the one that lets sessions in and closes it. Checked before the members test below, or the case
     // that matters — the founder gone, a peer still there — would never be reached.
     if (roomHasLostItsFounder(room)) {
       close(name, room, ORPHANED_ROOM_REASON);
@@ -2859,7 +2857,7 @@ function startBridge(config) {
           ? { kind: "goal", startedAt: prompt.startedAt }
           : codexPushTarget(prompt.text) ?? { kind: "user" };
       }
-      // The turn that carried a room password: read past, never published. Codex answered
+      // The turn that carried a one-time password: read past, never published. Codex answered
       // it before the bridge knew the password had been typed at all, so the answer is to
       // a question the room never asked. Before capacity is weighed: an answer that will
       // be thrown away must not hold a full room's reading open, nor stand in front of
@@ -3338,7 +3336,7 @@ function startBridge(config) {
   // this. Adapters have carried the token since v1.15.0; older copies left behind by an
   // update are exactly what the staleness check already names in Settings.
   const ROOM_PASSWORD_HINT =
-    "This room needs its own password. Ask the person at this terminal for it, then send it as the x-gyredeck-token header.";
+    "A session is let into this room by its own one-time password: ask the person at this terminal to copy it from the key beside this session in Gyredeck and paste it as their next prompt here. After that every call takes your own key in x-gyredeck-member.";
 
   const TOKEN_HINT =
     "This call must carry the machine token from ~/.config/gyredeck/gyredeck.ingest-token" +
@@ -3712,18 +3710,23 @@ function startBridge(config) {
   };
 
   /**
-   * The one way a member becomes confirmed (#259): founding the room, presenting its
-   * password, and posting with it in the header all come here. Being let in is when a
+   * The one way a member becomes confirmed (#259): founding the room and presenting the
+   * session's one-time password both come here. Being let in is when a
    * member is owed the heavy-run line — on its next collect (Claude Code, Antigravity) or
    * in the push that confirms it (Codex) — so a session that joined a room before it was
    * ever told outside one still learns of the helper. Kept on the membership, so leaving
    * and coming back is a new confirmation, told again.
    *
-   * It is also when the member's read key is minted (#274): the room's password is shared,
-   * so a read in a member's name takes this key as well, and the key is handed only to a
+   * It is also when the member's read key is minted (#274): a read in a member's name takes
+   * this key, and the key is handed only to a
    * read the broker vouches for. Minted first, so a failure leaves the member unconfirmed.
+   *
+   * And when the process it was let in from is recorded (#332): the generation of the
+   * session's live broker binding, or none when the broker has not bound it. A later
+   * binding of a different generation is a new process, which has to be let in again.
    */
-  const markConfirmed = (member) => {
+  const markConfirmed = (member, conversationId) => {
+    member.boundGeneration = brokerGeneration.get(conversationId) ?? null;
     member.readKey = randomBytes(32).toString("hex");
     member.confirmed = true;
     member.confirmedAt = new Date().toISOString();
@@ -3733,19 +3736,16 @@ function startBridge(config) {
   /**
    * Let a member in, once, however the person's consent reached the bridge.
    *
-   * Two callers arrive here: a session presenting the password itself
+   * Two callers arrive here: a session presenting its one-time password itself
    * (`/sync/rooms/<code>/confirm`), and Codex's notify handing over what the person typed
-   * (`/hook/sync/confirm`). A third used to — the founder reading the password out — and
-   * it did its own half of the work, announcing a confirmation and delivering none of the
-   * backlog. Reading the password out lets nobody in now; presenting it is the whole of
-   * how anyone gets in.
+   * (`/hook/sync/confirm`).
    *
    * How the session is told follows from what the session *is*, not from which caller
    * arrived: Codex is pushed to because it can be reached no other way, and everything
    * else is left to collect. `transitioned` says whether this call was the one that let
    * the member in; `held` is how much backlog actually went with it.
    */
-  const confirmRoomMember = (code, room, conversationId) => {
+  const confirmRoomMember = (code, room, conversationId, issuedAt) => {
     const member = room.members.get(conversationId);
     if (!member) return { transitioned: false, delivered: false, held: 0 };
     const toCodex = providerByConversation.get(conversationId) === "codexCliHook";
@@ -3763,7 +3763,7 @@ function startBridge(config) {
     // The confirmation boundary: a goal turn's answer belongs to this room only if the
     // turn began after this moment (#149). Set when confirmation is granted and never
     // moved by a repeat; a member that left and came back is a new record with a new one.
-    markConfirmed(member);
+    markConfirmed(member, conversationId);
     member.toldUnconfirmed = false;
     startHarvestAtEnd(conversationId);
     // Both the window the backlog is taken from and the record that the push carrying it
@@ -3775,7 +3775,9 @@ function startBridge(config) {
     announceMembership(
       code,
       room,
-      `${shownIn(room, conversationId)} was confirmed by the room's owner and can now speak here.`,
+      // The use of the one-time password rides this notice (#332): every confirm is one now,
+      // and two notices for one admission was the same news twice.
+      `${shownIn(room, conversationId)} was confirmed by the room's owner with the one-time password issued at ${issuedAt} and can now speak here.`,
       // The session being announced hears it in its own push below; announcing it again
       // is the second of the three that used to race.
       toCodex ? conversationId : null,
@@ -4400,10 +4402,6 @@ function startBridge(config) {
       // Who pressed Create. Only they are offered the key, because handing out the
       // right to speak is the founder's act, not something any member can pass on.
       createdBy: null,
-      // The room's password, presented in the x-gyredeck-token header for every read and
-      // every send here, kept only as its sha256 (#124): the plaintext is handed to the
-      // founder's app once, at create, and the app holds it in memory.
-      passwordHash: null,
       readSeq: 0,
       messages: [],
       // The highest seq this room has dropped to stay inside its caps. A reader whose
@@ -4423,6 +4421,9 @@ function startBridge(config) {
       // Which room this is, not only which code: a code is reused after a restart, and the
       // Discord relay opens a new post for a new room under an old code (#199).
       createdAt: Date.now(),
+      // Which room this is for the broker's parked mail (#332): random, so neither a
+      // clock that steps back nor two rooms made in one millisecond can share it.
+      instance: randomUUID(),
     };
     mailRooms.set(name, room);
     return room;
@@ -4910,10 +4911,8 @@ function startBridge(config) {
    *
    * A room deleted first has no members left to tell and no streams left to find. Called
    * both by the close button and by the founder leaving, because a room without its
-   * founder is not a room anybody can go on using: nobody can be let into it (`/passwords`
-   * answers `not_the_founder` to everyone left) and nobody can close it either, since the
-   * app asks as itself and gets the same refusal. It became a code that could only be
-   * abandoned.
+   * founder is not a room anybody can go on using: the founder's app is the one that lets
+   * sessions in and closes it. It became a code that could only be abandoned.
    */
   const closeRoom = (name, room, why) => {
     for (const conversationId of [...room.members.keys()]) {
@@ -4949,7 +4948,7 @@ function startBridge(config) {
     if (!mailbox) return;
     const text =
       `[Gyredeck: you are no longer in room ${name} — ${why}. You can neither read it` +
-      " nor post to it now, and its password will not let you back in. This is one of" +
+      " nor post to it now, and nothing you hold will let you back in. This is one of" +
       " the two messages that end a watch on that room: stop yours and do not open" +
       " another, since this end closed your watch and re-opening will be refused." +
       // Only you left (#380): told the room was closed, a member stops looking for it.
@@ -4979,27 +4978,22 @@ function startBridge(config) {
       : " Nobody else is in it yet.";
     const text =
       `[Gyredeck: you are now in sync room ${name} — ${how}.${company}` +
-      // What the password is for differs by what this session can do with it. Codex
-      // cannot open a stream and cannot call the bridge at all, so for it the password
-      // really is somebody else's business. Everyone else needs it in hand: it is the
-      // header on every call about this room, the watch included.
+      // Codex cannot open a stream and cannot call the bridge at all, so for it there is
+      // nothing to set up; everyone else reads and posts with its own key.
       (providerByConversation.get(conversationId) === "codexCliHook"
         ? confirmed
           ? " You can read it and post to it already, and messages are pushed into your" +
-            " session, so there is nothing to set up. The room's password is what the" +
-            " person hands to another session so that one can join; a long string of hex" +
-            " arriving here is that, and there is nothing for you to do with it."
-          : " You cannot read or post there yet. The person at this terminal will be" +
-            " given the room's password, and you are let in the moment they read it out" +
-            " — you do not present it yourself and there is nothing to run."
+            " session, so there is nothing to set up."
+          : " You cannot read or post there yet. The person at this terminal pastes this" +
+            " session's one-time password here, and you are let in the moment they do —" +
+            " you do not present it yourself and there is nothing to run."
         : confirmed
-          ? " You can read it and post to it, but you need the room's password in hand to" +
-            " do either: it is the x-gyredeck-token header on every call about this room," +
-            " including the watch you should be running on it. A long string of hex" +
-            " arriving in this terminal is that password."
-          : " You cannot read or post there yet: that needs the room's password, which the" +
-            " person at this terminal has to give you. A long string of hex arriving with" +
-            " no explanation is it — present it, and then keep a watch on the room.") +
+          ? " You can read it and post to it with your own key in x-gyredeck-member: the" +
+            " commands your hook prints carry it, including the watch you should be" +
+            " running on it."
+          : " You cannot read or post there yet: the person at this terminal lets you in by" +
+            " pasting this session's one-time password, a long string of hex, as their" +
+            " prompt here; your hook presents it. Then keep a watch on the room.") +
       "]";
     // A Codex founder is confirmed with no confirmation push, so its owed heavy-run line
     // rides this one (#259); everyone else is handed it on a collect.
@@ -5016,13 +5010,12 @@ function startBridge(config) {
    *
    * A confirm is a call the session makes itself and reads the answer to, so it is the
    * one place an instruction is certain to land — anything a hook injects arrives a turn
-   * later, by which point the session has usually guessed. The commands come with the
-   * password already in them: a session that just presented it plainly has it.
+   * later, by which point the session has usually guessed.
    */
-  const howToUseRoom = (name, password, conversationId, host, port) =>
+  const howToUseRoom = (name, conversationId, host, port) =>
     providerByConversation.get(conversationId) === "agyHost"
-      ? { ...howToUseRoomBase(name, password, conversationId, host, port), ...howAntigravityHears(conversationId) }
-      : howToUseRoomBase(name, password, conversationId, host, port);
+      ? { ...howToUseRoomBase(name, conversationId, host, port), ...howAntigravityHears(conversationId) }
+      : howToUseRoomBase(name, conversationId, host, port);
 
   /**
    * Antigravity wakes the agent only when a background task exits (#159), so the stream
@@ -5059,25 +5052,16 @@ function startBridge(config) {
     };
   };
 
-  const howToUseRoomBase = (name, password, conversationId, host, port) => ({
-    // A one-time code is spent by the confirm that hands this back (#331), so it is never
+  const howToUseRoomBase = (name, conversationId, host, port) => ({
+    // A one-time password is spent by the confirm that hands this back (#331), so it is never
     // offered as a credential: the member's own key is.
-    credential: password === null
-      ? {
-        header: "x-gyredeck-member",
-        value: null,
-        note:
-          "Your own key, on every call below: the commands your hook prints carry it. The" +
-          " code you pasted is spent and opens nothing.",
-      }
-      : {
-        header: "x-gyredeck-token",
-        value: password,
-        note:
-          "This room's own password, on every call below. Another room's password will not" +
-          " open this one. A read or a post in your name also takes your own key, which only" +
-          " your hook's deliveries carry (#294).",
-      },
+    credential: {
+      header: "x-gyredeck-member",
+      value: null,
+      note:
+        "Your own key, on every call below: the commands your hook prints carry it. The" +
+        " one-time password you pasted is spent and opens nothing.",
+    },
     identity: {
       as: conversationId,
       note:
@@ -5107,7 +5091,7 @@ function startBridge(config) {
       use: "Post with the REPLY command your hook prints with this room's mail: it carries your own key.",
       success: '{"ok":true,"seq":<number>} — the seq is the room-wide sequence of your message.',
       failure: {
-        403: "not_a_member or not_confirmed — you are out of the room, or have not presented its password; not_your_key — your own key is missing.",
+        403: "not_a_member or not_confirmed — you are out of the room, or have not been let in with this session's one-time password; not_your_key — your own key is missing.",
         400: "invalid_message — from or text missing; message_too_long — over the limit, with limit and length.",
       },
       rule:
@@ -5165,11 +5149,11 @@ function startBridge(config) {
   });
 
   /**
-   * Every use of a one-time code is said to the room (#331), and so to the owner on Discord:
+   * Every use of a one-time password is said to the room (#331), and so to the owner on Discord:
    * a use the person did not make is seen at once. Quiet, like every membership notice.
    */
   const announceJoinCodeUse = (name, room, conversationId, issuedAt) =>
-    announceMembership(name, room, `${shownIn(room, conversationId)} was let in with the one-time code issued at ${issuedAt}.`);
+    announceMembership(name, room, `${shownIn(room, conversationId)} was let in with the one-time password issued at ${issuedAt}.`);
 
   const announceMembership = (name, room, note, except = null, wakes = []) => {
     // No roster tail (#341): who is here rides each member's next delivery, as a difference
@@ -5184,13 +5168,6 @@ function startBridge(config) {
     deliverMail(name, room, text, ROOM_SENDER, notice, except);
   };
 
-
-  // Thirty-two hex characters, the length and shape of an MD5 digest. A room code is a
-  // name people say to each other and is kept short for that; this is the thing that
-  // grants the right to speak, and nobody types it — it is copied from the panel and
-  // pasted into a terminal — so length costs nothing and buys the difference between
-  // fifty bits and a hundred and twenty-eight.
-  const newRoomPassword = () => randomBytes(16).toString("hex");
 
   const newSyncCode = () => {
     for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -5238,6 +5215,9 @@ function startBridge(config) {
     ...(sync
       ? {
           room: sync.name,
+          // Which room this is, not only which code (#332): the broker hands mail it parked
+          // back only to the same room, and a closed room's code can be issued again.
+          roomInstance: sync.room.instance,
           ...(roomRulesReady ? { rules: { path: ROOM_RULES_DISPLAY_PATH, version: ROOM_RULES_VERSION } } : {}),
           // Whether this reader already holds a watch on the room, so the hook can leave
           // out the instructions for opening one — they are the longest part of a
@@ -5301,49 +5281,35 @@ function startBridge(config) {
    * a room nobody had confirmed it for — found by asking who had told Codex the
    * password, and the answer was that nobody had to.
    */
-  /**
-   * Whether a request carries this room's credential.
-   *
-   * The room's password, not the machine's token: every agent can read the ingest token
-   * file, so that one proves only "this call came from this machine" and can never
-   * carry the person's decision to let one particular session in. The room's password
-   * is copied by hand from the founder's panel into the joining session's terminal.
-   */
-  // Only a hash is kept (#124): the plaintext goes to the founder's app once, at create, and
-  // the app holds it in memory. Hashing the presented value first makes both sides one length,
-  // so the comparison is constant-time whatever was sent.
-  const hashRoomPassword = (password) => createHash("sha256").update(password).digest("hex");
-  const holdsRoomPassword = (room, headerValue) =>
-    typeof room.passwordHash === "string" &&
-    typeof headerValue === "string" &&
-    matchesIngestToken(room.passwordHash, hashRoomPassword(headerValue));
+  // Only a hash of a join code is kept. Hashing the presented value first makes both sides one
+  // length, so the comparison is constant-time whatever was sent.
+  const hashJoinCode = (code) => createHash("sha256").update(code).digest("hex");
 
   /**
    * One-time join codes (#331): one per session, minted by the app for the session it put in
    * the room. The person proves which session it is by pasting the code into that session's
-   * own terminal. A code works once, only for its own session, and for two minutes; minting
-   * another kills the one before. The shared room password keeps working for one release as
-   * the transition; after that it is retired.
+   * own terminal. A code works once, only for its own session, and for one minute; minting
+   * another kills the one before. It is the only way in: the shared room password was retired
+   * in v1.35.1 (#332).
    */
   const mintJoinCode = (room, conversationId) => {
     const code = randomBytes(16).toString("hex");
     room.joinCodes ??= new Map();
     room.joinCodes.set(conversationId, {
-      hash: hashRoomPassword(code),
+      hash: hashJoinCode(code),
       expiresAt: Date.now() + JOIN_CODE_TTL_MS,
       issuedAt: new Date().toISOString(),
     });
     return { code, expiresAt: new Date(Date.now() + JOIN_CODE_TTL_MS).toISOString() };
   };
   /**
-   * What a presented secret is for this session: the room's password, its own live code, a code
-   * minted for another session, an expired code of its own, or nothing. Reads only; `takeJoinCode`
+   * What a presented secret is for this session: its own live code, a code minted for another
+   * session, an expired code of its own, or nothing. Reads only; `takeJoinCode`
    * spends a code once everything else about the confirm has passed.
    */
   const judgeJoinSecret = (room, conversationId, presented) => {
-    if (holdsRoomPassword(room, presented)) return { ok: true, via: "password" };
     if (typeof presented !== "string" || !room.joinCodes) return { ok: false, reason: "bad" };
-    const hash = hashRoomPassword(presented);
+    const hash = hashJoinCode(presented);
     const own = room.joinCodes.get(conversationId);
     if (own && matchesIngestToken(own.hash, hash)) {
       return Date.now() <= own.expiresAt ? { ok: true, via: "code", issuedAt: own.issuedAt } : { ok: false, reason: "expired" };
@@ -5394,14 +5360,74 @@ function startBridge(config) {
   const BROKER_REFUSALS_MAX = 256;
   const brokerBound = new Set();
   const brokerRefusals = new Map();
-  // Answers "admitted" (true) or "the table is full" (false); a malformed id is neither,
-  // and the caller that sent it is told so by its own door.
-  const noteBrokerBound = (conversationId) => {
+  // The generation of each bound session's latest binding (#332), as the broker numbers
+  // them: a new process taking the session gets a higher one. Only for sessions in
+  // `brokerBound`, so it is capped with it.
+  const brokerGeneration = new Map();
+  // Answers "admitted" (true) or "the table is full" (false); a malformed id or generation
+  // is neither, and the caller that sent it is told so by its own door.
+  const noteBrokerBound = (conversationId, generation = null) => {
     if (typeof conversationId !== "string" || !MAIL_ROOM_NAME.test(conversationId)) return null;
-    if (brokerBound.has(conversationId)) return true;
-    if (brokerBound.size >= BROKER_BOUND_MAX) return false;
-    brokerBound.add(conversationId);
+    if (generation !== null && !(Number.isSafeInteger(generation) && generation > 0)) return null;
+    if (!brokerBound.has(conversationId)) {
+      if (brokerBound.size >= BROKER_BOUND_MAX) return false;
+      brokerBound.add(conversationId);
+    }
+    if (generation !== null) noteBindingGeneration(conversationId, generation);
     return true;
+  };
+
+  /**
+   * A session bound again (#332). The same process binding again, or a report from an older
+   * binding arriving late, changes nothing. A new process is not the one the person let
+   * in: any one-time password still waiting for the session dies, since it was handed out
+   * before this process existed, and a confirmed member is shut out until it is given a
+   * fresh one. This tells a change of process, not who owns the session: a forged bind can
+   * cost a member its place and announce it, never let anything in.
+   */
+  const noteBindingGeneration = (conversationId, generation) => {
+    const seen = brokerGeneration.get(conversationId);
+    if (seen !== undefined && generation <= seen) return;
+    brokerGeneration.set(conversationId, generation);
+    const sync = syncRoomFor(conversationId);
+    const member = sync?.room.members.get(conversationId);
+    if (!member || member.relay === true || member.boundGeneration === generation) return;
+    takeJoinCode(sync.room, conversationId);
+    if (member.confirmed === true) shutOutNewProcess(sync.name, sync.room, conversationId);
+  };
+
+  const shutOutNewProcess = (name, room, conversationId) => {
+    const member = room.members.get(conversationId);
+    member.confirmed = false;
+    delete member.readKey;
+    member.toldUnconfirmed = false;
+    member.heldThroughSeq = null;
+    // A watch opened by the old process carries the old key and would go on reading.
+    for (const res of [...room.clients]) {
+      if (res.gyredeckWatcher !== conversationId) continue;
+      try {
+        res.write(`: gyredeck this session reopened in a new process\n\n`);
+        res.end();
+      } catch {
+        // Already gone; its close handler has cleaned up.
+      }
+      room.clients.delete(res);
+    }
+    room.touchedAt = Date.now();
+    announceMembership(
+      name,
+      room,
+      `${shownIn(room, conversationId)} reopened in a new process and cannot read or speak here until it is given a fresh one-time password.`,
+    );
+    const mailbox = mailRoomFor(conversationId, true);
+    if (!mailbox) return;
+    const text =
+      `[Gyredeck: this session reopened in a new process, so room ${name} no longer lets it` +
+      " read or post. Ask the person at this terminal to copy this session's one-time" +
+      " password from the key beside it in Gyredeck and paste it as their next prompt here." +
+      " Until then, do not open a watch on the room: it will be refused.]";
+    const told = publishMail(mailbox, ROOM_SENDER, text, null, false, { [VOUCHED]: true, to: conversationId, kind: "tell" });
+    deliverMail(conversationId, mailbox, text, ROOM_SENDER, told);
   };
   const BROKER_REQUIRED_HINT =
     "This session reads its mail through the Gyredeck broker now; the hook that asked over" +
@@ -5453,33 +5479,28 @@ function startBridge(config) {
    *
    * Two callers are legitimate and they hold different things. A hook holds the machine
    * token, because that file is how it reaches the bridge at all. A session that has been
-   * let into a room holds that room's password, which is what `howToUseRoom` puts in every
+   * let into a room holds its own member key, which is what `howToUseRoom` puts in every
    * call it hands out. Either shuts out a process holding neither — and `collect=1` is
    * why that matters: it does not merely read the mail, it takes it, moving the cursor so
    * the session it was addressed to never sees it.
    *
-   * What this cannot do is say *which* session is asking. Neither credential is
-   * per-session: the machine token is read by every agent on this machine to make any call
-   * at all, and a room's password is shared by everyone in that room, an ex-member who
-   * still remembers it included. For a room member the inbox and wait routes ask for its
-   * own key or the broker's word as well (#274); a mailbox outside any room keeps this
+   * The machine token cannot say *which* session is asking: every agent on this machine
+   * reads it to make any call at all. For a room member the inbox and wait routes ask for
+   * its own key or the broker's word as well (#274); a mailbox outside any room keeps this
    * limit — see `event-protocol.md`, "What a mailbox credential does not prove".
    */
   const holdsMailboxCredential = (mailboxName, headerValue, req) => {
     if (holdsMachineToken(headerValue)) return true;
     const sync = syncRoomFor(mailboxName);
     if (!sync) return false;
-    // A confirmed member's own key opens its own mailbox (#331): one let in by a join code
-    // never holds the room's password.
+    // A confirmed member's own key opens its own mailbox (#331).
     const member = sync.room.members.get(mailboxName);
-    if (member?.confirmed === true && holdsMemberKey(member, req)) return true;
-    return holdsRoomPassword(sync.room, headerValue);
+    return member?.confirmed === true && holdsMemberKey(member, req);
   };
 
   /**
-   * Why a room people were put into may not be read: its own password, and still being in
-   * it. The password alone is not enough — a session that has been disconnected still
-   * remembers it.
+   * Why a room people were put into may not be read: a confirmed member's own key, and still
+   * being in it. The room password that once stood beside the key was retired in v1.35.1 (#332).
    *
    * One rule, because it was written twice and the two copies had already drifted: the
    * stream applied it and the backlog read beside it applied nothing, so a whole room
@@ -5491,22 +5512,14 @@ function startBridge(config) {
     const relay = refuseRelayRead(req, as);
     if (relay) return relay;
     if (as && room.members.get(as)?.relay === true) return null;
-    // A confirmed member's own key is enough on its own (#331): a session let in with a
-    // one-time code never learns the room's password, and the key already proves more — it
-    // names the one member asking, where the password names only "someone in the room".
-    if (as && room.members.get(as)?.confirmed === true && holdsMemberKey(room.members.get(as), req)) return null;
-    if (!holdsRoomPassword(room, headerValue)) {
-      return { error: "not_confirmed", message: ROOM_PASSWORD_HINT };
-    }
-    if (!as || room.members.get(as)?.confirmed !== true) {
+    const member = as ? room.members.get(as) : undefined;
+    if (!member || member.confirmed !== true) {
       return {
-        error: "not_a_member",
-        message: `Name yourself with ?as=<conversationId>; only a confirmed member of this room may ${verb} it.`,
+        error: "not_confirmed",
+        message: `Name yourself with ?as=<conversationId>; only a confirmed member of this room may ${verb} it. ${ROOM_PASSWORD_HINT}`,
       };
     }
-    // The password says a person let *someone* in; every member holds it. Only the key
-    // says the reader is the member it names (#274).
-    if (!holdsMemberKey(room.members.get(as), req)) return { error: "not_your_key", message: MEMBER_KEY_HINT };
+    if (!holdsMemberKey(member, req)) return { error: "not_your_key", message: MEMBER_KEY_HINT };
     return null;
   };
 
@@ -5518,7 +5531,7 @@ function startBridge(config) {
    */
   const MEMBER_KEY_HEADER = "x-gyredeck-member";
   const MEMBER_KEY_HINT =
-    "A read or a post in a member's name takes that member's own key in x-gyredeck-member, beside the room's password." +
+    "A read or a post in a member's name takes that member's own key in x-gyredeck-member." +
     " The key arrives with this session's own deliveries, written into the commands they hand you; a session" +
     " the Gyredeck broker cannot vouch for is never given one.";
   const holdsMemberKey = (member, req) =>
@@ -5528,8 +5541,7 @@ function startBridge(config) {
    * The one door for a read made in the name of a session that is in a room (#274 audit):
    * its inbox and wait, its private mailbox and that mailbox's stream. A member's mail is
    * taken only by the broker's collect, which knows the process asking, or with the
-   * member's own key; the shared password and the machine token are every member's and
-   * every agent's. Asked before anything is read or any position moves. A session in no
+   * member's own key; the machine token is every agent's. Asked before anything is read or any position moves. A session in no
    * room, and the relay (the app's own door), are not this door's to judge.
    */
   const refuseMemberRead = (as, req) => {
@@ -5542,7 +5554,7 @@ function startBridge(config) {
   /**
    * The one door for every read made as a relay member (#199 r3) — the stream, the backlog,
    * the inbox and the wait. Such a read moves the relay's position, which is the room's trim
-   * floor, so the room's password is not enough: any member holds that. It takes what the
+   * floor, so a member's key is not enough. It takes what the
    * app-only routes take, the machine token and the broker's word.
    */
   const isRelayMember = (as) => {
@@ -6185,36 +6197,34 @@ function startBridge(config) {
     for (const recipient of recipients) {
       const provider = providerByConversation.get(recipient);
       // A member that has not been confirmed gets none of the room's content. Reading is
-      // what the password buys — the others cannot open the stream without it, and
+      // what being let in buys — the others cannot open the stream without their key, and
       // pushing the conversation to Codex regardless would make it the one way in that
       // needs no permission at all. It is told once why it is quiet, and then nothing
-      // reaches it until a person hands over the password.
+      // reaches it until a person pastes its one-time password.
       const member = room.members.size > 0 ? room.members.get(recipient) : null;
       if (member && member.confirmed !== true) {
         if (member.toldUnconfirmed) continue;
         member.toldUnconfirmed = true;
-        // What to do with the password differs by agent, and telling everyone the same
-        // thing is how Codex ended up being asked to run a call its sandbox forbids.
-        // It cannot reach the bridge at all; the person types the password and Gyredeck
-        // does the rest, so its instruction is to ask and then wait.
+        // What to do differs by agent, and telling everyone the same thing is how Codex
+        // ended up being asked to run a call its sandbox forbids. It cannot reach the bridge
+        // at all; the person pastes the password and Gyredeck does the rest, so its
+        // instruction is to ask and then wait.
         const notice =
           provider === "codexCliHook"
-            ? "[Gyredeck: you have been put in a room here, but until someone gives you" +
-              " its password you can neither read what is said in it nor answer. Two" +
-              " things stop you calling Gyredeck about it, and both hold: the room's" +
-              " password is the x-gyredeck-token header on every such call and you do" +
-              " not have it, and your sandbox denies network syscalls outright, so even" +
-              " a request to 127.0.0.1 fails at connect rather than in transit. Ask the person at this" +
-              " terminal for the password and then wait — asking is the whole of your" +
-              " part. When they read it out of Gyredeck you are let in there and then," +
-              " and the room simply starts arriving. Nothing further will reach you" +
-              " until that happens.]"
-            : "[Gyredeck: you have been put in a room here, but until someone gives you" +
-              " its password you can neither read what is said in it nor answer. Ask the" +
-              " person at this terminal for the room's password, and to paste it as their" +
-              " next prompt here: your hook presents it and lets you in (#294). Do not send" +
-              " it yourself — a confirm sent by hand is refused. Until then, do not retry" +
-              " and do not look for another way in — nothing further will reach you.]";
+            ? "[Gyredeck: you have been put in a room here, but until you are let in you" +
+              " can neither read what is said in it nor answer, and your sandbox denies" +
+              " network syscalls outright, so you cannot call Gyredeck about it. Ask the" +
+              " person at this terminal to copy this session's one-time password from the" +
+              " key beside it in Gyredeck and paste it as their next prompt here, then wait" +
+              " — asking is the whole of your part. Once they do, the room simply starts" +
+              " arriving. Nothing further will reach you until that happens.]"
+            : "[Gyredeck: you have been put in a room here, but until you are let in you" +
+              " can neither read what is said in it nor answer. Ask the person at this" +
+              " terminal to copy this session's one-time password from the key beside it in" +
+              " Gyredeck and paste it as their next prompt here: your hook presents it and" +
+              " lets you in (#294). Do not send it yourself — a confirm sent by hand is" +
+              " refused. Until then, do not retry and do not look for another way in —" +
+              " nothing further will reach you.]";
         if (provider === "codexCliHook") {
           if (deliverToCodex(recipient, room, notice) === "queued") queued = true;
           else unavailable = true;
@@ -6825,7 +6835,7 @@ function startBridge(config) {
       return;
     }
 
-    // POST /hook/sync/confirm — the password the person typed at a Codex prompt, carried
+    // POST /hook/sync/confirm — the one-time password the person typed at a Codex prompt, carried
     // here by the one channel Codex has that needs nobody's permission.
     //
     // Codex cannot open a socket from inside its sandbox, and its hooks are each trusted
@@ -6833,11 +6843,12 @@ function startBridge(config) {
     // silence, so a new one would have shipped exactly the quiet failure this route
     // exists to remove (measured on 0.157.1, 2026-09-28). `notify` carries no such gate,
     // is already ours, and is handed `input-messages` — so the adapter tests the prompt
-    // against the shape of a room password and sends only that, never anything else the
-    // person typed.
+    // against the shape of a one-time password and sends only that, never anything else
+    // the person typed.
     //
-    // The machine token says the caller is a local process; it is the room's own password
-    // that says the person meant this session to be let in, and both are required.
+    // The machine token says the caller is a local process; it is the session's own
+    // one-time password that says the person meant this session to be let in, and both
+    // are required.
     if (req.method === "POST" && req.url === "/hook/sync/confirm") {
       if (refuseHookCall(res, req)) return;
       const body = await readJsonBody(req);
@@ -6864,8 +6875,8 @@ function startBridge(config) {
         return;
       }
       consumeTurn(conversationId, turnId);
-      if (secret.via === "code") {
-        takeJoinCode(found.room, conversationId);
+      takeJoinCode(found.room, conversationId);
+      if (found.room.members.get(conversationId)?.confirmed === true) {
         announceJoinCodeUse(found.name, found.room, conversationId, secret.issuedAt);
       }
       // Only Codex's notify reaches this route, and it is the reason the route exists:
@@ -6878,6 +6889,7 @@ function startBridge(config) {
         found.name,
         found.room,
         conversationId,
+        secret.issuedAt,
       );
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
       res.end(
@@ -7356,18 +7368,18 @@ function startBridge(config) {
       const code = segments[2];
 
       // Five acts the person performs in the app, and only there: creating a room, putting
-      // a session in one, issuing its password, taking a member out, and closing it. Each
+      // a session in one, issuing a session its join code, taking a member out, and closing it. Each
       // was authorised by something any local agent holds — a session id it can read from
       // a member list or the event log, or the machine token every agent can read from
       // disk — so any agent could found a room in another session's name and hold its
-      // password (#220), or end anyone's room (#221). The app's word is the one thing on
+      // join codes (#220), or end anyone's room (#221). The app's word is the one thing on
       // this machine no agent can read: the broker secret the app mints at launch and
       // hands this process on stdin, never on disk, in an environment or in argv. With no
       // secret there is no word to accept, so the acts are refused rather than falling back
       // to the machine token, which a release that failed to mint one would otherwise do.
       const appOnly =
         (req.method === "POST" && segments.length === 2) ||
-        (req.method === "POST" && segments.length === 4 && (segments[3] === "passwords" || segments[3] === "members")) ||
+        (req.method === "POST" && segments.length === 4 && segments[3] === "members") ||
         // Minting a session's one-time code is the app's act alone (#331).
         (req.method === "POST" && segments.length === 6 && segments[3] === "members" && segments[5] === "join-code") ||
         (req.method === "DELETE" && segments.length >= 3) ||
@@ -7390,7 +7402,7 @@ function startBridge(config) {
           sendJson(401, {
             ok: false,
             error: "app_only",
-            message: "Only the Gyredeck app can do this. Rooms are opened, joined and closed there; a session takes part once the person pastes the room's password as a prompt in it.",
+            message: "Only the Gyredeck app can do this. Rooms are opened, joined and closed there; a session takes part once the person pastes its one-time password as a prompt in it.",
           });
           return;
         }
@@ -7478,8 +7490,6 @@ function startBridge(config) {
           return;
         }
         room.createdBy = conversationId;
-        const password = newRoomPassword();
-        room.passwordHash = hashRoomPassword(password);
         const founder = {
           label: allocateLabel(room, conversationId),
           joinedAt: new Date().toISOString(),
@@ -7492,17 +7502,15 @@ function startBridge(config) {
           streamSeq: room.seq,
           lastReadAt: null,
         };
-        // Pressing Create in this session's own detail panel is the same act of intent the
-        // password exists to capture, so the founder needs no password.
-        markConfirmed(founder);
+        // Pressing Create in this session's own detail panel is the same act of intent a join
+        // code exists to capture, so the founder needs none.
+        markConfirmed(founder, conversationId);
         room.members.set(conversationId, founder);
         startHarvestAtEnd(conversationId);
         room.touchedAt = Date.now();
         // Told after the room exists, so the notice can name it and say who is there.
         tellJoined(name, room, conversationId, "you created it");
-        // The founder is handed the room's token once, here; everyone else gets it
-        // from them, by hand, into the terminal of the session being let in.
-        sendJson(201, { ok: true, password, ...describeRoom(name, room, conversationId) });
+        sendJson(201, { ok: true, ...describeRoom(name, room, conversationId) });
         return;
       }
 
@@ -7529,7 +7537,7 @@ function startBridge(config) {
 
       // POST /sync/rooms/<code>/members/<id>/join-code — a one-time code for that session alone
       // (#331), copied in the app and pasted into that session's terminal. A new one kills the
-      // last; it lives two minutes; it works once.
+      // last; it lives one minute; it works once.
       if (req.method === "POST" && segments.length === 6 && segments[3] === "members" && segments[5] === "join-code") {
         const room = mailRooms.get(code);
         const conversationId = decodeURIComponent(segments[4] ?? "");
@@ -7547,41 +7555,6 @@ function startBridge(config) {
         return;
       }
 
-      // POST /sync/rooms/<code>/passwords — the founder reads the room's password, to
-      // hand to a session being let in. The same string every time: it is presented in
-      // the x-gyredeck-token header of every read and send in this room, so it has to
-      // keep working.
-      if (req.method === "POST" && segments.length === 4 && segments[3] === "passwords") {
-        const body = await readJsonBody(req);
-        const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
-        const room = mailRooms.get(code);
-        if (!room || room.members.size === 0) {
-          sendJson(404, { ok: false, error: "no_such_room" });
-          return;
-        }
-        if (room.createdBy !== conversationId) {
-          sendJson(403, { ok: false, error: "not_the_founder" });
-          return;
-        }
-        room.touchedAt = Date.now();
-        // Reading the password out lets nobody in. It used to: the press confirmed every
-        // unconfirmed Codex member in the room at that instant, because Codex cannot open
-        // a socket from its sandbox and so could not present a password itself — the key
-        // press stood in for a consent it could not give.
-        //
-        // That is over. The password now reaches a Codex session the way it reaches every
-        // other: the person types it in, and `/hook/sync/confirm` carries it. So the press
-        // goes back to doing one thing, and the password goes back to being the thing that
-        // decides — a credential that confirms whoever holds it the moment it is copied is
-        // no credential at all. It also ends the order-dependence: pressing before a
-        // session joined confirmed nobody and nothing ever re-ran, which stranded it for
-        // good, and pressing after confirmed sessions the person had not meant to name.
-        // The bridge no longer has it to read out (#124): this answers only whether the caller
-        // is the founder, and the app shows the password it holds in memory.
-        sendJson(200, { ok: true, room: code });
-        return;
-      }
-
       // POST /sync/rooms/<code>/confirm — a joined session presents the password its
       // person typed into it, and earns the right to speak in the room.
       if (req.method === "POST" && segments.length === 4 && segments[3] === "confirm") {
@@ -7592,7 +7565,7 @@ function startBridge(config) {
           sendJson(403, {
             ok: false,
             error: "not_vouched",
-            message: "A session is let into a room by its own hook, through the Gyredeck app: paste the room's password as your prompt in that session. A confirm sent by hand is not accepted, since nothing here can tell whose session sent it.",
+            message: "A session is let into a room by its own hook, through the Gyredeck app: paste its one-time password, from the key beside it in Gyredeck, as your prompt in that session. A confirm sent by hand is not accepted, since nothing here can tell whose session sent it.",
           });
           return;
         }
@@ -7610,8 +7583,7 @@ function startBridge(config) {
         // Two very different situations answered by the same bare word, and a live
         // session met both: holding a password for a room it had never been added to,
         // and holding one for a room that had ended. Neither is something the session
-        // can fix, and both are one sentence to explain — the password is the right to
-        // speak in a room, not the way into one.
+        // can fix, and both are one sentence to explain.
         if (!room) {
           sendJson(404, {
             ok: false,
@@ -7627,7 +7599,7 @@ function startBridge(config) {
           sendJson(400, {
             ok: false,
             error: "missing_conversation_id",
-            message: `conversationId is missing or not a session id. Send your own session id with the password: {"conversationId":"<your id>","password":"<the room's password>"} to POST /sync/rooms/${code}/confirm.`,
+            message: `conversationId is missing or not a session id. Send your own session id with the password: {"conversationId":"<your id>","password":"<this session's one-time password>"} to POST /sync/rooms/${code}/confirm.`,
           });
           return;
         }
@@ -7635,7 +7607,7 @@ function startBridge(config) {
           sendJson(400, {
             ok: false,
             error: "missing_password",
-            message: `password is missing. Send the room's password with your id: {"conversationId":"${conversationId}","password":"<the room's password>"}.`,
+            message: `password is missing. Send this session's one-time password with your id: {"conversationId":"${conversationId}","password":"<this session's one-time password>"}.`,
           });
           return;
         }
@@ -7643,7 +7615,7 @@ function startBridge(config) {
           sendJson(404, {
             ok: false,
             error: "not_a_member",
-            message: "You are not in this room yet, and the password does not put you in one — it is the right to speak once you are. Ask the person at this terminal to add this session to the room from Gyredeck, then present the password again.",
+            message: "You are not in this room yet, and the password does not put you in one — it lets in a session already put there. Ask the person at this terminal to add this session to the room from Gyredeck, then present the password again.",
           });
           return;
         }
@@ -7659,7 +7631,7 @@ function startBridge(config) {
           sendJson(403, {
             ok: false,
             error: "code_for_another_session",
-            message: "That one-time code was made for another session in this room, not this one. Each session has its own: copy the one beside this session in Gyredeck.",
+            message: "That one-time password was made for another session in this room, not this one. Each session has its own: copy the one beside this session in Gyredeck.",
           });
           return;
         }
@@ -7667,7 +7639,7 @@ function startBridge(config) {
           sendJson(403, {
             ok: false,
             error: "code_expired",
-            message: "That one-time code has expired (they last two minutes). Copy a new one beside this session in Gyredeck.",
+            message: "That one-time password has expired (each lasts one minute). Copy a new one beside this session in Gyredeck.",
           });
           return;
         }
@@ -7675,7 +7647,7 @@ function startBridge(config) {
           sendJson(403, {
             ok: false,
             error: "bad_password",
-            message: "That is not this room's password. It is 32 hex characters, copied from Gyredeck by the person who made the room — a room code is not it, and neither is the machine's ingest token.",
+            message: "That is not this session's one-time password. It is 32 hex characters, copied from the key beside this session in Gyredeck — a room code is not it, and neither is the machine's ingest token.",
             // The session's own standing, to the broker that named it (#344): a member already
             // in is not told it is shut out by a value that was not the password.
             room: roomCode,
@@ -7685,24 +7657,21 @@ function startBridge(config) {
         }
         // A code is spent by any confirm it passes, a member already in included (#331 audit):
         // otherwise it works again and again, and no use of it is announced.
-        if (secret.via === "code") {
-          takeJoinCode(room, conversationId);
-          announceJoinCodeUse(roomCode, room, conversationId, secret.issuedAt);
-        }
-        const offered = secret.via === "code" ? null : password;
+        takeJoinCode(room, conversationId);
         const member = room.members.get(conversationId);
         if (member.confirmed === true) {
+          announceJoinCodeUse(roomCode, room, conversationId, secret.issuedAt);
           // Presenting it again is not an error: a session that restarts and is handed the
           // password a second time is asking the same question and gets the same answer.
           sendJson(200, {
             ok: true,
             already: true,
             ...describeRoom(roomCode, room, conversationId),
-            howTo: howToUseRoom(roomCode, offered, conversationId, BRIDGE_HOST, config.port),
+            howTo: howToUseRoom(roomCode, conversationId, BRIDGE_HOST, config.port),
           });
           return;
         }
-        confirmRoomMember(roomCode, room, conversationId);
+        confirmRoomMember(roomCode, room, conversationId, secret.issuedAt);
         sendJson(200, {
           ok: true,
           ...describeRoom(roomCode, room, conversationId),
@@ -7711,7 +7680,7 @@ function startBridge(config) {
           // itself, and so the one place an instruction is certain to be read —
           // everything a hook injects lands a turn later, by which point the session has
           // usually guessed.
-          howTo: howToUseRoom(roomCode, offered, conversationId, BRIDGE_HOST, config.port),
+          howTo: howToUseRoom(roomCode, conversationId, BRIDGE_HOST, config.port),
         });
         return;
       }
@@ -7763,11 +7732,11 @@ function startBridge(config) {
           room.members.set(conversationId, {
             label: allocateLabel(room, conversationId),
             // The person pressing Connect is the consent a password exists to capture, as
-            // pressing Create is for a founder; the relay reads with the password the app
-            // holds and is refused every post (`refuseToPublish`).
+            // pressing Create is for a founder; the relay reads by the app's word and is
+            // refused every post (`refuseToPublish`).
             ...(relay ? { relay: true, relayFrom: room.seq } : {}),
             // Joining puts a session in the room; it does not yet let it speak. The
-            // person confirms that separately, by typing the room's password into this
+            // person confirms that separately, by pasting its one-time password into this
             // session's own terminal — an act performed where the session lives rather
             // than in another window.
             confirmed: false,
@@ -7785,13 +7754,9 @@ function startBridge(config) {
           tellJoined(code, room, conversationId, "someone put you in it from the app");
         }
         room.touchedAt = Date.now();
-        // No `howTo`, and so no password. Joining is deliberately open — putting a session
-        // in a room grants it nothing — but the answer used to carry the room's password
-        // whenever the *named* session was already confirmed, without ever asking who was
-        // calling. Anything on this machine could name a member and be handed the one
-        // thing a person is supposed to read out by hand. Nothing on the desktop side
-        // reads `howTo`; the session that needs it gets it from `/confirm`, where it has
-        // just presented the password.
+        // No `howTo`. Joining is deliberately open — putting a session in a room grants it
+        // nothing. Nothing on the desktop side reads `howTo`; the session that needs it gets
+        // it from `/confirm`, where it has just presented its one-time password.
         sendJson(200, { ok: true, ...describeRoom(code, room, conversationId) });
         return;
       }
@@ -7848,7 +7813,7 @@ function startBridge(config) {
         return;
       }
       const payload = await readJsonBody(req);
-      const admitted = noteBrokerBound(payload?.conversationId);
+      const admitted = noteBrokerBound(payload?.conversationId, payload?.generation ?? null);
       if (admitted === null) {
         sendJson(400, { ok: false, error: "invalid_session" });
         return;
@@ -7863,9 +7828,8 @@ function startBridge(config) {
 
     // ── Usage (#158) ──
     // POST /usage — the app hands over each provider's usage as it reads it (machine token).
-    // GET /usage?as=<id> — that session's own provider's usage (machine token, or the
-    // password of the room the session is in; a room member's own key too, the same door
-    // as its inbox).
+    // GET /usage?as=<id> — that session's own provider's usage (machine token, or a room
+    // member's own key, the same door as its inbox).
     if (req.url === "/usage" || req.url.startsWith("/usage?")) {
       const sendJson = (status, body) => {
         res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
@@ -7948,8 +7912,8 @@ function startBridge(config) {
       // GET /mail — which rooms exist, so a peer can find its counterpart.
       //
       // The whole table, every room and its roster, which is the app's view and not a
-      // member's. The door above admits a room's password too, so this one route has to
-      // say which of the two it takes: passing the shape check is not being the app.
+      // member's. The door above admits a member's key too, so this one route has to
+      // say which it takes: passing the shape check is not being the app.
       if (req.method === "GET" && segments.length === 1) {
         if (!holdsMachineToken(headerToken)) {
           sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
@@ -8048,7 +8012,7 @@ function startBridge(config) {
             : [mine.to];
           const unconfirmed = target.filter((id) => sync.room.members.get(id)?.confirmed !== true);
           if (target.length > 0 && unconfirmed.length === target.length) {
-            return { ...base, reason: "Everyone it was addressed to is still waiting for the room's password, so none of them can read it yet." };
+            return { ...base, reason: "Everyone it was addressed to is still waiting to be let in with their one-time password, so none of them can read it yet." };
           }
           if (target.length === 0) {
             return { ...base, reason: "There is nobody else in this room to answer." };
@@ -8080,7 +8044,7 @@ function startBridge(config) {
           const at = new Date().toISOString();
           const sync = syncRoomFor(as);
           // A session's own mailbox is always its own to read. Its room is not: reading
-          // is what the password buys, and a merge that handed the room over anyway
+          // is what being let in buys, and a merge that handed the room over anyway
           // would be the same leak as pushing it — one door closed, another open. The
           // room is still *named* in the answer, so an unconfirmed session can be told
           // where it is and what it lacks.
@@ -8454,18 +8418,16 @@ function startBridge(config) {
         // the room already remembers as confirmed could be spoken for by anything that
         // sent the header non-empty — the one thing mail must not allow.
         //
-        // Either credential: the room's own password, or the machine token. Not the
-        // password alone, because the founder is confirmed by pressing Create and has no
-        // password in hand until a person reads one out — that exemption is the design,
-        // not an oversight. The machine token is read by every agent on this machine, so
-        // this does not isolate one local agent from another; that needs a per-session
-        // credential and is written up in event-protocol.md.
+        // Either credential: a confirmed member's own key, or the machine token. The machine
+        // token is read by every agent on this machine, so it does not isolate one local
+        // agent from another; which member may post is checked once the body names the
+        // sender (#294).
         const standing = SYNC_CODE.test(name) ? mailRooms.get(name) ?? null : null;
         if (standing && standing.members.size > 0) {
           // Or a confirmed member's own key (#331): which member it must be is checked once the
           // body names the sender — a post in a member's name takes that member's key (#294).
           const anyMemberKey = [...standing.members.values()].some((member) => member.confirmed === true && holdsMemberKey(member, req));
-          if (!holdsMachineToken(headerToken) && !holdsRoomPassword(standing, headerToken) && !anyMemberKey) {
+          if (!holdsMachineToken(headerToken) && !anyMemberKey) {
             sendJson(403, { ok: false, error: "not_confirmed", message: ROOM_PASSWORD_HINT });
             return;
           }
@@ -8498,13 +8460,13 @@ function startBridge(config) {
           return;
         }
         // A post never lets a member in (#294, the owner's decision): a pending member is
-        // confirmed only by the password it is handed through its hook's /confirm, and a
+        // confirmed only by the one-time password it is handed through its hook's /confirm, and a
         // post in a member's name takes that member's own key, which a pending one has not.
         // The app's own call: the machine token and the app's word together, the pair the
         // app-only routes take. Only it may speak as the room or the person (#205).
         const vouched = holdsMachineToken(headerToken) && holdsBrokerSecret(req.headers["x-gyredeck-broker"]);
         // A post in a member's name takes that member's own key or the broker's word (#294),
-        // the door #274 set for reads: the password and the machine token are every member's.
+        // the door #274 set for reads: the machine token is every agent's.
         const notTheirs = refuseToPublish(room, from, vouched) ? null : refuseMemberRead(from, req);
         if (notTheirs) {
           sendJson(403, { ok: false, ...notTheirs });
@@ -8517,7 +8479,7 @@ function startBridge(config) {
             error: refusal,
             message:
               refusal === "not_confirmed"
-                ? "This room needs its own password. Ask the person at this terminal for it, then send it as the x-gyredeck-token header."
+                ? ROOM_PASSWORD_HINT
                 : refusal === "relay_only"
                   ? "This member relays the room to Discord and never posts in it."
                   : refusal === "reserved_sender"
@@ -8637,8 +8599,8 @@ function startBridge(config) {
             message:
               "This message was not published: it would put more mail behind an unconfirmed" +
               ` member than can be handed over in one go (${Math.round(CODEX_PUSH_MAX_BYTES / 1024)} KB).` +
-              (waiting.length > 0 ? ` Still waiting for the room's password: ${waiting.join(", ")}.` : "") +
-              " Give them the password and the backlog clears, or wait until they are in.",
+              (waiting.length > 0 ? ` Still waiting for their one-time password: ${waiting.join(", ")}.` : "") +
+              " Let them in and the backlog clears, or wait until they are in.",
           });
           return;
         }
@@ -8853,16 +8815,15 @@ function startBridge(config) {
         // Asked before the name is resolved, because resolving a mailbox name creates it:
         // an uncredentialed caller must otherwise be able to fill the room table with
         // mailboxes nobody will ever read. A room that has members is not covered here —
-        // its own password is what stands in front of it, further down.
+        // its members' keys are what stand in front of it, further down.
         const standing = SYNC_CODE.test(name) ? mailRooms.get(name) ?? null : null;
         if ((standing?.members.size ?? 0) === 0 && !holdsMailboxCredential(name, headerToken)) {
           refuseStream(401, "unauthorized", TOKEN_HINT);
           return;
         }
         // The stream of a private mailbox is a read of it, and the same door applies.
-        // A sync room's stream is the room's: its password and the watcher's own key
-        // (#274) — the password alone is every member's, and the watch moves the named
-        // member's resume cursor.
+        // A sync room's stream is the room's: the watcher's own key (#274), since the watch
+        // moves the named member's resume cursor.
         if (!SYNC_CODE.test(name)) {
           const closed = refuseMailboxRead(name, brokerHeader) ?? refuseMemberRead(name, req);
           if (closed) {
@@ -8879,11 +8840,10 @@ function startBridge(config) {
           }
           return;
         }
-        // Reading a room people were put into needs that room's password — not the
-        // machine's, which every agent can read — and it needs the reader to still be
-        // in the room. The password alone is not enough: a session that has been
-        // disconnected still remembers it, and without this its watch would keep
-        // running on a room it was removed from.
+        // Reading a room people were put into needs the reader's own key — not the
+        // machine's token, which every agent can read — and it needs the reader to still
+        // be in the room, or a disconnected session's watch would keep running on a room
+        // it was removed from.
         const watcher = url.searchParams.get("as") ?? null;
         const refusal = refuseRoomRead(room, headerToken, watcher, "watch", req);
         if (refusal) {
@@ -9203,7 +9163,8 @@ if (isEntryPoint) {
           if (setBrokerSecret(line.slice("broker-secret ".length).trim())) secretGiven = true;
           else fail("the secret line is malformed");
         } else if (line.startsWith("broker-bound ")) {
-          const admitted = noteBrokerBound(line.slice("broker-bound ".length).trim());
+          const [boundId, boundGeneration] = line.slice("broker-bound ".length).trim().split(/\s+/);
+          const admitted = noteBrokerBound(boundId, boundGeneration === undefined ? null : /^[0-9]{1,15}$/.test(boundGeneration) ? Number(boundGeneration) : -1);
           if (admitted === null) fail("a bound session id is malformed");
           else if (admitted === false) fail(`the ledger exceeds the bridge's table (${BROKER_BOUND_MAX})`);
         } else if (line === "broker-ready") {

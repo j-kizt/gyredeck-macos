@@ -512,8 +512,8 @@ const getJson = (endpoint, token, path) =>
  * undelivered message is always better than a stalled prompt.
  */
 /**
- * A room password as the app hands it out: thirty-two hex characters, the shape of an
- * MD5 digest.
+ * A session's one-time password as the app hands it out (#331, #332): thirty-two hex
+ * characters, the shape of an MD5 digest.
  *
  * Anchored on word boundaries so it is found in a line of prose — the person pastes it
  * and usually says something around it. Nothing else of this shape is likely to be
@@ -522,11 +522,11 @@ const getJson = (endpoint, token, path) =>
 const ROOM_PASSWORD = /\b[0-9a-f]{32}\b/;
 
 /**
- * Take a room password out of what the person typed and present it to the bridge.
+ * Take a session's one-time password out of what the person typed and present it to the bridge.
  *
  * This is how a session earns the right to read and speak in a room it was joined to:
- * the person copies the room's password from its owner and types it in here, where the
- * session lives. Joining happens in the app; consenting happens in the terminal.
+ * the person copies this session's password from the key in the app and types it in here,
+ * where the session lives. Joining happens in the app; consenting happens in the terminal.
  *
  * Returns the room it confirmed and who is in it, or null. Failure is deliberately quiet — a
  * prompt that merely looks like a password is not worth an error in front of the person.
@@ -590,7 +590,7 @@ const approvedCommand = async (endpoint, token, conversationId, input) => {
  */
 const acceptedLine = (room) =>
   `NEW: the password you were just given was accepted for sync room ${room} — you may now read and post here.` +
-  " The hex you just pasted was this room's password and has been used: do not repeat it, and do not ask about it.";
+  " The hex you just pasted was this session's one-time password and is spent: do not repeat it, and do not ask about it.";
 
 /**
  * The collected messages as plain lines, for when building the delivery threw (#168).
@@ -824,10 +824,11 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
     // The refusal is easy to misread as a bug, so say what is missing and who has it
     // rather than leaving the session to work it out from a 403.
     standing.push(
-      "BLOCKED: you cannot read or post in this room yet. It needs the room's own" +
-        " password — a long line of hex the person copies from the key beside the room" +
-        " code in Gyredeck. Ask for it and wait; do not retry without it and do not" +
-        " look for another way in.\n" +
+      "BLOCKED: you cannot read or post in this room yet. It needs this session's own" +
+        " one-time password — a long line of hex the person copies from the key beside" +
+        " this session in Gyredeck's room. It works once, for this session only, and for" +
+        " one minute. Ask for it and wait; do not retry without it and do not look for" +
+        " another way in.\n" +
         "The person pastes it as their next prompt here, and this hook presents it for" +
         " you (#294): do not send it yourself — a confirm sent by hand is refused. The" +
         " next turn says whether you are in. Until it says the password was accepted," +

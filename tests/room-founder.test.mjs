@@ -30,8 +30,8 @@ test("a room still holding its founder is left alone", () => {
 
 test("a room whose founder is gone is over, whoever else is in it", () => {
   // The case that matters: somebody is still there, so nothing else would clear it. What
-  // is left cannot be joined — `/passwords` answers `not_the_founder` to everyone
-  // remaining — and cannot be closed, because the app asks as itself and is refused too.
+  // is left has no founder to bring anyone in, and cannot be closed, because the app asks as
+  // itself and is refused too.
   assert.equal(roomHasLostItsFounder(room({ members: ["peer"] })), true);
   assert.equal(roomHasLostItsFounder(room({ members: [] })), true);
 });

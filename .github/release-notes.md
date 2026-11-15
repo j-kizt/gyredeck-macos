@@ -1,5 +1,28 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Reinstalling the Codex hook keeps your hooks where they were — (v1.35.3)
+
+### Fixes
+
+- **Reinstalling the Codex hook no longer moves your own hooks.** Codex ties a hook's approval to
+  its place in its config. A reinstall used to remove Gyredeck's entries and add them again at the
+  end, which put them behind a hook of yours on the same event and moved yours into Gyredeck's old
+  place, so both lost their approval. Gyredeck's entries are now rewritten where they already are,
+  and added at the end only for an event they were not in. An empty entry someone else left keeps
+  its place too.
+- **A hook that only mentions Gyredeck's script is left alone.** A Codex or Claude Code install now
+  treats a hook as Gyredeck's only when it is exactly the command the installer writes: `node`, or
+  an absolute path to `node`, then the script, then `--event` and the event name. A copy such as
+  `gyredeck-claude-hook.mjs.backup`, another script given Gyredeck's path as an argument, or a
+  command with other shell commands around it is no longer replaced or removed, and no longer
+  counts as Gyredeck being installed.
+
+Known limits: an extra copy of Gyredeck's own hook, left by an older version or a hand edit, is
+still removed, so the hooks after it move up one place and Codex asks to approve them again.
+Keeping it would relay every event twice. A Gyredeck hook whose `node` path contains a space or
+another character the shell treats specially is not recognised as Gyredeck's, so a reinstall adds
+a new entry beside it.
+
 ## What is said in a sync room stays off the bridge's open stream — (v1.35.2)
 
 ### Fixes

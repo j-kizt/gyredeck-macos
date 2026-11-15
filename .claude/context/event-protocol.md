@@ -49,6 +49,7 @@ Bound to `127.0.0.1:47621`.
 | GET | `/health` | Bridge identity + capabilities. |
 | GET | `/snapshot` | `recent: GyredeckEvent[]` + capabilities. |
 | GET | `/events` | Live Server-Sent Events stream. |
+| GET | `/events/app` | The app's own stream: `room_message` events only. Machine token **and** the app's word, else `401 app_only` (#391). |
 | POST | `/ingest` | Multi-provider event fan-in (accepts a full envelope). |
 | POST | `/hook/stop` | Turn-completion relay → `turn_complete`. |
 | POST | `/hook/attention` | Attention/permission relay → `attention_requested`. |
@@ -202,7 +203,7 @@ The threat model, because a per-session secret was proposed more than once befor
 - Every hook and every agent runs as the same Unix user, so each can read anything the others can — the machine token included, which the app itself teaches them to read.
 - A hook is a process that lives for milliseconds. It cannot remember a secret between invocations, so a per-session secret would have to be written where the next invocation can find it — which is to say where every other agent can find it too. (#274's key is not stored by the hook: it is handed again on each broker-vouched delivery and lives in the command the session runs.)
 - `?as=` is a name the caller writes. Nothing in an HTTP request over loopback tells the bridge which process sent it: Node exposes no peer credentials for a TCP socket, and none for a Unix socket either.
-- `GET /snapshot` and `GET /events` are open by design, so the conversation ids to name are not secret in the first place.
+- `GET /snapshot` and `GET /events` are open by design, so the conversation ids to name are not secret in the first place. What was said in a room is not on them (#391).
 
 ### The mailbox broker — verified process identity plus first-claim session binding
 
@@ -380,8 +381,16 @@ room's stream take `?as=` naming a confirmed member **and** that member's own ke
 this with a shared room password beside `?as=`, which admitted a reader naming *any* confirmed member; that
 password is retired (v1.35.1, #332) and only the member's own key remains. The limit is the one stated above:
 the key does not defend against an agent searching another's files.
-`/events` and `/snapshot` still hand out 160-character previews of room messages to
-anyone on the machine, for the app's own panel; closing that is its own card.
+Room messages are not on `/events` or `/snapshot`, and not in the event log (#391): a
+`room_message` — which session is in which room, who spoke, a 160-character preview — goes
+out only on `GET /events/app`, which takes the machine token **and** the app's word. The app
+reads it from its Rust side and hands each event to the webview, since an `EventSource`
+cannot send a header. Each carries an SSE `id` (`<bridge instance>:<seq>`); the bridge keeps
+the last 200 and replays those after `?since=<id>`, or all of them when the id names another
+bridge instance, so an app that starts or reconnects late misses nothing. The Rust side keeps
+its own 200 for a webview that loads after them (`app_events`); Rust numbers each event as it arrives and hands it over as `{ n, event }`, live and kept alike; the webview holds live ones until the kept list is in, then hands both on in that order and never one older than the last, so a room switch in that moment cannot put an inbox back in the old room. A gap longer than 200 room messages loses the oldest from the app's inbox and banners, without saying so; the bound is there because the backlog lives in the bridge's memory. A log written before #391 is
+scrubbed of them once when the bridge starts, both generations. `/ingest` refuses a posted `room_message` (`400 reserved_type`): only the bridge says
+what was said in a room.
 
 **WAIT goes through the broker.** The instruction the Claude hook prints is now
 `node ~/.config/gyredeck/gyredeck-claude-hook.mjs wait 60 <id>` (an allow-rule for it is

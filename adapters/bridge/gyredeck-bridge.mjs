@@ -17,6 +17,7 @@
  *   GET  /health    - Bridge status and capabilities
  *   GET  /snapshot  - Current capabilities and recent events
  *   GET  /events    - Live Server-Sent Events stream
+ *   GET  /events/app - The app's own stream (room messages); token and the app's word
  *   POST /hook/stop - Turn completion hook relay
  *   POST /hook/attention - Attention/permission hook relay
  *   POST /ingest    - Multi-provider event fan-in
@@ -1974,6 +1975,11 @@ function createScopeTracker() {
  */
 const LOG_FILE_MODE = 0o600;
 
+/** Events only the app may read (#391), carried on `/events/app` and nowhere else. */
+const APP_ONLY_EVENTS = new Set(["room_message"]);
+/** How many of them the bridge keeps to replay to an app stream that reconnects. */
+const APP_BACKLOG_MAX = 200;
+
 /**
  * How large the event log may get, and how much of it is read back at startup.
  *
@@ -2049,6 +2055,32 @@ const openPrivateLog = (logFile) => {
  */
 export const rotateEventLog = (logFile) => {
   renameSync(logFile, rotatedLogPath(logFile));
+};
+
+/**
+ * Take what was said in rooms out of a log written before #391.
+ *
+ * Bridges before #391 wrote every `room_message` (its preview, who sent it and to whom) into
+ * the log beside everything else. Nothing writes one there now, so after the first start this
+ * finds nothing and writes nothing. Both generations are checked; a path that is not a plain
+ * file is left alone, as `openPrivateLog` would refuse it anyway.
+ */
+export const scrubAppOnlyEvents = (logFile) => {
+  for (const path of [rotatedLogPath(logFile), logFile]) {
+    let found;
+    try {
+      found = lstatSync(path);
+    } catch {
+      continue;
+    }
+    if (!found.isFile()) continue;
+    const text = readFileSync(path, "utf8");
+    if (![...APP_ONLY_EVENTS].some((type) => text.includes(`"${type}"`))) continue;
+    const kept = text.split("\n").filter((line) => {
+      try { return !APP_ONLY_EVENTS.has(JSON.parse(line)?.type); } catch { return true; }
+    });
+    writeFileAtomically(path, kept.join("\n"), LOG_FILE_MODE);
+  }
 };
 
 /**
@@ -2134,6 +2166,11 @@ function startBridge(config) {
   const roomRulesReady = writeRoomRules(`http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}`);
   // Beside the rules, for the same reason: the helper names the port it calls.
   writeHeavyHelper(`http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}`);
+  try {
+    scrubAppOnlyEvents(config.logFile);
+  } catch (error) {
+    console.error(`gyredeck: could not scrub room messages from the event log — ${error.code ?? error.message}`);
+  }
   const eventLog = openEventLog(config.logFile);
   if (!eventLog.enabled) console.error(`gyredeck: event log disabled — ${eventLog.why}`);
 
@@ -2144,8 +2181,16 @@ function startBridge(config) {
   };
 
   const clients = new Set();
+  // The app's own stream (#391): what was said in a room, and to whom, is for the app alone.
+  const appClients = new Set();
+  // Kept so a reconnect misses nothing (#391 audit): the app's stream asks from the last id it
+  // saw. An id names this bridge too, so one from a bridge before a restart replays everything.
+  const appStreamId = randomUUID().slice(0, 8);
+  const appBacklog = [];
+  let appSeq = 0;
   const maxRecent = 500;
-  const recent = readRecentEvents(config.logFile, maxRecent);
+  // A log written before #391 still holds room messages; they are not served from it.
+  const recent = readRecentEvents(config.logFile, maxRecent).filter((event) => !APP_ONLY_EVENTS.has(event.type));
   const tracker = createScopeTracker();
 
   /**
@@ -2224,6 +2269,18 @@ function startBridge(config) {
     // A voice that is not a session is never one (#205 audit): no event makes it a
     // provider, a presence, or a Codex thread to harvest.
     if (isReservedId(payload?.conversationId)) return;
+    // Who is in which room, who spoke and what they said (#391): never on the public stream,
+    // in /snapshot or in the log on disk — only on the app's stream, which takes its word.
+    if (APP_ONLY_EVENTS.has(payload?.type)) {
+      appSeq += 1;
+      const frame = `id: ${appStreamId}:${appSeq}\nevent: ${payload.type}\ndata: ${JSON.stringify(payload)}\n\n`;
+      appBacklog.push({ seq: appSeq, frame });
+      if (appBacklog.length > APP_BACKLOG_MAX) appBacklog.shift();
+      for (const res of appClients) {
+        try { res.write(frame); } catch { appClients.delete(res); }
+      }
+      return;
+    }
     tracker.rememberScope(payload);
     rememberProvider(payload);
     tellCodexOfHeavyRuns(payload?.conversationId);
@@ -6815,6 +6872,12 @@ function startBridge(config) {
         res.end(JSON.stringify({ ok: false, error: "reserved_id", message: "That id is the room's or the person's own voice, never a session." }));
         return;
       }
+      // Only the bridge says what was said in a room (#391): a posted one would be a forged banner.
+      if (body && typeof body === "object" && APP_ONLY_EVENTS.has(body.type)) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+        res.end(JSON.stringify({ ok: false, error: "reserved_type", message: "Room messages come from the bridge, never from a hook." }));
+        return;
+      }
       if (body && typeof body === "object" && typeof body.type === "string" && typeof body.id === "string") {
         emitLocal(body, { stampedBySession: true });
         res.writeHead(202, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
@@ -6998,6 +7061,30 @@ function startBridge(config) {
     if (req.url === "/snapshot") {
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
       res.end(JSON.stringify({ ok: true, recent, capabilities }));
+      return;
+    }
+
+    // The app's stream (#391): the machine token and the app's word, the pair the app-only
+    // routes take. The webview cannot send headers on an EventSource, so the app reads this
+    // one from its Rust side and hands the webview what it carries.
+    if (req.url === "/events/app" || req.url.startsWith("/events/app?")) {
+      if (!holdsMachineToken(req.headers["x-gyredeck-token"]) || !holdsBrokerSecret(req.headers["x-gyredeck-broker"])) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
+        res.end(JSON.stringify({ ok: false, error: "app_only", message: "Only the Gyredeck app reads its own stream." }));
+        return;
+      }
+      res.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+        "x-accel-buffering": "no",
+      });
+      res.write(`: gyredeck app stream connected ${new Date().toISOString()}\n\n`);
+      const [sinceStream, sinceSeq] = (new URL(req.url, "http://127.0.0.1").searchParams.get("since") ?? "").split(":");
+      const after = sinceStream === appStreamId && Number.isInteger(Number(sinceSeq)) ? Number(sinceSeq) : 0;
+      for (const kept of appBacklog) if (kept.seq > after) res.write(kept.frame);
+      appClients.add(res);
+      req.on("close", () => appClients.delete(res));
       return;
     }
 

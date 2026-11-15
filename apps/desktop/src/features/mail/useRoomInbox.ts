@@ -149,35 +149,48 @@ export const retainOpenRooms = (
  * Persisted because the question it answers is "what did I miss", and the answer must
  * survive the window being closed, which is exactly when messages arrive unseen.
  */
-export const useRoomInbox = ({ lastLiveEvent }: { lastLiveEvent: GyredeckEvent | null }) => {
+/**
+ * Every room message in `events` not yet in `recorded`, in order, each once.
+ *
+ * A list rather than the last live event (#391): what the app missed while it was not
+ * listening is handed back in one burst, and React keeps only the last of a burst of
+ * `lastLiveEvent` updates. Each event once by id, since re-recording an old room's message
+ * would put the session back in that room.
+ */
+export const recordRoomMessages = (
+  registry: RoomInboxRegistry,
+  events: GyredeckEvent[],
+  recorded: Set<string>,
+): RoomInboxRegistry =>
+  events.reduce((current, event) => {
+    if (event.type !== "room_message" || recorded.has(event.id)) return current;
+    recorded.add(event.id);
+    if (!event.conversationId) return current;
+    const data = event.data;
+    return recordMessage(current, event.conversationId, {
+      seq: data.seq,
+      room: data.room,
+      from: data.from,
+      fromLabel: data.fromLabel,
+      kind: data.kind,
+      preview: data.preview,
+      at: event.timestamp,
+    });
+  }, registry);
+
+export const useRoomInbox = ({ roomMessages }: { roomMessages: GyredeckEvent[] }) => {
   const [registry, setRegistry] = useState<RoomInboxRegistry>(read);
-  // The same event object can arrive again as other state settles; its id is the only
-  // thing that says "already counted", and counting twice is the visible failure.
-  const recordedRef = useRef<string | null>(null);
+  // The same events arrive again as other state settles; an id is the only thing that says
+  // "already counted", and counting twice is the visible failure.
+  const recordedRef = useRef(new Set<string>());
 
   useEffect(() => {
-    if (!lastLiveEvent || lastLiveEvent.type !== "room_message") return;
-    if (recordedRef.current === lastLiveEvent.id) return;
-    recordedRef.current = lastLiveEvent.id;
-
-    const conversationId = lastLiveEvent.conversationId;
-    if (!conversationId) return;
-    const data = lastLiveEvent.data;
-
     setRegistry((current) => {
-      const next = recordMessage(current, conversationId, {
-        seq: data.seq,
-        room: data.room,
-        from: data.from,
-        fromLabel: data.fromLabel,
-        kind: data.kind,
-        preview: data.preview,
-        at: lastLiveEvent.timestamp,
-      });
+      const next = recordRoomMessages(current, roomMessages, recordedRef.current);
       if (next !== current) write(next);
       return next;
     });
-  }, [lastLiveEvent]);
+  }, [roomMessages]);
 
   const markRead = useCallback((conversationId: string) => {
     setRegistry((current) => {

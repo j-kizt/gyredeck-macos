@@ -4259,7 +4259,7 @@ test("a room message reaches the presence stream, but only when it asks somethin
 
     // Mail and presence were separate streams, and the app only polls rooms while the
     // session list is on screen — never when a person most needs telling.
-    const stream = await fetch(`http://127.0.0.1:${port}/events`, { headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD } });
+    const stream = await fetch(`http://127.0.0.1:${port}/events/app`, { headers: { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD } });
     const reader = stream.body.getReader();
     let seen = "";
     const pump = (async () => {
@@ -4300,6 +4300,126 @@ test("a room message reaches the presence stream, but only when it asks somethin
     // notifications get switched off.
     assert.doesNotMatch(seen, /A-REACTION/, "a reaction is not worth interrupting anyone for");
     assert.doesNotMatch(seen, /FOR-SOMEONE-ELSE/, "somebody else's mail is not yours to be told about");
+  } finally {
+    bridge.kill();
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test("c391 what was said in a room reaches the app's stream and nothing any other caller can read", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-c391-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  // A log a bridge before #391 wrote: a room message with its preview, beside a presence event.
+  const logFile = join(home, ...CONFIG_DIR, "gyredeck.events.ndjson");
+  const earlier = { version: 1, id: "old-room", type: "room_message", timestamp: new Date().toISOString(), conversationId: "c391-old", data: { room: "OLDROOM", preview: "OLD-PREVIEW" } };
+  const presence = { version: 1, id: "old-open", type: "conversation_open", timestamp: new Date().toISOString(), conversationId: "c391-old", data: {} };
+  await writeFile(logFile, `${JSON.stringify(earlier)}\n${JSON.stringify(presence)}\n`, { mode: 0o600 });
+  const rotated = `${logFile}.1`;
+  const older = { ...earlier, id: "older-room", data: { room: "OLDROOM", preview: "OLDER-PREVIEW" } };
+  await writeFile(rotated, `${JSON.stringify(older)}\n`, { mode: 0o600 });
+
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+
+  const founder = "c391-founder";
+  const peer = "c391-peer";
+  const base = `http://127.0.0.1:${port}`;
+  const open = async (path, headers) => {
+    const response = await fetch(base + path, { headers });
+    const reader = response.body.getReader();
+    const got = { status: response.status, text: "" };
+    got.done = (async () => {
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) return;
+          got.text += new TextDecoder().decode(value);
+        }
+      } catch {}
+    })();
+    got.close = async () => { reader.cancel().catch(() => {}); await got.done; };
+    return got;
+  };
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
+    const call = async (method, path, body, with_ = headers) => {
+      const response = await fetch(base + path, { method, headers: with_, body: body ? JSON.stringify(body) : undefined });
+      return { status: response.status, body: await response.json() };
+    };
+
+    const created = await call("POST", "/sync/rooms", { conversationId: founder });
+    const code = created.body.room;
+    await call("POST", `/sync/rooms/${code}/members`, { conversationId: peer });
+    await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: peer, password: (await call("POST", `/sync/rooms/${code}/members/${peer}/join-code`, {})).body.code });
+
+    // Said before the app's stream is open: the gap a starting or reconnecting app has.
+    assert.equal((await call("POST", `/mail/${code}`, { from: peer, text: "EARLY-ASK", kind: "ask", to: "everyone" })).body.ok, true);
+    const appHeaders = { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
+    const app = await open("/events/app", appHeaders);
+    const stranger = await open("/events", {});
+    const agent = await open("/events", { "x-gyredeck-token": token });
+    assert.equal(app.status, 200);
+
+    assert.equal((await call("POST", `/mail/${code}`, { from: peer, text: "SECRET-ASK", kind: "ask", to: "everyone" })).body.ok, true);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await Promise.all([app.close(), stranger.close(), agent.close()]);
+
+    assert.match(app.text, /SECRET-ASK/, "the app is told");
+    assert.match(app.text, /EARLY-ASK/, "including what was said before it connected");
+    const lastId = [...app.text.matchAll(/^id: (\S+)$/gm)].at(-1)?.[1];
+    assert.ok(lastId, "each app event carries an id to resume from");
+
+    assert.equal((await call("POST", `/mail/${code}`, { from: peer, text: "LATE-ASK", kind: "ask", to: "everyone" })).body.ok, true);
+    const replay = async (path) => {
+      const got = await open(path, appHeaders);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await got.close();
+      return got.text;
+    };
+    const resumed = await replay(`/events/app?since=${lastId}`);
+    assert.match(resumed, /LATE-ASK/, "a reconnect gets what it missed");
+    assert.doesNotMatch(resumed, /EARLY-ASK|SECRET-ASK/, "and nothing it already had");
+    const foreign = await replay("/events/app?since=deadbeef:999");
+    for (const said of ["EARLY-ASK", "SECRET-ASK", "LATE-ASK"]) {
+      assert.match(foreign, new RegExp(said), "an id from another bridge gets everything kept");
+    }
+    assert.match(app.text, /event: room_message/);
+    for (const [who, got] of [["no credential", stranger], ["the machine token alone", agent]]) {
+      assert.doesNotMatch(got.text, /SECRET-ASK|room_message/, `the public stream, read with ${who}, carries no room message`);
+    }
+
+    const snapshot = await (await fetch(`${base}/snapshot`)).json();
+    const types = snapshot.recent.map((event) => event.type);
+    assert.ok(!types.includes("room_message"), "nor does /snapshot — the one just said or the one in an old log");
+    assert.ok(snapshot.recent.some((event) => event.id === "old-open"), "presence from the old log is still served");
+    assert.doesNotMatch(await readFile(logFile, "utf8"), /SECRET-ASK/, "and the log on disk does not keep it");
+    assert.doesNotMatch(await readFile(logFile, "utf8"), /OLD-PREVIEW/, "what an old bridge wrote is scrubbed at start");
+    assert.match(await readFile(logFile, "utf8"), /old-open/, "and the presence beside it is kept");
+    assert.doesNotMatch(await readFile(rotated, "utf8"), /OLDER-PREVIEW/, "the rotated generation too");
+    assert.equal((await stat(logFile)).mode & 0o777, 0o600, "the scrubbed log stays private");
+
+    // The app's stream takes both: the machine token alone is every agent's.
+    for (const [who, with_] of [["nothing", {}], ["the machine token alone", { "x-gyredeck-token": token }], ["the app's word alone", { "x-gyredeck-broker": TEST_APP_WORD }]]) {
+      const refused = await fetch(`${base}/events/app`, { headers: with_ });
+      assert.equal(refused.status, 401, `refused with ${who}`);
+      assert.equal((await refused.json()).error, "app_only");
+    }
+
+    // Only the bridge says what was said in a room: a posted one would be a forged banner.
+    const forged = await call("POST", "/ingest", { version: 1, id: "forged", type: "room_message", timestamp: new Date().toISOString(), conversationId: founder, data: { room: code, preview: "FORGED" } });
+    assert.equal(forged.status, 400);
+    assert.equal(forged.body.error, "reserved_type");
+    assert.ok(!(await (await fetch(`${base}/snapshot`)).json()).recent.some((event) => event.id === "forged"));
   } finally {
     bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });

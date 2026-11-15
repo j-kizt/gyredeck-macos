@@ -25,6 +25,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 mod agy_statusline;
+mod app_stream;
 mod broker;
 mod discord;
 mod github;
@@ -6199,6 +6200,7 @@ pub fn run() {
 
     let command_handler: Box<tauri::ipc::InvokeHandler<tauri::Wry>> =
         Box::new(tauri::generate_handler![
+            app_stream::app_events,
             agy_usage,
             session_registry_load,
             session_registry_save,
@@ -6293,6 +6295,7 @@ pub fn run() {
         .manage(broker::BrokerState::default())
         .manage(heavy_watch::HeavyWatchState::default())
         .manage(discord::DiscordState::default())
+        .manage(app_stream::AppStreamState::default())
         .invoke_handler(move |invoke| command_handler(invoke))
         .setup(|app| {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -6357,6 +6360,9 @@ pub fn run() {
             // one bridge call with the machine token and the broker's word, for the session
             // the OS bound; a bind is answered only once the bridge acknowledged it, so the
             // bridge can refuse that session's old path from then on.
+            if let Some(secret) = broker_secret.as_ref() {
+                app_stream::spawn(app.handle().clone(), secret.clone());
+            }
             if let Some(secret) = broker_secret {
                 let collect = {
                     let secret = secret.clone();

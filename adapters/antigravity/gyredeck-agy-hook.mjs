@@ -1114,7 +1114,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
   if (delivered.some((message) => byId.has(message.from) && (message.kind === "ask" || message.kind === "tell"))) {
     parts.push(
       "HAND-OFF: taking work on, reply ETA HH:MM now — that is the ack. Handing it over, arm a wake at the ETA you are sent (+15 min while none has come) and cancel it if the result arrives first; at the wake ask for a checkpoint — step, what runs or blocks it," +
-        " new evidence, new ETA. Asked for one, give it and keep working. A result carrying new work swaps the roles; finished work is acked as done (rules: Hand-offs).",
+        " new evidence, new ETA. Asked for one, give it and keep working. A result carrying new work swaps the roles; finished work is acked as done with a reaction (rules: Hand-offs).",
     );
   }
   // The owner typing in a Discord post the app follows (#205): the person, so never an

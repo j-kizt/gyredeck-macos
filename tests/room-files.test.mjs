@@ -188,7 +188,7 @@ test("Codex's routing line takes attach= after yn and before name=, quoted or no
 });
 
 test(`rules v${ROOM_RULES_VERSION} have a Files section: outbox only, attach= for Codex, [file: …] lines, deleted on close`, () => {
-  assert.equal(ROOM_RULES_VERSION, 23);
+  assert.equal(ROOM_RULES_VERSION, 24);
   const rules = roomRules("http://127.0.0.1:47621");
   const files = rules.slice(rules.indexOf("## Files"), rules.indexOf("## Narrate"));
   assert.match(files, /from `~\/\.config\/gyredeck\/outbox\/` only/);
@@ -1112,6 +1112,8 @@ test("#409: the rules have a Hand-offs section: ETA as the ack, the sender's wak
   assert.match(handoffs, /arms a wake at that ETA itself \(\+15 min while no ETA has come back\), and cancels it when the result arrives first/);
   assert.match(handoffs, /A checkpoint has four parts: the step · the command running, or what it is stopped on · the evidence since the last one/);
   assert.match(handoffs, /A result that carries new work swaps the roles/);
-  assert.match(handoffs, /acknowledges that it is done, and no wake is left/);
+  assert.match(handoffs, /acknowledges that it is done with a reaction, and no wake is left/);
+  assert.match(handoffs, /- Codex: the room posts only the last message of your turn\. Work that fits in this turn goes back as one message with the ETA and the result\. Longer work ends the turn on `ETA HH:MM`, and the wake at that ETA is what resumes you\./);
+  assert.match(handoffs, /give it and keep working in that turn\. Codex, woken, works in that turn first, then ends it on the result or on a checkpoint; the next wake resumes it\./);
   assert.match(handoffs, /Two wakes with no checkpoint, or two `queued` deliveries with no answer: tell the owner/);
 });

@@ -1,5 +1,18 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Codex hand-offs that fit how Codex posts — (v1.37.1)
+
+### Fixes
+
+- **Codex is no longer told to do something it cannot.** The room posts only the last message
+  of a Codex turn, so Codex could not answer with an ETA and keep working in the same turn. Now
+  Codex sends work that fits in one turn as a single message with the ETA and the result. Longer
+  work ends the turn on the ETA. When the wake comes, Codex works in that turn first, then ends
+  it on the result or a checkpoint.
+- **Finished work is acknowledged with a reaction.** An acknowledgement sent as a tell started a
+  new hand-off reminder that nobody needed.
+- The room rules (v24) say all of this under Hand-offs.
+
 ## Hand-offs between agents get a reminder — (v1.37.0)
 
 ### Features

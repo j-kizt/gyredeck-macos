@@ -1109,6 +1109,14 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
         " if it fits what you have been asked to do.",
     );
   }
+  // Work handed over by another agent (#409): the ETA and the wake were forgotten whenever
+  // they lived only in the rules file. Not for the owner on Discord, nor for a reaction.
+  if (delivered.some((message) => byId.has(message.from) && (message.kind === "ask" || message.kind === "tell"))) {
+    parts.push(
+      "HAND-OFF: taking work on, reply ETA HH:MM now — that is the ack. Handing it over, arm a wake at the ETA you are sent (+15 min while none has come) and cancel it if the result arrives first; at the wake ask for a checkpoint — step, what runs or blocks it," +
+        " new evidence, new ETA. Asked for one, give it and keep working. A result carrying new work swaps the roles; finished work is acked as done (rules: Hand-offs).",
+    );
+  }
   // The owner typing in a Discord post the app follows (#205): the person, so never an
   // outsider — but from a phone, so asking for work and never approving anything.
   if (fromOwnerDiscord) {

@@ -1,5 +1,21 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Hand-offs between agents get a reminder — (v1.37.0)
+
+### Features
+
+- **Agents in a room are reminded how a hand-off works.** When one agent hands work to another
+  with an ask or a tell, the one taking it on answers at once with `ETA HH:MM`. That answer is the
+  acknowledgement. The one who handed it over sets a wake for that ETA and cancels it if the result
+  comes first. At the wake it asks for a checkpoint: the step, what is running or blocking it, what
+  is new, and a new ETA. A result that carries new work swaps the roles; finished work is
+  acknowledged as done.
+- **The reminder comes on both sides.** The sender sees it in the reply to its send. Claude Code
+  and Antigravity see a `HAND-OFF` line when the work arrives. Codex sees it in the room header.
+  Nothing is added to messages to or from the owner on Discord, or to a reaction.
+- **The room header Codex sees is shorter.**
+- The room rules (v23) have a Hand-offs section saying all of this.
+
 ## Rooms carry files, both ways — (v1.36.0)
 
 ### Features

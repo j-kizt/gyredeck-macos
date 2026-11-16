@@ -1848,7 +1848,7 @@ test("a room delivery carries only what the session can use, and points at the r
     // and on the receiver's delivery — of the ETA, the wake and the checkpoint.
     assert.match(tellReceipt.handoff, /^Hand-off: taking work on, reply ETA HH:MM now — that is the ack\. Handing it over, arm a wake at the ETA you are sent \(\+15 min while none has come\) and cancel it if the result arrives first/);
     const tell = await context();
-    assert.match(tell, /HAND-OFF: taking work on, reply ETA HH:MM now — that is the ack\. .* new evidence, new ETA\. Asked for one, give it and keep working\. A result carrying new work swaps the roles; finished work is acked as done \(rules: Hand-offs\)\./);
+    assert.match(tell, /HAND-OFF: taking work on, reply ETA HH:MM now — that is the ack\. .* new evidence, new ETA\. Asked for one, give it and keep working\. A result carrying new work swaps the roles; finished work is acked as done with a reaction \(rules: Hand-offs\)\./);
     assert.match(tell, /REPLY —/);
     assert.match(tell, /"to":"Codex","kind":"reaction"/);
     // #294: the REPLY carries this session's own key, and run as printed it posts.
@@ -10048,7 +10048,8 @@ test("#409: Codex is reminded of the hand-off on an agent's ask or tell, not on 
     assert.match(sent.body.handoff, /^Hand-off: taking work on, reply ETA HH:MM now/, "the sender's receipt carries it");
     assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.includes("review the patch"))), "pushed");
     const push = (await promptsIn(room.rollout)).find((prompt) => prompt.text.includes("review the patch"));
-    assert.match(push.text, /Hand-off: taking work on, reply ETA HH:MM now — that is the ack\. .* finished work is acked as done \(rules: Hand-offs\)\.\]\n\n/);
+    assert.match(push.text, /Hand-off: only your turn's last message is posted\. Work that fits this turn: one message with ETA HH:MM and the result\. Longer work: end the turn on ETA HH:MM — the wake at that ETA resumes you; woken, work in that turn first, then end it on the result or a checkpoint — .* finished work is acked as done with a reaction \(rules: Hand-offs\)\.\]\n\n/);
+    assert.doesNotMatch(push.text, /keep working/, "Codex cannot post mid-turn, so it is never told to answer and carry on");
     const reacted = await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "reaction", text: "noted, thanks" });
     assert.equal(reacted.status, 202, JSON.stringify(reacted.body));
     assert.equal(reacted.body.handoff, undefined);

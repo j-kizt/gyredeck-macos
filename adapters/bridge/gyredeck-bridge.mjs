@@ -235,7 +235,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 23;
+export const ROOM_RULES_VERSION = 24;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -286,10 +286,11 @@ after you answer, show the words you sent — not that you replied — and the s
 ## Hand-offs
 Between agents only: never toward the owner on Discord, never on a reaction.
 - Whoever takes work on answers at once with \`ETA HH:MM\`: that answer is the acknowledgement and says the work has started.
+- Codex: the room posts only the last message of your turn. Work that fits in this turn goes back as one message with the ETA and the result. Longer work ends the turn on \`ETA HH:MM\`, and the wake at that ETA is what resumes you.
 - Whoever handed it over arms a wake at that ETA itself (+15 min while no ETA has come back), and cancels it when the result arrives first. Codex has no timer, so the member it works with holds its wakes.
 - At the wake, ask for a checkpoint. A checkpoint has four parts: the step · the command running, or what it is stopped on · the evidence since the last one (files read, commands run, results) · a new ETA. "Reviewing", or the last checkpoint again, is not one. A long command counts if the checkpoint names it, gives its start time and shows it is still running.
-- Asked for a checkpoint, give it and keep working in that turn.
-- A result that carries new work swaps the roles: its receiver answers with an ETA and the sender arms the wake, round after round. When the work is finished, the receiver of the result acknowledges that it is done, and no wake is left.
+- Asked for a checkpoint, give it and keep working in that turn. Codex, woken, works in that turn first, then ends it on the result or on a checkpoint; the next wake resumes it.
+- A result that carries new work swaps the roles: its receiver answers with an ETA and the sender arms the wake, round after round. When the work is finished, the receiver of the result acknowledges that it is done with a reaction, and no wake is left.
 - Two wakes with no checkpoint, or two \`queued\` deliveries with no answer: tell the owner.
 - The room reminds you: \`HAND-OFF\` on a delivery, \`handoff\` in a send's receipt.
 
@@ -1769,7 +1770,9 @@ export const OWNER_DISCORD_NOTE =
  * only in the rules file. Never to or from the owner on Discord, and never on a reaction.
  */
 export const HANDOFF_NOTE =
-  "Hand-off: taking work on, reply ETA HH:MM now — that is the ack. Handing it over, arm a wake at the ETA you are sent (+15 min while none has come) and cancel it if the result arrives first; at the wake ask for a checkpoint — step, what runs or blocks it, new evidence, new ETA. Asked for one, give it and keep working. A result carrying new work swaps the roles; finished work is acked as done (rules: Hand-offs).";
+  "Hand-off: taking work on, reply ETA HH:MM now — that is the ack. Handing it over, arm a wake at the ETA you are sent (+15 min while none has come) and cancel it if the result arrives first; at the wake ask for a checkpoint — step, what runs or blocks it, new evidence, new ETA. Asked for one, give it and keep working. A result carrying new work swaps the roles; finished work is acked as done with a reaction (rules: Hand-offs).";
+export const CODEX_HANDOFF_NOTE =
+  "Hand-off: only your turn's last message is posted. Work that fits this turn: one message with ETA HH:MM and the result. Longer work: end the turn on ETA HH:MM — the wake at that ETA resumes you; woken, work in that turn first, then end it on the result or a checkpoint — step, what runs or blocks it, new evidence, new ETA. A result carrying new work swaps the roles; finished work is acked as done with a reaction (rules: Hand-offs).";
 /** A member that is an agent: not the owner's Discord voice, and not the relay that only carries the room to it. */
 const isAgentMember = (room, id) => id !== OWNER_DISCORD_SENDER && room.members.has(id) && room.members.get(id)?.relay !== true;
 /** Carried in a publish's routing by the room's own notices and by an app-vouched post only. */
@@ -6682,7 +6685,7 @@ function startBridge(config) {
         " A seq not seen yet has not failed: do not send it again."
       : " Nothing of yours published here yet. A seq not seen yet has not failed: do not send it again.";
     const handoff = answering && (answering.kind === "ask" || answering.kind === "tell") && isAgentMember(room, answering.id)
-      ? ` ${HANDOFF_NOTE}`
+      ? ` ${CODEX_HANDOFF_NOTE}`
       : "";
     // Every other push carries the short form (#157): the rules that broke live when told
     // once — the routing line, never answering a reaction, where the seq comes from — plus

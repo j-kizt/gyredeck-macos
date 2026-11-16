@@ -1,15 +1,18 @@
 // #199: the Discord connector child, against an in-memory Discord. No network, no real token.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ChannelType, Collection, DiscordAPIError, DiscordjsErrorCodes } from "discord.js";
-import { COMMANDS, createConnector, parseAddress, RETENTION_MS } from "../adapters/discord/connector.mjs";
+import { COMMANDS, createConnector, FILE_FETCH_MS, FILE_MAX_BYTES, fileKind, parseAddress, MESSAGE_LIMIT, readHeld, RETENTION_MS, ROOM_FILES_MAX_BYTES, ROOM_INCOMING, roomFilesBytes } from "../adapters/discord/connector.mjs";
 import { loadState, saveState } from "../adapters/discord/state.mjs";
+import { fileKind as bridgeFileKind, ROOM_FILES_MAX_BYTES as BRIDGE_ROOM_FILES_MAX_BYTES, ROOM_INCOMING as BRIDGE_ROOM_INCOMING, roomFilesBytes as bridgeRoomFilesBytes } from "../adapters/bridge/gyredeck-bridge.mjs";
 import { createDiscordJs, FIND_PAGES_MAX, FIND_STARTERS_MAX } from "../adapters/discord/discord-js.mjs";
 import { createFakeDiscord, fakeClock, flush, kindError } from "./discord/fake.mjs";
 
@@ -24,10 +27,15 @@ function tmpState() {
   return join(mkdtempSync(join(tmpdir(), "gd-discord-")), "discord-state.json");
 }
 
-async function boot({ fake = createFakeDiscord(), clock = fakeClock(), statePath = tmpState(), forumId = "F1", ownerId = null } = {}) {
+// No test reaches the network: a download nobody set up fails.
+const noFetch = async (url) => {
+  throw new Error(`no network in tests: ${url}`);
+};
+
+async function boot({ fake = createFakeDiscord(), clock = fakeClock(), statePath = tmpState(), forumId = "F1", ownerId = null, fetchFile = noFetch } = {}) {
   const lines = [];
   fake.now = () => clock.now();
-  const c = createConnector({ discord: fake, clock, out: (l) => lines.push(l) });
+  const c = createConnector({ discord: fake, clock, out: (l) => lines.push(l), fetchFile });
   c.handle({ t: "hello", v: 1, token: TOKEN, forumId, ownerId, statePath });
   await flush();
   const of = (t) => lines.map((l) => JSON.parse(l)).filter((m) => m.t === t);
@@ -2585,7 +2593,7 @@ test("#205 discord.js adapter: reaction intents, guild posts, reactions and the 
     reply: async (o) => (replies.push(o), o.withResponse ? { resource: { message: { id: "P1" } } } : undefined),
   });
   assert.deepEqual(got.map(([e, x]) => [e, x.messageId ?? x.name]), [["post", "D1"], ["reaction", "M9"], ["command", "disconnect"]], "a webhook's or a bot's message, or a system message such as a post renamed (#356), is never a post");
-  assert.deepEqual(got[0][1], { messageId: "D1", channelId: "T1", authorId: OWNER, text: "hi", replyToId: "M9" });
+  assert.deepEqual(got[0][1], { messageId: "D1", channelId: "T1", authorId: OWNER, text: "hi", replyToId: "M9", attachments: [] });
   assert.deepEqual(got[1][1], { messageId: "M9", channelId: "T1", userId: OWNER, emoji: "✅" });
   const cmd = got[2][1];
   assert.equal("all" in cmd, false, "an all option left from an older registration is not read");
@@ -3075,5 +3083,911 @@ test("#207 a Reply to an approval request with six digits among words or marks i
   }
   fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "not yet, wait for v1.33.0", replyToId: request });
   assert.deepEqual(of("say").map((s) => s.text), ["not yet, wait for v1.33.0"]);
+  await c.close();
+});
+
+// ── #375: files in sync rooms ──
+
+const MiB = 1024 * 1024;
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
+const ZIP = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0, 0, 0, 8, 0]);
+
+// The one table `fileKind` is held to; the bridge's copy answers the same for every row.
+const FILE_KINDS = [
+  ["png", PNG, "image/png"],
+  ["jpeg", Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46]), "image/jpeg"],
+  ["gif87a", Buffer.from("GIF87a\x01\x00\x01\x00", "latin1"), "image/gif"],
+  ["gif89a", Buffer.from("GIF89a\x01\x00\x01\x00", "latin1"), "image/gif"],
+  ["webp", Buffer.concat([Buffer.from("RIFF"), Buffer.from([0x24, 0, 0, 0]), Buffer.from("WEBPVP8 ")]), "image/webp"],
+  ["pdf", Buffer.from("%PDF-1.7\n%\xe2\xe3\xcf\xd3\n", "latin1"), "application/pdf"],
+  ["utf-8 text", Buffer.from("héllo, ห้อง, ルーム\n"), "text/plain"],
+  ["json named anything", Buffer.from('{"a":1}\n'), "text/plain"],
+  ["empty", Buffer.alloc(0), null],
+  ["text with a NUL", Buffer.from("a\0b"), null],
+  ["invalid utf-8", Buffer.from([0x68, 0xc3, 0x28]), null],
+  ["docx / zip", ZIP, null],
+  ["mp4", Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from("ftypmp42")]), null],
+  ["RIFF that is not WEBP (wav)", Buffer.concat([Buffer.from("RIFF"), Buffer.from([0x24, 0, 0, 0]), Buffer.from("WAVEfmt ")]), null],
+  ["png signature cut short", Buffer.from([0x89, 0x50, 0x4e, 0x47]), null],
+];
+
+test("#375 the connector stages the owner's downloads where the bridge takes them from", () => {
+  assert.equal(ROOM_INCOMING, BRIDGE_ROOM_INCOMING);
+});
+
+test("#375 fileKind types a file by its bytes alone, from the shared table, and the bridge's copy agrees on every row", () => {
+  for (const [name, bytes, kind] of FILE_KINDS) {
+    assert.equal(fileKind(bytes), kind, name);
+    assert.equal(bridgeFileKind(bytes), kind, `bridge: ${name}`);
+  }
+});
+
+const cdn = (name) => `https://cdn.discordapp.com/attachments/1/2/${encodeURIComponent(name)}?ex=1&hm=2`;
+
+// A Discord CDN in memory: url → bytes, or a list of chunks streamed one pull at a time.
+function fakeCdn(files = {}) {
+  const calls = [];
+  const pulled = { chunks: 0 };
+  const fetchFile = async (url, init) => {
+    calls.push({ url, redirect: init?.redirect });
+    const f = files[url];
+    if (f === undefined) return new Response(null, { status: 404 });
+    if (!Array.isArray(f)) return new Response(f);
+    let i = 0;
+    return new Response(new ReadableStream({
+      pull(ctl) {
+        if (i === f.length) return ctl.close();
+        pulled.chunks++;
+        ctl.enqueue(new Uint8Array(f[i++]));
+      },
+    }));
+  };
+  return { fetchFile, calls, pulled };
+}
+
+const roomDir = (statePath) => join(dirname(statePath), "attachments", "sync-abcd");
+// The owner's downloads wait in the room folder's `.incoming` for the bridge to copy them out.
+const stageDir = (statePath) => join(roomDir(statePath), ROOM_INCOMING);
+const onDisk = (statePath) => (existsSync(stageDir(statePath)) ? readdirSync(stageDir(statePath)) : []);
+const attach = (name, size) => ({ url: cdn(name), name, size });
+
+test("#375 the owner's files are downloaded into the room's folder and said with the say; a post of files alone says their names", async () => {
+  const notes = Buffer.from("# notes\n");
+  const net = fakeCdn({ [cdn("shot.png")]: PNG, [cdn("notes.md")]: notes });
+  const { c, fake, of, threadId, statePath } = await ownerRoom({ fetchFile: net.fetchFile });
+  const one = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "", attachments: [attach("shot.png", PNG.length)] });
+  await flush();
+  const dir = stageDir(statePath);
+  const png = join(dir, `${one}-0-shot.png`);
+  assert.deepEqual(of("say"), [{ t: "say", room: "sync-abcd", threadId, ownerId: OWNER, discordMessageId: one, kind: "tell", to: "everyone", text: "(file: shot.png)", files: [{ path: png, name: "shot.png", type: "image/png", size: PNG.length }] }]);
+  assert.deepEqual(readFileSync(png), PNG);
+  assert.equal(statSync(png).mode & 0o777, 0o600);
+  assert.equal(statSync(dir).mode & 0o777, 0o700);
+  assert.deepEqual(net.calls.map((x) => x.redirect), ["error"], "a redirect never leads off Discord's hosts");
+  c.handle({ t: "said", discordMessageId: one, ok: true, seq: 1 });
+  await flush();
+
+  const two = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "", attachments: [attach("shot.png", PNG.length), attach("notes.md", notes.length)] });
+  await flush();
+  assert.equal(of("say").at(-1).text, "(files: shot.png, notes.md)");
+  assert.deepEqual(of("say").at(-1).files.map((f) => [f.name, f.type]), [["shot.png", "image/png"], ["notes.md", "text/plain"]]);
+  c.handle({ t: "said", discordMessageId: two, ok: true, seq: 2 });
+  await flush();
+  const typed = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "Codex: look at this", attachments: [attach("notes.md", notes.length)] });
+  await flush();
+  assert.deepEqual([of("say").at(-1).kind, of("say").at(-1).to, of("say").at(-1).text], ["ask", "Codex", "look at this"]);
+  const plain = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "no files" });
+  assert.deepEqual(of("say").at(-1), { t: "say", room: "sync-abcd", threadId, ownerId: OWNER, discordMessageId: plain, kind: "tell", to: "everyone", text: "no files" }, "a post without files says what it said before #375");
+  assert.deepEqual(saved(statePath).saying.map((l) => [l.discordMessageId, l.files?.length ?? 0]), [[typed, 1], [plain, 0]]);
+  await c.close();
+});
+
+test("#375 a post after one still downloading waits its turn: the room hears them in the order written", async () => {
+  const net = fakeCdn({ [cdn("a.png")]: PNG });
+  const gate = deferred();
+  const slow = async (url, init) => {
+    await gate.promise;
+    return net.fetchFile(url, init);
+  };
+  const { c, fake, of, threadId } = await ownerRoom({ fetchFile: slow });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "first", attachments: [attach("a.png", PNG.length)] });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "second" });
+  await flush();
+  assert.deepEqual(of("say"), [], "premise: the first post is still downloading");
+  gate.resolve();
+  await flush();
+  assert.deepEqual(of("say").map((s) => s.text), ["first", "second"]);
+  await c.close();
+});
+
+test("#375 only the owner's post in a followed room downloads anything", async () => {
+  const net = fakeCdn({ [cdn("a.png")]: PNG });
+  const { c, fake, of, threadId, statePath } = await ownerRoom({ fetchFile: net.fetchFile });
+  fake.ownerSays({ channelId: threadId, authorId: "U-STRANGER", text: "", attachments: [attach("a.png", PNG.length)] });
+  fake.ownerSays({ channelId: "T-ELSEWHERE", authorId: OWNER, text: "", attachments: [attach("a.png", PNG.length)] });
+  await flush();
+  assert.deepEqual(net.calls, [], "a stranger's post, and the owner's outside a room, fetch nothing");
+  c.handle({ t: "disconnect", room: "sync-abcd", reason: "closed" });
+  await flush();
+  const late = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "", attachments: [attach("a.png", PNG.length)] });
+  await flush();
+  assert.deepEqual(net.calls, [], "a room no longer followed fetches nothing");
+  assert.equal(fake.bot.at(-1).replyTo, late);
+  assert.match(fake.bot.at(-1).content, /no longer connected/);
+  assert.deepEqual([of("say"), onDisk(statePath)], [[], []]);
+  c.handle({ t: "connect", room: "sync-abcd", members: [], createdAt: 1 });
+  await flush();
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "", attachments: [attach("a.png", PNG.length)] });
+  await flush();
+  assert.equal(net.calls.length, 1, "control: the owner in the followed room downloads");
+  await c.close();
+});
+
+test("#375 a file is downloaded only from Discord's own https hosts; any other address refuses the post before anything is fetched", async () => {
+  const bad = [
+    ["http.png", "http://cdn.discordapp.com/attachments/1/2/http.png"],
+    ["elsewhere.png", "https://example.com/elsewhere.png"],
+    ["lookalike.png", "https://cdn.discordapp.com.example.com/lookalike.png"],
+    ["port.png", "https://cdn.discordapp.com:8443/port.png"],
+    ["user.png", "https://me@cdn.discordapp.com/user.png"],
+    ["local.png", "file:///etc/passwd"],
+    ["nothing.png", undefined],
+  ];
+  const good = { url: "https://media.discordapp.net/attachments/1/2/ok.png", name: "ok.png", size: PNG.length };
+  const net = fakeCdn({ [good.url]: PNG });
+  const { c, fake, of, threadId, statePath } = await ownerRoom({ fetchFile: net.fetchFile });
+  for (const [name, url] of bad) {
+    const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [good, { url, name, size: PNG.length }] });
+    await flush();
+    assert.equal(fake.bot.at(-1).replyTo, id, name);
+    assert.equal(fake.bot.at(-1).content, `Not sent: ${name} is not a file Discord holds.`);
+  }
+  assert.deepEqual([net.calls, of("say"), onDisk(statePath)], [[], [], []]);
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [good] });
+  await flush();
+  assert.equal(of("say").length, 1, "control: media.discordapp.net is Discord's");
+  await c.close();
+});
+
+test("#375 more than 10 files, or one over 10 MB by its word or by its bytes, refuses the whole post and leaves nothing on disk", async () => {
+  const ten = Array.from({ length: 10 }, (_, i) => `f${i}.txt`);
+  const files = Object.fromEntries(ten.map((n) => [cdn(n), Buffer.from(n)]));
+  const growing = Array.from({ length: 20 }, () => Buffer.alloc(MiB, 0x61));
+  const net = fakeCdn({ ...files, [cdn("big.txt")]: growing, [cdn("first.png")]: PNG });
+  const { c, fake, of, threadId, statePath } = await ownerRoom({ fetchFile: net.fetchFile });
+
+  const eleven = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [...ten, "f10.txt"].map((n) => attach(n, 3)) });
+  await flush();
+  assert.deepEqual([fake.bot.at(-1).replyTo, fake.bot.at(-1).content], [eleven, "Not sent: at most 10 files in one post."]);
+  assert.deepEqual(net.calls, []);
+
+  const said = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("first.png", PNG.length), attach("huge.pdf", 10 * MiB + 1)] });
+  await flush();
+  assert.deepEqual([fake.bot.at(-1).replyTo, fake.bot.at(-1).content], [said, "Not sent: huge.pdf is over 10 MB."]);
+  assert.deepEqual(net.calls, [], "a size Discord states as too big fetches nothing");
+
+  // Discord said 3 bytes; the body keeps coming.
+  const grew = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("first.png", PNG.length), attach("big.txt", 3)] });
+  await flush(200);
+  assert.deepEqual([fake.bot.at(-1).replyTo, fake.bot.at(-1).content], [grew, "Not sent: big.txt is over 10 MB."]);
+  assert.ok(net.pulled.chunks >= 11 && net.pulled.chunks <= 12, `reading stopped just past 10 MB (${net.pulled.chunks} of 20 chunks)`);
+  assert.deepEqual([of("say"), onDisk(statePath)], [[], []], "the file read before it is removed too");
+
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: ten.map((n) => attach(n, 3)) });
+  await flush(100);
+  assert.equal(of("say").at(-1)?.files?.length, 10, "control: ten files go");
+  await c.close();
+});
+
+test("#375 a file a session cannot read refuses the whole post, by its bytes whatever its name, and removes what the post downloaded", async () => {
+  const net = fakeCdn({ [cdn("shot.png")]: PNG, [cdn("report.txt")]: ZIP, [cdn("empty.txt")]: Buffer.alloc(0) });
+  const { c, fake, of, threadId, statePath } = await ownerRoom({ fetchFile: net.fetchFile });
+  for (const name of ["report.txt", "empty.txt"]) {
+    const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("shot.png", PNG.length), attach(name, 10)] });
+    await flush();
+    assert.deepEqual([fake.bot.at(-1).replyTo, fake.bot.at(-1).content], [id, `Not sent: ${name} is not a file a session can read (images, PDF, text).`]);
+  }
+  assert.equal(net.calls.length, 4, "premise: shot.png was downloaded before each refusal");
+  assert.deepEqual([of("say"), onDisk(statePath)], [[], []]);
+  await c.close();
+});
+
+test("#375 a say with files is sent again with them by the next child, which removes every download no saved say names", async () => {
+  const statePath = tmpState();
+  const fake = createFakeDiscord();
+  const net = fakeCdn({ [cdn("shot.png")]: PNG });
+  const first = await ownerRoom({ fake, statePath, fetchFile: net.fetchFile });
+  const id = fake.ownerSays({ channelId: first.threadId, authorId: OWNER, text: "", attachments: [attach("shot.png", PNG.length)] });
+  await flush();
+  const said = first.of("say");
+  assert.equal(said.length, 1, "premise: said once, receipt owed");
+  await first.c.close();
+  // A child that stopped after a download and before its count or its say left these.
+  writeFileSync(join(stageDir(statePath), "9-0-orphan.png"), PNG);
+  const other = join(dirname(stageDir(statePath)), "..", "sync-other", ROOM_INCOMING);
+  mkdirSync(other, { recursive: true });
+  writeFileSync(join(other, "8-0-orphan.png"), PNG);
+  // A room folder that is a link is never looked into.
+  const elsewhere = mkdtempSync(join(tmpdir(), "gd-sweep-"));
+  mkdirSync(join(elsewhere, ROOM_INCOMING));
+  writeFileSync(join(elsewhere, ROOM_INCOMING, "keep.png"), PNG);
+  symlinkSync(elsewhere, join(dirname(stageDir(statePath)), "..", "sync-link"));
+
+  const second = await ownerRoom({ fake, statePath });
+  const files = [{ path: join(stageDir(statePath), `${id}-0-shot.png`), name: "shot.png", type: "image/png", size: PNG.length }];
+  assert.deepEqual(second.of("say"), [{ ...said[0], files, retry: true }]);
+  assert.ok(existsSync(files[0].path));
+  assert.deepEqual(onDisk(statePath), [`${id}-0-shot.png`], "what no saved say names is removed as the child starts");
+  assert.deepEqual(readdirSync(other), [], "in every room's folder");
+  assert.deepEqual(readdirSync(join(elsewhere, ROOM_INCOMING)), ["keep.png"]);
+  rmSync(elsewhere, { recursive: true, force: true });
+  await second.c.close();
+});
+
+test("#375 a leftover download the starting child cannot remove is said, and removed once it can be", async () => {
+  const statePath = tmpState();
+  const stage = stageDir(statePath);
+  mkdirSync(stage, { recursive: true });
+  const orphan = join(stage, "9-0-orphan.png");
+  writeFileSync(orphan, PNG);
+  chmodSync(stage, 0o500);
+  let b;
+  try {
+    b = await boot({ statePath, ownerId: OWNER });
+    assert.ok(existsSync(orphan), "premise: it could not be removed");
+    assert.ok(b.of("error").some((e) => /could not be removed from a room's folder/.test(e.message)), JSON.stringify(b.of("error")));
+  } finally {
+    chmodSync(stage, 0o700);
+  }
+  await b.clock.advance(60_000);
+  assert.equal(existsSync(orphan), false, "tried again, and gone once it could be");
+  await b.c.close();
+});
+
+test("#375 a leftover download is kept while the state cannot be read, since a say there may name it", async () => {
+  const statePath = tmpState();
+  writeFileSync(statePath, "{}");
+  chmodSync(statePath, 0o000);
+  const stage = stageDir(statePath);
+  mkdirSync(stage, { recursive: true });
+  writeFileSync(join(stage, "9-0-shot.png"), PNG);
+  try {
+    const { c, of, clock } = await boot({ statePath });
+    assert.ok(of("error").some((e) => e.code === "storage_blocked"), "premise: blocked");
+    await clock.advance(120_000);
+    assert.deepEqual(readdirSync(stage), ["9-0-shot.png"]);
+    await c.close();
+  } finally {
+    chmodSync(statePath, 0o600);
+  }
+});
+
+test("#375 a sweep tried again while a post's files are still coming leaves the ones already down", async () => {
+  const statePath = tmpState();
+  // A leftover in another room that cannot be removed keeps the sweep coming back.
+  const other = join(dirname(stageDir(statePath)), "..", "sync-other", ROOM_INCOMING);
+  mkdirSync(other, { recursive: true });
+  writeFileSync(join(other, "8-0-orphan.png"), PNG);
+  chmodSync(other, 0o500);
+  let release;
+  const held = new Promise((r) => (release = r));
+  const net = fakeCdn({ [cdn("a.png")]: PNG, [cdn("b.png")]: PNG });
+  const fetchFile = async (url, init) => {
+    if (url === cdn("b.png")) await held;
+    return net.fetchFile(url, init);
+  };
+  try {
+    const { c, fake, of, clock, threadId } = await ownerRoom({ statePath, fetchFile });
+    assert.ok(of("error").some((e) => /could not be removed from a room's folder/.test(e.message)), "premise: a sweep is due");
+    await clock.advance(30_000);
+    const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length), attach("b.png", PNG.length)] });
+    await flush();
+    assert.deepEqual(onDisk(statePath), [`${id}-0-a.png`], "premise: the first is down, the second is coming");
+    await clock.advance(30_000);
+    assert.deepEqual(onDisk(statePath), [`${id}-0-a.png`], "the sweep passed over it");
+    release();
+    await flush(100);
+    const files = of("say").at(-1)?.files ?? [];
+    assert.deepEqual(files.map((f) => existsSync(f.path)), [true, true]);
+    await c.close();
+  } finally {
+    chmodSync(other, 0o700);
+  }
+});
+
+test("#375 a room passed over by a sweep while its post downloads is swept once the post is done", async () => {
+  const statePath = tmpState();
+  // Another room's leftover that cannot be removed yet puts a sweep a minute out.
+  const other = join(dirname(stageDir(statePath)), "..", "sync-other", ROOM_INCOMING);
+  mkdirSync(other, { recursive: true });
+  writeFileSync(join(other, "8-0-orphan.png"), PNG);
+  chmodSync(other, 0o500);
+  const orphan = join(stageDir(statePath), "9-0-orphan.png");
+  let release;
+  const held = new Promise((r) => (release = r));
+  const net = fakeCdn({ [cdn("a.png")]: PNG });
+  const fetchFile = async (url, init) => {
+    // A file no say names lands in this room while its post is downloading.
+    writeFileSync(orphan, PNG);
+    await held;
+    return net.fetchFile(url, init);
+  };
+  let b;
+  try {
+    b = await ownerRoom({ statePath, fetchFile });
+    assert.ok(b.of("error").some((e) => /could not be removed from a room's folder/.test(e.message)), "premise: a sweep is due");
+    await b.clock.advance(30_000);
+    b.fake.ownerSays({ channelId: b.threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length)] });
+    await flush();
+  } finally {
+    chmodSync(other, 0o700);
+  }
+  await b.clock.advance(30_000);
+  assert.ok(existsSync(orphan), "premise: the sweep passed over the room while its post downloads");
+  release();
+  await flush(100);
+  assert.equal(b.of("say").at(-1)?.files?.length, 1, "premise: the post went");
+  await b.clock.advance(60_000);
+  assert.equal(existsSync(orphan), false);
+  await b.c.close();
+});
+
+test("#375 a download that cannot be taken back is said, holds the room's next download, and is removed once it can be", async () => {
+  const statePath = tmpState();
+  const stage = stageDir(statePath);
+  const net = fakeCdn({ [cdn("a.png")]: PNG, [cdn("b.zip")]: ZIP, [cdn("c.png")]: PNG });
+  const fetchFile = async (url, init) => {
+    // a.png is on disk; the folder turns unwritable before the refusal takes it back.
+    if (url === cdn("b.zip")) chmodSync(stage, 0o500);
+    return net.fetchFile(url, init);
+  };
+  const b = await ownerRoom({ statePath, fetchFile });
+  try {
+    const first = b.fake.ownerSays({ channelId: b.threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length), attach("b.zip", ZIP.length)] });
+    await flush(100);
+    assert.deepEqual([b.fake.bot.at(-1).replyTo, b.fake.bot.at(-1).content], [first, "Not sent: b.zip is not a file a session can read (images, PDF, text)."]);
+    assert.deepEqual(onDisk(statePath), [`${first}-0-a.png`], "premise: it could not be taken back");
+    await b.clock.advance(60_000);
+    assert.ok(b.of("error").some((e) => /could not be removed from a room's folder/.test(e.message)), "said with no later post: " + JSON.stringify(b.of("error")));
+    const next = b.fake.ownerSays({ channelId: b.threadId, authorId: OWNER, text: "x", attachments: [attach("c.png", PNG.length)] });
+    await flush(100);
+    assert.equal(b.fake.bot.at(-1).replyTo, next);
+    assert.match(b.fake.bot.at(-1).content, /still there/);
+    assert.deepEqual(onDisk(statePath), [`${first}-0-a.png`], "nothing more was written");
+  } finally {
+    chmodSync(stage, 0o700);
+  }
+  await b.clock.advance(60_000);
+  assert.deepEqual(onDisk(statePath), [], "removed once it could be");
+  await b.c.close();
+});
+
+test("#375 a download whose close fails is taken back", async () => {
+  const statePath = tmpState();
+  const net = fakeCdn({ [cdn("a.png")]: PNG });
+  const b = await ownerRoom({ statePath, fetchFile: net.fetchFile });
+  const { openSync, closeSync } = fs;
+  const made = new Set();
+  fs.openSync = (path, flags, mode) => {
+    const fd = openSync(path, flags, mode);
+    if (typeof flags === "number" && flags & fs.constants.O_EXCL && String(path).startsWith(stageDir(statePath))) made.add(fd);
+    return fd;
+  };
+  fs.closeSync = (fd) => {
+    closeSync(fd);
+    if (made.delete(fd)) throw Object.assign(new Error("EIO: i/o error, close"), { code: "EIO" });
+  };
+  syncBuiltinESMExports();
+  try {
+    const id = b.fake.ownerSays({ channelId: b.threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length)] });
+    await flush(100);
+    assert.equal(b.fake.bot.at(-1).replyTo, id);
+    assert.match(b.fake.bot.at(-1).content, /could not be downloaded \(EIO/);
+    assert.deepEqual(onDisk(statePath), [], "taken back");
+  } finally {
+    Object.assign(fs, { openSync, closeSync });
+    syncBuiltinESMExports();
+  }
+  await b.c.close();
+});
+
+// Runs only in a child under a file-size limit, so the write fails part way for real.
+const CUT_SHORT = "#375 a download cut short by a failed write is taken back, and tried again until it is";
+test(CUT_SHORT, { skip: process.env.GYREDECK_TEST_FILE_LIMIT !== "1" }, async () => {
+  const statePath = tmpState();
+  const stage = stageDir(statePath);
+  const big = Buffer.from("x".repeat(200 * 1024));
+  const net = fakeCdn({ [cdn("a.txt")]: big, [cdn("b.txt")]: big });
+  const fetchFile = async (url, init) => {
+    // The part b.txt writes cannot be removed at first.
+    if (url === cdn("b.txt")) spawnSync("chmod", ["+a", "everyone deny delete_child", stage]);
+    return net.fetchFile(url, init);
+  };
+  const b = await ownerRoom({ statePath, fetchFile });
+  try {
+    const first = b.fake.ownerSays({ channelId: b.threadId, authorId: OWNER, text: "x", attachments: [attach("a.txt", big.length)] });
+    await flush(100);
+    assert.equal(b.fake.bot.at(-1).replyTo, first);
+    assert.match(b.fake.bot.at(-1).content, /could not be downloaded/);
+    assert.deepEqual(onDisk(statePath), [], "the part written was taken back");
+    const second = b.fake.ownerSays({ channelId: b.threadId, authorId: OWNER, text: "x", attachments: [attach("b.txt", big.length)] });
+    await flush(100);
+    assert.equal(b.fake.bot.at(-1).replyTo, second);
+    assert.deepEqual(onDisk(statePath), [`${second}-0-b.txt`], "premise: it could not be taken back");
+    await b.clock.advance(60_000);
+    assert.ok(b.of("error").some((e) => /could not be removed from a room's folder/.test(e.message)), "said with no later post: " + JSON.stringify(b.of("error")));
+  } finally {
+    spawnSync("chmod", ["-N", stage]);
+  }
+  await b.clock.advance(60_000);
+  assert.deepEqual(onDisk(statePath), [], "removed once it could be");
+  await b.c.close();
+});
+
+test("#375 a download cut short by a failed write (run under a 64 KB file-size limit)", { skip: process.env.GYREDECK_TEST_FILE_LIMIT === "1" }, () => {
+  const run = spawnSync("sh", ["-c", 'ulimit -f 64; exec "$0" "$@"', process.execPath, "--test", "--test-reporter=tap", "--test-name-pattern", `^${CUT_SHORT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, fileURLToPath(import.meta.url)], {
+    // Without the runner's own context, so the child reports to its stdout.
+    env: { ...process.env, NODE_TEST_CONTEXT: undefined, GYREDECK_TEST_FILE_LIMIT: "1" },
+    encoding: "utf8",
+  });
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  assert.match(run.stdout, /^# pass 1$/m, "the child ran the test: " + run.stdout);
+});
+
+test("#375 a folder past its cap from the bridge's side takes no download, not even for a moment", async () => {
+  const statePath = tmpState();
+  const stage = stageDir(statePath);
+  mkdirSync(stage, { recursive: true });
+  // A copy the bridge could not take back holds the folder past its cap.
+  const stuck = join(roomDir(statePath), "7-stuck.bin");
+  writeFileSync(stuck, "");
+  truncateSync(stuck, ROOM_FILES_MAX_BYTES + 1);
+  const net = fakeCdn({ [cdn("a.png")]: PNG });
+  const b = await ownerRoom({ statePath, fetchFile: net.fetchFile });
+  // A download written here could not be removed again.
+  spawnSync("chmod", ["+a", "everyone deny delete_child", stage]);
+  try {
+    const id = b.fake.ownerSays({ channelId: b.threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length)] });
+    await flush(100);
+    assert.deepEqual([b.fake.bot.at(-1).replyTo, b.fake.bot.at(-1).content], [id, "Not sent: the room's files are past 100 MB until one it could not take back is removed."]);
+    assert.deepEqual(onDisk(statePath), [], "nothing was written to be taken back");
+  } finally {
+    spawnSync("chmod", ["-N", stage]);
+  }
+  await b.c.close();
+});
+
+// A room line's file, as the bridge stores it under the room's folder.
+function roomFile(statePath, name, bytes = PNG) {
+  mkdirSync(roomDir(statePath), { recursive: true, mode: 0o700 });
+  const path = join(roomDir(statePath), `7-${name}`);
+  writeFileSync(path, bytes);
+  return { path, name, type: "image/png", size: bytes.length };
+}
+
+test("#375 a room line's files go with its first part only", async () => {
+  const { c, fake, statePath } = await ownerRoom();
+  const file = roomFile(statePath, "diagram.png");
+  const words = Array.from({ length: 900 }, (_, i) => `word${i}`).join(" ");
+  c.handle(message("sync-abcd", 1, { text: words, files: [file] }));
+  await flush();
+  const parts = fake.sent.filter((s) => s.content.includes("word"));
+  assert.ok(parts.length >= 3, "premise: split");
+  assert.deepEqual(parts.map((s) => s.files), [[{ data: PNG, name: "diagram.png" }], ...parts.slice(1).map(() => undefined)]);
+  c.handle(message("sync-abcd", 2));
+  await flush();
+  assert.equal(fake.sent.at(-1).files, undefined, "a line without files sends none");
+  await c.close();
+});
+
+test("#375 a file gone from the room's folder, outside it, or a link is not sent: the text says so, and that text is what is read back", async () => {
+  const { c, fake, clock, statePath } = await ownerRoom();
+  const gone = roomFile(statePath, "gone.pdf");
+  rmSync(gone.path);
+  const outside = join(dirname(statePath), "outside.png");
+  writeFileSync(outside, PNG);
+  const link = join(roomDir(statePath), "7-link.png");
+  symlinkSync(outside, link);
+  const kept = roomFile(statePath, "kept.png");
+  const seen = loseReplyOnce(fake, (t) => t.includes("hello"));
+  c.handle(message("sync-abcd", 1, { text: "hello", files: [gone, { ...gone, path: outside, name: "outside.png" }, { ...gone, path: link, name: "link.png" }, kept] }));
+  await clock.advance(2_000);
+  assert.ok(seen.lost, "premise: Discord took it and the reply was lost");
+  const sent = fake.sent.filter((s) => s.content.includes("hello"));
+  assert.equal(sent.length, 1, "read back by the same content, not posted again");
+  assert.equal(sent[0].content, "→ everyone · tell\nhello\n(file no longer available: gone.pdf)\n(file no longer available: outside.png)\n(file no longer available: link.png)");
+  assert.deepEqual(sent[0].files, [{ data: PNG, name: "kept.png" }]);
+  assert.ok(fake.log.some((e) => e.op === "fetchMessages"), "it was read back");
+  await c.close();
+});
+
+test("#375 a file is sent as the bytes read through one held descriptor: never through a link, never a folder, never over 10 MB", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gy-held-"));
+  const real = join(dir, "real.png");
+  writeFileSync(real, PNG);
+  const link = join(dir, "link.png");
+  symlinkSync(real, link);
+  const big = join(dir, "big.txt");
+  writeFileSync(big, "");
+  truncateSync(big, FILE_MAX_BYTES + 1);
+  const edge = join(dir, "edge.txt");
+  writeFileSync(edge, Buffer.alloc(FILE_MAX_BYTES, 0x61));
+  const zip = join(dir, "zip.png");
+  writeFileSync(zip, Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00]));
+  assert.deepEqual(readHeld(real), PNG, "control: a regular file is read");
+  assert.equal(readHeld(link), null, "a link is not followed");
+  assert.equal(readHeld(dir), null, "a folder is not a file");
+  assert.ok(readHeld(big) === null, "over 10 MB");
+  assert.equal(readHeld(edge)?.length, FILE_MAX_BYTES, "control: exactly 10 MB goes");
+  assert.equal(readHeld(join(dir, "gone.png")), null, "gone");
+  assert.equal(readHeld(zip), null, "bytes that are not a type a session can read, whatever the name");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("#375 a room line's file whose bytes are no longer an allowed type is not sent as what it was: the text says so", async () => {
+  const { c, fake, statePath } = await ownerRoom();
+  const swapped = roomFile(statePath, "shot.png", Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00]));
+  c.handle(message("sync-abcd", 1, { text: "hello", files: [swapped] }));
+  await flush();
+  const [sent] = fake.sent.filter((s) => s.content.includes("hello"));
+  assert.equal(sent.content, "→ everyone · tell\nhello\n(file no longer available: shot.png)");
+  assert.equal(sent.files, undefined);
+  await c.close();
+});
+
+test("#375 a file gone when a cut-off post is sent again is said in that post, never dropped in silence", async () => {
+  const { c, fake, clock, statePath } = await ownerRoom();
+  const file = roomFile(statePath, "shot.png");
+  let refused = false;
+  fake.gate = async (op, args) => {
+    if (op === "send" && !refused && args.content.includes("hello")) {
+      refused = true;
+      rmSync(file.path);
+      throw kindError("network");
+    }
+  };
+  c.handle(message("sync-abcd", 1, { text: "hello", files: [file] }));
+  await clock.advance(5_000);
+  assert.ok(refused, "premise: the first send was cut off before Discord took it");
+  const sent = fake.sent.filter((s) => s.content.includes("hello"));
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].content, "→ everyone · tell\nhello\n(file no longer available: shot.png)");
+  assert.equal(sent[0].files, undefined);
+  await c.close();
+});
+
+test("#375 a gone-file note that would not fit the part is posted on its own after it; no word of the part is cut", async () => {
+  const { c, fake, clock, statePath } = await ownerRoom();
+  const file = roomFile(statePath, "shot.png");
+  const head = "→ everyone · tell\n";
+  const text = "x".repeat(MESSAGE_LIMIT - head.length);
+  let refused = false;
+  fake.gate = async (op, args) => {
+    if (op === "send" && !refused && args.content.includes("xxx")) {
+      refused = true;
+      rmSync(file.path);
+      throw kindError("network");
+    }
+  };
+  c.handle(message("sync-abcd", 1, { text, files: [file] }));
+  await clock.advance(5_000);
+  assert.ok(refused, "premise: the first send was cut off before Discord took it");
+  const [part, note] = fake.sent.slice(-2);
+  assert.equal(part.content, head + text, "the part whole");
+  assert.equal(part.files, undefined);
+  assert.deepEqual([note.username, note.content], ["Room", "(file no longer available: shot.png)"]);
+  await c.close();
+});
+
+test("#375 a note owed for a part stays owed through a failed send and a restart, and goes before anything else", async () => {
+  const fake = createFakeDiscord();
+  const statePath = tmpState();
+  const first = await ownerRoom({ fake, statePath });
+  const file = roomFile(statePath, "shot.png");
+  const head = "→ everyone · tell\n";
+  const text = "x".repeat(MESSAGE_LIMIT - head.length);
+  let cut = false;
+  fake.gate = async (op, args) => {
+    if (op !== "send") return;
+    if (!cut && args.content.includes("xxx")) {
+      cut = true;
+      rmSync(file.path);
+      throw kindError("network");
+    }
+    if (args.content.startsWith("(file no longer available")) throw kindError("network");
+  };
+  first.c.handle(message("sync-abcd", 1, { text, files: [file] }));
+  await first.clock.advance(5_000);
+  await first.c.close();
+  const note = (s) => s.content === "(file no longer available: shot.png)";
+  assert.equal(fake.sent.filter((s) => s.content === head + text).length, 1, "premise: the part went");
+  assert.equal(fake.sent.filter(note).length, 0, "premise: the note did not");
+  assert.ok(saved(statePath).owedNote, "owed on disk");
+
+  fake.gate = null;
+  const sentBefore = fake.sent.length;
+  const second = await ownerRoom({ fake, statePath });
+  second.c.handle(message("sync-abcd", 2));
+  await flush();
+  const later = fake.sent.slice(sentBefore);
+  assert.ok(later.length >= 2, "premise: the second child posted");
+  assert.ok(note(later[0]), `the note first, then the rest: ${JSON.stringify(later.map((s) => s.content))}`);
+  assert.equal(fake.sent.filter(note).length, 1, "once");
+  assert.equal(saved(statePath).owedNote, undefined);
+  await second.c.close();
+});
+
+test("#375 the connector counts a room's folder as the bridge does, against the same cap", () => {
+  assert.equal(ROOM_FILES_MAX_BYTES, BRIDGE_ROOM_FILES_MAX_BYTES);
+  const dir = mkdtempSync(join(tmpdir(), "gy-count-"));
+  mkdirSync(join(dir, ROOM_INCOMING));
+  writeFileSync(join(dir, "1-a.png"), PNG);
+  writeFileSync(join(dir, ROOM_INCOMING, "2-0-b.txt"), "bb");
+  writeFileSync(join(dir, ".hidden"), "not counted");
+  mkdirSync(join(dir, "sub"));
+  symlinkSync(join(dir, "1-a.png"), join(dir, "link.png"));
+  assert.equal(roomFilesBytes(dir), PNG.length + 2);
+  assert.equal(bridgeRoomFilesBytes(dir), roomFilesBytes(dir));
+  // A `.incoming` not made yet is nothing; one that cannot be read, or a folder that cannot, is full.
+  rmSync(join(dir, ROOM_INCOMING), { recursive: true });
+  assert.deepEqual([roomFilesBytes(dir), bridgeRoomFilesBytes(dir)], [PNG.length, PNG.length]);
+  mkdirSync(join(dir, ROOM_INCOMING));
+  chmodSync(join(dir, ROOM_INCOMING), 0o300);
+  assert.deepEqual([roomFilesBytes(dir), bridgeRoomFilesBytes(dir)], [Infinity, Infinity]);
+  chmodSync(join(dir, ROOM_INCOMING), 0o700);
+  chmodSync(dir, 0o300);
+  assert.deepEqual([roomFilesBytes(dir), bridgeRoomFilesBytes(dir)], [Infinity, Infinity]);
+  chmodSync(dir, 0o700);
+  assert.deepEqual([roomFilesBytes(join(dir, "gone")), bridgeRoomFilesBytes(join(dir, "gone"))], [Infinity, Infinity], "a room folder that is not there is not empty");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("#375 a download that would take the room's folder past its cap is refused, and nothing of it is kept", async () => {
+  const net = fakeCdn({ [cdn("a.png")]: PNG });
+  let blinding = false;
+  const fetchFile = async (url, init) => {
+    if (blinding) chmodSync(stageDir(statePath), 0o300);
+    return net.fetchFile(url, init);
+  };
+  const { c, fake, of, threadId, statePath } = await ownerRoom({ fetchFile });
+  mkdirSync(roomDir(statePath), { recursive: true, mode: 0o700 });
+  const filler = join(roomDir(statePath), "1-filler.txt");
+  writeFileSync(filler, "");
+  truncateSync(filler, ROOM_FILES_MAX_BYTES - PNG.length + 1);
+  const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length)] });
+  await flush();
+  assert.deepEqual([fake.bot.at(-1).replyTo, fake.bot.at(-1).content], [id, "Not sent: the room's files would pass 100 MB."]);
+  assert.deepEqual([of("say"), onDisk(statePath)], [[], []]);
+  truncateSync(filler, ROOM_FILES_MAX_BYTES - PNG.length);
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length)] });
+  await flush();
+  assert.equal(of("say").at(-1)?.files?.length, 1, "control: exactly at the cap goes");
+  assert.equal(roomFilesBytes(roomDir(statePath)), ROOM_FILES_MAX_BYTES);
+  c.handle({ t: "said", discordMessageId: of("say").at(-1).discordMessageId, ok: true, seq: 1 });
+  await flush();
+  // A `.incoming` the download can be written into but not listed: the folder cannot be counted.
+  truncateSync(filler, 0);
+  blinding = true;
+  const blind = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length)] });
+  await flush();
+  chmodSync(stageDir(statePath), 0o700);
+  assert.deepEqual([fake.bot.at(-1).replyTo, fake.bot.at(-1).content], [blind, "Not sent: the room's files could not be counted."]);
+  assert.deepEqual(onDisk(statePath), []);
+  await c.close();
+});
+
+test("#375 one post's files wait at a time; an answer either way removes what the bridge did not take; a leftover is swept", async () => {
+  const net = fakeCdn({ [cdn("a.png")]: PNG, [cdn("b.png")]: PNG });
+  const { c, fake, of, threadId, statePath } = await ownerRoom({ fetchFile: net.fetchFile });
+  const first = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "to Nobody", attachments: [attach("a.png", PNG.length)] });
+  await flush();
+  assert.deepEqual(onDisk(statePath), [`${first}-0-a.png`], "premise: staged, answer owed");
+
+  const second = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("b.png", PNG.length)] });
+  await flush();
+  assert.deepEqual([fake.bot.at(-1).replyTo, fake.bot.at(-1).content], [second, "Not sent: the room is still taking the files of your last post. Send this again once that one has its ✅ or its answer."]);
+  assert.equal(net.calls.length, 1, "nothing downloaded for it");
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "words alone still go" });
+  await flush();
+  assert.equal(of("say").at(-1).text, "words alone still go");
+
+  // Refused before the bridge took the file, e.g. a name no member has.
+  c.handle({ t: "said", discordMessageId: first, ok: false, error: "Not sent: no member is called Nobody." });
+  await flush();
+  assert.deepEqual(onDisk(statePath), [], "a refusal removes the staged file");
+
+  const third = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("b.png", PNG.length)] });
+  await flush();
+  assert.equal(of("say").at(-1).files?.length, 1, "control: free again once answered");
+  c.handle({ t: "said", discordMessageId: third, ok: true, seq: 9 });
+  await flush();
+  assert.deepEqual(onDisk(statePath), [], "an ok removes whatever the bridge left");
+
+  // A child that stopped between a download and its say leaves a file no say names.
+  writeFileSync(join(stageDir(statePath), "orphan.png"), PNG);
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length)] });
+  await flush();
+  assert.ok(!onDisk(statePath).includes("orphan.png"), "swept before the next post's files");
+  await c.close();
+});
+
+for (const crash of [false, true]) {
+  test(`#375 a note owed after a part Discord took whose reply was lost is posted once${crash ? ", after a restart" : ""}`, async () => {
+    const fake = createFakeDiscord();
+    const statePath = tmpState();
+    const first = await ownerRoom({ fake, statePath });
+    const file = roomFile(statePath, "shot.png");
+    const head = "→ everyone · tell\n";
+    const text = "x".repeat(MESSAGE_LIMIT - head.length);
+    // Cut off once with the file there, gone by the retry; that retry Discord takes and the reply is lost.
+    let cut = false;
+    let lost = false;
+    fake.gate = async (op, args) => {
+      if (op === "send" && !cut && args.content === head + text) {
+        cut = true;
+        rmSync(file.path);
+        throw kindError("network");
+      }
+    };
+    fake.after = async (op, args) => {
+      if (op === "send" && !lost && args.content === head + text) {
+        lost = true;
+        throw kindError("network");
+      }
+    };
+    first.c.handle(message("sync-abcd", 1, { text, files: [file] }));
+    for (let i = 0; i < 40 && !lost; i++) await first.clock.advance(250);
+    assert.ok(cut && lost, "premise: Discord took the part, the reply was lost");
+    const note = (s) => s.content === "(file no longer available: shot.png)";
+    let c = first.c;
+    if (crash) {
+      await first.c.close();
+      assert.equal(saved(statePath).pending?.owed, "(file no longer available: shot.png)", "the note is on disk with the part's intent");
+      const second = await ownerRoom({ fake, statePath });
+      second.c.handle(message("sync-abcd", 2));
+      c = second.c;
+      await flush();
+    } else {
+      await first.clock.advance(5_000);
+    }
+    assert.equal(fake.sent.filter((s) => s.content === head + text).length, 1, "the part once");
+    assert.equal(fake.sent.filter(note).length, 1, "the note once");
+    const at = fake.sent.findIndex(note);
+    assert.equal(fake.sent[at - 1].content, head + text, "right after the part");
+    assert.equal(saved(statePath).owedNote, undefined);
+    await c.close();
+  });
+}
+
+test("#375 a room folder swapped for a link while a file downloads: nothing is written through it", async () => {
+  const gate = deferred();
+  const net = fakeCdn({ [cdn("a.png")]: PNG });
+  const slow = async (url, init) => {
+    await gate.promise;
+    return net.fetchFile(url, init);
+  };
+  const { c, fake, of, threadId, statePath } = await ownerRoom({ fetchFile: slow });
+  const elsewhere = mkdtempSync(join(tmpdir(), "gd-swap-"));
+  const posted = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length)] });
+  await flush();
+  assert.ok(existsSync(roomDir(statePath)), "premise: the folder was made and checked before the wait");
+  rmSync(roomDir(statePath), { recursive: true });
+  symlinkSync(elsewhere, roomDir(statePath));
+  gate.resolve();
+  await flush();
+  assert.equal(fake.bot.at(-1).replyTo, posted);
+  assert.match(fake.bot.at(-1).content, /is not a folder\)\.$/);
+  assert.deepEqual([of("say"), readdirSync(elsewhere)], [[], []]);
+  await c.close();
+});
+
+test("#375 discord.js adapter: a post's attachments reach the connector, and a webhook send carries its files", async () => {
+  const seen = {};
+  const forum = fakeForum({ tags: [] });
+  forum.fetchWebhooks = async () => new Collection();
+  forum.createWebhook = async () => ({ send: async (body) => ((seen.webhook = body), { id: "M1" }) });
+  const { discord, client } = await adapterWith(forum);
+  const posts = [];
+  discord.on("post", (p) => posts.push(p.attachments));
+  const msg = { id: "D1", channelId: "T9", guildId: "G1", content: "", author: { id: "U1", bot: false } };
+  client.emit("messageCreate", { ...msg, attachments: new Collection([["a1", { url: cdn("a.png"), name: "a.png", size: 12, contentType: "image/png" }]]) });
+  client.emit("messageCreate", { ...msg, attachments: new Collection() });
+  assert.deepEqual(posts, [[{ url: cdn("a.png"), name: "a.png", size: 12 }], []]);
+  await discord.sendWebhook({ forumId: "F1", threadId: "T9", username: "Gyre", content: "x", allowedMentions: NO_MENTIONS, files: [{ data: PNG, name: "a.png" }] });
+  assert.deepEqual(seen.webhook.files, [{ attachment: PNG, name: "a.png" }]);
+  await discord.sendWebhook({ forumId: "F1", threadId: "T9", username: "Gyre", content: "x", allowedMentions: NO_MENTIONS });
+  assert.equal("files" in seen.webhook, false);
+});
+
+test("#375 a download that hangs is given up after its time, and the posts behind it go on", async () => {
+  let signal = null;
+  const hang = async (url, init) => {
+    signal = init.signal;
+    return new Promise(() => {});
+  };
+  const { c, fake, clock, of, threadId, statePath } = await ownerRoom({ fetchFile: hang });
+  const stuck = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("slow.png", PNG.length)] });
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "after" });
+  await flush();
+  assert.ok(signal && !signal.aborted, "premise: the download is in flight");
+  assert.deepEqual(of("say"), []);
+  await clock.advance(FILE_FETCH_MS);
+  assert.ok(signal.aborted, "the download itself is cancelled");
+  assert.deepEqual([fake.bot.at(-1).replyTo, fake.bot.at(-1).content], [stuck, "Not sent: slow.png could not be downloaded (timed out)."]);
+  assert.deepEqual(of("say").map((x) => x.text), ["after"]);
+  assert.deepEqual(onDisk(statePath), []);
+  await c.close();
+});
+
+test("#375 a room unfollowed, or an owner changed, while the files download: nothing is said and the files are removed", async () => {
+  for (const change of ["disconnect", "owner"]) {
+    const gate = deferred();
+    const net = fakeCdn({ [cdn("a.png")]: PNG });
+    const slow = async (url, init) => {
+      await gate.promise;
+      return net.fetchFile(url, init);
+    };
+    const { c, fake, of, threadId, statePath } = await ownerRoom({ fetchFile: slow });
+    fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length)] });
+    await flush();
+    if (change === "disconnect") c.handle({ t: "disconnect", room: "sync-abcd", reason: "closed" });
+    else c.handle({ t: "owner", ownerId: "U-NEW" });
+    gate.resolve();
+    await flush();
+    assert.equal(net.calls.length, 1, `${change}: premise, the file was downloaded`);
+    assert.deepEqual([of("say"), onDisk(statePath)], [[], []], change);
+    await c.close();
+  }
+});
+
+test("#375 a post in an earlier instance's thread of a reused room code downloads nothing", async () => {
+  const net = fakeCdn({ [cdn("a.png")]: PNG });
+  const { c, fake, of, threadId } = await ownerRoom({ fetchFile: net.fetchFile });
+  c.handle({ t: "connect", room: "sync-abcd", members: [], createdAt: 2 });
+  await flush();
+  assert.notEqual(of("connected").at(-1).threadId, threadId, "premise: the code has a new post");
+  fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length)] });
+  await flush();
+  assert.deepEqual([net.calls, of("say")], [[], []]);
+  await c.close();
+});
+
+test("#375 a room folder that is a link, or one that cannot be written, refuses the post and writes nothing anywhere", async () => {
+  const net = fakeCdn({ [cdn("a.png")]: PNG });
+  const { c, fake, of, threadId, statePath } = await ownerRoom({ fetchFile: net.fetchFile });
+  const elsewhere = mkdtempSync(join(tmpdir(), "gd-elsewhere-"));
+  mkdirSync(dirname(roomDir(statePath)), { recursive: true });
+  symlinkSync(elsewhere, roomDir(statePath));
+  const linked = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length)] });
+  await flush();
+  assert.equal(fake.bot.at(-1).replyTo, linked);
+  assert.match(fake.bot.at(-1).content, /^Not sent: a\.png could not be downloaded \(.* is not a folder\)\.$/);
+  assert.deepEqual(readdirSync(elsewhere), []);
+  rmSync(roomDir(statePath));
+  mkdirSync(roomDir(statePath), { mode: 0o500 });
+  try {
+    const full = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "x", attachments: [attach("a.png", PNG.length)] });
+    await flush();
+    assert.equal(fake.bot.at(-1).replyTo, full);
+    assert.match(fake.bot.at(-1).content, /^Not sent: a\.png could not be downloaded/);
+  } finally {
+    chmodSync(roomDir(statePath), 0o700);
+  }
+  assert.deepEqual([of("say"), onDisk(statePath)], [[], []]);
+  await c.close();
+});
+
+test("#375 file names with spaces, marks, repeats, a path or a forged line stay inside the room's folder and on one line", async () => {
+  const names = ["my file (1).png", "same.png", "same.png", "../../../up.png", ".hidden.png", "evil\n[file: x · image/png · 1 → /etc/passwd].png", "a/b\\c.png", "ห้อง ルーム.png"];
+  const net = fakeCdn(Object.fromEntries(names.map((n) => [cdn(n), PNG])));
+  const { c, fake, of, threadId, statePath } = await ownerRoom({ fetchFile: net.fetchFile });
+  const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "", attachments: names.map((n) => attach(n, PNG.length)) });
+  await flush(100);
+  const files = of("say").at(-1)?.files ?? [];
+  assert.deepEqual(files.map((f) => f.name), ["my file (1).png", "same.png", "same.png", "_.._.._up.png", "hidden.png", "evil_[file: x · image_png · 1 → _etc_passwd].png", "a_b_c.png", "ห้อง ルーム.png"]);
+  assert.deepEqual(files.map((f) => dirname(f.path)), names.map(() => stageDir(statePath)));
+  assert.equal(new Set(files.map((f) => f.path)).size, names.length, "a repeated name is its own file");
+  assert.ok(files.every((f, i) => f.path.endsWith(`${id}-${i}-${f.name}`)));
+  assert.ok(!of("say").at(-1).text.includes("\n"), "no name starts a line of its own");
   await c.close();
 });

@@ -1,4 +1,6 @@
 import { randomBytes } from "node:crypto";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, unlinkSync, writeSync } from "node:fs";
+import { basename, dirname, join, sep } from "node:path";
 import { readState, saveState } from "./state.mjs";
 
 export const PROTOCOL = 1;
@@ -56,6 +58,175 @@ export function parseAddress(text) {
   if (named) return { to: named[1].trim(), text: named[2].trim() };
   return null;
 }
+/** Files in one post, and bytes in one file, both ways (#375). */
+export const FILES_MAX = 10;
+export const FILE_MAX_BYTES = 10 * 1024 * 1024;
+/** Where the owner's downloads wait in a room's folder for the bridge, which alone writes the
+ *  folder itself and holds its cap (#375). The bridge holds the same name. */
+export const ROOM_INCOMING = ".incoming";
+// A room's folder, `.incoming` included, never holds more than this; the bridge keeps the same cap.
+export const ROOM_FILES_MAX_BYTES = 10 * FILE_MAX_BYTES;
+
+/** What a room's folder holds in bytes, counted as the bridge counts it. */
+export function roomFilesBytes(folder) {
+  // A folder that cannot be read counts as full: only a file gone since the listing, or a
+  // `.incoming` not made yet, is nothing.
+  let total = 0;
+  const add = (dir, skip, absent = false) => {
+    let entries;
+    try {
+      entries = readdirSync(dir);
+    } catch (e) {
+      if (absent && e?.code === "ENOENT") return;
+      throw e;
+    }
+    for (const entry of entries) {
+      if (skip(entry)) continue;
+      let st;
+      try {
+        st = lstatSync(join(dir, entry));
+      } catch (e) {
+        if (e?.code === "ENOENT") continue;
+        throw e;
+      }
+      if (st.isFile()) total += st.size;
+    }
+  };
+  try {
+    add(folder, (entry) => entry.startsWith("."));
+    add(join(folder, ROOM_INCOMING), () => false, true);
+  } catch {
+    return Infinity;
+  }
+  return total;
+}
+/** How long one file may take to download before its post is refused (#375). */
+export const FILE_FETCH_MS = 60_000;
+/** The only hosts a file is ever downloaded from: Discord's own (#375). */
+const FILE_HOSTS = new Set(["cdn.discordapp.com", "media.discordapp.net"]);
+
+/** A file's type by its bytes, never its name (#375): one a session can read, or null. The
+ *  bridge holds the same function, byte for byte, tested against the same table. */
+export function fileKind(bytes) {
+  const b = Buffer.from(bytes);
+  if (b.length === 0) return null;
+  const starts = (sig, at = 0) => b.subarray(at, at + sig.length).equals(Buffer.from(sig, "latin1"));
+  if (starts("\x89PNG\r\n\x1a\n")) return "image/png";
+  if (starts("\xff\xd8\xff")) return "image/jpeg";
+  if (starts("GIF87a") || starts("GIF89a")) return "image/gif";
+  if (starts("RIFF") && starts("WEBP", 8)) return "image/webp";
+  if (starts("%PDF-")) return "application/pdf";
+  if (b.includes(0)) return null;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(b);
+    return "text/plain";
+  } catch {
+    return null;
+  }
+}
+
+/** A file's name as the room shows it: no `/`, no NUL, no leading `.`, at most 120 characters. */
+export function displayName(name) {
+  const clean = [...String(name ?? "").replace(/[/\\\0-\x1f\x7f]/g, "_").replace(/^\.+/, "")].slice(0, 120).join("");
+  return clean || "file";
+}
+
+/** "(file: a.png)" / "(files: a.png, b.pdf)": the text of a post that is only files. */
+export function filesText(files) {
+  const names = files.map((f) => f.name).join(", ");
+  return files.length === 1 ? `(file: ${names})` : `(files: ${names})`;
+}
+
+/** Whether a file may be downloaded from this address: https, Discord's hosts, nothing else. */
+export function fileUrl(url) {
+  let u;
+  try {
+    u = new URL(String(url));
+  } catch {
+    return false;
+  }
+  return u.protocol === "https:" && FILE_HOSTS.has(u.hostname) && !u.port && !u.username && !u.password;
+}
+
+// The bytes at `url`, read no further than FILE_MAX_BYTES: null past that, whatever the
+// response said its length was. A redirect is an error, so it never leaves Discord's hosts.
+async function readFile(fetchFile, url, signal) {
+  const res = await fetchFile(url, { redirect: "error", signal });
+  if (!res?.ok || !res.body) throw new Error(`HTTP ${res?.status ?? "error"}`);
+  if (Number(res.headers?.get?.("content-length")) > FILE_MAX_BYTES) return null;
+  const chunks = [];
+  let total = 0;
+  // Leaving the loop early cancels the download.
+  for await (const chunk of res.body) {
+    total += chunk.length;
+    if (total > FILE_MAX_BYTES) return null;
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, total);
+}
+
+// Created, never opened if it exists, never through a link, private from the first byte. A write
+// or close that fails once the file exists throws with `partial` set to its path, for the caller to take
+// back; a file that was never created is never named.
+function writeNew(path, bytes) {
+  const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  let failed = null;
+  try {
+    for (let at = 0; at < bytes.length; ) {
+      const written = writeSync(fd, bytes, at, bytes.length - at);
+      if (!(written > 0)) throw new Error("the file could not be written in full");
+      at += written;
+    }
+  } catch (e) {
+    failed = e;
+  }
+  try {
+    closeSync(fd);
+  } catch (e) {
+    failed ??= e;
+  }
+  if (failed) {
+    failed.partial = path;
+    throw failed;
+  }
+}
+
+// The bytes handed to Discord are the ones read and checked here, through a held descriptor
+// that never follows a link: a path given to discord.js would be opened again, later. Null when
+// the file is gone, not a regular file, over the limit, changed size while it was read, or not a
+// type a session can read. Never more than the size it had when opened is held in memory.
+export function readHeld(path) {
+  let fd;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > FILE_MAX_BYTES) return null;
+    const bytes = Buffer.alloc(st.size + 1);
+    let n = 0;
+    for (let got; n < bytes.length && (got = readSync(fd, bytes, n, bytes.length - n, null)) > 0; ) n += got;
+    if (n !== st.size) return null;
+    const held = bytes.subarray(0, n);
+    return fileKind(held) ? held : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** Removes each file; how many are still there for a reason other than being gone. */
+function removeFiles(files) {
+  let left = 0;
+  for (const f of files) {
+    try {
+      unlinkSync(f.path);
+    } catch (e) {
+      if (e?.code !== "ENOENT") left++;
+    }
+  }
+  return left;
+}
+
 const CLOSE_TEXT = { closed: "Room closed", ended: "Room ended — Gyredeck stopped", disconnected: "Disconnected" };
 
 export const realClock = {
@@ -171,7 +342,7 @@ export function notRelayed(messages) {
   return `${ranges.join(", ")} from ${[...new Set(messages.map((m) => m.sender))].join(", ")}`;
 }
 
-export function createConnector({ discord, out, clock = realClock }) {
+export function createConnector({ discord, out, clock = realClock, fetchFile = (url, init) => fetch(url, init) }) {
   let token = null;
   let statePath = null;
   let state = { v: 1, rooms: {} };
@@ -200,6 +371,8 @@ export function createConnector({ discord, out, clock = realClock }) {
   const approving = new Map();
   // Rooms whose saved says this child has sent again since it started.
   const resaid = new Set();
+  // Per room, the owner's post still downloading its files, which every later post waits for.
+  const inbound = new Map();
 
   function redact(text) {
     const s = String(text);
@@ -349,12 +522,210 @@ export function createConnector({ discord, out, clock = realClock }) {
       const addressed = parseAddress(body);
       say = addressed ? { kind: "ask", ...addressed } : { kind: "tell", to: "everyone", text: body };
     }
-    if (!say.text) return botReply(p.channelId, p.messageId, "Not sent: there is no text to send.");
+    const attached = Array.isArray(p.attachments) ? p.attachments : [];
+    if (!say.text && !attached.length) return botReply(p.channelId, p.messageId, "Not sent: there is no text to send.");
     if (say.text.length > SAY_MAX_TEXT) {
       return botReply(p.channelId, p.messageId, `Not sent: a room message is at most ${SAY_MAX_TEXT} characters and this one is ${say.text.length}. Split it.`);
     }
-    sayToRoom(code, p.channelId, p.messageId, say);
+    if (!attached.length && !inbound.has(code)) return sayToRoom(code, p.channelId, p.messageId, say);
+    // A post with files is said once they are on disk, and one written after it waits its
+    // turn, so the room hears the owner in the order they wrote (#375).
+    const turn = (inbound.get(code) ?? Promise.resolve())
+      .then(() => sayWithFiles(code, p, say, attached))
+      .catch((e) => fail("internal", e?.message, code))
+      .finally(() => {
+        if (inbound.get(code) === turn) inbound.delete(code);
+      });
+    inbound.set(code, turn);
   });
+
+  // The owner's files, downloaded into the room's folder before the say that names them
+  // (#375). Every check that needs no download is made for every file first, so a post
+  // refused for any of them fetches nothing; one refused for what its bytes turn out to be
+  // takes the whole post with it, and none of the post is left on disk.
+  async function sayWithFiles(code, p, say, attached) {
+    let files = [];
+    if (attached.length) {
+      // One post's files at a time wait in `.incoming`, so what waits there is never more than
+      // one post's worth on top of the folder the bridge caps.
+      if ((state.rooms[code]?.saying ?? []).some((l) => l.files?.length)) {
+        return botReply(p.channelId, p.messageId, "Not sent: the room is still taking the files of your last post. Send this again once that one has its ✅ or its answer.");
+      }
+      const got = await ownerFiles(code, p.messageId, attached);
+      if (got.refused) return botReply(p.channelId, p.messageId, got.refused);
+      files = got.files;
+    }
+    // The download may have outlived the room's follow, or the owner who wrote it.
+    if (stopped || p.authorId !== ownerId || roomOfThread(p.channelId) !== code || !workers.get(code)?.accepting) {
+      dropStaged(files);
+      if (!stopped && p.authorId === ownerId) botReply(p.channelId, p.messageId, "Not sent: this room is no longer connected to Discord.");
+      return;
+    }
+    sayToRoom(code, p.channelId, p.messageId, say.text ? say : { ...say, text: filesText(files) }, files);
+  }
+
+  // A child that stopped between a download and its count, or before its say, left a file no
+  // saved say names: the next child removes it as it starts, so the cap holds again (#375).
+  // A file it cannot remove is said, and tried again every minute until it is gone. A room
+  // still taking a post's files is passed over: what it has written is not saved in a say yet.
+  let incomingRoot = null;
+  let incomingTimer = null;
+  const INCOMING_RETRY_MS = 60_000;
+  // A download that could not be removed is left to the sweep, which says so and tries again.
+  function dropStaged(files) {
+    if (removeFiles(files)) armSweep();
+  }
+  function armSweep() {
+    if (!incomingTimer && !stopped) incomingTimer = clock.setTimeout(sweepIncoming, INCOMING_RETRY_MS);
+  }
+  function sweepIncoming() {
+    incomingTimer = null;
+    if (stopped || !incomingRoot) return;
+    const root = incomingRoot;
+    const named = new Set(Object.values(state.rooms).flatMap((rs) => (rs.saying ?? []).flatMap((l) => (l.files ?? []).map((f) => f.path))));
+    let codes = [];
+    try {
+      if (!lstatSync(root).isDirectory()) return;
+      codes = readdirSync(root);
+    } catch (e) {
+      if (e?.code === "ENOENT") return;
+      codes = null;
+    }
+    let left = codes === null ? 1 : 0;
+    let busy = 0;
+    for (const code of codes ?? []) {
+      if (inbound.has(code)) {
+        busy++;
+        continue;
+      }
+      const stage = join(root, code, ROOM_INCOMING);
+      try {
+        if (!lstatSync(join(root, code)).isDirectory() || !lstatSync(stage).isDirectory()) continue;
+      } catch (e) {
+        if (e?.code !== "ENOENT") left++;
+        continue;
+      }
+      let names;
+      try {
+        names = readdirSync(stage);
+      } catch (e) {
+        if (e?.code !== "ENOENT") left++;
+        continue;
+      }
+      for (const name of names) {
+        if (named.has(join(stage, name))) continue;
+        try {
+          unlinkSync(join(stage, name));
+        } catch (e) {
+          if (e?.code !== "ENOENT") left++;
+        }
+      }
+    }
+    if (!left) {
+      reported.delete("incoming");
+      // A room passed over is looked at again once its post is done.
+      if (busy) incomingTimer = clock.setTimeout(sweepIncoming, INCOMING_RETRY_MS);
+      return;
+    }
+    failOnce("incoming", "internal", "A download no say names could not be removed from a room's folder; trying again every minute.");
+    incomingTimer = clock.setTimeout(sweepIncoming, INCOMING_RETRY_MS);
+  }
+
+  // A room's folder, `attachments/<room>` beside the state file, a real directory and never a
+  // link: the owner's downloads go in its `.incoming`, and the bridge's copies are what is relayed.
+  function roomFolder(code) {
+    if (!statePath || !/^[\w-]{1,64}$/.test(code)) return null;
+    return join(dirname(statePath), "attachments", code);
+  }
+
+  // A download that hangs is given up, so the room's later posts are not held behind it.
+  function timed(ms, run) {
+    const ctl = new AbortController();
+    let handle;
+    const late = new Promise((_, reject) => {
+      handle = clock.setTimeout(() => {
+        ctl.abort();
+        reject(new Error("timed out"));
+      }, ms);
+    });
+    return Promise.race([run(ctl.signal), late]).finally(() => clock.clearTimeout(handle));
+  }
+
+  async function ownerFiles(code, messageId, attached) {
+    if (attached.length > FILES_MAX) return { refused: `Not sent: at most ${FILES_MAX} files in one post.` };
+    const list = attached.map((a) => ({ url: a?.url, name: displayName(a?.name), size: a?.size }));
+    for (const a of list) {
+      if (Number(a.size) > FILE_MAX_BYTES) return { refused: `Not sent: ${a.name} is over 10 MB.` };
+      if (!fileUrl(a.url)) return { refused: `Not sent: ${a.name} is not a file Discord holds.` };
+    }
+    const dir = roomFolder(code);
+    const files = [];
+    const refuse = (refused) => {
+      dropStaged(files);
+      return { refused };
+    };
+    let a = list[0];
+    try {
+      if (!dir) throw new Error("no folder for this room");
+      const stage = join(dir, ROOM_INCOMING);
+      const folders = (list = [dirname(dir), dir, stage]) => {
+        for (const d of list) {
+          const st = lstatSync(d);
+          if (!st.isDirectory() || st.isSymbolicLink()) throw new Error(`${d} is not a folder`);
+        }
+      };
+      // Each level is made only once the one above it is known to be a folder, not a link.
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      folders([dirname(dir), dir]);
+      try {
+        mkdirSync(stage, { mode: 0o700 });
+      } catch (e) {
+        if (e?.code !== "EEXIST") throw e;
+      }
+      folders();
+      // No say holds files here (sayWithFiles), so anything left is from a child that stopped
+      // between a download and its say.
+      // One that cannot be removed holds the room's next download until it is, so what is
+      // left there is never more than one file past the cap.
+      if (removeFiles(readdirSync(stage).map((name) => ({ path: join(stage, name) })))) {
+        armSweep();
+        throw new Error("a file the room took back is still there; try again in a minute");
+      }
+      const prefix = String(messageId).replace(/[^\w-]/g, "_");
+      for (const [i, next] of list.entries()) {
+        a = next;
+        const bytes = await timed(FILE_FETCH_MS, (signal) => readFile(fetchFile, a.url, signal));
+        if (bytes === null) return refuse(`Not sent: ${a.name} is over 10 MB.`);
+        const type = fileKind(bytes);
+        if (!type) return refuse(`Not sent: ${a.name} is not a file a session can read (images, PDF, text).`);
+        // A name of many wide characters is cut short on disk, never in the room.
+        let disk = `${prefix}-${i}-${a.name}`;
+        while (Buffer.byteLength(disk) > 240) disk = [...disk].slice(0, -1).join("");
+        const path = join(stage, disk);
+        // Checked again after the download's wait, with no wait before the write.
+        folders();
+        // Past the cap already: a file one of the two writers could not take back is still
+        // there, and nothing more is written until it is gone.
+        const before = roomFilesBytes(dir);
+        if (before > ROOM_FILES_MAX_BYTES) {
+          return refuse(Number.isFinite(before) ? `Not sent: the room's files are past ${ROOM_FILES_MAX_BYTES / 1024 / 1024} MB until one it could not take back is removed.` : "Not sent: the room's files could not be counted.");
+        }
+        writeNew(path, bytes);
+        // Counted after the write, as the bridge counts after its own: a file kept was counted
+        // with every file either of them wrote before it.
+        const held = roomFilesBytes(dir);
+        if (held > ROOM_FILES_MAX_BYTES) {
+          dropStaged([{ path }]);
+          return refuse(Number.isFinite(held) ? `Not sent: the room's files would pass ${ROOM_FILES_MAX_BYTES / 1024 / 1024} MB.` : "Not sent: the room's files could not be counted.");
+        }
+        files.push({ path, name: a.name, type, size: bytes.length });
+      }
+    } catch (e) {
+      if (e?.partial) files.push({ path: e.partial });
+      return refuse(`Not sent: ${a.name} could not be downloaded (${e?.message}).`);
+    }
+    return { files };
+  }
   discord.on("edit", (e) => {
     if (stopped || !ownerId || e.authorId !== ownerId || !roomOfThread(e.channelId)) return;
     if (spoken.get(e.messageId) !== false) return;
@@ -667,17 +1038,18 @@ export function createConnector({ discord, out, clock = realClock }) {
   // Saved before it is sent, and kept until its receipt is in the post: a child that dies in
   // between sends it again with the same Discord id, which the bridge answers with the seq
   // it already has (#205 r1).
-  function sayToRoom(code, threadId, discordMessageId, say) {
+  function sayToRoom(code, threadId, discordMessageId, say, files = []) {
     const rs = state.rooms[code];
     const { kind, to, text, replyToSeq } = say;
     // The owner who typed it is kept with it: a retry after the owner changed carries the old
     // id, which the app's Keychain check refuses (#205 audit).
-    const line = { room: code, threadId, discordMessageId, ownerId, kind, to, text, ...(replyToSeq != null ? { replyToSeq } : {}) };
+    const line = { room: code, threadId, discordMessageId, ownerId, kind, to, text, ...(replyToSeq != null ? { replyToSeq } : {}), ...(files.length ? { files } : {}) };
     (rs.saying ??= []).push(line);
     try {
       save();
     } catch (e) {
       rs.saying.pop();
+      dropStaged(files);
       return botReply(threadId, discordMessageId, `Not sent: Gyredeck could not save it first (${e?.message}).`);
     }
     spoken.delete(discordMessageId);
@@ -737,6 +1109,8 @@ export function createConnector({ discord, out, clock = realClock }) {
       fail(e?.kind === "permission" ? "missing_permission" : "internal", `Could not answer in Discord: ${e?.message}`, w.code);
     }
     if (at < 0) return;
+    // The answer is final: what the bridge did not take of the say's files is not needed again.
+    dropStaged(rs.saying[at].files ?? []);
     rs.saying.splice(at, 1);
     save();
   }
@@ -998,6 +1372,17 @@ export function createConnector({ discord, out, clock = realClock }) {
   // repeats at most the one post whose intent was pending; with state lost (replay) every
   // owed line Discord took but the app had not seen ACKed is posted again, once each.
   async function postOnce(w, rs, { key, username, content, ...extra }, apply = () => {}, allowedMentions = { parse: [] }) {
+    // A note owed for an earlier part goes before anything else is posted in the room (#375).
+    if (rs.owedNote && rs.owedNote.key !== key) await postOnce(w, rs, rs.owedNote, (r) => delete r.owedNote);
+    // A part Discord took is known by its intent, and the note owed after it comes with it.
+    const owe = (i) => {
+      if (i.owed) rs.owedNote = { key: `${i.key}:unsent`, username: "Room", content: i.owed };
+      return i.owed;
+    };
+    const paid = async (id) => {
+      if (rs.owedNote) await postOnce(w, rs, rs.owedNote, (r) => delete r.owedNote);
+      return id;
+    };
     const finish = (id, keep, anchor = true) => {
       if (id && anchor) rs.lastMsgId = id;
       if (!keep) delete rs.pending;
@@ -1016,19 +1401,41 @@ export function createConnector({ discord, out, clock = realClock }) {
       if (found) {
         rs.lastMsgId = found;
         rs.taken = { key: intent.key, id: found };
+        owe(intent);
       } else if (found === null) unreadable(w);
       delete rs.pending;
       save();
+      if (found && intent.owed) await paid();
       intent = null;
     }
-    if (intent?.key === key) ({ username, content } = intent);
+    let wanted = extra.files ?? [];
+    if (intent?.key === key) ({ username, content, files: wanted = [] } = intent);
     if (intent) {
       const found = await readBack(rs, username, content);
       // A child that lost its state reads back every line it is handed until one is missing.
-      if (found) return finish(found, intent.key === "replay");
+      if (found) {
+        owe(intent);
+        return paid(finish(found, intent.key === "replay"));
+      }
       if (found === null) unreadable(w);
     }
-    rs.pending = { key, username, content, ...extra };
+    // Read before the intent, so a file that cannot be sent is said in the content the
+    // read-back knows the post by, and an intent found after a restart names only the files
+    // that went with it (#375).
+    const files = [];
+    const unsent = [];
+    for (const f of wanted) {
+      const data = readHeld(f.path);
+      if (data) files.push({ data, name: f.name });
+      else unsent.push(f);
+    }
+    // A note that would take the part past Discord's limit is posted on its own right after it,
+    // so no word of the part is cut to make room for it.
+    const note = unsent.map((f) => `\n(file no longer available: ${f.name})`).join("");
+    const after = note && content.length + note.length > MESSAGE_LIMIT ? note.slice(1) : null;
+    if (note && !after) content += note;
+    const { files: _, ...rest } = extra;
+    rs.pending = { key, username, content, ...rest, ...(files.length ? { files: wanted.filter((f) => !unsent.includes(f)) } : {}), ...(after ? { owed: after } : {}) };
     save();
     const sent = await discord.sendWebhook({
       forumId: rs.forumId,
@@ -1036,8 +1443,11 @@ export function createConnector({ discord, out, clock = realClock }) {
       username,
       content,
       allowedMentions,
+      ...(files.length ? { files } : {}),
     });
-    return finish(sent?.id, false);
+    // The note is owed in the same save that records the part, and stays owed until Discord has it.
+    owe(rs.pending);
+    return paid(finish(sent?.id, false));
   }
 
   function unreadable(w) {
@@ -1177,6 +1587,19 @@ export function createConnector({ discord, out, clock = realClock }) {
     delete r.partSeq;
     delete r.lastPart;
     delete r.partDelayed;
+    delete r.partMissing;
+  }
+
+  // A room line's files that cannot be sent: gone from the room's folder, never in it, or no
+  // longer a file `readHeld` would send (#375).
+  function missingFiles(code, m) {
+    const dir = roomFolder(code);
+    return (m.files ?? []).flatMap((f, k) => (dir && f.path.startsWith(dir + sep) && readHeld(f.path) ? [] : [k]));
+  }
+
+  function withMissing(m, missing) {
+    if (!missing.length) return m;
+    return { ...m, text: `${m.text}${missing.map((k) => `\n(file no longer available: ${m.files?.[k]?.name ?? "file"})`).join("")}` };
   }
 
   async function relay(w, item) {
@@ -1215,14 +1638,20 @@ export function createConnector({ discord, out, clock = realClock }) {
       // A child that lost its state cannot know whether an earlier run marked this line
       // "(delayed)": the copy Discord holds is looked for under the other mark too, and when
       // found that is the text the line keeps (#199 I9c).
+      // Which of its files were gone when the seq was first cut is kept the same way, so the
+      // text, and with it the read-back's key, is cut the same again (#375).
+      const missing = intent ? intent.missing ?? [] : resumed ? rs.partMissing ?? [] : missingFiles(w.code, item.m);
+      const m = withMissing(item.m, missing);
       if (!intent && !resumed && rs.pending?.key === "replay") {
-        const other = messageParts(item.m, !delayed, mention);
+        const other = messageParts(m, !delayed, mention);
         if (await readBack(rs, other.username, other.parts[0])) delayed = !delayed;
       }
-      const { username, parts } = messageParts(item.m, delayed, mention);
+      const { username, parts } = messageParts(m, delayed, mention);
       item.username = username;
       item.parts = parts;
       item.delayed = delayed;
+      item.missing = missing;
+      item.files = (item.m.files ?? []).filter((_, k) => !missing.includes(k));
       if (intent) item.sent = Math.min(intent.part, item.parts.length);
       else if (resumed) item.sent = Math.min(rs.lastPart, item.parts.length);
     }
@@ -1246,11 +1675,17 @@ export function createConnector({ discord, out, clock = realClock }) {
           if (r.relayed.length > RELAYED_MAX) r.relayed.splice(0, r.relayed.length - RELAYED_MAX);
         }
         if (last) finished(r);
-        else Object.assign(r, { partSeq: seq, lastPart: i + 1, partDelayed: item.delayed });
+        else {
+          Object.assign(r, { partSeq: seq, lastPart: i + 1, partDelayed: item.delayed });
+          if (item.missing.length) r.partMissing = item.missing;
+          else delete r.partMissing;
+        }
       };
       if (item.parts[i]) {
         const allowed = mention && i === 0 ? { parse: [], users: [mention] } : { parse: [] };
-        msgId = await postOnce(w, rs, { key: `line:${seq}:${i}`, seq, part: i, delayed: item.delayed, username: item.username, content: item.parts[i] }, after, allowed);
+        // The files go with the first part only; the read-back still knows it by its content.
+        const extra = { ...(item.missing.length ? { missing: item.missing } : {}), ...(i === 0 && item.files.length ? { files: item.files } : {}) };
+        msgId = await postOnce(w, rs, { key: `line:${seq}:${i}`, seq, part: i, delayed: item.delayed, ...extra, username: item.username, content: item.parts[i] }, after, allowed);
       } else after(rs, null);
     }
     if (rs.lastSeq < seq) {
@@ -1357,6 +1792,10 @@ export function createConnector({ discord, out, clock = realClock }) {
       // not read at all is blocked, and nothing is posted until it is fixed.
       postsForgotten = loaded.fresh === true && !loaded.blocked;
       state = loaded.state;
+      // Not swept while the state cannot be read: a say it holds may name a file there, and is
+      // sent once a child can read it. What is left meanwhile still counts against the cap.
+      incomingRoot = join(dirname(statePath), "attachments");
+      if (!loaded.blocked) sweepIncoming();
       if (loaded.blocked) {
         // Not read, so not replaced — and with nowhere to record progress nothing is posted
         // either, or a restart could repeat any number of parts (#199 r5). Fails closed until
@@ -1443,6 +1882,11 @@ export function createConnector({ discord, out, clock = realClock }) {
           kind: String(msg.kind ?? "tell"),
           text: String(msg.text ?? ""),
         };
+        // The room's copies of the files it carries, for the first part to take along (#375).
+        const files = Array.isArray(msg.files)
+          ? msg.files.filter((f) => typeof f?.path === "string" && f.path).slice(0, FILES_MAX).map((f) => ({ path: f.path, name: displayName(f.name ?? basename(f.path)) }))
+          : [];
+        if (files.length) m.files = files;
         // Only an ask carries an approval request; a malformed one is relayed as plain text,
         // with no line asking for a code (#207).
         const approval = m.kind === "ask" ? approvalOf(msg.approval) : null;
@@ -1505,6 +1949,7 @@ export function createConnector({ discord, out, clock = realClock }) {
     pairing = null;
     spoken.clear();
     if (sweepTimer) clock.clearTimeout(sweepTimer);
+    if (incomingTimer) clock.clearTimeout(incomingTimer);
     if (settleTimer) clock.clearTimeout(settleTimer);
     for (const id of [...statusAsked.keys()]) statusDone(id, "Status is not available right now.");
     settleTimer = null;

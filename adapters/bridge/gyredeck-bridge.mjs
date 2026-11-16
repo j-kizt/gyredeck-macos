@@ -23,12 +23,12 @@
  *   POST /ingest    - Multi-provider event fan-in
  */
 
-import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir, loadavg } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 
@@ -41,6 +41,10 @@ const INGEST_TOKEN_PATH = join(MOD_DIR, "gyredeck.ingest-token");
 const SESSION_NAMES_PATH = join(MOD_DIR, "gyredeck.session-names.json");
 const SESSION_KINDS_PATH = join(MOD_DIR, "gyredeck.session-kinds.json");
 const ROOM_RULES_PATH = join(MOD_DIR, "room-rules.md");
+/** Where a room's files live while it is open (#375): one folder per room, removed with it. */
+export const ATTACH_DIR = join(MOD_DIR, "attachments");
+/** The one place a member may send a file from. Its contents are the member's; the bridge only reads them. */
+export const OUTBOX_DIR = join(MOD_DIR, "outbox");
 const BRIDGE_HOST = "127.0.0.1";
 
 /** The longest a person may make a session's name. Long enough for a sentence fragment,
@@ -231,7 +235,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 21;
+export const ROOM_RULES_VERSION = 22;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -267,6 +271,13 @@ room names the version it expects; if it names a newer one than you read, read t
 - \`listening\` in a receipt names the members with a watch open; a member that is pushed to, as Codex is, hears you without one.
 - Never put a session's one-time password in a message body.
 - Reading the room in your name also takes your own key, \`x-gyredeck-member\`. Your deliveries write it into the commands they hand you (the watch, a look back): run those as given. Never put it in a message body, and never use another member's — the room refuses a read whose key is not the reader's.
+
+## Files
+- A file goes from \`~/.config/gyredeck/outbox/\` only: copy it there first. Images (PNG, JPEG, GIF, WebP), PDF and UTF-8 text, whatever the name says — the bytes decide; at most 10 MB each and 10 in one post. Anything else is refused and nothing is sent.
+- Claude Code and Antigravity: a \`files\` field beside \`to\` and \`kind\`, each by its absolute path — \`"files":[{"path":"${OUTBOX_DIR}/<file>"}]\`. A refusal names the file: \`file_not_in_outbox\`, \`file_too_large\`, \`file_empty\`, \`file_type_not_allowed\`, \`too_many_files\`, \`room_files_full\`.
+- Codex: \`attach=<absolute path>\` on your first line, after \`yn\` and before \`name=\`, once per file; quote a path with spaces, \`attach="<path>"\`. A file that is refused is left off, the message still goes, and the room tells you which and why.
+- A file you receive arrives as a line \`[file: <name> · <type> · <size> → <path>]\`: read it at that path. The room keeps its own copy, and deletes every file when the room closes.
+- A link is text. Send it in the message; never download it to attach it.
 
 ## Narrate
 The person at your terminal can follow the room only through you. Say what came in and who sent it;
@@ -350,6 +361,309 @@ export const writeRoomRules = (origin, path = ROOM_RULES_PATH) => {
     console.error(`gyredeck: room rules not written — ${error.message}`);
     return false;
   }
+};
+
+// ── Files in rooms (#375) ──
+
+export const FILE_MAX_BYTES = 10 * 1024 * 1024;
+export const FILES_MAX = 10;
+/** A room's folder holds at most ten full posts; the bytes are on disk, not in the room's budget. */
+export const ROOM_FILES_MAX_BYTES = 10 * FILE_MAX_BYTES;
+/** Where the Discord connector puts the owner's downloads, inside a room's folder: never counted, never shown; the bridge copies a file out of it, checked, and removes it (#375). */
+export const ROOM_INCOMING = ".incoming";
+export const FILE_NAME_MAX = 120;
+
+/**
+ * What a file is, decided by its bytes and never by its name (#375): only what an AI session
+ * can read — PNG, JPEG, GIF, WebP, PDF, and UTF-8 text with no NUL. A `.txt` that is a zip is a
+ * zip, and refused. The Discord connector keeps a byte-for-byte copy of this function.
+ */
+export const fileKind = (bytes) => {
+  if (!bytes || bytes.length === 0) return null;
+  const head = String.fromCharCode(...bytes.subarray(0, 12));
+  if (head.startsWith("\x89PNG\r\n\x1a\n")) return "image/png";
+  if (head.startsWith("\xff\xd8\xff")) return "image/jpeg";
+  if (head.startsWith("GIF87a") || head.startsWith("GIF89a")) return "image/gif";
+  if (head.startsWith("RIFF") && head.slice(8, 12) === "WEBP") return "image/webp";
+  if (head.startsWith("%PDF-")) return "application/pdf";
+  if (bytes.includes(0)) return null;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return "text/plain";
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * A file's name as the room shows it: one line, no path, no leading dot, bounded. Brackets
+ * become parentheses, so a name cannot close its own `[file: …]` line and open a `[from …]`.
+ */
+export const cleanFileName = (value) =>
+  basename(String(value ?? ""))
+    .replace(/[\u0000-\u001f\u007f/]+/g, " ")
+    .replace(/\[/g, "(")
+    .replace(/\]/g, ")")
+    .replace(/^[.\s]+/, "")
+    .trim()
+    .slice(0, FILE_NAME_MAX) || "file";
+
+/** One line per file, appended to the text a delivery shows; the Claude hook writes the same. */
+export const fileLines = (files) =>
+  Array.isArray(files) ? files.map((file) => `\n[file: ${file.name} · ${file.type} · ${file.size} → ${file.path}]`).join("") : "";
+
+/** The real path of a directory that is one itself — not a link to one — or null. */
+const realDirectory = (path) => {
+  try {
+    return lstatSync(path).isDirectory() ? realpathSync(path) : null;
+  } catch {
+    return null;
+  }
+};
+
+const FILE_REFUSALS = {
+  file_not_in_outbox: (name) => `${name} was not sent: a member sends only a regular file inside ${OUTBOX_DIR}, named by its absolute path. Nothing was posted.`,
+  file_not_in_room: (name) => `${name} is not a file in this room's folder. Nothing was posted.`,
+  file_too_large: (name) => `${name} is over ${FILE_MAX_BYTES / 1024 / 1024} MB. Nothing was posted.`,
+  file_empty: (name) => `${name} is empty. Nothing was posted.`,
+  file_type_not_allowed: (name) => `${name} is not a file a session can read (PNG, JPEG, GIF, WebP, PDF or UTF-8 text). Nothing was posted.`,
+};
+const fileRefusal = (error, name) => ({ error, file: name, message: FILE_REFUSALS[error](name) });
+/** The same refusals as Codex is told them: its message went out, only the file did not. */
+const CODEX_FILE_REFUSALS = {
+  file_not_in_outbox: "not a regular file in the outbox",
+  file_too_large: `over ${FILE_MAX_BYTES / 1024 / 1024} MB`,
+  file_empty: "empty",
+  file_type_not_allowed: "not an image, a PDF or UTF-8 text",
+  room_files_full: `the room already holds ${ROOM_FILES_MAX_BYTES / 1024 / 1024} MB of files`,
+  room_files_unavailable: "it could not be stored for the room",
+};
+
+/**
+ * One file a post names, read whole if it may be sent from `base` (a real directory path):
+ * its real path, after every link is followed, is a regular file inside `base`, at most
+ * FILE_MAX_BYTES, not empty, and a kind `fileKind` allows. Read here, once, so what is checked
+ * is what is sent. `outside` is the refusal for a path that is not in `base`.
+ */
+export const readRoomFile = (path, base, outside) => {
+  const name = cleanFileName(path);
+  if (typeof path !== "string" || !isAbsolute(path) || path.includes("\0") || !base) return fileRefusal(outside, name);
+  let real;
+  try {
+    real = realpathSync(path);
+  } catch {
+    return fileRefusal(outside, name);
+  }
+  if (!real.startsWith(base + sep)) return fileRefusal(outside, name);
+  let fd;
+  try {
+    // No link at the end and no wait on a FIFO: what was resolved is what is opened.
+    fd = openSync(real, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  } catch {
+    return fileRefusal(outside, name);
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return fileRefusal(outside, name);
+    if (stat.size > FILE_MAX_BYTES) return fileRefusal("file_too_large", name);
+    // One byte over the cap is enough to know a file that grew since the stat is too large.
+    const bytes = Buffer.alloc(Math.min(stat.size, FILE_MAX_BYTES) + 1);
+    let size = 0;
+    for (let read; size < bytes.length && (read = readSync(fd, bytes, size, bytes.length - size, null)) > 0;) size += read;
+    if (size > FILE_MAX_BYTES) return fileRefusal("file_too_large", name);
+    if (size === 0) return fileRefusal("file_empty", name);
+    const content = bytes.subarray(0, size);
+    const type = fileKind(content);
+    if (!type) return fileRefusal("file_type_not_allowed", name);
+    return { bytes: content, name, type, size, real };
+  } finally {
+    closeSync(fd);
+  }
+};
+
+/** A room's own folder under `dir`, made if missing (0700); its real path, or null when something other than a directory stands there. */
+export const roomFolder = (room, dir = ATTACH_DIR) => {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (!realDirectory(dir)) return null;
+    mkdirSync(join(dir, room), { mode: 0o700 });
+  } catch (error) {
+    if (error.code !== "EEXIST") return null;
+  }
+  return realDirectory(join(dir, room));
+};
+
+/** What a room's folder holds in bytes: the room's copies and the downloads waiting in `.incoming`. The connector counts it the same way. */
+export const roomFilesBytes = (folder) => {
+  // A folder that cannot be read counts as full: only a file gone since the listing, or a
+  // `.incoming` not made yet, is nothing.
+  let total = 0;
+  const add = (dir, skip, absent = false) => {
+    let entries;
+    try {
+      entries = readdirSync(dir);
+    } catch (e) {
+      if (absent && e?.code === "ENOENT") return;
+      throw e;
+    }
+    for (const entry of entries) {
+      if (skip(entry)) continue;
+      let st;
+      try {
+        st = lstatSync(join(dir, entry));
+      } catch (e) {
+        if (e?.code === "ENOENT") continue;
+        throw e;
+      }
+      if (st.isFile()) total += st.size;
+    }
+  };
+  try {
+    add(folder, (entry) => entry.startsWith("."));
+    add(join(folder, ROOM_INCOMING), () => false, true);
+  } catch {
+    return Infinity;
+  }
+  return total;
+};
+
+/**
+ * A checked file's bytes as the room's own copy: a new name the sender cannot predict, 0600, never
+ * over anything. A write or close that fails once the file exists throws with `partial` set to its path, so
+ * the caller takes back what was written; a file that was never created is never named.
+ */
+export const storeRoomFile = (folder, file) => {
+  const path = join(folder, `${randomUUID().slice(0, 8)}-${file.name}`);
+  const fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+  let failed = null;
+  try {
+    writeFileSync(fd, file.bytes);
+  } catch (error) {
+    failed = error;
+  }
+  try {
+    closeSync(fd);
+  } catch (error) {
+    failed ??= error;
+  }
+  if (failed) {
+    failed.partial = path;
+    throw failed;
+  }
+  return { path, name: file.name, type: file.type, size: file.size };
+};
+
+/** Gone, or the path still to be removed. */
+export const removeTree = (path) => {
+  try {
+    rmSync(path, { recursive: true, force: true });
+    return null;
+  } catch (error) {
+    return error?.code === "ENOENT" ? null : path;
+  }
+};
+
+const leftRetryMs = () => Number(process.env.GYREDECK_TEST_STRANDED_RETRY_MS) || 60_000;
+
+/** Tried now and, until `attempt` says it is done, again every minute. */
+const retryUntil = (attempt) => {
+  if (attempt()) return;
+  const again = () => setTimeout(() => {
+    if (!attempt()) again();
+  }, leftRetryMs()).unref?.();
+  again();
+};
+
+// What an ended room left that could not be removed yet (#375). Until it is gone no room takes a
+// file under the name it holds — every name, while attachments/ itself could not be emptied at
+// start — so a removal tried again later only ever removes what was there before.
+const leftBehind = { all: false, names: new Set() };
+export const roomFilesHeld = (room) => leftBehind.all || leftBehind.names.has(room);
+
+const aside = new Set();
+// Out of the way first, under a name no room can have, and removed from there in its own time.
+const moveAside = (path, dir) => {
+  const to = join(dir, `.closed-${randomUUID().slice(0, 8)}`);
+  try {
+    renameSync(path, to);
+  } catch {
+    return false;
+  }
+  removeAside(to);
+  return true;
+};
+const removeAside = (path) => {
+  if (aside.has(path)) return;
+  aside.add(path);
+  let said = false;
+  retryUntil(() => {
+    if (!removeTree(path)) return aside.delete(path);
+    if (!said) process.stderr.write(`gyredeck: ${path} could not be removed yet; trying again every minute\n`);
+    said = true;
+    return false;
+  });
+};
+
+// True once nothing is left under `path`: a link or file is removed itself, never followed, and a
+// folder is moved aside, or removed where it is when it cannot be moved.
+const freeName = (path, dir) => {
+  try {
+    if (!lstatSync(path).isDirectory()) {
+      unlinkSync(path);
+      return true;
+    }
+  } catch (error) {
+    return error?.code === "ENOENT";
+  }
+  return moveAside(path, dir) || !removeTree(path);
+};
+
+/** A room's folder goes with the room; until it has, a room by that name takes no file. */
+export const removeRoomFiles = (room, dir = ATTACH_DIR) => {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(room)) return;
+  // One cleaner per name: a second would still be removing after the first let a newer room in.
+  if (leftBehind.names.has(room)) return;
+  const path = join(dir, room);
+  if (freeName(path, dir)) return;
+  leftBehind.names.add(room);
+  process.stderr.write(`gyredeck: room ${room} closed, but ${path} could not be removed yet; it takes no file until it is, trying again every minute\n`);
+  retryUntil(() => freeName(path, dir) && leftBehind.names.delete(room));
+};
+
+/**
+ * Rooms do not survive a restart, so neither do their files: everything under `dir` goes when
+ * the bridge starts, each entry on its own. Until every room's name is free, no room takes a
+ * file, and the sweep is tried again. The outbox is the members' and is never emptied.
+ */
+export const emptyAttachments = (dir = ATTACH_DIR) => {
+  let said = false;
+  const names = () => {
+    let entries;
+    try {
+      if (!lstatSync(dir).isDirectory()) {
+        unlinkSync(dir);
+        return true;
+      }
+      entries = readdirSync(dir);
+    } catch (error) {
+      return error?.code === "ENOENT";
+    }
+    let free = true;
+    for (const entry of entries) {
+      const path = join(dir, entry);
+      if (entry.startsWith(".closed-")) removeAside(path);
+      else if (!freeName(path, dir)) free = false;
+    }
+    return free;
+  };
+  // The hold is set and lifted from one answer, so every way out of a try leaves it right.
+  const sweep = () => {
+    leftBehind.all = !names();
+    if (leftBehind.all && !said) process.stderr.write(`gyredeck: ${dir} could not be emptied at start; no room takes a file until it is, trying again every minute\n`);
+    said ||= leftBehind.all;
+    return !leftBehind.all;
+  };
+  retryUntil(sweep);
 };
 
 // ── Heavy runs (#223) ──
@@ -1088,6 +1402,35 @@ export const codexEnvelopeLabel = (label) =>
 export const codexRoomTag = (label, kind, text) =>
   `[from ${String(label ?? "Agent").replace(/[\r\n]+/g, " ")} · ${kind}] ${text}`;
 
+// Either the line is only the routing, or it carries the message after a separator.
+// Codex wrote `@Antigravity reaction — <acknowledgement>` every time, which is the natural
+// way to write it and which the first version of this refused: the line did not match,
+// so the message fell through to the loud default and went to the whole room as a
+// tell. Silently, and with an ok and a seq, so nothing looked wrong from either end.
+// A separator is required rather than plain space, or `@Antigravity tell me about X`
+// would lose three words to the parser.
+// An optional `name="<Name>"` after the kind is the name Codex declares for itself (#182):
+// the one place it can say it, since it posts no fields. Quoted, so a name may hold spaces
+// and dashes without being read as the separator. A line without it parses as it always did.
+// `attach=<path>` (or `attach="<path with spaces>"`), any number, between `yn` and `name=`, is
+// a file Codex sends from the outbox (#375): it posts no fields, so this line is its only say.
+const CODEX_ROUTING_LINE =
+  /^@(.+?)[ \t]+(ask|tell|reaction|ack)(?:[ \t]+(yn))?((?:[ \t]+attach=(?:"[^"]*"|[^\s"]+))*)(?:[ \t]+name="([^"]*)")?[ \t]*(?:[—–\-:|][ \t]*(.*))?$/i;
+const CODEX_ATTACH = /attach=(?:"([^"]*)"|([^\s"]+))/g;
+/** The routing line Codex wrote first, taken apart; null when the line is not one. */
+export const parseCodexRoutingLine = (line) => {
+  const match = CODEX_ROUTING_LINE.exec(String(line ?? "").trim());
+  if (!match) return null;
+  return {
+    target: match[1].trim(),
+    kind: match[2].toLowerCase(),
+    yn: Boolean(match[3]),
+    attach: [...(match[4] ?? "").matchAll(CODEX_ATTACH)].map((found) => found[1] ?? found[2]),
+    name: match[5],
+    inline: (match[6] ?? "").trim(),
+  };
+};
+
 /** One line of a Codex rollout as a reply, or null when the line is anything else. */
 export const codexReplyFromLine = (line, sinceMs) => {
   const entry = codexEntryFromLine(line, sinceMs);
@@ -1618,7 +1961,7 @@ export const ORPHANED_ROOM_REASON =
  * run the real pass. Behind the closure the only reachable question was the predicate, and
  * a test that asks only that goes on passing with the pass itself deleted.
  */
-export const sweepRooms = (rooms, now, { close, idleMs }) => {
+export const sweepRooms = (rooms, now, { close, drop = (name) => rooms.delete(name), idleMs }) => {
   for (const [name, room] of rooms) {
     // A room without the session that made it is over, whoever else is still in it:
     // the founder's app is the one that lets sessions in and closes it. Checked before the members test below, or the case
@@ -1630,7 +1973,7 @@ export const sweepRooms = (rooms, now, { close, idleMs }) => {
     // A room with members was set up deliberately and stays until its last member
     // leaves; only unattended mailboxes age out.
     if (room.members.size > 0) continue;
-    if (room.clients.size === 0 && now - room.touchedAt > idleMs) rooms.delete(name);
+    if (room.clients.size === 0 && now - room.touchedAt > idleMs) drop(name);
   }
 };
 
@@ -2166,6 +2509,9 @@ function startBridge(config) {
   const roomRulesReady = writeRoomRules(`http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}`);
   // Beside the rules, for the same reason: the helper names the port it calls.
   writeHeavyHelper(`http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}`);
+  // No room outlives the bridge, so no room's files do (#375); the outbox is made, never emptied.
+  emptyAttachments();
+  try { mkdirSync(OUTBOX_DIR, { recursive: true, mode: 0o700 }); } catch {}
   try {
     scrubAppOnlyEvents(config.logFile);
   } catch (error) {
@@ -2224,7 +2570,7 @@ function startBridge(config) {
     // until something closes it, and this is that something.
     partWithMember(found.name, found.room, conversationId, "its session ended", { roomOpen: true });
     if (found.room.members.size === 0 && found.room.clients.size === 0) {
-      mailRooms.delete(found.name);
+      dropRoom(found.name);
     } else if (found.room.members.size > 0) {
       announceMembership(found.name, found.room, `${label} ended its session and left this room.`, null, owedAnswersFrom(found.room, conversationId));
     }
@@ -2381,18 +2727,6 @@ function startBridge(config) {
    * and becomes the fields; anything else leaves the text alone and takes the loud
    * default, because a Codex turn that was never taught this must still be heard.
    */
-  // Either the line is only the routing, or it carries the message after a separator.
-  // Codex wrote `@Antigravity reaction — <acknowledgement>` every time, which is the natural
-  // way to write it and which the first version of this refused: the line did not match,
-  // so the message fell through to the loud default and went to the whole room as a
-  // tell. Silently, and with an ok and a seq, so nothing looked wrong from either end.
-  // A separator is required rather than plain space, or `@Antigravity tell me about X`
-  // would lose three words to the parser.
-  // An optional `name="<Name>"` after the kind is the name Codex declares for itself (#182):
-  // the one place it can say it, since it posts no fields. Quoted, so a name may hold spaces
-  // and dashes without being read as the separator. A line without it parses as it always did.
-  const CODEX_ROUTING_LINE =
-    /^@(.+?)[ \t]+(ask|tell|reaction|ack)(?:[ \t]+(yn))?(?:[ \t]+name="([^"]*)")?[ \t]*(?:[—–\-:|][ \t]*(.*))?$/i;
   /**
    * Where an answer with no routing line goes (#340): back to whoever wrote the push it answers.
    * An ask gets a tell, which wakes the asker; anything else gets a reaction, which wakes nobody.
@@ -2414,7 +2748,7 @@ function startBridge(config) {
   };
   const routeCodexReply = (room, text, answering = null, unattributed = false) => {
     const [first, ...rest] = text.split("\n");
-    const match = CODEX_ROUTING_LINE.exec(first.trim());
+    const match = parseCodexRoutingLine(first);
     // `explicit` says the line named somebody the room knows — everyone, or a member by id
     // or label. A goal turn's answer is published on that and nothing else; a line that
     // named nobody, or somebody not here, is not a message to this room (#149).
@@ -2425,8 +2759,8 @@ function startBridge(config) {
       const routing = unattributed ? null : unroutedReply(room, answering);
       return routing ? { text, routing, explicit: false } : { text, routing: null, explicit: false, orphaned: true };
     }
-    const inline = (match[5] ?? "").trim();
-    const target = match[1].trim();
+    const inline = match.inline;
+    const target = match.target;
     const named = /^everyone$/i.test(target)
       ? MAIL_EVERYONE
       : room.members.has(target)
@@ -2441,8 +2775,20 @@ function startBridge(config) {
     const body = [inline, rest.join("\n").trim()].filter(Boolean).join("\n");
     // `yn` after `ask` says the owner may answer it ✅/❌ from Discord (#205); after any
     // other kind it is read off the line and opens nothing.
-    const kind = asKind(match[2].toLowerCase());
-    return { text: body || "ok", routing: { to, kind, ...(match[3] && kind === "ask" ? { yesNo: true } : {}) }, explicit: named !== null, name: match[4] };
+    const kind = asKind(match.kind);
+    return {
+      text: body || "ok",
+      routing: {
+        to,
+        kind,
+        ...(match.yn && kind === "ask" ? { yesNo: true } : {}),
+      },
+      explicit: named !== null,
+      name: match.name,
+      // Paths as Codex wrote them, kept out of `routing` so nothing can publish one unchecked:
+      // the harvest admits each as a member's file and puts the room's copies there.
+      attach: match.attach,
+    };
   };
 
   /**
@@ -2930,7 +3276,7 @@ function startBridge(config) {
         handledThrough = reply.endsAt;
         continue;
       }
-      const { text, routing, explicit, name: offeredName, orphaned } = routeCodexReply(
+      const { text, routing, explicit, name: offeredName, orphaned, attach } = routeCodexReply(
         destination.room,
         reply.text,
         origin?.answering ?? null,
@@ -2967,7 +3313,8 @@ function startBridge(config) {
       // audit). It is handled like any read answer — cursor on, claimed — and this turn is
       // told which seq it repeated, so the next brief does not name an older turn.
       // Only a session that may speak here is told what became of a repeat.
-      const repeated = refuseToPublish(destination.room, threadId) ? null : recentDuplicate(destination.room, threadId, text, routing);
+      // Words said again with files are not a repeat: the files may be new (#375).
+      const repeated = refuseToPublish(destination.room, threadId) || attach?.length > 0 ? null : recentDuplicate(destination.room, threadId, text, routing);
       if (repeated) {
         handledThrough = reply.endsAt;
         reader.origins.delete(reply.turnId);
@@ -3002,9 +3349,29 @@ function startBridge(config) {
       // Only a reaction Codex chose is held to the run: one the bridge chose for an unrouted
       // answer is its only copy of what Codex said, and wakes nobody to start a loop (#340).
       if (routing.kind === "reaction" && explicit && reactionRunExhausted(destination.room)) continue;
+      // Files Codex attached (#375) pass the door a member's post does: outbox only, copied. One
+      // refused is left off and the message still goes; Codex is told in the room which and why,
+      // since it never reads an answer to what it wrote.
+      const attached = attach?.length > 0 ? admitFiles(destination.name, attach.slice(0, FILES_MAX), { partial: true }) : null;
+      const leftOff = [
+        ...(attached?.refused ?? []).map((refusal) => `${refusal.file} (${CODEX_FILE_REFUSALS[refusal.error] ?? refusal.error})`),
+        ...(attach?.slice(FILES_MAX) ?? []).map((path) => `${cleanFileName(path)} (more than ${FILES_MAX} files)`),
+      ];
       const declared = newlyDeclared(destination.room, threadId, () =>
-        publishMail(destination.room, threadId, text, null, true, routing, destination.name !== threadId ? offeredName : undefined));
+        publishMail(destination.room, threadId, text, null, true, attached?.files.length > 0 ? { ...routing, files: attached.files } : routing, destination.name !== threadId ? offeredName : undefined));
       const published = declared.published;
+      if (!published) attached?.undo();
+      if (published?.seq && leftOff.length > 0) {
+        if (SYNC_CODE.test(destination.name)) {
+          const said =
+            `[Gyredeck: your message seq ${published.seq} went out without ${leftOff.join(", ")}. Attach only a file in` +
+            ` ${OUTBOX_DIR}, by its absolute path: at most ${FILE_MAX_BYTES / 1024 / 1024} MB, an image, a PDF or UTF-8 text.]`;
+          const told = publishMail(destination.room, ROOM_SENDER, said, null, false, { [VOUCHED]: true, to: threadId, kind: "tell" });
+          if (told) deliverMail(destination.name, destination.room, said, ROOM_SENDER, told);
+        } else {
+          console.error(`codex log ${path}: turn ${reply.turnId} attached files outside a room; left off: ${leftOff.join(", ")}`);
+        }
+      }
       if (published?.seq) {
         const to = published.to ?? MAIL_EVERYONE;
         publishedForCodex.set(threadId, {
@@ -3707,7 +4074,7 @@ function startBridge(config) {
         : `${lead}\n\n[Gyredeck: ${held.length} message${held.length === 1 ? "" : "s"} arrived` +
           " here before you were let in. In order:]\n\n" +
           held
-            .map((message) => `[${senderShown(room, message)} · ${message.kind}] ${message.text}`)
+            .map((message) => `[${senderShown(room, message)} · ${message.kind}] ${message.text}${fileLines(message.files)}`)
             .join("\n\n"),
       { full: true },
     ) + `\n\n${heavyHint(conversationId)}`;
@@ -4433,7 +4800,7 @@ function startBridge(config) {
   // The pass lives at module scope — see `sweepRooms`, including when it does and does
   // not run.
   const sweepMailRooms = () =>
-    sweepRooms(mailRooms, Date.now(), { close: closeRoom, idleMs: MAIL_ROOM_IDLE_MS });
+    sweepRooms(mailRooms, Date.now(), { close: closeRoom, drop: dropRoom, idleMs: MAIL_ROOM_IDLE_MS });
 
   const mailRoomFor = (name, create) => {
     const existing = mailRooms.get(name);
@@ -4987,7 +5354,50 @@ function startBridge(config) {
       }
     }
     room.clients.clear();
+    dropRoom(name);
+  };
+
+  /** Every way a room ends goes through here, so its files go with it (#375). */
+  const dropRoom = (name) => {
     mailRooms.delete(name);
+    stranded.delete(name);
+    removeRoomFiles(name);
+  };
+
+  // A copy the room took back that could not be removed, by room (#375). It is said, tried
+  // again every minute, and until it is gone the room takes no other file, so the folder is
+  // never past its cap by more than that one file.
+  const stranded = new Map();
+  const clearStranded = (roomName) => {
+    const left = stranded.get(roomName);
+    if (!left) return 0;
+    for (const path of left) {
+      try {
+        unlinkSync(path);
+        left.delete(path);
+      } catch (error) {
+        if (error?.code === "ENOENT") left.delete(path);
+      }
+    }
+    if (!left.size) stranded.delete(roomName);
+    return left.size;
+  };
+  const retryStranded = (roomName) => {
+    setTimeout(() => {
+      if (stranded.has(roomName) && clearStranded(roomName)) retryStranded(roomName);
+    }, leftRetryMs()).unref?.();
+  };
+  const takeBack = (roomName, path) => {
+    try {
+      unlinkSync(path);
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      const first = !stranded.has(roomName);
+      if (first) stranded.set(roomName, new Set());
+      stranded.get(roomName).add(path);
+      process.stderr.write(`gyredeck: room ${roomName} could not take back ${path} (${error?.code ?? error?.message}); it takes no file until it can\n`);
+      if (first) retryStranded(roomName);
+    }
   };
 
   const partWithMember = (name, room, conversationId, why, { roomOpen = false } = {}) => {
@@ -5818,6 +6228,104 @@ function startBridge(config) {
     return null;
   };
 
+  /**
+   * The files a post names, checked and made the room's (#375). A member's must be in the
+   * outbox, and are copied into the room's folder, so what the room shows cannot change after
+   * it is posted. The owner's must be in the folder's `.incoming`, where the app's Discord
+   * connector downloaded them, and are copied out the same way and removed from it. The
+   * connector writes `.incoming` from another process, so neither can check before it writes:
+   * each writes first and then counts the whole folder, and takes back what it wrote if the
+   * count is over the cap. A file kept was counted with every file written before it. By default all or nothing: the first refusal removes the copies this post made. `partial` keeps what passed and lists what did not, for Codex, which
+   * has no answer to read a refusal from.
+   */
+  const admitFiles = (roomName, paths, { owner = false, partial = false } = {}) => {
+    const folder = SYNC_CODE.test(roomName) ? roomFolder(roomName) : null;
+    let base = null;
+    try { base = realpathSync(owner ? join(folder, ROOM_INCOMING) : OUTBOX_DIR); } catch {}
+    const files = [];
+    const refused = [];
+    const undo = () => {
+      for (const file of files) takeBack(roomName, file.path);
+    };
+    // The connector's downloads are taken once, whatever the outcome: the room keeps its own copy.
+    const taken = () => {
+      if (!owner || !base) return;
+      for (const path of paths) {
+        try {
+          const real = realpathSync(path);
+          if (real.startsWith(base + sep)) unlinkSync(real);
+        } catch {}
+      }
+    };
+    try {
+      return admit();
+    } finally {
+      taken();
+    }
+    function admit() {
+      for (const path of paths) {
+        const read = readRoomFile(path, base, owner ? "file_not_in_room" : "file_not_in_outbox");
+        let refusal = read.error ? read : null;
+        if (!refusal && roomFilesHeld(roomName)) {
+          refusal = { error: "room_files_unavailable", file: read.name, message: `Files an earlier room left could not be removed yet, so ${read.name} was not taken. Nothing was posted.` };
+        }
+        if (!refusal && !folder) {
+          refusal = { error: "room_files_unavailable", file: read.name, message: "This room has no folder for files. Nothing was posted." };
+        }
+        // Asked before every file, not once per post: one this post wrote and could not take
+        // back holds the rest of the post too.
+        if (!refusal && clearStranded(roomName)) {
+          refusal = { error: "room_files_unavailable", file: read.name, message: `A file this room took back could not be removed yet, so ${read.name} was not taken. Nothing was posted.` };
+        }
+        // A folder already past its cap holds a file one of the two writers could not take
+        // back: nothing more is written there, by either, until it is gone.
+        const before = refusal ? 0 : roomFilesBytes(folder);
+        if (before > ROOM_FILES_MAX_BYTES) {
+          refusal = {
+            error: "room_files_full",
+            file: read.name,
+            message: Number.isFinite(before)
+              ? `This room's files are past ${ROOM_FILES_MAX_BYTES / 1024 / 1024} MB until one it could not take back is removed, so ${read.name} was not taken. Nothing was posted.`
+              : `This room's files could not be counted, so ${read.name} was not taken. Nothing was posted.`,
+          };
+        }
+        if (!refusal) {
+          let stored = null;
+          try {
+            // The connector names its downloads `<Discord message id>-<n>-<name>`; the room shows the name.
+            stored = storeRoomFile(folder, owner ? { ...read, name: read.name.replace(/^[0-9]+-[0-9]+-(?=.)/, "") } : read);
+          } catch (error) {
+            if (error?.partial) takeBack(roomName, error.partial);
+            refusal = { error: "room_files_unavailable", file: read.name, message: `${read.name} could not be stored for the room. Nothing was posted.` };
+          }
+          if (stored) {
+            // The download is not counted twice: its copy is now the room's.
+            if (owner) try { unlinkSync(read.real); } catch {}
+            const held = roomFilesBytes(folder);
+            if (held <= ROOM_FILES_MAX_BYTES) {
+              files.push(stored);
+              continue;
+            }
+            takeBack(roomName, stored.path);
+            refusal = {
+              error: "room_files_full",
+              file: read.name,
+              message: Number.isFinite(held)
+                ? `This room already holds ${Math.round((held - read.size) / 1024 / 1024)} MB of files, and ${read.name} would take it past ${ROOM_FILES_MAX_BYTES / 1024 / 1024} MB. Nothing was posted.`
+                : `This room's files could not be counted, so ${read.name} was not taken. Nothing was posted.`,
+            };
+          }
+        }
+        if (!partial) {
+          undo();
+          return { refusal };
+        }
+        refused.push(refusal);
+      }
+      return { files, refused, undo };
+    }
+  };
+
   const publishMail = (room, from, text, replyTo, fromSession = false, routing = null, offeredName = undefined) => {
     // The last door, so a path added later that forgets to ask cannot speak as the room or
     // the person either: only a caller holding `VOUCHED` — never something parsed off the
@@ -5894,6 +6402,8 @@ function startBridge(config) {
       // Which message the person on Discord answered (#205), by seq — not `replyTo`, which
       // names a mailbox to answer to.
       ...(routing?.[VOUCHED] === true && Number.isInteger(routing.inReplyTo) ? { inReplyTo: routing.inReplyTo } : {}),
+      // The room's own copies (#375), admitted by the caller; never the sender's path.
+      ...(Array.isArray(routing?.files) && routing.files.length > 0 ? { files: routing.files } : {}),
     };
     room.messages.push(message);
     // Notices first, against their own allowance, so the room's own voice can never cost
@@ -6356,7 +6866,7 @@ function startBridge(config) {
           roomName,
           room,
           recipient,
-          codexRoomTag(fromLabel, kind, from === OWNER_DISCORD_SENDER ? `${OWNER_DISCORD_NOTE}\n${text}` : text),
+          codexRoomTag(fromLabel, kind, `${from === OWNER_DISCORD_SENDER ? `${OWNER_DISCORD_NOTE}\n${text}` : text}${fileLines(routing?.files)}`),
           { answering: { id: from, kind } },
         );
         // Handed over only once `codex queue` took it (#341 audit r2): "queued" is said before the
@@ -7877,7 +8387,7 @@ function startBridge(config) {
         room.touchedAt = Date.now();
         // The one leaving is told first, while the room object is still here to name.
         partWithMember(code, room, conversationId, "someone disconnected it from the app", { roomOpen: true });
-        if (room.members.size === 0 && room.clients.size === 0) mailRooms.delete(code);
+        if (room.members.size === 0 && room.clients.size === 0) dropRoom(code);
         // Whoever is left was told this member was here, and might be about to ask it
         // something.
         else if (room.members.size > 0) announceMembership(code, room, `${label} left this room.`, null, owedAnswersFrom(room, conversationId));
@@ -8464,6 +8974,26 @@ function startBridge(config) {
           sendJson(400, { ok: false, error: "invalid_reply_to" });
           return;
         }
+        // Files are named by path (#375) and read only once the sender is known; here, the shape.
+        const askedFiles = body.files;
+        if (Array.isArray(askedFiles) && askedFiles.length > FILES_MAX) {
+          sendJson(400, { ok: false, error: "too_many_files", limit: FILES_MAX, message: `A post carries at most ${FILES_MAX} files. Nothing was sent.` });
+          return;
+        }
+        if (
+          askedFiles !== undefined &&
+          (!SYNC_CODE.test(name) ||
+            !Array.isArray(askedFiles) ||
+            askedFiles.length === 0 ||
+            askedFiles.some((file) => !file || typeof file !== "object" || Array.isArray(file) || typeof file.path !== "string"))
+        ) {
+          sendJson(400, {
+            ok: false,
+            error: "invalid_files",
+            message: 'files is a list of 1 to 10 {"path": "<absolute path>"} objects, and only a sync room takes them. Nothing was sent.',
+          });
+          return;
+        }
         // Who this is for and what it is for. Both are optional and both default to the
         // loud answer — an unaddressed `tell` to everyone — because a sender who omits
         // them or spells them wrong has to be over-heard rather than silently dropped.
@@ -8658,7 +9188,8 @@ function startBridge(config) {
           sendJson(202, { ok: true, room: name, seq: ownerRepeat, duplicate: true, message: `That Discord message already reached the room as seq ${ownerRepeat}.` });
           return;
         }
-        const duplicate = body.again === true || from === OWNER_DISCORD_SENDER ? null : recentDuplicate(room, from, text, { to: addressed, kind: routedKind });
+        // A post with files is never a repeat of one without them, nor of one with other files.
+        const duplicate = body.again === true || from === OWNER_DISCORD_SENDER || askedFiles !== undefined ? null : recentDuplicate(room, from, text, { to: addressed, kind: routedKind });
         if (duplicate) {
           sendJson(202, {
             ok: true,
@@ -8669,9 +9200,21 @@ function startBridge(config) {
           });
           return;
         }
+        // Read and copied here, after every check on who is sending and before anything that
+        // weighs the message, so the weighing sees the lines the files add. Every refusal from
+        // here on removes the copies (#375).
+        const admitted = askedFiles === undefined
+          ? null
+          : admitFiles(name, askedFiles.map((file) => file.path), { owner: vouched && from === OWNER_DISCORD_SENDER });
+        if (admitted?.refusal) {
+          sendJson(400, { ok: false, ...admitted.refusal });
+          return;
+        }
+        const files = admitted?.files ?? [];
         if (
-          heldWouldOverflow(room, { from, to: addressed, kind: routedKind, text })
+          heldWouldOverflow(room, { from, to: addressed, kind: routedKind, text, files })
         ) {
+          admitted?.undo();
           // Everything held for a member who has not been let in yet leaves in one push,
           // and one push is bounded by what a single command can carry. Refused here
           // rather than trimmed there: a message accepted and then dropped is the fault
@@ -8692,6 +9235,7 @@ function startBridge(config) {
           return;
         }
         if (roomIsFull(room, Buffer.byteLength(text, "utf8"))) {
+          admitted?.undo();
           // Everything left in the room is owed to somebody, so making space would mean
           // taking a message from the session it was addressed to — which is what used to
           // happen, without a word to anyone. The sender is told instead, and told who to
@@ -8708,6 +9252,7 @@ function startBridge(config) {
           return;
         }
         if (routedKind === "reaction" && reactionRunExhausted(room)) {
+          admitted?.undo();
           sendJson(409, {
             ok: false,
             error: "reaction_run",
@@ -8727,10 +9272,12 @@ function startBridge(config) {
             ...(approval ? { approval } : {}),
             ...(vouched ? { [VOUCHED]: true, inReplyTo } : {}),
             ...(approvedRequest ? { approved: approvedRequest.approval } : {}),
+            ...(files.length > 0 ? { files } : {}),
           }, body.name));
         const message = declared.published;
         if (message && approvedRequest) approvedRequest[APPROVED_SEQ] = message.seq;
         if (!message) {
+          admitted?.undo();
           // The checks above passed on the message without its name; with it, it no longer
           // fits. Refused like any message that does not fit, and nothing was declared.
           sendJson(409, {

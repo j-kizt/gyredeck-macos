@@ -168,10 +168,11 @@ export function createFakeDiscord({ forums = [FORUM], identity } = {}) {
       await fake.gate?.("react", args);
       fake.reactions.push(args);
     },
-    // Gateway events, as the discord.js adapter emits them (#205).
+    // Gateway events, as the discord.js adapter emits them (#205); `attachments` is always a
+    // list there, of { url, name, size } (#375).
     ownerSays(fields) {
       const messageId = fields.messageId ?? `D${++n}`;
-      events.emit("post", { replyToId: null, ...fields, messageId });
+      events.emit("post", { replyToId: null, attachments: [], ...fields, messageId });
       return messageId;
     },
     edit(fields) {

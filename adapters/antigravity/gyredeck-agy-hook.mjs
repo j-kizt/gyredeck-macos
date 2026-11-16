@@ -859,6 +859,16 @@ const withConfirmation = (steps, confirm, room) => {
  * Collected mail has left the reader's position over TCP, so dropping it there loses it for
  * good; this is built from nothing that can fail on a message's shape.
  */
+/**
+ * One line per file a message carries (#375), as the bridge writes them for Codex. Built from
+ * nothing but strings and a number, so a malformed entry is left out rather than thrown on.
+ */
+const fileLines = (message) =>
+  (Array.isArray(message?.files) ? message.files : [])
+    .filter((file) => typeof file?.path === "string" && typeof file?.name === "string")
+    .map((file) => `\n[file: ${file.name.replace(/[\r\n]+/g, " ")} · ${String(file.type ?? "")} · ${Number(file.size) || 0} → ${file.path.replace(/[\r\n]+/g, " ")}]`)
+    .join("");
+
 const plainSteps = async (taken) => {
   // A pasted password's result belongs to this invocation alone, so it is said either way,
   // with its HEAR or BLOCKED (#250 audit).
@@ -878,7 +888,7 @@ const plainSteps = async (taken) => {
       ...messages.map((message) => ({
         ephemeralMessage:
           `[from ${String(message?.from ?? "unknown").slice(0, 64)}` +
-          `${typeof message?.kind === "string" ? ` · ${message.kind}` : ""}] ${String(message?.text ?? "").slice(0, MAIL_MAX_TEXT)}`,
+          `${typeof message?.kind === "string" ? ` · ${message.kind}` : ""}] ${String(message?.text ?? "").slice(0, MAIL_MAX_TEXT)}${fileLines(message)}`,
       })),
     );
   }
@@ -1155,7 +1165,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
     ...delivered.map((message) => {
       const from = shown(message);
       return {
-        ephemeralMessage: `[gyredeck mail · from ${from}${kindOf(message) ? ` · ${kindOf(message)}` : ""}] ${message.text.slice(0, MAIL_MAX_TEXT)}`,
+        ephemeralMessage: `[gyredeck mail · from ${from}${kindOf(message) ? ` · ${kindOf(message)}` : ""}] ${message.text.slice(0, MAIL_MAX_TEXT)}${fileLines(message)}`,
       };
     }),
     ...(usageStep ? [usageStep] : []),

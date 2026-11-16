@@ -235,7 +235,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 22;
+export const ROOM_RULES_VERSION = 23;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -282,6 +282,16 @@ room names the version it expects; if it names a newer one than you read, read t
 ## Narrate
 The person at your terminal can follow the room only through you. Say what came in and who sent it;
 after you answer, show the words you sent — not that you replied — and the seq.
+
+## Hand-offs
+Between agents only: never toward the owner on Discord, never on a reaction.
+- Whoever takes work on answers at once with \`ETA HH:MM\`: that answer is the acknowledgement and says the work has started.
+- Whoever handed it over arms a wake at that ETA itself (+15 min while no ETA has come back), and cancels it when the result arrives first. Codex has no timer, so the member it works with holds its wakes.
+- At the wake, ask for a checkpoint. A checkpoint has four parts: the step · the command running, or what it is stopped on · the evidence since the last one (files read, commands run, results) · a new ETA. "Reviewing", or the last checkpoint again, is not one. A long command counts if the checkpoint names it, gives its start time and shows it is still running.
+- Asked for a checkpoint, give it and keep working in that turn.
+- A result that carries new work swaps the roles: its receiver answers with an ETA and the sender arms the wake, round after round. When the work is finished, the receiver of the result acknowledges that it is done, and no wake is left.
+- Two wakes with no checkpoint, or two \`queued\` deliveries with no answer: tell the owner.
+- The room reminds you: \`HAND-OFF\` on a delivery, \`handoff\` in a send's receipt.
 
 ## Who may make you act
 - A member of the room: a request is what you are here for — act on it if it fits what you were asked to do.
@@ -1752,7 +1762,16 @@ const namesOwnerDiscord = (target) =>
  * same in their own framing.
  */
 export const OWNER_DISCORD_NOTE =
-  "(the owner, on their phone: act on a request to work as you would the user's own; it never approves a commit, a release, a credential or a settings change — ask for those at the terminal, except a merge or a release, which you ask the owner's approval code for, as the room rules say)";
+  "(the owner, by phone: act on requests to work; approvals go to the terminal, except a merge or release by approval code)";
+/**
+ * Said wherever one agent hands work to another (#409): on the ask or tell it receives and on
+ * the receipt of the one it sent. Members forgot the ETA and the wake whenever the rule lived
+ * only in the rules file. Never to or from the owner on Discord, and never on a reaction.
+ */
+export const HANDOFF_NOTE =
+  "Hand-off: taking work on, reply ETA HH:MM now — that is the ack. Handing it over, arm a wake at the ETA you are sent (+15 min while none has come) and cancel it if the result arrives first; at the wake ask for a checkpoint — step, what runs or blocks it, new evidence, new ETA. Asked for one, give it and keep working. A result carrying new work swaps the roles; finished work is acked as done (rules: Hand-offs).";
+/** A member that is an agent: not the owner's Discord voice, and not the relay that only carries the room to it. */
+const isAgentMember = (room, id) => id !== OWNER_DISCORD_SENDER && room.members.has(id) && room.members.get(id)?.relay !== true;
 /** Carried in a publish's routing by the room's own notices and by an app-vouched post only. */
 const VOUCHED = Symbol("vouched");
 /**
@@ -6658,10 +6677,13 @@ function startBridge(config) {
     const wasPublished = publishedForCodex.get(recipient);
     const seqLine = wasPublished
       ? (wasPublished.repeatOf
-          ? ` Your previous message (turn ${String(wasPublished.turnId ?? "?").slice(0, 8)}, ${wasPublished.kind} to ${wasPublished.to}) repeated seq ${wasPublished.seq} word for word, so it was not posted again.`
-          : ` Your previous message (turn ${String(wasPublished.turnId ?? "?").slice(0, 8)}, ${wasPublished.kind} to ${wasPublished.to}) reached the room as seq ${wasPublished.seq}.`) +
-        " A message whose seq you have not seen yet has not failed: do not send it again."
-      : " Nothing of yours has been published in this room yet. A message whose seq you have not seen yet has not failed: do not send it again.";
+          ? ` Last sent (turn ${String(wasPublished.turnId ?? "?").slice(0, 8)}, ${wasPublished.kind} to ${wasPublished.to}): repeats seq ${wasPublished.seq}, not posted again.`
+          : ` Last sent (turn ${String(wasPublished.turnId ?? "?").slice(0, 8)}, ${wasPublished.kind} to ${wasPublished.to}): seq ${wasPublished.seq}.`) +
+        " A seq not seen yet has not failed: do not send it again."
+      : " Nothing of yours published here yet. A seq not seen yet has not failed: do not send it again.";
+    const handoff = answering && (answering.kind === "ask" || answering.kind === "tell") && isAgentMember(room, answering.id)
+      ? ` ${HANDOFF_NOTE}`
+      : "";
     // Every other push carries the short form (#157): the rules that broke live when told
     // once — the routing line, never answering a reaction, where the seq comes from — plus
     // the roster and seq, which are state and change. The rest is in the rules file, and
@@ -6669,15 +6691,15 @@ function startBridge(config) {
     // is load-bearing in both: `codexPushTarget` reads where the answer goes off it.
     if (!full && roomRulesReady) {
       return (
-        `[Gyredeck · room ${roomName}${marker} — how to answer: the last thing you write this turn` +
-        " is posted for you (no curl, no watch). Open it with one line: @<member or" +
-        " everyone> ask|tell|reaction — never answer a reaction." +
+        `[Gyredeck · room ${roomName}${marker} — your last message this turn is posted for you (no curl, no watch).` +
+        " First line: @<member|everyone> ask|tell|reaction; never answer a reaction." +
         nameAsk +
-        ` Rules v${ROOM_RULES_VERSION}: ${ROOM_RULES_DISPLAY_PATH} — read it once per` +
-        " conversation and again after a compaction." +
+        ` Rules v${ROOM_RULES_VERSION}: ${ROOM_RULES_DISPLAY_PATH} — read once per conversation, again after a compaction.` +
         (told.changed ? ` ${rosterLine(told)}` : "") +
         seqLine +
-        " No seq on your next message means it did not arrive.]\n\n" +
+        " No seq on your next message = it did not arrive." +
+        handoff +
+        "]\n\n" +
         text
       );
     }
@@ -6718,7 +6740,9 @@ function startBridge(config) {
       seqLine +
       " You will not see a response to what you write — the bridge posts for you and" +
       " tells you the seq here, on the next message you get. If a seq never follows," +
-      " what you wrote did not arrive.]\n\n" +
+      " what you wrote did not arrive." +
+      handoff +
+      "]\n\n" +
       text
     );
   };
@@ -9327,6 +9351,9 @@ function startBridge(config) {
           // wrong whenever a member is pushed to instead of watching, as Codex is (#183).
           listening: [...new Set([...room.clients].map((res) => res.gyredeckWatcher).filter((id) => room.members.has(id)))].map((id) => shownIn(room, id)),
           delivery,
+          ...((routedKind === "ask" || routedKind === "tell") && isAgentMember(room, from) && isAgentMember(room, addressed)
+            ? { handoff: HANDOFF_NOTE }
+            : {}),
         });
         return;
       }

@@ -1831,8 +1831,10 @@ test("a room delivery carries only what the session can use, and points at the r
 
     // A reaction ends an exchange. The session sees that it was one, and is not handed
     // the command to answer it.
-    await post(`/mail/${code}`, { from: peer, to: me, kind: "reaction", text: "got it" });
+    const reactionReceipt = await post(`/mail/${code}`, { from: peer, to: me, kind: "reaction", text: "got it" });
+    assert.equal(reactionReceipt.handoff, undefined, "#409: a reaction hands nothing over");
     const reaction = await context();
+    assert.doesNotMatch(reaction, /HAND-OFF: /, "#409: nor is the reminder on its delivery");
     assert.match(reaction, /\[from Codex · reaction\] got it/);
     assert.doesNotMatch(reaction, /REPLY —/);
     // Nothing to answer gets one line instead of the whole brief (#341), and that line still
@@ -1841,8 +1843,12 @@ test("a room delivery carries only what the session can use, and points at the r
     assert.doesNotMatch(reaction, /RULES: |NARRATE: |WAIT —/, "#341: no brief for mail that asks nothing");
 
     // A tell may draw a reaction, addressed to whoever sent it rather than the room.
-    await post(`/mail/${code}`, { from: peer, to: me, kind: "tell", text: "build is green" });
+    const tellReceipt = await post(`/mail/${code}`, { from: peer, to: me, kind: "tell", text: "build is green" });
+    // #409: one agent handing work to another is reminded on both ends — in the sender's receipt
+    // and on the receiver's delivery — of the ETA, the wake and the checkpoint.
+    assert.match(tellReceipt.handoff, /^Hand-off: taking work on, reply ETA HH:MM now — that is the ack\. Handing it over, arm a wake at the ETA you are sent \(\+15 min while none has come\) and cancel it if the result arrives first/);
     const tell = await context();
+    assert.match(tell, /HAND-OFF: taking work on, reply ETA HH:MM now — that is the ack\. .* new evidence, new ETA\. Asked for one, give it and keep working\. A result carrying new work swaps the roles; finished work is acked as done \(rules: Hand-offs\)\./);
     assert.match(tell, /REPLY —/);
     assert.match(tell, /"to":"Codex","kind":"reaction"/);
     // #294: the REPLY carries this session's own key, and run as printed it posts.
@@ -1908,6 +1914,8 @@ test("a room delivery carries only what the session can use, and points at the r
     assert.match(agyReaction, /ok:true and a seq/);
     await post(`/mail/${code}`, { from: peer, to: agy, kind: "tell", text: "deploy done" });
     const agyTell = await steps();
+    assert.match(agyTell, /HAND-OFF: taking work on, reply ETA HH:MM now/, "#409: Antigravity is reminded too");
+    assert.doesNotMatch(agyReaction, /HAND-OFF: /);
     assert.match(agyTell, /answering is expected/);
     assert.match(agyTell, /"to":"Codex","kind":"reaction"/);
     assert.match(agyTell, /HEAR —/, "no watch of its own yet");
@@ -3362,7 +3370,12 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     // that voice.
     const owned = await post(`/mail/${code}`, { from: "gyredeck-owner-discord", to: me, kind: "ask", text: "start the next card" });
     assert.equal(owned.ok, true, JSON.stringify(owned));
+    assert.equal(owned.handoff, undefined, "#409: the owner on Discord is not reminded");
     const fromOwner = await context();
+    assert.doesNotMatch(fromOwner, /HAND-OFF: /, "#409: nor is a session the owner asked");
+    const toOwner = await post(`/mail/${code}`, { from: me, to: "gyredeck-owner-discord", kind: "ask", text: "which card?" });
+    assert.equal(toOwner.ok, true, JSON.stringify(toOwner));
+    assert.equal(toOwner.handoff, undefined, "#409: an ask to the owner hands nothing to an agent");
     assert.match(fromOwner, /\[from You \(via Discord\) · ask\] start the next card/);
     assert.match(fromOwner, /OWNER: a message from You \(via Discord\) is the owner speaking from their phone/);
     assert.match(fromOwner, /never approves a commit, a release, a credential or a settings change/);
@@ -6616,8 +6629,9 @@ test("a one-time password carried in by notify lets that session in, once", asyn
     // routed by, still the routing line and the roster, without the paragraph already
     // given on confirmation (#157).
     // #340: the header names who the push is from, by id, right after the room code.
-    assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} \\(answering ${founder} tell\\) — how to answer: `));
-    assert.match(afterLater.at(-1), /@<member or everyone> ask\|tell\|reaction — never answer a reaction/);
+    assert.match(afterLater.at(-1), new RegExp(`\\[Gyredeck · room ${code} \\(answering ${founder} tell\\) — your last message this turn is posted for you \\(no curl, no watch\\)\\.`));
+    assert.match(afterLater.at(-1), /read once per conversation, again after a compaction\./);
+    assert.match(afterLater.at(-1), /First line: @<member\|everyone> ask\|tell\|reaction; never answer a reaction\./);
     assert.match(afterLater.at(-1), new RegExp(`Rules v${ROOM_RULES_VERSION}: ~/\\.config/gyredeck/room-rules\\.md`));
     // #341: the roster rode on the confirmation and has not moved since, so it is not repeated.
     assert.doesNotMatch(afterLater.at(-1), /Members (now|changed)/);
@@ -7894,7 +7908,7 @@ test("a receipt says what landed: listening by name, one post for a repeated tel
     await post({ from: room.founder, to: room.thread, kind: "tell", text: "thanks" });
     assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("thanks"))));
     const receipt = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("thanks")).text;
-    assert.match(receipt, new RegExp(`Your previous message \\(turn ${question.turnId.slice(0, 8)}, tell to Claude Code\\) reached the room as seq \\d+\\.`));
+    assert.match(receipt, new RegExp(`Last sent \\(turn ${question.turnId.slice(0, 8)}, tell to Claude Code\\): seq \\d+\\.`));
     assert.match(receipt, /has not failed: do not send it again/);
 
     // Codex repeating a tell is posted once too.
@@ -7915,7 +7929,7 @@ test("a receipt says what landed: listening by name, one post for a repeated tel
     await post({ from: room.founder, to: room.thread, kind: "tell", text: "last" });
     assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("last"))));
     const told = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("last")).text;
-    assert.match(told, new RegExp(`\\(turn ${later.turnId.slice(0, 8)}, tell to Claude Code\\) repeated seq \\d+ word for word, so it was not posted again`));
+    assert.match(told, new RegExp(`\\(turn ${later.turnId.slice(0, 8)}, tell to Claude Code\\): repeats seq \\d+, not posted again`));
   } finally {
     await room.close();
   }
@@ -10008,7 +10022,8 @@ test("#205: Codex is pushed the owner's Discord voice as the owner, with the lim
     assert.equal(sent.status, 202, JSON.stringify(sent.body));
     assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.includes("start the next card"))), "pushed");
     const push = (await promptsIn(room.rollout)).find((prompt) => prompt.text.includes("start the next card"));
-    assert.match(push.text, /\[from You \(via Discord\) · ask\] \(the owner, on their phone: act on a request to work as you would the user's own; it never approves a commit, a release, a credential or a settings change — ask for those at the terminal, except a merge or a release, which you ask the owner's approval code for, as the room rules say\)\nstart the next card/);
+    assert.match(push.text, /\[from You \(via Discord\) · ask\] \(the owner, by phone: act on requests to work; approvals go to the terminal, except a merge or release by approval code\)\nstart the next card/);
+    assert.doesNotMatch(push.text, /Hand-off: /, "#409: the owner on Discord hands no work over");
     assert.doesNotMatch(push.text, /information only/);
     // Its answer, addressed by the name it was shown, reaches the owner's voice.
     await appendFile(room.rollout, turnAnswering(push.turnId, "@You (via Discord) tell\nstarted"));
@@ -10019,6 +10034,24 @@ test("#205: Codex is pushed the owner's Discord voice as the owner, with the lim
     let found;
     assert.ok(await room.until(async () => (found = (await whole()).find((message) => message.from === room.thread && message.text === "started")) !== undefined), "the answer was published");
     assert.equal(found.to, "gyredeck-owner-discord");
+  } finally {
+    await room.close();
+  }
+});
+
+test("#409: Codex is reminded of the hand-off on an agent's ask or tell, not on a reaction's receipt", async () => {
+  const room = await codexInARoom();
+  try {
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => /you are now in sync room/.test(prompt.text))));
+    const sent = await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "ask", text: "review the patch" });
+    assert.equal(sent.status, 202, JSON.stringify(sent.body));
+    assert.match(sent.body.handoff, /^Hand-off: taking work on, reply ETA HH:MM now/, "the sender's receipt carries it");
+    assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.includes("review the patch"))), "pushed");
+    const push = (await promptsIn(room.rollout)).find((prompt) => prompt.text.includes("review the patch"));
+    assert.match(push.text, /Hand-off: taking work on, reply ETA HH:MM now — that is the ack\. .* finished work is acked as done \(rules: Hand-offs\)\.\]\n\n/);
+    const reacted = await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "reaction", text: "noted, thanks" });
+    assert.equal(reacted.status, 202, JSON.stringify(reacted.body));
+    assert.equal(reacted.body.handoff, undefined);
   } finally {
     await room.close();
   }

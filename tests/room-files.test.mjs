@@ -188,7 +188,7 @@ test("Codex's routing line takes attach= after yn and before name=, quoted or no
 });
 
 test(`rules v${ROOM_RULES_VERSION} have a Files section: outbox only, attach= for Codex, [file: …] lines, deleted on close`, () => {
-  assert.equal(ROOM_RULES_VERSION, 22);
+  assert.equal(ROOM_RULES_VERSION, 23);
   const rules = roomRules("http://127.0.0.1:47621");
   const files = rules.slice(rules.indexOf("## Files"), rules.indexOf("## Narrate"));
   assert.match(files, /from `~\/\.config\/gyredeck\/outbox\/` only/);
@@ -1102,4 +1102,16 @@ test("I6: Codex's attach= passes the member check — outbox only, copied; a ref
   } finally {
     await h.stop();
   }
+});
+
+test("#409: the rules have a Hand-offs section: ETA as the ack, the sender's wake, the checkpoint, roles swap, done", () => {
+  const rules = roomRules("http://127.0.0.1:47621");
+  const handoffs = rules.slice(rules.indexOf("## Hand-offs"), rules.indexOf("## Who may make you act"));
+  assert.match(handoffs, /^## Hand-offs\nBetween agents only: never toward the owner on Discord, never on a reaction\./);
+  assert.match(handoffs, /answers at once with `ETA HH:MM`: that answer is the acknowledgement/);
+  assert.match(handoffs, /arms a wake at that ETA itself \(\+15 min while no ETA has come back\), and cancels it when the result arrives first/);
+  assert.match(handoffs, /A checkpoint has four parts: the step · the command running, or what it is stopped on · the evidence since the last one/);
+  assert.match(handoffs, /A result that carries new work swaps the roles/);
+  assert.match(handoffs, /acknowledges that it is done, and no wake is left/);
+  assert.match(handoffs, /Two wakes with no checkpoint, or two `queued` deliveries with no answer: tell the owner/);
 });

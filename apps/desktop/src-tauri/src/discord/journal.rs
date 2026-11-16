@@ -23,7 +23,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::DisconnectReason;
+use super::{DisconnectReason, FileRef};
 
 pub(crate) const VERSION: u8 = 1;
 
@@ -62,6 +62,9 @@ pub(crate) enum Record {
         /// journals written before it, which replay with no yes/no answer.
         #[serde(default, rename = "yesNo", skip_serializing_if = "std::ops::Not::not")]
         yes_no: bool,
+        /// The files the line carries (#375). Absent in journals written before it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<FileRef>,
     },
     Ack { seq: u64, msg: Option<String> },
     Close { id: String, reason: DisconnectReason, at: u64 },
@@ -78,7 +81,7 @@ pub(crate) enum Record {
 /// A line or a loss, as the journal holds it until Discord takes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Item {
-    Line { seq: u64, sender: String, to: String, kind: String, text: String, ts: String, through: Option<u64>, sender_id: Option<String>, to_owner: bool, yes_no: bool },
+    Line { seq: u64, sender: String, to: String, kind: String, text: String, ts: String, through: Option<u64>, sender_id: Option<String>, to_owner: bool, yes_no: bool, files: Vec<FileRef> },
     Loss { seq: u64, n: u64, label: String, through: Option<u64> },
 }
 
@@ -98,7 +101,7 @@ impl Item {
 
     fn record(&self) -> Record {
         match self.clone() {
-            Item::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no } => Record::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no },
+            Item::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no, files } => Record::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no, files },
             Item::Loss { seq, n, label, through } => Record::Loss { seq, n, label, through },
         }
     }
@@ -227,7 +230,7 @@ pub(crate) fn parse(name: &str, bytes: &[u8]) -> Result<Parsed, Corrupt> {
             Record::Open { .. } => return Err(corrupt(line, "a second open".to_string())),
             Record::Line { .. } | Record::Loss { .. } => {
                 let item = match record {
-                    Record::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no } => Item::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no },
+                    Record::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no, files } => Item::Line { seq, sender, to, kind, text, ts, through, sender_id, to_owner, yes_no, files },
                     Record::Loss { seq, n, label, through } => Item::Loss { seq, n, label, through },
                     _ => unreachable!(),
                 };

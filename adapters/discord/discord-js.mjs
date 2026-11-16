@@ -146,6 +146,8 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
             authorId: msg.author?.id,
             text: msg.content ?? "",
             replyToId: msg.reference?.messageId ?? null,
+            // What Discord says of each file; the connector checks every word of it (#375).
+            attachments: [...(msg.attachments?.values?.() ?? [])].map((a) => ({ url: a.url, name: a.name, size: a.size })),
           });
           return;
         }
@@ -396,9 +398,11 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
         }
       }),
 
-    sendWebhook: ({ forumId, threadId, username, content, allowedMentions }) =>
+    sendWebhook: ({ forumId, threadId, username, content, allowedMentions, files }) =>
       guarded(async () => {
         const body = { content, username, threadId, allowedMentions };
+        // Bytes the connector already read, never a path for discord.js to open again (#375).
+        if (files?.length) body.files = files.map((f) => ({ attachment: f.data, name: f.name }));
         let sent;
         try {
           sent = await (await webhook(forumId)).send(body);

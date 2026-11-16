@@ -506,6 +506,7 @@ fn nothing_is_read_or_forwarded_for_a_room_that_is_not_connected() {
         yes_no: false,
         approval: None,
         withheld: false,
+        files: Vec::new(),
     });
     thread::sleep(Duration::from_millis(200));
     assert!(f.source.opens.lock().unwrap().iter().all(|(room, ..)| room == ROOM), "only the connected room is read");
@@ -854,7 +855,7 @@ fn an_ack_trims_exactly_the_seqs_it_names() {
     lock(&f.state.hub).connect(ROOM, vec![], Some(CREATED)).unwrap();
     for seq in 1..=5 {
         lock(&f.state.hub).forward(ToChild::Message {
-            room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false,
+            room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false, files: Vec::new(),
         });
     }
     assert_eq!(f.state.status().behind.get(ROOM), Some(&5));
@@ -958,7 +959,7 @@ fn what_discord_accepted_is_told_to_the_bridge_coalesced_on_the_apps_word() {
 fn a_late_ack_for_a_codes_earlier_room_never_trims_its_new_room() {
     let f = fixture("stale-ack", Some(TOKEN));
     let _buffer = f.attach_buffer();
-    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false };
+    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false, files: Vec::new() };
     {
         let mut hub = lock(&f.state.hub);
         hub.connect(ROOM, vec![], Some(100)).unwrap();
@@ -1021,7 +1022,7 @@ fn a_disconnect_keeps_what_discord_has_not_taken_and_a_new_child_gets_it() {
 fn a_second_disconnect_before_the_first_was_taken_keeps_both() {
     let f = fixture("two-disconnects", Some(TOKEN));
     let _first = f.attach_buffer();
-    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false };
+    let line = |seq: u64| ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false, files: Vec::new() };
     {
         let mut hub = lock(&f.state.hub);
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
@@ -1445,7 +1446,7 @@ fn standin_a_room_closed_while_no_child_runs_is_still_closed_by_the_next_child()
     {
         let mut hub = lock(&f.state.hub);
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
-        hub.forward(ToChild::Message { room: ROOM.into(), seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "m1".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false });
+        hub.forward(ToChild::Message { room: ROOM.into(), seq: 1, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "m1".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false, files: Vec::new() });
         hub.ack(ROOM, 1, Some(CREATED), None);
         assert_eq!(hub.backlog(ROOM), Some(0), "premise: nothing owed to Discord");
         // The child is gone (died, or its pipe filled) and the room ends before the next is up.
@@ -1470,7 +1471,7 @@ fn standin_remove_keeps_the_child_epoch() {
 }
 
 fn audit_line(seq: u64) -> ToChild {
-    ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false }
+    ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false, files: Vec::new() }
 }
 
 #[test]
@@ -1611,7 +1612,7 @@ fn a_storage_refusal_stays_shown_through_ready() {
 // ── #199 r7: the invariants the audit found open (199-invariants.md §5), one proof each ──
 
 fn held_line(seq: u64, sender: &str) -> ToChild {
-    ToChild::Message { room: ROOM.to_string(), seq, sender: sender.into(), to: "everyone".into(), kind: "tell".into(), text: "x".repeat(1024), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false }
+    ToChild::Message { room: ROOM.to_string(), seq, sender: sender.into(), to: "everyone".into(), kind: "tell".into(), text: "x".repeat(1024), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false, files: Vec::new() }
 }
 
 /// I18: an attach hands a fresh child everything held, however much, at the pace it reads.
@@ -1788,7 +1789,7 @@ fn recovered_hub(path: &Path, window: usize) -> Arc<Mutex<Hub>> {
 }
 
 fn line_in(room: &str, seq: u64) -> ToChild {
-    ToChild::Message { room: room.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: "2026-10-27T10:00:00.000Z".into(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false }
+    ToChild::Message { room: room.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: format!("m{seq}"), ts: "2026-10-27T10:00:00.000Z".into(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false, files: Vec::new() }
 }
 
 fn held_seqs(hub: &Hub, room: &str) -> Vec<u64> {
@@ -1909,7 +1910,7 @@ fn audit_repeated_disconnect_cycles_stay_inside_the_one_budget() {
     for cycle in 0..4_u64 {
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
         for seq in cycle * 3 + 1..=cycle * 3 + 3 {
-            hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false });
+            hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "Codex".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false, files: Vec::new() });
         }
         hub.disconnect(ROOM, DisconnectReason::Disconnected);
     }
@@ -1947,7 +1948,7 @@ fn attach_holds_references_not_lines() {
         hub.cap = held as usize + 1;
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
         for seq in 1..=held {
-            assert_eq!(hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "a".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false }), Forwarded::Taken);
+            assert_eq!(hub.forward(ToChild::Message { room: ROOM.into(), seq, sender: "a".into(), to: "everyone".into(), kind: "tell".into(), text: "x".into(), ts: String::new(), sender_id: None, to_owner: false, yes_no: false, approval: None, withheld: false, files: Vec::new() }), Forwarded::Taken);
         }
         hub.disconnect(ROOM, DisconnectReason::Disconnected);
         hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
@@ -4164,6 +4165,7 @@ fn say_in(room: &str, thread: &str, id: &str, to: Option<&str>, kind: Option<&st
         thread_id: thread.to_string(),
         owner_id: OWNER_ID.to_string(),
         retry: false,
+        files: Vec::new(),
     })
 }
 
@@ -4219,8 +4221,8 @@ fn a_say_is_posted_as_the_owner_only_for_a_connected_room_its_own_post_and_the_k
     assert_eq!(
         f.acts.posts.lock().unwrap().clone(),
         vec![
-            (ROOM.to_string(), OwnerPost { discord_message_id: msg_id(5), to: "everyone".into(), kind: "tell".into(), text: "hello room".into(), in_reply_to: None, approved: None }, APP_WORD.to_string()),
-            (ROOM.to_string(), OwnerPost { discord_message_id: msg_id(6), to: "peer-a".into(), kind: "ask".into(), text: "and you?".into(), in_reply_to: Some(3), approved: None }, APP_WORD.to_string()),
+            (ROOM.to_string(), OwnerPost { discord_message_id: msg_id(5), to: "everyone".into(), kind: "tell".into(), text: "hello room".into(), in_reply_to: None, approved: None, files: Vec::new() }, APP_WORD.to_string()),
+            (ROOM.to_string(), OwnerPost { discord_message_id: msg_id(6), to: "peer-a".into(), kind: "ask".into(), text: "and you?".into(), in_reply_to: Some(3), approved: None, files: Vec::new() }, APP_WORD.to_string()),
         ],
         "only the two in the right place reached the bridge, with the word the room was connected with"
     );
@@ -4779,6 +4781,7 @@ fn a_real_bridge_takes_the_owners_say_as_you_via_discord_and_no_one_else_can_spe
             thread_id: THREAD.to_string(),
             owner_id: OWNER_ID.to_string(),
             retry: false,
+            files: Vec::new(),
         }));
     };
     let answers = |id: &str| -> Vec<serde_json::Value> { buffer.lines().into_iter().filter(|line| line["t"] == "said" && line["discordMessageId"] == id).collect() };
@@ -4895,6 +4898,157 @@ fn a_yes_no_flag_outlives_a_compaction_and_a_relaunch_and_old_lines_have_none() 
     let old: journal::Record = serde_json::from_str(r#"{"t":"line","seq":9,"sender":"Codex","to":"everyone","kind":"ask","text":"x","ts":""}"#)
         .expect("a line written before the flag still parses");
     assert!(!serde_json::to_string(&old).unwrap().contains("yesNo"), "a line from before the flag has none");
+}
+
+// Files in a room (#375): a say names only files in its own room's attachments folder, the body
+// to the bridge carries `files` only when there are some, and a line's files reach the child and
+// the journal.
+
+/// A file of `bytes` at `<fixture>/attachments/<room>/<name>`, as the connector downloads one.
+fn attachment(f: &Fixture, room: &str, name: &str) -> FileRef {
+    let folder = f.dir.join(ATTACHMENTS_DIR).join(room);
+    fs::create_dir_all(&folder).unwrap();
+    let path = folder.join(name);
+    fs::write(&path, b"hello").unwrap();
+    file_ref(&path.display().to_string(), name)
+}
+
+fn file_ref(path: &str, name: &str) -> FileRef {
+    FileRef { path: path.to_string(), name: name.to_string(), kind: "text/plain".to_string(), size: 5 }
+}
+
+fn say_files(id: &str, text: &str, files: Vec<FileRef>) -> FromChild {
+    let mut line = say(ROOM, id, None, None, text, None);
+    if let FromChild::Say(inner) = &mut line {
+        inner.files = files;
+    }
+    line
+}
+
+#[test]
+fn a_say_names_only_files_in_its_own_rooms_folder_and_at_most_ten() {
+    let f = fixture_owned("say-files", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let own = attachment(&f, ROOM, "own.txt");
+    let other_room = attachment(&f, OTHER, "other.txt");
+    let elsewhere = f.dir.join("elsewhere.txt");
+    fs::write(&elsewhere, b"secret").unwrap();
+    let room_folder = f.dir.join(ATTACHMENTS_DIR).join(ROOM);
+    std::os::unix::fs::symlink(&elsewhere, room_folder.join("link.txt")).unwrap();
+    let dotdot = room_folder.join("..").join(OTHER).join("other.txt").display().to_string();
+    let relative = "../".repeat(std::env::current_dir().unwrap().components().count()) + own.path.trim_start_matches('/');
+    assert!(fs::metadata(&relative).is_ok(), "premise: the relative path names a file");
+    let refused = [
+        (1, other_room.clone()),
+        (2, file_ref(&dotdot, "dotdot.txt")),
+        // Relative, though from this process's folder it names the room's own file.
+        (3, file_ref(&relative, "relative.txt")),
+        (4, file_ref(&elsewhere.display().to_string(), "elsewhere.txt")),
+        (5, file_ref(&room_folder.join("link.txt").display().to_string(), "link.txt")),
+        (6, file_ref(&room_folder.display().to_string(), "folder")),
+        (7, file_ref(&room_folder.join("missing.txt").display().to_string(), "missing.txt")),
+    ];
+    for (n, file) in &refused {
+        on_core_event(&f.state.core, say_files(&msg_id(*n), "a file", vec![own.clone(), file.clone()]));
+    }
+    on_core_event(&f.state.core, say_files(&msg_id(8), "eleven", vec![own.clone(); 11]));
+    // Premise: the room's own files go, ten of them too.
+    on_core_event(&f.state.core, say_files(&msg_id(9), "one", vec![own.clone()]));
+    on_core_event(&f.state.core, say_files(&msg_id(10), "ten", vec![own.clone(); 10]));
+    wait_until("ten answers", || of_kind(&buffer.lines(), "said").len() == 10);
+    let lines = buffer.lines();
+    for (n, file) in &refused {
+        let answer = said(&lines, &msg_id(*n)).unwrap();
+        assert_eq!(answer["ok"], false, "{n}: {answer}");
+        assert_eq!(answer["error"], format!("{} is not a file this room was given, so nothing was sent", file.name), "{n}");
+    }
+    assert_eq!(said(&lines, &msg_id(8)).unwrap()["error"], "At most 10 files go in one message, so nothing was sent");
+    let posts = f.acts.posts.lock().unwrap().clone();
+    assert_eq!(posts.iter().map(|(_, post, _)| (post.text.as_str(), post.files.len())).collect::<Vec<_>>(), vec![("one", 1), ("ten", 10)], "only the room's own files reached the bridge");
+    assert_eq!(posts[0].1.files, vec![own]);
+}
+
+#[test]
+fn a_room_folder_that_is_a_link_lends_its_files_no_trust() {
+    let f = fixture_owned("say-files-link", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    let elsewhere = f.dir.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::write(elsewhere.join("id_ed25519"), b"secret").unwrap();
+    fs::create_dir_all(f.dir.join(ATTACHMENTS_DIR)).unwrap();
+    let room_folder = f.dir.join(ATTACHMENTS_DIR).join(ROOM);
+    std::os::unix::fs::symlink(&elsewhere, &room_folder).unwrap();
+    let through = file_ref(&room_folder.join("id_ed25519").display().to_string(), "id_ed25519");
+    on_core_event(&f.state.core, say_files(&msg_id(1), "a key", vec![through]));
+    // Premise: the same folder made real, a file in it goes.
+    fs::remove_file(&room_folder).unwrap();
+    let own = attachment(&f, ROOM, "own.txt");
+    on_core_event(&f.state.core, say_files(&msg_id(2), "real", vec![own]));
+    wait_until("two answers", || of_kind(&buffer.lines(), "said").len() == 2);
+    assert_eq!(said(&buffer.lines(), &msg_id(1)).unwrap()["error"], "id_ed25519 is not a file this room was given, so nothing was sent");
+    assert_eq!(posted_texts(&f), vec!["real".to_string()]);
+}
+
+#[test]
+fn an_owner_posts_body_carries_files_only_when_it_has_some_and_only_their_paths() {
+    let post = OwnerPost {
+        discord_message_id: msg_id(1),
+        to: "peer-a".into(),
+        kind: "ask".into(),
+        text: "look".into(),
+        in_reply_to: Some(4),
+        approved: None,
+        files: Vec::new(),
+    };
+    // The body as it was before files existed, key for key.
+    assert_eq!(
+        owner_post_body(&post),
+        serde_json::json!({ "from": OWNER_SENDER, "to": "peer-a", "kind": "ask", "text": "look", "discordMessageId": msg_id(1), "inReplyTo": 4 })
+    );
+    let with = OwnerPost { files: vec![file_ref("/a/b.png", "b.png"), file_ref("/a/c.txt", "c.txt")], ..post };
+    assert_eq!(
+        owner_post_body(&with),
+        serde_json::json!({ "from": OWNER_SENDER, "to": "peer-a", "kind": "ask", "text": "look", "discordMessageId": msg_id(1), "inReplyTo": 4, "files": [{ "path": "/a/b.png" }, { "path": "/a/c.txt" }] }),
+        "the bridge reads name, type and size itself"
+    );
+}
+
+#[test]
+fn a_lines_files_reach_the_child_and_the_journal_and_a_path_outside_the_room_never_does() {
+    let f = fixture("files-wire", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    let own = attachment(&f, ROOM, "own.txt");
+    let other_room = attachment(&f, OTHER, "other.txt");
+    let mut with_files = mail(1, "peer-a", "everyone", "tell", "see this");
+    with_files["files"] = serde_json::to_value(vec![own.clone()]).unwrap();
+    let mut outside = mail(2, "peer-a", "everyone", "tell", "and this");
+    outside["files"] = serde_json::to_value(vec![own.clone(), other_room]).unwrap();
+    f.stream(ROOM, &[with_files, outside, mail(3, "peer-a", "everyone", "tell", "no files")]);
+    wait_until("three lines", || of_kind(&buffer.lines(), "message").len() == 3);
+    let all = buffer.lines();
+    let lines = of_kind(&all, "message");
+    let own_json = serde_json::to_value(vec![own.clone()]).unwrap();
+    assert_eq!(lines[0]["files"], own_json);
+    assert_eq!(lines[0]["files"][0]["type"], "text/plain", "the kind goes out as `type`");
+    assert_eq!(lines[1]["files"], own_json, "the other room's file is left out");
+    assert_eq!(lines[1]["text"], "and this\n(file not relayed: other.txt)");
+    assert!(lines[2].get("files").is_none(), "a line with none carries no `files`: {}", lines[2]);
+
+    let path = journal_path(&f);
+    let (_next, handed) = launch_wire(&path, Moment::Launch).unwrap();
+    let replayed: Vec<&serde_json::Value> = handed.iter().filter(|line| line["t"] == "message").collect();
+    assert_eq!(replayed.len(), 3, "premise: all three are replayed");
+    assert_eq!(replayed[0]["files"], own_json, "the files came back from the journal");
+    assert!(replayed[2].get("files").is_none());
+    let old: journal::Record = serde_json::from_str(r#"{"t":"line","seq":9,"sender":"Codex","to":"everyone","kind":"tell","text":"x","ts":""}"#)
+        .expect("a line written before files still parses");
+    assert!(matches!(&old, journal::Record::Line { files, .. } if files.is_empty()));
+    assert!(!serde_json::to_string(&old).unwrap().contains("files"), "and is written back without them");
 }
 
 #[test]
@@ -5532,7 +5686,7 @@ fn a_request_past_the_open_cap_is_said_unapprovable_and_still_keeps_a_code_off_t
 
 #[test]
 fn a_request_is_journalled_as_its_act_so_relayed_again_it_asks_for_no_code() {
-    let line = |approval: Option<Approval>| ToChild::Message { room: ROOM.into(), seq: 1, sender: "Gyre".into(), to: OWNER_SENDER.into(), kind: "ask".into(), text: "Reply with the 6-digit code".into(), ts: String::new(), sender_id: None, to_owner: true, yes_no: false, approval, withheld: false };
+    let line = |approval: Option<Approval>| ToChild::Message { room: ROOM.into(), seq: 1, sender: "Gyre".into(), to: OWNER_SENDER.into(), kind: "ask".into(), text: "Reply with the 6-digit code".into(), ts: String::new(), sender_id: None, to_owner: true, yes_no: false, approval, withheld: false, files: Vec::new() };
     let text = |record: Option<journal::Record>| match record {
         Some(journal::Record::Line { text, .. }) => text,
         other => panic!("{other:?}"),
@@ -5566,6 +5720,7 @@ fn c5_c7_c8_a_right_code_on_its_request_posts_the_stamp_to_the_requester_and_nev
                 text: "Approved with the code: merge PR #370 at aaaaaaaaaaaa".into(),
                 in_reply_to: Some(1),
                 approved: Some(Approval::Merge { pr: 370, sha: SHA_A.into() }),
+                files: Vec::new(),
             },
             APP_WORD.to_string(),
         )]

@@ -126,6 +126,11 @@ const LAUNCH_WINDOW: usize = 2 * UNACKED_CAP;
 /// A journal is compacted once it is this many times the byte budget.
 const JOURNAL_COMPACT_FACTOR: u64 = 2;
 const JOURNAL_DIR: &str = "discord-journal";
+/// Beside the state file: `<dir>/attachments/<room>/` holds the room's files, the only place a
+/// file a room message names may be (#375).
+const ATTACHMENTS_DIR: &str = "attachments";
+/// At most this many files in one message, either way (#375).
+const FILES_MAX: usize = 10;
 const JOURNAL_BLOCKED: &str = "journal_blocked";
 /// A quit's loss kept only in the Keychain, or a Keychain record of losses that cannot be read.
 const LOSS_UNRECORDED: &str = "loss_unrecorded";
@@ -274,6 +279,9 @@ pub(crate) enum ToChild {
         /// approved from Discord, the child adds no ask for the code, and still keeps one off the room.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         withheld: bool,
+        /// The files the line carries, each inside the room's attachments folder (#375).
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        files: Vec<FileRef>,
     },
     /// `id` names this close, so `closed` clears this one and not another of the instance.
     Disconnect { room: String, reason: DisconnectReason, id: String },
@@ -500,6 +508,42 @@ struct Say {
     /// Sent again by a child that found it saved without a receipt.
     #[serde(default)]
     retry: bool,
+    /// What the child downloaded into the room's attachments folder (#375).
+    #[serde(default)]
+    files: Vec<FileRef>,
+}
+
+/// One file a room message carries (#375): a copy inside `attachments/<room>/` that the bridge
+/// or the connector made. `type` and `size` were read from the bytes, never from the name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FileRef {
+    pub path: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub size: u64,
+}
+
+/// `<dir of the state file>/attachments`: the folder every room's files live under.
+fn attachments_root(state_path: &Path) -> PathBuf {
+    state_path.parent().map(|dir| dir.join(ATTACHMENTS_DIR)).unwrap_or_else(|| PathBuf::from(ATTACHMENTS_DIR))
+}
+
+/// Whether `path` is a regular file inside `<root>/<room>/` once every link is followed: a
+/// relative path, `..`, another room's folder or a link out of it is not, and neither is
+/// anything under a room folder that is itself a link (#375). The bridge checks again with its
+/// own realpath when it reads the file.
+fn in_room_folder(root: &Path, room: &str, path: &str) -> bool {
+    if !Path::new(path).is_absolute() || !valid_sync_code(room) {
+        return false;
+    }
+    if !std::fs::symlink_metadata(root.join(room)).is_ok_and(|meta| meta.is_dir()) {
+        return false;
+    }
+    let (Ok(folder), Ok(file)) = (std::fs::canonicalize(root.join(room)), std::fs::canonicalize(path)) else {
+        return false;
+    };
+    file.starts_with(&folder) && std::fs::metadata(&file).is_ok_and(|meta| meta.is_file())
 }
 
 /// Six digits or more in all, whatever separates them: a code typed with words or marks around
@@ -792,6 +836,7 @@ fn notice(room: &str, seq: u64, text: String) -> ToChild {
         yes_no: false,
         approval: None,
         withheld: false,
+        files: Vec::new(),
     }
 }
 
@@ -817,9 +862,9 @@ const TERMINAL_ONLY: &str = "It touches credentials, the Discord pairing, the ap
 /// the asker's words asking for one are not what is shown (#207).
 fn line_record(line: &ToChild) -> Option<journal::Record> {
     match line.clone() {
-        ToChild::Message { seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, approval, .. } => {
+        ToChild::Message { seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, approval, files, .. } => {
             let text = approval.map_or(text, |approval| approval.not_approvable(RELAYED_AGAIN));
-            Some(journal::Record::Line { seq, sender, to, kind, text, ts, through: None, sender_id, to_owner, yes_no })
+            Some(journal::Record::Line { seq, sender, to, kind, text, ts, through: None, sender_id, to_owner, yes_no, files })
         }
         _ => None,
     }
@@ -827,8 +872,8 @@ fn line_record(line: &ToChild) -> Option<journal::Record> {
 
 fn item_line(room: &str, item: journal::Item) -> ToChild {
     match item {
-        journal::Item::Line { seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, .. } => {
-            ToChild::Message { room: room.to_string(), seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, approval: None, withheld: false }
+        journal::Item::Line { seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, files, .. } => {
+            ToChild::Message { room: room.to_string(), seq, sender, to, kind, text, ts, sender_id, to_owner, yes_no, approval: None, withheld: false, files }
         }
         journal::Item::Loss { seq, n, label, .. } => notice(room, seq, loss_text(n, &label)),
     }
@@ -2202,6 +2247,8 @@ pub(crate) struct OwnerPost {
     pub in_reply_to: Option<u64>,
     /// What an approval code approved (#207); the bridge takes it only from the app.
     pub approved: Option<Approval>,
+    /// Files in the room's attachments folder (#375); the bridge reads name, type and size itself.
+    pub files: Vec<FileRef>,
 }
 
 /// Why the bridge did not publish an owner post, and who could have been written to.
@@ -2261,6 +2308,8 @@ pub(crate) struct Core {
     /// Held from reading the approval record to the stamp, so two codes are never checked at
     /// once (#207). Holds the secret being set up, in hex, until a code from it verifies.
     approval_gate: Mutex<Option<String>>,
+    /// `<dir of the state file>/attachments`, where a say's files must be (#375).
+    attachments: PathBuf,
 }
 
 pub(crate) struct DiscordState {
@@ -2366,6 +2415,7 @@ impl DiscordState {
             status_busy: AtomicBool::new(false),
             approvals: Arc::clone(&deps.approvals),
             approval_gate: Mutex::new(None),
+            attachments: attachments_root(&deps.state_path),
         });
         Self {
             hub,
@@ -2731,6 +2781,7 @@ impl DiscordState {
             acked_sent: 0,
             ack_at: Instant::now(),
             paused,
+            attachments: attachments_root(&self.deps.state_path),
         };
         let join = thread::Builder::new()
             .name(format!("gyredeck-discord-{room}"))
@@ -2963,6 +3014,14 @@ impl Core {
         if word.is_empty() {
             return Err(gone.to_string());
         }
+        // Only what Discord gave this room goes in: a path anywhere else is refused here, before
+        // the bridge is asked (#375).
+        if say.files.len() > FILES_MAX {
+            return Err(format!("At most {FILES_MAX} files go in one message, so nothing was sent"));
+        }
+        if let Some(file) = say.files.iter().find(|file| !in_room_folder(&self.attachments, &say.room, &file.path)) {
+            return Err(format!("{} is not a file this room was given, so nothing was sent", file.name));
+        }
         let to = say.to.as_deref().map(str::trim).filter(|to| !to.is_empty()).unwrap_or("everyone").to_string();
         let kind = match say.kind.as_deref() {
             Some(kind @ ("ask" | "tell" | "reaction")) => kind.to_string(),
@@ -2976,7 +3035,7 @@ impl Core {
                 return Err("That looks like it holds an approval code, so it was not sent to the room. Reply with the 6 digits alone".to_string());
             }
         }
-        Ok((word, OwnerPost { discord_message_id: say.discord_message_id.clone(), to, kind, text: say.text.clone(), in_reply_to: say.reply_to_seq, approved: None }))
+        Ok((word, OwnerPost { discord_message_id: say.discord_message_id.clone(), to, kind, text: say.text.clone(), in_reply_to: say.reply_to_seq, approved: None, files: say.files.clone() }))
     }
 
     /// The owner's approval code (#207): checked as a `say` is, then against the request it
@@ -3063,6 +3122,7 @@ impl Core {
             text: format!("Approved with the code: {}", echo.describe()),
             in_reply_to: Some(approve.reply_to_seq),
             approved: Some(echo),
+            files: Vec::new(),
         };
         let posted = self.acts.post_owner(&approve.room, &post, &word);
         drop(gate);
@@ -3498,6 +3558,8 @@ struct RoomReader {
     ack_at: Instant,
     /// Start in `wait_for_room`: the room code was over its budget at Connect.
     paused: bool,
+    /// Where a line's files must be before the child is handed their paths (#375).
+    attachments: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -3528,6 +3590,8 @@ struct WireMessage {
     yes_no: Option<serde_json::Value>,
     #[serde(default)]
     approval: Option<serde_json::Value>,
+    #[serde(default)]
+    files: Vec<FileRef>,
 }
 
 impl RoomReader {
@@ -3798,11 +3862,17 @@ impl RoomReader {
         let terminal_only = approval.as_ref().and_then(Approval::terminal_only);
         let withheld = approval.is_some() && (!open || terminal_only.is_some());
         let requested = approval.clone().map(|approval| Requested { approval, requester: message.from.clone(), read_at: Instant::now(), used: withheld });
-        let text = match &approval {
+        let mut text = match &approval {
             Some(approval) if terminal_only.is_some() => approval.not_approvable(TERMINAL_ONLY),
             Some(approval) if withheld => approval.not_approvable(TOO_MANY_OPEN),
             _ => message.text,
         };
+        // The child uploads what a path names, so a path outside the room's folder never
+        // reaches it; the line says a file was left out (#375).
+        let (files, outside): (Vec<FileRef>, Vec<FileRef>) = message.files.into_iter().partition(|file| in_room_folder(&self.attachments, &self.room, &file.path));
+        for file in outside {
+            text.push_str(&format!("\n(file not relayed: {})", file.name));
+        }
         let forwarded = hub.forward(ToChild::Message {
             room: self.room.clone(),
             seq: message.seq,
@@ -3816,6 +3886,7 @@ impl RoomReader {
             yes_no,
             approval,
             withheld,
+            files,
         });
         // Only a line taken now is a request: a seq seen before keeps what it had, used or not.
         if let (Forwarded::Taken, Some(requested), Some(feed)) = (&forwarded, requested, hub.rooms.get_mut(&self.room)) {
@@ -4357,11 +4428,8 @@ impl RoomActs for BridgeActs {
     }
 }
 
-/// Publish one owner post on `target` with the machine token and the app's word (#205).
-pub(crate) fn post_owner_to(target: &standalone_bridge::BridgeTarget, room: &str, post: &OwnerPost, app_word: &str) -> Result<u64, Refused> {
-    if !valid_sync_code(room) {
-        return Err(Refused { message: "Not a room code".to_string(), names: None });
-    }
+/// The body of one owner post: `files` only when there are some, each as its path alone (#375).
+fn owner_post_body(post: &OwnerPost) -> serde_json::Value {
     let mut body = serde_json::json!({
         "from": OWNER_SENDER,
         "to": post.to,
@@ -4375,6 +4443,18 @@ pub(crate) fn post_owner_to(target: &standalone_bridge::BridgeTarget, room: &str
     if let Some(approved) = &post.approved {
         body["approved"] = serde_json::to_value(approved).unwrap_or_default();
     }
+    if !post.files.is_empty() {
+        body["files"] = post.files.iter().map(|file| serde_json::json!({ "path": file.path })).collect();
+    }
+    body
+}
+
+/// Publish one owner post on `target` with the machine token and the app's word (#205).
+pub(crate) fn post_owner_to(target: &standalone_bridge::BridgeTarget, room: &str, post: &OwnerPost, app_word: &str) -> Result<u64, Refused> {
+    if !valid_sync_code(room) {
+        return Err(Refused { message: "Not a room code".to_string(), names: None });
+    }
+    let body = owner_post_body(post);
     let (status, value) = standalone_bridge::bridge_request_to(target, "POST", &format!("/mail/{room}"), Some(body.to_string()), Duration::from_secs(3), Some(app_word))
         .map_err(|error| Refused { message: format!("Gyredeck could not reach its bridge: {error}"), names: None })?;
     // 📨 only for a seq the bridge says it published.

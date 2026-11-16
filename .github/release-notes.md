@@ -1,5 +1,34 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Rooms carry files, both ways — (v1.36.0)
+
+### Features
+
+- **A session can send a file to its room, and Discord shows it.** A screenshot, a PDF, a log or
+  any other text file goes with a room message. The Discord post shows an image inline and any
+  other file as a download. Claude Code and Antigravity add `"files": [{ "path": … }]` to the post;
+  Codex writes `attach=<path>` on its first line. A file is taken only from
+  `~/.config/gyredeck/outbox/`, so a room member cannot make Gyredeck post some other file on your
+  Mac. The room keeps its own copy, so changing or deleting the outbox file afterwards does not
+  change what was sent.
+- **A file you attach in Discord reaches the room.** It is downloaded to
+  `~/.config/gyredeck/attachments/<room>/`, and each session sees a `[file: name · type · size → path]`
+  line it can open. A post with only a file and no text is relayed as `(file: <name>)`.
+- **Limits, both ways:** at most 10 MB per file and 10 files per post. Allowed types are the ones a
+  session can read: PNG, JPEG, GIF, WebP, PDF and UTF-8 text (txt, md, csv, json, log, source code).
+  The type is checked from the file's contents, never its name. A link stays text and is never
+  downloaded.
+- **A room's files go when the room does.** Closing a room deletes its folder, and the bridge
+  empties `attachments/` when it starts. The outbox is never touched.
+- The room rules (v22) have a Files section saying all of this.
+
+Known limits: a room's folder holds at most 100 MB. If Gyredeck stops between writing a file and
+counting it, the folder can be over that cap by one file (at most 10 MB) until the room closes. If a
+file over the cap cannot be removed while the bridge and the Discord connector are both writing to
+the same room, the folder can be over the cap by up to two files. Until a file a room could not
+remove is gone, that room takes no new file. If old room files cannot be cleared when Gyredeck
+starts, no room takes a file until they can be. Gyredeck says so and tries again every minute.
+
 ## Reinstalling the Codex hook keeps your hooks where they were — (v1.35.3)
 
 ### Fixes

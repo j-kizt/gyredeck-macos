@@ -1264,7 +1264,7 @@ fn connect_is_refused_until_the_current_child_is_ready_and_a_refused_token_undoe
     );
     assert!(f.state.status().ready, "premise: a good token is ready");
     // The token changes and the new one is refused.
-    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "bad_token".into(), message: "refused".into() });
+    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "bad_token".into(), message: "refused".into(), room: None, held: false });
     let status = f.state.status();
     assert!(!status.ready);
     assert_eq!((status.bot, status.invite_url), (None, None), "nothing of the old child is left showing");
@@ -1600,13 +1600,62 @@ fn the_owner_line_names_the_round_it_accepts() {
 fn a_storage_refusal_stays_shown_through_ready() {
     let f = fixture("storage-sticky", Some(TOKEN));
     let _buffer = f.attach_buffer();
-    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "storage_blocked".into(), message: "The Discord state file could not be read".into() });
+    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "storage_blocked".into(), message: "The Discord state file could not be read".into(), room: None, held: false });
     on_child_event(
         &f.state.hub,
         f.owners.as_ref(),
         FromChild::Ready { bot: Bot { id: "42".into(), username: "Gyre Bot".into() }, application_id: "123456789012345678".into(), forums: vec![] },
     );
     assert_eq!(f.state.status().error.map(|error| error.code).as_deref(), Some("storage_blocked"));
+}
+
+/// #199 reopened: a room held by a refusal (the bot lost access to the forum) stays shown
+/// through a later `ready`, which the child sends again whenever the forums change, and goes
+/// only when the child says that room is `unheld`. The child says it once per stall, so a
+/// cleared one is lost.
+#[test]
+fn a_room_held_by_a_refusal_stays_shown_through_ready_until_it_is_unheld() {
+    let f = fixture("room-error-sticky", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    let held = FromChild::Error { code: "missing_permission".into(), message: "The bot lacks a permission it needs on the forum.".into(), room: Some(ROOM.into()), held: true };
+    on_child_event(&f.state.hub, f.owners.as_ref(), held);
+    on_child_event(
+        &f.state.hub,
+        f.owners.as_ref(),
+        FromChild::Ready { bot: Bot { id: "42".into(), username: "Gyre Bot".into() }, application_id: "123456789012345678".into(), forums: vec![] },
+    );
+    let status = f.state.status();
+    assert_eq!(status.room_errors.get(ROOM).map(|error| error.code.as_str()), Some("missing_permission"));
+    assert!(status.error.is_none(), "a room's refusal is not the connector's error");
+    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Unheld { room: "sync-other".into() });
+    assert!(f.state.status().room_errors.contains_key(ROOM), "another room passing says nothing about this one");
+    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Unheld { room: ROOM.into() });
+    assert!(f.state.status().room_errors.is_empty());
+}
+
+/// An error about a room that holds nothing (a reply Discord refused, a read-back it would not
+/// allow) is not a held room: the queue went on.
+#[test]
+fn an_error_about_a_room_that_holds_nothing_is_not_a_held_room() {
+    let f = fixture("room-error-not-held", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "missing_permission".into(), message: "Could not answer in Discord".into(), room: Some(ROOM.into()), held: false });
+    let status = f.state.status();
+    assert!(status.room_errors.is_empty());
+    assert_eq!(status.error.map(|error| error.code).as_deref(), Some("missing_permission"));
+}
+
+/// A fatal code names a room only by accident: it stops the connector, so it is the
+/// connector's error, and what the gone child said held a room goes with it.
+#[test]
+fn a_fatal_error_is_the_connectors_and_forgets_the_held_rooms() {
+    let f = fixture("room-error-fatal", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "missing_permission".into(), message: "held".into(), room: Some("sync-other".into()), held: true });
+    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "bad_token".into(), message: "refused".into(), room: Some(ROOM.into()), held: true });
+    let status = f.state.status();
+    assert_eq!(status.error.map(|error| error.code).as_deref(), Some("bad_token"));
+    assert!(status.room_errors.is_empty());
 }
 
 // ── #199 r7: the invariants the audit found open (199-invariants.md §5), one proof each ──
@@ -2165,7 +2214,11 @@ fn every_new_wire_field_reads_and_writes_as_specified() {
     let unnamed: FromChild = serde_json::from_str(r#"{"t":"closed","room":"sync-ab23","createdAt":1,"id":null}"#).unwrap();
     assert!(matches!(unnamed, FromChild::Closed { id: None, .. }));
     let error: FromChild = serde_json::from_str(r#"{"t":"error","code":"readback_unavailable","message":"no history"}"#).unwrap();
-    assert!(matches!(error, FromChild::Error { ref code, .. } if code == "readback_unavailable"));
+    assert!(matches!(error, FromChild::Error { ref code, held: false, .. } if code == "readback_unavailable"));
+    let held: FromChild = serde_json::from_str(r#"{"t":"error","code":"missing_permission","message":"m","room":"sync-ab23","held":true}"#).unwrap();
+    assert!(matches!(held, FromChild::Error { room: Some(ref room), held: true, .. } if room == ROOM));
+    let unheld: FromChild = serde_json::from_str(r#"{"t":"unheld","room":"sync-ab23"}"#).unwrap();
+    assert!(matches!(unheld, FromChild::Unheld { ref room } if room == ROOM));
     let dropped: WireDropped = serde_json::from_str(r#"{"droppedThroughSeq":5}"#).unwrap();
     assert_eq!((dropped.dropped_through_seq, dropped.relay_from), (5, 0));
     // A dedupe ACK with no id keeps the anchor an earlier one gave.

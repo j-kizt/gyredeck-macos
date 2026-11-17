@@ -173,6 +173,16 @@ export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDi
           </span>
         </div>
       ))}
+      {Object.entries(status?.roomErrors ?? {}).map(([room, error]) => (
+        // Still being tried, so an unnamed cause is shown as itself, never as the connector stopping (#199).
+        <div className="setup-row" data-discord="room-error" key={`room-error-${room}`}>
+          <span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span>
+          <span className="setup-copy">
+            <span className="setup-title">{`Room ${room} is not reaching Discord`}</span>
+            <span className="setup-detail">{ERROR_COPY[error.code] ?? error.message}</span>
+          </span>
+        </div>
+      ))}
       {Object.entries(status?.leaving ?? {}).map(([room, reason]) => (
         // Shown with or without a token: the member still sits in the room, holding it up.
         <div className="setup-row" data-discord="leaving" key={`leaving-${room}`}>

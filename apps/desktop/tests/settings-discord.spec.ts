@@ -592,3 +592,23 @@ test.describe("approval code at 444 × 560", () => {
     expect(boxes.overflow).toEqual([]);
   });
 });
+
+// #199 reopened: a room held by a refusal is named, with what to do, and goes when it moves.
+test("a room held by a refusal gets its own row, and none show when no room is held", async ({ page }) => {
+  const roomErrors = { "sync-ab12": { code: "missing_permission", message: "The bot lacks a permission it needs on the forum." } };
+  await open(page, { ...blank, configured: true, running: true, ready: true, roomErrors } as Status);
+  const rows = page.locator(".setup-row[data-discord='room-error']");
+  await expect(rows).toHaveCount(1);
+  await expect(rows).toContainText("sync-ab12");
+  await expect(rows).toContainText("missing a permission");
+  await open(page, { ...blank, configured: true, running: true, ready: true } as Status);
+  await expect(rows).toHaveCount(0);
+});
+
+test("a room held by an unnamed cause shows that cause, never that the connector stopped", async ({ page }) => {
+  const roomErrors = { "sync-ab12": { code: "internal", message: "503 Service Unavailable" } };
+  await open(page, { ...blank, configured: true, running: true, ready: true, roomErrors } as Status);
+  const rows = page.locator(".setup-row[data-discord='room-error']");
+  await expect(rows).toContainText("503 Service Unavailable");
+  await expect(rows).not.toContainText("connector stopped");
+});

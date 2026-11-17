@@ -448,7 +448,18 @@ enum FromChild {
         #[serde(default)]
         created_at: Option<u64>,
     },
-    Error { code: String, message: String },
+    /// `room` names the room the error is about; `held` says that room's queue head is
+    /// waiting on it, and stays so until `unheld` (#199 reopened).
+    Error {
+        code: String,
+        message: String,
+        #[serde(default)]
+        room: Option<String>,
+        #[serde(default)]
+        held: bool,
+    },
+    /// What held this room's queue head has passed.
+    Unheld { room: String },
     /// The owner typed in a followed post, or reacted to a relayed message (#205).
     Say(Say),
     /// The owner replied to an approval request with six digits (#207).
@@ -649,6 +660,9 @@ pub(crate) struct DiscordStatus {
     pub held: usize,
     /// What the journal refused: `journal_blocked` per room code, `journal_corrupt` per file.
     pub journal_errors: BTreeMap<String, DiscordError>,
+    /// Why a room's relay is held, per room (#199 reopened). Its own field, so a later `ready`
+    /// does not clear it: it goes when the child says that room is `unheld`, or the child goes.
+    pub room_errors: BTreeMap<String, DiscordError>,
     /// A saved token or owner macOS would not hand over, by which ("token", "owner") (#288). Its
     /// own field, so nothing that clears the connector's error clears it: it goes only when a
     /// read or a save of that item succeeds.
@@ -963,6 +977,7 @@ struct Hub {
     /// Why the journal directory could not be used: every Connect is refused until it can.
     journal_down: Option<String>,
     journal_errors: BTreeMap<String, DiscordError>,
+    room_errors: BTreeMap<String, DiscordError>,
     keychain_refused: BTreeMap<String, String>,
     /// Journals recovery refused, by name: left as they are, until Remove deletes them.
     refused: Vec<String>,
@@ -1985,6 +2000,7 @@ impl Hub {
         self.application_id = None;
         self.forums.clear();
         self.pairing = None;
+        self.room_errors.clear();
     }
 }
 
@@ -2561,6 +2577,7 @@ impl DiscordState {
             error: hub.error.clone(),
             held: hub.parked.len(),
             journal_errors: hub.journal_errors.clone(),
+            room_errors: hub.room_errors.clone(),
             keychain_refused: hub.keychain_refused.clone(),
         }
     }
@@ -3511,7 +3528,7 @@ fn on_child_event_from(hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64, ev
             hub.pairing = None;
             hub.send(&ToChild::Owner { owner_id: Some(owner_id), round });
         }
-        FromChild::Error { code, message } => {
+        FromChild::Error { code, message, room, held } => {
             // Five wrong codes: this pairing is over, and the owner starts another.
             if code == "pairing_locked" {
                 hub.pairing = None;
@@ -3519,10 +3536,24 @@ fn on_child_event_from(hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64, ev
             if FATAL_ERRORS.contains(&code.as_str()) {
                 hub.forget_child();
             }
-            hub.error = Some(DiscordError { code, message });
+            // Said once by the child per stall: kept until it says `unheld`, whatever `ready`
+            // comes in between (#199 reopened).
+            match room.filter(|_| held && !FATAL_ERRORS.contains(&code.as_str())) {
+                Some(room) => {
+                    hub.room_errors.insert(room, DiscordError { code, message });
+                }
+                None => hub.error = Some(DiscordError { code, message }),
+            }
         }
-        FromChild::Posted { room, seq, created_at, msg_id } => hub.ack(&room, seq, created_at, msg_id),
-        FromChild::Closed { room, created_at, id } => hub.closed(&room, created_at, id),
+        FromChild::Unheld { room } => {
+            hub.room_errors.remove(&room);
+        }
+        FromChild::Posted { room, seq, created_at, msg_id } => {
+            hub.ack(&room, seq, created_at, msg_id);
+        }
+        FromChild::Closed { room, created_at, id } => {
+            hub.closed(&room, created_at, id);
+        }
         // The post of the room instance followed now; one of an earlier instance, replayed
         // while it drains, is not where the owner speaks to this one.
         FromChild::Connected { room: Some(room), thread_id: Some(thread_id), created_at } => {

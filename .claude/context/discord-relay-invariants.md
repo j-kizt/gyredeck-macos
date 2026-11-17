@@ -158,6 +158,7 @@ K = kept, Ch = changed, N = new.
 | I19 | K | No forum ≠ no room (`cn:360-368`, `rs:910-931`). |
 | I20 | Ch | *Notices are lines, and a prefix loss is said.* Every line the relay was owed reaches Discord or is said as a count with a truthful label, **including the prefix the bridge dropped before the first frame** (`event: dropped`, I4). |
 | I21 | Ch | *What will not be delivered is said, durably.* **Quit:** held lines are *not* lost (I3). Lines the bridge held unread (`roster.seq − last_seq`) and lines the journal failed to write become a `loss{n,label}` record before the child is stopped (journal, after up to 3 tries; else the `.loss` fallback file). It is not durable when the disk refuses both (see d18). The next launch posts one loss line per batch before its close. **Remove:** as at 5fa75a0 (`End` → "N not relayed", or `dropped` status); then the journals are deleted. A `loss` record leaves the journal only after its line is acked (`posted` for the loss's synthetic seq). |
+| I22 | K | *A held room is said, and stays said.* The child marks `held: true` only on what holds a room's queue head (`drain`/`attempt`: every wait of a head is a hold — `stuck`, `rate`, `network` (a failed call, or waiting offline), `perm`, `forum`, `other`; the retries with no wait, `missing` send and `rejected`, keep the cause until their next outcome). It keeps one current cause per room and says it again only when the cause changes, so the app never shows an earlier cause than the one holding now. It sends `unheld` when that head gets past it. Rust keeps a held, non-fatal error in `room_errors[room]`, never `error`, so a later `ready` cannot erase it, and drops it on that room's `unheld` or when the child is forgotten. An error naming a room that holds nothing (a refused receipt, `readback_unavailable`) stays the connector's `error`. (#199 reopened: the bot lost forum access, and `ready` erased the only report.) |
 
 ---
 
@@ -349,6 +350,7 @@ Per the IPC lesson, one test drives the real child and the real Rust parser thro
 | Risk | Note |
 |---|---|
 | The Hub refactor (push → pull) touches every send path | It is the largest change; T11 and T-IPC must land first |
+| T19 | I22 | `a_room_held_by_a_refusal_stays_shown_through_ready_until_it_is_unheld`, `an_error_about_a_room_that_holds_nothing_is_not_a_held_room`, `a_fatal_error_is_the_connectors_and_forgets_the_held_rooms`, wire in `every_new_wire_field…` · `a refused permission names the held room…`, `a receipt Discord refuses names its room but holds nothing…`, `a hold that changes cause is said again…`, `every wait of a held head shows its own cause…`, T8 (read-back not held) · settings `a room held by a refusal gets its own row` | `tests.rs`, `discord-connector.test.mjs`, `settings-discord.spec.ts` |
 | `F_FULLFSYNC` cost | ~5–30 ms per call. It is batched per instance at ≤ 1 per 2 s; I have not measured it here |
 | discord.js `webhook.send` return value and `messages.fetch` on archived forum threads | Believed, not run; check with a live bot before the audit |
 | A read-back that races a request which outlived its timeout | Cannot be closed (no idempotency key); stated in I9(a) |

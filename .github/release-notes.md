@@ -8,8 +8,7 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   was shown with the `&amp;` left in. Listening Ports now decodes, once, numeric references
   (`&#8212;`, `&#x2014;`) and a set of common named ones (`&amp;`, `&lt;`, `&quot;`, `&nbsp;`,
   `&copy;`, `&mdash;` and a few more). A reference that does not end in `;`, or a name outside that
-  set, is still shown as written. A browser reads `&#128;`–`&#159;` as other characters; here they
-  stay control characters, and a title that carries one is not shown.
+  set, is still shown as written. `&#128;`–`&#159;` are not decoded the way a browser decodes them.
 
 ## A closed room's Discord post closes, even after Discord archived it — (v1.37.3)
 

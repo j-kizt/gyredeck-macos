@@ -104,12 +104,16 @@ const assetRoot = join(distRoot, "assets");
  * cause, a closed room's hold kept under Remote access, and the held post's own forum) measured
  * 122,130 JS / 125,207 total locally, +405 on main's 121,725; a local build reads ~40 B under CI,
  * so 122,240 and 125,320 leave ~70 over the CI figure. Raised by the owner at the terminal on 2026-11-18 ("ขยับเพดานได้").
+ *
+ * #379 (git monitor errors stay on one line and keep the last good reading) on top of #322
+ * measured 122,384 JS on CI and 122,347 / 125,426 locally; 122,400 and 125,520 leave ~15 / ~55
+ * over the CI figure. Raised by the owner at the terminal on 2026-11-18 ("ขยับทั้งสองตัวได้เลย").
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 122_240,
-  jsTotalGzipBytes: 125_320,
+  jsGzipBytes: 122_400,
+  jsTotalGzipBytes: 125_520,
 };
 
 const walk = async (directory) => {

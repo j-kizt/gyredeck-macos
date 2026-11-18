@@ -18,6 +18,7 @@ import {
   writeStatusCache,
   writeTrackedRepos,
 } from "./adapter";
+import { pendingRepoState, settledRepoState } from "./repoState";
 import type { GitProvider, GithubRepoState, IGhAccount } from "./types";
 
 interface IAccountRef {
@@ -138,26 +139,19 @@ export const useGithubMonitor = ({ active, canUseNativeControls }: IUseGithubMon
   trackedRef.current = trackedRepos;
 
   const refreshRepo = useCallback(async (repo: string) => {
-    setStatuses((current) => ({
-      ...current,
-      [repo]: current[repo]?.status === "ready"
-        ? current[repo]
-        : { status: "loading" },
-    }));
+    setStatuses((current) => ({ ...current, [repo]: pendingRepoState(current[repo]) }));
     try {
       const view = viewingRef.current;
       const data = await fetchRepoStatus(repo, view?.provider, view?.login);
-      setStatuses((current) => ({ ...current, [repo]: { status: "ready", data, updatedAt: Date.now() } }));
+      setStatuses((current) => ({ ...current, [repo]: settledRepoState(current[repo], { data }, Date.now()) }));
+      // An empty status that only carries an error is not what the repo looks like.
+      if (data.error) return;
       const cache = readStatusCache();
       cache[repo] = data;
       writeStatusCache(cache);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setStatuses((current) => {
-        const previous = current[repo];
-        const carried = previous && previous.status === "ready" ? { data: previous.data, updatedAt: previous.updatedAt } : {};
-        return { ...current, [repo]: { status: "error", message, ...carried } };
-      });
+      setStatuses((current) => ({ ...current, [repo]: settledRepoState(current[repo], { message }, Date.now()) }));
     }
   }, []);
 

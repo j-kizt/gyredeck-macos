@@ -1139,6 +1139,59 @@ mod macos {
             .map_or(&[], |index| &response[index + 4..])
     }
 
+    // A browser tab shows `&amp;` as `&`: references are decoded once, before whitespace is
+    // folded, so a decoded newline is a space and a decoded control still drops the title.
+    fn decode_html_references(text: &str) -> String {
+        const NAMED: &[(&str, char)] = &[
+            ("amp", '&'), ("lt", '<'), ("gt", '>'), ("quot", '"'), ("apos", '\''),
+            ("nbsp", '\u{a0}'), ("copy", '©'), ("reg", '®'), ("trade", '™'),
+            ("mdash", '—'), ("ndash", '–'), ("hellip", '…'), ("bull", '•'), ("middot", '·'),
+            ("lsquo", '‘'), ("rsquo", '’'), ("ldquo", '“'), ("rdquo", '”'),
+            ("laquo", '«'), ("raquo", '»'), ("euro", '€'),
+        ];
+        let mut decoded = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find('&') {
+            decoded.push_str(&rest[..at]);
+            rest = &rest[at..];
+            let reference = rest[1..].find(';').map(|end| &rest[1..=end]);
+            let character = reference.and_then(|name| {
+                let numeric = name.strip_prefix('#');
+                match numeric {
+                    Some(number) => {
+                        let (digits, radix) = match number.strip_prefix(['x', 'X']) {
+                            Some(hex) => (hex, 16),
+                            None => (number, 10),
+                        };
+                        if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+                            return None;
+                        }
+                        Some(
+                            u32::from_str_radix(digits, radix)
+                                .ok()
+                                .filter(|&code| code != 0)
+                                .and_then(char::from_u32)
+                                .unwrap_or('\u{fffd}'),
+                        )
+                    }
+                    None => NAMED.iter().find(|(known, _)| *known == name).map(|(_, c)| *c),
+                }
+            });
+            match (character, reference) {
+                (Some(character), Some(name)) => {
+                    decoded.push(character);
+                    rest = &rest[name.len() + 2..];
+                }
+                _ => {
+                    decoded.push('&');
+                    rest = &rest[1..];
+                }
+            }
+        }
+        decoded.push_str(rest);
+        decoded
+    }
+
     fn response_html_title(response: &[u8]) -> Option<String> {
         if !matches!(response_status(response), Some(200..=299)) || !is_html_content_type(response)
         {
@@ -1149,7 +1202,7 @@ mod macos {
         let title_start = lowercase.find("<title")?;
         let content_start = title_start + lowercase[title_start..].find('>')? + 1;
         let content_end = content_start + lowercase[content_start..].find("</title>")?;
-        let title = body[content_start..content_end]
+        let title = decode_html_references(&body[content_start..content_end])
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
@@ -1703,6 +1756,46 @@ mod macos {
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><title>Unsafe\0title</title></html>"
                 ),
                 None
+            );
+        }
+
+        #[test]
+        fn decodes_character_references_in_a_page_title_once_as_a_browser_tab_shows_them() {
+            let page = |head: &str| {
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><head>{head}</head></html>")
+            };
+            let title = |text: &str| response_html_title(page(&format!("<title>{text}</title>")).as_bytes());
+            let cases: &[(&str, Option<&str>)] = &[
+                ("Doop — designed by Agents &amp; Humans", Some("Doop — designed by Agents & Humans")),
+                ("&lt;b&gt; &quot;x&quot; &apos;y&apos;", Some("<b> \"x\" 'y'")),
+                ("&copy; &reg; &trade; &mdash; &hellip; &nbsp;end", Some("© ® ™ — … end")),
+                ("&#39; &#8212; &#128512;", Some("' — 😀")),
+                ("&#x27; &#X2014; &#x1F600;", Some("' — 😀")),
+                ("&amp;amp; &amp;lt;", Some("&amp; &lt;")),
+                ("&foo; & alone &amp", Some("&foo; & alone &amp")),
+                ("AT&T", Some("AT&T")),
+                ("&#; &#x; &#12a; &# 1;", Some("&#; &#x; &#12a; &# 1;")),
+                ("&#0; &#xD800; &#x110000; &#99999999999;", Some("\u{fffd} \u{fffd} \u{fffd} \u{fffd}")),
+                ("a&#10;b&#9;c", Some("a b c")),
+                ("a&#7;b", None),
+                ("ไทย 😀 — as written", Some("ไทย 😀 — as written")),
+                ("Gyredeck", Some("Gyredeck")),
+                ("gyredeck-bridge", Some("gyredeck-bridge")),
+                ("", None),
+            ];
+            for (input, expected) in cases {
+                assert_eq!(title(input).as_deref(), *expected, "title {input:?}");
+            }
+            let long = title(&"&amp;".repeat(130)).expect("bounded title");
+            assert_eq!(long, "&".repeat(120), "cut at 120 decoded characters");
+            assert_eq!(
+                response_html_title(page("<TITLE lang=\"en\">\n    Docs &amp;\n    more\n</TITLE>").as_bytes()).as_deref(),
+                Some("Docs & more")
+            );
+            // As today: the first `<title` wins, even inside a script before the real one.
+            assert_eq!(
+                response_html_title(page("<script>let t = '<title>x</title>';</script><title>Real</title>").as_bytes()).as_deref(),
+                Some("x")
             );
         }
 

@@ -1,5 +1,33 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Listening Ports decodes common character references in page titles — (v1.37.4)
+
+### Fixes
+
+- **A page title shows `&` where its markup says `&amp;`.** A title such as `Agents &amp; Humans`
+  was shown with the `&amp;` left in. Listening Ports now decodes, once, numeric references
+  (`&#8212;`, `&#x2014;`) and a set of common named ones (`&amp;`, `&lt;`, `&quot;`, `&nbsp;`,
+  `&copy;`, `&mdash;` and a few more). A reference that does not end in `;`, or a name outside that
+  set, is still shown as written. `&#128;`–`&#159;` are not decoded the way a browser decodes them.
+
+## A closed room's Discord post closes, even after Discord archived it — (v1.37.3)
+
+### Fixes
+
+- **Closing a room no longer gets stuck when Discord archived its post first.** Discord archives
+  a quiet post on its own. The app could miss that, and then every try to retag the post as
+  closed was refused, so the room's Discord messages stayed held. Now the post is checked fresh,
+  reopened, retagged and archived again. If a step fails, it is tried again, and a room whose post
+  still exists is said to be closed only once that post is archived.
+- **A held room is shown even when nothing is waiting to be sent.** A held room with no row
+  under Sync rooms now has one under Permission → Remote access.
+- **A lost permission names the forum the room's messages were going to,** not one picked
+  since then, when the app knows that forum's name; otherwise it says "the forum".
+- **A deleted forum points you to the forum picker,** and the line says how many messages
+  are waiting, when any are.
+- **A held room whose cause the app does not recognise reads "Reason:"** and no longer blames
+  Discord, since the cause may be on this Mac.
+
 ## A Discord room that stops relaying says why — (v1.37.2)
 
 ### Fixes

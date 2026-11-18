@@ -1,5 +1,23 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Git Monitor says when a token has expired — (v1.37.6)
+
+### Fixes
+
+- **A repo whose token has expired or was revoked shows that, not an empty repo.** The token
+  was refused, the refusal was read as "no pull requests", and the card showed a repo with no
+  runs, no PRs and no commits. Now the card says "GitHub token expired or invalid — re-add the
+  account" (GitLab likewise). Any other error the backend reports for a repo is also shown as
+  the card's error instead of an empty card. A card that showed data before keeps it under the
+  error, through later refreshes too, and the error stays on the card while a refresh runs
+  instead of turning back into "Loading…".
+- **Ages past a month read in months and years.** A commit eight years old showed as
+  "3234d ago"; it now shows "8y ago". Ages are counted in whole days, so a commit 29½ days
+  old is still "29d ago".
+- **Git Monitor's lines stay on one line.** A long error, commit message or PR title is cut
+  with "…" instead of wrapping, and a card's full error shows on hover. Icons, status dots and
+  the sign-in code keep their size instead of being squeezed. Sign-in errors are centred.
+
 ## A room's Discord relay is no longer listed as an agent — (v1.37.5)
 
 ### Fixes

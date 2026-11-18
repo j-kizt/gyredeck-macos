@@ -11,8 +11,8 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   still exists is said to be closed only once that post is archived.
 - **A held room is shown even when nothing is waiting to be sent.** A held room with no row
   under Sync rooms now has one under Permission → Remote access.
-- **A lost permission points at the forum the room's messages were going to,** not one picked
-  since then, and names it when the app knows the forum's name.
+- **A lost permission names the forum the room's messages were going to,** not one picked
+  since then, when the app knows that forum's name; otherwise it says "the forum".
 - **A deleted forum points you to the forum picker,** and the line says how many messages
   are waiting, when any are.
 - **A held room whose cause the app does not recognise reads "Reason:"** and no longer blames

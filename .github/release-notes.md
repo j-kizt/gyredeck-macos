@@ -1,5 +1,16 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Page titles under Listening Ports read as a browser tab shows them — (v1.37.4)
+
+### Fixes
+
+- **A page title no longer shows HTML character references as written.** A title such as
+  `Agents &amp; Humans` was shown with the `&amp;` left in. Listening Ports now decodes each
+  reference once, as a browser tab does: `&amp;` reads `&`. Numeric references (`&#8212;`,
+  `&#x2014;`) and a set of common named ones (`&lt;`, `&quot;`, `&nbsp;`, `&copy;`, `&mdash;` and a
+  few more) are decoded. A reference must end in `;`; one without it, or a name outside that set, is
+  shown as written.
+
 ## A closed room's Discord post closes, even after Discord archived it — (v1.37.3)
 
 ### Fixes

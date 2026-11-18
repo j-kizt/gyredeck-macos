@@ -1,5 +1,23 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A closed room's Discord post closes, even after Discord archived it — (v1.37.3)
+
+### Fixes
+
+- **Closing a room no longer gets stuck when Discord archived its post first.** Discord archives
+  a quiet post on its own. The app could miss that, and then every try to retag the post as
+  closed was refused, so the room's Discord messages stayed held. Now the post is checked fresh,
+  reopened, retagged and archived again. If a step fails, it is tried again, and the room is said
+  to be closed only once its post is archived.
+- **A held room is shown even when nothing is waiting to be sent.** A held room with no row
+  under Sync rooms now has one under Permission → Remote access.
+- **A lost permission names the forum the room's messages were going to,** not one picked
+  since then.
+- **A deleted forum points you to the forum picker,** and the line says how many messages
+  are waiting, when any are.
+- **A held room's cause reads "Reason:"** and no longer blames Discord, since the cause may be
+  on this Mac.
+
 ## A Discord room that stops relaying says why — (v1.37.2)
 
 ### Fixes

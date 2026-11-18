@@ -1,5 +1,14 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A Discord room that stops relaying says why — (v1.37.2)
+
+### Fixes
+
+- **Settings now shows a room that is not reaching Discord, and why.** When Discord refused the
+  bot (for example, it lost access to the forum), the room's messages waited, as they should, but
+  Settings showed nothing: the one report was cleared a moment later. Each held room now has its own
+  row with the current cause, and the row goes away once that room's messages move again.
+
 ## Codex hand-offs that fit how Codex posts — (v1.37.1)
 
 ### Fixes

@@ -95,12 +95,16 @@ const assetRoot = join(distRoot, "assets");
  * the inbox's burst handling) measured 121,724 / 124,801 on CI, +226 / +225 on #331's
  * 121,498 / 124,576; 121,726 and 124,803 leave 2 each. Raised by the owner from Discord on
  * 2026-11-16 ("yes", sync-r5j3 seq 19).
+ *
+ * #199 reopened (a room the relay holds gets its own Settings row) measured 121,765 / 124,841 on
+ * CI, +41 / +40 on #391's 121,724 / 124,801; 121,790 and 124,866 leave 25 each, since a local
+ * build reads ~40 B under CI. Raised by the owner at the terminal on 2026-11-18 ("เอาสิ").
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 121_726,
-  jsTotalGzipBytes: 124_803,
+  jsGzipBytes: 121_790,
+  jsTotalGzipBytes: 124_866,
 };
 
 const walk = async (directory) => {

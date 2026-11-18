@@ -1333,7 +1333,7 @@ test("T8: with read-back refused, a recovery repeats at most one closing line an
     next.c.handle({ t: "disconnect", room: "R", reason: "closed", id: "c1" });
     await flush();
     counts.push(count(fake, (t) => t === "Room closed"));
-    if (run === 0) assert.deepEqual(next.of("error").map((e) => e.code), ["readback_unavailable"]);
+    if (run === 0) assert.deepEqual(next.of("error").map((e) => [e.code, e.held]), [["readback_unavailable", undefined]], "a warning, not a held room");
     assert.deepEqual(next.of("closed").map((e) => e.id), ["c1"]);
     await next.c.close();
   }
@@ -3989,5 +3989,85 @@ test("#375 file names with spaces, marks, repeats, a path or a forged line stay 
   assert.equal(new Set(files.map((f) => f.path)).size, names.length, "a repeated name is its own file");
   assert.ok(files.every((f, i) => f.path.endsWith(`${id}-${i}-${f.name}`)));
   assert.ok(!of("say").at(-1).text.includes("\n"), "no name starts a line of its own");
+  await c.close();
+});
+
+// #199 reopened: the bot lost forum access, and the only word of it was erased by a later `ready`.
+test("a refused permission names the held room, once per stall, while another room goes on", async () => {
+  const { c, fake, clock, of } = await boot();
+  c.handle({ t: "connect", room: "B", members: [], createdAt: 1 });
+  await flush();
+  let refused = true;
+  fake.gate = async (op) => { if (op === "createPost" && refused) throw kindError("permission"); };
+  c.handle({ t: "connect", room: "A", members: [], createdAt: 1 });
+  c.handle(message("A", 1));
+  c.handle(message("B", 1));
+  await flush();
+  await clock.advance(120_000);
+  assert.deepEqual(of("posted").map((p) => p.room), ["B"], "B is not held behind A");
+  const perm = () => of("error").filter((e) => e.code === "missing_permission");
+  assert.deepEqual(perm().map((e) => [e.room, e.held]), [["A", true]], "said once, naming A as held, through every retry");
+  assert.deepEqual(of("unheld"), []);
+  refused = false;
+  await clock.advance(60_000);
+  assert.deepEqual(of("posted").map((p) => `${p.room}${p.seq}`), ["B1", "A1"]);
+  assert.deepEqual(of("unheld").map((u) => u.room), ["A"], "A's hold is said to be over, once");
+  fake.gate = async (op) => { if (op === "send") throw kindError("permission"); };
+  c.handle(message("A", 2));
+  await flush();
+  assert.deepEqual(perm().map((e) => e.room), ["A", "A"], "a new stall after recovery is said again");
+  await c.close();
+});
+
+test("a hold that changes cause is said again, so the app shows the current one; the same cause is said once", async () => {
+  const { c, fake, clock, of } = await boot();
+  const causes = ["permission", "permission", "rate", "permission", "permission"];
+  fake.gate = async (op) => {
+    if (op === "createPost" && causes.length) throw kindError(causes.shift(), { retryAfter: 10 });
+  };
+  c.handle({ t: "connect", room: "A", members: [], createdAt: 1 });
+  await flush();
+  await clock.advance(300_000);
+  assert.equal(causes.length, 0, "premise: every refusal was met");
+  assert.deepEqual(of("error").filter((e) => e.held).map((e) => e.code), ["missing_permission", "rate_limited", "missing_permission"]);
+  assert.deepEqual(of("unheld").map((u) => u.room), ["A"]);
+  await c.close();
+});
+
+test("every wait of a held head shows its own cause: refused, unreachable, gone offline; back online and through, it is unheld", async () => {
+  const { c, fake, clock, of } = await boot();
+  const causes = ["permission", "network", "permission"];
+  fake.gate = async (op) => {
+    if (op === "createPost" && causes.length) throw kindError(causes.shift());
+  };
+  c.handle({ t: "connect", room: "A", members: [], createdAt: 1 });
+  await flush();
+  await clock.advance(300_000);
+  assert.equal(causes.length, 0, "premise: every refusal was met");
+  const held = () => of("error").filter((e) => e.held).map((e) => e.code);
+  assert.deepEqual(held(), ["missing_permission", "discord_down", "missing_permission"]);
+  assert.deepEqual(of("error").filter((e) => e.code === "discord_down" && !e.held).length, 1, "the connector's own word stays");
+  fake.emit("offline");
+  c.handle(message("A", 1));
+  await flush();
+  assert.deepEqual(held().at(-1), "discord_down", "a head waiting for Discord to come back says so, after a different cause");
+  fake.emit("online");
+  await flush();
+  assert.deepEqual(texts(fake), ["m1"]);
+  assert.deepEqual(of("unheld").map((u) => u.room), ["A", "A"]);
+  await c.close();
+});
+
+test("a receipt Discord refuses names its room but holds nothing: no held, no unheld, the queue goes on", async () => {
+  const { c, fake, of, threadId, statePath } = await ownerRoom();
+  const id = fake.ownerSays({ channelId: threadId, authorId: OWNER, text: "hello" });
+  fake.gate = async (op) => { if (op === "react") throw kindError("permission"); };
+  c.handle({ t: "said", discordMessageId: id, ok: true, seq: 3 });
+  await flush();
+  const refused = of("error").filter((e) => e.code === "missing_permission");
+  assert.equal(refused.length, 1, "premise: the receipt was refused");
+  assert.equal(refused[0].held, undefined);
+  assert.deepEqual(saved(statePath).saying, [], "given up, so nothing waits behind it");
+  assert.deepEqual(of("unheld"), []);
   await c.close();
 });

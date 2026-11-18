@@ -384,15 +384,29 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
     out(redact(JSON.stringify(obj)));
   }
 
-  function fail(code, message, room) {
+  function fail(code, message, room, held) {
     const c = ERROR_CODES.has(code) ? code : "internal";
-    send({ t: "error", code: c, message: redact(message ?? c), ...(room ? { room } : {}) });
+    send({ t: "error", code: c, message: redact(message ?? c), ...(room ? { room } : {}), ...(held ? { held: true } : {}) });
   }
 
   function failOnce(key, code, message, room) {
     if (reported.has(key)) return;
     reported.add(key);
     fail(code, message, room);
+  }
+
+  // What holds each room's queue head, as last said. Said again only when it changes, so the
+  // app shows the current cause, never an earlier one; `unheld` once the head gets past (#199).
+  const holds = new Map();
+
+  function hold(w, why, code, message) {
+    if (holds.get(w.code) === why) return;
+    holds.set(w.code, why);
+    fail(code, message, w.code, true);
+  }
+
+  function unhold(w) {
+    if (holds.delete(w.code)) send({ t: "unheld", room: w.code });
   }
 
   // Whether a change to the state has not reached the disk yet. Nothing goes on to Discord
@@ -1247,13 +1261,13 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
         try {
           await attempt(w, w.queue[0]);
         } catch (e) {
-          failOnce(`stuck:${w.code}`, "internal", e?.message, w.code);
+          hold(w, "stuck", "internal", e?.message);
           await wait(backoff);
           backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
           continue;
         }
         backoff = 1000;
-        reported.delete(`stuck:${w.code}`);
+        unhold(w);
         w.queue.shift();
       }
     } finally {
@@ -1265,31 +1279,32 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
   async function attempt(w, item) {
     let backoff = 1000;
     while (!stopped) {
-      if (!online) await wait(Infinity, { untilOnline: true });
+      if (!online) {
+        hold(w, "network", "discord_down", "Cannot reach Discord; messages are queued.");
+        await wait(Infinity, { untilOnline: true });
+      }
       if (stopped) return;
       try {
         await perform(w, item);
-        reported.delete(`rate:${w.code}`);
-        reported.delete(`perm:${w.code}`);
-        reported.delete(`other:${w.code}`);
-        if (item.op === "open") reported.delete(`forum:${w.code}`);
+        unhold(w);
         return;
       } catch (e) {
         if (stopped) return;
         const kind = e?.kind;
         if (kind === "rate") {
-          failOnce(`rate:${w.code}`, "rate_limited", "Discord asked us to slow down.", w.code);
+          hold(w, "rate", "rate_limited", "Discord asked us to slow down.");
           await wait(Math.max(0, Number(e.retryAfter) || 0));
           continue;
         }
         if (kind === "network") {
           failOnce("down", "discord_down", "Cannot reach Discord; messages are queued.");
+          hold(w, "network", "discord_down", "Cannot reach Discord; messages are queued.");
           await wait(backoff, { untilOnline: true });
           backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
           continue;
         }
         if (kind === "permission") {
-          failOnce(`perm:${w.code}`, "missing_permission", "The bot lacks a permission it needs on the forum.", w.code);
+          hold(w, "perm", "missing_permission", "The bot lacks a permission it needs on the forum.");
           await wait(backoff);
           backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
           continue;
@@ -1301,7 +1316,7 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
         if (kind === "missing" && item.op === "open") {
           // Parked, not emptied: the room keeps accepting and its queue waits behind the
           // open until a forum is there — said by a `forum` line, or found on a retry (#199 I19).
-          failOnce(`forum:${w.code}`, "no_forum", "The chosen forum channel no longer exists.", w.code);
+          hold(w, "forum", "no_forum", "The chosen forum channel no longer exists.");
           if (forumId) tagCache.delete(forumId);
           await wait(backoff, { untilForum: true });
           backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
@@ -1319,7 +1334,7 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
         }
         // Anything else may pass — a 5xx, a save that failed — so it is tried again, never
         // dropped, and the room says it is held up.
-        failOnce(`other:${w.code}`, "internal", e?.message, w.code);
+        hold(w, "other", "internal", e?.message);
         await wait(backoff);
         backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
       }

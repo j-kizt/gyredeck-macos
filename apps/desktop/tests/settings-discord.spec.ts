@@ -25,6 +25,7 @@ type Status = {
   leaving?: Record<string, string>;
   dropped?: Record<string, number>;
   droppedLines?: Record<string, string>;
+  roomErrors?: Record<string, { code: string; message: string }>;
   /** The mock's own switch: a leave the bridge refuses. */
   failLeave?: boolean;
   /** The mock's own: what `discord_approvals` answers (#207). */
@@ -593,22 +594,78 @@ test.describe("approval code at 444 × 560", () => {
   });
 });
 
-// #199 reopened: a room held by a refusal is named, with what to do, and goes when it moves.
-test("a room held by a refusal gets its own row, and none show when no room is held", async ({ page }) => {
-  const roomErrors = { "sync-ab12": { code: "missing_permission", message: "The bot lacks a permission it needs on the forum." } };
-  await open(page, { ...blank, configured: true, running: true, ready: true, roomErrors } as Status);
-  const rows = page.locator(".setup-row[data-discord='room-error']");
-  await expect(rows).toHaveCount(1);
-  await expect(rows).toContainText("sync-ab12");
-  await expect(rows).toContainText("missing a permission");
-  await open(page, { ...blank, configured: true, running: true, ready: true } as Status);
-  await expect(rows).toHaveCount(0);
-});
+// #199 reopened: a held room says so on its own row in Sync rooms, only when the owner has to act,
+// with what to do; Permission no longer carries a row for it.
+test.describe("a room Discord refuses", () => {
+  test.use({ viewport: { width: 444, height: 560 } });
+  const held = (page: Page) => page.locator(".setup-account-row", { hasText: "sync-abcd" }).locator("[data-discord='room-held']");
+  const refused = (code: string, message: string, count = 19) =>
+    paired({ connectedRooms: ["sync-abcd"], behind: { "sync-abcd": count }, roomErrors: { "sync-abcd": { code, message } } });
 
-test("a room held by an unnamed cause shows that cause, never that the connector stopped", async ({ page }) => {
-  const roomErrors = { "sync-ab12": { code: "internal", message: "503 Service Unavailable" } };
-  await open(page, { ...blank, configured: true, running: true, ready: true, roomErrors } as Status);
-  const rows = page.locator(".setup-row[data-discord='room-error']");
-  await expect(rows).toContainText("503 Service Unavailable");
-  await expect(rows).not.toContainText("connector stopped");
+  test("a lost permission names the forum and where to fix it, and goes once the room moves", async ({ page }) => {
+    await open(page, refused("missing_permission", "The bot lacks a permission it needs on the forum."), "Connection");
+    await expect(held(page)).toHaveText("Can't post to Discord — give the bot access to forum rooms: Edit Channel → Permissions. 19 messages go out once it can.");
+    await page.getByRole("tab", { name: "Permission" }).click();
+    await expect(page.locator("[data-discord='room-error']")).toHaveCount(0);
+    await expect(row(page, "behind")).toHaveCount(0);
+    await open(page, paired({ connectedRooms: ["sync-abcd"] }), "Connection");
+    await expect(page.locator("[data-discord='room-held']")).toHaveCount(0);
+  });
+
+  test("a lost permission names the forum the held post lives in, not the one picked now", async ({ page }) => {
+    await open(page, paired({ forums: [FORUM, { id: "f2", name: "archive", guildName: "Home" }], connectedRooms: ["sync-abcd"], behind: { "sync-abcd": 1 }, roomErrors: { "sync-abcd": { code: "missing_permission", message: "x", forumId: "f2" } } }), "Connection");
+    await expect(held(page)).toHaveText("Can't post to Discord — give the bot access to forum archive: Edit Channel → Permissions. 1 message goes out once it can.");
+  });
+
+  test("a deleted forum points at the forum picker, with the count, and says below when it sits above it", async ({ page }) => {
+    await open(page, refused("no_forum", "The chosen forum channel no longer exists."), "Connection");
+    await expect(held(page)).toHaveText("Can't post to Discord — 19 messages waiting. Its forum was deleted: pick another under Permission → Remote access.");
+    await open(page, paired({ connectedRooms: [], behind: { "sync-gone": 2 }, roomErrors: { "sync-gone": { code: "no_forum", message: "x" } } }), "Permission");
+    await expect(row(page, "behind").locator(".setup-detail")).toHaveText("Can't post to Discord — 2 messages waiting. Its forum was deleted: pick another below.");
+  });
+
+  test("an unnamed cause is shown as it was said, never as the connector stopping", async ({ page }) => {
+    await open(page, refused("internal", "503 Service Unavailable", 1), "Connection");
+    await expect(held(page)).toHaveText("Can't post to Discord — 1 message waiting. Reason: 503 Service Unavailable");
+  });
+
+  for (const code of ["rate_limited", "discord_down"]) {
+    test(`${code} is ridden out without a word on the row`, async ({ page }) => {
+      await open(page, refused(code, "boom", 3), "Connection");
+      await expect(page.locator(".setup-account-row", { hasText: "sync-abcd" })).toBeVisible();
+      await expect(page.locator("[data-discord='room-held']")).toHaveCount(0);
+      await page.getByRole("tab", { name: "Permission" }).click();
+      await expect(row(page, "behind").locator(".setup-detail")).toHaveText("3 messages waiting for Discord");
+    });
+  }
+
+  test("a held room with no Sync row is said under Remote access, cause and count, once", async ({ page }) => {
+    await open(page, paired({ connectedRooms: [], behind: { "sync-gone": 1 }, roomErrors: { "sync-gone": { code: "internal", message: "Thread is archived" } } }), "Connection");
+    await expect(page.locator("[data-discord='room-held']")).toHaveCount(0);
+    await page.getByRole("tab", { name: "Permission" }).click();
+    await expect(row(page, "behind").locator(".setup-title")).toHaveText("Room sync-gone");
+    await expect(row(page, "behind").locator(".setup-detail")).toHaveText("Can't post to Discord — 1 message waiting. Reason: Thread is archived");
+  });
+
+  test("a held room with nothing owed and no Sync row is still said under Remote access", async ({ page }) => {
+    await open(page, paired({ connectedRooms: [], behind: {}, roomErrors: { "sync-gone": { code: "internal", message: "Thread is archived" } } }), "Permission");
+    await expect(row(page, "behind").locator(".setup-title")).toHaveText("Room sync-gone");
+    await expect(row(page, "behind").locator(".setup-detail")).toHaveText("Can't post to Discord — Reason: Thread is archived");
+  });
+
+  test("the longest line stays inside its row, under the room's name, with nothing spilling sideways", async ({ page }) => {
+    await open(page, refused("internal", "x".repeat(300), 1000), "Connection");
+    const boxes = await held(page).evaluate((line) => {
+      const rowEl = line.closest(".setup-account-row")!;
+      const name = rowEl.querySelector(".setup-account-login")!;
+      const r = (el: Element) => el.getBoundingClientRect();
+      return { line: r(line), row: r(rowEl), name: r(name), wide: rowEl.scrollWidth > rowEl.clientWidth, color: getComputedStyle(line).color };
+    });
+    expect(boxes.line.top).toBeGreaterThanOrEqual(boxes.name.bottom);
+    expect(boxes.line.left).toBeGreaterThanOrEqual(boxes.row.left);
+    expect(boxes.line.right).toBeLessThanOrEqual(boxes.row.right + 0.5);
+    expect(boxes.line.bottom).toBeLessThanOrEqual(boxes.row.bottom + 0.5);
+    expect(boxes.wide).toBe(false);
+    expect(boxes.color).toBe("rgb(240, 163, 94)");
+  });
 });

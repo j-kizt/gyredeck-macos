@@ -384,9 +384,9 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
     out(redact(JSON.stringify(obj)));
   }
 
-  function fail(code, message, room, held) {
+  function fail(code, message, room, held, forum) {
     const c = ERROR_CODES.has(code) ? code : "internal";
-    send({ t: "error", code: c, message: redact(message ?? c), ...(room ? { room } : {}), ...(held ? { held: true } : {}) });
+    send({ t: "error", code: c, message: redact(message ?? c), ...(room ? { room } : {}), ...(held ? { held: true } : {}), ...(forum ? { forumId: forum } : {}) });
   }
 
   function failOnce(key, code, message, room) {
@@ -400,9 +400,13 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
   const holds = new Map();
 
   function hold(w, why, code, message) {
-    if (holds.get(w.code) === why) return;
-    holds.set(w.code, why);
-    fail(code, message, w.code, true);
+    // The forum the held call targeted, taken when it began (`perform`), never the one picked
+    // while it was in flight. Said again when that forum changes.
+    const forum = w.target ?? forumId;
+    const key = `${why}:${forum}`;
+    if (holds.get(w.code) === key) return;
+    holds.set(w.code, key);
+    fail(code, message, w.code, true, forum);
   }
 
   function unhold(w) {
@@ -1342,6 +1346,9 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
   }
 
   async function perform(w, item) {
+    // An open, or a send re-posting a deleted post, makes its post in the forum picked now;
+    // anything else goes to the post where it lives.
+    w.target = item.op === "open" || item.needsPost ? forumId : state.rooms[w.code]?.forumId ?? forumId;
     if (item.op === "open") return openPost(w, item);
     if (item.op === "send") {
       if (item.needsPost) {

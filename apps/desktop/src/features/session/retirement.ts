@@ -51,6 +51,20 @@ export const isRetiredOneShot = (events: GyredeckEvent[], now: Date) => {
   return now.getTime() - Date.parse(latest.timestamp) >= ONE_SHOT_GRACE_MS;
 };
 
+/** The ids Gyredeck itself speaks under in a room (`ROOM_SENDER`, `APP_SENDER`, `OWNER_DISCORD_SENDER` in the bridge). */
+const GYREDECK_VOICES = new Set(["gyredeck-room", "gyredeck", "gyredeck-owner-discord"]);
+
+/**
+ * Whether this conversation is one of Gyredeck's own voices rather than an agent (#322).
+ *
+ * A message to everyone in a room wakes every member, the room's Discord relay
+ * (`discord-<room>`) included, and each wake is a `room_message` under that member's id —
+ * which the list then showed as an idle "Agent" with no workspace.
+ */
+export const isGyredeckVoice = (conversationId: string, events: GyredeckEvent[]) =>
+  GYREDECK_VOICES.has(conversationId) ||
+  events.some((event) => event.type === "room_message" && conversationId === `discord-${event.data.room}`);
+
 /**
  * Whether this session should leave the list now.
  *
@@ -64,4 +78,6 @@ export const shouldRetireFromList = (
   events: GyredeckEvent[],
   now: Date,
   selectedConversationId: string | null,
-) => conversationId !== selectedConversationId && isRetiredOneShot(events, now);
+) =>
+  isGyredeckVoice(conversationId, events) ||
+  (conversationId !== selectedConversationId && isRetiredOneShot(events, now));

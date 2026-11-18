@@ -86,3 +86,28 @@ test("a hook-first turn keeps its row, because nothing ever named its client", (
   const events = session(completeEvent(undefined), closeEvent());
   assert.equal(shouldRetireFromList("hook-first", events, justAfter(events), null), false);
 });
+
+const roomMessage = (conversationId, room) => ({
+  type: "room_message",
+  conversationId,
+  timestamp: AT,
+  data: { room, seq: 3, from: "agent-a", fromLabel: "Claude Code", kind: "tell", preview: "hi" },
+});
+
+test("a room's Discord relay and Gyredeck's own voices are never a session row (#322)", () => {
+  const now = new Date(AT);
+  const relay = session(roomMessage("discord-sync-pz2p", "sync-pz2p"));
+  assert.equal(shouldRetireFromList("discord-sync-pz2p", relay, now, null), true);
+  // Not even while it is the one open: it is not an agent there could be anything to open.
+  assert.equal(shouldRetireFromList("discord-sync-pz2p", relay, now, "discord-sync-pz2p"), true);
+  for (const voice of ["gyredeck-room", "gyredeck", "gyredeck-owner-discord"]) {
+    assert.equal(shouldRetireFromList(voice, session(roomMessage(voice, "sync-pz2p")), now, null), true, voice);
+  }
+});
+
+test("an agent woken by the same room keeps its row (#322)", () => {
+  const now = new Date(AT);
+  assert.equal(shouldRetireFromList("agent-b", session(roomMessage("agent-b", "sync-pz2p")), now, null), false);
+  // A relay of another room is still only a name: the rule is the relay of the room the message came from.
+  assert.equal(shouldRetireFromList("discord-sync-other", session(roomMessage("discord-sync-other", "sync-pz2p")), now, null), false);
+});

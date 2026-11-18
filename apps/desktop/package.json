@@ -1,6 +1,6 @@
 {
   "name": "@gyredeck/desktop",
-  "version": "1.37.3",
+  "version": "1.37.5",
   "private": true,
   "type": "module",
   "scripts": {

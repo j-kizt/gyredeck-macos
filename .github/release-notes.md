@@ -1,5 +1,26 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A room's Discord relay is no longer listed as an agent — (v1.37.5)
+
+### Fixes
+
+- **The session list no longer shows a room's Discord relay as "Gyredeck · Idle · Agent".** A
+  message to everyone in a room could wake the room's Discord relay, and that wake reached the
+  session list under the relay's id, so the relay showed as an idle agent with no workspace. The
+  list now leaves out a room's relay (`discord-<room>`) once a message from that room has reached
+  it, and the ids Gyredeck itself speaks under in a room (`gyredeck-room`, `gyredeck`,
+  `gyredeck-owner-discord`).
+
+## Listening Ports decodes common character references in page titles — (v1.37.4)
+
+### Fixes
+
+- **A page title shows `&` where its markup says `&amp;`.** A title such as `Agents &amp; Humans`
+  was shown with the `&amp;` left in. Listening Ports now decodes, once, numeric references
+  (`&#8212;`, `&#x2014;`) and a set of common named ones (`&amp;`, `&lt;`, `&quot;`, `&nbsp;`,
+  `&copy;`, `&mdash;` and a few more). A reference that does not end in `;`, or a name outside that
+  set, is still shown as written. `&#128;`–`&#159;` are not decoded the way a browser decodes them.
+
 ## A closed room's Discord post closes, even after Discord archived it — (v1.37.3)
 
 ### Fixes

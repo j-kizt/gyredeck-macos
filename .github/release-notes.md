@@ -6,9 +6,10 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
 
 - **The session list no longer shows a room's Discord relay as "Gyredeck · Idle · Agent".** A
   message to everyone in a room could wake the room's Discord relay, and that wake reached the
-  session list under the relay's id, so the relay showed as an idle agent with no workspace. The list now leaves out a room's relay (`discord-<room>`) once a message from
-  that room has reached it, and the ids Gyredeck itself speaks under in a room (`gyredeck-room`,
-  `gyredeck`, `gyredeck-owner-discord`).
+  session list under the relay's id, so the relay showed as an idle agent with no workspace. The
+  list now leaves out a room's relay (`discord-<room>`) once a message from that room has reached
+  it, and the ids Gyredeck itself speaks under in a room (`gyredeck-room`, `gyredeck`,
+  `gyredeck-owner-discord`).
 
 ## Listening Ports decodes common character references in page titles — (v1.37.4)
 

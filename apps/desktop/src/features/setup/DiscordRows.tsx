@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, ExternalLink, KeyRound, MessageSquareDashed, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import type { IUseDiscord } from "./useDiscord";
+import type { IDiscordStatus, IUseDiscord } from "./useDiscord";
 
 /** Lucide carries no brand marks, so the Discord logo is drawn here. */
 export const DiscordLogo = ({ size = 14 }: { size?: number }) => (
@@ -23,6 +23,30 @@ const ERROR_COPY: Record<string, string> = {
 
 const errorCopy = (error: { code: string; message: string }) =>
   ERROR_COPY[error.code] ?? `The Discord connector stopped on an error: ${error.message}`;
+
+/** What a room's row says while Discord refuses its posts (#199): only a cause the owner has to
+ *  act on, with what to do. One Gyredeck rides out by itself (slowed down, Discord unreachable)
+ *  says nothing; an unnamed one is shown as Discord said it, since it may never clear. */
+export const heldLine = (status: IDiscordStatus | null | undefined, room: string, nearPicker = false): string | null => {
+  const error = status?.roomErrors?.[room];
+  if (!error || error.code === "rate_limited" || error.code === "discord_down") return null;
+  const count = status?.behind?.[room] ?? 0;
+  const waiting = count === 1 ? "1 message" : `${count} messages`;
+  const goOut = count === 0 ? "" : count === 1 ? " 1 message goes out once it can." : ` ${count} messages go out once it can.`;
+  if (error.code === "missing_permission") {
+    const forum = status?.forums.find((f) => f.id === (error.forumId ?? status.forumId))?.name;
+    return `Can't post to Discord — give the bot access to ${forum ? `forum ${forum}` : "the forum"}: Edit Channel → Permissions.${goOut}`;
+  }
+  const said = count === 0 ? "" : `${waiting} waiting. `;
+  if (error.code === "no_forum") return `Can't post to Discord — ${said}Its forum was deleted: pick another ${nearPicker ? "below" : "under Permission → Remote access"}.`;
+  return `Can't post to Discord — ${said}Reason: ${error.message}`;
+};
+
+// Rust lists a room under behind only while something is owed, so a hold with nothing owed is added here.
+const heldOrBehind = (status: IDiscordStatus | null | undefined): Record<string, number> => ({
+  ...Object.fromEntries(Object.keys(status?.roomErrors ?? {}).filter((room) => heldLine(status, room)).map((room) => [room, 0])),
+  ...status?.behind,
+});
 
 type ApprovalState = "off" | "settingUp" | "on" | "locked" | "unreadable";
 
@@ -90,7 +114,7 @@ const ApprovalRow = ({ run, busy }: Pick<IUseDiscord, "run" | "busy">) => {
 };
 
 /** Settings → Permission → Remote access (#199): a bot that follows sync rooms into a Discord forum. */
-export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDiscord; canUseNativeControls: boolean }) => {
+export const DiscordRows = ({ discord, canUseNativeControls, syncRooms }: { discord: IUseDiscord; canUseNativeControls: boolean; syncRooms: string[] }) => {
   const { status, failure, busy, run } = discord;
   const [token, setToken] = useState("");
   const [confirming, setConfirming] = useState(false);
@@ -173,16 +197,6 @@ export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDi
           </span>
         </div>
       ))}
-      {Object.entries(status?.roomErrors ?? {}).map(([room, error]) => (
-        // Still being tried, so an unnamed cause is shown as itself, never as the connector stopping (#199).
-        <div className="setup-row" data-discord="room-error" key={`room-error-${room}`}>
-          <span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span>
-          <span className="setup-copy">
-            <span className="setup-title">{`Room ${room} is not reaching Discord`}</span>
-            <span className="setup-detail">{ERROR_COPY[error.code] ?? error.message}</span>
-          </span>
-        </div>
-      ))}
       {Object.entries(status?.leaving ?? {}).map(([room, reason]) => (
         // Shown with or without a token: the member still sits in the room, holding it up.
         <div className="setup-row" data-discord="leaving" key={`leaving-${room}`}>
@@ -194,12 +208,12 @@ export const DiscordRows = ({ discord, canUseNativeControls }: { discord: IUseDi
           <button className="pill-btn" type="button" disabled={busy} onClick={() => void run("discord_retry_leave", { code: room })} data-tauri-drag-region="false">Try leaving again</button>
         </div>
       ))}
-      {(["behind", "dropped"] as const).flatMap((kind) => Object.entries(status?.[kind] ?? {}).map(([room, count]) => (
+      {(["behind", "dropped"] as const).flatMap((kind) => Object.entries(kind === "dropped" ? status?.dropped ?? {} : heldOrBehind(status)).filter(([room]) => kind !== "behind" || !(heldLine(status, room) && syncRooms.includes(room))).map(([room, count]) => (
         <div className="setup-row passive" data-discord={kind} key={`${kind}-${room}`}>
           <span className="status-slot"><MessageSquareDashed className="setup-icon" size={14} strokeWidth={2.3} /></span>
           <span className="setup-copy">
             <span className="setup-title">{`Room ${room}`}</span>
-            <span className="setup-detail">{`${count} message${count === 1 ? "" : "s"} ${kind === "behind" ? "waiting for" : "could not be sent to"} Discord${kind === "dropped" && status?.droppedLines?.[room] ? `: ${status.droppedLines[room]}` : ""}`}</span>
+            <span className="setup-detail">{(kind === "behind" && heldLine(status, room, true)) || `${count} message${count === 1 ? "" : "s"} ${kind === "behind" ? "waiting for" : "could not be sent to"} Discord${kind === "dropped" && status?.droppedLines?.[room] ? `: ${status.droppedLines[room]}` : ""}`}</span>
           </span>
         </div>
       )))}

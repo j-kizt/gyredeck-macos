@@ -11,7 +11,7 @@ import HeavyPatternsRow from "./HeavyPatternsRow";
 import { useHeavyRuns } from "./useHeavyRuns";
 import { codexTrustCopy, hookNeedsAttention, hookSettled, type IHookStatus } from "./hookStatus";
 import { useDiscord, type IUseDiscord } from "./useDiscord";
-import { DiscordLogo, DiscordRows } from "./DiscordRows";
+import { DiscordLogo, DiscordRows, heldLine } from "./DiscordRows";
 import { offerDisconnectAll, showSyncRooms, stillHeld } from "./disconnectAll";
 import { ReleaseNotes } from "./ReleaseNotes";
 
@@ -223,6 +223,9 @@ const GitAccountList = ({ accounts, canUseNativeControls, onSetActive, onRemove 
  * Read-only on purpose — a room is joined and left from a session's own detail panel,
  * where the person can see which session they are acting on.
  */
+// The rooms that get a row under Sync rooms; a held room outside it is said under Remote access instead (#199).
+const openRooms = (rooms: ISetupPanelProps["mailRooms"]) => Object.values(rooms).filter((entry) => entry.members.length > 0);
+
 const SyncRoomList = ({
   rooms,
   canUseNativeControls,
@@ -239,7 +242,7 @@ const SyncRoomList = ({
   // `ready`, not a bot name: a name can be left over from a connector whose token was since refused.
   const discordReady = Boolean(discord.status?.ready && discord.status.forumId && discord.status.owner);
   if (!canUseNativeControls) return null;
-  const open = Object.values(rooms).filter((entry) => entry.members.length > 0);
+  const open = openRooms(rooms);
   // Every room at once lives here, on the Mac, never in Discord: a post acts on its own room
   // only (owner, 2026-11-02). The set is the rooms connected at the press.
   const connected = discord.status?.connectedRooms ?? [];
@@ -276,7 +279,7 @@ const SyncRoomList = ({
       ) : null}
       <div className="setup-account-list">
       {open.map((entry) => (
-        <div className="setup-account-row" key={entry.room} data-closing={closing === entry.room}>
+        <div className="setup-account-row" key={entry.room} data-closing={closing === entry.room} data-held={heldLine(discord.status, entry.room) ? "true" : undefined}>
           <span className="setup-account-icon"><Link2 size={15} strokeWidth={2.3} /></span>
           <span className="setup-account-main">
             <span className="setup-account-login">{entry.room}</span>
@@ -327,6 +330,10 @@ const SyncRoomList = ({
               )}
             </button>
           ) : null}
+          {(() => {
+            const line = heldLine(discord.status, entry.room);
+            return line ? <span className="setup-detail setup-account-held" role="status" data-discord="room-held">{line}</span> : null;
+          })()}
         </div>
         ))}
       </div>
@@ -590,7 +597,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
                   <button className="switch-toggle" type="button" role="switch" aria-checked={allowed === true} data-on={allowed === true} disabled={!canUseNativeControls || syncRepliesBusy || typeof allowed != "boolean"} onClick={() => void onSyncRepliesChange(agent, !allowed)} data-tauri-drag-region="false" aria-label={`${allowed === true ? "Stop letting" : "Let"} ${name} answer rooms without asking`}><span className="switch-thumb" /></button>
                 )}</div>;
               })}
-              <DiscordRows discord={discord} canUseNativeControls={canUseNativeControls} />
+              <DiscordRows discord={discord} canUseNativeControls={canUseNativeControls} syncRooms={openRooms(mailRooms).map((entry) => entry.room)} />
             </>
           ) : null}
 

@@ -145,6 +145,18 @@
   background: rgba(255, 255, 255, 0.04);
 }
 
+/* The cause a room's posts are held on takes the row's full width under its name (#199). */
+.setup-account-row[data-held] {
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+
+.setup-detail.setup-account-held {
+  flex-basis: 100%;
+  min-width: 0;
+  color: #f0a35e;
+}
+
 /* A room on its way out reads as leaving rather than simply present, so the wait is
    visible in the row and not only in the button. */
 .setup-account-row[data-closing="true"] {

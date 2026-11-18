@@ -1264,7 +1264,7 @@ fn connect_is_refused_until_the_current_child_is_ready_and_a_refused_token_undoe
     );
     assert!(f.state.status().ready, "premise: a good token is ready");
     // The token changes and the new one is refused.
-    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "bad_token".into(), message: "refused".into(), room: None, held: false });
+    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "bad_token".into(), message: "refused".into(), room: None, held: false, forum_id: None });
     let status = f.state.status();
     assert!(!status.ready);
     assert_eq!((status.bot, status.invite_url), (None, None), "nothing of the old child is left showing");
@@ -1600,7 +1600,7 @@ fn the_owner_line_names_the_round_it_accepts() {
 fn a_storage_refusal_stays_shown_through_ready() {
     let f = fixture("storage-sticky", Some(TOKEN));
     let _buffer = f.attach_buffer();
-    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "storage_blocked".into(), message: "The Discord state file could not be read".into(), room: None, held: false });
+    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "storage_blocked".into(), message: "The Discord state file could not be read".into(), room: None, held: false, forum_id: None });
     on_child_event(
         &f.state.hub,
         f.owners.as_ref(),
@@ -1617,7 +1617,8 @@ fn a_storage_refusal_stays_shown_through_ready() {
 fn a_room_held_by_a_refusal_stays_shown_through_ready_until_it_is_unheld() {
     let f = fixture("room-error-sticky", Some(TOKEN));
     let _buffer = f.attach_buffer();
-    let held = FromChild::Error { code: "missing_permission".into(), message: "The bot lacks a permission it needs on the forum.".into(), room: Some(ROOM.into()), held: true };
+    // As the child writes it: the forum is the held post's, carried to the app as `forumId`.
+    let held: FromChild = serde_json::from_str(&format!(r#"{{"t":"error","code":"missing_permission","message":"The bot lacks a permission it needs on the forum.","room":"{ROOM}","held":true,"forumId":"F2"}}"#)).unwrap();
     on_child_event(&f.state.hub, f.owners.as_ref(), held);
     on_child_event(
         &f.state.hub,
@@ -1627,6 +1628,7 @@ fn a_room_held_by_a_refusal_stays_shown_through_ready_until_it_is_unheld() {
     let status = f.state.status();
     assert_eq!(status.room_errors.get(ROOM).map(|error| error.code.as_str()), Some("missing_permission"));
     assert!(status.error.is_none(), "a room's refusal is not the connector's error");
+    assert_eq!(serde_json::to_value(&status.room_errors[ROOM]).unwrap()["forumId"], "F2");
     on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Unheld { room: "sync-other".into() });
     assert!(f.state.status().room_errors.contains_key(ROOM), "another room passing says nothing about this one");
     on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Unheld { room: ROOM.into() });
@@ -1639,7 +1641,7 @@ fn a_room_held_by_a_refusal_stays_shown_through_ready_until_it_is_unheld() {
 fn an_error_about_a_room_that_holds_nothing_is_not_a_held_room() {
     let f = fixture("room-error-not-held", Some(TOKEN));
     let _buffer = f.attach_buffer();
-    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "missing_permission".into(), message: "Could not answer in Discord".into(), room: Some(ROOM.into()), held: false });
+    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "missing_permission".into(), message: "Could not answer in Discord".into(), room: Some(ROOM.into()), held: false, forum_id: None });
     let status = f.state.status();
     assert!(status.room_errors.is_empty());
     assert_eq!(status.error.map(|error| error.code).as_deref(), Some("missing_permission"));
@@ -1651,8 +1653,8 @@ fn an_error_about_a_room_that_holds_nothing_is_not_a_held_room() {
 fn a_fatal_error_is_the_connectors_and_forgets_the_held_rooms() {
     let f = fixture("room-error-fatal", Some(TOKEN));
     let _buffer = f.attach_buffer();
-    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "missing_permission".into(), message: "held".into(), room: Some("sync-other".into()), held: true });
-    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "bad_token".into(), message: "refused".into(), room: Some(ROOM.into()), held: true });
+    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "missing_permission".into(), message: "held".into(), room: Some("sync-other".into()), held: true, forum_id: None });
+    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "bad_token".into(), message: "refused".into(), room: Some(ROOM.into()), held: true, forum_id: None });
     let status = f.state.status();
     assert_eq!(status.error.map(|error| error.code).as_deref(), Some("bad_token"));
     assert!(status.room_errors.is_empty());
@@ -2215,8 +2217,8 @@ fn every_new_wire_field_reads_and_writes_as_specified() {
     assert!(matches!(unnamed, FromChild::Closed { id: None, .. }));
     let error: FromChild = serde_json::from_str(r#"{"t":"error","code":"readback_unavailable","message":"no history"}"#).unwrap();
     assert!(matches!(error, FromChild::Error { ref code, held: false, .. } if code == "readback_unavailable"));
-    let held: FromChild = serde_json::from_str(r#"{"t":"error","code":"missing_permission","message":"m","room":"sync-ab23","held":true}"#).unwrap();
-    assert!(matches!(held, FromChild::Error { room: Some(ref room), held: true, .. } if room == ROOM));
+    let held: FromChild = serde_json::from_str(r#"{"t":"error","code":"missing_permission","message":"m","room":"sync-ab23","held":true,"forumId":"F2"}"#).unwrap();
+    assert!(matches!(held, FromChild::Error { room: Some(ref room), held: true, forum_id: Some(ref forum), .. } if room == ROOM && forum == "F2"));
     let unheld: FromChild = serde_json::from_str(r#"{"t":"unheld","room":"sync-ab23"}"#).unwrap();
     assert!(matches!(unheld, FromChild::Unheld { ref room } if room == ROOM));
     let dropped: WireDropped = serde_json::from_str(r#"{"droppedThroughSeq":5}"#).unwrap();

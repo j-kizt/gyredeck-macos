@@ -332,14 +332,21 @@ export function createDiscordJs({ makeClient = (options) => new Client(options) 
       }),
 
     // An archived thread accepts only an unarchive, so unarchive before retagging and
-    // retag before archiving.
+    // retag before archiving. Discord archives an idle post on its own, so a close can find
+    // it archived already and must still open it to retag (#199). Forced: a cached flag can
+    // miss that archive, and a retag sent on it is refused on every retry. A retag alone
+    // leaves the post open: its only callers act on a live thread, which a message opens anyway.
     editThread: (id, { archived, appliedTags }) =>
       guarded(async () => {
-        const t = await client.channels.fetch(id);
+        const t = await client.channels.fetch(id, { force: true });
         if (!t) throw kindError("missing", "thread gone");
-        if (!archived && t.archived) await t.setArchived(false);
+        let open = !t.archived;
+        if (!open && (appliedTags || !archived)) {
+          await t.setArchived(false);
+          open = true;
+        }
         if (appliedTags) await t.setAppliedTags(appliedTags);
-        if (archived && !t.archived) await t.setArchived(true);
+        if (archived && open) await t.setArchived(true);
       }),
 
     deleteThread: (id) => guarded(() => client.rest.delete(Routes.channel(id))),

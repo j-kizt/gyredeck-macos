@@ -353,6 +353,88 @@ test("forum tags open/closed are created when missing, and left alone when prese
   assert.equal(forum.setCalls.length, 1, "present tags are not re-created");
 });
 
+test("closing a post Discord already archived opens it to retag, then archives it again (#199)", async () => {
+  const calls = [];
+  const thread = {
+    id: "F1",
+    archived: true,
+    async setArchived(v) { calls.push(v ? "archive" : "unarchive"); thread.archived = v; return thread; },
+    async setAppliedTags(tags) {
+      if (thread.archived) throw Object.assign(new Error("Thread is archived"), { code: 50083, status: 400 });
+      calls.push(`tags:${tags}`);
+      return thread;
+    },
+  };
+  const { discord } = await adapterWith(thread);
+  await discord.editThread("F1", { archived: true, appliedTags: ["closed"] });
+  assert.deepEqual(calls, ["unarchive", "tags:closed", "archive"]);
+  assert.equal(thread.archived, true);
+  calls.length = 0;
+  await discord.editThread("F1", { archived: true });
+  assert.deepEqual(calls, [], "archived with nothing to retag is left alone");
+});
+
+test("a close reads the thread from Discord, not a cache that missed its archive (#199)", async () => {
+  const calls = [];
+  const thread = {
+    id: "F1",
+    archived: false,
+    refresh() { thread.archived = true; },
+    async setArchived(v) { calls.push(v ? "archive" : "unarchive"); thread.archived = v; return thread; },
+    async setAppliedTags(tags) {
+      if (thread.archived) throw Object.assign(new Error("Thread is archived"), { code: 50083, status: 400 });
+      calls.push(`tags:${tags}`);
+      return thread;
+    },
+  };
+  const { discord } = await adapterWith(thread);
+  await discord.editThread("F1", { archived: true, appliedTags: ["closed"] });
+  assert.deepEqual(calls, ["unarchive", "tags:closed", "archive"]);
+});
+
+test("a retag alone leaves an archived post open; a close archives it again (#199)", async () => {
+  const calls = [];
+  const thread = {
+    id: "F1",
+    archived: true,
+    async setArchived(v) { calls.push(v ? "archive" : "unarchive"); thread.archived = v; return thread; },
+    async setAppliedTags(tags) { calls.push(`tags:${tags}`); return thread; },
+  };
+  const { discord } = await adapterWith(thread);
+  await discord.editThread("F1", { appliedTags: ["open"] });
+  assert.deepEqual(calls, ["unarchive", "tags:open"]);
+  assert.equal(thread.archived, false, "its callers act on a live thread, which a message opens anyway");
+  thread.archived = true;
+  calls.length = 0;
+  await discord.editThread("F1", { archived: true, appliedTags: ["closed"] });
+  assert.deepEqual(calls, ["unarchive", "tags:closed", "archive"]);
+  assert.equal(thread.archived, true);
+});
+
+test("a close on an archived post that fails between steps ends archived on its retry (#199)", async () => {
+  for (const cut of ["tags", "archive"]) {
+    const calls = [];
+    let refuse = 1;
+    const refused = (step) => {
+      if (step !== cut || refuse-- <= 0) return;
+      calls.push(`${step}:refused`);
+      throw Object.assign(new Error("Internal Server Error"), { status: 500 });
+    };
+    const thread = {
+      id: "F1",
+      archived: true,
+      async setArchived(v) { if (v) refused("archive"); calls.push(v ? "archive" : "unarchive"); thread.archived = v; return thread; },
+      async setAppliedTags(tags) { refused("tags"); calls.push(`tags:${tags}`); return thread; },
+    };
+    const { discord } = await adapterWith(thread);
+    await assert.rejects(discord.editThread("F1", { archived: true, appliedTags: ["closed"] }), cut);
+    assert.equal(thread.archived, false, `${cut}: premise, left open by the failure`);
+    await discord.editThread("F1", { archived: true, appliedTags: ["closed"] });
+    assert.equal(thread.archived, true, cut);
+    assert.equal(calls.at(-1), "archive", cut);
+  }
+});
+
 test("pairing accepts only the exact code, in a DM, within 10 minutes, once", async () => {
   const { c, fake, clock, of } = await boot();
   const dm = (text, userId = "U1") => fake.emit("dm", { userId, username: `user-${userId}`, text });
@@ -528,7 +610,7 @@ async function adapterWith(forum, { login = "ready" } = {}) {
       options = opts;
       client = new EventEmitter();
       client.user = { id: "B1", username: "gyre-bot" };
-      client.channels = { fetch: async (id) => (id === forum.id ? forum : null) };
+      client.channels = { fetch: async (id, opts) => (id === forum.id ? (opts?.force && forum.refresh?.(), forum) : null) };
       client.guilds = { cache: new Map() };
       client.destroy = async () => {};
       client.login = async () => {
@@ -1257,6 +1339,23 @@ test("postOnce, every site: a post Discord took whose reply was lost is read bac
     assert.ok(b.fake.log.some((e) => e.op === "fetchMessages"), `${name}: it was read back`);
     await b.c.close();
   }
+});
+
+test("a close whose archive Discord refuses once is said closed only after its retry archives it (#199)", async () => {
+  const { c, fake, clock, of } = await boot();
+  c.handle({ t: "connect", room: "R", members: [], createdAt: 1 });
+  await flush();
+  let refuse = 1;
+  let tries = 0;
+  fake.gate = async (op) => { if (op === "editThread" && tries++ < refuse) throw kindError("other"); };
+  c.handle({ t: "disconnect", room: "R", reason: "closed", id: "c1" });
+  await flush();
+  assert.deepEqual(of("closed"), [], "nothing said while the archive is refused");
+  await clock.advance(60_000);
+  assert.deepEqual(of("closed").map((e) => e.id), ["c1"]);
+  assert.equal(tries, 2, "premise: refused once, then tried again");
+  assert.ok(fake.log.some((e) => e.op === "editThread" && e.archived), "the retry archived it");
+  await c.close();
 });
 
 test("T8 (ported from the r7 audit): a closing line taken before the archive failed is not posted again by the next child", async () => {
@@ -4012,10 +4111,73 @@ test("a refused permission names the held room, once per stall, while another ro
   await clock.advance(60_000);
   assert.deepEqual(of("posted").map((p) => `${p.room}${p.seq}`), ["B1", "A1"]);
   assert.deepEqual(of("unheld").map((u) => u.room), ["A"], "A's hold is said to be over, once");
+  c.handle({ t: "forum", forumId: "F2" });
   fake.gate = async (op) => { if (op === "send") throw kindError("permission"); };
   c.handle(message("A", 2));
   await flush();
   assert.deepEqual(perm().map((e) => e.room), ["A", "A"], "a new stall after recovery is said again");
+  assert.deepEqual(perm().map((e) => e.forumId), ["F1", "F1"], "the forum named is the post's, not the one picked since");
+  await c.close();
+});
+
+// #199 r3: an open after the forum was changed makes its post in the new forum, so a refusal
+// there names the new forum, and a forum picked again while held is said again.
+test("a refused open into a newly picked forum names that forum, not the room's old one", async () => {
+  const { c, fake, clock, of } = await boot();
+  c.handle({ t: "connect", room: "A", members: [], createdAt: 1 });
+  await flush();
+  c.handle({ t: "disconnect", room: "A", reason: "closed" });
+  await flush();
+  c.handle({ t: "forum", forumId: "F2" });
+  fake.gate = async (op) => { if (op === "createPost") throw kindError("permission"); };
+  c.handle({ t: "connect", room: "A", members: [], createdAt: 1 });
+  await flush();
+  await clock.advance(60_000);
+  const perm = () => of("error").filter((e) => e.code === "missing_permission");
+  assert.deepEqual(perm().map((e) => [e.room, e.forumId]), [["A", "F2"]]);
+  c.handle({ t: "forum", forumId: "F3" });
+  await clock.advance(120_000);
+  assert.deepEqual(perm().map((e) => e.forumId), ["F2", "F3"], "said again for the forum picked since");
+  await c.close();
+});
+
+test("a refusal that lands after another forum was picked names the forum the call went to", async () => {
+  const { c, fake, clock, of } = await boot();
+  c.handle({ t: "connect", room: "A", members: [], createdAt: 1 });
+  await flush();
+  c.handle({ t: "disconnect", room: "A", reason: "closed" });
+  await flush();
+  c.handle({ t: "forum", forumId: "F2" });
+  const inFlight = deferred();
+  let first = true;
+  fake.gate = async (op) => {
+    if (op !== "createPost") return;
+    if (first) { first = false; await inFlight.promise; }
+    throw kindError("permission");
+  };
+  c.handle({ t: "connect", room: "A", members: [], createdAt: 1 });
+  await flush();
+  c.handle({ t: "forum", forumId: "F3" });
+  inFlight.resolve();
+  await flush();
+  const perm = () => of("error").filter((e) => e.code === "missing_permission");
+  assert.deepEqual(perm().map((e) => e.forumId), ["F2"], "the refused call was made in F2");
+  await clock.advance(120_000);
+  assert.deepEqual(perm().map((e) => e.forumId), ["F2", "F3"], "the retry goes to F3, and says so");
+  await c.close();
+});
+
+test("a send whose post was deleted is refused in the forum it is re-posted to, and names that forum", async () => {
+  const { c, fake, clock, of } = await boot();
+  c.handle({ t: "connect", room: "A", members: [], createdAt: 1 });
+  await flush();
+  c.handle({ t: "forum", forumId: "F2" });
+  fake.threads.clear();
+  fake.gate = async (op) => { if (op === "createPost") throw kindError("permission"); };
+  c.handle(message("A", 1));
+  await flush();
+  await clock.advance(60_000);
+  assert.deepEqual(of("error").filter((e) => e.code === "missing_permission").map((e) => e.forumId), ["F2"]);
   await c.close();
 });
 

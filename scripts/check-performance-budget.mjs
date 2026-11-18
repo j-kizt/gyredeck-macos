@@ -99,12 +99,17 @@ const assetRoot = join(distRoot, "assets");
  * #199 reopened (a room the relay holds gets its own Settings row) measured 121,765 / 124,841 on
  * CI, +41 / +40 on #391's 121,724 / 124,801; 121,790 and 124,866 leave 25 each, since a local
  * build reads ~40 B under CI. Raised by the owner at the terminal on 2026-11-18 ("เอาสิ").
+ *
+ * #199 reopened again (the held cause moves onto the room's own row, with what to do for each
+ * cause, a closed room's hold kept under Remote access, and the held post's own forum) measured
+ * 122,130 JS / 125,207 total locally, +405 on main's 121,725; a local build reads ~40 B under CI,
+ * so 122,240 and 125,320 leave ~70 over the CI figure. Raised by the owner at the terminal on 2026-11-18 ("ขยับเพดานได้").
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 121_790,
-  jsTotalGzipBytes: 124_866,
+  jsGzipBytes: 122_240,
+  jsTotalGzipBytes: 125_320,
 };
 
 const walk = async (directory) => {

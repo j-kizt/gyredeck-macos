@@ -457,6 +457,9 @@ enum FromChild {
         room: Option<String>,
         #[serde(default)]
         held: bool,
+        /// The forum a held room's post lives in.
+        #[serde(default, rename = "forumId")]
+        forum_id: Option<String>,
     },
     /// What held this room's queue head has passed.
     Unheld { room: String },
@@ -624,9 +627,12 @@ pub(crate) struct Owner {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct DiscordError {
     pub code: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forum_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1128,7 +1134,7 @@ impl Hub {
 
     fn journal_blocked(&mut self, room: &str, error: impl fmt::Display) -> String {
         let message = format!("The relay journal for {room} could not be written ({error}), so Discord stops taking its lines in until it can");
-        self.journal_errors.insert(room.to_string(), DiscordError { code: JOURNAL_BLOCKED.to_string(), message: message.clone() });
+        self.journal_errors.insert(room.to_string(), DiscordError { code: JOURNAL_BLOCKED.to_string(), message: message.clone(), forum_id: None });
         message
     }
 
@@ -1473,7 +1479,7 @@ impl Hub {
             }
         };
         for (key, message) in shown {
-            self.journal_errors.insert(key, DiscordError { code: LOSS_UNRECORDED.to_string(), message });
+            self.journal_errors.insert(key, DiscordError { code: LOSS_UNRECORDED.to_string(), message, forum_id: None });
         }
     }
 
@@ -1795,6 +1801,7 @@ impl Hub {
             DiscordError {
                 code: JOURNAL_CORRUPT.to_string(),
                 message: format!("The relay journal {} is not replayed: {}{at}. It is left as it is", corrupt.name, corrupt.why),
+                forum_id: None,
             },
         );
     }
@@ -2413,7 +2420,7 @@ impl DiscordState {
             }
             Err(error) => {
                 let why = format!("{} is not a private directory this app can use ({error})", journal_path.display());
-                hub.journal_errors.insert(String::new(), DiscordError { code: JOURNAL_BLOCKED.to_string(), message: why.clone() });
+                hub.journal_errors.insert(String::new(), DiscordError { code: JOURNAL_BLOCKED.to_string(), message: why.clone(), forum_id: None });
                 hub.journal_down = Some(why);
             }
         }
@@ -3329,7 +3336,7 @@ fn supervise(launch: Launch, core: Arc<Core>, stop_rx: mpsc::Receiver<()>, log: 
                     let mut fields = serde_json::Map::new();
                     fields.insert("error".to_string(), serde_json::Value::String(error.clone()));
                     log.record("discord_spawn_failed", fields);
-                    lock(&hub).error = Some(DiscordError { code: "internal".to_string(), message: error });
+                    lock(&hub).error = Some(DiscordError { code: "internal".to_string(), message: error, forum_id: None });
                     backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
                     next_start = Instant::now() + backoff;
                 }
@@ -3520,6 +3527,7 @@ fn on_child_event_from(hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64, ev
                 hub.error = Some(DiscordError {
                     code: "internal".to_string(),
                     message: format!("Pairing could not be saved, so it did not happen: {error}"),
+                    forum_id: None,
                 });
                 return;
             }
@@ -3528,7 +3536,7 @@ fn on_child_event_from(hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64, ev
             hub.pairing = None;
             hub.send(&ToChild::Owner { owner_id: Some(owner_id), round });
         }
-        FromChild::Error { code, message, room, held } => {
+        FromChild::Error { code, message, room, held, forum_id } => {
             // Five wrong codes: this pairing is over, and the owner starts another.
             if code == "pairing_locked" {
                 hub.pairing = None;
@@ -3540,9 +3548,9 @@ fn on_child_event_from(hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64, ev
             // comes in between (#199 reopened).
             match room.filter(|_| held && !FATAL_ERRORS.contains(&code.as_str())) {
                 Some(room) => {
-                    hub.room_errors.insert(room, DiscordError { code, message });
+                    hub.room_errors.insert(room, DiscordError { code, message, forum_id });
                 }
-                None => hub.error = Some(DiscordError { code, message }),
+                None => hub.error = Some(DiscordError { code, message, forum_id: None }),
             }
         }
         FromChild::Unheld { room } => {

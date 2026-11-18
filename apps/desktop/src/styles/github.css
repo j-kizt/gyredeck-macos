@@ -84,6 +84,7 @@
   height: 24px;
   border: 1px solid var(--hair);
   border-radius: 7px;
+  padding: 0;
   background: var(--fill);
   color: var(--text-2);
   cursor: pointer;
@@ -289,6 +290,23 @@
   white-space: normal;
 }
 
+.gh-card-line svg,
+.gh-card-line .gh-dot {
+  flex-shrink: 0;
+}
+
+.gh-card-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gh-signin-error {
+  justify-content: center;
+  text-align: center;
+}
+
 .gh-card-line .muted,
 .gh-account-note.muted,
 .muted {
@@ -334,6 +352,18 @@
   font-size: 11.5px;
 }
 
+.gh-device > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gh-device svg,
+.gh-device .gh-icon-btn {
+  flex-shrink: 0;
+}
+
 .gh-code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
@@ -344,6 +374,8 @@
   border-radius: 6px;
   padding: 3px 8px;
   cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .gh-device-panel {
@@ -358,6 +390,7 @@
 
 .gh-device-actions {
   display: flex;
+  justify-content: flex-end;
   gap: 8px;
 }
 

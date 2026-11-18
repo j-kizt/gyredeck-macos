@@ -363,15 +363,16 @@ fn api_get(
         .send()
         .map_err(|e| format!("{} request failed: {e}", provider.label()))?;
     if response.status().as_u16() == 401 {
-        return Err(format!(
-            "{} token expired or invalid — re-add the account",
-            provider.label()
-        ));
+        return Err(token_rejected(provider));
     }
     if !response.status().is_success() {
         return Err(format!("{} API returned {}", provider.label(), response.status()));
     }
     Ok(response)
+}
+
+fn token_rejected(provider: Provider) -> String {
+    format!("{} token expired or invalid — re-add the account", provider.label())
 }
 
 fn api_get_json(
@@ -572,18 +573,29 @@ fn open_pulls(
     provider: Provider,
     token: &str,
     repo: &str,
-) -> (usize, Vec<GithubPull>) {
+) -> Result<(usize, Vec<GithubPull>), String> {
     let path = match provider {
         Provider::Github => format!("repos/{repo}/pulls?state=open&per_page=100"),
         Provider::Gitlab => {
             format!("projects/{}/merge_requests?state=opened&per_page=100", gitlab_project_id(repo))
         }
     };
-    let Ok(value) = api_get_json(client, provider, token, &path) else {
-        return (0, Vec::new());
+    pulls_or_rejected(api_get_json(client, provider, token, &path), provider)
+}
+
+/// A rejected token is the one failure said on the card (#379): read as "no PRs", it told the
+/// person their repos were empty. Any other failure still reads as none, as before.
+fn pulls_or_rejected(
+    fetched: Result<Value, String>,
+    provider: Provider,
+) -> Result<(usize, Vec<GithubPull>), String> {
+    let value = match fetched {
+        Ok(value) => value,
+        Err(error) if error == token_rejected(provider) => return Err(error),
+        Err(_) => return Ok((0, Vec::new())),
     };
     let Some(array) = value.as_array() else {
-        return (0, Vec::new());
+        return Ok((0, Vec::new()));
     };
     let count = array.len();
     let pulls = array
@@ -614,7 +626,7 @@ fn open_pulls(
             },
         })
         .collect();
-    (count, pulls)
+    Ok((count, pulls))
 }
 
 fn repo_status_blocking(
@@ -640,7 +652,20 @@ fn repo_status_blocking(
         return Err("Invalid repository (expected owner/name)".to_string());
     }
     let token = token.as_str();
-    let (open_pr_count, pulls) = open_pulls(&client, provider, token, repo);
+    // Asked first, so a rejected token is said before two more requests are refused the same way.
+    let (open_pr_count, pulls) = match open_pulls(&client, provider, token, repo) {
+        Ok(found) => found,
+        Err(error) => {
+            return Ok(GithubRepoStatus {
+                repo: repo.to_string(),
+                commit: None,
+                runs: Vec::new(),
+                open_pr_count: 0,
+                pulls: Vec::new(),
+                error: Some(error),
+            });
+        }
+    };
     Ok(GithubRepoStatus {
         repo: repo.to_string(),
         commit: latest_commit(&client, provider, token, repo),
@@ -1604,4 +1629,42 @@ pub async fn github_credential_helper_disable() -> Result<CredentialHelperStatus
     tauri::async_runtime::spawn_blocking(credential_helper_disable_blocking)
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rejected_token_is_said_and_any_other_failure_still_reads_as_no_pulls() {
+        for provider in [Provider::Github, Provider::Gitlab] {
+            assert_eq!(
+                pulls_or_rejected(Err(token_rejected(provider)), provider).err(),
+                Some(token_rejected(provider))
+            );
+            let other = pulls_or_rejected(Err(format!("{} API returned 404 Not Found", provider.label())), provider);
+            assert_eq!(other.map(|(count, pulls)| (count, pulls.len())), Ok((0, 0)));
+        }
+        let found = pulls_or_rejected(Ok(serde_json::json!([{ "number": 7, "title": "t", "user": { "login": "a" } }])), Provider::Github);
+        assert_eq!(found.map(|(count, pulls)| (count, pulls[0].number)), Ok((1, 7)));
+    }
+
+    #[test]
+    fn a_401_from_the_api_is_the_rejected_token_error() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 2048];
+            let _ = stream.read(&mut buffer);
+            stream
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let client = reqwest::blocking::Client::new();
+        let result = api_get_json(&client, Provider::Github, "token", &format!("http://{address}/repos/a/b/pulls"));
+        server.join().unwrap();
+        assert_eq!(result.err(), Some(token_rejected(Provider::Github)));
+    }
 }

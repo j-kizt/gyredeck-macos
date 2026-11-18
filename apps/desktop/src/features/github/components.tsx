@@ -3,6 +3,7 @@ import { Check, ChevronsUpDown, Copy, Download, GitBranch, GitCommit, GitPullReq
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import type { GitProvider, GithubRepoState, IGithubRun } from "./types";
 import type { IGithubMonitor } from "./useGithubMonitor";
+import { relativeTime } from "./repoState";
 import { Tooltip } from "../../Tooltip";
 
 const PROVIDERS: { id: GitProvider; label: string }[] = [
@@ -37,18 +38,6 @@ export const ProviderIcon = ({ provider, size = 13 }: { provider: GitProvider; s
     )}
   </svg>
 );
-
-const relativeTime = (iso: string): string => {
-  const then = Date.parse(iso);
-  if (Number.isNaN(then)) return "";
-  const seconds = Math.max(0, Math.round((Date.now() - then) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.round(hours / 24)}d ago`;
-};
 
 const runState = (run: IGithubRun): { symbol: string; tone: string; label: string } => {
   if (run.status !== "completed") return { symbol: "●", tone: "running", label: run.status.replace(/_/g, " ") || "running" };
@@ -119,7 +108,7 @@ const RepoCard = ({ repo, provider, state, onRemove, dragging, onDragStart, onDr
           </button>
         </div>
         {state?.status === "loading" && !data ? (
-          <div className="gh-card-line muted">Loading…</div>
+          <div className="gh-card-line muted"><span className="gh-card-text">Loading…</span></div>
         ) : (
           <>
             {run ? (
@@ -130,38 +119,44 @@ const RepoCard = ({ repo, provider, state, onRemove, dragging, onDragStart, onDr
                     layouts here and being wrong somewhere nobody checks. */}
                 {latestRun?.url ? (
                   <button className="gh-card-line gh-link" type="button" onClick={() => latestRun.url && openExternal(latestRun.url)}>
-                    <span className={`gh-dot ${run.tone}`}>{run.symbol}</span> CI {run.label}
-                    {latestRun.name ? <span className="muted"> · {latestRun.name}</span> : null}
+                    <span className={`gh-dot ${run.tone}`}>{run.symbol}</span>
+                    <span className="gh-card-text">CI {run.label}{latestRun.name ? <span className="muted"> · {latestRun.name}</span> : null}</span>
                   </button>
                 ) : (
                   <div className="gh-card-line">
-                    <span className={`gh-dot ${run.tone}`}>{run.symbol}</span> CI {run.label}
-                    {latestRun?.name ? <span className="muted"> · {latestRun.name}</span> : null}
+                    <span className={`gh-dot ${run.tone}`}>{run.symbol}</span>
+                    <span className="gh-card-text">CI {run.label}{latestRun?.name ? <span className="muted"> · {latestRun.name}</span> : null}</span>
                   </div>
                 )}
               </Tooltip>
             ) : data ? (
-              <div className="gh-card-line muted">No workflow runs</div>
+              <div className="gh-card-line muted"><span className="gh-card-text">No workflow runs</span></div>
             ) : null}
             {data ? (
               <Tooltip label={data.pulls[0]?.title ?? `${data.open_pr_count} open ${noun}${data.open_pr_count === 1 ? "" : "s"}`}>
                 <button className="gh-card-line gh-link" type="button" onClick={() => openExternal(requestsUrl(provider, repo))}>
-                  <GitPullRequest size={12} strokeWidth={2.3} /> {data.open_pr_count} open {noun}{data.open_pr_count === 1 ? "" : "s"}
-                  {data.pulls[0] ? <span className="muted"> · {data.pulls[0].title}</span> : null}
+                  <GitPullRequest size={12} strokeWidth={2.3} />
+                  <span className="gh-card-text">
+                    {data.open_pr_count} open {noun}{data.open_pr_count === 1 ? "" : "s"}
+                    {data.pulls[0] ? <span className="muted"> · {data.pulls[0].title}</span> : null}
+                  </span>
                 </button>
               </Tooltip>
             ) : null}
             {data?.commit ? (
               <Tooltip label={data.commit.message}>
                 <button className="gh-card-line gh-link" type="button" onClick={() => data.commit && openExternal(commitUrl(provider, repo, data.commit.sha))}>
-                  <GitCommit size={12} strokeWidth={2.3} /> {data.commit.sha} {data.commit.message}
-                  <span className="muted"> · {relativeTime(data.commit.committed_at)}</span>
+                  <GitCommit size={12} strokeWidth={2.3} />
+                  <span className="gh-card-text">
+                    {data.commit.sha} {data.commit.message}
+                    <span className="muted"> · {relativeTime(data.commit.committed_at)}</span>
+                  </span>
                 </button>
               </Tooltip>
             ) : data ? (
-              <div className="gh-card-line muted">No commits yet</div>
+              <div className="gh-card-line muted"><span className="gh-card-text">No commits yet</span></div>
             ) : null}
-            {state?.status === "error" ? <div className="gh-card-line error">{state.message}</div> : null}
+            {state?.status === "error" ? <div className="gh-card-line error" title={state.message}><span className="gh-card-text">{state.message}</span></div> : null}
           </>
         )}
       </div>
@@ -243,10 +238,10 @@ const AddRepo = ({ tracked, onAdd, loadRepos }: IAddRepoProps) => {
             onChange={(event) => setFilter(event.target.value)}
             autoFocus
           />
-          {loading ? <div className="gh-card-line muted">Loading repos…</div> : null}
+          {loading ? <div className="gh-card-line muted"><span className="gh-card-text">Loading repos…</span></div> : null}
           {error ? <div className="gh-card-line error">{error}</div> : null}
           {!loading && !error && candidates.length === 0 ? (
-            <div className="gh-card-line muted">No matching repos</div>
+            <div className="gh-card-line muted"><span className="gh-card-text">No matching repos</span></div>
           ) : null}
           <div className="gh-picker-list">
             {candidates.map((repo) => (
@@ -284,7 +279,7 @@ const DeviceFlowPrompt = ({ monitor }: { monitor: IGithubMonitor }) => {
     return <div className="gh-device muted"><RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> Starting sign-in…</div>;
   }
   if (flow.status === "error") {
-    return <div className="gh-card-line error">{flow.message}</div>;
+    return <div className="gh-card-line error gh-signin-error">{flow.message}</div>;
   }
   const label = providerLabel(flow.provider);
   return (
@@ -380,7 +375,7 @@ const AddAccount = ({ monitor, signingIn, onDone }: { monitor: IGithubMonitor; s
           </>
         )}
       </div>
-      {error ? <div className="gh-card-line error">{error}</div> : null}
+      {error ? <div className="gh-card-line error gh-signin-error">{error}</div> : null}
       <DeviceFlowPrompt monitor={monitor} />
     </div>
   );
@@ -565,7 +560,7 @@ export const GithubPanel = ({ monitor, canUseNativeControls }: IGithubPanelProps
       </div>
       {addingAccount ? <AddAccount monitor={monitor} signingIn={signingIn} onDone={() => setAddingAccount(false)} /> : null}
       {monitor.switching ? (
-        <div className="gh-card-line muted"><RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /> Switching account…</div>
+        <div className="gh-card-line muted"><RefreshCw className="gh-spin" size={12} strokeWidth={2.3} /><span className="gh-card-text">Switching account…</span></div>
       ) : null}
       {!addingAccount ? (
         <>

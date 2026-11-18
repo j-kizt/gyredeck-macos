@@ -4,10 +4,10 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
 
 ### Fixes
 
-- **A repo whose token GitHub or GitLab refuses shows that, not an empty repo.** When the
+- **A repo whose token is refused with a 401 shows that, not an empty repo.** When the
   pull-request request was answered 401, that was read as "no pull requests", and the card
-  showed a repo with no runs, no PRs and no commits. Now a 401 there makes the card say "GitHub token expired or invalid — re-add the
-  account" (GitLab likewise). Any other error the backend reports for a repo is also shown as
+  showed a repo with no runs, no PRs and no commits. Now a 401 there makes the card say
+  "GitHub token expired or invalid — re-add the account" (GitLab likewise). Any other error the backend reports for a repo is also shown as
   the card's error instead of an empty card. A card that showed data before keeps it under the
   error, through later refreshes too, and the error stays on the card while a refresh runs
   instead of turning back into "Loading…".

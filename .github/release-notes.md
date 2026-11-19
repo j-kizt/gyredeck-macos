@@ -1,5 +1,25 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Discord lets go of a sync room as soon as it is closed — (v1.37.7)
+
+### Fixes
+
+- **Closing a sync room from the app stops Discord following it.** The app closed the
+  room on the bridge but left Discord's reader to find out by itself, and a reader waiting on
+  Discord (behind on what it had to post, or unable to write its journal) never did. The room
+  stayed in Discord's connected list, so "Disconnect all from Discord" stayed in Settings with no
+  room left to disconnect. Closing a room now tells Discord directly, and the room leaves the list
+  even while its reader is waiting on Discord or on its journal. A close made outside the app,
+  such as one from another tool, is still found by the reader itself, as below.
+- **A room closed elsewhere is noticed by a reader that is waiting.** A reader that is not reading
+  the room asks the bridge about it again every few seconds. A room that is gone is let go as
+  closed; a Discord relay taken out of a room that goes on is let go as disconnected and keeps its
+  place to resume from.
+- **Closing or disconnecting a room from the app while Discord is connecting to it no longer
+  leaves it followed.** A Connect, a disconnect and a close of the same room made by the app now
+  run one after the other: a close or disconnect waits for the Connect in flight and then lets go
+  of what it made, and an old disconnect cannot take out the relay of a newer connection.
+
 ## Git Monitor says when a token has expired — (v1.37.6)
 
 ### Fixes

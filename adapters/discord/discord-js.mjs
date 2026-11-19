@@ -13,7 +13,7 @@ import {
 } from "discord.js";
 
 const DISCORD_EPOCH = 1420070400000n;
-const NETWORK = /fetch failed|ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|socket|other side closed|aborted/i;
+const NETWORK = /fetch failed|ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|UND_ERR_(?:CONNECT|HEADERS|BODY)_TIMEOUT|socket|other side closed|aborted/i;
 
 function kindError(kind, message, extra = {}) {
   return Object.assign(new Error(message), { kind, ...extra });

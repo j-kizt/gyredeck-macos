@@ -563,6 +563,20 @@ test("a bot without the Message Content intent reports error missing_intent", as
   await c.close();
 });
 
+test("#199 a login that times out connecting is Discord being down, not an internal fault", async () => {
+  for (const code of ["UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]) {
+    const timeout = Object.assign(new Error("Connect Timeout Error (attempted address: discord.com:443, timeout: 10000ms)"), { code });
+    const { discord } = await adapterWith(fakeForum({ tags: [] }), { login: timeout });
+    await assert.rejects(withTimeout(discord.login(TOKEN)), (e) => e.kind === "network", code);
+    const fake = createFakeDiscord();
+    fake.login = () => withTimeout(discord.login(TOKEN));
+    const { c, of } = await boot({ fake });
+    await flush();
+    assert.deepEqual(of("error").map((e) => e.code), ["discord_down"], code);
+    await c.close();
+  }
+});
+
 test("ready carries v, bot, applicationId and forums", async () => {
   const { c, of } = await boot();
   assert.deepEqual(of("ready"), [
@@ -614,6 +628,7 @@ async function adapterWith(forum, { login = "ready" } = {}) {
       client.guilds = { cache: new Map() };
       client.destroy = async () => {};
       client.login = async () => {
+        if (login instanceof Error) throw login;
         if (login === "TokenInvalid") throw Object.assign(new Error("An invalid token was provided."), { code: DiscordjsErrorCodes.TokenInvalid });
         setImmediate(() => {
           if (typeof login === "number") client.emit("shardDisconnect", { code: login }, 0);

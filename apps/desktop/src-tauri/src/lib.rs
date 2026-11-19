@@ -1164,9 +1164,16 @@ fn sync_create(broker: tauri::State<'_, broker::BrokerState>, conversation_id: S
     standalone_bridge::sync_create(&conversation_id, &broker.secret()?)
 }
 
+/// Off the main thread: a closed room's Discord reader is stopped and waited for (#377).
 #[tauri::command]
-fn sync_close(broker: tauri::State<'_, broker::BrokerState>, code: String, conversation_id: String) -> Result<(), String> {
-    standalone_bridge::sync_close(&code, &conversation_id, &broker.secret()?)
+async fn sync_close(app: tauri::AppHandle, code: String, conversation_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let secret = app.state::<broker::BrokerState>().secret()?;
+        app.state::<discord::DiscordState>()
+            .room_closed(&code, || standalone_bridge::sync_close(&code, &conversation_id, &secret))
+    })
+    .await
+    .map_err(|error| format!("Closing the room did not finish: {error}"))?
 }
 
 #[tauri::command]

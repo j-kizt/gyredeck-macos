@@ -230,6 +230,10 @@ struct FakeSource {
     hold: Arc<AtomicBool>,
     /// The bridge's `/events`, one stream per open (#205).
     events: Mutex<VecDeque<Vec<u8>>>,
+    /// Rooms the bridge has closed: an open or an ACK is answered 404 (#377).
+    gone: Mutex<std::collections::HashSet<String>>,
+    /// Rooms that go on, with this relay taken out: an ACK is refused as Removed.
+    removed: Mutex<std::collections::HashSet<String>>,
 }
 
 /// A stream that counts being closed, so a test can see the reader let go of it.
@@ -282,6 +286,9 @@ impl RoomSource for Arc<FakeSource> {
     }
     fn open(&self, room: &str, as_id: &str, app_word: &str, since: u64) -> Result<Box<dyn Read + Send>, SourceError> {
         self.probe_synced("open", room, since);
+        if self.gone.lock().unwrap().contains(room) {
+            return Err(SourceError::Gone);
+        }
         self.opens.lock().unwrap().push((room.to_string(), as_id.to_string(), app_word.to_string()));
         self.sinces.lock().unwrap().push(since);
         let stream = |bytes| -> Box<dyn Read + Send> { Box::new(FakeStream { bytes: Cursor::new(bytes), dropped: Arc::clone(&self.dropped), hold: Arc::clone(&self.hold) }) };
@@ -296,6 +303,12 @@ impl RoomSource for Arc<FakeSource> {
     }
     fn ack(&self, room: &str, _as_id: &str, app_word: &str, seq: u64) -> Result<(), SourceError> {
         self.probe_synced("ack", room, seq);
+        if self.gone.lock().unwrap().contains(room) {
+            return Err(SourceError::Gone);
+        }
+        if self.removed.lock().unwrap().contains(room) {
+            return Err(SourceError::Removed);
+        }
         self.acks.lock().unwrap().push((room.to_string(), app_word.to_string(), seq));
         Ok(())
     }
@@ -891,6 +904,362 @@ fn a_full_buffer_closes_the_stream_and_resumes_from_the_last_seq_forwarded() {
     assert_eq!(f.source.sinces.lock().unwrap()[..2], [0, 2], "reopened from the last seq forwarded");
 }
 
+fn closed_rooms(buffer: &SharedBuf) -> Vec<(String, String)> {
+    of_kind(&buffer.lines(), "disconnect")
+        .iter()
+        .map(|line| (line["room"].as_str().unwrap().into(), line["reason"].as_str().unwrap().into()))
+        .collect()
+}
+
+#[test]
+fn a_room_closed_on_the_bridge_while_it_keeps_running_is_no_longer_followed() {
+    let f = fixture("one-closed", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    f.acts.founded.lock().unwrap().push(OTHER.to_string());
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    f.state.connect(OTHER, APP_WORD).unwrap();
+    wait_until("both readers to have tried the bridge", || {
+        let opens = f.source.opens.lock().unwrap();
+        opens.iter().any(|(room, ..)| room == ROOM) && opens.iter().any(|(room, ..)| room == OTHER)
+    });
+
+    f.source.gone.lock().unwrap().insert(ROOM.to_string());
+    wait_until("the closed room let go", || !closed_rooms(&buffer).is_empty());
+    assert_eq!(closed_rooms(&buffer), vec![(ROOM.into(), "closed".into())]);
+    assert_eq!(f.state.status().connected_rooms, vec![OTHER.to_string()]);
+}
+
+#[test]
+fn a_room_the_app_closed_is_let_go_at_once_even_while_discord_is_behind() {
+    let f = fixture("app-closed", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    lock(&f.state.hub).cap = 2;
+    log_of(&f, ROOM, 1..=5);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("the reader to wait on Discord", || f.source.dropped.load(Ordering::SeqCst) == 1);
+    f.source.gone.lock().unwrap().insert(ROOM.to_string());
+
+    f.state.room_closed(ROOM, || Ok(())).unwrap();
+    assert!(f.state.status().connected_rooms.is_empty());
+    assert_eq!(closed_rooms(&buffer), vec![(ROOM.into(), "closed".into())]);
+    assert!(f.acts.leaves.lock().unwrap().is_empty(), "a closed room has no relay to take out");
+}
+
+#[test]
+fn a_room_closed_while_its_reader_waits_on_discord_is_let_go_at_the_next_ack() {
+    let f = fixture("closed-full", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    lock(&f.state.hub).cap = 4;
+    log_of(&f, ROOM, 1..=10);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("the reader to wait on Discord", || message_seqs(&buffer).len() == 4 && f.source.dropped.load(Ordering::SeqCst) == 1);
+    f.source.gone.lock().unwrap().insert(ROOM.to_string());
+
+    // Still over half the cap owed, so the reader keeps waiting rather than reopening.
+    ack(&f, ROOM, 1);
+    wait_until("the closed room let go", || !closed_rooms(&buffer).is_empty());
+    assert_eq!(closed_rooms(&buffer), vec![(ROOM.into(), "closed".into())]);
+    assert!(f.state.status().connected_rooms.is_empty());
+    assert_eq!(f.source.opens.lock().unwrap().len(), 1, "found by the ACK, not by reopening");
+}
+
+#[test]
+fn a_room_closed_after_its_last_ack_is_let_go_while_discord_stays_behind() {
+    let f = fixture("closed-after-ack", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    lock(&f.state.hub).cap = 4;
+    log_of(&f, ROOM, 1..=10);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("the reader to wait on Discord", || message_seqs(&buffer).len() == 4 && f.source.dropped.load(Ordering::SeqCst) == 1);
+    ack(&f, ROOM, 1);
+    wait_until("the bridge to take the ACK", || f.source.acks.lock().unwrap().iter().any(|(room, _, seq)| room == ROOM && *seq == 1));
+
+    // Closed after that ACK, and Discord takes nothing more: no new ACK, no reopen.
+    f.source.gone.lock().unwrap().insert(ROOM.to_string());
+    wait_until("the closed room let go", || !closed_rooms(&buffer).is_empty());
+    assert_eq!(closed_rooms(&buffer), vec![(ROOM.into(), "closed".into())]);
+    assert!(f.state.status().connected_rooms.is_empty());
+    assert_eq!(f.source.opens.lock().unwrap().len(), 1, "found while waiting, not by reopening");
+}
+
+#[test]
+fn a_relay_taken_out_of_a_live_room_while_discord_stays_behind_is_disconnected_not_closed() {
+    let f = fixture("removed-after-ack", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    lock(&f.state.hub).cap = 4;
+    log_of(&f, ROOM, 1..=10);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("the reader to wait on Discord", || message_seqs(&buffer).len() == 4 && f.source.dropped.load(Ordering::SeqCst) == 1);
+    ack(&f, ROOM, 1);
+    wait_until("the bridge to take the ACK", || f.source.acks.lock().unwrap().iter().any(|(room, _, seq)| room == ROOM && *seq == 1));
+
+    f.source.removed.lock().unwrap().insert(ROOM.to_string());
+    wait_until("the removed relay let go", || !closed_rooms(&buffer).is_empty());
+    assert_eq!(closed_rooms(&buffer), vec![(ROOM.into(), "disconnected".into())]);
+    assert!(f.state.status().connected_rooms.is_empty());
+    assert!(lock(&f.state.hub).resume.contains_key(ROOM), "a live room keeps its place to resume from");
+}
+
+/// The reader retries a journal that cannot sync without opening the room, so only the repeated
+/// ACK can tell it the room went; that ACK never carries a seq the journal has not synced.
+fn blocked_journal_reader(name: &str) -> (Fixture, SharedBuf) {
+    let f = fixture(name, Some(TOKEN));
+    let buffer = f.attach_buffer();
+    *f.source.probe.lock().unwrap() = Some(Arc::downgrade(&f.state.hub));
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    // The new journal is synced once before the first open; failing that sync would keep the
+    // reader from ever opening, and the lines below from ever arriving.
+    wait_until("a first open", || !f.source.opens.lock().unwrap().is_empty());
+    // From here the journal takes lines in but never makes them durable.
+    lock(&f.state.hub).rooms[ROOM].journal.as_ref().unwrap().fail_next_syncs(u32::MAX);
+    log_of(&f, ROOM, 1..=2);
+    wait_until("both lines", || message_seqs(&buffer) == vec![1, 2]);
+    ack(&f, ROOM, 2);
+    wait_until("the journal shown blocked", || f.state.status().journal_errors.contains_key(ROOM));
+    // The recheck comes after several of the ACK's own beats, each of which met the failed sync.
+    wait_until("the room asked again", || f.source.synced_at.lock().unwrap().iter().any(|(what, _, _)| *what == "ack"));
+    (f, buffer)
+}
+
+fn assert_no_ack_past_the_sync(f: &Fixture) {
+    let seen = f.source.synced_at.lock().unwrap().clone();
+    for (what, told, synced) in &seen {
+        assert!(*what != "ack" || told <= synced, "an ACK of {told} reached the bridge with the journal synced through {synced}: {seen:?}");
+    }
+}
+
+#[test]
+fn a_room_closed_while_its_journal_cannot_sync_is_let_go() {
+    let (f, buffer) = blocked_journal_reader("blocked-closed");
+    f.source.gone.lock().unwrap().insert(ROOM.to_string());
+    wait_until("the closed room let go", || !closed_rooms(&buffer).is_empty());
+    assert_eq!(closed_rooms(&buffer), vec![(ROOM.into(), "closed".into())]);
+    assert!(f.state.status().connected_rooms.is_empty());
+    assert_no_ack_past_the_sync(&f);
+}
+
+/// Connect is held at the gap `at` (see `Core::connect_gap`); `between` runs there, and the
+/// Connect's answer is returned once it is let go (#377). Only the first gap `at` is held, so a
+/// Connect or disconnect started in `between` runs through its own.
+fn connect_around(f: &Fixture, at: &'static str, between: impl FnOnce()) -> Result<DiscordStatus, String> {
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel::<()>();
+    let mut held = false;
+    *f.state.core.connect_gap.lock().unwrap() = Some(Box::new(move |gap| {
+        if gap == at && !held {
+            held = true;
+            reached_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+        }
+    }));
+    thread::scope(|scope| {
+        // Owned here, so a failed assert drops it and lets the held Connect go, not hang.
+        let go = go;
+        let connecting = scope.spawn(|| f.state.connect(ROOM, APP_WORD));
+        if reached.recv_timeout(Duration::from_secs(8)).is_err() {
+            panic!("the Connect never reached the gap {at}: {:?}", connecting.join().unwrap());
+        }
+        if at != "connect" {
+            assert!(f.state.status().connected_rooms.contains(&ROOM.to_string()), "the gap is after the room was taken");
+        }
+        between();
+        go.send(()).unwrap();
+        connecting.join().unwrap()
+    })
+}
+
+/// The app closes the room while a Connect is held at `at`: the close waits for that Connect,
+/// which answers Ok, and then lets go of what it made (#377 r11).
+fn closed_around(f: &Fixture, at: &'static str) {
+    thread::scope(|scope| {
+        let mut closing = None;
+        let answer = connect_around(f, at, || {
+            let close = scope.spawn(|| f.state.room_closed(ROOM, || Ok(())).unwrap());
+            thread::sleep(Duration::from_millis(300));
+            assert!(!close.is_finished(), "the close waits for the Connect in flight");
+            closing = Some(close);
+        });
+        assert!(answer.is_ok(), "the Connect finishes first: {answer:?}");
+        closing.unwrap().join().unwrap();
+    });
+}
+
+fn assert_nothing_left_reading(f: &Fixture) {
+    assert!(f.state.status().connected_rooms.is_empty());
+    assert!(f.state.core.readers.lock().unwrap().is_empty(), "no reader for a room let go");
+    assert!(f.state.core.presence.lock().unwrap().is_none(), "no presence with no room");
+}
+
+#[test]
+fn a_room_closed_while_discord_is_connecting_leaves_no_reader_and_no_presence() {
+    let f = fixture("closed-while-connecting", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    // A close waits for the Connect it meets, then lets go of what that Connect made (#377 r11).
+    closed_around(&f, "register");
+    assert_nothing_left_reading(&f);
+    wait_until("the close told", || closed_rooms(&buffer) == vec![(ROOM.to_string(), "closed".to_string())]);
+    assert!(f.acts.leaves.lock().unwrap().is_empty(), "a closed room has no relay to take out");
+}
+
+#[test]
+fn a_room_disconnected_while_discord_is_connecting_leaves_no_reader_and_no_presence() {
+    let f = fixture("disconnected-while-connecting", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    // A disconnect waits for the Connect it meets, then lets go of what that Connect made (#377 r9).
+    thread::scope(|scope| {
+        let mut disconnecting = None;
+        let answer = connect_around(&f, "register", || {
+            disconnecting = Some(scope.spawn(|| f.state.disconnect(ROOM, Some(APP_WORD))));
+        });
+        assert!(answer.is_ok(), "the Connect finishes first: {answer:?}");
+        disconnecting.unwrap().join().unwrap().expect("the disconnect after it");
+    });
+    assert_nothing_left_reading(&f);
+    wait_until("the disconnect told", || closed_rooms(&buffer) == vec![(ROOM.to_string(), "disconnected".to_string())]);
+    assert_eq!(*f.acts.leaves.lock().unwrap(), vec![ROOM.to_string()], "the relay taken out once");
+}
+
+#[test]
+fn a_connect_overtaken_by_a_close_and_a_new_connect_of_the_same_code_leaves_the_new_one_reading() {
+    let f = fixture("reconnected-while-connecting", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    thread::scope(|scope| {
+        let mut newer = None;
+        let answer = connect_around(&f, "register", || {
+            newer = Some(scope.spawn(|| {
+                f.state.room_closed(ROOM, || Ok(())).unwrap();
+                f.state.connect(ROOM, APP_WORD)
+            }));
+        });
+        assert!(answer.is_ok(), "the first Connect finishes before the close: {answer:?}");
+        newer.unwrap().join().unwrap().expect("the same code connects again");
+    });
+    assert_eq!(f.state.status().connected_rooms, vec![ROOM.to_string()]);
+    let readers = f.state.core.readers.lock().unwrap();
+    assert!(!readers[ROOM].stop.load(Ordering::SeqCst), "the newer Connect's reader is the one still reading");
+}
+
+#[test]
+fn a_connect_of_a_room_already_followed_answers_its_status() {
+    // Leaked so a Connect that never answers fails the test instead of hanging it.
+    let f: &'static Fixture = Box::leak(Box::new(fixture("connect-twice", Some(TOKEN))));
+    let _buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    let (answered, answer) = std::sync::mpsc::channel();
+    thread::spawn(move || answered.send(f.state.connect(ROOM, APP_WORD)).unwrap());
+    let status = answer.recv_timeout(Duration::from_secs(8)).expect("the second Connect answers").unwrap();
+    assert_eq!(status.connected_rooms, vec![ROOM.to_string()]);
+    assert_eq!(f.acts.joins.lock().unwrap().len(), 1, "no second join for a room already followed");
+}
+
+#[test]
+fn a_connect_while_an_old_disconnect_is_leaving_joins_only_after_the_leave() {
+    let f = fixture("connect-while-leaving", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel::<()>();
+    *f.state.core.connect_gap.lock().unwrap() = Some(Box::new(move |gap| {
+        if gap == "leave" {
+            reached_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+        }
+    }));
+    thread::scope(|scope| {
+        // Owned here, so a failed assert drops it and lets the held disconnect go, not hang.
+        let go = go;
+        let disconnecting = scope.spawn(|| f.state.disconnect(ROOM, Some(APP_WORD)));
+        reached.recv_timeout(Duration::from_secs(8)).expect("the old disconnect reached its leave");
+        let connecting = scope.spawn(|| f.state.connect(ROOM, APP_WORD));
+        thread::sleep(Duration::from_millis(300));
+        // The bridge reuses the relay's membership: a join here would be taken out by the leave.
+        assert_eq!(f.acts.joins.lock().unwrap().len(), 1, "no new join while the old leave is pending");
+        go.send(()).unwrap();
+        disconnecting.join().unwrap().expect("the old disconnect");
+        connecting.join().unwrap().expect("the new Connect");
+    });
+    assert_eq!(f.acts.joins.lock().unwrap().len(), 2);
+    assert_eq!(*f.acts.leaves.lock().unwrap(), vec![ROOM.to_string()]);
+    assert_eq!(f.state.status().connected_rooms, vec![ROOM.to_string()]);
+    let readers = f.state.core.readers.lock().unwrap();
+    assert!(!readers[ROOM].stop.load(Ordering::SeqCst), "the new Connect's reader is reading");
+}
+
+#[test]
+fn a_room_closed_by_the_app_lets_nothing_go_when_the_bridge_refuses() {
+    let f = fixture("close-refused", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    let refused = f.state.room_closed(ROOM, || Err("refused".to_string()));
+    assert_eq!(refused, Err("refused".to_string()));
+    assert_eq!(f.state.status().connected_rooms, vec![ROOM.to_string()], "a room still open is still followed");
+}
+
+#[test]
+fn a_code_reused_while_its_old_room_is_closing_is_connected_after_the_close() {
+    let f = fixture("reused-while-closing", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel::<()>();
+    *f.state.core.connect_gap.lock().unwrap() = Some(Box::new(move |gap| {
+        if gap == "closed" {
+            reached_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+        }
+    }));
+    thread::scope(|scope| {
+        // Owned here, so a failed assert drops it and lets the held close go, not hang.
+        let go = go;
+        let closing = scope.spawn(|| f.state.room_closed(ROOM, || Ok(())));
+        reached.recv_timeout(Duration::from_secs(8)).expect("the old room closed on the bridge");
+        // The bridge has handed the code to a new room, and the app connects it.
+        let connecting = scope.spawn(|| f.state.connect(ROOM, APP_WORD));
+        thread::sleep(Duration::from_millis(300));
+        assert!(!connecting.is_finished(), "the new room's Connect waits for the old close's let-go");
+        go.send(()).unwrap();
+        closing.join().unwrap().expect("the old close");
+        connecting.join().unwrap().expect("the new room's Connect");
+    });
+    assert_eq!(f.state.status().connected_rooms, vec![ROOM.to_string()], "the new room is followed");
+    assert_eq!(f.acts.joins.lock().unwrap().len(), 2);
+    let readers = f.state.core.readers.lock().unwrap();
+    assert!(!readers[ROOM].stop.load(Ordering::SeqCst), "the new room's reader is reading");
+}
+
+#[test]
+fn a_room_closed_after_its_reader_is_registered_starts_no_presence() {
+    let f = fixture("closed-before-presence", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    closed_around(&f, "presence");
+    assert_nothing_left_reading(&f);
+}
+
+#[test]
+fn a_room_closed_before_discord_takes_it_is_not_added_back_while_the_bridge_is_unreachable() {
+    let f = fixture("closed-before-taken", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    // The Connect has read the room and not yet taken it; after the close nothing answers the
+    // reader (no stream), so only the close itself can let the room go (#377 r11).
+    closed_around(&f, "connect");
+    assert_nothing_left_reading(&f);
+    wait_until("the close told", || closed_rooms(&buffer) == vec![(ROOM.to_string(), "closed".to_string())]);
+    thread::sleep(Duration::from_millis(300));
+    assert!(f.state.status().connected_rooms.is_empty(), "the room stays let go");
+    assert!(f.acts.leaves.lock().unwrap().is_empty(), "a closed room has no relay to take out");
+}
+
+#[test]
+fn a_relay_taken_out_while_its_journal_cannot_sync_is_disconnected_and_keeps_its_place() {
+    let (f, buffer) = blocked_journal_reader("blocked-removed");
+    f.source.removed.lock().unwrap().insert(ROOM.to_string());
+    wait_until("the removed relay let go", || !closed_rooms(&buffer).is_empty());
+    assert_eq!(closed_rooms(&buffer), vec![(ROOM.into(), "disconnected".into())]);
+    assert!(f.state.status().connected_rooms.is_empty());
+    assert!(lock(&f.state.hub).resume.contains_key(ROOM), "a live room keeps its place to resume from");
+    assert_no_ack_past_the_sync(&f);
+}
+
 #[test]
 fn more_than_the_cap_pending_across_a_child_death_all_arrives_in_order() {
     let f = fixture("death", Some(TOKEN));
@@ -1330,6 +1699,51 @@ impl Drop for LiveBridge {
         let _ = self.child.wait();
         let _ = fs::remove_dir_all(&self.home);
     }
+}
+
+/// #377: the real bridge's refused ACK is read as the open's would be — a relay taken out of a
+/// live room is Removed, a room that is gone is Gone.
+#[test]
+fn a_real_bridge_refuses_an_ack_as_removed_for_a_relay_taken_out_and_gone_for_a_closed_room() {
+    let port = {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let home = scratch("live-bridge-ack");
+    fs::create_dir_all(home.join(".config/gyredeck")).unwrap();
+    fs::write(home.join(".config/gyredeck/gyredeck.config.json"), format!("{{\"host\":\"127.0.0.1\",\"port\":{port}}}")).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../adapters/bridge/gyredeck-bridge.mjs");
+    let mut child = Command::new(node())
+        .arg(&script)
+        .args(["--port", &port.to_string(), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"])
+        .env("HOME", &home)
+        .env("GYREDECK_NO_AGENT_SPAWN", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the bridge");
+    child.stdin.as_mut().unwrap().write_all(format!("broker-secret {APP_WORD}\nbroker-ready\n").as_bytes()).unwrap();
+    let _bridge = LiveBridge { child, home: home.clone() };
+    let token_path = home.join(".config/gyredeck/gyredeck.ingest-token");
+    wait_until("the bridge to serve", || token_path.exists() && TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok());
+    let app = standalone_bridge::BridgeTarget { port, token: fs::read_to_string(&token_path).unwrap().trim().to_string() };
+    let call = |method: &str, path: &str, body: serde_json::Value| standalone_bridge::bridge_request_to(&app, method, path, Some(body.to_string()), Duration::from_secs(2), Some(APP_WORD)).unwrap();
+
+    let (status, created) = call("POST", "/sync/rooms", serde_json::json!({ "conversationId": "founder-1" }));
+    assert_eq!(status, 201, "{created}");
+    let room = created["room"].as_str().unwrap().to_string();
+    let relay = format!("discord-{room}");
+    let (status, joined) = call("POST", &format!("/sync/rooms/{room}/members"), serde_json::json!({ "conversationId": relay, "relay": "discord" }));
+    assert_eq!(status, 200, "{joined}");
+    let source = BridgeSource { target: Some(app.clone()) };
+    assert!(source.ack(&room, &relay, APP_WORD, 0).is_ok());
+
+    assert_eq!(call("DELETE", &format!("/sync/rooms/{room}/members/{relay}"), serde_json::json!({})).0, 200);
+    assert!(matches!(source.ack(&room, &relay, APP_WORD, 0), Err(SourceError::Removed)));
+
+    assert_eq!(call("DELETE", &format!("/sync/rooms/{room}"), serde_json::json!({})).0, 200);
+    assert!(matches!(source.ack(&room, &relay, APP_WORD, 0), Err(SourceError::Gone)));
 }
 
 #[test]
@@ -2314,6 +2728,25 @@ fn a_relay_ack_on_an_open_stream_waits_for_the_journal_sync() {
     for (what, told, synced) in seen.iter().filter(|(what, ..)| *what == "ack") {
         assert!(told <= synced, "{what} told the bridge {told} with the journal synced only through {synced}");
     }
+}
+
+/// #377: a relay taken out while its stream is open is let go once, as Disconnected, and keeps
+/// its place to resume from; no second end wipes it.
+#[test]
+fn a_relay_taken_out_while_its_stream_is_open_keeps_its_place_to_resume_from() {
+    let f = fixture("removed-open", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    f.source.hold.store(true, Ordering::SeqCst);
+    f.stream(ROOM, &(1..=3).map(|seq| mail(seq, "peer-a", "everyone", "tell", &format!("m{seq}"))).collect::<Vec<_>>());
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("three", || message_seqs(&buffer).len() == 3);
+    f.source.removed.lock().unwrap().insert(ROOM.to_string());
+    ack(&f, ROOM, 3);
+    wait_until("the removed relay let go", || !closed_rooms(&buffer).is_empty());
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(closed_rooms(&buffer), vec![(ROOM.into(), "disconnected".into())]);
+    assert!(f.state.status().connected_rooms.is_empty());
+    assert!(lock(&f.state.hub).resume.contains_key(ROOM), "a live room keeps its place to resume from");
 }
 
 /// Finding 9: the bridge's join point moves no seq past what the journal holds.

@@ -317,6 +317,38 @@ test("the app's ACK keeps a busy room open within one stream; nobody else may AC
     await reading;
     assert.deepEqual([...statuses], [202], "more than the room's cap went through one stream with no room_full");
     assert.ok(sent.every((seq) => seen.includes(seq)), "and every one reached the relay");
+
+    // #377: an ACK that moves nothing is answered, but is not a read; one that moves is.
+    const relayRead = async () => {
+      const { body } = await h.call("GET", `/sync/rooms?as=${relayId}`);
+      const { pending, lastReadAt } = body.members.find((m) => m.conversationId === relayId);
+      return { readSeq: body.seq - pending, lastReadAt };
+    };
+    const held = await relayRead();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const same = await ack(held.readSeq);
+    assert.deepEqual([same.status, (await same.json()).readSeq], [200, held.readSeq]);
+    assert.equal((await ack(0)).status, 200);
+    assert.deepEqual(await relayRead(), held, "a repeated ACK leaves the relay's read as it was");
+    const posted = await fetch(`${h.base}/mail/${code}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...founder },
+      body: JSON.stringify({ from: "founder-1", to: "everyone", kind: "tell", text: "one more" }),
+    });
+    const { seq: next } = await posted.json();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal((await ack(next)).status, 200);
+    const moved = await relayRead();
+    assert.equal(moved.readSeq, next);
+    assert.notEqual(moved.lastReadAt, held.lastReadAt, "an ACK that moves is a read");
+
+    // #377: a relay taken out of a live room and a room that is gone are refused apart.
+    assert.equal((await h.call("DELETE", `/sync/rooms/${code}/members/${relayId}`)).status, 200);
+    const removed = await ack(1);
+    assert.deepEqual([removed.status, (await removed.json()).error], [404, "not_a_relay"]);
+    assert.equal((await h.call("DELETE", `/sync/rooms/${code}`)).status, 200);
+    const gone = await ack(1);
+    assert.deepEqual([gone.status, (await gone.json()).error], [404, "no_such_room"]);
   } finally {
     await h.stop();
   }

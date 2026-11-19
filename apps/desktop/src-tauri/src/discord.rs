@@ -160,6 +160,8 @@ const STORAGE_BLOCKED: &str = "storage_blocked";
 const FATAL_ERRORS: [&str; 2] = ["bad_token", "missing_intent"];
 /// How often the reader tells the bridge what Discord has accepted, coalesced.
 const ACK_EVERY: Duration = Duration::from_secs(2);
+/// How often a reader waiting on Discord asks the bridge whether its room still exists (#377).
+const ROOM_RECHECK_EVERY: Duration = Duration::from_secs(5);
 /// How many times a quit tries to journal its loss record before it uses the fallback file.
 const QUIT_LOSS_TRIES: u32 = 3;
 const QUIT_LOSS_RETRY: Duration = Duration::from_millis(100);
@@ -1139,7 +1141,7 @@ impl Hub {
     }
 
     /// Follow a room: its journal (with its header) exists before the child hears of it.
-    fn connect(&mut self, room: &str, members: Vec<String>, created_at: Option<u64>) -> Result<(), String> {
+    fn connect(&mut self, room: &str, members: Vec<String>, created_at: Option<u64>) -> Result<u64, String> {
         if let Some(why) = self.journal_down.clone() {
             return Err(self.journal_blocked(room, why));
         }
@@ -1203,7 +1205,7 @@ impl Hub {
         self.rooms_changed();
         self.send(&line);
         self.queue_feed(room, id);
-        Ok(())
+        Ok(id)
     }
 
     /// The agents of a connected room, from a roster read: whose idleness makes it quiet.
@@ -2011,8 +2013,8 @@ impl Hub {
     }
 }
 
-fn lock(hub: &Mutex<Hub>) -> MutexGuard<'_, Hub> {
-    hub.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // ── what this side depends on, injectable for the tests ──
@@ -2333,6 +2335,15 @@ pub(crate) struct Core {
     approval_gate: Mutex<Option<String>>,
     /// `<dir of the state file>/attachments`, where a say's files must be (#375).
     attachments: PathBuf,
+    /// One Connect, disconnect or close of a room at a time, from its join to its leave: an old
+    /// leave let through after a new join takes the new connection's relay out (#377 r9), and a
+    /// close let through mid-Connect is undone when the Connect takes the room (#377 r11).
+    lifecycles: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Run at each gap of a Connect ("connect": the room read, not yet taken; "register": the room taken, its reader not yet registered;
+    /// "presence": registered, presence not yet started) and of a disconnect ("leave": the room
+    /// let go, the relay not yet taken out) and a close ("closed": closed on the bridge, not yet let go), so a test can act there (#377).
+    #[cfg(test)]
+    connect_gap: Mutex<Option<Box<dyn FnMut(&'static str) + Send>>>,
 }
 
 pub(crate) struct DiscordState {
@@ -2439,6 +2450,9 @@ impl DiscordState {
             approvals: Arc::clone(&deps.approvals),
             approval_gate: Mutex::new(None),
             attachments: attachments_root(&deps.state_path),
+            lifecycles: Mutex::default(),
+            #[cfg(test)]
+            connect_gap: Mutex::new(None),
         });
         Self {
             hub,
@@ -2735,7 +2749,9 @@ impl DiscordState {
         if !self.deps.acts.founded(room) {
             return Err("Only a room this app created can be followed on Discord".to_string());
         }
-        {
+        let lifecycle = self.core.lifecycle(room);
+        let _lifecycle = lock(&lifecycle);
+        let followed = {
             let hub = lock(&self.hub);
             if !(hub.ready && hub.channel.is_some()) {
                 return Err("Discord is not ready yet. Check the bot token and its Message Content intent in Settings → Permission".to_string());
@@ -2743,9 +2759,11 @@ impl DiscordState {
             if hub.forum_id.is_none() {
                 return Err("Pick a Discord forum channel first".to_string());
             }
-            if hub.rooms.contains_key(room) {
-                return Ok(self.status());
-            }
+            hub.rooms.contains_key(room)
+        };
+        // Read with the hub let go: `status` takes it again (#377 r10).
+        if followed {
+            return Ok(self.status());
         }
         let member = relay_member(room);
         let generation = self.deps.source.generation();
@@ -2767,22 +2785,31 @@ impl DiscordState {
         let names: HashMap<String, String> =
             roster.members.iter().map(|entry| (entry.id.clone(), entry.shown.clone())).collect();
         let room_seq = roster.seq;
-        let connected = lock(&self.hub).connect(room, roster.members.iter().map(|entry| entry.shown.clone()).collect(), roster.created_at);
-        {
+        #[cfg(test)]
+        self.core.gap("connect");
+        // The feed this Connect made, read under the lock that made it: taken from the room
+        // later, it could be a newer Connect's after a close in between (#377 r8).
+        let connected = {
             let mut hub = lock(&self.hub);
-            if let Some(feed) = hub.rooms.get_mut(room) {
-                feed.bridge_seq = room_seq.unwrap_or(0);
-                // The word the owner's posts and a Discord disconnect go with (#205).
-                feed.word = app_word.to_string();
+            hub.connect(room, roster.members.iter().map(|entry| entry.shown.clone()).collect(), roster.created_at).map(|id| {
+                if let Some(feed) = hub.rooms.get_mut(room) {
+                    feed.bridge_seq = room_seq.unwrap_or(0);
+                    // The word the owner's posts and a Discord disconnect go with (#205).
+                    feed.word = app_word.to_string();
+                }
+                hub.set_agents(room, &roster);
+                id
+            })
+        };
+        let feed_id = match connected {
+            Ok(id) => id,
+            Err(error) => {
+                if let Err(left) = self.deps.acts.leave(room, &member, app_word) {
+                    lock(&self.hub).leaving.insert(room.to_string(), left);
+                }
+                return Err(error);
             }
-            hub.set_agents(room, &roster);
-        }
-        if let Err(error) = connected {
-            if let Err(left) = self.deps.acts.leave(room, &member, app_word) {
-                lock(&self.hub).leaving.insert(room.to_string(), left);
-            }
-            return Err(error);
-        }
+        };
         // Over the room code's budget already (lines still draining from an earlier connection):
         // the reader starts paused, so nothing is opened and the bridge's floor holds (I14, d19).
         let paused = {
@@ -2796,6 +2823,7 @@ impl DiscordState {
             member,
             app_word: app_word.to_string(),
             generation,
+            feed: feed_id,
             names,
             shown_checked: HashMap::new(),
             names_stale: false,
@@ -2804,20 +2832,40 @@ impl DiscordState {
             stop: Arc::clone(&stop),
             acked_sent: 0,
             ack_at: Instant::now(),
+            rechecked_at: Instant::now(),
             paused,
+            gone: false,
             attachments: attachments_root(&self.deps.state_path),
         };
-        let join = thread::Builder::new()
-            .name(format!("gyredeck-discord-{room}"))
-            .spawn(move || reader.run())
-            .map_err(|error| format!("Could not start reading the room: {error}"))?;
-        if let Ok(mut readers) = self.core.readers.lock() {
+        #[cfg(test)]
+        self.core.gap("register");
+        // Registered under the readers' lock, and only while this very connection is still the
+        // room's: a close or disconnect takes that lock before letting the room go, so it either
+        // finds this reader or this Connect finds the room gone, never neither (#377).
+        {
+            let mut readers = lock(&self.core.readers);
+            if lock(&self.hub).rooms.get(room).map(|feed| feed.id) != Some(feed_id) {
+                return Err("The room was closed or disconnected while Discord was connecting to it".to_string());
+            }
+            let join = thread::Builder::new()
+                .name(format!("gyredeck-discord-{room}"))
+                .spawn(move || reader.run())
+                .map_err(|error| format!("Could not start reading the room: {error}"))?;
             if let Some(old) = readers.insert(room.to_string(), ReaderHandle { stop, join }) {
                 old.stop.store(true, Ordering::SeqCst);
             }
         }
+        #[cfg(test)]
+        self.core.gap("presence");
         self.core.watch_presence();
         Ok(self.status())
+    }
+
+    /// The app closes this room itself with `close`: once it has, stop following the room now,
+    /// rather than wait for its reader to find out, which a reader waiting on Discord never does
+    /// (#377). A close the bridge refused lets nothing go.
+    pub(crate) fn room_closed(&self, room: &str, close: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        self.core.room_closed(room, close)
     }
 
     pub(crate) fn disconnect(&self, room: &str, app_word: Option<&str>) -> Result<DiscordStatus, String> {
@@ -2830,16 +2878,58 @@ impl DiscordState {
 }
 
 impl Core {
+    fn lifecycle(&self, room: &str) -> Arc<Mutex<()>> {
+        Arc::clone(lock(&self.lifecycles).entry(room.to_string()).or_default())
+    }
+
+    #[cfg(test)]
+    fn gap(&self, at: &'static str) {
+        let gap = self.connect_gap.lock().unwrap().take();
+        if let Some(mut gap) = gap {
+            gap(at);
+            *self.connect_gap.lock().unwrap() = Some(gap);
+        }
+    }
+
     /// Stop reading a room, close its post as Disconnected, and take the relay out: the one
     /// disconnect, for the button, Remove and the owner's ✅ on Discord (#205). The room
     /// itself goes on.
-    fn disconnect(&self, room: &str, app_word: Option<&str>) -> Result<(), String> {
-        let reader = self.readers.lock().ok().and_then(|mut readers| readers.remove(room));
-        if let Some(reader) = reader {
-            reader.stop.store(true, Ordering::SeqCst);
-            let _ = reader.join.join();
+    /// A closed room has no relay left to take out, so nothing is asked of the bridge.
+    fn room_closed(&self, room: &str, close: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        // After any Connect of the room in flight, so what it made is let go too: one that read
+        // the room before the close would otherwise add it back after the close (#377 r11).
+        // The close itself runs under the lock as well: the bridge may hand the code to a new
+        // room as soon as it is closed, and that room's Connect must not come before this let-go
+        // (#377 r12).
+        let lifecycle = self.lifecycle(room);
+        let _lifecycle = lock(&lifecycle);
+        close()?;
+        #[cfg(test)]
+        self.gap("closed");
+        {
+            // Held until the room is let go, so a Connect between its two halves sees it (#377).
+            let mut readers = lock(&self.readers);
+            if let Some(reader) = readers.remove(room) {
+                reader.stop.store(true, Ordering::SeqCst);
+                let _ = reader.join.join();
+            }
+            let mut hub = lock(&self.hub);
+            hub.disconnect(room, DisconnectReason::Closed);
+            hub.leaving.remove(room);
         }
+        self.stop_presence_if_idle();
+        Ok(())
+    }
+
+    fn disconnect(&self, room: &str, app_word: Option<&str>) -> Result<(), String> {
+        let lifecycle = self.lifecycle(room);
+        let _lifecycle = lock(&lifecycle);
         let (was_connected, was_leaving) = {
+            let mut readers = lock(&self.readers);
+            if let Some(reader) = readers.remove(room) {
+                reader.stop.store(true, Ordering::SeqCst);
+                let _ = reader.join.join();
+            }
             let mut hub = lock(&self.hub);
             (hub.disconnect(room, DisconnectReason::Disconnected), hub.leaving.contains_key(room))
         };
@@ -2847,6 +2937,8 @@ impl Core {
         if !was_connected && !was_leaving {
             return Ok(());
         }
+        #[cfg(test)]
+        self.gap("leave");
         let left = match app_word {
             Some(word) => self.acts.leave(room, &relay_member(room), word),
             None => Err("Gyredeck could not vouch for itself to its own bridge".to_string()),
@@ -2968,11 +3060,13 @@ impl Core {
     }
 
     /// Follow the bridge's event stream while any room is connected, for the quiet prompt.
+    /// Both this and `stop_presence_if_idle` read the rooms under the presence lock, so the
+    /// later of the two acts on what is true by then (#377).
     fn watch_presence(&self) {
         let Ok(mut slot) = self.presence.lock() else {
             return;
         };
-        if slot.as_ref().is_some_and(|handle| !handle.join.is_finished()) {
+        if lock(&self.hub).rooms.is_empty() || slot.as_ref().is_some_and(|handle| !handle.join.is_finished()) {
             return;
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -2983,11 +3077,13 @@ impl Core {
     }
 
     fn stop_presence_if_idle(&self) {
+        let Ok(mut slot) = self.presence.lock() else {
+            return;
+        };
         if !lock(&self.hub).rooms.is_empty() {
             return;
         }
-        let presence = self.presence.lock().ok().and_then(|mut slot| slot.take());
-        if let Some(presence) = presence {
+        if let Some(presence) = slot.take() {
             presence.stop.store(true, Ordering::SeqCst);
             let _ = presence.join.join();
         }
@@ -3582,6 +3678,9 @@ struct RoomReader {
     member: String,
     app_word: String,
     generation: u64,
+    /// The hub's connection this reader serves; a later connection of the same code is not its
+    /// to end (#377).
+    feed: u64,
     names: HashMap<String, String>,
     /// Each (member, name it was shown under) already checked against the roster, so a
     /// replay of old lines asks the bridge once per name, not once per line.
@@ -3595,8 +3694,13 @@ struct RoomReader {
     /// The last ACK the bridge took, and when one was last sent.
     acked_sent: u64,
     ack_at: Instant,
+    /// When a waiting reader last asked whether its room still exists.
+    rechecked_at: Instant,
     /// Start in `wait_for_room`: the room code was over its budget at Connect.
     paused: bool,
+    /// The bridge refused an ACK because the room is gone or the relay was taken out of it,
+    /// while this reader was not opening a stream, the only other place either is seen (#377).
+    gone: bool,
     /// Where a line's files must be before the child is handed their paths (#375).
     attachments: PathBuf,
 }
@@ -3669,6 +3773,7 @@ impl RoomReader {
                             self.end(DisconnectReason::Closed);
                             return;
                         }
+                        FollowEnd::LetGo => return,
                         FollowEnd::Full => {
                             if !self.wait_for_room() {
                                 return;
@@ -3712,14 +3817,26 @@ impl RoomReader {
                 return false;
             }
             self.flush_ack();
+            // A journal that cannot sync keeps this loop from ever opening, so the room is
+            // asked here too (#377). An open that fails for any other reason asks it itself.
+            if lock(&self.hub).journal_errors.contains_key(&self.room) {
+                self.recheck_room();
+            }
+            if self.gone {
+                return false;
+            }
             thread::sleep(READER_POLL.min(until.saturating_duration_since(Instant::now())));
         }
         true
     }
 
     fn end(&self, reason: DisconnectReason) {
-        if !self.stopped() {
-            lock(&self.hub).disconnect(&self.room, reason);
+        if self.stopped() {
+            return;
+        }
+        let mut hub = lock(&self.hub);
+        if hub.rooms.get(&self.room).is_some_and(|feed| feed.id == self.feed) {
+            hub.disconnect(&self.room, reason);
         }
     }
 
@@ -3742,8 +3859,34 @@ impl RoomReader {
             lock(&self.hub).journal_blocked(&self.room, error);
             return;
         }
-        if self.source.ack(&self.room, &self.member, &self.app_word, acked).is_ok() {
-            self.acked_sent = acked;
+        match self.source.ack(&self.room, &self.member, &self.app_word, acked) {
+            Ok(()) => self.acked_sent = acked,
+            Err(error) => self.ack_refused(error),
+        }
+    }
+
+    /// The same reasons as a refused open: a room gone is Closed, a relay taken out is
+    /// Disconnected and keeps its place to resume from.
+    fn ack_refused(&mut self, error: SourceError) {
+        let reason = match error {
+            SourceError::Gone => DisconnectReason::Closed,
+            SourceError::Removed => DisconnectReason::Disconnected,
+            SourceError::Unavailable => return,
+        };
+        self.gone = true;
+        self.end(reason);
+    }
+
+    /// While Discord takes nothing, no new ACK goes out and no stream is opened, so neither can
+    /// learn of a close. The last ACK the bridge took is sent again (it never moves back), and
+    /// its refusal is read as a refused ACK.
+    fn recheck_room(&mut self) {
+        if self.gone || self.rechecked_at.elapsed() < ROOM_RECHECK_EVERY {
+            return;
+        }
+        self.rechecked_at = Instant::now();
+        if let Err(error) = self.source.ack(&self.room, &self.member, &self.app_word, self.acked_sent) {
+            self.ack_refused(error);
         }
     }
 
@@ -3753,6 +3896,7 @@ impl RoomReader {
                 return false;
             }
             self.flush_ack();
+            self.recheck_room();
             let hub = lock(&self.hub);
             if !hub.rooms.contains_key(&self.room) {
                 return false;
@@ -3774,6 +3918,9 @@ impl RoomReader {
                 return FollowEnd::Ended;
             }
             self.flush_ack();
+            if self.gone {
+                return FollowEnd::LetGo;
+            }
             match stream.read(&mut buffer) {
                 Ok(0) => return FollowEnd::Ended,
                 Ok(read) => {
@@ -3996,6 +4143,8 @@ enum FollowEnd {
     Ended,
     /// The room said it has ended.
     Closed,
+    /// A refused ACK already let the room go, with its own reason; nothing is left to end.
+    LetGo,
     /// The child holds too much unacknowledged; stop reading until it catches up.
     Full,
     /// The journal refused a write; back off, then read again from `since`.
@@ -4608,7 +4757,8 @@ impl RoomSource for BridgeSource {
         let body = serde_json::json!({ "as": as_id, "seq": seq }).to_string();
         match standalone_bridge::bridge_request_to(&target, "POST", &format!("/mail/{room}/relay-ack"), Some(body), Duration::from_millis(1500), Some(app_word)) {
             Ok((200, _)) => Ok(()),
-            Ok((404, _)) => Err(SourceError::Gone),
+            Ok((404, value)) if value.get("error").and_then(serde_json::Value::as_str) == Some("no_such_room") => Err(SourceError::Gone),
+            Ok((404, _)) => Err(SourceError::Removed),
             Ok(_) | Err(_) => Err(SourceError::Unavailable),
         }
     }

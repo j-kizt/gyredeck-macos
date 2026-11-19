@@ -8951,7 +8951,13 @@ function startBridge(config) {
         const as = typeof body.as === "string" ? body.as : "";
         const seq = Number.isSafeInteger(body.seq) && body.seq >= 0 ? body.seq : null;
         const room = SYNC_CODE.test(name) ? mailRooms.get(name) : null;
-        const member = room?.members.get(as);
+        // A room that is gone and a relay taken out of a live room are told apart: the app
+        // forgets where it was in the first and keeps it for the second (#377).
+        if (!room) {
+          sendJson(404, { ok: false, error: "no_such_room" });
+          return;
+        }
+        const member = room.members.get(as);
         if (member?.relay !== true) {
           sendJson(404, { ok: false, error: "not_a_relay" });
           return;
@@ -8965,7 +8971,9 @@ function startBridge(config) {
           sendJson(400, { ok: false, error: "invalid_seq" });
           return;
         }
-        markRead(room, as, seq, new Date().toISOString());
+        // The app repeats its last ACK to learn whether the room is still there (#377); one that
+        // moves nothing is not a read, so it neither stamps a read time nor wakes anyone.
+        if (Math.min(seq, room.seq) > (member.readSeq ?? 0)) markRead(room, as, seq, new Date().toISOString());
         sendJson(200, { ok: true, room: name, readSeq: member.readSeq });
         return;
       }

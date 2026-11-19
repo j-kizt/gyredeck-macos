@@ -50,8 +50,12 @@ impl FoundedRooms {
     fn contains(&self, code: &str) -> bool {
         self.by_code.contains_key(code)
     }
-    fn remove(&mut self, code: &str) {
-        self.by_code.remove(code);
+    /// Forget a room the bridge said has ended, unless the code was founded again since
+    /// `asked_at` (#332): a closed code can be handed to a new room before the close returns.
+    fn forget(&mut self, code: &str, asked_at: u64) {
+        if self.by_code.get(code).is_some_and(|stored| *stored <= asked_at) {
+            self.by_code.remove(code);
+        }
     }
     fn clear(&mut self) {
         self.by_code.clear();
@@ -1283,11 +1287,18 @@ pub(crate) fn sync_close(code: &str, conversation_id: &str, app_word: &str) -> R
     if !valid_room(code) || !valid_room(conversation_id) {
         return Err("Not a valid room".to_string());
     }
-    let (status, value) = bridge_request_vouched(
+    close_room(&BridgeTarget::configured()?, code, conversation_id, app_word)
+}
+
+fn close_room(target: &BridgeTarget, code: &str, conversation_id: &str, app_word: &str) -> Result<(), String> {
+    let asked_at = founded_rooms().generation();
+    let (status, value) = bridge_request_to(
+        target,
         "DELETE",
         &format!("/sync/rooms/{code}?as={conversation_id}"),
         None,
-        app_word,
+        MAIL_REQUEST_TIMEOUT,
+        Some(app_word),
     )?;
     if !(200..300).contains(&status) {
         return Err(match value.get("error").and_then(serde_json::Value::as_str) {
@@ -1295,7 +1306,7 @@ pub(crate) fn sync_close(code: &str, conversation_id: &str, app_word: &str) -> R
             _ => sync_error(status, &value),
         });
     }
-    founded_rooms().remove(code);
+    founded_rooms().forget(code, asked_at);
     Ok(())
 }
 
@@ -1384,13 +1395,24 @@ pub(crate) fn sync_leave(code: &str, conversation_id: &str, app_word: &str) -> R
     if !valid_room(code) || !valid_room(conversation_id) {
         return Err("Not a valid room".to_string());
     }
-    let (status, value) =
-        bridge_request_vouched("DELETE", &format!("/sync/rooms/{code}/members/{conversation_id}"), None, app_word)?;
+    leave_room(&BridgeTarget::configured()?, code, conversation_id, app_word)
+}
+
+fn leave_room(target: &BridgeTarget, code: &str, conversation_id: &str, app_word: &str) -> Result<(), String> {
+    let asked_at = founded_rooms().generation();
+    let (status, value) = bridge_request_to(
+        target,
+        "DELETE",
+        &format!("/sync/rooms/{code}/members/{conversation_id}"),
+        None,
+        MAIL_REQUEST_TIMEOUT,
+        Some(app_word),
+    )?;
     // Already gone is the state the caller wanted.
     if status == 404 || (200..300).contains(&status) {
         // The founder leaving ends the room, and so does the last member.
         if value.get("closed").and_then(serde_json::Value::as_bool) == Some(true) {
-            founded_rooms().remove(code);
+            founded_rooms().forget(code, asked_at);
         }
         return Ok(());
     }
@@ -1546,6 +1568,64 @@ mod tests {
         net::TcpListener,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    /// A bridge that answers one request only once told to, and says when the request arrived.
+    fn held_bridge(reply: &'static str) -> (BridgeTarget, mpsc::Receiver<()>, mpsc::Sender<()>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("held bridge listener");
+        let port = listener.local_addr().expect("held bridge port").port();
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the request");
+            let (mut seen, mut buf) = (Vec::new(), [0u8; 1024]);
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).expect("read the request");
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..n]);
+            }
+            arrived_tx.send(()).expect("say it arrived");
+            go_rx.recv().expect("told to answer");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            stream.write_all(response.as_bytes()).expect("answer");
+        });
+        (BridgeTarget { port, token: "test-token".to_string() }, arrived_rx, go_tx, join)
+    }
+
+    /// Close or leave `code` on a held bridge; `refound` founds the code again while the
+    /// bridge has the request and has not yet answered.
+    fn end_held(code: &'static str, leave: bool, refound: bool) {
+        let (target, arrived, go, bridge) = held_bridge(r#"{"ok":true,"closed":true}"#);
+        let ending = thread::spawn(move || {
+            if leave {
+                leave_room(&target, code, "conv-332", "word")
+            } else {
+                close_room(&target, code, "conv-332", "word")
+            }
+        });
+        arrived.recv_timeout(Duration::from_secs(5)).expect("the request reached the bridge");
+        if refound {
+            founded_rooms().insert(code);
+        }
+        go.send(()).expect("let the bridge answer");
+        ending.join().expect("the close thread").expect("the bridge said it ended");
+        bridge.join().expect("the held bridge");
+    }
+
+    #[test]
+    fn a_code_founded_again_while_its_old_room_is_closing_stays_founded() {
+        for (code, leave) in [("sync-332-close", false), ("sync-332-leave", true)] {
+            founded_rooms().insert(code);
+            end_held(code, leave, true);
+            assert!(founded_room(code), "{code}: the old room's end forgot the new room");
+            end_held(code, leave, false);
+            assert!(!founded_room(code), "{code}: a room that ended with nothing founded since is forgotten");
+        }
+    }
 
     fn wait_for_probe(endpoint: BridgeEndpoint, expected: BridgeProbe) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);

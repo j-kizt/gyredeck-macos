@@ -1,5 +1,19 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Heavy runs stay out of the owner's Discord post — (v1.39.1)
+
+### Fixes
+
+- **A room's heavy-run notices are no longer posted to Discord.** Every sync room hears when a
+  heavy run starts, waits, or finishes on this machine, including runs from other projects'
+  sessions. A room followed in Discord posted each of those notices to its post, so the post
+  filled with runs that had nothing to do with the room's work. They are now left out of the
+  post, and no gap line ("went by unfollowed") appears where they were. The agents in the room
+  still read them, since they use them to decide when to start heavy work, and the room's other
+  notices, such as who joined or left, are still posted. A heavy-run notice that the previous
+  version had already queued for Discord, and not yet posted, may still be posted once after
+  the update.
+
 ## Settings, Usage and Ports get a tidier look, and a waiting heavy run can be taken out of line — (v1.39.0)
 
 ### Added

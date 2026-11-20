@@ -36,6 +36,8 @@ export interface IUseDiscord {
   status: IDiscordStatus | null;
   /** Why the last command failed, as the native side said it. */
   failure: string | null;
+  /** Which command on which room that was, so the room's own row can say it (#376). */
+  failedOn: { command: string; room: string | null } | null;
   busy: boolean;
   run: (command: string, args?: Record<string, unknown>) => Promise<unknown>;
   /** Disconnect these rooms from Discord; what failed is kept until the next try (#205). */
@@ -49,6 +51,7 @@ const DISCORD_POLL_MS = 5_000;
 export const useDiscord = (canUseNativeControls: boolean): IUseDiscord => {
   const [status, setStatus] = useState<IDiscordStatus | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
+  const [failedOn, setFailedOn] = useState<IUseDiscord["failedOn"]>(null);
   const [busy, setBusy] = useState(false);
   const [stillConnected, setStillConnected] = useState<IDisconnectAllResult["failed"]>([]);
 
@@ -70,10 +73,12 @@ export const useDiscord = (canUseNativeControls: boolean): IUseDiscord => {
   const run = useCallback(async (command: string, args?: Record<string, unknown>) => {
     setBusy(true);
     setFailure(null);
+    setFailedOn(null);
     try {
       return await invoke(command, args);
     } catch (e) {
       setFailure(e instanceof Error ? e.message : String(e));
+      setFailedOn({ command, room: typeof args?.code === "string" ? args.code : null });
       return undefined;
     } finally {
       await read();
@@ -84,6 +89,7 @@ export const useDiscord = (canUseNativeControls: boolean): IUseDiscord => {
   const disconnectEvery = useCallback(async (rooms: readonly string[]) => {
     setBusy(true);
     setFailure(null);
+    setFailedOn(null);
     try {
       const result = await disconnectAll(rooms, (code) => invoke("discord_disconnect", { code }));
       setStillConnected(result.failed);
@@ -93,5 +99,5 @@ export const useDiscord = (canUseNativeControls: boolean): IUseDiscord => {
     }
   }, [read]);
 
-  return { status, failure, busy, run, disconnectAll: disconnectEvery, stillConnected };
+  return { status, failure, failedOn, busy, run, disconnectAll: disconnectEvery, stillConnected };
 };

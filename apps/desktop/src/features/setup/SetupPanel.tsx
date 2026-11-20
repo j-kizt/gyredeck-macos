@@ -102,7 +102,7 @@ export interface ISetupPanelProps {
   keepAwakeError: string | null;
   hookStatus: IHookStatus;
   /** Rooms the bridge currently holds, keyed by code. Only ones with members are shown. */
-  mailRooms: Record<string, { room: string; members: string[]; pending: number; founder: string | null }>;
+  mailRooms: Record<string, { room: string; members: string[]; pending: number; founder: string | null; capacity?: number | null }>;
   notifications: INotificationsState;
   onCloseRoom: (room: string, founder: string) => Promise<void>;
   /** Per agent; null or absent while unknown, so a switch does not claim "off" before it has looked; a string is why it could not look. */
@@ -263,6 +263,9 @@ const GitAccountList = ({ accounts, canUseNativeControls, onSetActive, onRemove 
 
 type MailRoom = ISetupPanelProps["mailRooms"][string];
 
+/** What the native side says when the bridge refuses a join with `room_full` (`sync_error` in standalone_bridge.rs). */
+const ROOM_FULL = "That room is full";
+
 /**
  * One sync room, laid out like a Git account, with its actions in the same ⋮ menu (#376).
  *
@@ -286,8 +289,18 @@ const SyncRoomRow = ({ entry, discord, discordReady, onCloseRoom }: {
   const followed = discord.status?.connectedRooms.includes(entry.room) === true;
   const held = heldLine(discord.status, entry.room);
   const founder = entry.founder;
+  // Discord joins as a member, so a room with no place left cannot take it (#376).
+  const full = entry.capacity != null && entry.members.length >= entry.capacity;
+  // aria-disabled, not disabled: the item stays in the arrow keys' reach, so its reason can be heard.
+  const connectBlocked = !followed && full;
+  const failed = discord.failedOn?.room === entry.room ? discord.failure : null;
+  // The advice follows the refusal itself, never the roster, which can lag it by a poll either way.
+  const failedLine = !failed ? null
+    : discord.failedOn?.command !== "discord_connect" ? `Couldn't disconnect from Discord: ${failed}`
+    : failed === ROOM_FULL ? `Couldn't connect to Discord: the room is full${full ? ` (${entry.members.length} of ${entry.capacity})` : ""}. Discord needs a place of its own — have a session leave, then Connect again.`
+    : `Couldn't connect to Discord: ${failed}`;
   return (
-    <div className="setup-account-row" data-closing={closing} data-held={held ? "true" : undefined}>
+    <div className="setup-account-row" data-closing={closing} data-held={held || failedLine ? "true" : undefined}>
       <span className="setup-account-icon"><Link2 size={15} strokeWidth={2.3} /></span>
       <span className="setup-account-main">
         <span className="setup-account-login">
@@ -317,12 +330,13 @@ const SyncRoomRow = ({ entry, discord, discordReady, onCloseRoom }: {
             {/* Offered only once a post has somewhere to go and someone to answer to, and only for a
                 room this Mac founded, as before #376. */}
             {founder && discordReady ? (
-              <button className="setup-menu-item" type="button" role="menuitem" disabled={discord.busy} aria-label={followed ? "Disconnect from Discord" : "Connect to Discord"} onClick={() => { close(); void discord.run(followed ? "discord_disconnect" : "discord_connect", { code: entry.room }); }}>
+              <button className="setup-menu-item" type="button" role="menuitem" disabled={discord.busy} aria-disabled={connectBlocked || undefined} title={connectBlocked ? `This room is full (${entry.members.length} of ${entry.capacity})` : undefined} aria-label={followed ? "Disconnect from Discord" : connectBlocked ? `Connect to Discord: the room is full (${entry.members.length} of ${entry.capacity})` : "Connect to Discord"} onClick={() => { if (connectBlocked) return; close(); void discord.run(followed ? "discord_disconnect" : "discord_connect", { code: entry.room }); }}>
                 <DiscordLogo size={12} /> {followed ? "Disconnect" : "Connect"}
+                {connectBlocked ? <span className="setup-menu-item-why" aria-hidden="true">Room full</span> : null}
               </button>
             ) : null}
             {/* The founder is the input sync_close needs; a bridge that names none gets no close to send. */}
-            <button className="setup-menu-item danger" type="button" role="menuitem" disabled={!founder} title={founder ? "Close this room for everyone in it" : "This room's founder is not known"} onClick={() => {
+            <button className="setup-menu-item danger" type="button" role="menuitem" aria-disabled={!founder || undefined} aria-label={founder ? undefined : "Close room: this room's founder is not known"} title={founder ? "Close this room for everyone in it" : "This room's founder is not known"} onClick={() => {
               if (!founder) return;
               close();
               setClosing(true);
@@ -334,6 +348,7 @@ const SyncRoomRow = ({ entry, discord, discordReady, onCloseRoom }: {
         ) : null}
       </div>
       {held ? <span className="setup-detail setup-account-held" role="status" data-discord="room-held">{held}</span> : null}
+      {failedLine ? <span className="setup-detail setup-account-held" role="status" data-discord="room-failed">{failedLine}</span> : null}
     </div>
   );
 };

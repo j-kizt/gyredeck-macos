@@ -120,12 +120,15 @@ const assetRoot = join(distRoot, "assets");
  * by exactly that, by the owner from Discord the same day ("yes", sync-xas5 seq 742 to 732).
  * CI then read 123,159 / 126,232, 36 B over those local figures (a local build reads under CI, as
  * above); both set to the CI figure by the owner at the terminal the same day.
+ * #376 reopened (a refused Connect said on its room's row, a full room's Connect marked and
+ * reachable by the keys) read 123,483 / 126,557 on CI, +324 / +325; both set to the CI figure,
+ * approved by the owner at the terminal on 2026-11-21.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 123_159,
-  jsTotalGzipBytes: 126_232,
+  jsGzipBytes: 123_483,
+  jsTotalGzipBytes: 126_557,
 };
 
 const walk = async (directory) => {

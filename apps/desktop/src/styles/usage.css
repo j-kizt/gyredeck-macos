@@ -51,9 +51,8 @@
   gap: 4px;
   min-width: 0;
   min-height: 0;
-  overflow-y: auto;
+  overflow-y: scroll;
   padding-right: 10px;
-  scrollbar-gutter: stable;
   border-right: 1px solid var(--hair);
 }
 
@@ -98,10 +97,9 @@
 .usage-detail-panel {
   min-width: 0;
   min-height: 0;
-  overflow-y: auto;
+  overflow-y: scroll;
   /* The shared gutter rule (panel-body.css .sheet-body): slot kept, paid from the padding. */
   padding: 0 calc(var(--sheet-inline-padding) - var(--scrollbar-gutter)) 22px 0;
-  scrollbar-gutter: stable;
 }
 
 .usage-settings-panel {
@@ -677,9 +675,8 @@
     grid-template-rows: auto minmax(0, 1fr);
     align-content: start;
     gap: 8px;
-    overflow-y: auto;
+    overflow-y: scroll;
     padding-right: calc(var(--sheet-inline-padding) - var(--scrollbar-gutter));
-    scrollbar-gutter: stable;
   }
 
   .usage-layout[data-view="settings"] {

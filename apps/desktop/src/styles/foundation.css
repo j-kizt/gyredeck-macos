@@ -26,7 +26,9 @@
   --field-border: var(--hair);
   --field-radius: 6px;
   --field-padding: 5px 7px;
-  --scrollbar-track: rgba(255, 255, 255, 0.035);
+  /* Transparent: every scroller keeps its bar slot (overflow-y: scroll), and an empty slot must
+     not draw a stripe down a page that does not scroll (#376, approved design 2026-11-21). */
+  --scrollbar-track: transparent;
   --scrollbar-thumb: rgba(255, 255, 255, 0.16);
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.25);
   /* The bar's width, and the slot every scroller keeps for it whether or not it overflows. */

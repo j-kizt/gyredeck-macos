@@ -76,13 +76,13 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  overflow-y: auto;
+  overflow-y: scroll;
   padding-bottom: 12px;
   /* The sheet gives this view no right padding, so the panel reaches the window edge itself
      and pads back in: the scrollbar sits at the edge, as Usage's does, instead of inset beside
      the content (#277). A negative margin did this before #376, and made .setup-layout, which
      hides overflow, scroll sideways on focus. */
-  scrollbar-gutter: stable; padding-right: calc(var(--sheet-inline-padding) - var(--scrollbar-gutter));
+  padding-right: calc(var(--sheet-inline-padding) - var(--scrollbar-gutter));
 }
 
 /* This column scrolls; its rows must never be squeezed to fit it. A row with an explicit

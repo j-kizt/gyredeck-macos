@@ -547,9 +547,8 @@
   flex-direction: column;
   gap: 2px;
   min-height: 72px;
-  overflow-y: auto;
+  overflow-y: scroll;
   padding-right: 2px;
-  scrollbar-gutter: stable;
 }
 
 .action-row {
@@ -1124,9 +1123,8 @@
   flex-direction: column;
   gap: 6px;
   min-height: 72px;
-  overflow-y: auto;
+  overflow-y: scroll;
   padding: 0 2px 0 0;
-  scrollbar-gutter: stable;
 }
 
 .session-sync-message {

@@ -1980,6 +1980,21 @@ test("#205 the owner voice's own messages coming back from the room are not rela
   await c.close();
 });
 
+test("#436 a heavy-run notice is acknowledged and never posted; the room's other notices and lines still are", async () => {
+  const { c, fake, statePath, of } = await ownerRoom();
+  c.handle(message("sync-abcd", 1, { sender: "Room", senderId: "gyredeck-room", kind: "heavy", text: "HEAVY RUN: Claude Code started cargo test." }));
+  c.handle(message("sync-abcd", 2, { sender: "Room", senderId: "gyredeck-room", kind: "notice", text: "Codex joined." }));
+  c.handle(message("sync-abcd", 3, { sender: "Room", senderId: "gyredeck-room", kind: "heavy", text: "HEAVY RUN: Claude Code's cargo test finished (1m 2s)." }));
+  c.handle(message("sync-abcd", 4, { senderId: "conv-gyre", text: "m4" }));
+  await flush();
+  const said = fake.sent.map((s) => s.content).join("\n");
+  assert.doesNotMatch(said, /HEAVY RUN/);
+  assert.deepEqual(texts(fake).filter((t) => t === "Codex joined." || /^m\d$/.test(t)), ["Codex joined.", "m4"]);
+  assert.deepEqual(of("posted").map((p) => p.seq), [1, 2, 3, 4], "every seq is accounted for, so no gap is said");
+  assert.equal(saved(statePath).lastSeq, 4);
+  await c.close();
+});
+
 test("#205 /disconnect is registered as a guild command with no option: it acts on its post's room only", async () => {
   const { c, fake } = await boot({ ownerId: OWNER });
   assert.deepEqual(fake.commands.find((d) => d.name === "disconnect"), { name: "disconnect", description: "Stop following this room in Discord (the room stays open)" });

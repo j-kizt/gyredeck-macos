@@ -67,6 +67,9 @@ const APP_SENDER: &str = "gyredeck";
 /// from a call carrying the machine token and the app's word.
 pub(crate) const OWNER_SENDER: &str = "gyredeck-owner-discord";
 const OWNER_LABEL: &str = "You (via Discord)";
+/// The kind a room's heavy-run notice reaches the child under (#436): it accounts for the seq
+/// and posts nothing, so the owner's post is not filled with other sessions' runs.
+const HEAVY_KIND: &str = "heavy";
 /// Every agent in a connected room idle this long, and the owner is asked once whether to
 /// disconnect (#205). Nothing disconnects on its own.
 const QUIET_AFTER: Duration = Duration::from_secs(10 * 60);
@@ -3735,6 +3738,9 @@ struct WireMessage {
     approval: Option<serde_json::Value>,
     #[serde(default)]
     files: Vec<FileRef>,
+    /// What a room notice is about (#436); `heavy` marks a heavy-run notice.
+    #[serde(default)]
+    topic: Option<String>,
 }
 
 impl RoomReader {
@@ -4028,11 +4034,12 @@ impl RoomReader {
                 self.names.get(other).cloned().unwrap_or_else(|| other.to_string())
             }
         };
+        let from_room = message.from == ROOM_SENDER;
         let kind = match message.kind.as_deref() {
+            Some("notice") if from_room && message.topic.as_deref() == Some("heavy") => HEAVY_KIND.to_string(),
             Some(kind @ ("ask" | "tell" | "reaction" | "notice")) => kind.to_string(),
             _ => "tell".to_string(),
         };
-        let from_room = message.from == ROOM_SENDER;
         // The person, by either of their voices: an ask to them is the one that pings (#205).
         let to_owner = kind == "ask" && matches!(message.to.as_deref(), Some(OWNER_SENDER | APP_SENDER));
         let yes_no = kind == "ask" && message.yes_no == Some(serde_json::Value::Bool(true));

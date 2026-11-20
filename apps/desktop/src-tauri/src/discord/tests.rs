@@ -620,6 +620,24 @@ fn a_gap_in_the_room_is_said_once_as_a_count() {
 }
 
 #[test]
+fn a_heavy_run_notice_reaches_the_child_as_its_own_kind_only_from_the_room() {
+    let f = fixture("heavy", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    f.members(ROOM, &[("peer-a", "Codex")]);
+    let heavy = |seq: u64, from: &str, kind: &str| {
+        let mut line = mail(seq, from, "everyone", kind, "HEAVY RUN: Codex started cargo test.");
+        line["topic"] = "heavy".into();
+        line
+    };
+    f.stream(ROOM, &[heavy(1, "gyredeck-room", "notice"), mail(2, "gyredeck-room", "everyone", "notice", "Codex joined."), heavy(3, "peer-a", "tell"), heavy(4, "peer-a", "notice")]);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("four", || of_kind(&buffer.lines(), "message").iter().any(|m| m["seq"] == 4));
+    let lines = buffer.lines();
+    let seen: Vec<(u64, String)> = of_kind(&lines, "message").iter().map(|m| (m["seq"].as_u64().unwrap(), m["kind"].as_str().unwrap().into())).collect();
+    assert_eq!(seen, vec![(1, "heavy".into()), (2, "notice".into()), (3, "tell".into()), (4, "notice".into())]);
+}
+
+#[test]
 fn no_line_to_the_child_carries_the_apps_word() {
     let f = fixture("secrets", Some(TOKEN));
     let buffer = f.attach_buffer();

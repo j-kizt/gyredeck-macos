@@ -6490,6 +6490,9 @@ function startBridge(config) {
       ...(routing?.approval && kind === "ask" ? { approval: routing.approval } : {}),
       ...(routing?.[VOUCHED] === true && routing.approved ? { approved: routing.approved } : {}),
       ...(from === ROOM_SENDER && typeof routing?.about === "string" ? { about: routing.about } : {}),
+      // What a room notice is about, by field rather than by its words (#436): the Discord
+      // relay leaves the heavy-run ones out of the owner's thread.
+      ...(from === ROOM_SENDER && typeof routing?.topic === "string" ? { topic: routing.topic } : {}),
       ...(from === ROOM_SENDER && Array.isArray(routing?.[WAKES]) && routing[WAKES].length > 0 ? { [WAKES]: routing[WAKES] } : {}),
       // Which message the person on Discord answered (#205), by seq — not `replyTo`, which
       // names a mailbox to answer to.
@@ -7268,7 +7271,7 @@ function startBridge(config) {
   const tellRoomsOfHeavy = (text, about) => {
     for (const room of mailRooms.values()) {
       if (room.members.size === 0) continue;
-      publishMail(room, ROOM_SENDER, `HEAVY RUN: ${text}`, null, false, { [VOUCHED]: true, kind: "notice", quiet: true, about: about ?? undefined });
+      publishMail(room, ROOM_SENDER, `HEAVY RUN: ${text}`, null, false, { [VOUCHED]: true, kind: "notice", quiet: true, topic: "heavy", about: about ?? undefined });
     }
   };
   const holderLabel = (holder) => heavyLabelFor(holder.as) ?? holder.as;

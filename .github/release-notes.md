@@ -1,6 +1,6 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
-## See how often a sync room wakes a session — (v1.38.0)
+## See how often a sync room wakes a session — (v1.38.1)
 
 ### Added
 

@@ -1140,9 +1140,26 @@ const WATCH_REOPEN_GRACE_MS = Number(process.env.GYREDECK_WATCH_REOPEN_GRACE_MS)
  *  self-update ends a live thread with `other` and resumes it 3–4 s later (log 11-10 → 11-13,
  *  max 4.4 s; real ends were ≥ 65 s apart from any resume). */
 const CLOSE_GRACE_MS = Number(process.env.GYREDECK_CLOSE_GRACE_MS) || 15_000;
+/** The same grace for a Codex thread (#380 reopened): on 2026-11-20 a daemon self-update resumed
+ *  the thread 16 s after its close. A limited mitigation, nothing more: past it the member leaves
+ *  as before and comes back only with the owner's fresh confirmation. */
+const CODEX_CLOSE_GRACE_MS = Number(process.env.GYREDECK_CODEX_CLOSE_GRACE_MS) || 60_000;
 /** SessionEnd reasons that are someone leaving on purpose (Claude Code hooks reference): the
  *  session is not coming back under this id, so it leaves at once. Anything else waits. */
 const DELIBERATE_ENDS = new Set(["clear", "resume", "logout", "prompt_input_exit", "bypass_permissions_disabled"]);
+/** The only close reasons kept (#380 reopened): what a hook sends is its own input, so anything
+ *  else is stored as `other` and no arbitrary text reaches the event log. `quit` is the adapters'
+ *  default when the agent gave none. */
+const CLOSE_REASONS = new Set([...DELIBERATE_ENDS, "other", "quit"]);
+const closeReason = (reason) => (CLOSE_REASONS.has(reason) ? reason : "other");
+/** A close as it is kept: the allowlisted reason and the counts Codex's hook sends, numbers or null. */
+const closeData = (data) => {
+  const kept = { reason: closeReason(data?.reason) };
+  for (const key of ["durationMs", "messageCount", "toolCallCount"]) {
+    if (data && key in data) kept[key] = Number.isFinite(data[key]) ? data[key] : null;
+  }
+  return kept;
+};
 
 // ── Token management ──
 
@@ -2640,7 +2657,7 @@ function startBridge(config) {
       if (syncRoomFor(conversationId)?.room.members.get(conversationId) === held && !seenSince(held, closedAt)) {
         releaseClosedSession(conversationId);
       }
-    }, CLOSE_GRACE_MS);
+    }, isCodexSession(conversationId) ? CODEX_CLOSE_GRACE_MS : CLOSE_GRACE_MS);
     timer.unref?.();
     closingSessions.set(conversationId, { timer, closedAt });
   };
@@ -7472,6 +7489,7 @@ function startBridge(config) {
         return;
       }
       if (body && typeof body === "object" && typeof body.type === "string" && typeof body.id === "string") {
+        if (body.type === "conversation_close") body.data = closeData(body.data);
         emitLocal(body, { stampedBySession: true });
         res.writeHead(202, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
         res.end(JSON.stringify({ ok: true, type: body.type }));

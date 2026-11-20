@@ -15555,6 +15555,64 @@ test("#380: back by anything of its own stamped after the close; an old timer ne
   }
 });
 
+test("#380 reopened: a Codex thread waits out a longer grace of its own, and leaves at once on purpose", async () => {
+  const f = await leanRoomFixture("c380", { GYREDECK_CLOSE_GRACE_MS: "800", GYREDECK_CODEX_CLOSE_GRACE_MS: "3000" });
+  try {
+    const event = (type, data, at = new Date()) => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type, timestamp: at.toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" }, data,
+    });
+    const inRoom = async () => (await f.call("GET", `/sync/rooms?as=${f.peer}`)).body.room === f.code;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // The 2026-11-20 self-update: `other`, then the resume past the 15 s every session gets.
+    await event("conversation_close", { reason: "other" });
+    await pause(1500);
+    assert.equal(await inRoom(), true, "C1: past the common grace, a Codex thread is still waiting out its own");
+    await event("conversation_open", { reason: "resume" });
+    await pause(2500);
+    assert.equal(await inRoom(), true, "C1: back inside it, the thread keeps its place");
+
+    await event("conversation_close", { reason: "other" });
+    await pause(1500);
+    assert.equal(await inRoom(), true, "C2: premise: still waiting");
+    await pause(2500);
+    assert.equal(await inRoom(), false, "C2: not back by the end of its grace, it leaves");
+
+    await f.admit(f.peer);
+    await event("conversation_close", { reason: "logout" });
+    assert.equal(await inRoom(), false, "C3: a deliberate end does not wait, Codex or not");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#380 reopened: a close keeps only an allowlisted reason and its counts, never what else the hook sent", async () => {
+  const f = await leanRoomFixture("r380", { GYREDECK_CLOSE_GRACE_MS: "800" });
+  try {
+    const logFile = join(f.home, ...CONFIG_DIR, "gyredeck.events.ndjson");
+    const close = (data) => f.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "conversation_close", timestamp: new Date().toISOString(), conversationId: f.peer, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" }, data,
+    });
+    const closes = async () => (await readFile(logFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line))
+      .filter((event) => event.type === "conversation_close" && event.conversationId === f.peer).map((event) => event.data);
+
+    assert.equal((await close({ reason: "SECRET-REASON", durationMs: 1200, messageCount: "SECRET-COUNT", note: "SECRET-NOTE" })).status, 202, "premise: taken");
+    assert.equal((await close({ reason: "logout", toolCallCount: null })).status, 202, "premise: taken");
+    assert.equal((await close(null)).status, 202, "premise: a close with no data is taken");
+    const kept = await closes();
+    assert.deepEqual(kept, [
+      { reason: "other", durationMs: 1200, messageCount: null },
+      { reason: "logout", toolCallCount: null },
+      { reason: "other" },
+    ], "R1: an unknown reason is kept as other, a known one as itself, and nothing else the hook sent");
+    assert.doesNotMatch(await readFile(logFile, "utf8"), /SECRET-/, "R2: the log on disk holds none of it");
+  } finally {
+    await f.close();
+  }
+});
+
 test("#380: every hook stamps its event when the agent fired it, not when its input finished arriving", async () => {
   // A hook whose stdin lands late (a busy machine, or the old process's hook still running
   // after SessionEnd) must not stamp a turn_start after a close that came later.

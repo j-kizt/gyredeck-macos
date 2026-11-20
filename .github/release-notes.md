@@ -4,9 +4,10 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
 
 ### Fixes
 
-- **A room's heavy-run notices are no longer posted to Discord.** Every sync room hears when a
-  heavy run starts, waits, or finishes on this machine, including runs from other projects'
-  sessions. A room followed in Discord posted each of those notices to its post, so the post
+- **A room's heavy-run notices are no longer posted to Discord.** Sync rooms are told about heavy
+  runs on this machine, including runs from other projects' sessions: a run that has gone on for
+  more than 30 seconds, someone waiting behind another session's run or for the machine's load to drop, and the end of a run whose
+  start was told. A room followed in Discord posted each of those notices to its post, so the post
   filled with runs that had nothing to do with the room's work. They are now left out of the
   post, and no gap line ("went by unfollowed") appears where they were. The agents in the room
   still read them, since they use them to decide when to start heavy work, and the room's other

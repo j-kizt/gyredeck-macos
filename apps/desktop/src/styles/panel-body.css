@@ -9,12 +9,26 @@
      header in .sheet-inner. */
   margin-inline: calc(-1 * var(--sheet-inline-padding));
   padding: 0 var(--sheet-inline-padding) 12px;
+  /* The gutter rule every scroller shares (Usage, Settings): the bar's slot is kept whether
+     or not the content overflows, and paid for out of the right padding, so the content sits
+     --sheet-inline-padding from both window edges either way. */
+  padding-right: calc(var(--sheet-inline-padding) - var(--scrollbar-gutter));
+  scrollbar-gutter: stable;
+}
+
+/* Usage and Settings scroll inside, under the same rule; a kept slot here would be a second,
+   empty one beside theirs. They reach the window edge themselves, so their scrollers do without
+   a negative margin: one past a box that hides its overflow is clipped there, and focus can
+   scroll that box sideways. */
+.sheet-body[data-view="usage"],
+.sheet-body[data-view="setup"] {
+  padding-right: 0;
+  scrollbar-gutter: auto;
 }
 
 .sheet-body[data-view="usage"] {
-  margin-inline: 0;
   overflow: hidden;
-  padding: 0;
+  padding: 0 0 0 var(--sheet-inline-padding);
 }
 
 /* Settings scrolls its two columns separately, so the page must not scroll as well —
@@ -35,7 +49,7 @@
   height: 8px;
   border-radius: 50%;
   flex: none;
-  background: #5b5b5f;
+  background: var(--status-idle);
 }
 
 .bridge-dot[data-connected="true"] {

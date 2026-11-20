@@ -3208,8 +3208,8 @@ impl Core {
             .ok_or(STALE)?;
         let mut record = match self.approvals.read() {
             Ok(Some(bytes)) => serde_json::from_slice::<totp::Record>(&bytes)
-                .map_err(|_| "The saved approval code cannot be read, so nothing was approved. Set it up again in Settings → Permission".to_string())?,
-            Ok(None) => return Err("Approval codes are not set up, so nothing was approved. Set one up in Gyredeck's Settings → Permission".to_string()),
+                .map_err(|_| "The saved multi-factor authentication secret cannot be read, so nothing was approved. Set it up again in Gyredeck's Settings → Connection".to_string())?,
+            Ok(None) => return Err("Multi-factor authentication is not set up, so nothing was approved. Set it up in Gyredeck's Settings → Connection".to_string()),
             Err(why) => return Err(format!("Gyredeck could not read the approval code from the Keychain ({why}), so nothing was approved")),
         };
         let verdict = record.check(&approve.code.0, now_ms / 1000);
@@ -3228,7 +3228,7 @@ impl Core {
                 return Err(format!("That code is not right, so nothing was approved. {left} more wrong code{} lock{} approvals", plural(u64::from(left)), if left == 1 { "s" } else { "" }));
             }
             totp::Verdict::Wrong { locked: true } | totp::Verdict::Locked => {
-                return Err("Approvals are locked after three wrong codes. Unlock them in Gyredeck's Settings → Permission on the Mac".to_string());
+                return Err("Approvals are locked after three wrong codes. Unlock multi-factor authentication in Gyredeck's Settings → Connection on the Mac".to_string());
             }
             totp::Verdict::Malformed => return Err("That is not a 6-digit code, so it was not checked".to_string()),
         }

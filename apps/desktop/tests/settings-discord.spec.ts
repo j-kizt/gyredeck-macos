@@ -2,9 +2,10 @@ import { readFileSync } from "node:fs";
 import { expect, test, type Page } from "@playwright/test";
 
 /**
- * Settings → Permission → Remote access: the Discord bot that follows sync rooms (#199), and the
- * per-room Discord button on the founder's rows under Settings → Connection. The native commands
- * are mocked with the `discord_status` shape the Rust side answers.
+ * Settings → Permission → Remote access: the Discord bot that follows sync rooms (#199), the
+ * per-room ⋮ menu under Settings → Sync → Rooms (#376), and multi-factor authentication under
+ * Settings → Connection → Security. The native commands are mocked with the `discord_status`
+ * shape the Rust side answers.
  */
 
 type Status = {
@@ -122,7 +123,7 @@ const mock = async (page: Page, status: Status) => {
   }, [status, ROOMS] as const);
 };
 
-const open = async (page: Page, status: Status, tab: "Permission" | "Connection" = "Permission") => {
+const open = async (page: Page, status: Status, tab: "Permission" | "Connection" | "Sync" = "Permission") => {
   await mock(page, status);
   await page.goto("/?demo=1");
   await page.getByRole("button", { name: "Settings" }).click();
@@ -243,30 +244,113 @@ for (const [code, copy] of Object.entries(ERROR_COPY)) {
   });
 }
 
-test.describe("the room button", () => {
+test.describe("the room menu", () => {
   const founderRow = (page: Page) => page.locator(".setup-account-row", { hasText: "sync-abcd" });
   const joinedRow = (page: Page) => page.locator(".setup-account-row", { hasText: "sync-wxyz" });
-
-  test("sits only on the founder's row, tinted while followed, and toggles", async ({ page }) => {
-    await open(page, paired({ connectedRooms: ["sync-abcd"] }), "Connection");
-    await expect(joinedRow(page)).toBeVisible();
-    await expect(joinedRow(page).getByRole("button", { name: /Discord/ })).toHaveCount(0);
-    const button = founderRow(page).getByRole("button", { name: "Disconnect from Discord" });
-    // Named by aria-label itself, not only by the title a name lookup would fall back to.
-    await expect(button).toHaveAttribute("aria-label", "Disconnect from Discord");
-    await expect(button).toHaveAttribute("title", "Disconnect from Discord");
-    await expect(button).toHaveAttribute("data-active", "true");
+  const menuOf = async (row: ReturnType<typeof founderRow>, room: string) => {
+    const button = row.getByRole("button", { name: `Actions for ${room}` });
+    await expect(button).toHaveAttribute("aria-haspopup", "menu");
     await button.click();
-    const again = founderRow(page).getByRole("button", { name: "Connect to Discord" });
-    await expect(again).toHaveAttribute("data-active", "false");
-    await expect(again).toHaveAttribute("aria-label", "Connect to Discord");
-    await expect(again).toHaveAttribute("title", "Connect to Discord");
-    await again.click();
-    await expect(founderRow(page).getByRole("button", { name: "Disconnect from Discord" })).toBeVisible();
-    expect((await calls(page)).filter((call) => call.command.startsWith("discord_") && call.command !== "discord_status")).toEqual([
+    await expect(button).toHaveAttribute("aria-expanded", "true");
+    return row.getByRole("menu");
+  };
+
+  test("every row has a ⋮ menu; the founder's offers Connect / Disconnect and Close room, and a followed room says so after its name", async ({ page }) => {
+    await open(page, paired({ connectedRooms: ["sync-abcd"] }), "Sync");
+    // Connected: a 12px accent Discord mark after the name, named for a screen reader.
+    const mark = founderRow(page).locator(".setup-account-login").getByRole("img", { name: "Connected to Discord" });
+    await expect(mark).toBeVisible();
+    expect(await mark.evaluate((el) => getComputedStyle(el).color)).toBe(await page.evaluate(() => `rgb(${getComputedStyle(document.documentElement).getPropertyValue("--accent-rgb").trim()})`));
+    expect(await mark.locator("svg").evaluate((el) => el.getAttribute("width"))).toBe("12");
+    await expect(joinedRow(page).getByRole("img", { name: "Connected to Discord" })).toHaveCount(0);
+    // No action sits on the row itself any more; it is all in the menu.
+    await expect(founderRow(page).getByRole("button", { name: /Discord|Close room/ })).toHaveCount(0);
+
+    let menu = await menuOf(founderRow(page), "sync-abcd");
+    await expect(menu.getByRole("menuitem")).toHaveText(["Disconnect", "Close room"]);
+    await menu.getByRole("menuitem", { name: "Disconnect from Discord" }).click();
+    await expect(founderRow(page).getByRole("menu")).toHaveCount(0);
+    await expect(founderRow(page).getByRole("img", { name: "Connected to Discord" })).toHaveCount(0);
+    menu = await menuOf(founderRow(page), "sync-abcd");
+    await expect(menu.getByRole("menuitem")).toHaveText(["Connect", "Close room"]);
+    await menu.getByRole("menuitem", { name: "Connect to Discord" }).click();
+    await expect(founderRow(page).getByRole("img", { name: "Connected to Discord" })).toBeVisible();
+    expect((await calls(page)).filter((call) => call.command.startsWith("discord_") && call.command !== "discord_status" && call.command !== "discord_approvals")).toEqual([
       { command: "discord_disconnect", args: { code: "sync-abcd" } },
       { command: "discord_connect", args: { code: "sync-abcd" } },
     ]);
+
+    // A joined room has a menu too; this Mac did not found it, so it has no founder to close it as.
+    const joined = await menuOf(joinedRow(page), "sync-wxyz");
+    await expect(joined.getByRole("menuitem")).toHaveText(["Close room"]);
+    await expect(joined.getByRole("menuitem", { name: "Close room" })).toBeDisabled();
+  });
+
+  test("the menu closes on Escape and on a click outside it, and its items never wrap", async ({ page }) => {
+    await open(page, paired(), "Sync");
+    const menu = await menuOf(founderRow(page), "sync-abcd");
+    for (const item of await menu.getByRole("menuitem").all()) {
+      expect(await item.evaluate((el) => getComputedStyle(el).whiteSpace)).toBe("nowrap");
+    }
+    await page.keyboard.press("Escape");
+    await expect(menu).toHaveCount(0);
+    // The menu's Escape is the menu's: Settings, which also closes on Escape, stays open.
+    await expect(page.getByRole("tabpanel", { name: "Sync" })).toBeVisible();
+    await menuOf(founderRow(page), "sync-abcd");
+    await page.locator(".setup-section-heading").click();
+    await expect(founderRow(page).getByRole("menu")).toHaveCount(0);
+  });
+
+  test("the menu is a menu to the keyboard: Enter opens it on its first item, the arrows, Home and End move between items, and Escape gives focus back to ⋮ (#376 audit)", async ({ page }) => {
+    await open(page, paired({ connectedRooms: ["sync-abcd"] }), "Sync");
+    const button = founderRow(page).getByRole("button", { name: "Actions for sync-abcd" });
+    await button.focus();
+    await page.keyboard.press("Enter");
+    const menu = founderRow(page).getByRole("menu");
+    const disconnect = menu.getByRole("menuitem", { name: "Disconnect from Discord" });
+    const close = menu.getByRole("menuitem", { name: "Close room" });
+    await expect(disconnect).toBeFocused();
+    await page.keyboard.press("ArrowDown");
+    await expect(close).toBeFocused();
+    await page.keyboard.press("ArrowDown");
+    await expect(disconnect).toBeFocused();
+    await page.keyboard.press("ArrowUp");
+    await expect(close).toBeFocused();
+    await page.keyboard.press("Home");
+    await expect(disconnect).toBeFocused();
+    await page.keyboard.press("End");
+    await expect(close).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(menu).toHaveCount(0);
+    await expect(button).toBeFocused();
+    await expect(page.getByRole("tabpanel", { name: "Sync" })).toBeVisible();
+    expect((await calls(page)).filter((call) => call.command === "discord_disconnect" || call.command === "sync_close")).toEqual([]);
+  });
+
+  test("Close room closes the founder's room as its founder, and the ⋮ button spins and stays shut until it is done", async ({ page }) => {
+    await open(page, paired(), "Sync");
+    await page.evaluate(() => {
+      const internals = (window as typeof window & { __TAURI_INTERNALS__: { invoke: (c: string, a?: unknown) => Promise<unknown> } }).__TAURI_INTERNALS__;
+      const real = internals.invoke;
+      const w = window as typeof window & { __closes: unknown[]; __finish?: () => void };
+      w.__closes = [];
+      internals.invoke = (command, args) => {
+        if (command !== "sync_close") return real(command, args);
+        w.__closes.push(args);
+        return new Promise((resolve) => { w.__finish = () => resolve(null); });
+      };
+    });
+    const menu = await menuOf(founderRow(page), "sync-abcd");
+    const close = menu.getByRole("menuitem", { name: "Close room" });
+    await expect(close).toHaveClass(/danger/);
+    await close.click();
+    const button = founderRow(page).getByRole("button", { name: "Actions for sync-abcd" });
+    await expect(button).toBeDisabled();
+    await expect(button.locator(".setup-spin")).toHaveCount(1);
+    expect(await page.evaluate(() => (window as typeof window & { __closes: unknown[] }).__closes)).toEqual([{ code: "sync-abcd", conversationId: "claude" }]);
+    await page.evaluate(() => (window as typeof window & { __finish: () => void }).__finish());
+    await expect(button).toBeEnabled();
+    await expect(button.locator(".setup-spin")).toHaveCount(0);
   });
 
   for (const [name, status, shown] of [
@@ -277,15 +361,32 @@ test.describe("the room button", () => {
     // Everything else in place, but the connector is not ready: a token refused after a good one.
     ["the connector is not ready", paired({ ready: false }), "Bot · Gyre Bot"],
   ] as const) {
-    test(`is hidden while ${name}`, async ({ page }) => {
+    test(`offers no Connect while ${name}, only Close room`, async ({ page }) => {
       await open(page, status, "Permission");
-      // Premise: this status has been read and rendered — Settings holds one reading for both tabs.
+      // Premise: this status has been read and rendered — Settings holds one reading for every tab.
       await expect(row(page, "bot").locator(".setup-detail").first()).toHaveText(shown);
-      await page.getByRole("tab", { name: "Connection" }).click();
-      await expect(founderRow(page).getByRole("button", { name: "Close room sync-abcd" })).toBeVisible();
-      await expect(founderRow(page).getByRole("button", { name: /Discord/ })).toHaveCount(0);
+      await page.getByRole("tab", { name: "Sync" }).click();
+      const menu = await menuOf(founderRow(page), "sync-abcd");
+      await expect(menu.getByRole("menuitem")).toHaveText(["Close room"]);
+      await expect(menu.getByRole("menuitem", { name: /Discord/ })).toHaveCount(0);
     });
   }
+});
+
+test("Rooms carries Disconnect all on its title line, at the right, named for Discord", async ({ page }) => {
+  await open(page, paired({ connectedRooms: ["sync-abcd"] }), "Sync");
+  const heading = page.locator(".setup-subheading", { hasText: "Rooms" });
+  const button = heading.getByRole("button", { name: "Disconnect all from Discord" });
+  await expect(button).toHaveText("Disconnect all");
+  await expect(button.locator("svg")).toHaveCount(1);
+  const [head, pill] = [await heading.boundingBox(), await button.boundingBox()];
+  if (!head || !pill) throw new Error("not laid out");
+  expect(pill.y).toBeGreaterThanOrEqual(head.y);
+  expect(pill.y + pill.height).toBeLessThanOrEqual(head.y + head.height + 0.5);
+  expect(pill.x + pill.width).toBeGreaterThan(head.x + head.width - 4);
+  await button.click();
+  await expect(heading.getByRole("button")).toHaveCount(0);
+  expect(await commands(page, "discord_disconnect")).toEqual([{ command: "discord_disconnect", args: { code: "sync-abcd" } }]);
 });
 
 test("a room the Discord member could not leave stays listed after Remove and a remount, until a retry works", async ({ page }) => {
@@ -398,19 +499,20 @@ for (const viewport of [{ width: 444, height: 560 }, { width: 444, height: 280 }
     });
   }
 
-  test("the founder's room row with the Discord button stays in one piece", async ({ page }) => {
-    await open(page, paired({ connectedRooms: ["sync-abcd"] }), "Connection");
+  test("the founder's room row with the Discord mark and the ⋮ menu stays in one piece", async ({ page }) => {
+    await open(page, paired({ connectedRooms: ["sync-abcd"] }), "Sync");
     const founder = page.locator(".setup-account-row", { hasText: "sync-abcd" });
-    // Premise: the longest the row gets — the waiting count, the Discord button and the close button.
+    // Premise: the longest the row gets — the Discord mark, the waiting count and the ⋮ button.
     await expect(founder.getByText("999 waiting")).toBeVisible();
-    await expect(founder.getByRole("button", { name: "Disconnect from Discord" })).toBeVisible();
+    await expect(founder.getByRole("img", { name: "Connected to Discord" })).toBeVisible();
+    await expect(founder.getByRole("button", { name: "Actions for sync-abcd" })).toBeVisible();
     const boxes = await founder.evaluate((element) => {
       const rect = (node: Element | null) => {
         if (!node) throw new Error("not laid out");
         const { x, y, width, height } = node.getBoundingClientRect();
         return { x, y, width, height };
       };
-      const heading = [...document.querySelectorAll(".setup-subheading")].find((node) => node.textContent === "Sync rooms") ?? null;
+      const heading = [...document.querySelectorAll(".setup-subheading")].find((node) => node.firstElementChild?.textContent === "Rooms") ?? null;
       return {
         row: rect(element),
         head: rect(heading),
@@ -481,31 +583,39 @@ test("an unrecorded loss is shown even with no token saved, and goes with Remove
   await expect(rows).toHaveCount(0);
 });
 
-// #207: the approval code is set up here, once, and only for a paired owner.
+// #207, #376: multi-factor authentication is set up under Connection → Security, once, and is
+// there whatever state the Discord connector is in.
 const SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+const mfa = (page: Page) => page.locator(".setup-row[data-mfa='row']");
 
-test("approval code: shown only once an owner is paired", async ({ page }) => {
-  await open(page, withBot({ forums: [FORUM], forumId: FORUM.id, pairingCode: "482913" }));
-  await expect(row(page, "owner")).toBeVisible();
-  await expect(row(page, "approvals")).toHaveCount(0);
+test("multi-factor authentication sits under Connection → Security whether or not Discord is set up or paired", async ({ page }) => {
+  for (const status of [blank, withBot({ forums: [FORUM], forumId: FORUM.id, pairingCode: "482913" }), paired()]) {
+    await open(page, status, "Connection");
+    await expect(page.locator(".setup-subheading", { hasText: "Security" })).toBeVisible();
+    await expect(mfa(page).locator(".setup-title")).toHaveText("Multi-factor authentication");
+    await expect(mfa(page).locator(".setup-detail").first()).toHaveText("Ask for a code from an authenticator app before anything you approve from outside this Mac goes through");
+    await page.getByRole("tab", { name: "Permission" }).click();
+    await expect(mfa(page)).toHaveCount(0);
+    await expect(page.locator("[data-discord='approvals']")).toHaveCount(0);
+  }
 });
 
-test("approval code: Set up shows the QR and the secret once, a wrong code keeps them, the right one turns it on", async ({ page }) => {
-  await open(page, paired());
-  const approvals = row(page, "approvals");
-  await expect(approvals.locator(".setup-detail").first()).toHaveText("Approve a merge or a release from Discord with a code from an authenticator app");
+test("multi-factor authentication: Set up shows the QR and the secret once, a wrong code keeps them and is said in its own row, the right one turns it on", async ({ page }) => {
+  await open(page, paired(), "Connection");
+  const approvals = mfa(page);
   await approvals.getByRole("button", { name: "Set up" }).click();
-  await expect(approvals.getByRole("img", { name: "Approval code QR" })).toBeVisible();
-  await expect(approvals.getByLabel("Approval code secret")).toHaveText(SECRET);
-  const field = approvals.getByLabel("Approval code", { exact: true });
+  await expect(approvals.getByRole("img", { name: "Multi-factor authentication QR" })).toBeVisible();
+  await expect(approvals.getByLabel("Multi-factor authentication secret")).toHaveText(SECRET);
+  const field = approvals.getByLabel("Multi-factor authentication", { exact: true });
   await field.fill("111111");
   await approvals.getByRole("button", { name: "Turn on" }).click();
-  await expect(row(page, "bot").getByRole("status")).toContainText("That code is not right");
+  await expect(approvals.getByRole("alert")).toContainText("That code is not right");
   await expect(field).toHaveValue("");
-  await expect(approvals.getByLabel("Approval code secret")).toHaveText(SECRET);
+  await expect(approvals.getByLabel("Multi-factor authentication secret")).toHaveText(SECRET);
   await field.fill("287082");
   await approvals.getByRole("button", { name: "Turn on" }).click();
-  await expect(approvals.locator(".setup-detail").first()).toHaveText("On. A merge or a release asked for in Discord waits for a code");
+  await expect(approvals.locator(".setup-detail").first()).toHaveText("On. Anything you approve from outside this Mac waits for a code");
+  await expect(approvals.getByRole("alert")).toHaveCount(0);
   await expect(approvals.getByRole("button", { name: "Reset" })).toBeVisible();
   expect(await page.content()).not.toContain(SECRET);
   expect((await commands(page, "discord_approvals_confirm")).map((call) => call.args)).toEqual([{ code: "111111" }, { code: "287082" }]);
@@ -520,55 +630,55 @@ const APP_IMAGE_POLICY = (() => {
   return parts.find((part) => part.startsWith("img-src ")) ?? parts.find((part) => part.startsWith("default-src "))!.replace("default-src", "img-src");
 })();
 
-test("approval code: the QR decodes under the app's own image policy", async ({ page }) => {
+test("multi-factor authentication: the QR decodes under the app's own image policy", async ({ page }) => {
   await page.route((url) => url.pathname === "/", async (route) => {
     const response = await route.fetch();
     await route.fulfill({ response, headers: { ...response.headers(), "content-security-policy": APP_IMAGE_POLICY } });
   });
-  await open(page, paired());
-  const approvals = row(page, "approvals");
+  await open(page, paired(), "Connection");
+  const approvals = mfa(page);
   await approvals.getByRole("button", { name: "Set up" }).click();
-  const qr = approvals.getByRole("img", { name: "Approval code QR" });
+  const qr = approvals.getByRole("img", { name: "Multi-factor authentication QR" });
   await expect(qr).toBeVisible();
   await expect.poll(() => qr.evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth)).toBe(192);
 });
 
-test("approval code: Start over during setup asks for a new secret", async ({ page }) => {
-  await open(page, paired());
-  const approvals = row(page, "approvals");
+test("multi-factor authentication: Start over during setup asks for a new secret", async ({ page }) => {
+  await open(page, paired(), "Connection");
+  const approvals = mfa(page);
   await approvals.getByRole("button", { name: "Set up" }).click();
   await expect(approvals.getByRole("button")).toHaveText(["Start over", "Turn on"]);
   await approvals.getByRole("button", { name: "Start over" }).click();
-  await expect(approvals.getByLabel("Approval code secret")).toHaveText(SECRET);
+  await expect(approvals.getByLabel("Multi-factor authentication secret")).toHaveText(SECRET);
   expect(await commands(page, "discord_approvals_setup")).toHaveLength(2);
 });
 
-test("approval code: locked offers Unlock and nothing else", async ({ page }) => {
-  await open(page, paired({ approvals: "locked" }));
-  const approvals = row(page, "approvals");
-  await expect(approvals.locator(".setup-detail").first()).toHaveText("Locked after three wrong codes. Nothing can be approved from Discord until you unlock it");
+test("multi-factor authentication: locked offers Unlock and nothing else", async ({ page }) => {
+  await open(page, paired({ approvals: "locked" }), "Connection");
+  const approvals = mfa(page);
+  await expect(approvals.locator(".setup-detail").first()).toHaveText("Locked after three wrong codes. Nothing can be approved until you unlock it");
   await expect(approvals.getByRole("button")).toHaveText(["Unlock"]);
   await approvals.getByRole("button", { name: "Unlock" }).click();
   await expect(approvals.getByRole("button", { name: "Reset" })).toBeVisible();
   expect(await commands(page, "discord_approvals_unlock")).toHaveLength(1);
 });
 
-test("approval code: a setup left unfinished, as after a relaunch, offers Set up and no secret", async ({ page }) => {
-  await open(page, paired({ approvals: "settingUp" }));
-  const approvals = row(page, "approvals");
+test("multi-factor authentication: a setup left unfinished, as after a relaunch, offers Set up and no secret", async ({ page }) => {
+  await open(page, paired({ approvals: "settingUp" }), "Connection");
+  const approvals = mfa(page);
   await expect(approvals.locator(".setup-detail").first()).toHaveText("Setup was not finished. Set it up again");
   await expect(approvals.getByRole("button")).toHaveText(["Set up"]);
   await expect(approvals.locator(".setup-qr, .setup-secret")).toHaveCount(0);
 });
 
-test.describe("approval code at 444 × 560", () => {
+test.describe("multi-factor authentication at 444 × 560", () => {
   test.use({ viewport: { width: 444, height: 560 } });
 
-  test("the setup row with its QR, secret and code field stays inside its box, below the owner row", async ({ page }) => {
-    await open(page, paired({ owner: { id: "u1", username: LONG_BOT.username } }));
-    const approvals = row(page, "approvals");
+  test("the setup row with its QR, secret and code field stays inside its box, below the Security heading", async ({ page }) => {
+    await open(page, paired({ owner: { id: "u1", username: LONG_BOT.username } }), "Connection");
+    const approvals = mfa(page);
     await approvals.getByRole("button", { name: "Set up" }).click();
-    await expect(approvals.getByRole("img", { name: "Approval code QR" })).toBeVisible();
+    await expect(approvals.getByRole("img", { name: "Multi-factor authentication QR" })).toBeVisible();
     await approvals.scrollIntoViewIfNeeded();
     const boxes = await approvals.evaluate((element) => {
       const rect = (node: Element | null) => {
@@ -578,7 +688,7 @@ test.describe("approval code at 444 × 560", () => {
       };
       return {
         row: rect(element),
-        owner: rect(document.querySelector(".setup-row[data-discord='owner']")),
+        owner: rect([...document.querySelectorAll(".setup-subheading")].find((node) => node.textContent === "Security") ?? null),
         parts: [".setup-copy", ".setup-qr", ".setup-secret", ".setup-input", ".setup-row-actions .pill-btn"].map((selector) => ({ name: selector, ...rect(element.querySelector(selector)) })),
         overflow: [element, ...element.querySelectorAll<HTMLElement>("*")].filter((node) => !(node instanceof SVGElement) && node.scrollWidth > node.clientWidth).map((node) => node.className),
       };
@@ -594,7 +704,7 @@ test.describe("approval code at 444 × 560", () => {
   });
 });
 
-// #199 reopened: a held room says so on its own row in Sync rooms, only when the owner has to act,
+// #199 reopened: a held room says so on its own row under Sync → Rooms, only when the owner has to act,
 // with what to do; Permission no longer carries a row for it.
 test.describe("a room Discord refuses", () => {
   test.use({ viewport: { width: 444, height: 560 } });
@@ -603,35 +713,35 @@ test.describe("a room Discord refuses", () => {
     paired({ connectedRooms: ["sync-abcd"], behind: { "sync-abcd": count }, roomErrors: { "sync-abcd": { code, message } } });
 
   test("a lost permission names the forum and where to fix it, and goes once the room moves", async ({ page }) => {
-    await open(page, refused("missing_permission", "The bot lacks a permission it needs on the forum."), "Connection");
+    await open(page, refused("missing_permission", "The bot lacks a permission it needs on the forum."), "Sync");
     await expect(held(page)).toHaveText("Can't post to Discord — give the bot access to forum rooms: Edit Channel → Permissions. 19 messages go out once it can.");
     await page.getByRole("tab", { name: "Permission" }).click();
     await expect(page.locator("[data-discord='room-error']")).toHaveCount(0);
     await expect(row(page, "behind")).toHaveCount(0);
-    await open(page, paired({ connectedRooms: ["sync-abcd"] }), "Connection");
+    await open(page, paired({ connectedRooms: ["sync-abcd"] }), "Sync");
     await expect(page.locator("[data-discord='room-held']")).toHaveCount(0);
   });
 
   test("a lost permission names the forum the held post lives in, not the one picked now", async ({ page }) => {
-    await open(page, paired({ forums: [FORUM, { id: "f2", name: "archive", guildName: "Home" }], connectedRooms: ["sync-abcd"], behind: { "sync-abcd": 1 }, roomErrors: { "sync-abcd": { code: "missing_permission", message: "x", forumId: "f2" } } }), "Connection");
+    await open(page, paired({ forums: [FORUM, { id: "f2", name: "archive", guildName: "Home" }], connectedRooms: ["sync-abcd"], behind: { "sync-abcd": 1 }, roomErrors: { "sync-abcd": { code: "missing_permission", message: "x", forumId: "f2" } } }), "Sync");
     await expect(held(page)).toHaveText("Can't post to Discord — give the bot access to forum archive: Edit Channel → Permissions. 1 message goes out once it can.");
   });
 
   test("a deleted forum points at the forum picker, with the count, and says below when it sits above it", async ({ page }) => {
-    await open(page, refused("no_forum", "The chosen forum channel no longer exists."), "Connection");
+    await open(page, refused("no_forum", "The chosen forum channel no longer exists."), "Sync");
     await expect(held(page)).toHaveText("Can't post to Discord — 19 messages waiting. Its forum was deleted: pick another under Permission → Remote access.");
     await open(page, paired({ connectedRooms: [], behind: { "sync-gone": 2 }, roomErrors: { "sync-gone": { code: "no_forum", message: "x" } } }), "Permission");
     await expect(row(page, "behind").locator(".setup-detail")).toHaveText("Can't post to Discord — 2 messages waiting. Its forum was deleted: pick another below.");
   });
 
   test("an unnamed cause is shown as it was said, never as the connector stopping", async ({ page }) => {
-    await open(page, refused("internal", "503 Service Unavailable", 1), "Connection");
+    await open(page, refused("internal", "503 Service Unavailable", 1), "Sync");
     await expect(held(page)).toHaveText("Can't post to Discord — 1 message waiting. Reason: 503 Service Unavailable");
   });
 
   for (const code of ["rate_limited", "discord_down"]) {
     test(`${code} is ridden out without a word on the row`, async ({ page }) => {
-      await open(page, refused(code, "boom", 3), "Connection");
+      await open(page, refused(code, "boom", 3), "Sync");
       await expect(page.locator(".setup-account-row", { hasText: "sync-abcd" })).toBeVisible();
       await expect(page.locator("[data-discord='room-held']")).toHaveCount(0);
       await page.getByRole("tab", { name: "Permission" }).click();
@@ -640,7 +750,7 @@ test.describe("a room Discord refuses", () => {
   }
 
   test("a held room with no Sync row is said under Remote access, cause and count, once", async ({ page }) => {
-    await open(page, paired({ connectedRooms: [], behind: { "sync-gone": 1 }, roomErrors: { "sync-gone": { code: "internal", message: "Thread is archived" } } }), "Connection");
+    await open(page, paired({ connectedRooms: [], behind: { "sync-gone": 1 }, roomErrors: { "sync-gone": { code: "internal", message: "Thread is archived" } } }), "Sync");
     await expect(page.locator("[data-discord='room-held']")).toHaveCount(0);
     await page.getByRole("tab", { name: "Permission" }).click();
     await expect(row(page, "behind").locator(".setup-title")).toHaveText("Room sync-gone");
@@ -654,7 +764,7 @@ test.describe("a room Discord refuses", () => {
   });
 
   test("the longest line stays inside its row, under the room's name, with nothing spilling sideways", async ({ page }) => {
-    await open(page, refused("internal", "x".repeat(300), 1000), "Connection");
+    await open(page, refused("internal", "x".repeat(300), 1000), "Sync");
     const boxes = await held(page).evaluate((line) => {
       const rowEl = line.closest(".setup-account-row")!;
       const name = rowEl.querySelector(".setup-account-login")!;

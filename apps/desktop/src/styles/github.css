@@ -97,12 +97,6 @@
   color: var(--danger);
 }
 
-.gh-icon-btn.danger:hover:not(:disabled) {
-  color: var(--danger);
-  border-color: var(--danger);
-  background: rgba(255, 107, 102, 0.14);
-}
-
 .gh-icon-btn:hover {
   background: var(--fill-2);
   color: var(--text);
@@ -115,9 +109,9 @@
 
 .gh-remove:hover,
 .gh-remove:focus-visible {
-  color: #ff9b97;
-  border-color: rgba(255, 107, 102, 0.4);
-  background: rgba(255, 80, 80, 0.16);
+  color: var(--danger-text);
+  border-color: rgba(var(--danger-rgb), 0.4);
+  background: rgba(var(--danger-tint-rgb), 0.16);
 }
 
 .gh-add {
@@ -456,7 +450,7 @@
 
 .gh-icon-btn[data-error="true"] {
   color: var(--danger);
-  border-color: rgba(255, 107, 102, 0.4);
+  border-color: rgba(var(--danger-rgb), 0.4);
 }
 
 /* ── Add-account panel (provider picker + token) ── */
@@ -477,7 +471,7 @@
   padding: 2px;
   border: 1px solid var(--hair);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(var(--ink-rgb), 0.03);
 }
 
 .gh-provider-tab {

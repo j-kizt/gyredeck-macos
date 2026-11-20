@@ -78,6 +78,25 @@ test("Setup sections use vertical roving tabs and labelled panels", async ({ pag
   await expect(page.getByRole("tab", { name: "Update" })).toBeFocused();
 });
 
+test("Setup tabs are in alphabetical order, and the arrow keys walk them in that order (#376)", async ({ page }) => {
+  await page.goto("/?demo=1&demoScenario=idle");
+  await page.getByRole("button", { name: "Settings" }).click();
+  await expect(page.getByRole("button", { name: "Back to sessions" })).toBeFocused();
+  const tabs = page.getByRole("tablist", { name: "Setup sections" }).getByRole("tab");
+  const labels = (await tabs.allTextContents()).map((text) => text.trim());
+  expect(labels).toEqual([...labels].sort((a, b) => a.localeCompare(b)));
+  expect(labels).toEqual(["Connection", "Display", "Git", "Notification", "Permission", "Plugins", "Sync", "Update"]);
+  await expect(page.getByRole("tab", { name: "Connection" })).toHaveAttribute("aria-selected", "true");
+  await tabs.first().focus();
+  for (const label of labels.slice(1)) {
+    await page.keyboard.press("ArrowDown");
+    await expect(page.getByRole("tab", { name: label })).toBeFocused();
+    await expect(page.getByRole("tabpanel", { name: label })).toBeVisible();
+  }
+  await page.keyboard.press("ArrowDown");
+  await expect(page.getByRole("tab", { name: "Connection" })).toBeFocused();
+});
+
 test("narrow Setup switches to horizontal tab semantics", async ({ page }) => {
   await page.setViewportSize({ width: 280, height: 440 });
   await page.goto("/?demo=1&demoScenario=idle");

@@ -29,6 +29,9 @@ export interface IUseHeavyRuns {
   error: string | null;
   releasing: boolean;
   stop: (holderId: string) => Promise<void>;
+  /** The queue entry id being removed, while the bridge is asked. */
+  removing: string | null;
+  remove: (entryId: string) => Promise<void>;
 }
 
 const HEAVY_POLL_MS = 5_000;
@@ -41,6 +44,7 @@ export const useHeavyRuns = (canUseNativeControls: boolean): IUseHeavyRuns => {
   const [status, setStatus] = useState<IHeavyStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [releasing, setReleasing] = useState(false);
+  const [removing, setRemoving] = useState<string | null>(null);
 
   const read = useCallback(async () => {
     try {
@@ -63,19 +67,37 @@ export const useHeavyRuns = (canUseNativeControls: boolean): IUseHeavyRuns => {
     };
   }, [canUseNativeControls, read]);
 
+  // Kept apart from the status read's error (#376 audit): a refused Kill or Remove is said until
+  // the next one is pressed, and a status read that succeeds a moment later does not erase it.
+  const [actionError, setActionError] = useState<string | null>(null);
+  const act = useCallback(async (command: string, args: Record<string, unknown>) => {
+    setActionError(null);
+    try {
+      await invoke(command, args);
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    }
+    await read();
+  }, [read]);
+
   const stop = useCallback(async (holderId: string) => {
     setReleasing(true);
     try {
-      await invoke<string>("heavy_stop", { holderId });
-      await read();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      await read();
+      await act("heavy_stop", { holderId });
     } finally {
       setReleasing(false);
     }
-  }, [read]);
+  }, [act]);
 
-  return { status, error, releasing, stop };
+  const remove = useCallback(async (entryId: string) => {
+    setRemoving(entryId);
+    try {
+      await act("heavy_remove", { entryId });
+    } finally {
+      setRemoving(null);
+    }
+  }, [act]);
+
+  return { status, error: actionError ?? error, releasing, stop, removing, remove };
 };
 

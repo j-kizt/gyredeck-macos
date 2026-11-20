@@ -110,12 +110,20 @@ const assetRoot = join(distRoot, "assets");
  * over the CI figure. Raised by the owner at the terminal on 2026-11-18 ("ขยับทั้งสองตัวได้เลย").
  * #338 (the room wake count in the Sync session heading) adds ~87 gzip bytes: 122,434 / 125,513
  * locally. Both raised by 100, by the owner at the terminal on 2026-11-19.
+ *
+ * #376 (Settings, Usage and Ports polish: the room menu, the Sync tab, MFA's own row, the four
+ * meter tones, the held refresh, and Remove for a waiting heavy run) measured 122,910 / 125,981
+ * locally against 122,434 / 125,513 on the clean base 53991cb under the same build: +476 / +468.
+ * Both raised by exactly that growth. Raised by the owner from Discord on 2026-11-20 ("yes",
+ * sync-xas5 seq 704). The audit then asked the ⋮ menus to be menus to the keyboard as well
+ * (focus, arrows, Home/End, Escape back to ⋮): +147 / +108 more, to 123,123 / 126,196, raised
+ * by exactly that, by the owner from Discord the same day ("yes", sync-xas5 seq 742 to 732).
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 122_500,
-  jsTotalGzipBytes: 125_620,
+  jsGzipBytes: 123_123,
+  jsTotalGzipBytes: 126_196,
 };
 
 const walk = async (directory) => {

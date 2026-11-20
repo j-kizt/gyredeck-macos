@@ -28,7 +28,7 @@
   border-bottom: 1px solid var(--hair);
   /* Match the panel background (not pure black) so the sticky bar blends in and
      still cleanly covers rows scrolling underneath it. */
-  background: #161618;
+  background: var(--canvas);
 }
 
 .runtime-subtitle {
@@ -194,13 +194,13 @@
 
 @keyframes service-live-pulse {
   0% {
-    box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.45);
+    box-shadow: 0 0 0 0 rgba(var(--done-rgb), 0.45);
   }
   70% {
-    box-shadow: 0 0 0 4px rgba(74, 222, 128, 0);
+    box-shadow: 0 0 0 4px rgba(var(--done-rgb), 0);
   }
   100% {
-    box-shadow: 0 0 0 0 rgba(74, 222, 128, 0);
+    box-shadow: 0 0 0 0 rgba(var(--done-rgb), 0);
   }
 }
 
@@ -310,27 +310,27 @@
 }
 
 .runtime-row[data-pressure="normal"] .runtime-pressure-label {
-  border-color: rgba(74, 222, 128, 0.24);
+  border-color: rgba(var(--done-rgb), 0.24);
   color: var(--done);
-  background: rgba(74, 222, 128, 0.08);
+  background: rgba(var(--done-rgb), 0.08);
 }
 
 .runtime-row[data-pressure="elevated"] .runtime-pressure-label {
-  border-color: rgba(255, 178, 61, 0.24);
+  border-color: rgba(var(--waiting-rgb), 0.24);
   color: var(--text-2);
   background: transparent;
 }
 
 .runtime-row[data-pressure="high"] .runtime-pressure-label {
-  border-color: rgba(255, 178, 61, 0.24);
+  border-color: rgba(var(--waiting-rgb), 0.24);
   color: var(--waiting);
-  background: rgba(255, 178, 61, 0.09);
+  background: rgba(var(--waiting-rgb), 0.09);
 }
 
 .runtime-row[data-pressure="critical"] .runtime-pressure-label {
-  border-color: rgba(255, 107, 102, 0.24);
+  border-color: rgba(var(--danger-rgb), 0.24);
   color: var(--danger);
-  background: rgba(255, 107, 102, 0.09);
+  background: rgba(var(--danger-rgb), 0.09);
 }
 
 .runtime-row[data-pressure="unavailable"] .runtime-pressure-label {

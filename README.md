@@ -50,7 +50,7 @@ is what you do, in the place where that session lives.
 
 From then on the exchange happens in the agents' own terminals. There is no message
 list and no compose box in Gyredeck on purpose — a person in the middle of it is the
-thing being designed out. Settings → Connection lists the rooms that are open.
+thing being designed out. Settings → Sync lists the rooms that are open.
 
 **A session can be reached while it is idle**, which is the part that makes this
 usable:
@@ -94,7 +94,7 @@ all: the loud default, because a message nobody hears is the worse mistake.
 | **Listening Ports** | Locally listening TCP/HTTP services named from their command line, with open-in-browser and guarded stop controls |
 | **Git Monitor** | Per-repo latest commit, CI status (GitHub Actions / GitLab pipelines), and open PRs/MRs across **GitHub & GitLab**; add repos from a picker, sign in via OAuth device flow or import from `gh`/`glab`, and switch/manage accounts inline |
 
-**Settings** (gear) is grouped into **Connection** (bridge status, configurable local port, and the sync rooms currently open), **Display**, **Git** (built-in credential helper, account list, and git-identity sync), **Permission** (what an agent may do unprompted), **Plugins** (agent hooks), and **Update** (current version + check/install updates). It also holds the **Terminal** picker (iTerm2 / Ghostty) used by session Focus, and Keep-display-awake.
+**Settings** (gear) is grouped into **Connection** (bridge status, configurable local port, and multi-factor authentication), **Display**, **Git** (built-in credential helper, account list, and git-identity sync), **Notification**, **Permission** (what an agent may do unprompted), **Plugins** (agent hooks), **Sync** (the sync rooms currently open, and the heavy-run slot with its heavy commands), and **Update** (current version + check/install updates). It also holds the **Terminal** picker (iTerm2 / Ghostty) used by session Focus, and Keep-display-awake.
 
 ## Privacy
 

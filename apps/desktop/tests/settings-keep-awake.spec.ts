@@ -175,3 +175,31 @@ test("the page number is asked once, however long it takes, so no two requests c
   expect(new Set(pages)).toEqual(new Set([7]));
   await expect(row.getByText(`Active · ${ROOM}`)).toBeVisible();
 });
+
+// #376: on, but refused by macOS — the switch reads as not in effect, yet is still the way to turn it off.
+test("a refused keep-awake dims the switch while it is on, and the switch still turns it off", async ({ page }) => {
+  const row = await open(page, held(null, 1, "macOS refused the display assertion"));
+  const toggle = row.getByRole("switch");
+  await expect(row.getByText("Unavailable · macOS refused the display assertion")).toBeVisible();
+  await expect(toggle).toHaveAttribute("aria-checked", "true");
+  // Dimmed to the eye only (#376 audit): to assistive technology and to Playwright's own
+  // actionability check it is the enabled switch, so the click below is not forced.
+  await expect(toggle).toBeEnabled();
+  await expect(toggle).not.toHaveAttribute("aria-disabled");
+  expect(await toggle.evaluate((el) => getComputedStyle(el).opacity)).toBe("0.4");
+  await answer(page, held(null, 2));
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+  await expect(row.getByText("Off · display follows macOS idle settings")).toBeVisible();
+  expect(await toggle.evaluate((el) => getComputedStyle(el).opacity)).toBe("1");
+});
+
+test("a keep-awake that holds again is no longer dimmed", async ({ page }) => {
+  const row = await open(page, held(null, 1, "macOS refused the display assertion"));
+  const toggle = row.getByRole("switch");
+  expect(await toggle.evaluate((el) => getComputedStyle(el).opacity)).toBe("0.4");
+  await answer(page, held(ROOM, 2));
+  await beat(page);
+  await expect(row.getByText(`Active · ${ROOM}`)).toBeVisible();
+  expect(await toggle.evaluate((el) => getComputedStyle(el).opacity)).toBe("1");
+});

@@ -6349,6 +6349,32 @@ fn c4_wrong_codes_lock_and_only_the_mac_unlocks() {
     assert_eq!(answer(&f, &buffer, approve_with(&sent_id(1_000, 5), 1, &code_now(0), merge(370, SHA_A)))["ok"], true);
 }
 
+/// What Discord is told when an approval cannot be checked names the setting by the name and the
+/// place Settings shows it (#376): multi-factor authentication, under Settings → Connection.
+#[test]
+fn an_unchecked_approval_points_at_multi_factor_authentication_under_connection() {
+    let (f, buffer) = approvals_room("approve-where");
+    let mut errors = Vec::new();
+    *f.approvals.bytes.lock().unwrap() = Some(b"garbage".to_vec());
+    errors.push(answer(&f, &buffer, approve_with(&sent_id(1_000, 1), 1, &code_now(0), merge(370, SHA_A))));
+    *f.approvals.bytes.lock().unwrap() = None;
+    errors.push(answer(&f, &buffer, approve_with(&sent_id(1_000, 2), 1, &code_now(0), merge(370, SHA_A))));
+    set_up_codes(&f);
+    let wrong = format!("{:06}", (code_now(0).parse::<u32>().unwrap() + 1) % 1_000_000);
+    for n in 3..=5 {
+        answer(&f, &buffer, approve_with(&sent_id(1_000, n), 1, &wrong, merge(370, SHA_A)));
+    }
+    let locked = answer(&f, &buffer, approve_with(&sent_id(1_000, 6), 1, &code_now(0), merge(370, SHA_A)));
+    assert!(locked["error"].as_str().unwrap().contains("locked"), "{locked}");
+    errors.push(locked);
+    for reply in &errors {
+        let error = reply["error"].as_str().unwrap();
+        assert!(error.contains("Settings → Connection"), "{reply}");
+        assert!(error.to_lowercase().contains("multi-factor authentication"), "{reply}");
+        assert!(!error.contains("Settings → Permission"), "{reply}");
+    }
+}
+
 #[test]
 fn a_use_the_keychain_will_not_save_approves_nothing() {
     let (f, buffer) = approvals_room("approve-unsaved");

@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ArrowRight, Bell, Check, Coffee, Download, Focus, Gauge, KeyRound, Link2, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Power, Puzzle, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from "react";
+import { ArrowRight, Bell, Check, Coffee, DoorClosed, Download, Focus, Gauge, KeyRound, Link2, Lock, MessageSquareDashed, Monitor as MonitorIcon, MoreVertical, Pencil, PlugZap, Power, Puzzle, RefreshCw, ShieldCheck, Trash2, type LucideIcon } from "lucide-react";
 import type { IGyredeckBridgeCapabilities } from "@gyredeck/protocol";
 import type { INotificationsState, NotificationPermission } from "../notifications/useNotifications";
 import { shortenPath } from "../session/activity";
@@ -14,13 +14,24 @@ import { useDiscord, type IUseDiscord } from "./useDiscord";
 import { DiscordLogo, DiscordRows, heldLine } from "./DiscordRows";
 import { offerDisconnectAll, showSyncRooms, stillHeld } from "./disconnectAll";
 import { ReleaseNotes } from "./ReleaseNotes";
+import { MfaRow } from "./MfaRow";
 
 export type SyncAgent = "claude" | "agy";
 
-type SetupCategory = "connection" | "display" | "git" | "notification" | "permission" | "plugins" | "update";
-// Alphabetical. Arrow-key order and the visible order are the same list, because a
-// roving tabstop that jumps somewhere else is a bug.
-const SETUP_CATEGORIES: SetupCategory[] = ["connection", "display", "git", "notification", "permission", "plugins", "update"];
+// Alphabetical by label (owner, 2026-11-09), so a new tab has one right place. The tabs are drawn
+// from this list and the arrow keys walk it, because a roving tabstop that jumps somewhere other
+// than the next tab on screen is a bug.
+const SETUP_CATEGORIES = [
+  { id: "connection", label: "Connection", icon: PlugZap },
+  { id: "display", label: "Display", icon: MonitorIcon },
+  { id: "git", label: "Git", icon: KeyRound },
+  { id: "notification", label: "Notification", icon: Bell },
+  { id: "permission", label: "Permission", icon: ShieldCheck },
+  { id: "plugins", label: "Plugins", icon: Puzzle },
+  { id: "sync", label: "Sync", icon: Link2 },
+  { id: "update", label: "Update", icon: Download },
+] as const satisfies ReadonlyArray<{ id: string; label: string; icon: LucideIcon }>;
+type SetupCategory = (typeof SETUP_CATEGORIES)[number]["id"];
 
 // Terminals Focus can jump to. Add a row here (plus its AppleScript in the native
 // focus_terminal handler) to support another terminal.
@@ -121,6 +132,55 @@ export interface ISetupPanelProps {
   updater: IUseUpdater;
 }
 
+const menuItems = (wrap: HTMLElement | null) =>
+  Array.from(wrap?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? []);
+
+/**
+ * A row's ⋮ menu closes on a click outside it or on Escape: one rule for every such menu. The
+ * returned handler goes on the menu's wrapper: an Escape pressed inside an open menu closes the
+ * menu only, and does not also reach the surface, where Escape closes Settings.
+ *
+ * It is also the keyboard of a menu button, since the trigger says aria-haspopup="menu": opening
+ * moves focus to the first item, the arrows, Home and End move between the items that can be
+ * pressed, and Escape hands focus back to the trigger (#376 audit).
+ */
+const useMenuDismiss = (open: boolean, ref: RefObject<HTMLElement | null>, close: () => void) => {
+  const latestClose = useRef(close);
+  latestClose.current = close;
+  useEffect(() => {
+    if (open) menuItems(ref.current)[0]?.focus();
+  }, [open, ref]);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onPointerDown = (event: MouseEvent) => {
+      if (ref.current && !ref.current.contains(event.target as Node)) latestClose.current();
+    };
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") latestClose.current(); };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open, ref]);
+  return (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (!open) return;
+    if (event.key === "Escape") {
+      event.stopPropagation();
+      latestClose.current();
+      ref.current?.querySelector<HTMLElement>('[aria-haspopup="menu"]')?.focus();
+      return;
+    }
+    const items = menuItems(ref.current);
+    if (items.length === 0) return;
+    const at = items.indexOf(document.activeElement as HTMLButtonElement);
+    const next = { ArrowDown: at + 1, ArrowUp: at - 1, Home: 0, End: items.length - 1 }[event.key];
+    if (next === undefined) return;
+    event.preventDefault();
+    items[(next + items.length) % items.length].focus();
+  };
+};
+
 const GitAccountRow = ({ account, isHelper, onSetActive, onRemove }: {
   account: IGhAccount;
   isHelper: boolean;
@@ -133,20 +193,7 @@ const GitAccountRow = ({ account, isHelper, onSetActive, onRemove }: {
   const ref = useRef<HTMLDivElement>(null);
 
   const close = () => { setOpen(false); setConfirming(false); };
-
-  useEffect(() => {
-    if (!open) return undefined;
-    const onPointerDown = (event: MouseEvent) => {
-      if (ref.current && !ref.current.contains(event.target as Node)) close();
-    };
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
-    document.addEventListener("mousedown", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("mousedown", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
-    };
-  }, [open]);
+  const onMenuKeyDown = useMenuDismiss(open, ref, close);
 
   const run = async (fn: () => Promise<void> | void) => {
     setBusy(true);
@@ -165,7 +212,7 @@ const GitAccountRow = ({ account, isHelper, onSetActive, onRemove }: {
           </div>
         ) : null}
       </div>
-      <div className="setup-account-menu-wrap" ref={ref}>
+      <div className="setup-account-menu-wrap" ref={ref} onKeyDown={onMenuKeyDown}>
         <button className="gh-icon-btn" type="button" aria-haspopup="menu" aria-expanded={open} aria-label={`Actions for ${account.login}`} title="Account actions" data-tauri-drag-region="false" onClick={() => setOpen((o) => !o)}>
           <MoreVertical size={12} strokeWidth={2.3} />
         </button>
@@ -214,16 +261,93 @@ const GitAccountList = ({ accounts, canUseNativeControls, onSetActive, onRemove 
   );
 };
 
+type MailRoom = ISetupPanelProps["mailRooms"][string];
+
+/**
+ * One sync room, laid out like a Git account, with its actions in the same ⋮ menu (#376).
+ *
+ * Closing ends the room for everyone in it, so it is asked as the founder, the same hand that
+ * gave out the password. It is not instant either: every member is told and every stream is cut
+ * before the room goes, so the ⋮ button spins and stays shut until the close has finished,
+ * rather than offering a second close of a room already going. The state is the row's own, so
+ * two rooms closing at once each keep theirs.
+ */
+const SyncRoomRow = ({ entry, discord, discordReady, onCloseRoom }: {
+  entry: MailRoom;
+  discord: IUseDiscord;
+  discordReady: boolean;
+  onCloseRoom: (room: string, founder: string) => Promise<void>;
+}) => {
+  const [open, setOpen] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const close = () => setOpen(false);
+  const onMenuKeyDown = useMenuDismiss(open, ref, close);
+  const followed = discord.status?.connectedRooms.includes(entry.room) === true;
+  const held = heldLine(discord.status, entry.room);
+  const founder = entry.founder;
+  return (
+    <div className="setup-account-row" data-closing={closing} data-held={held ? "true" : undefined}>
+      <span className="setup-account-icon"><Link2 size={15} strokeWidth={2.3} /></span>
+      <span className="setup-account-main">
+        <span className="setup-account-login">
+          {entry.room}
+          {followed ? <span className="setup-room-discord" role="img" aria-label="Connected to Discord"><DiscordLogo size={12} /></span> : null}
+        </span>
+        <span className="setup-account-tags">
+          {/* A count, not a roster: which sessions are in a room is answered in
+              their own detail panels, and naming them here made every row as tall
+              as the number of members. */}
+          <span className="setup-detail">
+            {entry.members.length === 1 ? "1 session" : `${entry.members.length} sessions`}
+          </span>
+        </span>
+      </span>
+      {entry.pending > 0 ? (
+        <span className="setup-account-active" title={`${entry.pending} waiting to be collected`}>
+          {entry.pending} waiting
+        </span>
+      ) : null}
+      <div className="setup-account-menu-wrap" ref={ref} onKeyDown={onMenuKeyDown}>
+        <button className="gh-icon-btn" type="button" aria-haspopup="menu" aria-expanded={open} aria-label={`Actions for ${entry.room}`} aria-busy={closing} title={closing ? "Closing…" : "Room actions"} disabled={closing} data-tauri-drag-region="false" onClick={() => setOpen((o) => !o)}>
+          {closing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.4} /> : <MoreVertical size={12} strokeWidth={2.3} />}
+        </button>
+        {open ? (
+          <div className="setup-menu" role="menu">
+            {/* Offered only once a post has somewhere to go and someone to answer to, and only for a
+                room this Mac founded, as before #376. */}
+            {founder && discordReady ? (
+              <button className="setup-menu-item" type="button" role="menuitem" disabled={discord.busy} aria-label={followed ? "Disconnect from Discord" : "Connect to Discord"} onClick={() => { close(); void discord.run(followed ? "discord_disconnect" : "discord_connect", { code: entry.room }); }}>
+                <DiscordLogo size={12} /> {followed ? "Disconnect" : "Connect"}
+              </button>
+            ) : null}
+            {/* The founder is the input sync_close needs; a bridge that names none gets no close to send. */}
+            <button className="setup-menu-item danger" type="button" role="menuitem" disabled={!founder} title={founder ? "Close this room for everyone in it" : "This room's founder is not known"} onClick={() => {
+              if (!founder) return;
+              close();
+              setClosing(true);
+              void onCloseRoom(entry.room, founder).finally(() => setClosing(false));
+            }}>
+              <DoorClosed size={12} strokeWidth={2.3} /> Close room
+            </button>
+          </div>
+        ) : null}
+      </div>
+      {held ? <span className="setup-detail setup-account-held" role="status" data-discord="room-held">{held}</span> : null}
+    </div>
+  );
+};
+
 /**
  * The sync rooms the bridge is holding, laid out like the account list, and shown only
  * while there are any.
  *
  * Only rooms with members: a plain mailbox exists for every session that has ever been
  * sent anything, and listing those would bury the two or three that mean something.
- * Read-only on purpose — a room is joined and left from a session's own detail panel,
- * where the person can see which session they are acting on.
+ * A room is joined and left from a session's own detail panel, where the person can see
+ * which session they are acting on.
  */
-// The rooms that get a row under Sync rooms; a held room outside it is said under Remote access instead (#199).
+// The rooms that get a row under Sync → Rooms; a held room outside it is said under Remote access instead (#199).
 const openRooms = (rooms: ISetupPanelProps["mailRooms"]) => Object.values(rooms).filter((entry) => entry.members.length > 0);
 
 const SyncRoomList = ({
@@ -232,13 +356,11 @@ const SyncRoomList = ({
   onCloseRoom,
   discord,
 }: {
-  rooms: Record<string, { room: string; members: string[]; pending: number; founder: string | null }>;
+  rooms: Record<string, MailRoom>;
   canUseNativeControls: boolean;
   onCloseRoom: (room: string, founder: string) => Promise<void>;
   discord: IUseDiscord;
 }) => {
-  const [closing, setClosing] = useState<string | null>(null);
-  // Offered only once a post has somewhere to go and someone to answer to.
   // `ready`, not a bot name: a name can be left over from a connector whose token was since refused.
   const discordReady = Boolean(discord.status?.ready && discord.status.forumId && discord.status.owner);
   if (!canUseNativeControls) return null;
@@ -249,92 +371,40 @@ const SyncRoomList = ({
   const held = stillHeld(discord.stillConnected, { connectedRooms: connected, leaving: discord.status?.leaving });
   const still = held.connected;
   // Absent rather than empty. A room exists only while people are using one, so "none
-  // open" is the ordinary state and a row saying so would sit under Connection
-  // permanently, describing nothing — unless Discord still follows a room or failed to leave one.
+  // open" is the ordinary state and a row saying so would sit under Sync permanently,
+  // describing nothing — unless Discord still follows a room or failed to leave one.
   if (!showSyncRooms(open.length, connected, held)) return null;
   return (
     <>
-      <div className="setup-subheading">Sync rooms</div>
-      {offerDisconnectAll(connected, held) ? (
-          <span className="setup-row-actions">
-            {connected.length > 0 ? (
-              <button className="pill-btn danger" type="button" disabled={discord.busy} onClick={() => void discord.disconnectAll(connected)} data-tauri-drag-region="false">
-                Disconnect all from Discord
+      <div className="setup-subheading setup-subheading-row">
+        <span>Rooms</span>
+        {connected.length > 0 ? (
+          // The visible words no longer say Discord; the logo and the accessible name do.
+          <button className="pill-btn danger" type="button" disabled={discord.busy} onClick={() => void discord.disconnectAll(connected)} data-tauri-drag-region="false" aria-label="Disconnect all from Discord">
+            <DiscordLogo size={12} />Disconnect all
+          </button>
+        ) : null}
+      </div>
+      {offerDisconnectAll(connected, held) && (still.length > 0 || held.leaving.length > 0) ? (
+        <span className="setup-row-actions full">
+          {still.length > 0 ? (
+            <>
+              <span className="setup-detail" role="status">
+                Still connected: {still.map((f) => `${f.code} (${f.reason})`).join(", ")}
+              </span>
+              <button className="pill-btn" type="button" disabled={discord.busy} onClick={() => void discord.disconnectAll(still.map((f) => f.code))} data-tauri-drag-region="false">
+                Try again
               </button>
-            ) : null}
-            {still.length > 0 ? (
-              <>
-                <span className="setup-detail" role="status">
-                  Still connected: {still.map((f) => `${f.code} (${f.reason})`).join(", ")}
-                </span>
-                <button className="pill-btn" type="button" disabled={discord.busy} onClick={() => void discord.disconnectAll(still.map((f) => f.code))} data-tauri-drag-region="false">
-                  Try again
-                </button>
-              </>
-            ) : null}
-            {held.leaving.length > 0 ? (
-              <span className="setup-detail" role="status">Not all left Discord: see "Discord is still in room" below.</span>
-            ) : null}
-          </span>
+            </>
+          ) : null}
+          {held.leaving.length > 0 ? (
+            <span className="setup-detail" role="status">Not all left Discord: see "Discord is still in room" under Permission.</span>
+          ) : null}
+        </span>
       ) : null}
       <div className="setup-account-list">
-      {open.map((entry) => (
-        <div className="setup-account-row" key={entry.room} data-closing={closing === entry.room} data-held={heldLine(discord.status, entry.room) ? "true" : undefined}>
-          <span className="setup-account-icon"><Link2 size={15} strokeWidth={2.3} /></span>
-          <span className="setup-account-main">
-            <span className="setup-account-login">{entry.room}</span>
-            <span className="setup-account-tags">
-              {/* A count, not a roster: which sessions are in a room is answered in
-                  their own detail panels, and naming them here made every row as tall
-                  as the number of members. */}
-              <span className="setup-detail">
-                {entry.members.length === 1 ? "1 session" : `${entry.members.length} sessions`}
-              </span>
-            </span>
-          </span>
-          {entry.pending > 0 ? (
-            <span className="setup-account-active" title={`${entry.pending} waiting to be collected`}>
-              {entry.pending} waiting
-            </span>
-          ) : null}
-          {entry.founder && discordReady ? (() => {
-            const followed = discord.status?.connectedRooms.includes(entry.room) === true;
-            const label = followed ? "Disconnect from Discord" : "Connect to Discord";
-            return (
-              <button className="gh-icon-btn" type="button" data-active={followed} disabled={discord.busy} onClick={() => void discord.run(followed ? "discord_disconnect" : "discord_connect", { code: entry.room })} data-tauri-drag-region="false" title={label} aria-label={label}>
-                <DiscordLogo size={13} />
-              </button>
-            );
-          })() : null}
-          {entry.founder ? (
-            // Closing ends the room for everyone in it, so it belongs to whoever opened
-            // it — the same hand that gave out the password. It is not instant either:
-            // every member is told and every stream is cut before the room goes, so the
-            // button says it is working rather than sitting dead until the row leaves.
-            <button
-              className="gh-icon-btn danger"
-              type="button"
-              disabled={closing === entry.room}
-              onClick={() => {
-                setClosing(entry.room);
-                void onCloseRoom(entry.room, entry.founder ?? "").finally(() => setClosing(null));
-              }}
-              data-tauri-drag-region="false"
-              title={closing === entry.room ? "Closing…" : "Close this room for everyone in it"}
-              aria-label={closing === entry.room ? `Closing room ${entry.room}` : `Close room ${entry.room}`}
-            >
-              {closing === entry.room ? (
-                <RefreshCw className="setup-spin" size={13} strokeWidth={2.4} />
-              ) : (
-                <Trash2 size={13} strokeWidth={2.3} />
-              )}
-            </button>
-          ) : null}
-          {(() => {
-            const line = heldLine(discord.status, entry.room);
-            return line ? <span className="setup-detail setup-account-held" role="status" data-discord="room-held">{line}</span> : null;
-          })()}
-        </div>
+        {open.map((entry) => (
+          <SyncRoomRow key={entry.room} entry={entry} discord={discord} discordReady={discordReady} onCloseRoom={onCloseRoom} />
         ))}
       </div>
     </>
@@ -351,71 +421,94 @@ const heavyElapsed = (ms: number): string => {
 };
 
 
+/** The session's own name: the bridge labels a run "Provider / Name", and the card has room for the name only. */
+const sessionName = (label: string | null | undefined, as: string): string => {
+  const text = label ?? as;
+  const slash = text.indexOf(" / ");
+  return slash === -1 ? text : text.slice(slash + 3);
+};
+
 /**
- * The machine's one heavy-run slot (#223): who holds it, what it runs and for how long, and
- * who is waiting. The app may free a stuck slot and nothing more — no reordering, no jumping
- * the line.
+ * The machine's one heavy-run slot (#223), folded into the Heavy commands card (#376): the run
+ * holding it, the runs outside the helper, and who is waiting. When nothing runs, the card says
+ * nothing about the slot. The app may free a stuck slot and take a waiting run out of the line
+ * (#376), and nothing more — no reordering, no jumping the line.
  */
-const HeavyRunsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean }) => {
-  const heavy = useHeavyRuns(canUseNativeControls);
+const HeavyRunLines = ({ heavy }: { heavy: ReturnType<typeof useHeavyRuns> }) => {
   // Asked here, in the row: the macOS webview implements no window.confirm (#243 audit). The
-  // confirmation names the run it was asked about, so a run that took the slot since is
-  // never the one stopped.
+  // confirmation is keyed by the run it was asked about, so a run that took the slot since is
+  // never the one killed.
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
-  if (!canUseNativeControls) return null;
   const holder = heavy.status?.holder ?? null;
   // A run recorded before #243 was never verified as the helper's, so the app cannot stop it.
   const stoppable = holder !== null && holder.verified !== false;
   const confirming = holder !== null && stoppable && confirmingId === holder.id;
   const queue = heavy.status?.queue ?? [];
   const observed = heavy.status?.observed ?? [];
-  const detail = heavy.error
-    ? heavy.error
-    : !heavy.status
-      ? "Checking…"
-      : holder
-        ? `${holder.label ?? holder.as} · ${holder.what} · ${heavyElapsed(holder.elapsedMs)}${holder.state === "reserved" ? " · starting" : ""}${holder.loadSkipped ? " · started under load" : ""}`
-        : observed.length > 0 ? "Held by a run outside the helper" : "Free";
+  if (!holder && observed.length === 0 && queue.length === 0) return null;
+  return (
+    <div className="setup-runs" data-heavy-holder={holder?.as ?? ""} title={heavy.status?.limit}>
+      {holder ? (
+        <div className="setup-run" data-heavy-run="holder">
+          <span className="setup-run-copy">
+            <span className="setup-detail setup-run-what">{holder.what}</span>
+            <span className="setup-detail">
+              {`${sessionName(holder.label, holder.as)} · ${heavyElapsed(holder.elapsedMs)}${holder.state === "reserved" ? " · starting" : ""}${holder.loadSkipped ? " · started under load" : ""}`}
+            </span>
+            {holder.helperGone ? <span className="setup-detail">Helper gone, command still running</span> : null}
+            {!stoppable ? <span className="setup-detail">Started before this version — stop it from its terminal.</span> : null}
+          </span>
+          {confirming ? (
+            <span className="setup-row-actions">
+              <button className="pill-btn" type="button" onClick={() => setConfirmingId(null)} data-tauri-drag-region="false">Cancel</button>
+              <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => { setConfirmingId(null); void heavy.stop(holder.id); }} data-tauri-drag-region="false" aria-label={`Kill ${holder.what} now`}>
+                {heavy.releasing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
+                Kill
+              </button>
+            </span>
+          ) : stoppable ? (
+            <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => setConfirmingId(holder.id)} data-tauri-drag-region="false" aria-label={`Kill ${holder.what}`}>
+              {heavy.releasing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
+              Kill
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      {/* No Kill here: an observed run is never the app's to end (#245, Q18). */}
+      {observed.map((run) => (
+        <div className="setup-run" key={`observed-${run.pid}`} data-heavy-observed={run.pid} title={run.cwd ?? undefined}>
+          <span className="setup-run-copy">
+            <span className="setup-detail setup-run-what">{run.pattern}</span>
+            <span className="setup-detail">{`${run.label} · ${heavyElapsed(run.elapsedMs)} · outside the queue`}</span>
+          </span>
+        </div>
+      ))}
+      {queue.map((entry) => (
+        <div className="setup-run" key={entry.id ?? `${entry.position}-${entry.as}`} data-heavy-queued={entry.position}>
+          <span className="setup-detail">{`${entry.position} · ${entry.what} · ${sessionName(entry.label, entry.as)}`}</span>
+          {/* An entry from a bridge older than #245 carries no id, so it cannot be named. */}
+          {entry.id ? (
+            <button className="pill-btn danger" type="button" disabled={heavy.removing !== null} onClick={() => { if (entry.id) void heavy.remove(entry.id); }} data-tauri-drag-region="false" aria-label={`Remove ${entry.what} from the queue`}>
+              {heavy.removing === entry.id ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
+              Remove
+            </button>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+};
+
+const HeavyRuns = ({ canUseNativeControls }: { canUseNativeControls: boolean }) => {
+  const heavy = useHeavyRuns(canUseNativeControls);
+  if (!canUseNativeControls) return null;
   return (
     <>
       <div className="setup-subheading">Heavy runs</div>
-      <div className="setup-row" data-heavy-holder={holder?.as ?? ""}>
-        <span className="status-slot"><Gauge className="setup-icon" size={14} strokeWidth={2.3} /></span>
-        <span className="setup-copy">
-          <span className="setup-title">Heavy-run slot</span>
-          <span className="setup-detail">{detail}</span>
-          {holder?.helperGone ? <span className="setup-detail">Helper gone, command still running</span> : null}
-          {holder && !stoppable ? <span className="setup-detail">Started before this version — stop it from its terminal.</span> : null}
-          {queue.map((entry) => (
-            <span className="setup-detail" key={`${entry.position}-${entry.as}`}>
-              {`Waiting ${entry.position} · ${entry.label ?? entry.as} · ${entry.what} · ${heavyElapsed(entry.waitedMs)}`}
-            </span>
-          ))}
-          {/* No Stop here: an observed run is never the app's to end (#245, Q18). */}
-          {observed.map((run) => (
-            <span className="setup-detail" key={`observed-${run.pid}`} data-heavy-observed={run.pid} title={run.cwd ?? undefined}>
-              {`Observed · ${run.label} · ${run.pattern} · ${run.exe} · pid ${run.pid}${run.cwd ? ` · ${shortenPath(run.cwd)}` : ""} · ${heavyElapsed(run.elapsedMs)}`}
-            </span>
-          ))}
-          {heavy.status ? <span className="setup-detail" title={heavy.status.limit}>Runs outside the helper show as observed.</span> : null}
-          {holder && confirming ? <span className="setup-detail" role="alert">{`Stop ${holder.what} of ${holder.label ?? holder.as}? Its command will be ended.`}</span> : null}
-        </span>
-        {holder && confirming ? (
-          <span className="setup-row-actions">
-            <button className="pill-btn" type="button" onClick={() => setConfirmingId(null)} data-tauri-drag-region="false">Cancel</button>
-            <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => { setConfirmingId(null); void heavy.stop(holder.id); }} data-tauri-drag-region="false">
-              {heavy.releasing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
-              Stop
-            </button>
-          </span>
-        ) : holder && stoppable ? (
-          <button className="pill-btn danger" type="button" disabled={heavy.releasing} onClick={() => setConfirmingId(holder.id)} data-tauri-drag-region="false">
-            {heavy.releasing ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : null}
-            {heavy.releasing ? "Stopping…" : "Stop this run"}
-          </button>
-        ) : null}
-      </div>
-      <HeavyPatternsRow canUseNativeControls={canUseNativeControls} />
+      <HeavyPatternsRow canUseNativeControls={canUseNativeControls}>
+        {heavy.error ? <span className="setup-detail" role="alert">{heavy.error}</span> : null}
+        <HeavyRunLines heavy={heavy} />
+      </HeavyPatternsRow>
     </>
   );
 };
@@ -515,9 +608,9 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
   const handleCategoryKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, current: SetupCategory): void => {
     if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
-    const currentIndex = SETUP_CATEGORIES.indexOf(current);
+    const currentIndex = SETUP_CATEGORIES.findIndex((category) => category.id === current);
     const nextIndex = event.key === "Home" ? 0 : event.key === "End" ? SETUP_CATEGORIES.length - 1 : (currentIndex + (["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1) + SETUP_CATEGORIES.length) % SETUP_CATEGORIES.length;
-    const next = SETUP_CATEGORIES[nextIndex] ?? "connection";
+    const next = SETUP_CATEGORIES[nextIndex]?.id ?? "connection";
     selectCategory(next);
     window.requestAnimationFrame(() => document.getElementById(`setup-tab-${next}`)?.focus());
   };
@@ -533,13 +626,9 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
     <div className="setup-body">
       <div className="setup-layout">
         <div className="setup-sidebar" role="tablist" aria-label="Setup sections" aria-orientation={compactNavigation ? "horizontal" : "vertical"}>
-          <button className="setup-side-tab" id="setup-tab-connection" type="button" role="tab" aria-selected={activeCategory === "connection"} aria-controls="setup-panel-connection" tabIndex={activeCategory === "connection" ? 0 : -1} data-active={activeCategory === "connection"} onClick={() => selectCategory("connection")} onKeyDown={(event) => handleCategoryKeyDown(event, "connection")}><PlugZap size={12} strokeWidth={2.2} /><span>Connection</span></button>
-          <button className="setup-side-tab" id="setup-tab-display" type="button" role="tab" aria-selected={activeCategory === "display"} aria-controls="setup-panel-display" tabIndex={activeCategory === "display" ? 0 : -1} data-active={activeCategory === "display"} onClick={() => selectCategory("display")} onKeyDown={(event) => handleCategoryKeyDown(event, "display")}><MonitorIcon size={12} strokeWidth={2.2} /><span>Display</span></button>
-          <button className="setup-side-tab" id="setup-tab-git" type="button" role="tab" aria-selected={activeCategory === "git"} aria-controls="setup-panel-git" tabIndex={activeCategory === "git" ? 0 : -1} data-active={activeCategory === "git"} onClick={() => selectCategory("git")} onKeyDown={(event) => handleCategoryKeyDown(event, "git")}><KeyRound size={12} strokeWidth={2.2} /><span>Git</span></button>
-          <button className="setup-side-tab" id="setup-tab-notification" type="button" role="tab" aria-selected={activeCategory === "notification"} aria-controls="setup-panel-notification" tabIndex={activeCategory === "notification" ? 0 : -1} data-active={activeCategory === "notification"} onClick={() => selectCategory("notification")} onKeyDown={(event) => handleCategoryKeyDown(event, "notification")}><Bell size={12} strokeWidth={2.2} /><span>Notification</span></button>
-          <button className="setup-side-tab" id="setup-tab-permission" type="button" role="tab" aria-selected={activeCategory === "permission"} aria-controls="setup-panel-permission" tabIndex={activeCategory === "permission" ? 0 : -1} data-active={activeCategory === "permission"} onClick={() => selectCategory("permission")} onKeyDown={(event) => handleCategoryKeyDown(event, "permission")}><ShieldCheck size={12} strokeWidth={2.2} /><span>Permission</span></button>
-          <button className="setup-side-tab" data-flag={pluginsNeedAttention} id="setup-tab-plugins" type="button" role="tab" aria-selected={activeCategory === "plugins"} aria-controls="setup-panel-plugins" tabIndex={activeCategory === "plugins" ? 0 : -1} data-active={activeCategory === "plugins"} onClick={() => selectCategory("plugins")} onKeyDown={(event) => handleCategoryKeyDown(event, "plugins")}><Puzzle size={12} strokeWidth={2.2} /><span>Plugins</span></button>
-          <button className="setup-side-tab" id="setup-tab-update" type="button" role="tab" aria-selected={activeCategory === "update"} aria-controls="setup-panel-update" tabIndex={activeCategory === "update" ? 0 : -1} data-active={activeCategory === "update"} onClick={() => selectCategory("update")} onKeyDown={(event) => handleCategoryKeyDown(event, "update")}><Download size={12} strokeWidth={2.2} /><span>Update</span></button>
+          {SETUP_CATEGORIES.map(({ id, label, icon: Icon }) => (
+            <button key={id} className="setup-side-tab" data-flag={id === "plugins" ? pluginsNeedAttention : undefined} id={`setup-tab-${id}`} type="button" role="tab" aria-selected={activeCategory === id} aria-controls={`setup-panel-${id}`} tabIndex={activeCategory === id ? 0 : -1} data-active={activeCategory === id} onClick={() => selectCategory(id)} onKeyDown={(event) => handleCategoryKeyDown(event, id)}><Icon size={12} strokeWidth={2.2} /><span>{label}</span></button>
+          ))}
         </div>
 
         <div className="setup-category-panel" id={`setup-panel-${activeCategory}`} role="tabpanel" aria-labelledby={`setup-tab-${activeCategory}`}>
@@ -550,8 +639,16 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
               <div className="setup-row setup-row-stack"><div className="setup-row-main"><span className="status-slot"><PlugZap className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Bridge port</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : portStatus ?? `Local bridge port · ${bridgePort}`}</span></span>{canUseNativeControls ? <button className="pill-btn" type="button" onClick={toggleEditPort} data-tauri-drag-region="false" aria-expanded={editingPort} aria-label="Edit bridge port"><Pencil size={12} strokeWidth={2.3} />Edit</button> : null}</div>{editingPort ? <span className="setup-row-actions full"><input className="setup-input" type="number" min={MIN_BRIDGE_PORT} max={MAX_BRIDGE_PORT} value={portField} onChange={(event) => setPortField(event.target.value)} disabled={portBusy} data-tauri-drag-region="false" aria-label="Bridge port" autoFocus /><button className="pill-btn accent" type="button" onClick={() => void applyPort()} disabled={!canApplyPort} data-tauri-drag-region="false"><Check size={12} strokeWidth={2.3} />Apply</button></span> : null}</div>
               <div className="setup-row passive"><span className="status-slot"><ArrowRight className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">{guidance.title}</span><span className="setup-detail">{guidance.detail}</span></span></div>
               {nativeAction.message ? <div className="notice-row" data-online={nativeAction.bridgeOnline === true} role="status" aria-live="polite">{nativeAction.message}</div> : null}
+              <div className="setup-subheading">Security</div>
+              <MfaRow canUseNativeControls={canUseNativeControls} />
+            </>
+          ) : null}
+
+          {activeCategory === "sync" ? (
+            <>
+              <div className="setup-section-heading"><span>Sync</span><small>Rooms and heavy runs</small></div>
               <SyncRoomList rooms={mailRooms} canUseNativeControls={canUseNativeControls} onCloseRoom={onCloseRoom} discord={discord} />
-              <HeavyRunsRow canUseNativeControls={canUseNativeControls} />
+              <HeavyRuns canUseNativeControls={canUseNativeControls} />
             </>
           ) : null}
 
@@ -614,7 +711,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
           {activeCategory === "display" ? (
             <>
               <div className="setup-section-heading"><span>Display</span><small>Screen and focus behavior</small></div>
-              <div className="setup-row"><span className="status-slot"><Coffee className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Keep awake while working</span><span className="setup-detail">{!keepAwakeEnabled && !keepAwakeError ? "Off · display follows macOS idle settings" : !canUseNativeControls ? "Desktop runtime required" : keepAwakeError ? `Unavailable · ${keepAwakeError}` : keepAwakeWhy ? `Active · ${keepAwakeWhy}` : "On · stays awake for agents, Discord rooms and heavy runs"}</span></span><button className="switch-toggle" type="button" role="switch" aria-checked={keepAwakeEnabled} data-on={keepAwakeEnabled} disabled={!canUseNativeControls} onClick={() => onKeepAwakeChange(!keepAwakeEnabled)} data-tauri-drag-region="false" aria-label={`${keepAwakeEnabled ? "Disable" : "Enable"} keep display awake`}><span className="switch-thumb" /></button></div>
+              <div className="setup-row"><span className="status-slot"><Coffee className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Keep awake while working</span><span className="setup-detail">{!keepAwakeEnabled && !keepAwakeError ? "Off · display follows macOS idle settings" : !canUseNativeControls ? "Desktop runtime required" : keepAwakeError ? `Unavailable · ${keepAwakeError}` : keepAwakeWhy ? `Active · ${keepAwakeWhy}` : "On · stays awake for agents, Discord rooms and heavy runs"}</span></span><button className="switch-toggle" type="button" role="switch" aria-checked={keepAwakeEnabled} data-on={keepAwakeEnabled} disabled={!canUseNativeControls} data-dimmed={keepAwakeEnabled && keepAwakeError ? "" : undefined} onClick={() => onKeepAwakeChange(!keepAwakeEnabled)} data-tauri-drag-region="false" aria-label={`${keepAwakeEnabled ? "Disable" : "Enable"} keep display awake`}><span className="switch-thumb" /></button></div>
               <div className="setup-row"><span className="status-slot"><Focus className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Terminal</span><span className="setup-detail">Focus jumps to this terminal at the session cwd</span></span><select className="setup-select" value={terminal} onChange={(event) => onTerminalChange(event.target.value as TerminalChoice)} data-tauri-drag-region="false" aria-label="Focus terminal">{TERMINAL_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></div>
               <div className="setup-row"><span className="status-slot"><Power className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Start when you log in</span><span className="setup-detail">{launchAtLogin.error ?? (canUseNativeControls ? "Opens hidden in the menu bar, not on screen" : "Needs the desktop runtime")}</span></span><button className="switch-toggle" type="button" role="switch" aria-checked={launchAtLogin.enabled} data-on={launchAtLogin.enabled} disabled={!canUseNativeControls || launchAtLogin.busy} onClick={() => void launchAtLogin.set(!launchAtLogin.enabled)} data-tauri-drag-region="false" aria-label="Start Gyredeck when you log in"><span className="switch-thumb" /></button></div>
             </>
@@ -635,7 +732,7 @@ export const SetupPanel = ({ capabilities, canUseNativeControls, connectionTitle
             <>
               <div className="setup-section-heading"><span>Update</span><small>App version and updates</small></div>
               <div className="setup-row passive"><span className="status-slot"><Check className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">Current version</span><span className="setup-detail">{updater.currentVersion ? `v${updater.currentVersion}` : canUseNativeControls ? "Reading version…" : "Desktop runtime required"}</span></span></div>
-              <div className="setup-row"><span className="status-slot"><Download className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">App updates</span><span className="setup-detail">{!canUseNativeControls ? "Desktop runtime required" : updater.status === "error" ? (updater.message ?? UPDATER_DETAIL.error) : updater.status === "available" ? `${UPDATER_DETAIL.available}${updater.version ? ` · v${updater.version}` : ""}` : updater.status === "downloading" ? UPDATER_DETAIL.downloading : UPDATER_DETAIL[updater.status]}</span></span>{updater.status === "available" || updater.status === "downloading" ? (<button className="pill-btn accent" type="button" disabled={!canUseNativeControls || updater.status === "downloading"} onClick={() => void updater.installAndRelaunch()} data-tauri-drag-region="false">{updater.status === "downloading" ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : <Download size={12} strokeWidth={2.3} />}{updater.status === "downloading" ? "Downloading…" : "Update"}</button>) : (<button className="pill-btn" type="button" disabled={!canUseNativeControls || updater.status === "checking"} onClick={() => void updater.check()} data-tauri-drag-region="false"><RefreshCw className={updater.status === "checking" ? "setup-spin" : undefined} size={12} strokeWidth={2.3} />{updater.status === "checking" ? "Checking…" : "Check"}</button>)}</div>
+              <div className="setup-row"><span className="status-slot"><Download className="setup-icon" size={14} strokeWidth={2.3} /></span><span className="setup-copy"><span className="setup-title">App updates</span><span className="setup-detail" data-tone={canUseNativeControls && updater.status === "error" ? "warn" : undefined}>{!canUseNativeControls ? "Desktop runtime required" : updater.status === "error" ? (updater.message ?? UPDATER_DETAIL.error) : updater.status === "available" ? `${UPDATER_DETAIL.available}${updater.version ? ` · v${updater.version}` : ""}` : updater.status === "downloading" ? UPDATER_DETAIL.downloading : UPDATER_DETAIL[updater.status]}</span></span>{updater.status === "available" || updater.status === "downloading" ? (<button className="pill-btn accent" type="button" disabled={!canUseNativeControls || updater.status === "downloading"} onClick={() => void updater.installAndRelaunch()} data-tauri-drag-region="false">{updater.status === "downloading" ? <RefreshCw className="setup-spin" size={12} strokeWidth={2.3} /> : <Download size={12} strokeWidth={2.3} />}{updater.status === "downloading" ? "Downloading…" : "Update"}</button>) : (<button className="pill-btn" type="button" disabled={!canUseNativeControls || updater.status === "checking"} onClick={() => void updater.check()} data-tauri-drag-region="false"><RefreshCw className={updater.status === "checking" ? "setup-spin" : undefined} size={12} strokeWidth={2.3} />{updater.status === "checking" ? "Checking…" : "Check"}</button>)}</div>
               {updater.status === "available" ? (
                 <div className="update-notes">
                   <div className="update-notes-head"><span>Release notes{updater.version ? ` · v${updater.version}` : ""}</span>{updater.date ? <span className="update-notes-date">{updater.date.slice(0, 10)}</span> : null}</div>

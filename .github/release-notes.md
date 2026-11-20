@@ -1,5 +1,18 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## A new room keeps its place on Discord when an old room's close is slow — (v1.37.8)
+
+### Fixes
+
+- **Closing a room no longer takes Discord away from a new room that got its code.** The app
+  keeps a list of the rooms it created, by code, and only those can be connected to Discord. A
+  close or a leave that ended a room took its code off that list once the bridge answered. If the
+  bridge had already handed the same code to a new room, and the app had created that room before
+  the old close was answered, the old close took the new room off the list too, and connecting it
+  to Discord was refused with "Only a room this app created can be followed on Discord". A close
+  or a leave now takes a code off the list only if nothing created a room under that code after
+  the close or leave was sent.
+
 ## Discord lets go of a sync room as soon as it is closed — (v1.37.7)
 
 ### Fixes

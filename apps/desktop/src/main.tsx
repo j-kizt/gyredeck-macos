@@ -258,7 +258,7 @@ const App = () => {
   // Mail waiting per session. Gated like the other pollers: the chip only exists on
   // the session list, so there is nothing to keep fresh when that is not on screen.
   const mailRooms = useMailRooms({
-    // The session list needs this for the mail chip, and Settings → Connection lists
+    // The session list needs this for the mail chip, and Settings → Sync lists
     // the open rooms — so Settings being open is a reason to poll, not to stop.
     active: setupOpen || (activeMainTab === "sessions" && !selectedSessionId),
     canUseNativeControls,

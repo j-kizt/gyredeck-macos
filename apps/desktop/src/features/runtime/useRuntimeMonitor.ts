@@ -4,6 +4,9 @@ import { buildLocalServiceOwnerTargets, createDemoLocalServices, localServicePro
 import type { ILocalService, ILocalServiceControlRequest, ILocalServiceControlResult, ILocalServiceOwnerTarget, ILocalServicesSnapshot, IRuntimeMonitorView, IRuntimeTargetSource } from "./types";
 
 const ACTIVE_REFRESH_MS = 5_000;
+// One turn of the toolbar spin: a scan usually ends sooner, and a click that shows nothing
+// moving reads as a click that did nothing.
+const MANUAL_REFRESH_MIN_BUSY_MS = 800;
 
 interface IUseRuntimeMonitorOptions extends IRuntimeTargetSource {
   servicesActive: boolean;
@@ -21,6 +24,10 @@ export const useRuntimeMonitor = ({ canUseNativeControls, demoMode, registry, se
   const [services, setServices] = useState<ILocalService[]>([]);
   const [servicesLoading, setServicesLoading] = useState(false);
   const [servicesError, setServicesError] = useState<string | null>(null);
+  // Display only, apart from servicesLoadingRef: holding that would turn away the scans that
+  // follow a stop, and the snapshot is applied the moment it arrives either way.
+  const [manualBusyHeld, setManualBusyHeld] = useState(false);
+  const manualBusyTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     serviceOwnerTargetsRef.current = serviceOwnerTargets;
@@ -135,6 +142,20 @@ export const useRuntimeMonitor = ({ canUseNativeControls, demoMode, registry, se
     }
   }, [canUseNativeControls, demoMode, refreshServices]);
 
+  const refreshServicesManually = useCallback(() => {
+    if (manualBusyTimerRef.current !== null) window.clearTimeout(manualBusyTimerRef.current);
+    setManualBusyHeld(true);
+    manualBusyTimerRef.current = window.setTimeout(() => {
+      manualBusyTimerRef.current = null;
+      setManualBusyHeld(false);
+    }, MANUAL_REFRESH_MIN_BUSY_MS);
+    void refreshServices();
+  }, [refreshServices]);
+
+  useEffect(() => () => {
+    if (manualBusyTimerRef.current !== null) window.clearTimeout(manualBusyTimerRef.current);
+  }, []);
+
   useEffect(() => {
     if (!servicesActive) return undefined;
     void refreshServices();
@@ -145,8 +166,8 @@ export const useRuntimeMonitor = ({ canUseNativeControls, demoMode, registry, se
   return {
     services,
     servicesError,
-    servicesLoading,
-    refreshServices: () => void refreshServices(),
+    servicesLoading: servicesLoading || manualBusyHeld,
+    refreshServices: refreshServicesManually,
     controlLocalService,
   };
 };

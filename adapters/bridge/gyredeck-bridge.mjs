@@ -1039,6 +1039,12 @@ const heavyHelper = async (setup) => {
         answer = await call("acquire", { as, what, requestId, lease });
         continue;
       }
+      if (answer.status === 410 && answer.body.error === "removed") {
+        state = "refused";
+        clearInterval(heartbeat);
+        say("removed from the heavy queue by the Gyredeck app — not running");
+        process.exit(75);
+      }
       if (answer.status === 404 && answer.body.error === "ticket_unknown") {
         // The bridge restarted and the line with it: join again, at the back.
         state = "acquiring";
@@ -5226,7 +5232,7 @@ function startBridge(config) {
    * turn, never woken for it. Only a session proven to have started the run is told: one
    * the app's broker has bound to the ancestor process. Codex has no such proof yet
    * (openai/codex#52783), so a Codex run is labelled "Codex" and nobody is told; a run with
-   * no agent above it is "Terminal". Remembered by recency, like the told set; the pending
+   * no agent above it is "Unknown". Remembered by recency, like the told set; the pending
    * set is bounded the same way.
    */
   const heavyNudged = new Map();
@@ -7093,6 +7099,13 @@ function startBridge(config) {
   let heavyHolder = null;
   const heavyQueue = [];
   const heavyPolls = new Set();
+  // Runs the app took out of the line (#376), by ticket and by request identity, so their
+  // helper is told and stops — whether it next waits on the ticket or retries `acquire` with
+  // the same request — rather than joining again. Bounded; a restart forgets.
+  const heavyRemoved = new Map();
+  const wasRemoved = (requestIdHash) => [...heavyRemoved.values()].some((removed) => sameHash(removed, requestIdHash));
+  const removedAnswer = () => ({ ok: false, v: HEAVY_PROTOCOL_VERSION, error: "removed", message: "The Gyredeck app removed this run from the heavy-run queue." });
+  const HEAVY_REMOVED_MAX = 128;
 
   // Heavy runs started outside the helper (#245), as the app last reported them from the
   // process table. The report expires on its own, so an app that quit or hung cannot hold
@@ -7366,9 +7379,11 @@ function startBridge(config) {
   };
 
   const OBSERVED_KIND_LABELS = { claude: "Claude Code", agy: "Antigravity", codex: "Codex" };
-  /** Named as holders are (#243): the session that started it, its agent alone, or "Terminal" when no agent did. */
+  /** Named as holders are (#243): the session that started it, its agent alone, or "Unknown" when
+   *  no agent is above it. Every place the run is named — Settings, notifications, room notices —
+   *  reads this label, so the bridge is the one place the word is chosen. */
   const observedLabelFor = (run) =>
-    (run.session ? heavyLabelFor(run.session) : null) ?? (run.kind ? OBSERVED_KIND_LABELS[run.kind] : "Terminal");
+    (run.session ? heavyLabelFor(run.session) : null) ?? (run.kind ? OBSERVED_KIND_LABELS[run.kind] : "Unknown");
   const observedEnded = (run) => {
     if (!observedAnnounced.delete(observedKey(run))) return;
     tellRoomsOfHeavy(`${observedLabelFor(run)}'s ${run.pattern} finished (${heavyDuration(Date.now() - run.startedAtMs)}).`, run.session);
@@ -7765,6 +7780,32 @@ function startBridge(config) {
         return;
       }
 
+      // DELETE /heavy/queue?id=… — the app's "Remove" on a waiting run (#376). The app's word,
+      // like stopping the holder; the holder itself is never touched here.
+      if (req.method === "DELETE" && pathname === "/heavy/queue") {
+        if (brokerSecret === null) {
+          sendJson(503, { ok: false, error: "app_word_unavailable", message: "A waiting heavy run is removed from the Gyredeck app, and this bridge was started without the app's word. Quit and reopen Gyredeck." });
+          return;
+        }
+        if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"])) {
+          sendJson(401, { ok: false, error: "app_only", message: "Only the Gyredeck app can remove a waiting heavy run; a helper leaves the line by cancelling its own ticket." });
+          return;
+        }
+        const id = heavyUrl.searchParams.get("id");
+        const at = id ? heavyQueue.findIndex((entry) => entry.id === id) : -1;
+        if (at < 0) {
+          sendJson(409, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "entry_gone", message: "That run is no longer waiting; nothing was removed." });
+          return;
+        }
+        const [removed] = heavyQueue.splice(at, 1);
+        heavyRemoved.set(removed.ticket, removed.requestIdHash);
+        if (heavyRemoved.size > HEAVY_REMOVED_MAX) heavyRemoved.delete(heavyRemoved.keys().next().value);
+        for (const poll of [...heavyPolls]) if (poll.ticket === removed.ticket) poll.finish();
+        promoteHeavy();
+        sendJson(200, { ok: true, v: HEAVY_PROTOCOL_VERSION, removed: true });
+        return;
+      }
+
       // PUT /heavy/observed — the app's report of heavy runs it sees in the process table
       // outside the helper (#245). The app's word only: an agent able to report runs could
       // hold the slot for everyone. Replaces the last report whole; expires at the TTL.
@@ -7868,6 +7909,10 @@ function startBridge(config) {
         }
         const requestIdHash = hashOf(requestId);
         const leaseHash = hashOf(lease);
+        if (wasRemoved(requestIdHash)) {
+          sendJson(410, removedAnswer());
+          return;
+        }
         // A retry of a request already answered: the same grant or the same place, and only
         // for whoever presents both halves of the pair.
         if (heavyHolder && sameHash(heavyHolder.requestIdHash, requestIdHash)) {
@@ -7917,6 +7962,10 @@ function startBridge(config) {
       if (action === "wait" || action === "cancel") {
         const ticket = typeof body.ticket === "string" ? body.ticket : "";
         const granted = heavyHolder !== null && heavyHolder.ticket === ticket && heavyHolderMatches(lease);
+        if (heavyRemoved.has(ticket)) {
+          sendJson(410, removedAnswer());
+          return;
+        }
         if (action === "cancel") {
           const at = heavyTicketAt(ticket, lease);
           if (at < 0) {
@@ -7959,6 +8008,7 @@ function startBridge(config) {
             else {
               const index = heavyQueue.findIndex((candidate) => candidate.ticket === ticket);
               if (index >= 0) sendJson(200, heavyQueued(index));
+              else if (heavyRemoved.has(ticket)) sendJson(410, removedAnswer());
               else sendJson(404, { ok: false, v: HEAVY_PROTOCOL_VERSION, error: "ticket_unknown" });
             }
           },

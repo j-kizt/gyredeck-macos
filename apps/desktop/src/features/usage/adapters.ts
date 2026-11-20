@@ -2,6 +2,7 @@ import {
   getUsageMetricGroupLabel,
   getUsageMetricGroupModels,
 } from "./providers";
+import { meterStatus } from "./meterStatus";
 import { formatResetLabel } from "./settings";
 import type {
   IAgentUsageSnapshot,
@@ -61,36 +62,6 @@ const getTextValue = (line: IUsageMetricLine | null): string | null => {
   return null;
 };
 
-const getStatusLevel = (
-  left: number | null,
-): IUsageMetric["statusLevel"] => {
-  if (left === null) {
-    return "unavailable";
-  }
-
-  if (left <= 20) {
-    return "danger";
-  }
-
-  return left <= 45 ? "warning" : "ok";
-};
-
-const getStatusLabel = (left: number | null): IUsageMetric["statusLabel"] => {
-  if (left === null) {
-    return "Unavailable";
-  }
-
-  if (left === 0) {
-    return "Exhausted";
-  }
-
-  if (left <= 20) {
-    return "Nearly exhausted";
-  }
-
-  return left <= 45 ? "Running low" : "Available";
-};
-
 const normalizeMetric = (
   line: IUsageMetricLine,
   settings: IUsageSettings,
@@ -121,8 +92,8 @@ const normalizeMetric = (
     // downstream asking "how much is left" would otherwise have to recompute it and
     // could disagree with the meter beside it.
     leftPercent: left,
-    statusLevel: getStatusLevel(left),
-    statusLabel: getStatusLabel(left),
+    statusLevel: meterStatus(left).level,
+    statusLabel: meterStatus(left).label,
     remainingLabel: hasAvailableQuota
       ? "Quota available"
       : value === null
@@ -325,7 +296,6 @@ export const createDemoAgentUsage = (
     value: number,
     remainingLabel: string,
     resetLabel: string | null,
-    statusLevel: IUsageMetric["statusLevel"] = "ok",
   ): IUsageMetric => {
     const groupLabel = getUsageMetricGroupLabel(label);
 
@@ -337,8 +307,8 @@ export const createDemoAgentUsage = (
       value,
       // The demo builds its metrics already expressed as what is left.
       leftPercent: value,
-      statusLevel,
-      statusLabel: getStatusLabel(value),
+      statusLevel: meterStatus(value).level,
+      statusLabel: meterStatus(value).label,
       remainingLabel,
       resetLabel,
     };
@@ -367,7 +337,6 @@ export const createDemoAgentUsage = (
               42,
               "42% left",
               "Resets in 1d 19h",
-              "warning",
             ),
           ],
     sessionPercent: provider.id === "codex" ? 27 : null,

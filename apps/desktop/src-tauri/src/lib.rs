@@ -1219,6 +1219,12 @@ fn heavy_stop(holder_id: String, broker: tauri::State<'_, broker::BrokerState>) 
     standalone_bridge::heavy_stop(&holder_id, &broker.secret()?)
 }
 
+/// Take a waiting run out of the heavy-run line, named by the queue entry id the person saw.
+#[tauri::command]
+fn heavy_remove(entry_id: String, broker: tauri::State<'_, broker::BrokerState>) -> Result<(), String> {
+    standalone_bridge::heavy_remove(&entry_id, &broker.secret()?)
+}
+
 /// The heavy commands the app observes outside the helper (#245): the defaults, and the
 /// person's own.
 #[tauri::command]
@@ -6285,6 +6291,7 @@ pub fn run() {
             discord_approvals_unlock,
             heavy_status,
             heavy_stop,
+            heavy_remove,
             heavy_patterns,
             set_heavy_patterns,
             set_bridge_port,

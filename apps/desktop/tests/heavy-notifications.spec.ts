@@ -12,7 +12,7 @@ type Win = typeof window & { __heavyEmit: (payload: unknown) => void; __delivere
 
 const look = (overrides: Record<string, unknown> = {}) => ({ ok: true, v: 1, load: 1, loadLimit: 5, holder: null, queue: [], observed: [], waiting: 0, limit: "", ...overrides });
 const RUN = { id: "a1a1a1a1a1a1a1a1", as: "s-gyre", label: "Claude Code / Gyre Assistant", what: "test:hooks", state: "active", since: "2026-10-26T01:00:00Z", elapsedMs: 252_000, loadSkipped: false, helperGone: false };
-const OBSERVED = { pid: 4242, pattern: "cargo test|build|check", exe: "cargo", cwd: null, label: "Terminal", startedAtMs: 1_790_000_000_000, elapsedMs: 65_000 };
+const OBSERVED = { pid: 4242, pattern: "cargo test|build|check", exe: "cargo", cwd: null, label: "Unknown", startedAtMs: 1_790_000_000_000, elapsedMs: 65_000 };
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
@@ -53,7 +53,7 @@ test("a run that starts and ends is posted once each, named as Settings names it
   // Premise: the hook is reading — the next change is posted.
   await emit(page, look({ observed: [OBSERVED] }));
   await expect.poll(() => delivered(page)).toEqual([
-    { identifier: "gyredeck.heavy.started.observed.4242.1790000000000", title: "Terminal started a heavy run", body: "cargo test|build|check" },
+    { identifier: "gyredeck.heavy.started.observed.4242.1790000000000", title: "Unknown started a heavy run", body: "cargo test|build|check" },
     { identifier: "gyredeck.heavy.ended.helper.a1a1a1a1a1a1a1a1", title: "test:hooks finished (4m 17s)", body: "Claude Code / Gyre Assistant" },
   ]);
 });
@@ -83,5 +83,5 @@ test("C4: switching Heavy runs off and on again releases no backlog", async ({ p
   // The same state again, then one real change: only that change is posted.
   await emit(page, look({ queue: [{ id: "c3c3c3c3c3c3c3c3", position: 1, as: "s-audit", label: "Codex", what: "cargo check", waitedMs: 6_000 }], load: 7 }));
   await emit(page, look({ observed: [OBSERVED], queue: [{ id: "c3c3c3c3c3c3c3c3", position: 1, as: "s-audit", label: "Codex", what: "cargo check", waitedMs: 11_000 }] }));
-  await expect.poll(async () => (await delivered(page)).map((d) => d.title)).toEqual(["Terminal started a heavy run"]);
+  await expect.poll(async () => (await delivered(page)).map((d) => d.title)).toEqual(["Unknown started a heavy run"]);
 });

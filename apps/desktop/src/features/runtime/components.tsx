@@ -186,12 +186,12 @@ const LocalServiceRow = ({ expanded, onControl, onOpen, onResult, onToggle, serv
             ) : phase === "stillRunning" ? (
               <div className="runtime-service-actions">
                 <span className="runtime-service-control-status">Process did not stop.</span>
-                <button className="pill-btn danger" type="button" onClick={() => setPhase("confirmForce")}>Force kill…</button>
+                <button className="pill-btn danger" type="button" onClick={() => setPhase("confirmForce")}>Force kill</button>
               </div>
             ) : (
               <div className="runtime-service-actions">
                 {controlError ? <span className="runtime-service-control-error" role="status">{controlError}</span> : null}
-                {canControl ? <button className="pill-btn danger" type="button" onClick={() => setPhase("confirmStop")}>Stop process…</button> : <span className="runtime-service-control-status">{service.controlUnavailableReason ?? "Process control unavailable"}</span>}
+                {canControl ? <button className="pill-btn danger" type="button" onClick={() => setPhase("confirmStop")}>Stop process</button> : <span className="runtime-service-control-status">{service.controlUnavailableReason ?? "Process control unavailable"}</span>}
               </div>
             )}
           </div>

@@ -8,7 +8,7 @@ const { heavyChangesBetween, heavyMarkOf, heavyDuration } = await import(
 /** `GET /heavy` (and the native `heavy_state` event) in the shape the bridge answers. */
 const state = ({ holder = null, queue = [], observed = [], load = 1 } = {}) => ({ ok: true, v: 1, load, loadLimit: 5, holder, queue, observed, waiting: queue.length, limit: "" });
 const helperRun = (overrides = {}) => ({ id: "a1a1a1a1a1a1a1a1", as: "s-gyre", label: "Claude Code / Gyre Assistant", what: "test:hooks", state: "active", since: "2026-10-26T01:00:00Z", elapsedMs: 252_000, loadSkipped: false, helperGone: false, ...overrides });
-const observedRun = (overrides = {}) => ({ pid: 4242, pattern: "cargo test|build|check", exe: "cargo", cwd: "/tmp/p", label: "Terminal", startedAtMs: 1_790_000_000_000, elapsedMs: 65_000, ...overrides });
+const observedRun = (overrides = {}) => ({ pid: 4242, pattern: "cargo test|build|check", exe: "cargo", cwd: "/tmp/p", label: "Unknown", startedAtMs: 1_790_000_000_000, elapsedMs: 65_000, ...overrides });
 const waiter = (overrides = {}) => ({ id: "c3c3c3c3c3c3c3c3", position: 1, as: "s-audit", label: "Codex / Gyredesk Audit", what: "cargo check", waitedMs: 3_000, ...overrides });
 
 /** Each step's changes, the mark carried from one look to the next as the hook carries it. */
@@ -48,12 +48,12 @@ test("C2 and C3: one start and one end per run, for helper and observed runs ali
     {
       name: "an observed run gets the same messages, named as Settings names it",
       looks: [state(), state({ observed: [observedRun()] }), state({ observed: [observedRun({ elapsedMs: 70_000 })] }), state()],
-      want: [[], ["started: Terminal started a heavy run — cargo test|build|check"], [], ["ended: cargo test|build|check finished (1m 10s) — Terminal"]],
+      want: [[], ["started: Unknown started a heavy run — cargo test|build|check"], [], ["ended: cargo test|build|check finished (1m 10s) — Unknown"]],
     },
     {
       name: "a reused pid with another start is another observed run",
       looks: [state(), state({ observed: [observedRun()] }), state({ observed: [observedRun({ startedAtMs: 1_790_000_600_000, label: "Codex", elapsedMs: 2_000 })] })],
-      want: [[], ["started: Terminal started a heavy run — cargo test|build|check"], ["started: Codex started a heavy run — cargo test|build|check", "ended: cargo test|build|check finished (1m 5s) — Terminal"]],
+      want: [[], ["started: Unknown started a heavy run — cargo test|build|check"], ["started: Codex started a heavy run — cargo test|build|check", "ended: cargo test|build|check finished (1m 5s) — Unknown"]],
     },
     {
       name: "someone waits behind the holder, once",
@@ -63,7 +63,7 @@ test("C2 and C3: one start and one end per run, for helper and observed runs ali
     {
       name: "someone waits behind an observed run",
       looks: [state({ observed: [observedRun()] }), state({ observed: [observedRun()], queue: [waiter()] })],
-      want: [[], ["waiting: Codex / Gyredesk Audit is waiting behind Terminal — cargo check"]],
+      want: [[], ["waiting: Codex / Gyredesk Audit is waiting behind Unknown — cargo check"]],
     },
     {
       name: "someone waits for the load to drop (Q23)",

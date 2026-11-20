@@ -59,8 +59,20 @@ test("Usage keeps Codex values visible and labels them outdated after a refresh 
   await expect(page.getByText("Codex usage is rate limited. Try again shortly.")).toBeVisible();
 });
 
-test("Usage meters communicate remaining quota with semantic color and copy", async ({ page }) => {
-  await page.addInitScript(() => {
+// Percent left at every boundary of meterStatus.ts, with the level and words each must show,
+// and the tone token the dot, the label and the bar all take (#376).
+const METER_CASES = [
+  { left: 100, level: "ok", label: "Available", tone: "--tone-ok" },
+  { left: 46, level: "ok", label: "Available", tone: "--tone-ok" },
+  { left: 45, level: "low", label: "Running low", tone: "--tone-low" },
+  { left: 21, level: "low", label: "Running low", tone: "--tone-low" },
+  { left: 20, level: "critical", label: "Nearly exhausted", tone: "--tone-critical" },
+  { left: 1, level: "critical", label: "Nearly exhausted", tone: "--tone-critical" },
+  { left: 0, level: "out", label: "Exhausted", tone: "--tone-out" },
+] as const;
+
+test("Usage meters take one of four tones by what is left, the same on the dot, the label and the bar", async ({ page }) => {
+  await page.addInitScript((cases) => {
     (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
       invoke: async (command: string) => {
         if (command === "set_keep_awake") return false;
@@ -70,63 +82,93 @@ test("Usage meters communicate remaining quota with semantic color and copy", as
             displayName: "Codex",
             plan: "Pro",
             fetchedAt: "2026-08-13T06:00:00Z",
-            lines: [
-              { type: "progress", label: "Available quota", used: 10, limit: 100 },
-              { type: "progress", label: "Low quota", used: 60, limit: 100 },
-              { type: "progress", label: "Nearly empty quota", used: 85, limit: 100 },
-              { type: "progress", label: "Empty quota", used: 100, limit: 100 },
-            ],
+            lines: cases.map((entry) => ({ type: "progress", label: `Quota ${entry.left}`, used: 100 - entry.left, limit: 100 })),
           };
         }
         throw new Error(`${command} unavailable`);
       },
     };
-  });
+  }, METER_CASES.map((entry) => ({ left: entry.left })));
 
   await page.goto("/");
   await page.getByRole("tab", { name: "Usage" }).click();
 
   const meters = page.locator(".usage-meter");
-  await expect(meters).toHaveCount(4);
-  await expect(meters.nth(0)).toHaveAttribute("data-level", "ok");
-  await expect(meters.nth(0)).toContainText("Available");
-  await expect(meters.nth(1)).toHaveAttribute("data-level", "warning");
-  await expect(meters.nth(1)).toContainText("Running low");
-  await expect(meters.nth(2)).toHaveAttribute("data-level", "danger");
-  await expect(meters.nth(2)).toContainText("Nearly exhausted");
-  await expect(meters.nth(3)).toHaveAttribute("data-level", "danger");
-  await expect(meters.nth(3)).toContainText("Exhausted");
+  await expect(meters).toHaveCount(METER_CASES.length);
+  const tones = await page.evaluate((names) => {
+    // Resolved through a probe, so a token defined as var(--done) compares as the colour it is.
+    const probe = document.createElement("span");
+    document.body.append(probe);
+    const out = Object.fromEntries(names.map((name) => {
+      probe.style.color = `var(${name})`;
+      return [name, getComputedStyle(probe).color];
+    }));
+    probe.remove();
+    return out;
+  }, ["--tone-ok", "--tone-low", "--tone-critical", "--tone-out"]);
+  // Four tones, four colours: yellow and orange per the approved frames, not one shared amber.
+  expect(new Set(Object.values(tones)).size).toBe(4);
+  expect(tones["--tone-low"]).toBe("rgb(250, 204, 21)");
+  expect(tones["--tone-critical"]).toBe("rgb(255, 138, 61)");
+  expect(tones["--tone-out"]).toBe("rgb(255, 107, 102)");
 
-  await expect(meters.nth(0).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "90");
-  await expect(meters.nth(1).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "40");
-  await expect(meters.nth(2).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "15");
-  await expect(meters.nth(3).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "0");
+  for (const [index, entry] of METER_CASES.entries()) {
+    const meter = meters.nth(index);
+    await expect(meter, `${entry.left}% left`).toHaveAttribute("data-level", entry.level);
+    await expect(meter.locator(".usage-meter-status"), `${entry.left}% left`).toHaveText(entry.label);
+    await expect(meter.getByRole("progressbar")).toHaveAttribute("aria-valuenow", String(entry.left));
+    const painted = await meter.evaluate((el) => ({
+      label: getComputedStyle(el.querySelector(".usage-meter-status")!).color,
+      dot: getComputedStyle(el.querySelector(".usage-status-dot")!).backgroundColor,
+      fill: getComputedStyle(el.querySelector(".usage-meter-fill")!).backgroundColor,
+    }));
+    expect(painted, `${entry.left}% left`).toEqual({ label: tones[entry.tone], dot: tones[entry.tone], fill: tones[entry.tone] });
+  }
 
-  const fillColors = await meters.locator(".usage-meter-fill").evaluateAll((fills) =>
-    fills.map((fill) => getComputedStyle(fill).backgroundColor),
-  );
-  expect(fillColors).toEqual([
-    "rgb(74, 222, 128)",
-    "rgb(255, 178, 61)",
-    "rgb(255, 107, 102)",
-    "rgb(255, 107, 102)",
-  ]);
-
+  // The used/left toggle changes the number shown, never the level: that follows what is left.
   await page.getByRole("button", { name: "Usage settings" }).click();
   await page.getByRole("radio", { name: "Used" }).click();
-  await page.getByRole("tab", { name: "Codex" }).click();
+  await page.getByRole("button", { name: "Usage settings" }).click();
+  for (const [index, entry] of METER_CASES.entries()) {
+    await expect(meters.nth(index), `${entry.left}% left, shown as used`).toHaveAttribute("data-level", entry.level);
+    await expect(meters.nth(index).locator(".usage-meter-status")).toHaveText(entry.label);
+    await expect(meters.nth(index).getByRole("progressbar")).toHaveAttribute("aria-valuenow", String(100 - entry.left));
+  }
+});
 
+test("a meter with no reading is unavailable, untoned and without a bar", async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (command: string) => {
+        if (command === "set_keep_awake") return false;
+        if (command === "codex_usage") {
+          return { providerId: "codex", displayName: "Codex", plan: "Pro", fetchedAt: "2026-08-13T06:00:00Z", lines: [
+            { type: "progress", label: "Session", used: 30, limit: 100 },
+            { type: "progress", label: "Weekly", limit: 100 },
+          ] };
+        }
+        throw new Error(`${command} unavailable`);
+      },
+    };
+  });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Usage" }).click();
+  const meters = page.locator(".usage-meter");
+  await expect(meters).toHaveCount(2);
   await expect(meters.nth(0)).toHaveAttribute("data-level", "ok");
-  await expect(meters.nth(0)).toContainText("Available");
-  await expect(meters.nth(1)).toHaveAttribute("data-level", "warning");
-  await expect(meters.nth(1)).toContainText("Running low");
-  await expect(meters.nth(2)).toHaveAttribute("data-level", "danger");
-  await expect(meters.nth(2)).toContainText("Nearly exhausted");
-  await expect(meters.nth(3)).toContainText("Exhausted");
-  await expect(meters.nth(0).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "10");
-  await expect(meters.nth(1).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "60");
-  await expect(meters.nth(2).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "85");
-  await expect(meters.nth(3).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "100");
+  await expect(meters.nth(1)).toHaveAttribute("data-level", "unavailable");
+  await expect(meters.nth(1).locator(".usage-meter-status")).toHaveText("Unavailable");
+  await expect(meters.nth(1)).toHaveAttribute("data-empty", "true");
+  const painted = await meters.nth(1).evaluate((el) => {
+    const probe = document.createElement("span");
+    probe.style.color = "var(--text-3)";
+    document.body.append(probe);
+    const muted = getComputedStyle(probe).color;
+    probe.remove();
+    return { muted, status: getComputedStyle(el.querySelector(".usage-meter-status")!).color, fill: getComputedStyle(el.querySelector(".usage-meter-fill")!).opacity };
+  });
+  expect(painted.status).toBe(painted.muted);
+  expect(painted.fill).toBe("0");
 });
 
 test("Usage marks a native cached Status response as outdated instead of online", async ({ page }) => {

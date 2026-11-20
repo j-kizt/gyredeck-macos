@@ -10952,6 +10952,55 @@ test("heavy C8: stopping a run is the app's alone, and only the run it names", a
   }
 });
 
+test("heavy remove: only the app takes a waiting run out of the line, the holder is untouched, and the helper stops (#376)", async () => {
+  const h = await heavyHarness("remove");
+  try {
+    await h.start();
+    const held = await h.hold("run-a");
+    const holderId = (await h.state()).holder.id;
+    const ran = join(h.home, "ran");
+    const run = h.helper(["--as", "run-b", "--what", "waits", "--", "touch", ran]);
+    const entry = await until(async () => (await h.state()).queue.find((candidate) => candidate.as === "run-b"), "run-b is waiting");
+    const remove = (query, word) => fetch(`${h.base}/heavy/queue${query}`, {
+      method: "DELETE", headers: { "x-gyredeck-token": h.token(), ...(word ? { "x-gyredeck-broker": word } : {}) },
+    });
+    const asAgent = await remove(`?id=${entry.id}`);
+    assert.equal(asAgent.status, 401);
+    assert.equal((await asAgent.json()).error, "app_only");
+    assert.equal((await remove(`?id=${entry.id}`, "b6".repeat(32))).status, 401, "a wrong word is no word");
+    for (const query of ["", `?id=${holderId}`, "?id=0000000000000000"]) {
+      const wrong = await remove(query, TEST_APP_WORD);
+      assert.equal(wrong.status, 409, query || "no id");
+      assert.equal((await wrong.json()).error, "entry_gone");
+    }
+    assert.equal((await h.state()).queue.length, 1, "still waiting");
+
+    const asApp = await remove(`?id=${entry.id}`, TEST_APP_WORD);
+    assert.equal(asApp.status, 200);
+    const exited = await run.exited;
+    assert.equal(exited.code, 75, run.stderr);
+    assert.match(run.stderr, /removed from the heavy queue by the Gyredeck app — not running/);
+    assert.equal(existsSync(ran), false, "the command never ran");
+    const after = await h.state();
+    assert.deepEqual(after.queue, [], "and it did not join again");
+    assert.equal(after.holder?.id, holderId, "the holder still holds the slot");
+    assert.equal(groupAliveInTest(held.pgid), true, "and its command still runs");
+
+    // A helper between a refused wait and its retry (too_many_waits) comes back through
+    // `acquire` with the same request, not the ticket: it is refused there too.
+    const retry = h.pair();
+    assert.equal((await h.acquire("run-c", "retries", retry)).status, 202);
+    const queued = (await h.state()).queue.find((candidate) => candidate.as === "run-c");
+    assert.equal((await remove(`?id=${queued.id}`, TEST_APP_WORD)).status, 200);
+    const again = await h.acquire("run-c", "retries", retry);
+    assert.equal(again.status, 410, JSON.stringify(again.body));
+    assert.equal(again.body.error, "removed");
+    assert.deepEqual((await h.state()).queue, [], "the retry did not join the line");
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test("heavy stop: a run that ignores SIGTERM is killed, and a reservation that ran nothing is dropped (#243)", async () => {
   const h = await heavyHarness("stop");
   try {
@@ -11349,7 +11398,7 @@ const statusHolder = (overrides = {}) => ({
   state: "active", since: new Date().toISOString(), elapsedMs: 192_000, loadSkipped: false, helperGone: false, verified: true, adopted: false, ...overrides,
 });
 const statusQueued = { id: "fedcba9876543210", position: 1, as: "a2600000-0000-4000-8000-0000000000bb", label: "Codex / Altrix Audit", what: "cargo test", waitedMs: 40_000 };
-const statusObserved = { pid: 5001, pattern: "cargo test|build|check", exe: "/Users/someone/.cargo/bin/cargo", cwd: "/Users/someone/secret-project", label: "Terminal", startedAtMs: Date.now() - 65_000, elapsedMs: 65_000 };
+const statusObserved = { pid: 5001, pattern: "cargo test|build|check", exe: "/Users/someone/.cargo/bin/cargo", cwd: "/Users/someone/secret-project", label: "Unknown", startedAtMs: Date.now() - 65_000, elapsedMs: 65_000 };
 const statusAnswer = (overrides = {}) => ({
   status: 200,
   body: { ok: true, v: 1, load: 1.25, loadLimit: 5, holder: null, queue: [], observed: [], waiting: 0, limit: "advisory", ...overrides },
@@ -11366,7 +11415,7 @@ const statusCases = [
   { name: "C3 an empty slot is free", reply: () => statusAnswer(), code: 0,
     out: [FREE_LINE, /^load: 1\.25 \(the slot is granted at 5 or less\)$/m] },
   { name: "C3 a run observed outside the helper is not free", reply: () => statusAnswer({ observed: [statusObserved] }), code: 0,
-    out: [/^heavy-run slot: taken by a run outside the helper$/m, /^ {2}Terminal — cargo test\|build\|check, 1m 5s$/m], notOut: [FREE_LINE] },
+    out: [/^heavy-run slot: taken by a run outside the helper$/m, /^ {2}Unknown — cargo test\|build\|check, 1m 5s$/m], notOut: [FREE_LINE] },
   { name: "C3 a line with no holder is not free", reply: () => statusAnswer({ queue: [statusQueued] }), code: 0,
     out: [/^heavy-run slot: not held, but the line is waiting$/m], notOut: [FREE_LINE] },
   { name: "C3 a holder alone is not free", reply: () => statusAnswer({ holder: statusHolder() }), code: 0,
@@ -11378,7 +11427,7 @@ const statusCases = [
       /^ {2}its helper has gone quiet; the command still runs and holds the slot$/m,
       /^ {2}granted after the load stayed high for 10 minutes$/m,
       /^waiting: 1$/m, /^ {2}1\. Codex \/ Altrix Audit — cargo test, waited 40s$/m,
-      /^running outside the helper: 1$/m, /^ {2}Terminal — cargo test\|build\|check, 1m 5s$/m,
+      /^running outside the helper: 1$/m, /^ {2}Unknown — cargo test\|build\|check, 1m 5s$/m,
       /^load: 6\.5 \(the slot is granted at 5 or less\)$/m,
     ],
     absent: [statusHolder().as, statusQueued.as, statusHolder().id, statusQueued.id, statusObserved.cwd, statusObserved.exe, String(statusObserved.pid)], notOut: [FREE_LINE] },
@@ -11570,7 +11619,7 @@ test("#260 --status C1/C2/C10: against a real bridge it shows the holder, the li
     assert.match(run.stdout, /^waiting: 1$/m);
     assert.match(run.stdout, /^ {2}1\. an unnamed session — cargo test, waited \d+s$/m);
     assert.match(run.stdout, /^running outside the helper: 1$/m);
-    assert.match(run.stdout, /^ {2}Terminal — cargo test\|build\|check, 1m \d+s$/m);
+    assert.match(run.stdout, /^ {2}Unknown — cargo test\|build\|check, 1m \d+s$/m);
     assert.match(run.stdout, /^load: 1 \(the slot is granted at 5 or less\)$/m);
     assert.doesNotMatch(run.stdout, FREE_LINE);
     for (const value of [holderId, waiterId, before.holder.id, before.queue[0].id, "/tmp/secret-project", "/opt/secret/cargo"]) {
@@ -12605,7 +12654,7 @@ const rereadPaths = [
       return { result: await f.invoke() };
     },
     expect: "none",
-    premise: (r) => assert.ok(r.steps.some((text) => text.includes("HEAVY RUN: Terminal started cargo test|build|check")), `premise: the notice was delivered: ${JSON.stringify(r.steps)}`),
+    premise: (r) => assert.ok(r.steps.some((text) => text.includes("HEAVY RUN: Unknown started cargo test|build|check")), `premise: the notice was delivered: ${JSON.stringify(r.steps)}`),
   },
   {
     name: "a heavy-run room notice beside room mail (#244)", tag: "pheavym", options: { withBroker: true },
@@ -12616,7 +12665,7 @@ const rereadPaths = [
       return { seq: await f.say("after the notice"), result: await f.invoke() };
     },
     expect: "since", reply: true,
-    premise: (r) => assert.ok(r.steps.some((text) => text.includes("HEAVY RUN: Terminal started")), "premise: the notice was delivered too"),
+    premise: (r) => assert.ok(r.steps.some((text) => text.includes("HEAVY RUN: Unknown started")), "premise: the notice was delivered too"),
   },
   { name: "a message with no seq", tag: "pnoseq", options: { withBroker: true, inboxBody: (body) => ({ ...body, messages: (body.messages ?? []).map(({ seq: _seq, ...message }) => message) }) }, run: async (f) => { await f.confirm(); await f.say("no seq"); return { result: await f.invoke() }; }, expect: "none" },
   // Room mail handed over with no member key (#274): no command it could not run, and a line
@@ -13004,7 +13053,7 @@ test("observed: GET /heavy shows what was matched and who started it, never the 
     const { observed } = await h.state();
     assert.deepEqual(observed.map((run) => Object.keys(run).sort()), Array(3).fill(["cwd", "elapsedMs", "exe", "label", "pattern", "pid", "startedAtMs"]));
     assert.ok(!JSON.stringify(observed).includes("s3cret"), "nothing but the named fields passes");
-    assert.deepEqual(observed.map((run) => run.label), ["Terminal", "Claude Code / Gyre Assistant", "Codex"]);
+    assert.deepEqual(observed.map((run) => run.label), ["Unknown", "Claude Code / Gyre Assistant", "Codex"]);
     assert.ok(observed[0].elapsedMs >= 60_000 && observed[0].elapsedMs < 120_000, String(observed[0].elapsedMs));
 
     await reportObserved(h, []);
@@ -13227,9 +13276,9 @@ test("room notices: start, wait and end, for helper and observed runs, named as 
     // helper start and finish are covered by the #263 table below.
     const want = [
       /^HEAVY RUN: run-b is waiting behind Claude Code to run b\.$/,
-      /^HEAVY RUN: Terminal started cargo test\|build\|check, outside the queue\.$/,
-      /^HEAVY RUN: run-c is waiting behind Terminal to run c\.$/,
-      /^HEAVY RUN: Terminal's cargo test\|build\|check finished \(1m \d+s\)\.$/,
+      /^HEAVY RUN: Unknown started cargo test\|build\|check, outside the queue\.$/,
+      /^HEAVY RUN: run-c is waiting behind Unknown to run c\.$/,
+      /^HEAVY RUN: Unknown's cargo test\|build\|check finished \(1m \d+s\)\.$/,
       /^HEAVY RUN: run-d is waiting for the load to drop \(7 > 5\) to run d\.$/,
     ];
     assert.equal(said.length, want.length, said.join("\n"));
@@ -13267,7 +13316,7 @@ test("room notices C5: a heavy-run notice wakes nobody — no frame to a watch, 
     assert.equal(wait.timedOut, true, "the held wait was not ended by the notices");
     // Readable all the same, on the next collect.
     const collected = await fetch(`${h.base}/mail/inbox?as=${founder}&collect=1`, { headers: await h.member(founder) }).then((r) => r.json());
-    assert.ok((collected.messages ?? []).some((m) => m.text.startsWith("HEAVY RUN: Terminal started")), JSON.stringify(collected.messages));
+    assert.ok((collected.messages ?? []).some((m) => m.text.startsWith("HEAVY RUN: Unknown started")), JSON.stringify(collected.messages));
 
     // Control: a tell to the room does reach the same watch and ends a wait.
     const appCall = (path, body) => fetch(`${h.base}${path}`, {
@@ -13460,13 +13509,13 @@ const N263_ROWS = [
     p: [/^Claude Code started cargo test\|build\|check, outside the queue\.$/, /^Claude Code's cargo test\|build\|check finished \(1m \d+s\)\.$/],
   },
   {
-    name: "N2 N5 a long Terminal run is heard by both members",
+    name: "N2 N5 a long run with no agent above it is heard by both members",
     run: async (h) => {
       await reportObserved(h, [observedRun()]);
       await reportObserved(h, []);
     },
-    a: [/^Terminal started cargo test\|build\|check, outside the queue\.$/, /^Terminal's cargo test\|build\|check finished \(1m \d+s\)\.$/],
-    p: [/^Terminal started cargo test\|build\|check, outside the queue\.$/, /^Terminal's cargo test\|build\|check finished \(1m \d+s\)\.$/],
+    a: [/^Unknown started cargo test\|build\|check, outside the queue\.$/, /^Unknown's cargo test\|build\|check finished \(1m \d+s\)\.$/],
+    p: [/^Unknown started cargo test\|build\|check, outside the queue\.$/, /^Unknown's cargo test\|build\|check finished \(1m \d+s\)\.$/],
   },
   {
     name: "N5 an observed run that crosses the delay while reported is announced by the sweep",
@@ -13477,8 +13526,8 @@ const N263_ROWS = [
       await until(async () => (await r.noticesOf(HEAVY_P)).length === 1, "the sweep's announcement");
       await reportObserved(h, []);
     },
-    a: [/^Terminal started cargo test\|build\|check, outside the queue\.$/, /^Terminal's cargo test\|build\|check finished \(\d+s\)\.$/],
-    p: [/^Terminal started cargo test\|build\|check, outside the queue\.$/, /^Terminal's cargo test\|build\|check finished \(\d+s\)\.$/],
+    a: [/^Unknown started cargo test\|build\|check, outside the queue\.$/, /^Unknown's cargo test\|build\|check finished \(\d+s\)\.$/],
+    p: [/^Unknown started cargo test\|build\|check, outside the queue\.$/, /^Unknown's cargo test\|build\|check finished \(\d+s\)\.$/],
   },
   {
     name: "N6 DECIDED BY SUBAGENT: P waits behind A's run, which ends inside the delay — the wait is said to A, nothing else",
@@ -14276,7 +14325,7 @@ for (const hook of QUIET_HOOKS) {
       assert.equal(f.broker.outstanding(), null, "the broker holds nothing for it either");
       // The next collect — a foreground one, through the same broker — still has it.
       const next = await f.broker.ask({ v: 1, collect: { limit: 10 } });
-      assert.deepEqual((next.messages ?? []).map((m) => m.text.slice(0, 26)), ["HEAVY RUN: Terminal starte"]);
+      assert.deepEqual((next.messages ?? []).map((m) => m.text.slice(0, 26)), ["HEAVY RUN: Unknown started"]);
     } finally {
       await f.cleanup();
     }

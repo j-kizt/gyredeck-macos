@@ -656,8 +656,8 @@ export const AgentUsageList = ({
           </button>
         </div>
       </div>
-      <div className="usage-layout">
-        <div
+      <div className="usage-layout" data-view={active === "settings" ? "settings" : "provider"}>
+        {active !== "settings" && <div
           className="usage-sidebar"
           role="tablist"
           aria-label="Usage providers"
@@ -690,8 +690,15 @@ export const AgentUsageList = ({
               ) : null}
             </button>
           ))}
-        </div>
-        <div id="usage-provider-panel" className="usage-detail-panel" role="tabpanel" aria-labelledby={`usage-tab-${active}`}>
+        </div>}
+        {/* Settings is reached by the gear, not by a tab, so it is not labelled as a tab's panel. */}
+        <div
+          id="usage-provider-panel"
+          className="usage-detail-panel"
+          {...(active === "settings"
+            ? { role: "region", "aria-label": "Usage settings" }
+            : { role: "tabpanel", "aria-labelledby": `usage-tab-${active}` })}
+        >
           {active === "settings" ? (
             <SettingsPanel settings={settings} onChange={onSettingsChange} />
           ) : selected ? (

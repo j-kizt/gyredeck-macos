@@ -45,6 +45,6 @@ export const stillHeld = (
 export const offerDisconnectAll = (connectedRooms: string[], held: { connected: unknown[]; leaving: unknown[] }) =>
   connectedRooms.length > 0 || held.connected.length > 0 || held.leaving.length > 0;
 
-/** Whether the Sync rooms section shows at all: an open room, or anything Disconnect all offers. */
+/** Whether the Rooms section under Sync shows at all: an open room, or anything Disconnect all offers. */
 export const showSyncRooms = (openRooms: number, connectedRooms: string[], held: { connected: unknown[]; leaving: unknown[] }) =>
   openRooms > 0 || offerDisconnectAll(connectedRooms, held);

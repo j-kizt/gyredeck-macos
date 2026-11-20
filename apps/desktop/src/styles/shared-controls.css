@@ -20,8 +20,8 @@
   justify-content: center;
   border: none;
   border-radius: 50%;
-  color: rgba(255, 255, 255, 0.54);
-  background: rgba(255, 255, 255, 0.055);
+  color: rgba(var(--ink-rgb), 0.54);
+  background: rgba(var(--ink-rgb), 0.055);
   cursor: pointer;
   transition: background 120ms ease, color 120ms ease, transform 120ms ease;
 }
@@ -51,8 +51,8 @@
 
 .header-tab:hover,
 .header-tab[data-active="true"] {
-  color: rgba(255, 255, 255, 0.9);
-  background: rgba(255, 255, 255, 0.11);
+  color: rgba(var(--ink-rgb), 0.9);
+  background: rgba(var(--ink-rgb), 0.11);
 }
 
 .header-tab:hover {
@@ -72,7 +72,7 @@
   justify-content: center;
   border: none;
   border-radius: 50%;
-  color: rgba(255, 255, 255, 0.62);
+  color: rgba(var(--ink-rgb), 0.62);
   background: var(--fill);
   cursor: pointer;
   transition: background 120ms ease, color 120ms ease, transform 120ms ease,
@@ -102,7 +102,7 @@
 
 .gear-btn:hover,
 .row-btn:hover {
-  color: rgba(255, 255, 255, 0.86);
+  color: rgba(var(--ink-rgb), 0.86);
   background: var(--fill-2);
   transform: scale(1.08);
 }
@@ -149,20 +149,20 @@
   padding: 4px 11px;
   border: none;
   border-radius: 999px;
-  color: rgba(255, 255, 255, 0.8);
+  color: rgba(var(--ink-rgb), 0.8);
   background: var(--fill-2);
   font-size: 11px;
   font-weight: 500;
 }
 
 .pill-btn:not(:disabled):hover {
-  background: rgba(255, 255, 255, 0.16);
+  background: rgba(var(--ink-rgb), 0.16);
 }
 
 .pill-btn.danger,
 .row-btn.danger {
-  color: #ff9b97;
-  background: rgba(255, 80, 80, 0.18);
+  color: var(--danger-text);
+  background: rgba(var(--danger-tint-rgb), 0.18);
 }
 
 .pill-btn.accent,
@@ -197,7 +197,7 @@
 }
 
 .notice-row[data-online="true"] {
-  color: rgba(74, 222, 128, 0.92);
+  color: rgba(var(--done-rgb), 0.92);
 }
 
 .app-tooltip {
@@ -221,4 +221,32 @@
 
 .app-tooltip[data-below="true"] {
   transform: translate(-50%, 8px);
+}
+
+/* A side tab's name, in Settings and Usage alike. Kept even though the wide layout sizes
+   itself to fit: below 380px the Settings tabs become three equal columns, where a long name
+   still has to give way gracefully. */
+.setup-side-tab span,
+.usage-side-tab span:not(.usage-side-dot) {
+  overflow: hidden;
+  font-size: 10px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The picked option of a segmented control, wherever it is. */
+.usage-setting-option[data-active="true"],
+.setup-size-options button[data-active="true"],
+.setup-segment-option[data-active="true"] {
+  color: var(--on-selected);
+  background: var(--selected-fill);
+}
+
+/* An icon button that does the one destructive thing in its row, on hover. */
+.gh-icon-btn.danger:hover:not(:disabled),
+.session-sync-icon.danger:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: rgba(var(--danger-rgb), 0.14);
 }

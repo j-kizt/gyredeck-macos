@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Check, Gauge, Trash2 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { Check, Gauge, Plus, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 
 /** `heavy_patterns`: the commands observed out of the box, and the person's own (#245). */
 export interface IHeavyPatterns {
@@ -13,6 +13,7 @@ export interface IUseHeavyPatterns {
   error: string | null;
   busy: boolean;
   save: (custom: string[]) => Promise<boolean>;
+  clearError: () => void;
 }
 
 const useHeavyPatterns = (canUseNativeControls: boolean): IUseHeavyPatterns => {
@@ -39,19 +40,43 @@ const useHeavyPatterns = (canUseNativeControls: boolean): IUseHeavyPatterns => {
     }
   }, []);
 
-  return { patterns, error, busy, save };
+  const clearError = useCallback(() => setError(null), []);
+
+  return { patterns, error, busy, save, clearError };
 };
 
-/** The commands observed outside the helper (#245): the defaults, and the person's own to add and remove. */
-const HeavyPatternsRow = ({ canUseNativeControls }: { canUseNativeControls: boolean }) => {
+// The editor's two buttons, as the approved frames draw them (owner, 2026-11-20): one place to
+// change their words or icons, so the row and its test cannot disagree about them.
+const OPEN_EDITOR = { icon: Plus, label: "Add", ariaLabel: "Add a heavy command" } as const;
+const SAVE_PATTERN = { icon: Check, label: "Save" } as const;
+
+/**
+ * The commands observed outside the helper (#245): the defaults, and the person's own to add and
+ * remove. Changed only behind its button, the way Bridge port is (#376): until it is pressed
+ * nothing in the row can be changed, so the person's own patterns stay listed but their Remove
+ * buttons show only while the editor is open.
+ */
+const HeavyPatternsRow = ({ canUseNativeControls, children }: { canUseNativeControls: boolean; children?: ReactNode }) => {
   const heavy = useHeavyPatterns(canUseNativeControls);
   const [field, setField] = useState("");
+  const [editing, setEditing] = useState(false);
   const custom = heavy.patterns?.custom ?? [];
+  // Opening starts clean: an earlier refusal or half-typed pattern is not this attempt's.
+  const toggleEditor = () => {
+    setField("");
+    heavy.clearError();
+    setEditing((open) => !open);
+  };
   const add = async () => {
     const pattern = field.trim();
     if (!pattern) return;
-    if (await heavy.save([...custom, pattern])) setField("");
+    if (await heavy.save([...custom, pattern])) {
+      setField("");
+      setEditing(false);
+    }
   };
+  const OpenIcon = OPEN_EDITOR.icon;
+  const SaveIcon = SAVE_PATTERN.icon;
   return (
     <div className="setup-row setup-row-stack" data-heavy-patterns="">
       <div className="setup-row-main">
@@ -60,21 +85,31 @@ const HeavyPatternsRow = ({ canUseNativeControls }: { canUseNativeControls: bool
           <span className="setup-title">Heavy commands</span>
           <span className="setup-detail">{heavy.error ?? (heavy.patterns ? heavy.patterns.defaults.join(" · ") : "Checking…")}</span>
         </span>
+        {canUseNativeControls ? (
+          <button className="pill-btn" type="button" onClick={toggleEditor} disabled={!heavy.patterns} data-tauri-drag-region="false" aria-expanded={editing} aria-label={OPEN_EDITOR.ariaLabel}>
+            <OpenIcon size={12} strokeWidth={2.3} />{OPEN_EDITOR.label}
+          </button>
+        ) : null}
       </div>
+      {children}
       {custom.map((pattern) => (
         <span className="setup-row-actions full" key={pattern}>
           <span className="setup-detail" data-heavy-pattern={pattern}>{pattern}</span>
-          <button className="pill-btn" type="button" disabled={heavy.busy} onClick={() => void heavy.save(custom.filter((other) => other !== pattern))} data-tauri-drag-region="false" aria-label={`Remove ${pattern}`}>
-            <Trash2 size={12} strokeWidth={2.3} />Remove
-          </button>
+          {editing ? (
+            <button className="pill-btn danger" type="button" disabled={heavy.busy} onClick={() => void heavy.save(custom.filter((other) => other !== pattern))} data-tauri-drag-region="false" aria-label={`Remove ${pattern}`}>
+              <Trash2 size={12} strokeWidth={2.3} />Remove
+            </button>
+          ) : null}
         </span>
       ))}
-      <span className="setup-row-actions full">
-        <input className="setup-input" type="text" value={field} placeholder="make check" onChange={(event) => setField(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void add(); }} disabled={heavy.busy || !heavy.patterns} data-tauri-drag-region="false" aria-label="Heavy command pattern" />
-        <button className="pill-btn accent" type="button" onClick={() => void add()} disabled={heavy.busy || !heavy.patterns || field.trim() === ""} data-tauri-drag-region="false">
-          <Check size={12} strokeWidth={2.3} />Add
-        </button>
-      </span>
+      {editing ? (
+        <span className="setup-row-actions full">
+          <input className="setup-input" type="text" value={field} placeholder="make check" onChange={(event) => setField(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void add(); }} disabled={heavy.busy} data-tauri-drag-region="false" aria-label="Heavy command pattern" autoFocus />
+          <button className="pill-btn accent" type="button" onClick={() => void add()} disabled={heavy.busy || field.trim() === ""} data-tauri-drag-region="false">
+            <SaveIcon size={12} strokeWidth={2.3} />{SAVE_PATTERN.label}
+          </button>
+        </span>
+      ) : null}
     </div>
   );
 };

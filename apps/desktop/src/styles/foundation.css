@@ -15,9 +15,49 @@
   --waiting: #ffb23d;
   --done: #4ade80;
   --danger: #ff6b66;
+  --warn-text: #e0a458;
+  /* How much of a quota is left, worst last. Named for the state, so a meter, a dot and a
+     label read the same table rather than each picking a colour. */
+  --tone-ok: var(--done);
+  --tone-low: #facc15;
+  --tone-critical: #ff8a3d;
+  --tone-out: var(--danger);
+  --field-bg: rgba(0, 0, 0, 0.2);
+  --field-border: var(--hair);
+  --field-radius: 6px;
+  --field-padding: 5px 7px;
   --scrollbar-track: rgba(255, 255, 255, 0.035);
   --scrollbar-thumb: rgba(255, 255, 255, 0.16);
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.25);
+  /* The bar's width, and the slot every scroller keeps for it whether or not it overflows. */
+  --scrollbar-gutter: 8px;
+  /* The window's own background, which sticky bars repaint to cover what scrolls under them. */
+  --canvas: #161618;
+  /* Channels for alpha variants, as --accent-rgb: --ink-rgb for every white overlay. */
+  --ink-rgb: 255, 255, 255;
+  --done-rgb: 74, 222, 128;
+  --danger-rgb: 255, 107, 102;
+  --waiting-rgb: 255, 178, 61;
+  /* The tint behind --danger-text: a warmer red than --danger, so the two are kept apart. */
+  --danger-tint-rgb: 255, 80, 80;
+  --danger-text: #ff9b97;
+  --danger-text-armed: #ffb0ad;
+  --held-text: #f0a35e;
+  --info: #60a5fa;
+  --info-rgb: 96, 165, 250;
+  --status-idle: #5b5b5f;
+  --status-inactive: #3f3f43;
+  --status-inactive-text: #77777d;
+  /* The picked option of a segmented control: a light chip with dark text. */
+  --selected-fill: rgba(255, 255, 255, 0.92);
+  --on-selected: #111;
+  --switch-thumb: #fff;
+  /* The QR code needs a light ground to scan, whatever the theme. */
+  --qr-ground: #fff;
+  --action-agent: #b9a7ff;
+  --action-memory: #7dd3a4;
+  --founder-mark: #e5b53a;
+  --trend-bar: #74aa9c;
 
   color: var(--text);
   background: transparent;
@@ -49,7 +89,7 @@ body,
   height: 100%;
   margin: 0;
   overflow: hidden;
-  background: #161618;
+  background: var(--canvas);
   user-select: none;
 }
 
@@ -80,12 +120,18 @@ button {
 }
 
 /* Every scroll area, not a list of them: a list is how Settings and the Release notes box
-   came to wear the default macOS scrollbar (#277). */
-* {
-  scrollbar-width: thin;
-  scrollbar-color: var(--scrollbar-thumb) transparent;
+   came to wear the default macOS scrollbar (#277). The standard properties are kept for
+   engines without ::-webkit-scrollbar only: where both exist, Chromium lets them win, and
+   the bar then stops being the --scrollbar-gutter wide that every scroller reserves. */
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) transparent;
+  }
 }
 
+/* Literal, not var(--scrollbar-gutter): WebKit's support for var() in scrollbar pseudo-elements
+   is unverified. Must equal --scrollbar-gutter (scroll-areas.spec.ts checks). */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;

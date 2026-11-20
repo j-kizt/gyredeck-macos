@@ -1351,6 +1351,26 @@ pub(crate) fn heavy_stop(holder_id: &str, app_word: &str) -> Result<String, Stri
     Ok(value.get("result").and_then(serde_json::Value::as_str).unwrap_or("none").to_string())
 }
 
+/// Take a waiting run out of the heavy-run line — the app's "Remove" (#376). Named by the
+/// queue entry id the person saw; the run holding the slot is never touched here.
+pub(crate) fn heavy_remove(entry_id: &str, app_word: &str) -> Result<(), String> {
+    if entry_id.len() != 16 || !entry_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("Not a heavy-run queue entry id".to_string());
+    }
+    let (status, value) = bridge_request_vouched("DELETE", &format!("/heavy/queue?id={entry_id}"), None, app_word)?;
+    if !(200..300).contains(&status) {
+        return Err(match (status, value.get("error").and_then(serde_json::Value::as_str).unwrap_or("")) {
+            (401, "app_only") => "Gyredeck could not vouch for itself to its own bridge. Quit and reopen Gyredeck".to_string(),
+            (401, _) => "Gyredeck could not authenticate to its own bridge".to_string(),
+            (503, "app_word_unavailable") => "The bridge was started without Gyredeck's word. Quit and reopen Gyredeck".to_string(),
+            (404, _) => "This bridge cannot remove a waiting run yet. Quit and reopen Gyredeck".to_string(),
+            (409, "entry_gone") => "That run is no longer waiting; nothing was removed".to_string(),
+            _ => format!("The bridge refused the request (HTTP {status})"),
+        });
+    }
+    Ok(())
+}
+
 /// Join a room by code. Idempotent, so pressing Connect twice is not an error.
 pub(crate) fn sync_join(code: &str, conversation_id: &str, app_word: &str) -> Result<SyncRoom, String> {
     if !valid_room(conversation_id) {

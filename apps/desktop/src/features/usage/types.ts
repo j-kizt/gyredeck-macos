@@ -1,3 +1,5 @@
+import type { MeterLabel, MeterLevel } from "./meterStatus";
+
 export type UsageProviderId = "codex" | "agy" | "claude";
 export type UsageMode = "left" | "used";
 export type UsageResetMode = "relative" | "absolute";
@@ -60,13 +62,8 @@ export interface IUsageMetric {
   value: number | null;
   /** How much is left, always — unlike `value`, which follows the used/left toggle. */
   leftPercent: number | null;
-  statusLevel: "ok" | "warning" | "danger" | "unavailable";
-  statusLabel:
-    | "Available"
-    | "Running low"
-    | "Nearly exhausted"
-    | "Exhausted"
-    | "Unavailable";
+  statusLevel: MeterLevel;
+  statusLabel: MeterLabel;
   remainingLabel: string | null;
   resetLabel: string | null;
 }

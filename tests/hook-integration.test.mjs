@@ -15433,6 +15433,30 @@ test("#331 J5: a code is spent even on a member already in, dies with its member
   }
 });
 
+test("#376: the app's room listing carries the member cap the join refuses at", async () => {
+  const f = await leanRoomFixture("r376");
+  try {
+    const listed = async () => (await f.call("GET", "/mail")).body.rooms.find((room) => room.room === f.code);
+    const capacity = (await listed()).capacity;
+    assert.ok(Number.isInteger(capacity) && capacity > 2, "the listing names the cap");
+    let refused = null;
+    for (let index = 0; index < capacity + 2 && refused === null; index += 1) {
+      const id = `a3760000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+      await f.call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId: id, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 },
+      });
+      const joined = await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: id });
+      if (joined.status !== 200) refused = joined;
+    }
+    assert.deepEqual([refused?.status, refused?.body.error], [429, "room_full"], "a join past the cap is refused");
+    const room = await listed();
+    assert.equal(room.members.length, room.capacity, "the refusal came exactly at the cap the listing names");
+  } finally {
+    await f.close();
+  }
+});
+
 test("#344: which room a session is in, and its roster, are read only by its members and the app", async () => {
   const f = await leanRoomFixture("r344");
   try {

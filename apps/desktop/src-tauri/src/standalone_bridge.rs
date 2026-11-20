@@ -979,6 +979,8 @@ pub(crate) struct MailRoom {
     pub members: Vec<String>,
     /// The session that created the room, and the only one that may close it.
     pub founder: Option<String>,
+    /// The most members the bridge lets into this room; none from a bridge that does not say.
+    pub capacity: Option<u32>,
     pub pending: u32,
     pub subscribers: u32,
     #[serde(rename = "lastMessageAt")]
@@ -1471,7 +1473,12 @@ pub(crate) fn mail_rooms(app_word: &str) -> Result<Vec<MailRoom>, String> {
         .collect();
     founded_rooms().forget_ended_rooms(&live, asked_at);
 
-    Ok(rooms
+    Ok(mail_rooms_from(rooms))
+}
+
+/// The bridge's `/mail` listing as the app's rooms, each field read the same way for every room.
+fn mail_rooms_from(rooms: &[serde_json::Value]) -> Vec<MailRoom> {
+    rooms
         .iter()
         .filter_map(|room| {
             let name = room.get("room")?.as_str()?.to_string();
@@ -1495,6 +1502,10 @@ pub(crate) fn mail_rooms(app_word: &str) -> Result<Vec<MailRoom>, String> {
                             .collect()
                     })
                     .unwrap_or_default(),
+                capacity: room
+                    .get("capacity")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as u32),
                 room: name,
                 seq: number("seq"),
                 pending: number("pending"),
@@ -1503,7 +1514,7 @@ pub(crate) fn mail_rooms(app_word: &str) -> Result<Vec<MailRoom>, String> {
                 last_read_at: text("lastReadAt"),
             })
         })
-        .collect())
+        .collect()
 }
 
 fn classify_connect_error(error: &std::io::Error) -> BridgeProbe {
@@ -1572,6 +1583,24 @@ pub(crate) fn find_node_binary() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// Settings matches this line to give a full room its advice (`ROOM_FULL` in SetupPanel.tsx).
+    #[test]
+    fn a_full_room_is_refused_with_the_line_settings_matches() {
+        let refusal = serde_json::json!({ "ok": false, "error": "room_full" });
+        assert_eq!(super::sync_error(429, &refusal), "That room is full");
+    }
+
+    #[test]
+    fn a_rooms_member_cap_reaches_settings_and_an_older_bridge_names_none() {
+        let rooms = super::mail_rooms_from(&[
+            serde_json::json!({ "room": "sync-full", "members": ["a", "b"], "capacity": 8 }),
+            serde_json::json!({ "room": "sync-older", "members": ["a"] }),
+        ]);
+        assert_eq!((rooms[0].capacity, rooms[1].capacity), (Some(8), None));
+        let shown = serde_json::to_value(&rooms[0]).unwrap();
+        assert_eq!(shown["capacity"].as_u64(), Some(8));
+    }
+
     #[test]
     fn a_rooms_wake_counts_reach_the_panel_under_the_bridges_names() {
         let value = serde_json::json!({

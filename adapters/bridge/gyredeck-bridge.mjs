@@ -8697,6 +8697,8 @@ function startBridge(config) {
       })(),
       // Named so a listing can tell which rooms the person may close from here.
       founder: room.createdBy ?? null,
+              // The cap itself, so Settings can say a room is full without keeping a copy of it (#376).
+              capacity: MAIL_MAX_MEMBERS,
               lastMessageAt: room.messages.at(-1)?.ts ?? null,
               lastReadAt: reader.lastReadAt ?? null,
             };

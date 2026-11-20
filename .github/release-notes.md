@@ -1,5 +1,21 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Connect to Discord says why it could not — (v1.39.3)
+
+### Fixes
+
+- **Connect on a room no longer seems to do nothing when it fails.** Discord follows a room by
+  joining it as a member, and a room holds at most 8. On a room that already had 8, Connect
+  failed, but the reason was shown only under Settings → Permission, so nothing changed on the
+  Sync page where Connect was pressed. A Connect or Disconnect that fails is now said under that
+  room's own row. When the room was full, the line says so and what to do: have a session leave,
+  then Connect again.
+- **A full room shows up front that it cannot be connected.** In a room that already has 8
+  members, Connect in the room's ⋮ menu is greyed out and marked "Room full". It can still be
+  reached with the arrow keys, and a screen reader reads it with the reason. A room already
+  followed on Discord still offers Disconnect. Close room on a room whose founder is not known
+  also stays reachable with the keys now, and is read with its reason.
+
 ## Pages keep equal margins when they do not scroll — (v1.39.2)
 
 ### Fixes

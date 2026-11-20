@@ -2,7 +2,7 @@
 .sheet-body {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  overflow-y: scroll;
   /* Full-bleed to the window edge, then pad the content back in equally on both sides.
      This puts the scrollbar out in the right padding zone (at the window edge) instead
      of floating over the content, while keeping content symmetric and aligned with the
@@ -11,9 +11,10 @@
   padding: 0 var(--sheet-inline-padding) 12px;
   /* The gutter rule every scroller shares (Usage, Settings): the bar's slot is kept whether
      or not the content overflows, and paid for out of the right padding, so the content sits
-     --sheet-inline-padding from both window edges either way. */
+     --sheet-inline-padding from both window edges either way. The slot is kept by
+     `overflow-y: scroll`, never `scrollbar-gutter: stable`: WKWebView parses that but keeps no
+     slot until the content overflows, which left the right edge 8px tight (#376 reopened). */
   padding-right: calc(var(--sheet-inline-padding) - var(--scrollbar-gutter));
-  scrollbar-gutter: stable;
 }
 
 /* Usage and Settings scroll inside, under the same rule; a kept slot here would be a second,
@@ -23,7 +24,6 @@
 .sheet-body[data-view="usage"],
 .sheet-body[data-view="setup"] {
   padding-right: 0;
-  scrollbar-gutter: auto;
 }
 
 .sheet-body[data-view="usage"] {

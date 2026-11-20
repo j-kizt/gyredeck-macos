@@ -103,7 +103,7 @@ test.describe("every scroller keeps the bar's 8 px slot and its content an equal
       return {
         overflows: el.scrollHeight > el.clientHeight + 1,
         slot: el.offsetWidth - el.clientWidth - el.clientLeft - parseFloat(style.borderRightWidth),
-        gutter: style.scrollbarGutter,
+        overflowY: style.overflowY,
         inset,
         left: contentLeft,
         right: window.innerWidth - contentRight,
@@ -121,7 +121,9 @@ test.describe("every scroller keeps the bar's 8 px slot and its content an equal
     });
 
   const expectGutter = (seen: Awaited<ReturnType<typeof measure>>, name: string, fullBleed: boolean) => {
-    expect(seen.gutter, name).toBe("stable");
+    // `scroll`, not `scrollbar-gutter: stable`: WKWebView keeps no slot for the latter until the
+    // content overflows, and this Chromium run would not show it (#376 reopened).
+    expect(seen.overflowY, name).toBe("scroll");
     expect(seen.clippedBy, `${name}: reaches past a clipping ancestor`).toEqual([]);
     expect(seen.slot, `${name}: the bar's slot`).toBe(8);
     expect(Math.abs(seen.right - seen.inset), `${name}: right inset ${seen.right} vs ${seen.inset} (${seen.box})`).toBeLessThanOrEqual(1);
@@ -165,9 +167,25 @@ test.describe("every scroller keeps the bar's 8 px slot and its content an equal
       await expect.poll(async () => (await measure(page, ".setup-category-panel")).overflows, "premise").toBe(overflows);
       expectGutter(await measure(page, ".setup-category-panel"), "Settings", false);
       // The page itself does not keep a second, empty slot beside the panel's.
-      expect((await measure(page, ".sheet-body")).gutter).toBe("auto");
+      expect((await measure(page, ".sheet-body")).overflowY).toBe("hidden");
     });
   }
+});
+
+test("no stylesheet keeps a bar slot with scrollbar-gutter, which the app's WKWebView ignores until content overflows (#376)", async ({ page }) => {
+  await open(page);
+  const users = await page.evaluate(() => {
+    const out: string[] = [];
+    const walk = (rules: CSSRuleList) => {
+      for (const rule of Array.from(rules)) {
+        if (rule instanceof CSSStyleRule && rule.style.getPropertyValue("scrollbar-gutter")) out.push(rule.selectorText);
+        if ("cssRules" in rule) walk((rule as CSSGroupingRule).cssRules);
+      }
+    };
+    for (const sheet of Array.from(document.styleSheets)) walk(sheet.cssRules);
+    return out;
+  });
+  expect(users).toEqual([]);
 });
 
 test("Release notes render headings, bullets, bold and code as elements, wrap a long path, and keep markup as text", async ({ page }) => {

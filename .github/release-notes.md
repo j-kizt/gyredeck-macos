@@ -1,5 +1,19 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Gyredeck keeps trying when Discord is slow to answer — (v1.37.9)
+
+### Fixes
+
+- **A Discord connection that times out is retried, not given up on.** When the connection to
+  Discord timed out at login, the error was not recognised as Discord being unreachable. The
+  Discord connector stopped without trying again, and Settings showed "The Discord connector
+  stopped on an error:" followed by the timeout. A timeout now counts as Discord being
+  unreachable: Settings says "Can't reach Discord right now. Messages wait and go out in order
+  when it is back.", and the connector keeps trying until it gets in.
+- **A post that times out waits for Discord quietly.** A room's message whose post timed out was
+  already tried again, but the room's row showed Discord's raw timeout error meanwhile. It is now
+  held as Discord being unreachable, which the row does not show, since it clears by itself.
+
 ## A new room keeps its place on Discord when an old room's close is slow — (v1.37.8)
 
 ### Fixes

@@ -1,5 +1,16 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Pages keep equal margins when they do not scroll — (v1.39.2)
+
+### Fixes
+
+- **A short page no longer sits closer to its right edge than its left.** v1.39.0 kept room for
+  the scrollbar so a page would not shift when its bar appeared. The app's web view ignored that
+  rule until a page was long enough to scroll, so a short page lost the bar's 8 px on the right.
+  Sessions, Listening Ports, Git Monitor, Usage and the Settings panel now always keep that room,
+  scrolling or not. An empty bar's track is transparent, so it cannot be seen. Their content sits
+  at the same distance from both sides either way.
+
 ## Heavy runs stay out of the owner's Discord post — (v1.39.1)
 
 ### Fixes

@@ -118,12 +118,14 @@ const assetRoot = join(distRoot, "assets");
  * sync-xas5 seq 704). The audit then asked the ⋮ menus to be menus to the keyboard as well
  * (focus, arrows, Home/End, Escape back to ⋮): +147 / +108 more, to 123,123 / 126,196, raised
  * by exactly that, by the owner from Discord the same day ("yes", sync-xas5 seq 742 to 732).
+ * CI then read 123,159 / 126,232, 36 B over those local figures (a local build reads under CI, as
+ * above); both set to the CI figure by the owner at the terminal the same day.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 123_123,
-  jsTotalGzipBytes: 126_196,
+  jsGzipBytes: 123_159,
+  jsTotalGzipBytes: 126_232,
 };
 
 const walk = async (directory) => {

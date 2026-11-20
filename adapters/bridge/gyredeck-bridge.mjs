@@ -1912,6 +1912,18 @@ export const trimRoomNotices = (room) => {
   return dropped;
 };
 
+/**
+ * Keeps a member's woken seqs to what the room still holds (#338 audit r3, r4). A seq the room
+ * let go, from the front or from the middle by a notice trim, cannot reach the member again by a
+ * replay or a collect, and a push that lands for it late was never counted, so forgetting it
+ * loses nothing. A floor would swallow that late push. Twice the room's size keeps this rare.
+ */
+export const pruneWoken = (member, room) => {
+  if (member.woken.size <= 2 * MAIL_MAX_MESSAGES) return;
+  const held = new Set(room.messages.map((message) => message.seq));
+  for (const seq of member.woken) if (!held.has(seq)) member.woken.delete(seq);
+};
+
 export const trimRoomMessages = (room) => {
   const safeUpTo = slowestReaderSeq(room);
   let bytes = roomBytes(room);
@@ -4133,7 +4145,14 @@ function startBridge(config) {
     const delivered =
       (() => {
         const roster = rosterFor(room, conversationId);
-        return deliverToCodex(conversationId, room, confirmationPayload(room, conversationId, all), { settled: (ok) => { if (ok) roster.mark(); } });
+        const member = room.members.get(conversationId);
+        return deliverToCodex(conversationId, room, confirmationPayload(room, conversationId, all), {
+          settled: (ok) => {
+            if (!ok) return;
+            roster.mark();
+            noteWoken(room, conversationId, all, member, true);
+          },
+        });
       })() === "queued";
     const held = all;
     const member = room.members.get(conversationId);
@@ -5324,6 +5343,8 @@ function startBridge(config) {
         joinedAt: member.joinedAt,
         pending: Math.max(0, room.seq - member.readSeq),
         lastReadAt: member.lastReadAt ?? null,
+        wakes: member.wakes ?? 0,
+        wakesToAnswer: member.wakesToAnswer ?? 0,
       }));
     })(),
     you: as && room.members.has(as) ? as : null,
@@ -6232,6 +6253,32 @@ function startBridge(config) {
   };
 
   /**
+   * One wake of a member by one delivery (#338): a stream frame, a waiting collect that
+   * returned, a push Codex took, a wake-only watch that ended. Counted once per delivery, and
+   * only for what this member was not already woken for, so a message that reached it twice is
+   * one wake. `wakesToAnswer` counts the wakes that carried an ask. A relay is not a session.
+   *
+   * Woken seqs are kept as a set, not a high-water mark: Codex pushes finish in any order, and
+   * a later seq taken first must not swallow an earlier one (#338 audit r1). A delivery that
+   * settles later passes the membership it was made for, so one that lands after a leave and
+   * rejoin is not counted against the new membership. `pushed`: the delivery is a push of its
+   * own that woke the member even when every message in it was already seen (#338 audit r2: a
+   * confirmation with no held mail).
+   */
+  const noteWoken = (room, conversationId, messages, member = conversationId ? room.members.get(conversationId) : null, pushed = false) => {
+    if (!member || member.relay === true || room.members.get(conversationId) !== member) return;
+    member.woken ??= new Set();
+    const fresh = messages.filter(
+      (message) => wakesMember(message, conversationId) && !member.woken.has(message.seq),
+    );
+    if (fresh.length === 0 && !pushed) return;
+    member.wakes = (member.wakes ?? 0) + 1;
+    if (fresh.some((message) => message.kind === "ask")) member.wakesToAnswer = (member.wakesToAnswer ?? 0) + 1;
+    for (const { seq } of fresh) if (Number.isInteger(seq)) member.woken.add(seq);
+    pruneWoken(member, room);
+  };
+
+  /**
    * The same tell from the same sender to the same address within a minute, if there is
    * one. A sender that has not yet seen its seq re-sends, and the receiver then reads the
    * same words twice (#183: seq 9 and 12). The room answers with the first one instead.
@@ -6458,6 +6505,7 @@ function startBridge(config) {
         // How far this member's stream has been written, which is what `since=resume`
         // hands back. Deliberately not the same as readSeq below: a push is not a read.
         noteStreamed(room, res.gyredeckWatcher, message);
+        noteWoken(room, res.gyredeckWatcher, [message]);
       } catch {
         room.clients.delete(res);
       }
@@ -6899,7 +6947,15 @@ function startBridge(config) {
         // Handed over only once `codex queue` took it (#341 audit r2): "queued" is said before the
         // process has run, and a failed push must leave the roster owed.
         const roster = rosterFor(room, recipient);
-        const outcome = deliverToCodex(recipient, room, outgoing, { settled: (ok) => { if (ok) roster.mark(); } });
+        const woke = { seq: routing?.seq, from, to: routing?.to ?? MAIL_EVERYONE, kind, quiet: routing?.quiet, [WAKES]: routing?.[WAKES] };
+        const member = room.members.get(recipient);
+        const outcome = deliverToCodex(recipient, room, outgoing, {
+          settled: (ok) => {
+            if (!ok) return;
+            roster.mark();
+            noteWoken(room, recipient, [woke], member);
+          },
+        });
         if (outcome === "queued") {
           queued = true;
           readByPush(recipient);
@@ -8740,6 +8796,7 @@ function startBridge(config) {
             for (const [roomName, room] of sources) {
               if (!room) continue;
               const taken = collected.filter((message) => message.room === roomName);
+              if (wakingOnly) noteWoken(room, as, taken);
               // Past everything looked at, not merely everything handed over — but never
               // past what the cap left behind, which is still owed to this session.
               const upTo = collected.length < fresh.length
@@ -9604,6 +9661,8 @@ function startBridge(config) {
             if (written) {
               res.write(mailFrame(message));
               replayed = true;
+              // One stream frame is one wake, a wake-only watch's included (#338 audit r2).
+              noteWoken(room, watcher, [message]);
             }
             // Moved past whether it was written or not, and moved here rather than only
             // where frames are pushed. Catching up used to hand messages over without

@@ -13920,13 +13920,18 @@ test("#259 r1: a wait's poll is handed neither notice; the next drain gets both"
 });
 
 /** A bridge with a fake `codex` that logs every push, and no out-of-room heavy push. */
-const codexHeavyFixture = async (tag) => {
+const codexHeavyFixture = async (tag, { gated = false } = {}) => {
   const home = await mkdtemp(join(tmpdir(), `gyredeck-259-${tag}-`));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const fakeBin = join(home, ".bun", "bin");
   await mkdir(fakeBin, { recursive: true });
   const queued = join(home, "queued.log");
-  await writeFile(join(fakeBin, "codex"), `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(queued)}, JSON.stringify(process.argv.slice(2)) + "\\n");\n`);
+  // Gated: a push whose message carries GATE-<name> finishes only once release(name) is called,
+  // so a test can choose the order pushes complete in (#338 audit r1); one carrying FAIL-PUSH fails.
+  const gate = gated
+    ? `const fs = require('node:fs'); if (process.argv.join(' ').includes('FAIL-PUSH')) process.exit(1); const m = process.argv.join(' ').match(/GATE-(\\w+)/); while (m && !fs.existsSync(${JSON.stringify(home)} + '/release-' + m[1])) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);\n`
+    : "";
+  await writeFile(join(fakeBin, "codex"), `#!${process.execPath}\n${gate}require('node:fs').appendFileSync(${JSON.stringify(queued)}, JSON.stringify(process.argv.slice(2)) + "\\n");\n`);
   await chmod(join(fakeBin, "codex"), 0o755);
   const port = await freePort();
   await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
@@ -13961,7 +13966,8 @@ const codexHeavyFixture = async (tag) => {
   // Each push is a `codex queue` child of the bridge; with none left, every push it has
   // started is on record, whatever order the processes finished in (#329 audit).
   const settled = () => until(async () => spawnSync("pgrep", ["-P", String(bridge.pid)]).status === 1, "no codex queue still running");
-  return { home, call, pushes, messagesTo, ingestCodex, settled, close };
+  const release = (name) => writeFile(join(home, `release-${name}`), "");
+  return { home, call, pushes, messagesTo, ingestCodex, settled, release, close };
 };
 
 test("#259 C1 C2 C3 C7: Codex confirmed through notify carries the line in its confirming push, and no other", async () => {
@@ -14536,7 +14542,7 @@ const quietRoomFixture = async (tag) => {
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
   const app = { "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
-  return { port, code, founder, admit, watch, history, say, call, close, app };
+  return { port, code, founder, admit, watch, headersOf, history, say, call, close, app };
 };
 
 test("#339 C1 C3 C5 C6: a join, a confirmation, a name and a reaction wake nobody, and are still there to read", async () => {
@@ -14582,6 +14588,214 @@ test("#339 C1 C3 C5 C6: a join, a confirmation, a name and a reaction wake nobod
     const replay = again.frames();
     await again.stop();
     assert.doesNotMatch(replay, /joined this room|REACTION-TO|is called/, "C1 C5: nothing quiet comes back on a reopened watch");
+  } finally {
+    await f.close();
+  }
+});
+
+const wakesOf = async (f, id) => {
+  const row = (await f.call("GET", `/sync/rooms?as=${f.founder}`)).body.members.find((member) => member.conversationId === id);
+  return [row.wakes, row.wakesToAnswer];
+};
+
+test("#338 W1 W2 W3: each delivery that woke a member is one wake, an ask makes it one to answer, and nothing is counted twice", async () => {
+  const f = await quietRoomFixture("w338");
+  const peer = "q338-wake-peer";
+  try {
+    await f.admit(peer);
+    const relayId = `discord-${f.code}`;
+    assert.equal((await f.call("POST", `/sync/rooms/${f.code}/members`, { conversationId: relayId, relay: "discord" })).status, 200, "premise: the Discord relay is in");
+    const relayWatch = await watchRoom(f.port, f.code, relayId, f.app);
+    assert.deepEqual(await wakesOf(f, f.founder), [0, 0], "nobody is woken by joins and confirmations");
+
+    // Live frames: one wake each; a reaction wakes nobody.
+    const watch = await f.watch(f.founder);
+    assert.equal((await f.say(peer, { to: f.founder, kind: "tell", text: "W-TELL" })).status, 202);
+    assert.equal((await f.say(peer, { to: f.founder, kind: "reaction", text: "W-REACTION" })).status, 202);
+    assert.equal((await f.say(peer, { to: "everyone", kind: "ask", text: "W-ASK-ALL" })).status, 202);
+    await watch.waitFor(/W-ASK-ALL/, "premise: the ask is streamed");
+    await relayWatch.waitFor(/W-ASK-ALL/, "premise: the relay is handed it too");
+    await watch.stop();
+    await relayWatch.stop();
+    assert.deepEqual(await wakesOf(f, f.founder), [2, 1], "W1: two frames woke it, one carried an ask");
+    assert.deepEqual(await wakesOf(f, relayId), [0, 0], "W3: the relay is not a session");
+
+    // A waiting collect of what the watch already carried is not a second wake.
+    assert.equal((await f.call("GET", `/mail/inbox?as=${f.founder}&collect=1&waking=1&limit=10`)).status, 200);
+    assert.deepEqual(await wakesOf(f, f.founder), [2, 1], "W2: what woke it once is not counted again");
+
+    // Two asks while no watch is open come back as a replay of two frames: a wake each (#338 audit r1).
+    assert.equal((await f.say(peer, { to: f.founder, kind: "ask", text: "W-LATE-ASK-1" })).status, 202);
+    assert.equal((await f.say(peer, { to: f.founder, kind: "ask", text: "W-LATE-ASK-2" })).status, 202);
+    const reopened = await f.watch(f.founder);
+    await reopened.waitFor(/W-LATE-ASK-2/, "premise: the replay carries both");
+    await reopened.stop();
+    assert.deepEqual(await wakesOf(f, f.founder), [4, 3], "W1: each replayed frame is one wake, each with its ask");
+    // A wake-only watch (Antigravity, once=1) ends after its replay, and still counts each frame (#338 audit r2).
+    assert.equal((await f.say(peer, { to: f.founder, kind: "ask", text: "W-ONCE-ASK-1" })).status, 202);
+    assert.equal((await f.say(peer, { to: f.founder, kind: "ask", text: "W-ONCE-ASK-2" })).status, 202);
+    const once = await fetch(`http://127.0.0.1:${f.port}/mail/${f.code}/events?as=${f.founder}&since=resume&once=1`, { headers: await f.headersOf(f.founder) });
+    assert.match(await once.text(), /W-ONCE-ASK-2/, "premise: the wake-only watch replayed both and ended");
+    assert.deepEqual(await wakesOf(f, f.founder), [6, 5], "W1: a wake-only replay is a wake per frame");
+
+    // A waiting collect that returns is one wake.
+    assert.equal((await f.say(f.founder, { to: peer, kind: "tell", text: "W-TO-PEER" })).status, 202);
+    assert.equal((await f.say(f.founder, { to: peer, kind: "ask", text: "W-ASK-PEER" })).status, 202);
+    const woke = await f.call("GET", `/mail/inbox?as=${peer}&collect=1&waking=1&limit=10`);
+    assert.match(JSON.stringify(woke.body), /W-ASK-PEER/, "premise: the collect returned the ask");
+    assert.deepEqual(await wakesOf(f, peer), [1, 1], "W1: one returned collect is one wake, with an ask in it");
+    // A collect that is not waiting is a session already awake: not a wake.
+    assert.equal((await f.say(f.founder, { to: peer, kind: "tell", text: "W-DRAIN" })).status, 202);
+    assert.equal((await f.call("GET", `/mail/inbox?as=${peer}&collect=1&limit=10`)).status, 200);
+    assert.deepEqual(await wakesOf(f, peer), [1, 1], "W1: a drain is not a wake");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#338 W4: a push Codex took is one wake, and a reaction it was not pushed is none", async () => {
+  const f = await codexHeavyFixture("w338c");
+  try {
+    const founder = "a3380000-0000-4000-8000-0000000000f1";
+    const codex = "01a06082-8ef6-7900-ae39-44fe2e463381";
+    const code = (await f.call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    const mintFor = async (id) => (await f.call("POST", `/sync/rooms/${code}/members/${id}/join-code`, {})).body.code;
+    await f.ingestCodex(codex);
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: codex });
+    const wakes = async () => {
+      const row = (await f.call("GET", `/sync/rooms?as=${founder}`)).body.members.find((member) => member.conversationId === codex);
+      return [row.wakes, row.wakesToAnswer];
+    };
+    // Mail held until Codex is let in leaves in the one push that confirms it: one wake.
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "ask", text: "W-HELD-ASK" })).status, 202);
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "W-HELD-TELL" })).status, 202);
+    assert.deepEqual(await wakes(), [0, 0], "premise: held mail wakes nobody");
+    assert.equal((await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: "01a06082-8ef6-7900-ae39-44fe2e463382", password: await mintFor(codex) })).body.transitioned, true, "premise: Codex is let in");
+    await until(async () => (await f.messagesTo(codex)).some((message) => /W-HELD-TELL/.test(message)), "the confirmation's push");
+    await f.settled();
+    assert.deepEqual(await wakes(), [1, 1], "W4: the confirmation's push of held mail is one wake, with an ask in it");
+    const before = await wakes();
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "reaction", text: "W-REACTION" })).status, 202);
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "W-TELL" })).status, 202);
+    await until(async () => (await f.messagesTo(codex)).some((message) => /W-TELL/.test(message)), "the tell's push");
+    await f.settled();
+    assert.deepEqual(await wakes(), [before[0] + 1, before[1]], "W4: the tell's push is one wake; the reaction none");
+    assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "ask", text: "W-ASK" })).status, 202);
+    await until(async () => (await f.messagesTo(codex)).some((message) => /W-ASK/.test(message)), "the ask's push");
+    await f.settled();
+    assert.deepEqual(await wakes(), [before[0] + 2, before[1] + 1], "W4: the ask's push is one wake to answer");
+  } finally {
+    await f.close();
+  }
+});
+
+const codexWakeRoom = async (f, tag) => {
+  const founder = `a3380000-0000-4000-8000-0000000000${tag}`;
+  const codex = `01a06082-8ef6-7900-ae39-44fe2e4633${tag}`;
+  const code = (await f.call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+  await f.ingestCodex(codex);
+  const join = () => f.call("POST", `/sync/rooms/${code}/members`, { conversationId: codex });
+  const letIn = async (turn) => {
+    const password = (await f.call("POST", `/sync/rooms/${code}/members/${codex}/join-code`, {})).body.code;
+    assert.equal((await f.call("POST", "/hook/sync/confirm", { conversationId: codex, turnId: `01a06082-8ef6-7900-ae39-44fe2e4634${turn}`, password })).body.transitioned, true, "premise: Codex is let in");
+  };
+  const confirm = async (turn) => {
+    await join();
+    await letIn(turn);
+  };
+  const wakes = async () => {
+    const row = (await f.call("GET", `/sync/rooms?as=${founder}`)).body.members.find((member) => member.conversationId === codex);
+    return [row.wakes, row.wakesToAnswer];
+  };
+  const say = async (kind, text) => assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind, text })).status, 202);
+  const pushed = (pattern, what) => until(async () => (await f.messagesTo(codex)).some((message) => pattern.test(message)), what);
+  return { code, codex, join, letIn, confirm, wakes, say, pushed };
+};
+
+test("#338 W5: pushes that finish in reverse order are a wake each", async () => {
+  const f = await codexHeavyFixture("w338r", { gated: true });
+  try {
+    const r = await codexWakeRoom(f, "a1");
+    await r.confirm("a1");
+    await f.settled();
+    const before = await r.wakes();
+    await r.say("ask", "GATE-first W-FIRST");
+    await r.say("tell", "GATE-second W-SECOND");
+    await f.release("second");
+    await r.pushed(/W-SECOND/, "the later push finishing first");
+    await until(async () => (await r.wakes())[0] === before[0] + 1, "the later push counted");
+    await f.release("first");
+    await f.settled();
+    assert.deepEqual(await r.wakes(), [before[0] + 2, before[1] + 1], "W5: the earlier seq finishing last is still a wake, with its ask");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#338 W6: a push that finishes after its member left and rejoined is not counted against the new membership", async () => {
+  const f = await codexHeavyFixture("w338j", { gated: true });
+  try {
+    const r = await codexWakeRoom(f, "b1");
+    await r.confirm("b1");
+    await f.settled();
+    await r.say("ask", "GATE-old W-OLD");
+    assert.equal((await f.call("DELETE", `/sync/rooms/${r.code}/members/${r.codex}`)).status, 200, "premise: it left");
+    await r.confirm("b2");
+    await until(async () => (await f.messagesTo(r.codex)).filter((message) => /you are confirmed in room/.test(message)).length === 2, "the second confirmation's push");
+    const rejoined = await r.wakes();
+    await f.release("old");
+    await r.pushed(/W-OLD/, "the old push finishing");
+    await f.settled();
+    assert.deepEqual(await r.wakes(), rejoined, "W6: the old membership's push is not a wake of the new one");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#338 W7: a confirmation push that landed is one wake with no held mail, none when it failed, and none for a newer membership", async () => {
+  const f = await codexHeavyFixture("w338k", { gated: true });
+  try {
+    const plain = await codexWakeRoom(f, "c1");
+    await plain.confirm("c1");
+    await f.settled();
+    assert.deepEqual(await plain.wakes(), [1, 0], "W7: the confirmation push alone is one wake");
+
+    const failed = await codexWakeRoom(f, "c2");
+    await failed.join();
+    await failed.say("tell", "FAIL-PUSH W-HELD");
+    await failed.letIn("c2");
+    await f.settled();
+    assert.deepEqual(await failed.wakes(), [0, 0], "W7: a confirmation push that failed is no wake");
+
+    const rejoin = await codexWakeRoom(f, "c3");
+    await rejoin.join();
+    await rejoin.say("tell", "GATE-conf W-HELD-OLD");
+    await rejoin.letIn("c3");
+    assert.equal((await f.call("DELETE", `/sync/rooms/${rejoin.code}/members/${rejoin.codex}`)).status, 200, "premise: it left before the push landed");
+    await rejoin.confirm("c4");
+    await f.release("conf");
+    await f.settled();
+    assert.equal((await f.messagesTo(rejoin.codex)).filter((message) => /you are confirmed in room/.test(message)).length, 2, "premise: both confirmation pushes landed");
+    assert.deepEqual(await rejoin.wakes(), [1, 0], "W7: only the new membership's own confirmation is its wake");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#338 W8: an ask whose push lands after 260 later ones is still a wake to answer", async () => {
+  const f = await codexHeavyFixture("w338l", { gated: true });
+  try {
+    const r = await codexWakeRoom(f, "d1");
+    await r.confirm("d1");
+    await f.settled();
+    const before = await r.wakes();
+    await r.say("ask", "GATE-late W-LATE-ASK");
+    const later = 260;
+    for (let index = 0; index < later; index += 1) await r.say("tell", `W-LATER-${index}`);
+    await until(async () => (await r.wakes())[0] === before[0] + later, "every later push counted", 120_000);
+    await f.release("late");
+    await f.settled();
+    assert.deepEqual(await r.wakes(), [before[0] + later + 1, before[1] + 1], "W8: the late ask is counted, past any bound on remembered seqs");
   } finally {
     await f.close();
   }

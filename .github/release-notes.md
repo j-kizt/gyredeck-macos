@@ -4,11 +4,14 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
 
 ### Added
 
-- **Remove a heavy run that is still waiting.** Under Settings → Sync, each heavy run waiting
-  in the queue now has a red Remove button. Removing it takes that run out of the line without
-  touching the run that is going, and the waiting command is never started: its helper stops,
-  says the Gyredeck app removed it, and exits with code 75. Only the app can do this. A removed
-  run that retries is refused rather than let back into the line.
+- **Remove a heavy run that is still waiting.** Under Settings → Sync, a heavy run waiting in
+  the queue now has a red Remove button, shown for each waiting run the bridge names with an id
+  (runs queued by an older bridge carry none and show no button). Removing it takes that run out
+  of the line without touching the run that is going. Only the app can do this. When the
+  waiting helper is told it was removed, it says the Gyredeck app removed it, runs nothing and
+  exits with code 75. A removed run that retries is refused while the bridge still remembers the
+  removal: it keeps the last 128 in memory, and forgets them when it restarts. As before, a
+  helper that cannot reach the bridge at all runs its command outside the queue.
 - **Sync rooms read like Git accounts.** Each room under Settings → Sync is one row with its
   session count, and its actions (Connect or Disconnect for Discord, and Close room) sit in a ⋮
   menu, as an account's do. A room followed in Discord shows the Discord mark after its name.

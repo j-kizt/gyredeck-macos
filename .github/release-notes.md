@@ -1,5 +1,34 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
+## Settings, Usage and Ports get a tidier look, and a waiting heavy run can be taken out of line — (v1.39.0)
+
+### Added
+
+- **Remove a heavy run that is still waiting.** Under Settings → Sync, a heavy run waiting in
+  the queue now has a red Remove button, shown for each waiting run the bridge names with an id
+  (runs queued by an older bridge carry none and show no button). Removing it takes that run out
+  of the line without touching the run that is going. Only the app can do this. When the
+  waiting helper is told it was removed, it says the Gyredeck app removed it, runs nothing and
+  exits with code 75. A removed run that retries is refused while the bridge still remembers the
+  removal: it keeps the last 128 in memory, and forgets them when it restarts. As before, a
+  helper that cannot reach the bridge at all runs its command outside the queue.
+- **Sync rooms read like Git accounts.** Each room under Settings → Sync is one row with its
+  session count, and its actions (Connect or Disconnect for Discord, and Close room) sit in a ⋮
+  menu, as an account's do. A room followed in Discord shows the Discord mark after its name.
+- **The ⋮ menus work from the keyboard.** Opening one puts focus on its first item, the arrow
+  keys, Home and End move between the items that can be pressed, and Escape closes the menu and
+  puts focus back on ⋮, without closing Settings. This holds for room and Git account menus alike.
+- **The approval code is now Multi-factor authentication, in a row of its own.** The
+  authenticator code that approves a merge or a release from Discord used to sit among the
+  Discord rows as "Approval code". It is now under Settings → Connection → Security.
+
+### Fixes
+
+- **A refused Kill now stays said.** When Kill on a running heavy run was refused, the reason
+  was shown and then wiped at once by the status read that followed it, so nothing was left on
+  screen. The reason now stays until the next Kill or Remove is pressed, while the status keeps
+  refreshing. Remove, new in this release, behaves the same way.
+
 ## A Codex thread gets longer to come back to its sync room — (v1.38.2)
 
 ### Fixes

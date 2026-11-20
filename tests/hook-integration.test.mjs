@@ -14742,7 +14742,11 @@ test("#338 W6: a push that finishes after its member left and rejoined is not co
     assert.equal((await f.call("DELETE", `/sync/rooms/${r.code}/members/${r.codex}`)).status, 200, "premise: it left");
     await r.confirm("b2");
     await until(async () => (await f.messagesTo(r.codex)).filter((message) => /you are confirmed in room/.test(message)).length === 2, "the second confirmation's push");
+    // The push is on record before its process exits, and only the exit counts it (W7a);
+    // `settled` cannot wait for it here, since the old push is still held at its gate.
+    await until(async () => (await r.wakes())[0] === 1, "the second confirmation's push landing");
     const rejoined = await r.wakes();
+    assert.deepEqual(rejoined, [1, 0], "premise: the new membership's own confirmation is its one wake");
     await f.release("old");
     await r.pushed(/W-OLD/, "the old push finishing");
     await f.settled();

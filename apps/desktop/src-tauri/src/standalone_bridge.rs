@@ -1162,6 +1162,10 @@ pub(crate) struct SyncMember {
     pub confirmed: bool,
     pub pending: u32,
     pub you: bool,
+    /// How many deliveries the room woke this member with, and how many carried an ask (#338).
+    pub wakes: u32,
+    #[serde(rename = "wakesToAnswer")]
+    pub wakes_to_answer: u32,
 }
 
 /// The room a session is in, or the absence of one.
@@ -1194,6 +1198,8 @@ fn parse_sync_room(value: &serde_json::Value, as_id: &str) -> SyncRoom {
                             .unwrap_or("Agent")
                             .to_string(),
                         pending: member.get("pending").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                        wakes: member.get("wakes").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                        wakes_to_answer: member.get("wakesToAnswer").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                     })
                 })
                 .collect()
@@ -1546,6 +1552,22 @@ pub(crate) fn find_node_binary() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rooms_wake_counts_reach_the_panel_under_the_bridges_names() {
+        let value = serde_json::json!({
+            "room": "sync-ab23",
+            "members": [
+                { "conversationId": "me", "provider": "Claude Code", "confirmed": true, "pending": 0, "wakes": 6, "wakesToAnswer": 4 },
+                { "conversationId": "older-bridge", "provider": "Codex", "confirmed": true, "pending": 0 }
+            ]
+        });
+        let room = super::parse_sync_room(&value, "me");
+        assert_eq!((room.members[0].wakes, room.members[0].wakes_to_answer), (6, 4));
+        assert_eq!((room.members[1].wakes, room.members[1].wakes_to_answer), (0, 0));
+        let shown = serde_json::to_value(&room.members[0]).unwrap();
+        assert_eq!((shown["wakes"].as_u64(), shown["wakesToAnswer"].as_u64()), (Some(6), Some(4)));
+    }
+
     #[test]
     fn a_room_that_ended_is_no_longer_founded() {
         let mut founded = super::FoundedRooms::default();

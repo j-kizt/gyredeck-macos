@@ -8,6 +8,9 @@ export interface ISyncMember {
   confirmed: boolean;
   pending: number;
   you: boolean;
+  /** Times the bridge woke this member, and how many of those carried a question for it. */
+  wakes: number;
+  wakesToAnswer: number;
 }
 
 export interface ISyncRoomState {

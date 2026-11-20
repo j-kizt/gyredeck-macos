@@ -15,7 +15,7 @@ test("the sync panel walks create, join and disconnect, and shows a refusal wher
         if (command === "sync_create") {
           room = {
             room: "sync-4f2a",
-            members: [{ conversationId: "me", provider: "Claude Code", pending: 0, you: true }],
+            members: [{ conversationId: "me", provider: "Claude Code", pending: 0, you: true, wakes: 0, wakesToAnswer: 0 }],
           };
           return room;
         }
@@ -25,8 +25,8 @@ test("the sync panel walks create, join and disconnect, and shows a refusal wher
           room = {
             room: "sync-4f2a",
             members: [
-              { conversationId: "me", provider: "Claude Code", pending: 0, you: true },
-              { conversationId: "peer", provider: "Codex", pending: 2, you: false },
+              { conversationId: "me", provider: "Claude Code", pending: 0, you: true, wakes: 3, wakesToAnswer: 1 },
+              { conversationId: "peer", provider: "Codex", pending: 2, you: false, wakes: 7, wakesToAnswer: 5 },
             ],
           };
           return room;
@@ -64,6 +64,8 @@ test("the sync panel walks create, join and disconnect, and shows a refusal wher
   // joined, so nothing is left to confirm — just the code and the two things worth
   // doing with it.
   await expect(sync.locator(".session-sync-code")).toHaveText("sync-4f2a");
+  // How often the bridge woke this session, not the other member.
+  await expect(sync.locator(".session-sync-wakes")).toHaveText("Woken 3 times · 1 to answer");
   await expect(sync.getByRole("button", { name: "Copy room code sync-4f2a" })).toBeVisible();
   await expect(sync.getByRole("button", { name: "Disconnect from sync room" })).toBeVisible();
   await expect(sync.getByRole("button", { name: "Create sync" })).toHaveCount(0);
@@ -79,4 +81,8 @@ test("the sync panel walks create, join and disconnect, and shows a refusal wher
 
   await sync.getByRole("button", { name: "Disconnect from sync room" }).click();
   await expect(sync.getByRole("button", { name: "Create sync" })).toBeVisible();
+  await expect(sync.locator(".session-sync-wakes")).toHaveCount(0);
+
+  await sync.getByRole("button", { name: "Create sync" }).click();
+  await expect(sync.locator(".session-sync-wakes")).toHaveText("Not woken yet");
 });

@@ -2,7 +2,7 @@ import { Check, Copy, Crown, DoorClosed, KeyRound, Link2, Link2Off } from "lucid
 import { useEffect, useRef, useState } from "react";
 import type { ISessionSummary } from "../session/types";
 import { copyJoinCode } from "./copyJoinCode";
-import type { ISyncRoomState } from "./useSyncRoom";
+import type { ISyncMember, ISyncRoomState } from "./useSyncRoom";
 
 /**
  * Connecting one session to another, and nothing else.
@@ -13,6 +13,9 @@ import type { ISyncRoomState } from "./useSyncRoom";
  * the thing being designed out. What is left is the room's code and the two things
  * worth doing to it.
  */
+const wakesLabel = (you?: ISyncMember) =>
+  you?.wakes ? `Woken ${you.wakes} time${you.wakes > 1 ? "s" : ""} · ${you.wakesToAnswer} to answer` : "Not woken yet";
+
 export const SessionSyncPanel = ({
   session,
   sync,
@@ -26,7 +29,7 @@ export const SessionSyncPanel = ({
   /** Whether this session's own agent has the Gyredeck hook. Null while unknown. */
   hookInstalled: boolean | null;
 }) => {
-  const { room, busy, error, canAct, isFounder, issueJoinCode, create, join, leave, clearError } = sync;
+  const { room, members, busy, error, canAct, isFounder, issueJoinCode, create, join, leave, clearError } = sync;
   const [mode, setMode] = useState<"idle" | "joining">("idle");
   const [code, setCode] = useState("");
   const [copied, setCopied] = useState(false);
@@ -91,7 +94,10 @@ export const SessionSyncPanel = ({
   return (
     <section className="session-sync" aria-labelledby="session-sync-heading" data-connected={Boolean(room)}>
       <div className="session-sync-head">
-        <span id="session-sync-heading">Sync session</span>
+        <span id="session-sync-heading">
+          Sync session
+          {room ? <span className="session-sync-wakes">{wakesLabel(members.find((member) => member.you))}</span> : null}
+        </span>
         {room ? (
           // Create already puts this session in the room, so there is nothing left to
           // confirm: the code and the two things worth doing with it are all there is.

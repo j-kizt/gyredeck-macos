@@ -108,12 +108,14 @@ const assetRoot = join(distRoot, "assets");
  * #379 (git monitor errors stay on one line and keep the last good reading) on top of #322
  * measured 122,384 JS on CI and 122,347 / 125,426 locally; 122,400 and 125,520 leave ~15 / ~55
  * over the CI figure. Raised by the owner at the terminal on 2026-11-18 ("ขยับทั้งสองตัวได้เลย").
+ * #338 (the room wake count in the Sync session heading) adds ~87 gzip bytes: 122,434 / 125,513
+ * locally. Both raised by 100, by the owner at the terminal on 2026-11-19.
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 122_400,
-  jsTotalGzipBytes: 125_520,
+  jsGzipBytes: 122_500,
+  jsTotalGzipBytes: 125_620,
 };
 
 const walk = async (directory) => {

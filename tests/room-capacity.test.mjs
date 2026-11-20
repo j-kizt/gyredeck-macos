@@ -6,6 +6,7 @@ import {
   MAIL_MAX_NOTICES,
   MAIL_MAX_ROOM_BYTES,
   messageBytes,
+  pruneWoken,
   roomBytes,
   ROOM_SENDER,
   roomIsFull,
@@ -214,4 +215,21 @@ test("I20: past the wider ceiling the oldest goes, and the drop is recorded", ()
   const r = relayRoom(0, 4 * MAIL_MAX_NOTICES + 5);
   assert.equal(r.messages.length, 4 * MAIL_MAX_NOTICES);
   assert.equal(r.droppedThroughSeq, 5, "the reader is told what it will never be handed");
+});
+
+test("#338 W9: a member's woken seqs stay bounded when notices go from the middle of the room", () => {
+  // Codex r4: pruning only below the oldest held seq let an old message at the front pin the
+  // set while waking room tells came and were trimmed from behind it.
+  const r = room({ messages: [{ seq: 1, from: "peer", to: "everyone", kind: "tell", text: "x" }], members: { unread: 0 } });
+  const member = { woken: new Set([1]) };
+  for (let seq = 2; seq <= 2001; seq += 1) {
+    r.messages.push({ seq, from: ROOM_SENDER, to: "everyone", kind: "tell", text: "x" });
+    member.woken.add(seq);
+    trimRoomNotices(r);
+    pruneWoken(member, r);
+  }
+  assert.equal(r.messages[0].seq, 1, "the old message still pins the front");
+  assert.ok(r.messages.length <= MAIL_MAX_NOTICES + 1);
+  assert.ok(member.woken.size <= 2 * MAIL_MAX_MESSAGES, `woken held ${member.woken.size}`);
+  assert.ok(member.woken.has(1) && member.woken.has(2001), "what the room still holds stays woken");
 });

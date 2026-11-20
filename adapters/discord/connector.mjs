@@ -30,6 +30,8 @@ export const RELAYED_MAX = 500;
 const SPOKEN_MAX = 500;
 export const EDIT_NOTE = "Edits are not sent to the room; send a new message.";
 export const OWNER_VOICE = "gyredeck-owner-discord";
+// A room's heavy-run notice, as the app hands it over (#436): accounted for, never posted.
+export const HEAVY_KIND = "heavy";
 export const YES = "✅";
 export const NO = "❌";
 export const SENT = "📨";
@@ -1633,8 +1635,9 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
       acked(w, seq, item.inst, rs.lastMsgId ?? rs.threadId);
       return;
     }
-    // The owner's own words are already in the post, as the message they typed (#205).
-    if (item.m.senderId === OWNER_VOICE) {
+    // The owner's own words are already in the post, as the message they typed (#205); a
+    // heavy-run notice is for the agents, who collect it from the room (#436).
+    if (item.m.senderId === OWNER_VOICE || item.m.kind === HEAVY_KIND) {
       rs.lastSeq = seq;
       dropParts(rs);
       save();

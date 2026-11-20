@@ -13317,6 +13317,9 @@ test("room notices C5: a heavy-run notice wakes nobody — no frame to a watch, 
     // Readable all the same, on the next collect.
     const collected = await fetch(`${h.base}/mail/inbox?as=${founder}&collect=1`, { headers: await h.member(founder) }).then((r) => r.json());
     assert.ok((collected.messages ?? []).some((m) => m.text.startsWith("HEAVY RUN: Unknown started")), JSON.stringify(collected.messages));
+    // Tagged by field, so the Discord relay can leave them out of the owner's post (#436).
+    const heavy = (collected.messages ?? []).filter((m) => m.text.startsWith("HEAVY RUN: "));
+    assert.deepEqual(heavy.map((m) => [m.from, m.topic]), heavy.map(() => ["gyredeck-room", "heavy"]));
 
     // Control: a tell to the room does reach the same watch and ends a wait.
     const appCall = (path, body) => fetch(`${h.base}${path}`, {
@@ -13329,11 +13332,13 @@ test("room notices C5: a heavy-run notice wakes nobody — no frame to a watch, 
     await fetch(`${h.base}/mail/inbox?as=${founder}&collect=1`, { headers: await h.member(founder) });
     const wakes = fetch(`${h.base}/mail/wait?as=${founder}&timeout=10`, { headers: await h.member(founder) }).then((r) => r.json());
     await new Promise((resolve) => setTimeout(resolve, 200));
-    const told = await appCall(`/mail/${room.code}`, { from: peer, text: "control", kind: "tell", to: founder });
+    const told = await appCall(`/mail/${room.code}`, { from: peer, text: "control", kind: "tell", to: founder, topic: "heavy" });
     assert.equal(told.status, 202, await told.clone().text());
     const woken = await wakes;
     assert.equal(woken.timedOut, false, "premise: this wait can be woken");
     assert.ok((woken.messages ?? []).some((m) => m.text === "control"), "and it was the tell that woke it");
+    // Only the room tags a topic: a member's line asking for one is posted as said (#436).
+    assert.equal(woken.messages.find((m) => m.text === "control").topic, undefined);
     await until(() => frames.some((frame) => frame.includes("control")), "premise: this watch receives frames");
     assert.ok(!frames.some((frame) => frame.includes("HEAVY RUN")), frames.join("\n"));
     controller.abort();

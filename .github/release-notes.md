@@ -18,8 +18,8 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   sign. A message sent straight to a Codex member was also marked read as soon as its push was
   queued. Mail now counts as read only when `codex queue` exits successfully. A push that fails
   while the bridge keeps running is tried again on the thread's next wake. The waiting pushes
-  live in memory only: if the bridge restarts first, the mail stays unread but is not pushed
-  again by itself. When the bridge cannot find Codex at all, nothing is pushed. A thread's pushes into one room go one at a time, in the order the mail was
+  live in the bridge's memory, as the rooms do: a bridge restart drops them, and they are not
+  pushed again. When the bridge cannot find Codex at all, nothing is pushed. A thread's pushes into one room go one at a time, in the order the mail was
   said. A push that runs past 60 seconds is stopped and counts as not taken, even if it then
   exits successfully, so a message Codex had already taken before its push was stopped can
   arrive twice.

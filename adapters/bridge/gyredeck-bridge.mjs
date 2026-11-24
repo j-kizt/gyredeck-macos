@@ -1146,10 +1146,13 @@ const WATCH_REOPEN_GRACE_MS = Number(process.env.GYREDECK_WATCH_REOPEN_GRACE_MS)
  *  self-update ends a live thread with `other` and resumes it 3–4 s later (log 11-10 → 11-13,
  *  max 4.4 s; real ends were ≥ 65 s apart from any resume). */
 const CLOSE_GRACE_MS = Number(process.env.GYREDECK_CLOSE_GRACE_MS) || 15_000;
-/** The same grace for a Codex thread (#380 reopened): on 2026-11-20 a daemon self-update resumed
- *  the thread 16 s after its close. A limited mitigation, nothing more: past it the member leaves
- *  as before and comes back only with the owner's fresh confirmation. */
-const CODEX_CLOSE_GRACE_MS = Number(process.env.GYREDECK_CODEX_CLOSE_GRACE_MS) || 60_000;
+/** The same grace for a Codex thread (#380): around a daemon self-update a thread resumed 16 s
+ *  (2026-11-20) and 64 s (2026-11-24) after its close, so a short window did not hold. An hour is
+ *  a mitigation inside a time limit (owner, 2026-11-24), not identity and not a promise that every
+ *  update is covered: a dead thread stays listed for that hour, and past it the member leaves as
+ *  before and comes back only with the owner's fresh confirmation. */
+export const codexCloseGraceMs = (env = process.env) => Number(env.GYREDECK_CODEX_CLOSE_GRACE_MS) || 60 * 60_000;
+const CODEX_CLOSE_GRACE_MS = codexCloseGraceMs();
 /** SessionEnd reasons that are someone leaving on purpose (Claude Code hooks reference): the
  *  session is not coming back under this id, so it leaves at once. Anything else waits. */
 const DELIBERATE_ENDS = new Set(["clear", "resume", "logout", "prompt_input_exit", "bypass_permissions_disabled"]);
@@ -2687,6 +2690,7 @@ function startBridge(config) {
     tracker.rememberScope(payload);
     rememberProvider(payload);
     tellCodexOfHeavyRuns(payload?.conversationId);
+    if (typeof payload?.conversationId === "string") wakeCodexOutboxes(payload.conversationId);
     if (stampedBySession && typeof payload.conversationId === "string") {
       const stampedAt = Date.parse(payload.timestamp);
       if (payload.type === "conversation_close") {
@@ -4038,6 +4042,7 @@ function startBridge(config) {
     const member = room.members.get(conversationId);
     if (member?.label) room.formerLabels.set(conversationId, member.label);
     room.members.delete(conversationId);
+    purgeCodexOutboxes(room.name, conversationId);
     // A member taken out takes its unused code with it (#331 audit): put back, it needs a new one.
     room.joinCodes?.delete(conversationId);
     releaseCodexReader(conversationId);
@@ -4165,36 +4170,30 @@ function startBridge(config) {
 
   const tellConfirmedToCodex = (name, room, conversationId) => {
     const all = heldFor(room, conversationId);
-    const delivered =
-      (() => {
-        const roster = rosterFor(room, conversationId);
-        const member = room.members.get(conversationId);
-        return deliverToCodex(conversationId, room, confirmationPayload(room, conversationId, all), {
-          settled: (ok) => {
-            if (!ok) return;
-            roster.mark();
-            noteWoken(room, conversationId, all, member, true);
-          },
-        });
-      })() === "queued";
-    const held = all;
+    const roster = rosterFor(room, conversationId);
     const member = room.members.get(conversationId);
+    const through = member?.heldThroughSeq;
+    // Through the outbox like every other push (#380 audit): the window is counted as read only
+    // once `codex queue` took it, and mail published after this queues behind it, in order.
+    const delivered = pushToCodex(conversationId, name, room, confirmationPayload(room, conversationId, all),
+      typeof through === "number" ? through : null, () => {
+        roster.mark();
+        noteWoken(room, conversationId, all, member, true);
+        // And then past the quiet mail after it (#339): nothing else would ever move it for Codex.
+        passCodexOverQuiet(room, conversationId);
+      }) === "queued";
     if (delivered && member) {
-      // The heavy-run line rode in the push just sent (#259).
+      // The heavy-run line rides in this push (#259).
       member.heavyOwed = false;
-      // Through the whole window, because the whole window went: nothing is trimmed here.
+      // Through the whole window, because the whole window goes: nothing is trimmed here.
       // A backlog too large to hand over in one push is refused at the door instead, so
-      // everything the room accepted for this member is in the message just sent.
+      // everything the room accepted for this member is in the message queued.
       if (all.length > 0) member.drainedThroughSeq = all[all.length - 1].seq;
-      // The whole window was handed over, so its place moves through it, and then past the
-      // quiet mail after it (#339): nothing else would ever move it for Codex.
-      if (typeof member.heldThroughSeq === "number") markRead(room, conversationId, member.heldThroughSeq, new Date().toISOString());
-      // Everything owed has gone. Anything published from here on is ordinary mail and
-      // is pushed as it arrives; there is nothing left for a repeated paste to resend.
+      // Everything owed is on its way. Anything published from here on is ordinary mail and
+      // queues behind it; there is nothing left for a repeated paste to resend.
       member.heldThroughSeq = null;
-      passCodexOverQuiet(room, conversationId);
     }
-    return { delivered, held: delivered ? held.length : 0 };
+    return { delivered, held: delivered ? all.length : 0 };
   };
 
   /**
@@ -4737,6 +4736,12 @@ function startBridge(config) {
   // How long a turn's stop keeps reading for its answer (#181). Seconds, not minutes: it
   // covers the gap between the hook and Codex's own write, nothing more.
   const CODEX_STOP_GRACE_MS = 5_000;
+  // How long one `codex queue` may run (#380 audit r6). It only hands a message to Codex's own
+  // daemon and returns, in well under a second when the daemon is up and in seconds when it
+  // has to start, so a minute is far past any honest run — and it is also the longest a
+  // rejoined member's mail can wait behind a run left over from before it left. Overridable so
+  // a test can hang a child without waiting a minute; nothing else sets it.
+  const CODEX_QUEUE_DEADLINE_MS = Number(process.env.GYREDECK_CODEX_QUEUE_DEADLINE_MS) || 60_000;
 
   /** Newest rollout log for a Codex thread, or null when the session is unknown. */
   const codexRolloutFor = (threadId) => {
@@ -4839,7 +4844,9 @@ function startBridge(config) {
   /** The most a bounded look (`until=`) hands back: one delivery's worth, with room to spare. */
   const MAIL_LOOK_MAX = 50;
   const MAIL_MAX_FROM = 64;
-  const MAIL_ROOM_IDLE_MS = 3_600_000;
+  // Overridable so a test can drive the idle sweep without waiting an hour (#380 audit r6);
+  // nothing else sets it.
+  const MAIL_ROOM_IDLE_MS = Number(process.env.GYREDECK_MAIL_ROOM_IDLE_MS) || 3_600_000;
   const MAIL_MAX_MEMBERS = 8;
   // A stream is closed after this long whether anything happened or not. A watcher
   // that is never hung up on outlives the reason it was armed: the room ends, the
@@ -5426,6 +5433,7 @@ function startBridge(config) {
   /** Every way a room ends goes through here, so its files go with it (#375). */
   const dropRoom = (name) => {
     mailRooms.delete(name);
+    purgeCodexOutboxes(name);
     stranded.delete(name);
     removeRoomFiles(name);
   };
@@ -6622,6 +6630,42 @@ function startBridge(config) {
    * Fire-and-forget on purpose: the POST that triggered this has already been answered,
    * and a session that never replies must not leave a request hanging.
    */
+  /**
+   * Run one `codex queue`, and report how it ended exactly once: `onEnd(ok, code)`.
+   *
+   * Every push goes through here, so every push has a deadline (#380 audit r6). A run that has
+   * not exited by `CODEX_QUEUE_DEADLINE_MS` is asked to stop, and killed one deadline later if
+   * it has not. Either way, and whatever its exit code, it counts as refused — what it carried stays unread and goes again
+   * on the session's next event — and only once the process has really exited: the outbox
+   * starts nothing more for that thread and room while it still runs, so two runs can never
+   * deliver at once. A run that could not start at all ends at its error, since no exit follows.
+   */
+  const runCodexQueue = (binary, threadId, text, onEnd) => {
+    const child = spawn(binary, ["queue", "--thread", threadId, "--message", text], { stdio: ["ignore", "ignore", "ignore"] });
+    // Set before the signal (#380 audit r7): a run stopped at its deadline is a refusal even if it
+    // then exits 0, since nothing says what it had done before it was stopped.
+    let timedOut = false;
+    let timer = setTimeout(() => {
+      timedOut = true;
+      console.error(`⚠ codex queue gave no answer in ${CODEX_QUEUE_DEADLINE_MS} ms for ${threadId}; it is stopped, and the message is tried again on the session's next event`);
+      child.kill("SIGTERM");
+      timer = setTimeout(() => child.kill("SIGKILL"), CODEX_QUEUE_DEADLINE_MS);
+      timer.unref?.();
+    }, CODEX_QUEUE_DEADLINE_MS);
+    timer.unref?.();
+    child.on("error", (error) => {
+      // Emitted too when a kill fails; only a child that never started ends here.
+      if (child.pid !== undefined) return;
+      clearTimeout(timer);
+      console.error(`⚠ codex queue could not be started (${error?.code ?? error}): ${binary}`);
+      onEnd(false, null);
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      onEnd(code === 0 && !timedOut, code);
+    });
+  };
+
   const deliverToCodex = (threadId, room, text, { harvest = true, settled = null } = {}) => {
     const binary = findAgentBinary("codex");
     if (!binary) return "unavailable";
@@ -6644,14 +6688,9 @@ function startBridge(config) {
         done = true;
         settled?.(ok);
       };
-      const child = spawn(binary, ["queue", "--thread", threadId, "--message", text], { stdio: ["ignore", "ignore", "ignore"] });
-      child.on("error", (error) => {
-        console.error(`⚠ codex queue could not be started (${error?.code ?? error}): ${binary}`);
-        settle(false);
-      });
-      child.on("exit", (code) => {
-        if (code !== 0) console.error(`⚠ codex queue exited ${code} for a notice to ${threadId}; it is tried again on the session's next event`);
-        settle(code === 0);
+      runCodexQueue(binary, threadId, text, (ok, code) => {
+        if (!ok && code !== null) console.error(`⚠ codex queue exited ${code} for a notice to ${threadId}; it is tried again on the session's next event`);
+        settle(ok);
       });
       return "queued";
     }
@@ -6677,9 +6716,6 @@ function startBridge(config) {
         reader.path = rolloutPath;
       } catch {}
     }
-    const child = spawn(binary, ["queue", "--thread", threadId, "--message", text], {
-      stdio: ["ignore", "ignore", "ignore"],
-    });
     // The caller has already been told "queued"; a push that could not even start is
     // one line on stderr, which is more than the silence it used to be. `settled` hears
     // whether `codex queue` actually took it (#341 audit r2), for what may only be counted
@@ -6690,11 +6726,7 @@ function startBridge(config) {
       pushSettled = true;
       settled?.(ok);
     };
-    child.on("error", (error) => {
-      console.error(`⚠ codex queue could not be started (${error?.code ?? error}): ${binary}`);
-      settlePush(false);
-    });
-    child.on("exit", (code) => settlePush(code === 0));
+    runCodexQueue(binary, threadId, text, (ok) => settlePush(ok));
 
     // Without a log to read there is nothing to harvest, but the message was still
     // delivered — the session will show it even if we cannot see the answer.
@@ -6824,15 +6856,93 @@ function startBridge(config) {
     );
   };
 
+  // A push into Codex is Codex reading: nothing else ever collects in its name — its hooks never
+  // read, and since #137 nothing outside may — so without this a room with a Codex member would
+  // fill to its cap and stay there. But only once `codex queue` took it (#380 audit): "queued"
+  // is said before the process has run. So every push that moves a Codex cursor goes through one
+  // outbox per thread and room, one push at a time, in order, and the cursor moves only for the
+  // head, only when `codex queue` exited 0 — it never passes a message Codex has not taken. A
+  // head that failed, or could not start, stays the head and is tried again on the thread's next
+  // event or the next message for it. Nothing is dropped while its room and member stand and the
+  // room still holds it: a held head keeps the cursor still, so the room fills to its cap and
+  // refuses new posts. The room's own voice is exempt from that cap, so it is bounded the way
+  // the room bounds it (#380 audit r4): a notice `trimRoomNotices` let go is gone for every
+  // member, and its entry lapses with it — the outbox never holds more of the room than the
+  // room does. A confirming push is not a notice of the room's: it carries held mail and never
+  // lapses this way. A held room does not hold up the thread's other rooms. The outbox
+  // lives in memory: after a restart nothing pushes what it held (accepted by the owner,
+  // 2026-11-24); the cursor still shows it unread.
+  const codexOutboxes = new Map();
+  // A member leaves a room only through `retireLabel` and a room ends only through `dropRoom`, and
+  // both empty the matching boxes here (#380 audit r5), so no way out of a room can leave a box
+  // holding what is gone until some later wake. A head in flight stays until its run settles:
+  // `settled` finds its room or member gone and neither reads nor hands it on. A box is deleted
+  // only when nothing of it is in flight, so its in-flight run always finds itself still filed.
+  const purgeCodexOutboxes = (roomName, threadId = null) => {
+    for (const [key, box] of [...codexOutboxes]) {
+      if (box.roomName !== roomName || (threadId !== null && box.threadId !== threadId)) continue;
+      box.queue = box.inFlight ? box.queue.slice(0, 1) : [];
+      if (!box.inFlight) codexOutboxes.delete(key);
+    }
+  };
+  const lapsed = (threadId, push) =>
+    mailRooms.get(push.roomName) !== push.room ||
+    push.room.members.get(threadId) !== push.member ||
+    (push.roomsOwnVoice && !push.room.messages.some((message) => message.seq === push.seq));
+  const drainCodexOutbox = (key) => {
+    const box = codexOutboxes.get(key);
+    if (!box || box.inFlight) return;
+    while (box.queue.length) {
+      const push = box.queue[0];
+      if (lapsed(box.threadId, push)) {
+        box.queue.shift();
+        continue;
+      }
+      box.inFlight = true;
+      box.wokenInFlight = false;
+      const outcome = deliverToCodex(box.threadId, push.room, push.outgoing, {
+        settled: (ok) => {
+          box.inFlight = false;
+          const standing = mailRooms.get(push.roomName) === push.room && push.room.members.get(box.threadId) === push.member;
+          if (ok || !standing) {
+            box.queue.shift();
+            if (ok && standing) {
+              if (Number.isInteger(push.seq)) markRead(push.room, box.threadId, push.seq, new Date().toISOString());
+              push.onTaken?.();
+            }
+            drainCodexOutbox(key);
+          } else if (box.wokenInFlight) drainCodexOutbox(key);
+          if (!box.queue.length && !box.inFlight) codexOutboxes.delete(key);
+        },
+      });
+      if (outcome !== "queued") box.inFlight = false;
+      return;
+    }
+    codexOutboxes.delete(key);
+  };
+  const wakeCodexOutboxes = (threadId) => {
+    for (const [key, box] of [...codexOutboxes]) {
+      if (box.threadId !== threadId) continue;
+      if (box.inFlight) box.wokenInFlight = true;
+      else drainCodexOutbox(key);
+    }
+  };
+  const pushToCodex = (recipient, roomName, room, outgoing, seq, onTaken = null, roomsOwnVoice = false) => {
+    if (!findAgentBinary("codex")) return "unavailable";
+    const key = `${recipient}\u0000${roomName}`;
+    const box = codexOutboxes.get(key) ?? { threadId: recipient, roomName, queue: [], inFlight: false, wokenInFlight: false };
+    codexOutboxes.set(key, box);
+    // Every entry behind the head is checked on every push, so what lapsed never accumulates
+    // behind a head that keeps failing; the head in flight is settled by its own run.
+    box.queue = box.queue.filter((push, index) => (index === 0 && box.inFlight) || !lapsed(recipient, push));
+    box.queue.push({ roomName, room, member: room.members.get(recipient), seq, outgoing, onTaken, roomsOwnVoice });
+    if (box.inFlight) box.wokenInFlight = true;
+    else drainCodexOutbox(key);
+    return "queued";
+  };
+
   const noDestinationSaid = new Set();
   const deliverMail = (roomName, room, text, from, routing = null, except = null) => {
-    // A push into Codex is Codex reading: nothing else ever collects in its name — its
-    // hooks never read, and since #137 nothing outside may — so the only way its cursor
-    // in a room could move was a collect nobody makes, and a room with a Codex member
-    // would fill to its cap and stay there. The message handed over moves the cursor.
-    const readByPush = (recipient) => {
-      if (Number.isInteger(routing?.seq)) markRead(room, recipient, routing.seq, new Date().toISOString());
-    };
     // A message that should not interrupt is still in the room to be read; it just is
     // not carried to anyone. Codex is the reason this has to be decided here: it holds
     // no stream to filter and cannot choose whether to be woken, so the room chooses
@@ -6952,10 +7062,8 @@ function startBridge(config) {
               (replyTo === null
                 ? " your own log and keeps it in your mailbox.]\n\n"
                 : ` your own log and delivers it to the sender (reply-to ${replyTo}).]\n\n`) + text;
-          if (deliverToCodex(recipient, room, outgoing) === "queued") {
-            queued = true;
-            readByPush(recipient);
-          } else unavailable = true;
+          if (pushToCodex(recipient, roomName, room, outgoing, routing?.seq, null, routing ? isRoomsOwnVoice(routing) : false) === "queued") queued = true;
+          else unavailable = true;
           continue;
         }
         // Who it is from and which kind it is, in the words the rules use: without the kind
@@ -6975,17 +7083,12 @@ function startBridge(config) {
         const roster = rosterFor(room, recipient);
         const woke = { seq: routing?.seq, from, to: routing?.to ?? MAIL_EVERYONE, kind, quiet: routing?.quiet, [WAKES]: routing?.[WAKES] };
         const member = room.members.get(recipient);
-        const outcome = deliverToCodex(recipient, room, outgoing, {
-          settled: (ok) => {
-            if (!ok) return;
-            roster.mark();
-            noteWoken(room, recipient, [woke], member);
-          },
-        });
-        if (outcome === "queued") {
-          queued = true;
-          readByPush(recipient);
-        } else unavailable = true;
+        const outcome = pushToCodex(recipient, roomName, room, outgoing, routing?.seq, () => {
+          roster.mark();
+          noteWoken(room, recipient, [woke], member);
+        }, routing ? isRoomsOwnVoice(routing) : false);
+        if (outcome === "queued") queued = true;
+        else unavailable = true;
       } else if (provider === "agyHost" || provider === "claudeCodeHook") {
         waiting = true;
       }
@@ -7673,6 +7776,9 @@ function startBridge(config) {
             // How many sessions' logs are being followed. Bounded by the sessions in rooms
             // or still owed an answer; a number that only grows is a leak.
             readers: codexReaders.size,
+            // Pushes waiting in the Codex outboxes (#380 audit r4). Bounded by what the rooms
+            // hold; a number that only grows is a leak.
+            outboxed: [...codexOutboxes.values()].reduce((count, box) => count + box.queue.length, 0),
           },
           // Whether the app has handed over the broker's word, how many sessions the
           // broker has bound, and the old-path collects refused on their behalf — the one
@@ -9473,13 +9579,10 @@ function startBridge(config) {
             ? "relayed"
             : "owner_not_connected")
           : delivered;
-        // A queued message is in the session's hands whether or not it answers, so it
-        // is not still waiting to be collected. Leaving it pending would light the
-        // chip on a session that had already been handed the message.
-        if (delivery === "queued") {
-          room.readSeq = Math.max(room.readSeq, message.seq);
-          room.lastReadAt = message.ts;
-        }
+        // "queued" is not read (#380 audit r7, map C22): it is said when the push enters the Codex
+        // outbox, before `codex queue` has run, and the run can still be refused, time out or
+        // lapse. The outbox marks the read itself, once the run exited 0 — the one place a push
+        // to Codex is counted as taken.
         if (declared.name) announceDeclaredName(name, room, from, declared.name);
         sendJson(202, {
           ok: true,

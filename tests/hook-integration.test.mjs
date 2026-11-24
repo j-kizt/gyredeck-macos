@@ -6274,8 +6274,12 @@ test("a batch re-read after the dedup window overflows still publishes each answ
   // is what frees room space behind it — nothing collects in its name any more.
   const fakeBin = join(home, ".bun", "bin");
   await mkdir(fakeBin, { recursive: true });
-  await writeFile(join(fakeBin, "codex"), "#!/bin/sh\nexit 0\n");
+  // Held while `reading` is absent, so the test decides when Codex reads (#380: pushes now
+  // leave one at a time, and how far they got by the first stop was down to the runner).
+  const reading = join(home, "codex-reads");
+  await writeFile(join(fakeBin, "codex"), `#!/bin/sh\nwhile [ ! -e '${reading}' ]; do sleep 0.02; done\nexit 0\n`);
   await chmod(join(fakeBin, "codex"), 0o755);
+  await writeFile(reading, "");
   const rollout = join(rolloutDir, `rollout-2026-09-23T09-00-00-${thread}.jsonl`);
   const port = await freePort();
   await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
@@ -6313,12 +6317,21 @@ test("a batch re-read after the dedup window overflows still publishes each answ
     const code = created.body.room;
     assert.equal((await joinConfirmed(call, code, founder, thread)).status, 200);
 
-    // The founder fills the room to just under its message cap, addressed to the Codex
-    // session so nothing may be spent while it is not collecting. 500 is the cap; leaving
-    // 65 free means the 66th Codex reply is the one refused.
-    const roomState = await (await fetch(`http://127.0.0.1:${port}/mail`, { headers })).json();
-    const already = roomState.rooms.find((entry) => entry.room === code).buffered;
-    for (let i = already; i < 500 - 65; i += 1) {
+    const health = async () => (await (await fetch(`http://127.0.0.1:${port}/health`)).json()).codexHarvest;
+    const answers = async () => {
+      const history = await (await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${founder}`, {
+        headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, token),
+      })).json();
+      return history.messages.filter((message) => message.from === thread).map((message) => message.text);
+    };
+    // Codex has read everything so far, so all of it may be spent; then it stops reading.
+    await until(async () => (await health()).outboxed === 0 && spawnSync("pgrep", ["-P", String(bridge.pid)]).status === 1, "Codex to read what the join sent");
+    await rm(reading);
+
+    // The founder fills the room with 435 messages to the Codex session, which it has not
+    // read, so none may be spent: 500 is the cap, and 65 free means the 66th Codex reply is
+    // the one refused.
+    for (let i = 0; i < 500 - 65; i += 1) {
       const said = await call("POST", `/mail/${code}`, { from: founder, to: thread, kind: "tell", text: `filler-${i}` });
       assert.equal(said.status, 202, `filling the room stopped early at ${i}`);
     }
@@ -6332,25 +6345,27 @@ test("a batch re-read after the dedup window overflows still publishes each answ
     });
 
     await stop();
+    await until(async () => (await answers()).length >= 65, "the head of the batch", 30_000);
     await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.deepEqual(await answers(), said.slice(0, 65), "premise: the room took 65 and refused the 66th");
 
     // The pushes into Codex are its reading, which is what frees the space the tail
-    // needs; nothing collects in its name over TCP any more (#137).
-    await new Promise((resolve) => setTimeout(resolve, 300));
-
+    // needs; nothing collects in its name over TCP any more (#137). The tail is read again
+    // as Codex reads, from wherever the cursor stopped.
+    await writeFile(reading, "");
+    await until(async () => (await health()).outboxed === 0, "the pushes into Codex to drain", 120_000);
     await stop();
+    await until(async () => (await answers()).includes(said[65]), "the refused 66th answer, once Codex has read", 30_000);
+    // Any second copy is published by a re-read the drain or the stop set off; let those finish.
     await new Promise((resolve) => setTimeout(resolve, 300));
-
-    const history = await (await fetch(`http://127.0.0.1:${port}/mail/${code}?as=${founder}`, {
-      headers: await memberHeaders(`http://127.0.0.1:${port}`, founder, token),
-    })).json();
-    const fromCodex = history.messages.filter((message) => message.from === thread).map((message) => message.text);
+    const fromCodex = await answers();
 
     const counted = fromCodex.reduce((tally, text) => tally.set(text, (tally.get(text) ?? 0) + 1), new Map());
     const twice = [...counted].filter(([, times]) => times > 1);
     assert.deepEqual(twice, [], `published more than once: ${JSON.stringify(twice)}`);
-    assert.ok(counted.size > 64, `the batch has to outrun the dedup window, and only ${counted.size} answers arrived`);
+    assert.deepEqual([...fromCodex].sort(), [...said].sort(), "every answer of the batch, the refused 66th included, published exactly once");
   } finally {
+    await writeFile(reading, "").catch(() => {});
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
@@ -14013,9 +14028,11 @@ const codexHeavyFixture = async (tag, { gated = false } = {}) => {
   await mkdir(fakeBin, { recursive: true });
   const queued = join(home, "queued.log");
   // Gated: a push whose message carries GATE-<name> finishes only once release(name) is called,
+  // or once the fixture's home is gone, so a test that fails with a gate still shut leaves no
+  // `codex` spinning after it (#380 r8: two did, and held the heavy-run slot for an hour).
   // so a test can choose the order pushes complete in (#338 audit r1); one carrying FAIL-PUSH fails.
   const gate = gated
-    ? `const fs = require('node:fs'); if (process.argv.join(' ').includes('FAIL-PUSH')) process.exit(1); const m = process.argv.join(' ').match(/GATE-(\\w+)/); while (m && !fs.existsSync(${JSON.stringify(home)} + '/release-' + m[1])) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);\n`
+    ? `const fs = require('node:fs'); if (process.argv.join(' ').includes('FAIL-PUSH')) process.exit(1); const m = process.argv.join(' ').match(/GATE-(\\w+)/); while (m && !fs.existsSync(${JSON.stringify(home)} + '/release-' + m[1]) && fs.existsSync(${JSON.stringify(home)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);\n`
     : "";
   await writeFile(join(fakeBin, "codex"), `#!${process.execPath}\n${gate}require('node:fs').appendFileSync(${JSON.stringify(queued)}, JSON.stringify(process.argv.slice(2)) + "\\n");\n`);
   await chmod(join(fakeBin, "codex"), 0o755);
@@ -14798,6 +14815,12 @@ const codexWakeRoom = async (f, tag) => {
   return { code, codex, join, letIn, confirm, wakes, say, pushed };
 };
 
+// #380: a thread's pushes into one room leave one at a time, in order, so a later push can no
+// longer finish before an earlier one. W5, W6 and W8 keep their claims under that order: the
+// later push is released first and must wait, and each push still counts once it lands.
+const pushedNow = async (f, codex, pattern) => (await f.messagesTo(codex)).some((message) => pattern.test(message));
+const heldBack = () => new Promise((resolve) => setTimeout(resolve, 500));
+
 test("#338 W5: pushes that finish in reverse order are a wake each", async () => {
   const f = await codexHeavyFixture("w338r", { gated: true });
   try {
@@ -14808,11 +14831,15 @@ test("#338 W5: pushes that finish in reverse order are a wake each", async () =>
     await r.say("ask", "GATE-first W-FIRST");
     await r.say("tell", "GATE-second W-SECOND");
     await f.release("second");
-    await r.pushed(/W-SECOND/, "the later push finishing first");
-    await until(async () => (await r.wakes())[0] === before[0] + 1, "the later push counted");
+    await heldBack();
+    assert.equal(await pushedNow(f, r.codex, /W-SECOND/), false, "premise (#380): the later push waits behind the earlier one");
+    assert.deepEqual(await r.wakes(), before, "premise: nothing counted while the earlier push is held");
     await f.release("first");
+    await r.pushed(/W-SECOND/, "the later push, after the earlier one");
     await f.settled();
-    assert.deepEqual(await r.wakes(), [before[0] + 2, before[1] + 1], "W5: the earlier seq finishing last is still a wake, with its ask");
+    const order = (await f.messagesTo(r.codex)).filter((message) => /W-FIRST|W-SECOND/.test(message)).map((message) => (/W-FIRST/.test(message) ? "first" : "second"));
+    assert.deepEqual(order, ["first", "second"], "premise (#380): in the order they were said");
+    assert.deepEqual(await r.wakes(), [before[0] + 2, before[1] + 1], "W5: a push said during another's flight is still a wake, and the held ask is still one to answer");
   } finally {
     await f.close();
   }
@@ -14827,16 +14854,17 @@ test("#338 W6: a push that finishes after its member left and rejoined is not co
     await r.say("ask", "GATE-old W-OLD");
     assert.equal((await f.call("DELETE", `/sync/rooms/${r.code}/members/${r.codex}`)).status, 200, "premise: it left");
     await r.confirm("b2");
-    await until(async () => (await f.messagesTo(r.codex)).filter((message) => /you are confirmed in room/.test(message)).length === 2, "the second confirmation's push");
-    // The push is on record before its process exits, and only the exit counts it (W7a);
-    // `settled` cannot wait for it here, since the old push is still held at its gate.
-    await until(async () => (await r.wakes())[0] === 1, "the second confirmation's push landing");
-    const rejoined = await r.wakes();
-    assert.deepEqual(rejoined, [1, 0], "premise: the new membership's own confirmation is its one wake");
+    const confirmations = async () => (await f.messagesTo(r.codex)).filter((message) => /you are confirmed in room/.test(message)).length;
+    // #380: the old push is in flight in this thread's box for the room, so the new
+    // confirmation waits behind it and the old push is the one that finishes after the rejoin.
+    await heldBack();
+    assert.equal(await confirmations(), 1, "premise (#380): the second confirmation waits behind the old push");
+    assert.deepEqual(await r.wakes(), [0, 0], "premise: the new membership starts with no wake");
     await f.release("old");
-    await r.pushed(/W-OLD/, "the old push finishing");
+    await r.pushed(/W-OLD/, "the old push finishing after the rejoin");
+    await until(async () => (await confirmations()) === 2, "the second confirmation's push");
     await f.settled();
-    assert.deepEqual(await r.wakes(), rejoined, "W6: the old membership's push is not a wake of the new one");
+    assert.deepEqual(await r.wakes(), [1, 0], "W6: the old membership's push is not a wake of the new one; its own confirmation is its one wake");
   } finally {
     await f.close();
   }
@@ -14882,10 +14910,17 @@ test("#338 W8: an ask whose push lands after 260 later ones is still a wake to a
     await r.say("ask", "GATE-late W-LATE-ASK");
     const later = 260;
     for (let index = 0; index < later; index += 1) await r.say("tell", `W-LATER-${index}`);
-    await until(async () => (await r.wakes())[0] === before[0] + later, "every later push counted", 120_000);
+    // #380: the 260 wait behind the held ask rather than landing before it, and the ask
+    // settles with all 260 having woken its box while it was in flight.
+    await heldBack();
+    assert.equal(await pushedNow(f, r.codex, /W-LATER-/), false, "premise (#380): the later pushes wait behind the held ask");
+    assert.deepEqual(await r.wakes(), before, "premise: nothing counted while the ask is held");
     await f.release("late");
+    await until(async () => (await f.messagesTo(r.codex)).filter((message) => /W-LATER-/.test(message)).length === later, "every later push", 120_000);
     await f.settled();
-    assert.deepEqual(await r.wakes(), [before[0] + later + 1, before[1] + 1], "W8: the late ask is counted, past any bound on remembered seqs");
+    const order = (await f.messagesTo(r.codex)).filter((message) => /W-LATE-ASK|W-LATER-/.test(message));
+    assert.match(order[0], /W-LATE-ASK/, "premise (#380): the held ask lands first");
+    assert.deepEqual(await r.wakes(), [before[0] + later + 1, before[1] + 1], "W8: the held ask is counted as a wake to answer, with 260 behind it");
   } finally {
     await f.close();
   }

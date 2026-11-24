@@ -8,7 +8,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { connect as netConnect, createServer } from "node:net";
 import { randomBytes, randomUUID } from "node:crypto";
 import test, { after } from "node:test";
-import { ROOM_RULES_VERSION } from "../adapters/bridge/gyredeck-bridge.mjs";
+import { MAIL_MAX_NOTICES, ROOM_RULES_VERSION } from "../adapters/bridge/gyredeck-bridge.mjs";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
@@ -7716,6 +7716,37 @@ const { randomUUID } = require("node:crypto");
 const args = process.argv.slice(2);
 const thread = args[args.indexOf("--thread") + 1];
 const message = args[args.indexOf("--message") + 1];
+// #380 audit: every attempt is logged; codex-slow makes a run take 800 ms; codex-refuses makes it
+// exit 1 the way a daemon mid-update does — every run if empty, runs whose message holds its text,
+// or the next N runs if it holds a number.
+const fs = require("node:fs");
+fs.appendFileSync(join(process.env.HOME, "codex-attempts.log"), JSON.stringify(message) + "\\n");
+if (fs.existsSync(join(process.env.HOME, "codex-slow"))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 800);
+// #380 audit r6: every start is logged with the messages of the runs still alive beside it, and
+// codex-hangs makes runs whose message holds its text (every run if empty) never return by
+// themselves: asked to stop they exit 1 after 700 ms, or never if codex-ignores-term exists.
+const live = join(process.env.HOME, "codex-live");
+fs.mkdirSync(live, { recursive: true });
+const alongside = fs.readdirSync(live).filter((pid) => {
+  try { process.kill(Number(pid), 0); return true; } catch { return false; }
+}).map((pid) => { try { return fs.readFileSync(join(live, pid), "utf8"); } catch { return ""; } });
+fs.appendFileSync(join(process.env.HOME, "codex-starts.log"), JSON.stringify({ message, pid: process.pid, alongside }) + "\\n");
+fs.writeFileSync(join(live, String(process.pid)), message);
+process.on("exit", () => { try { fs.unlinkSync(join(live, String(process.pid))); } catch {} });
+const hangs = join(process.env.HOME, "codex-hangs");
+if (fs.existsSync(hangs) && (!fs.readFileSync(hangs, "utf8").trim() || message.includes(fs.readFileSync(hangs, "utf8").trim()))) {
+  // codex-term-exits-zero makes the stopped run exit 0, as a run that finished its work on the way out would (#380 audit r7).
+  process.on("SIGTERM", () => { if (!fs.existsSync(join(process.env.HOME, "codex-ignores-term"))) setTimeout(() => process.exit(fs.existsSync(join(process.env.HOME, "codex-term-exits-zero")) ? 0 : 1), 700); });
+  setInterval(() => {}, 1 << 30);
+  return;
+}
+const rule = join(process.env.HOME, "codex-refuses");
+if (fs.existsSync(rule)) {
+  const said = fs.readFileSync(rule, "utf8").trim();
+  if (/^\\d+$/.test(said)) {
+    if (Number(said) > 0) { fs.writeFileSync(rule, String(Number(said) - 1)); process.exit(1); }
+  } else if (!said || message.includes(said)) process.exit(1);
+}
 const root = join(process.env.HOME, ".codex", "sessions");
 const rollout = readdirSync(root, { recursive: true }).map(String).find((name) => name.endsWith(".jsonl") && name.includes(thread));
 if (rollout) {
@@ -7752,7 +7783,7 @@ const promptsIn = async (rollout) => (await readFile(rollout, "utf8")).split("\n
   .filter((entry) => entry.payload?.type === "item_completed" && entry.payload.item?.type === "UserMessage")
   .map((entry) => ({ turnId: entry.payload.turn_id, text: entry.payload.item.content.map((part) => part.text).join("") }));
 
-const codexInARoom = async ({ replyTimeoutMs = null } = {}) => {
+const codexInARoom = async ({ replyTimeoutMs = null, env: extraEnv = {} } = {}) => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-bound-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const fakeBin = join(home, ".bun", "bin");
@@ -7778,6 +7809,7 @@ const codexInARoom = async ({ replyTimeoutMs = null } = {}) => {
         // covered by its own test and would shift every count here.
         GYREDECK_TEST_HEAVY_NO_CODEX_PUSH: "1",
         ...(replyTimeoutMs === null ? {} : { GYREDECK_CODEX_REPLY_TIMEOUT_MS: String(replyTimeoutMs) }),
+        ...extraEnv,
       },
       stdio: ["pipe", "pipe", "pipe"],
     },
@@ -15198,8 +15230,10 @@ test("#341 R4: a delivery in the second between the room's five-minute close and
 test("#341 R7: a Codex push that codex queue refused does not count as handing the roster over", async () => {
   const f = await codexHeavyFixture("r7");
   try {
-    // A codex that records every push and refuses the one marked to fail.
-    await writeFile(join(f.home, ".bun", "bin", "codex"), `#!${process.execPath}\nconst a = process.argv.slice(2); require('node:fs').appendFileSync(${JSON.stringify(join(f.home, "queued.log"))}, JSON.stringify(a) + "\\n"); process.exit(a[a.indexOf("--message") + 1].includes("FAIL-ME") ? 1 : 0);\n`);
+    // A codex that records every push and refuses the one marked to fail, the first time only:
+    // since #380 a refused push is not skipped but tried again, in order, before what follows it.
+    const refusedOnce = JSON.stringify(join(f.home, "refused-once"));
+    await writeFile(join(f.home, ".bun", "bin", "codex"), `#!${process.execPath}\nconst fs = require('node:fs'); const a = process.argv.slice(2); fs.appendFileSync(${JSON.stringify(join(f.home, "queued.log"))}, JSON.stringify(a) + "\\n"); const refuse = a[a.indexOf("--message") + 1].includes("FAIL-ME") && !fs.existsSync(${refusedOnce}); if (refuse) fs.writeFileSync(${refusedOnce}, ""); process.exit(refuse ? 1 : 0);\n`);
     const founder = "a3410000-0000-4000-8000-0000000007f1";
     const codex = "01a06082-8ef6-7900-ae39-44fe2e463417";
     const late = "a3410000-0000-4000-8000-0000000007f2";
@@ -15217,8 +15251,14 @@ test("#341 R7: a Codex push that codex queue refused does not count as handing t
     assert.match(failed, /Members (now|changed)/, "premise: the failed push carried the change");
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.equal((await f.call("POST", `/mail/${code}`, { from: founder, to: codex, kind: "tell", text: "AFTER-THE-FAILURE" })).status, 202);
-    const next = await until(async () => (await f.messagesTo(codex)).find((message) => message.includes("AFTER-THE-FAILURE")), "the next push");
-    assert.match(next, /Members (now|changed)/, "R7: the roster is still owed after a refused push");
+    const pushes = await until(async () => {
+      const all = await f.messagesTo(codex);
+      return all.some((message) => message.includes("AFTER-THE-FAILURE")) ? all : null;
+    }, "the next push");
+    const after = pushes.findIndex((message) => message.includes("AFTER-THE-FAILURE"));
+    const retried = pushes.slice(0, after).filter((message) => message.includes("FAIL-ME"));
+    assert.equal(retried.length, 2, "#380: the refused push went again, before the message after it");
+    assert.match(retried[1], /Members (now|changed)/, "R7: the roster is still owed after a refused push");
   } finally {
     await f.close();
   }
@@ -15734,5 +15774,433 @@ test("#380: every hook stamps its event when the agent fired it, not when its in
   } finally {
     sink.close();
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+/** A Codex thread in a room, settled, with the handles the #380 outbox tests read (#380 audit r2). */
+const codexOutboxRoom = async (options = {}) => {
+  const room = await codexInARoom(options);
+  const pendingOf = async () => (await room.call("GET", `/sync/rooms?as=${room.founder}`)).body.members
+    .find((member) => member.conversationId === room.thread)?.pending;
+  const tell = async (text) => {
+    const sent = await room.call("POST", `/mail/${room.code}`, { from: room.founder, to: room.thread, kind: "tell", text });
+    assert.equal(sent.body.ok, true, `premise: ${text} was posted`);
+  };
+  const heard = () => room.call("POST", "/ingest", {
+    version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+    conversationId: room.thread, cwd: "/tmp/project",
+    runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" },
+    data: { inputCount: 1 },
+  });
+  const attempts = async (text) => {
+    try {
+      return (await readFile(join(room.home, "codex-attempts.log"), "utf8")).split("\n").filter(Boolean)
+        .map((line) => JSON.parse(line)).filter((message) => message.includes(text)).length;
+    } catch {
+      return 0;
+    }
+  };
+  const taken = async () => (await promptsIn(room.rollout)).map((prompt) => prompt.text);
+  const takenIndex = async (text) => (await taken()).findIndex((message) => message.endsWith(text));
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  // Settled: the mailbox notice and the confirming push both taken, so nothing of the join is
+  // still in the outbox when a test starts refusing.
+  assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => /you are confirmed in room/.test(prompt.text))), `the premise: the confirming push was taken / ${room.stderrRef.value}`);
+  assert.ok(await room.until(async () => (await pendingOf()) === 0), "the premise: nothing is waiting");
+  return { ...room, pendingOf, tell, heard, attempts, taken, takenIndex, pause };
+};
+
+test("#380: a push `codex queue` refused is not counted as read, and goes again the next time the thread is heard from", async () => {
+  const room = await codexOutboxRoom();
+  try {
+    await writeFile(join(room.home, "codex-refuses"), "");
+    await room.tell("REFUSED-ONCE");
+    assert.ok(await room.until(async () => (await room.attempts("REFUSED-ONCE")) === 1), "premise: the push was tried");
+    await room.pause(500);
+    assert.equal(await room.takenIndex("REFUSED-ONCE"), -1, "the premise: the fake refused it");
+    assert.equal(await room.pendingOf(), 1, "a refused push is not counted as read");
+
+    await rm(join(room.home, "codex-refuses"));
+    await room.pause(500);
+    assert.equal(await room.pendingOf(), 1, "nothing is pushed again until the session is heard from");
+    await room.heard();
+    assert.ok(await room.until(async () => (await room.takenIndex("REFUSED-ONCE")) >= 0), `the refused push went again: ${room.stderrRef.value}`);
+    assert.ok(await room.until(async () => (await room.pendingOf()) === 0), "and counts as read once Codex took it");
+  } finally {
+    await room.close();
+  }
+});
+
+test("#380: a later push that succeeds cannot carry the cursor past an earlier one that failed; order is kept", async () => {
+  const room = await codexOutboxRoom();
+  try {
+    // The first push of FIRST is refused; posting SECOND wakes the outbox, which tries FIRST
+    // again before it, and that is refused too. SECOND must not go ahead of it, nor be read.
+    await writeFile(join(room.home, "codex-refuses"), "2");
+    await room.tell("FIRST");
+    assert.ok(await room.until(async () => (await room.attempts("FIRST")) === 1), "premise: FIRST was tried");
+    await room.pause(300);
+    await room.tell("SECOND");
+    assert.ok(await room.until(async () => (await room.attempts("FIRST")) === 2), "the new message tried FIRST again first");
+    await room.pause(500);
+    assert.equal(await room.attempts("SECOND"), 0, "SECOND waits behind the refused FIRST");
+    assert.equal(await room.pendingOf(), 2, "neither is counted as read");
+
+    await room.heard();
+    assert.ok(await room.until(async () => (await room.takenIndex("SECOND")) >= 0), `both went once heard from: ${room.stderrRef.value}`);
+    assert.ok((await room.takenIndex("FIRST")) < (await room.takenIndex("SECOND")), "in the order they were posted");
+    assert.ok(await room.until(async () => (await room.pendingOf()) === 0), "and both count as read");
+  } finally {
+    await room.close();
+  }
+});
+
+test("#380: a wake that comes while a push is in flight is not lost, and many wakes retry it once", async () => {
+  const room = await codexOutboxRoom();
+  try {
+    await writeFile(join(room.home, "codex-slow"), "");
+    await writeFile(join(room.home, "codex-refuses"), "1");
+    await room.tell("IN-FLIGHT");
+    assert.ok(await room.until(async () => (await room.attempts("IN-FLIGHT")) === 1), "premise: the push started");
+    // Heard from three times while the refused push is still running; nothing after it.
+    await room.heard();
+    await room.heard();
+    await room.heard();
+    assert.ok(await room.until(async () => (await room.takenIndex("IN-FLIGHT")) >= 0), `the wake during the push retried it: ${room.stderrRef.value}`);
+    await room.pause(2_000);
+    assert.equal(await room.attempts("IN-FLIGHT"), 2, "once refused, once taken: no loop");
+    assert.equal(await room.pendingOf(), 0);
+  } finally {
+    await room.close();
+  }
+});
+
+test("#380: a push held for a member that left is not delivered to the member that came back", async () => {
+  const room = await codexOutboxRoom();
+  try {
+    await writeFile(join(room.home, "codex-refuses"), "OLD-MEMBER-ONLY");
+    await room.tell("OLD-MEMBER-ONLY");
+    assert.ok(await room.until(async () => (await room.attempts("OLD-MEMBER-ONLY")) === 1), "premise: the push was tried");
+    await room.pause(300);
+    // Taken out of the room from the app — nothing of the thread's own is heard, so the push is
+    // still held, not in flight — and let in again: a new member, under the same id.
+    assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200, "premise: removed");
+    assert.ok(await room.until(async () => (await room.pendingOf()) === undefined), "premise: it left");
+    const triedBeforeLeaving = await room.attempts("OLD-MEMBER-ONLY");
+    await rm(join(room.home, "codex-refuses"));
+    assert.equal((await joinConfirmed(room.call, room.code, room.founder, room.thread)).status, 200, "premise: let in again");
+    await room.heard();
+    await room.pause(1_500);
+    assert.equal(await room.attempts("OLD-MEMBER-ONLY"), triedBeforeLeaving, "the old member's push is not tried for the new one");
+    assert.equal(await room.takenIndex("OLD-MEMBER-ONLY"), -1);
+  } finally {
+    await room.close();
+  }
+});
+
+test("#380: a confirming push carrying held mail that `codex queue` refused leaves that mail unread, and goes again when the thread is heard from", async () => {
+  const room = await codexOutboxRoom();
+  try {
+    // Out and back in unconfirmed: a new member, so mail to it is held for the confirming push.
+    assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200, "premise: removed");
+    assert.ok(await room.until(async () => (await room.pendingOf()) === undefined), "premise: it left");
+    await room.call("POST", `/sync/rooms/${room.code}/members`, { conversationId: room.thread });
+    await room.tell("HELD-ONE");
+    await room.tell("HELD-TWO");
+    await room.pause(500);
+    assert.equal(await room.attempts("HELD-ONE"), 0, "premise: held, not pushed, while unconfirmed");
+    const before = await room.pendingOf();
+    assert.ok(before >= 2, `premise: the held mail is waiting (${before})`);
+
+    await writeFile(join(room.home, "codex-refuses"), "you are confirmed");
+    const password = (await room.call("POST", `/sync/rooms/${room.code}/members/${room.thread}/join-code`, {})).body.code;
+    assert.equal((await room.call("POST", `/sync/rooms/${room.code}/confirm`, { conversationId: room.thread, password })).status, 200, "premise: let in");
+    assert.ok(await room.until(async () => (await room.attempts("HELD-TWO")) === 1), "premise: the confirming push with the held mail was tried");
+    await room.pause(500);
+    assert.ok(!(await room.taken()).some((text) => text.includes("HELD-ONE")), "the premise: the fake refused it");
+    const refused = await room.pendingOf();
+    assert.ok(refused >= before, `a refused confirming push does not count the held mail as read (pending ${before} → ${refused})`);
+
+    await rm(join(room.home, "codex-refuses"));
+    await room.pause(500);
+    assert.equal(await room.pendingOf(), refused, "nothing is pushed again until the session is heard from");
+    await room.heard();
+    assert.ok(
+      await room.until(async () => (await room.taken()).some((text) => /you are confirmed in room/.test(text) && text.includes("HELD-ONE") && text.includes("HELD-TWO"))),
+      `the confirming push went again, held mail and all: ${room.stderrRef.value}`,
+    );
+    assert.equal(await room.attempts("HELD-TWO"), 2, "once refused, once taken");
+    assert.ok(await room.until(async () => (await room.pendingOf()) === 0), "and only once Codex took it is the held mail read");
+  } finally {
+    await room.close();
+  }
+});
+
+test("#380: notices of the room's own, piling up behind a head `codex queue` keeps refusing, stay within the room's notice allowance; the mail and the latest notice still arrive, in order", async () => {
+  const room = await codexOutboxRoom();
+  const mailbox = (text) => room.call("POST", `/mail/${room.thread}`, { from: room.founder, kind: "tell", text });
+  const membershipNotice = /^\[Gyredeck: you are (no longer in room|now in sync room) /;
+  const notices = async () => (await room.taken()).filter((text) => membershipNotice.test(text)).length;
+  try {
+    const noticesBefore = await notices();
+    await writeFile(join(room.home, "codex-refuses"), "");
+    assert.equal((await mailbox("MAILBOX-FIRST")).body.ok, true, "premise: mail into the thread's mailbox was posted");
+    assert.ok(await room.until(async () => (await room.attempts("MAILBOX-FIRST")) >= 1), "premise: the mailbox head was tried");
+    // Each removal and each re-add tells the thread in its mailbox; the room's own voice is
+    // exempt from the room cap, so only the outbox's bound stands between these and the head.
+    const cycles = MAIL_MAX_NOTICES + 8;
+    for (let cycle = 0; cycle < cycles; cycle += 1) {
+      assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200, `premise: removed (${cycle})`);
+      assert.equal((await room.call("POST", `/sync/rooms/${room.code}/members`, { conversationId: room.thread })).status, 200, `premise: put back (${cycle})`);
+    }
+    const outboxed = (await (await fetch(`http://127.0.0.1:${room.port}/health`)).json()).codexHarvest.outboxed;
+    assert.ok(
+      outboxed >= 1 && outboxed <= MAIL_MAX_NOTICES + 1,
+      `behind the refused head the outbox holds at most the notices the room still does: ${outboxed} waiting after ${2 * cycles} notices, allowance ${MAIL_MAX_NOTICES} + the head`,
+    );
+    // The last notice said before this mail is the latest put-back ("now in sync room").
+    assert.equal((await mailbox("MAILBOX-SECOND")).body.ok, true, "premise: the second mail was posted");
+    await room.pause(500);
+    assert.equal(await room.takenIndex("MAILBOX-FIRST"), -1, "the premise: the head was refused throughout");
+    assert.equal(await notices(), noticesBefore, "the premise: no notice got past the refused head");
+
+    await rm(join(room.home, "codex-refuses"));
+    await room.heard();
+    assert.ok(await room.until(async () => (await room.takenIndex("MAILBOX-SECOND")) >= 0, 20_000), `the mail behind the notices arrived: ${room.stderrRef.value}`);
+    await room.pause(500);
+    const taken = await room.taken();
+    const first = taken.findIndex((text) => text.endsWith("MAILBOX-FIRST"));
+    const second = taken.findIndex((text) => text.endsWith("MAILBOX-SECOND"));
+    assert.ok(first >= 0 && second > first, `both mails, in the order they were posted (${first}, ${second})`);
+    const between = taken.slice(first + 1, second);
+    assert.ok(between.every((text) => membershipNotice.test(text)), "only the notices said between the two mails came between them");
+    assert.match(taken[second - 1], /^\[Gyredeck: you are now in sync room /, "the latest notice arrived, last before the mail after it");
+    assert.equal((await notices()) - noticesBefore, between.length, "the premise: every notice delivered came between the two mails");
+    assert.ok(between.length > 0, "the premise: some of the notices were still owed");
+    assert.ok(
+      between.length <= MAIL_MAX_NOTICES,
+      `the outbox held no more of the room's own notices than the room did: ${between.length} delivered of ${2 * cycles} said, allowance ${MAIL_MAX_NOTICES}`,
+    );
+  } finally {
+    await room.close();
+  }
+});
+
+/** How many pushes wait in every Codex outbox, the head in flight included (#380 audit r4). */
+const outboxedOf = async (room) => (await (await fetch(`http://127.0.0.1:${room.port}/health`)).json()).codexHarvest.outboxed;
+
+test("#380: a refused push for a member taken out of the room leaves the outbox with it, with no later wake", async () => {
+  const room = await codexOutboxRoom();
+  try {
+    await writeFile(join(room.home, "codex-refuses"), "REMOVED-HELD");
+    await room.tell("REMOVED-HELD");
+    assert.ok(await room.until(async () => (await room.attempts("REMOVED-HELD")) === 1), "premise: the push was tried");
+    await room.pause(300);
+    assert.equal(await room.takenIndex("REMOVED-HELD"), -1, "the premise: the fake refused it");
+    assert.equal(await outboxedOf(room), 1, "the premise: the refused push is held, settled, nothing else waiting");
+    assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200, "premise: removed");
+    // Nothing of the thread's own is heard from here on: only the removal can empty the outbox.
+    assert.ok(await room.until(async () => (await outboxedOf(room)) === 0, 4_000), `the removed member's push left the outbox: ${await outboxedOf(room)} waiting`);
+    assert.equal(await room.attempts("REMOVED-HELD"), 1, "and it was not tried again");
+  } finally {
+    await room.close();
+  }
+});
+
+test("#380: a refused push in a room that is then closed leaves the outbox with the room, with no later wake", async () => {
+  const room = await codexOutboxRoom();
+  try {
+    await writeFile(join(room.home, "codex-refuses"), "CLOSED-HELD");
+    await room.tell("CLOSED-HELD");
+    assert.ok(await room.until(async () => (await room.attempts("CLOSED-HELD")) === 1), "premise: the push was tried");
+    await room.pause(300);
+    assert.equal(await room.takenIndex("CLOSED-HELD"), -1, "the premise: the fake refused it");
+    assert.equal(await outboxedOf(room), 1, "the premise: the refused push is held, settled, nothing else waiting");
+    const closed = await room.call("DELETE", `/sync/rooms/${room.code}`);
+    assert.equal(closed.body.closed, true, "premise: the room was closed");
+    assert.ok(await room.until(async () => (await outboxedOf(room)) === 0, 4_000), `the closed room's push left the outbox: ${await outboxedOf(room)} waiting`);
+    assert.equal(await room.attempts("CLOSED-HELD"), 1, "and it was not tried again");
+  } finally {
+    await room.close();
+  }
+});
+
+test("#380: a push still in flight when its member is taken out settles without being handed on, leaves nothing behind, and is not tried for the member let in again", async () => {
+  const room = await codexOutboxRoom();
+  try {
+    await writeFile(join(room.home, "codex-slow"), "");
+    await writeFile(join(room.home, "codex-refuses"), "IN-FLIGHT-LEAVER");
+    await room.tell("IN-FLIGHT-LEAVER");
+    assert.ok(await room.until(async () => (await room.attempts("IN-FLIGHT-LEAVER")) === 1), "premise: the push started");
+    const started = Date.now();
+    assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200, "premise: removed");
+    const atRemoval = await outboxedOf(room);
+    const removedAfter = Date.now() - started;
+    // The fake's run takes 800 ms from the attempt being logged; the poll that saw it adds less than that.
+    assert.ok(removedAfter < 500, `the premise: removed while the push was still running (${removedAfter} ms after it was seen)`);
+    assert.ok(atRemoval >= 1, `the head in flight is still filed until its run settles (${atRemoval})`);
+    assert.equal((await joinConfirmed(room.call, room.code, room.founder, room.thread)).status, 200, "premise: let in again");
+    assert.ok(await room.until(async () => (await outboxedOf(room)) === 0, 10_000), `everything settled and nothing was left behind: ${await outboxedOf(room)} waiting`);
+    await rm(join(room.home, "codex-refuses"));
+    await room.heard();
+    await room.pause(1_500);
+    assert.equal(await room.attempts("IN-FLIGHT-LEAVER"), 1, "the old member's push is not tried for the new one");
+    assert.equal(await room.takenIndex("IN-FLIGHT-LEAVER"), -1);
+    assert.equal(await outboxedOf(room), 0, "and no box came back for it");
+  } finally {
+    await room.close();
+  }
+});
+
+test("#380: a mailbox the idle sweep removes takes its refused push out of the outbox with it, with no later wake", async () => {
+  const room = await codexOutboxRoom({ env: { GYREDECK_MAIL_ROOM_IDLE_MS: "3000" } });
+  try {
+    await writeFile(join(room.home, "codex-refuses"), "IDLE-HELD");
+    const posted = await room.call("POST", `/mail/${room.thread}`, { from: room.founder, kind: "tell", text: "IDLE-HELD" });
+    assert.equal(posted.body.ok, true, "premise: mail into the thread's mailbox was posted");
+    assert.ok(await room.until(async () => (await room.attempts("IDLE-HELD")) === 1), "premise: the push was tried");
+    await room.pause(300);
+    assert.equal(await room.takenIndex("IDLE-HELD"), -1, "the premise: the fake refused it");
+    assert.equal(await outboxedOf(room), 1, "the premise: the refused push is held in the mailbox's outbox");
+    // Past the mailbox's idle time with nothing touching it: /health neither sweeps nor wakes.
+    await room.pause(3_500);
+    assert.equal(await outboxedOf(room), 1, "the premise: nothing but the sweep has removed it yet");
+    // Every /sync/rooms request runs the sweep (`sweepRooms`): the mailbox has no members and no
+    // stream and has been idle past its time, so it is dropped — the sync room, with members, is not.
+    assert.equal((await room.call("GET", `/sync/rooms?as=${room.founder}`)).status, 200, "premise: the sweep ran");
+    assert.ok(await room.until(async () => (await outboxedOf(room)) === 0, 2_000), `the swept mailbox's push left the outbox: ${await outboxedOf(room)} waiting`);
+    assert.equal(await room.attempts("IDLE-HELD"), 1, "and it was not tried again");
+    assert.notEqual(await room.pendingOf(), undefined, "the premise: the sync room and its member were not swept");
+  } finally {
+    await room.close();
+  }
+});
+
+/** Every `codex queue` the fake saw start, with the messages of the runs alive beside it (#380 audit r6). */
+const startsOf = async (room) => {
+  try {
+    return (await readFile(join(room.home, "codex-starts.log"), "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+};
+const alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+/** A hung fake outlives its bridge; nothing else would ever end it. */
+const killHung = async (room) => {
+  for (const { pid } of await startsOf(room)) if (alive(pid)) try { process.kill(pid, "SIGKILL"); } catch {}
+};
+
+test("#380: a `codex queue` that never returns is stopped at its deadline, killed when it will not stop, and what it carried stays unread and goes again", async () => {
+  const room = await codexOutboxRoom({ env: { GYREDECK_CODEX_QUEUE_DEADLINE_MS: "1500" } });
+  try {
+    await writeFile(join(room.home, "codex-hangs"), "HUNG-ONCE");
+    await writeFile(join(room.home, "codex-ignores-term"), "");
+    await room.tell("HUNG-ONCE");
+    assert.ok(await room.until(async () => (await room.attempts("HUNG-ONCE")) === 1), "premise: the push started");
+    const { pid } = (await startsOf(room)).find((start) => start.message.includes("HUNG-ONCE"));
+    await room.pause(1_000);
+    assert.ok(alive(pid), "the premise: the run hangs");
+    // Asked to stop at 1.5 s, which this one ignores; killed a deadline later.
+    assert.ok(await room.until(async () => !alive(pid), 6_000), "the run that would not stop was killed");
+    await room.pause(300);
+    assert.equal(await room.pendingOf(), 1, "a run stopped at its deadline is not counted as read");
+    assert.equal(await room.attempts("HUNG-ONCE"), 1, "nothing goes again until the session is heard from");
+
+    await rm(join(room.home, "codex-hangs"));
+    await room.heard();
+    assert.ok(await room.until(async () => (await room.takenIndex("HUNG-ONCE")) >= 0), `it went again once heard from: ${room.stderrRef.value}`);
+    assert.ok(await room.until(async () => (await room.pendingOf()) === 0), "and counts as read once Codex took it");
+    assert.equal(await room.attempts("HUNG-ONCE"), 2, "once hung, once taken");
+  } finally {
+    await killHung(room);
+    await room.close();
+  }
+});
+
+test("#380: a member taken out while its `codex queue` hangs, and let in again, gets its mail once the hung run has ended, never two runs at once", async () => {
+  const room = await codexOutboxRoom({ env: { GYREDECK_CODEX_QUEUE_DEADLINE_MS: "1500" } });
+  try {
+    await writeFile(join(room.home, "codex-hangs"), "HUNG-LEAVER");
+    await room.tell("HUNG-LEAVER");
+    assert.ok(await room.until(async () => (await room.attempts("HUNG-LEAVER")) === 1), "premise: the push started");
+    const { pid } = (await startsOf(room)).find((start) => start.message.includes("HUNG-LEAVER"));
+    assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200, "premise: removed");
+    assert.equal((await joinConfirmed(room.call, room.code, room.founder, room.thread)).status, 200, "premise: let in again");
+    await room.tell("AFTER-REJOIN");
+    await room.pause(300);
+    assert.ok(alive(pid), "the premise: the old member's run still hangs");
+    assert.equal(await room.attempts("AFTER-REJOIN"), 0, "the premise: the new member's mail waits behind it");
+
+    assert.ok(await room.until(async () => (await room.takenIndex("AFTER-REJOIN")) >= 0, 8_000), `the new member's mail arrived after the deadline: ${room.stderrRef.value}`);
+    assert.ok(!alive(pid), "the hung run has ended");
+    const forThisRoom = (await startsOf(room)).filter((start) => start.pid !== pid && (/you are confirmed in room/.test(start.message) || start.message.includes("AFTER-REJOIN")));
+    assert.ok(forThisRoom.length >= 2, `the premise: the confirming push and the new mail both ran (${forThisRoom.length})`);
+    for (const start of forThisRoom) {
+      assert.ok(!start.alongside.some((message) => message.includes("HUNG-LEAVER")), `no run for this room started while the hung one was alive: ${start.message.slice(0, 80)}`);
+    }
+    assert.equal(await room.attempts("HUNG-LEAVER"), 1, "the old member's push is not tried for the new one");
+    assert.equal(await room.takenIndex("HUNG-LEAVER"), -1);
+    assert.ok(await room.until(async () => (await outboxedOf(room)) === 0), "and nothing is left behind");
+  } finally {
+    await killHung(room);
+    await room.close();
+  }
+});
+
+test("#380: a `codex queue` stopped at its deadline is a refusal even when it exits 0, and what it carried goes again", async () => {
+  const room = await codexOutboxRoom({ env: { GYREDECK_CODEX_QUEUE_DEADLINE_MS: "1500" } });
+  try {
+    await writeFile(join(room.home, "codex-hangs"), "HUNG-EXITS-ZERO");
+    await writeFile(join(room.home, "codex-term-exits-zero"), "");
+    await room.tell("HUNG-EXITS-ZERO");
+    assert.ok(await room.until(async () => (await room.attempts("HUNG-EXITS-ZERO")) === 1), "premise: the push started");
+    const { pid } = (await startsOf(room)).find((start) => start.message.includes("HUNG-EXITS-ZERO"));
+    await room.pause(1_000);
+    assert.ok(alive(pid), "the premise: the run hangs past nothing but its deadline");
+    // Asked to stop at 1.5 s; it exits 0 700 ms later.
+    assert.ok(await room.until(async () => !alive(pid), 6_000), "the premise: the stopped run exited");
+    await room.pause(300);
+    assert.equal(await room.takenIndex("HUNG-EXITS-ZERO"), -1, "the premise: the fake took nothing before it was stopped");
+    assert.equal(await room.pendingOf(), 1, "a run stopped at its deadline is not counted as read, whatever its exit code");
+    assert.equal(await room.attempts("HUNG-EXITS-ZERO"), 1, "nothing goes again until the session is heard from");
+
+    await rm(join(room.home, "codex-hangs"));
+    await room.heard();
+    assert.ok(await room.until(async () => (await room.takenIndex("HUNG-EXITS-ZERO")) >= 0), `it went again once heard from: ${room.stderrRef.value}`);
+    assert.ok(await room.until(async () => (await room.pendingOf()) === 0), "and counts as read once Codex took it");
+    assert.equal(await room.attempts("HUNG-EXITS-ZERO"), 2, "once stopped, once taken");
+  } finally {
+    await killHung(room);
+    await room.close();
+  }
+});
+
+test("#380: mail posted into a Codex thread's mailbox is not counted as read when the bridge says queued, only once `codex queue` took it (map C22)", async () => {
+  const room = await codexOutboxRoom();
+  const mailboxPending = async () => (await room.call("GET", "/mail")).body.rooms?.find((listed) => listed.room === room.thread)?.pending;
+  try {
+    assert.ok(await room.until(async () => (await mailboxPending()) === 0), `the premise: nothing waits in the mailbox (${await mailboxPending()})`);
+    await writeFile(join(room.home, "codex-refuses"), "MAILBOX-REFUSED");
+    const posted = await room.call("POST", `/mail/${room.thread}`, { from: room.founder, kind: "tell", text: "MAILBOX-REFUSED" });
+    assert.equal(posted.body.delivery, "queued", "the premise: the bridge said queued");
+    assert.equal(await mailboxPending(), 1, "said queued is not read: the push has not run yet");
+    assert.ok(await room.until(async () => (await room.attempts("MAILBOX-REFUSED")) === 1), "premise: the push was tried");
+    await room.pause(300);
+    assert.equal(await room.takenIndex("MAILBOX-REFUSED"), -1, "the premise: the fake refused it");
+    assert.equal(await mailboxPending(), 1, "a refused push leaves the mailbox's mail unread");
+
+    await rm(join(room.home, "codex-refuses"));
+    await room.heard();
+    assert.ok(await room.until(async () => (await room.takenIndex("MAILBOX-REFUSED")) >= 0), `it went again once heard from: ${room.stderrRef.value}`);
+    assert.ok(await room.until(async () => (await mailboxPending()) === 0), "and is read once Codex took it");
+  } finally {
+    await room.close();
   }
 });

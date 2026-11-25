@@ -273,6 +273,7 @@ The events route, for a relay watcher only, writes `event: dropped\ndata: {"drop
 | child → Rust | `posted` | `msgId` |
 | child → Rust | `closed` | `id` |
 | child → Rust | `error` | codes `readback_unavailable` |
+| child → Rust | `commands` | new (#454): where setting up the slash commands stands when the first try fails — `code` `commands_unregistered` while a network failure is retried, `missing_permission`/`internal` once a refusal ends the retries, no code once they are set up. Rust keeps it in `commands_error`, apart from `error`, shown only while `error` is empty; `ready` never touches it, the next `commands`, a new child or a forgotten child replaces it |
 | bridge → Rust | SSE | `event: dropped` |
 | bridge → Rust | `/sync/rooms` | `seq` (already sent, `br:4418`) |
 

@@ -329,7 +329,7 @@ export function awayText(ms) {
 
 const ERROR_CODES = new Set([
   "bad_token", "missing_intent", "missing_permission", "no_forum",
-  "rate_limited", "discord_down", "room_unknown", "pairing_locked", "reconcile_incomplete", "storage_blocked", "readback_unavailable", "internal",
+  "rate_limited", "discord_down", "room_unknown", "pairing_locked", "reconcile_incomplete", "storage_blocked", "readback_unavailable", "commands_unregistered", "internal",
 ]);
 
 /** "#41–#43, #47 from Codex, Gyre Assistant" — the same shape as `not_relayed` in discord.rs. */
@@ -1197,13 +1197,39 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
     reported.delete("down");
     send(readyMessage());
     releaseReady();
-    discord.registerCommands(COMMANDS).catch((e) =>
-      fail(e?.kind === "permission" ? "missing_permission" : "internal", `Could not register /disconnect: ${e?.message}`),
-    );
+    registerCommands();
     // A prompt Discord may have taken before a restart is found and armed again.
     await settleAll();
     scheduleSweep();
     await sweep();
+  }
+
+  // A network failure here is retried like login (#454). Every outcome after a failure goes out
+  // as `commands`, which the app keeps apart from `error`: a `ready` leaves it, and only the next
+  // `commands` replaces it, so it never says "retrying" once the retries have stopped.
+  function commandsSaid(code, message) {
+    send({ t: "commands", ...(code ? { code: ERROR_CODES.has(code) ? code : "internal", message: redact(message) } : {}) });
+  }
+
+  async function registerCommands() {
+    let backoff = 1000;
+    let failed = false;
+    while (!stopped) {
+      try {
+        await discord.registerCommands(COMMANDS);
+        if (failed && !stopped) commandsSaid(null);
+        return;
+      } catch (e) {
+        if (stopped) return;
+        if (e?.kind !== "network") {
+          return commandsSaid(e?.kind === "permission" ? "missing_permission" : "internal", `Could not register /disconnect: ${e?.message}`);
+        }
+        if (!failed) commandsSaid("commands_unregistered", "Could not register /disconnect and /status yet; retrying.");
+        failed = true;
+        await wait(backoff);
+        backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
+      }
+    }
   }
 
   function scheduleSweep() {

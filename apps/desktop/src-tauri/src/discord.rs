@@ -468,6 +468,14 @@ enum FromChild {
     },
     /// What held this room's queue head has passed.
     Unheld { room: String },
+    /// Where setting up the slash commands stands (#454): no code once they are set up; else
+    /// `commands_unregistered` while a network failure is retried, or the refusal that ended it.
+    Commands {
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+    },
     /// The owner typed in a followed post, or reacted to a relayed message (#205).
     Say(Say),
     /// The owner replied to an approval request with six digits (#207).
@@ -937,6 +945,9 @@ struct Hub {
     application_id: Option<String>,
     forums: Vec<Forum>,
     error: Option<DiscordError>,
+    /// Why the slash commands are not set up (#454), said only by `commands` and kept apart from
+    /// `error` so neither clears or hides the other for good: shown only while `error` is empty.
+    commands_error: Option<DiscordError>,
     /// The code being offered, its round, and when it was offered.
     pairing: Option<Pairing>,
     /// True only between the current child's `ready` and its exit or a fatal error: the
@@ -1119,7 +1130,9 @@ impl Hub {
             channel.shared.broken.store(true, Ordering::SeqCst);
         }
         self.channel = Some(channel);
-        // A new child reports its own storage; the last one's refusal is not this one's.
+        // A new child reports its own storage and registers its own commands; the last one's
+        // refusal is not this one's.
+        self.commands_error = None;
         if self.error.as_ref().is_some_and(|error| error.code == STORAGE_BLOCKED) {
             self.error = None;
         }
@@ -2013,6 +2026,7 @@ impl Hub {
         self.forums.clear();
         self.pairing = None;
         self.room_errors.clear();
+        self.commands_error = None;
     }
 }
 
@@ -2598,7 +2612,7 @@ impl DiscordState {
             dropped: hub.dropped.clone(),
             dropped_lines: hub.dropped_lines.clone(),
             pairing_code: hub.pairing_code(),
-            error: hub.error.clone(),
+            error: hub.error.clone().or_else(|| hub.commands_error.clone()),
             held: hub.parked.len(),
             journal_errors: hub.journal_errors.clone(),
             room_errors: hub.room_errors.clone(),
@@ -3654,6 +3668,9 @@ fn on_child_event_from(hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64, ev
         }
         FromChild::Unheld { room } => {
             hub.room_errors.remove(&room);
+        }
+        FromChild::Commands { code, message } => {
+            hub.commands_error = code.map(|code| DiscordError { message: message.unwrap_or_else(|| code.clone()), code, forum_id: None });
         }
         FromChild::Posted { room, seq, created_at, msg_id } => {
             hub.ack(&room, seq, created_at, msg_id);

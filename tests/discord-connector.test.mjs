@@ -4263,3 +4263,63 @@ test("a receipt Discord refuses names its room but holds nothing: no held, no un
   assert.deepEqual(of("unheld"), []);
   await c.close();
 });
+
+test("#454 a /disconnect registration that fails on the network is retried, and its error clears once it lands", async () => {
+  const fake = createFakeDiscord();
+  let refusals = 2;
+  fake.gate = async (op) => {
+    if (op === "registerCommands" && refusals > 0) {
+      refusals--;
+      throw kindError("network", "Connect Timeout Error");
+    }
+  };
+  const { c, clock, of } = await boot({ fake });
+  const said = () => of("commands").map((m) => m.code ?? null);
+  assert.deepEqual(said(), ["commands_unregistered"], "said once, as commands, never as the connector's error");
+  assert.equal(of("error").length, 0);
+  assert.equal(fake.commands, null, "premise: not registered yet");
+  await clock.advance(1000);
+  assert.equal(fake.commands, null, "second try refused too");
+  assert.deepEqual(said(), ["commands_unregistered"], "a retry does not say it again");
+  fake.emit("forums");
+  await flush();
+  assert.equal(of("ready").length, 2, "premise: a forum change sends ready again");
+  assert.deepEqual(said(), ["commands_unregistered"], "a forum change while it waits says nothing about the commands");
+  await clock.advance(2000);
+  assert.deepEqual(fake.commands.map((d) => d.name), COMMANDS.map((d) => d.name), "registered on the third try");
+  assert.deepEqual(said(), ["commands_unregistered", null], "a commands with no code once it lands");
+  await c.close();
+});
+
+test("#454 a retry that then meets a refusal stops and says the refusal in place of retrying", async () => {
+  const fake = createFakeDiscord();
+  let tries = 0;
+  fake.gate = async (op) => {
+    if (op === "registerCommands") {
+      tries++;
+      throw tries === 1 ? kindError("network", "Connect Timeout Error") : kindError("permission", "Missing Access");
+    }
+  };
+  const { c, clock, of } = await boot({ fake });
+  await clock.advance(120_000);
+  assert.equal(tries, 2, "no retry after the refusal");
+  assert.deepEqual(of("commands").map((m) => m.code), ["commands_unregistered", "missing_permission"]);
+  assert.equal(of("error").length, 0);
+  await c.close();
+});
+
+test("#454 a /disconnect registration refused for a permission is not retried and stays shown", async () => {
+  const fake = createFakeDiscord();
+  let tries = 0;
+  fake.gate = async (op) => {
+    if (op === "registerCommands") {
+      tries++;
+      throw kindError("permission", "Missing Access");
+    }
+  };
+  const { c, clock, of } = await boot({ fake });
+  await clock.advance(120_000);
+  assert.equal(tries, 1);
+  assert.deepEqual(of("commands").map((m) => m.code ?? null), ["missing_permission"], "said once, and nothing clears it");
+  await c.close();
+});

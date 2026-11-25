@@ -2041,6 +2041,64 @@ fn a_storage_refusal_stays_shown_through_ready() {
     assert_eq!(f.state.status().error.map(|error| error.code).as_deref(), Some("storage_blocked"));
 }
 
+/// #454: where the slash commands stand is kept apart from the connector's other error. `ready`
+/// (sent again on a forum change) leaves it, only the next `commands` replaces it, and in either
+/// order neither condition hides or clears the other for good.
+#[test]
+fn the_commands_state_and_another_error_are_kept_apart_in_either_order() {
+    let ready = || FromChild::Ready { bot: Bot { id: "42".into(), username: "Gyre Bot".into() }, application_id: "123456789012345678".into(), forums: vec![] };
+    let commands = |code: Option<&str>| -> FromChild {
+        serde_json::from_value(match code {
+            Some(code) => serde_json::json!({ "t": "commands", "code": code, "message": format!("{code} said") }),
+            None => serde_json::json!({ "t": "commands" }),
+        })
+        .unwrap()
+    };
+    let storage = || FromChild::Error { code: "storage_blocked".into(), message: "The Discord state file could not be read".into(), room: None, held: false, forum_id: None };
+    let internal = || FromChild::Error { code: "internal".into(), message: "something else".into(), room: None, held: false, forum_id: None };
+    let shown = |f: &Fixture| f.state.status().error.map(|error| error.code);
+
+    let f = fixture("commands-alone", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    on_child_event(&f.state.hub, f.owners.as_ref(), commands(Some("commands_unregistered")));
+    on_child_event(&f.state.hub, f.owners.as_ref(), ready());
+    assert_eq!(shown(&f).as_deref(), Some("commands_unregistered"), "ready leaves it");
+    on_child_event(&f.state.hub, f.owners.as_ref(), commands(None));
+    assert_eq!(shown(&f), None);
+    on_child_event(&f.state.hub, f.owners.as_ref(), commands(Some("commands_unregistered")));
+    let _next = f.attach_buffer();
+    assert_eq!(shown(&f), None, "a new child registers its own commands");
+
+    // network, then a refusal that ends the retries: the refusal replaces "retrying" and a
+    // ready after it neither clears it nor brings "retrying" back.
+    let f = fixture("network-then-refused", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    on_child_event(&f.state.hub, f.owners.as_ref(), commands(Some("commands_unregistered")));
+    on_child_event(&f.state.hub, f.owners.as_ref(), internal());
+    on_child_event(&f.state.hub, f.owners.as_ref(), commands(Some("missing_permission")));
+    assert_eq!(shown(&f).as_deref(), Some("internal"), "the unrelated error leads and is kept");
+    on_child_event(&f.state.hub, f.owners.as_ref(), ready());
+    assert_eq!(shown(&f).as_deref(), Some("missing_permission"), "the refusal, never the old retrying");
+
+    // storage first, then commands: the commands landing must not take the storage warning.
+    let f = fixture("storage-then-commands", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    on_child_event(&f.state.hub, f.owners.as_ref(), storage());
+    on_child_event(&f.state.hub, f.owners.as_ref(), commands(Some("commands_unregistered")));
+    assert_eq!(shown(&f).as_deref(), Some("storage_blocked"), "the connector's own refusal leads");
+    on_child_event(&f.state.hub, f.owners.as_ref(), commands(None));
+    assert_eq!(shown(&f).as_deref(), Some("storage_blocked"), "commands landing clears only the commands");
+
+    // commands first, then another error: a ready clearing that one brings the commands back.
+    let f = fixture("commands-then-internal", Some(TOKEN));
+    let _buffer = f.attach_buffer();
+    on_child_event(&f.state.hub, f.owners.as_ref(), commands(Some("commands_unregistered")));
+    on_child_event(&f.state.hub, f.owners.as_ref(), internal());
+    assert_eq!(shown(&f).as_deref(), Some("internal"));
+    on_child_event(&f.state.hub, f.owners.as_ref(), ready());
+    assert_eq!(shown(&f).as_deref(), Some("commands_unregistered"), "still unregistered after the other one cleared");
+}
+
 /// #199 reopened: a room held by a refusal (the bot lost access to the forum) stays shown
 /// through a later `ready`, which the child sends again whenever the forums change, and goes
 /// only when the child says that room is `unheld`. The child says it once per stall, so a

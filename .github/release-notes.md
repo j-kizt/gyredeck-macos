@@ -14,9 +14,12 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   once the commands are set up.
 - **A refusal ends the retries and stays shown.** If Discord refuses to set up the commands
   (for a missing permission, say), Gyredeck stops trying and shows the refusal in place of
-  the retry line. It stays shown until the connector starts again, which tries once more.
-- **One error no longer hides or clears another.** The state of the slash commands is kept
-  apart from the connector's other errors. When both are present, the other error is shown
-  first; the commands line comes back once that one clears.
+  the retry line. It stays until the connector stops or starts again; a new start tries once
+  more.
+- **Another error no longer overwrites or clears the commands line.** The state of the slash
+  commands is kept apart from the connector's other errors. The Discord row shows one line at
+  a time: when both are present, the other error is shown first, and the commands line comes
+  back once that one clears.
 - **An error the app has no wording for no longer says the connector stopped.** It now reads
-  "Discord connector error", since such an error does not stop the connector.
+  "Discord connector error", since some of these errors, such as a refused command setup,
+  leave the connector running.

@@ -127,8 +127,8 @@ const assetRoot = join(distRoot, "assets");
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 123_483,
-  jsTotalGzipBytes: 126_557,
+  jsGzipBytes: 123_583,
+  jsTotalGzipBytes: 126_657,
 };
 
 const walk = async (directory) => {

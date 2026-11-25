@@ -19,11 +19,11 @@ const ERROR_COPY: Record<string, string> = {
   discord_down: "Can't reach Discord right now. Messages wait and go out in order when it is back.",
   room_unknown: "That room is no longer open, so it can't be followed.",
   pairing_locked: "Too many wrong codes were sent to the bot. Press Pair again for a new code.",
-  commands_unregistered: "Can't reach Discord to add /disconnect yet. Still trying.",
+  commands_unregistered: "Retrying /disconnect setup.",
 };
 
 const errorCopy = (error: { code: string; message: string }) =>
-  ERROR_COPY[error.code] ?? `The Discord connector reported an error: ${error.message}`;
+  ERROR_COPY[error.code] ?? `Discord connector error: ${error.message}`;
 
 /** What a room's row says while Discord refuses its posts (#199): only a cause the owner has to
  *  act on, with what to do. One Gyredeck rides out by itself (slowed down, Discord unreachable)

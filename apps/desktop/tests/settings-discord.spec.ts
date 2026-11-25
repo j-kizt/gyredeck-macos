@@ -64,7 +64,8 @@ const ERROR_COPY: Record<string, string> = {
   discord_down: "Can't reach Discord right now. Messages wait and go out in order when it is back.",
   room_unknown: "That room is no longer open, so it can't be followed.",
   pairing_locked: "Too many wrong codes were sent to the bot. Press Pair again for a new code.",
-  internal: "The Discord connector stopped on an error: boom",
+  commands_unregistered: "Can't reach Discord to add /disconnect yet. Still trying.",
+  internal: "The Discord connector reported an error: boom",
 };
 
 const blank: Status = { configured: false, running: false, ready: false, bot: null, forums: [], forumId: null, owner: null, inviteUrl: null, connectedRooms: [], pairingCode: null, error: null };
@@ -524,7 +525,7 @@ for (const viewport of [{ width: 444, height: 560 }, { width: 444, height: 280 }
       // Premise: each row shows its longest text, so the layout is measured on it.
       if (status.bot) {
         await expect(row(page, "bot").locator(".setup-detail").first()).toHaveText(`Bot · ${LONG_BOT.username}`);
-        await expect(row(page, "bot").locator("[data-discord-error]")).toHaveText(`The Discord connector stopped on an error: ${LONG_ERROR.message}`);
+        await expect(row(page, "bot").locator("[data-discord-error]")).toHaveText(`The Discord connector reported an error: ${LONG_ERROR.message}`);
         await expect(page.getByRole("combobox", { name: "Discord forum" })).toHaveValue(LONG_FORUM.id);
         await expect(row(page, "owner").locator(".setup-detail")).toHaveText(`Send this code to ${LONG_BOT.username} in a direct message on Discord`);
       } else {

@@ -92,7 +92,7 @@ export const DiscordRows = ({ discord, canUseNativeControls, syncRooms }: { disc
             <span className="setup-detail">{detail}</span>
             {status?.error ? <span className="setup-detail" role="status" data-discord-error={status.error.code}>{errorCopy(status.error)}</span> : null}
             {failure ? <span className="setup-detail" role="status">{failure}</span> : null}
-            {confirming ? <span className="setup-detail" role="alert">Remove Discord? The bot stops and its token is deleted. Posts already in Discord stay there.</span> : null}
+            {confirming ? <span className="setup-detail" role="alert">Remove Discord? The bot stops and its token is deleted. Posts already in Discord stay there. Multi-factor authentication is not changed.</span> : null}
           </span>
           {/* Also with no token left: a kept warning says Remove clears it, so Remove is there (#282). */}
           {(status?.configured || Object.keys(status?.journalErrors ?? {}).length > 0) && !confirming ? (

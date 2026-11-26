@@ -7,7 +7,7 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
 - **Removing Discord no longer removes multi-factor authentication.** Removing the Discord bot
   also deleted the multi-factor authentication record, so the codes in your authenticator app
   stopped working and it had to be set up again from scratch, though nothing on the confirmation
-  said so. Remove now stops the bot and deletes its token only. Its confirmation reads: "Remove
+  said so. Remove now leaves multi-factor authentication as it was. Its confirmation reads: "Remove
   Discord? The bot stops and its token is deleted. Posts already in Discord stay there.
   Multi-factor authentication is not changed."
 - **Multi-factor authentication has its own Remove.** In Settings → Connection → Security, the

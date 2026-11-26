@@ -14036,7 +14036,7 @@ const codexHeavyFixture = async (tag, { gated = false } = {}) => {
   // `codex` spinning after it (#380 r8: two did, and held the heavy-run slot for an hour).
   // so a test can choose the order pushes complete in (#338 audit r1); one carrying FAIL-PUSH fails.
   const gate = gated
-    ? `const fs = require('node:fs'); if (process.argv.join(' ').includes('FAIL-PUSH')) process.exit(1); const m = process.argv.join(' ').match(/GATE-(\\w+)/); while (m && !fs.existsSync(${JSON.stringify(home)} + '/release-' + m[1]) && fs.existsSync(${JSON.stringify(home)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);\n`
+    ? `const fs = require('node:fs'); if (process.argv.join(' ').includes('FAIL-PUSH')) process.exit(1); const m = process.argv.join(' ').match(/GATE-(\\w+)/); if (m) fs.writeFileSync(${JSON.stringify(home)} + '/started-' + m[1], ''); while (m && !fs.existsSync(${JSON.stringify(home)} + '/release-' + m[1]) && fs.existsSync(${JSON.stringify(home)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);\n`
     : "";
   await writeFile(join(fakeBin, "codex"), `#!${process.execPath}\n${gate}require('node:fs').appendFileSync(${JSON.stringify(queued)}, JSON.stringify(process.argv.slice(2)) + "\\n");\n`);
   await chmod(join(fakeBin, "codex"), 0o755);
@@ -14076,7 +14076,10 @@ const codexHeavyFixture = async (tag, { gated = false } = {}) => {
   const settled = () => until(async () => spawnSync("pgrep", ["-P", String(bridge.pid)]).status === 1 &&
     (await (await fetch(`http://127.0.0.1:${port}/health`)).json()).codexHarvest.queueing === 0, "no codex queue still running or waiting");
   const release = (name) => writeFile(join(home, `release-${name}`), "");
-  return { home, call, pushes, messagesTo, ingestCodex, settled, release, close };
+  // A gated push writes started-<name> as it begins to wait (#399): a push now waits its turn
+  // behind its thread's earlier ones, so "it is in flight" has to be seen, not assumed.
+  const started = (name) => until(async () => existsSync(join(home, `started-${name}`)), `the ${name} push in flight`);
+  return { home, call, pushes, messagesTo, ingestCodex, settled, release, started, close };
 };
 
 test("#259 C1 C2 C3 C7: Codex confirmed through notify carries the line in its confirming push, and no other", async () => {
@@ -14895,6 +14898,7 @@ test("#338 W7: a confirmation push that landed is one wake with no held mail, no
     await rejoin.join();
     await rejoin.say("tell", "GATE-conf W-HELD-OLD");
     await rejoin.letIn("c3");
+    await f.started("conf");
     assert.equal((await f.call("DELETE", `/sync/rooms/${rejoin.code}/members/${rejoin.codex}`)).status, 200, "premise: it left before the push landed");
     await rejoin.confirm("c4");
     await f.release("conf");

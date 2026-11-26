@@ -10498,6 +10498,60 @@ test("the Antigravity hook's wait asks the broker, ends on mail, and is refused 
   }
 });
 
+test("an Antigravity member with no wait running is kept going once to start it, and only then (#397)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-397-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port: await freePort() }));
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "ab".repeat(32));
+  const me = `a3970000-0000-4000-8000-${randomBytes(6).toString("hex")}`;
+  const member = (fields) => ({ v: 1, ok: true, boundTo: me, room: "sync-q397", members: [{ conversationId: me, confirmed: true, you: true }], messages: [], ...fields });
+  const stop = (fields = {}) => runAdapter("adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "Stop"], home,
+    { conversationId: me, workspacePaths: ["/tmp/p"], terminationReason: "NO_TOOL_CALL", continuationActive: false, executionNum: 0, ...fields });
+  const answerOf = (run) => { assert.equal(run.code, 0, run.stderr); return JSON.parse(run.stdout.trim().split("\n").at(-1)); };
+  let broker = null;
+  let running = null;
+  try {
+    broker = await fakeBroker(home, (request) => (request.bind ? { v: 1, ok: true, bound: { conversationId: me, pid: 1 } } : member()));
+    let answer = answerOf(await stop());
+    assert.equal(answer.decision, "continue", "a member with no wait is kept going");
+    assert.match(answer.reason, new RegExp(`gyredeck-agy-hook\\.mjs wait 300 ${me}; rc=\\$\\?`), "told the exact wait to start");
+    assert.match(answer.reason, /room sync-q397/);
+    assert.deepEqual(broker.requests.map((r) => Object.keys(r).find((k) => k !== "v")), ["bind", "collect"]);
+    assert.deepEqual(broker.requests[1].collect, { limit: 10, wakingOnly: true }, "a waiting collect: takes nothing quiet");
+
+    // Mail waiting: still kept going, and the batch is never acknowledged, so the wait is handed it.
+    await broker.close();
+    broker = await fakeBroker(home, (request) => (request.bind ? { v: 1, ok: true, bound: { conversationId: me, pid: 1 } }
+      : member({ delivery: 7, messages: [{ seq: 3, from: "codex-1", text: "hi", kind: "ask" }] })));
+    answer = answerOf(await stop());
+    assert.equal(answer.decision, "continue");
+    assert.ok(!broker.requests.some((r) => r.ack), "nothing acknowledged at Stop");
+
+    const allowed = async (label, fields, reply = member()) => {
+      await broker.close();
+      broker = await fakeBroker(home, (request) => (request.bind ? { v: 1, ok: true, bound: { conversationId: me, pid: 1 } } : reply));
+      const got = answerOf(await stop(fields));
+      assert.equal(got.decision, "allow", label);
+      return broker.requests;
+    };
+    assert.deepEqual(await allowed("already the continuation it asked for", { continuationActive: true }), [], "and the broker is not asked");
+    assert.deepEqual(await allowed("a turn the person cancelled", { terminationReason: "USER_CANCELED" }), []);
+    await allowed("not in a room", {}, { v: 1, ok: true, boundTo: me, room: null, members: [], messages: [] });
+    await allowed("not yet let in", {}, member({ members: [{ conversationId: me, confirmed: false, you: true }] }));
+    await allowed("an answer for another session", {}, member({ boundTo: "someone-else" }));
+    await allowed("the broker refuses", {}, { v: 1, ok: false, error: "unbound", message: "bind first" });
+
+    // A wait already running for this session — the loop's own command line — is left alone.
+    running = spawn("sh", ["-c", `sleep 60; : gyredeck-agy-hook.mjs wait 300 ${me}`], { stdio: "ignore" });
+    await until(async () => String(spawnSync("ps", ["-axww", "-o", "command="]).stdout).includes(`wait 300 ${me}`), "the stand-in wait in ps");
+    assert.deepEqual(await allowed("a wait is running", {}), [], "and the broker is not asked");
+  } finally {
+    running?.kill();
+    await broker?.close();
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
 // ── Heavy runs (#223) ──
 
 const HEAVY_HELPER_DEADLINE_MS = 15_000;

@@ -667,6 +667,53 @@ test("#205 a yes/no flag is a boolean on an ask, kept on the message; anything e
   }
 });
 
+// An ask to the owner that reads as yes/no but carries no flag (#381, owner 2026-11-27 sync-9782
+// seq 675/677): refused, because Discord drops a ✅/❌ on it and the asker waits forever. Any other
+// unmarked ask to the owner is sent, and its receipt says it needs a typed answer.
+test("#381 an unmarked yes/no-worded ask to the owner is refused; other unmarked asks to the owner carry a hint", async () => {
+  const h = await startBridge();
+  try {
+    const { code, password } = await roomWithRelay(h);
+    const peer = await asMember(h, "peer-a", password);
+    const post = (body) => fetch(`${h.base}/mail/${code}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...peer },
+      body: JSON.stringify({ from: "peer-a", to: "gyredeck-owner-discord", ...body }),
+    }).then(async (r) => ({ status: r.status, body: await r.json() }));
+    for (const text of ["merge ไหม ตอบ ใช่/ไม่", "Ship it? yes/no", "Ship it? YES / NO", "go on? y/n", "ตอบ ✅/❌", "ตอบ ❌/✅"]) {
+      const refused = await post({ kind: "ask", text });
+      assert.equal(refused.status, 400, text);
+      assert.equal(refused.body.error, "missing_yes_no", text);
+      assert.match(refused.body.message, /"yesNo": true/, text);
+    }
+    const marked = await post({ kind: "ask", yesNo: true, text: "merge ไหม ตอบ ใช่/ไม่" });
+    assert.equal(marked.body.ok, true, "the same ask marked goes through");
+    assert.equal("hint" in marked.body, false, "and carries no hint");
+    const typed = await post({ kind: "ask", text: "Which plan?" });
+    assert.equal(typed.body.ok, true, "an unmarked ask not worded yes/no is sent");
+    assert.match(typed.body.hint, /only by typing/);
+    const told = await post({ kind: "tell", text: "done, yes/no not needed" });
+    assert.equal(told.body.ok, true, "a tell is never refused for its wording");
+    assert.equal("hint" in told.body, false);
+    const toEveryone = await fetch(`${h.base}/mail/${code}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...peer },
+      body: JSON.stringify({ from: "peer-a", to: "everyone", kind: "ask", text: "Ship it? yes/no" }),
+    }).then((r) => r.json());
+    assert.equal(toEveryone.ok, true, "only an ask to the owner is checked");
+    assert.equal("hint" in toEveryone, false);
+    const messages = await readRoom(h, code);
+    assert.equal(messages.filter((m) => /yes\s*\/\s*no|y\/n|ใช่\/ไม่|✅\/❌|❌\/✅/i.test(m.text) && m.kind === "ask" && m.to === "gyredeck-owner-discord" && m.yesNo !== true).length, 0, "nothing refused was published");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("rules v25 say an unmarked yes/no-worded ask to the owner is refused with missing_yes_no", () => {
+  assert.ok(ROOM_RULES_VERSION >= 25, "introduced in v25");
+  assert.match(roomRules("http://127.0.0.1:47621"), /missing_yes_no/);
+});
+
 test("rules v16 tell every agent how to mark a yes/no ask, and that ✅ is a yes, never an approval", () => {
   assert.ok(ROOM_RULES_VERSION >= 16, "introduced in v16, kept by every later version");
   const rules = roomRules("http://127.0.0.1:47621");

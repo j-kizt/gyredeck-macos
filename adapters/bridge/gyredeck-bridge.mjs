@@ -235,7 +235,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 24;
+export const ROOM_RULES_VERSION = 25;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -263,6 +263,7 @@ room names the version it expects; if it names a newer one than you read, read t
 {"from":"<your id>","to":"<member or everyone>","kind":"ask|tell|reaction","text":"<your message>","replyTo":"<your id>","name":"<your name — first post only>"}
 \`\`\`
 - Claude Code and Antigravity mark a yes/no ask with \`"yesNo": true\` beside \`kind\`. It must be \`true\` or \`false\` and \`true\` only on an ask; anything else is refused with \`invalid_yes_no\` and nothing is sent.
+- An ask to \`gyredeck-owner-discord\` whose text reads as yes/no (\`ใช่/ไม่\`, \`yes/no\`, \`y/n\`, \`✅/❌\`) but has no \`"yesNo": true\` is refused with \`missing_yes_no\` and nothing is sent: a ✅/❌ on an unmarked ask never reaches you. Any other unmarked ask to the owner is sent, and its receipt carries a \`hint\`.
 - Claude Code and Antigravity ask the owner for an approval code with \`"approval"\` beside \`kind\`, under Approval from Discord. Anything else there, or on anything but an ask to \`gyredeck-owner-discord\`, is refused with \`invalid_approval\` and nothing is sent.
 - Claude Code and Antigravity never put \`[to: …]\` or \`@…\` in \`text\`: they route only through the \`to\` and \`kind\` fields.
 - Codex only — you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\`, with \`yn\` right after \`ask\` for a yes/no ask (\`@Claude Code ask yn — merge it?\`) and \`name="<Name>"\` after that on your first message — and is removed before the room sees it. This first line is Codex's alone. Say everything in one closing message. Without the line, your message goes back to whoever wrote to you: as a tell if they asked, as a reaction otherwise, which wakes nobody.
@@ -6185,6 +6186,13 @@ function startBridge(config) {
   };
   /** Unaddressed and attention-worthy: what a sender who says nothing must get. */
   const MAIL_DEFAULT_KIND = "tell";
+  // What reads as a yes/no question to the owner (#381). Only these spellings: a guess past
+  // them would refuse ordinary questions.
+  const YES_NO_WORDING = /ใช่\s*\/\s*ไม่|\byes\s*\/\s*no\b|\by\s*\/\s*n\b|✅\s*\/\s*❌|❌\s*\/\s*✅/i;
+  const MISSING_YES_NO_HINT =
+    'This ask reads as a yes/no question, but the owner can answer ✅/❌ from Discord only when it carries "yesNo": true. Nothing was sent: send it again with "yesNo": true, or reword it as a question that needs a typed reply.';
+  const UNMARKED_ASK_HINT =
+    'Sent without "yesNo": the owner can answer it only by typing. If it is a yes/no question, send it with "yesNo": true so a ✅/❌ reaches you.';
   const MAIL_EVERYONE = "everyone";
 
   /**
@@ -9487,6 +9495,14 @@ function startBridge(config) {
           sendJson(400, { ok: false, error: "invalid_approval", message: APPROVAL_HINT });
           return;
         }
+        // An ask to the owner that is not marked yes/no (#381): Discord drops a ✅/❌ on it, so the
+        // asker would wait on an answer that never comes. One that reads as yes/no is refused, so
+        // it is sent again marked; any other is sent, and the receipt says how it can be answered.
+        const unmarkedOwnerAsk = addressed === OWNER_DISCORD_SENDER && routedKind === "ask" && body.yesNo !== true && !approval && !isReservedId(from);
+        if (unmarkedOwnerAsk && YES_NO_WORDING.test(text)) {
+          sendJson(400, { ok: false, error: "missing_yes_no", message: MISSING_YES_NO_HINT });
+          return;
+        }
         // The stamp an approval code earns (#207), only on the app's own vouched call as the
         // owner, as a tell to the one who asked, answering a live request for exactly this
         // act that has no stamp yet. Checked and taken with no await between, so two stamps
@@ -9660,6 +9676,7 @@ function startBridge(config) {
           // wrong whenever a member is pushed to instead of watching, as Codex is (#183).
           listening: [...new Set([...room.clients].map((res) => res.gyredeckWatcher).filter((id) => room.members.has(id)))].map((id) => shownIn(room, id)),
           delivery,
+          ...(unmarkedOwnerAsk ? { hint: UNMARKED_ASK_HINT } : {}),
           ...((routedKind === "ask" || routedKind === "tell") && isAgentMember(room, from) && isAgentMember(room, addressed)
             ? { handoff: HANDOFF_NOTE }
             : {}),

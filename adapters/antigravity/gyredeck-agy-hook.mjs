@@ -476,7 +476,7 @@ const OWNER_DISCORD_SENDER = "gyredeck-owner-discord";
  * elapsed deadline for the whole exchange: a request's own timeout is an idle timeout, and
  * a bridge that dribbled a byte at a time could hold the invocation for as long as it liked.
  */
-const getJsonStatus = (endpoint, token, path, deadlineMs = 750, headers = {}) =>
+const getJsonStatus = (endpoint, token, path, deadlineMs = 750) =>
   new Promise((resolve) => {
     let settled = false;
     const done = (value) => {
@@ -492,7 +492,7 @@ const getJsonStatus = (endpoint, token, path, deadlineMs = 750, headers = {}) =>
         port: endpoint.port,
         path,
         method: "GET",
-        headers: { ...headers, accept: "application/json", "x-gyredeck-token": token },
+        headers: { accept: "application/json", "x-gyredeck-token": token },
         timeout: deadlineMs,
       },
       (res) => {
@@ -954,8 +954,8 @@ const waitRunning = (conversationId) => new Promise((resolve) => {
  * `continuationActive` says this turn is already that continuation — and only on a turn that
  * ended normally, never on one the person cancelled.
  *
- * The collect is a waiting one and is never acknowledged: it takes nothing quiet, and a batch it
- * is handed stays with the broker, which hands it again to the wait this asks for.
+ * Membership is read through the broker (`room`), which asks the bridge for the bound session
+ * with its own word: it collects nothing, so no mail is moved or held at Stop.
  */
 const keepHearing = async (conversationId, input) => {
   if (!conversationId || !WAIT_ID.test(conversationId)) return null;
@@ -963,20 +963,15 @@ const keepHearing = async (conversationId, input) => {
   if ((await waitRunning(conversationId)) !== false) return null;
   const bound = judgeBrokerAnswer(await askBroker({ bind: { conversationId } }));
   if (!bound.result) return null;
-  const collected = judgeBrokerAnswer(await askBroker({ collect: { limit: MAIL_MAX_STEPS, wakingOnly: true } }));
-  const result = collected.result;
-  if (!result || result.boundTo !== conversationId) return null;
-  // The collect can hand back a batch held since an earlier turn, with the room and members as
-  // they were then: it says nothing about now. Only its key is used, to ask the bridge which
-  // room this session is in at this moment; a member who left, or whose room closed, is refused
-  // there and is not told to start a wait (#397 audit).
-  const key = typeof result.memberKey === "string" && /^[a-f0-9]{64}$/.test(result.memberKey) ? result.memberKey : null;
-  const [endpoint, token] = await Promise.all([readEndpoint(), readIngestToken()]);
-  if (!key || !token) return null;
-  const now = await getJsonStatus(endpoint, token, `/sync/rooms?as=${conversationId}`, 750, { "x-gyredeck-member": key });
-  const room = now.status === 200 && now.body?.ok === true && now.body.you === conversationId ? now.body.room : null;
+  // Asked of the bridge now, through the broker's binding: not from a collect, whose batch may
+  // have been held since an earlier turn and still name a room the session has left, or carry
+  // the key of a membership it has since rejoined under (#397 audit). Nothing is taken.
+  const read = judgeBrokerAnswer(await askBroker({ room: {} }));
+  const now = read.result;
+  if (!now || now.boundTo !== conversationId || now.room?.you !== conversationId) return null;
+  const room = now.room.room;
   if (typeof room !== "string") return null;
-  const mine = Array.isArray(now.body.members) ? now.body.members.find((member) => member?.conversationId === conversationId) : null;
+  const mine = Array.isArray(now.room.members) ? now.room.members.find((member) => member?.conversationId === conversationId) : null;
   if (mine?.confirmed !== true) return null;
   return `Before you stop: you are a member of room ${room}, and no wait is running for you, so ` +
     "nobody in the room can reach you until someone types here. Start it now as a background task, " +

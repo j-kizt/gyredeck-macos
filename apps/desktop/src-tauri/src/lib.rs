@@ -6480,7 +6480,15 @@ pub fn run() {
                         standalone_bridge::bridge_request_vouched("POST", &format!("/mail/{room}/approval/use"), Some(body), &secret)
                     })
                 };
-                if let Err(error) = app.state::<broker::BrokerState>().start_default(collect, report_bound, confirm, use_approval) {
+                // The bound session's room now (#397), read with the broker's word: what an
+                // Antigravity Stop hook checks before telling its agent to start a wait.
+                let room_of = {
+                    let secret = secret.clone();
+                    std::sync::Arc::new(move |session: &str| {
+                        standalone_bridge::bridge_request_vouched("GET", &format!("/sync/rooms?as={session}"), None, &secret)
+                    })
+                };
+                if let Err(error) = app.state::<broker::BrokerState>().start_default(collect, report_bound, confirm, use_approval, room_of) {
                     eprintln!("Gyredeck mailbox broker is unavailable: {error}");
                 }
             }

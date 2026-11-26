@@ -325,6 +325,18 @@
   gap: 9px;
 }
 
+.setup-row-main > .pill-btn {
+  flex-shrink: 0;
+}
+
+.setup-row-main > .pill-btn.icon-only {
+  justify-content: center;
+  width: 21px;
+  height: 21px;
+  margin-left: -4px;
+  padding: 0;
+}
+
 .setup-row-stack .setup-row-actions {
   justify-content: flex-end;
 }

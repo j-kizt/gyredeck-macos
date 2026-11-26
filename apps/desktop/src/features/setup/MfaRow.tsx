@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Check, ShieldCheck } from "lucide-react";
+import { Check, ShieldCheck, Trash2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 
 type MfaState = "off" | "settingUp" | "on" | "locked" | "unreadable";
@@ -24,6 +24,7 @@ export const MfaRow = ({ canUseNativeControls }: { canUseNativeControls: boolean
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
 
   const read = useCallback(async () => {
     setState(await invoke<MfaState>("discord_approvals").catch(() => null));
@@ -53,6 +54,11 @@ export const MfaRow = ({ canUseNativeControls }: { canUseNativeControls: boolean
     if ((await run("discord_approvals_confirm", { code: value })) !== undefined) setSetup(null);
   };
 
+  const remove = async () => {
+    setConfirming(false);
+    await run("discord_approvals_remove");
+  };
+
   return (
     <div className="setup-row setup-row-stack" data-mfa="row">
       <div className="setup-row-main">
@@ -63,11 +69,25 @@ export const MfaRow = ({ canUseNativeControls }: { canUseNativeControls: boolean
         </span>
         {!canUseNativeControls || !state ? null : state === "locked" && !setup ? (
           <button className="pill-btn" type="button" disabled={busy} onClick={() => void run("discord_approvals_unlock")} data-tauri-drag-region="false">Unlock</button>
-        ) : (
-          <button className="pill-btn" type="button" disabled={busy} onClick={() => void start()} data-tauri-drag-region="false">{setup ? "Start over" : state === "on" ? "Reset" : "Set up"}</button>
+        ) : confirming && state === "on" && !setup ? null : (
+          <>
+            <button className="pill-btn" type="button" disabled={busy} onClick={() => void start()} data-tauri-drag-region="false">{setup ? "Start over" : state === "on" ? "Reset" : "Set up"}</button>
+            {state === "on" && !setup ? (
+              <button className="pill-btn danger icon-only" type="button" disabled={busy} onClick={() => setConfirming(true)} aria-label="Remove multi-factor authentication" title="Remove" data-tauri-drag-region="false"><Trash2 size={12} strokeWidth={2.3} /></button>
+            ) : null}
+          </>
         )}
       </div>
       {failure ? <span className="setup-detail" role="alert" data-mfa="failure">{failure}</span> : null}
+      {confirming && state === "on" && !setup ? (
+        <>
+          <span className="setup-detail" role="alert" data-mfa="confirm">Remove multi-factor authentication? The codes in your authenticator app stop working, and approvals sent from outside this Mac are refused until you set it up again.</span>
+          <span className="setup-row-actions">
+            <button className="pill-btn" type="button" disabled={busy} onClick={() => setConfirming(false)} data-tauri-drag-region="false">Cancel</button>
+            <button className="pill-btn danger" type="button" disabled={busy} onClick={() => void remove()} data-tauri-drag-region="false"><Trash2 size={12} strokeWidth={2.3} />Remove</button>
+          </span>
+        </>
+      ) : null}
       {setup ? (
         <>
           <img className="setup-qr" src={`data:image/svg+xml;utf8,${encodeURIComponent(setup.svg)}`} width={192} height={192} alt="Multi-factor authentication QR" />

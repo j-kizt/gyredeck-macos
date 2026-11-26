@@ -1329,6 +1329,13 @@ async fn discord_approvals_unlock(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|error| format!("Unlocking approvals did not finish: {error}"))?
 }
 
+#[tauri::command]
+async fn discord_approvals_remove(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<discord::DiscordState>().remove_approvals())
+        .await
+        .map_err(|error| format!("Removing multi-factor authentication did not finish: {error}"))?
+}
+
 /// Take the Discord member out of a room again after a leave the bridge refused. Needs only
 /// the broker's word, so it works after Remove, with no token kept.
 #[tauri::command]
@@ -6289,6 +6296,7 @@ pub fn run() {
             discord_approvals_setup,
             discord_approvals_confirm,
             discord_approvals_unlock,
+            discord_approvals_remove,
             heavy_status,
             heavy_stop,
             heavy_remove,

@@ -6513,9 +6513,31 @@ fn c11_setup_shows_a_secret_once_and_turns_approvals_on_only_with_a_code_from_it
     f.state.confirm_approvals(&format!("{:06}", totp::code_at(&secret, step))).unwrap();
     assert_eq!(f.state.approvals_state(), Ok(ApprovalState::On));
     assert_eq!(saved_record(&f).unwrap().last_step, step, "the setup's code is used too");
-    // Remove takes the record.
+    // Removing Discord leaves it set up (#442): it is a setting of its own.
+    let kept = saved_record(&f).unwrap();
     f.state.remove(Some(APP_WORD)).unwrap();
+    assert_eq!(f.state.approvals_state(), Ok(ApprovalState::On));
+    assert_eq!(saved_record(&f).unwrap().last_step, kept.last_step);
+}
+
+#[test]
+fn c442_its_own_remove_takes_the_record_and_a_setup_in_progress_and_then_nothing_is_approved() {
+    let (f, buffer) = approvals_room("approve-remove");
+    f.approvals.refuse_delete.store(true, Ordering::SeqCst);
+    assert!(f.state.remove_approvals().is_err());
+    assert_eq!(f.state.approvals_state(), Ok(ApprovalState::On), "a Keychain that refuses leaves it on and says so");
+    f.approvals.refuse_delete.store(false, Ordering::SeqCst);
+    f.state.remove_approvals().unwrap();
     assert!(saved_record(&f).is_none());
+    assert_eq!(f.state.approvals_state(), Ok(ApprovalState::Off));
+    let refused = answer(&f, &buffer, approve_with(&sent_id(1_000, 1), 1, &code_now(0), merge(370, SHA_A)));
+    assert!(refused["error"].as_str().unwrap().contains("not set up, so nothing was approved"), "{refused}");
+    assert!(f.acts.posts.lock().unwrap().is_empty());
+    // A setup in progress goes with it: no gate is left waiting for a code.
+    f.state.setup_approvals().unwrap();
+    assert_eq!(f.state.approvals_state(), Ok(ApprovalState::SettingUp));
+    f.state.remove_approvals().unwrap();
+    assert_eq!(f.state.approvals_state(), Ok(ApprovalState::Off));
 }
 
 fn base32_decode(text: &str) -> Vec<u8> {

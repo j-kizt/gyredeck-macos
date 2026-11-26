@@ -2716,7 +2716,7 @@ impl DiscordState {
         self.deps.owners.delete()?;
         // Remove is the one way a kept loss is let go unsaid.
         self.deps.losses.delete()?;
-        self.core.forget_approvals()?;
+        // Multi-factor authentication is its own setting (#442): removing the bot leaves it set up.
         self.deps.settings.set(&[(CONFIG_FORUM, None)])?;
         let mut hub = lock(&self.hub);
         let leaving = std::mem::take(&mut hub.leaving);
@@ -2752,6 +2752,10 @@ impl DiscordState {
 
     pub(crate) fn approvals_state(&self) -> Result<ApprovalState, String> {
         self.core.approvals_state()
+    }
+
+    pub(crate) fn remove_approvals(&self) -> Result<(), String> {
+        self.core.forget_approvals()
     }
 
     /// Follow a room this app founded on Discord: join it as the relay, then read it.
@@ -3324,7 +3328,7 @@ impl Core {
         })
     }
 
-    /// Remove's part (#207): the record goes, and a setup in progress with it.
+    /// Its own Remove (#442): the record goes, and a setup in progress with it.
     fn forget_approvals(&self) -> Result<(), String> {
         let mut gate = self.approval_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *gate = None;

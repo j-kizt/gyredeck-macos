@@ -123,12 +123,15 @@ const assetRoot = join(distRoot, "assets");
  * #376 reopened (a refused Connect said on its room's row, a full room's Connect marked and
  * reachable by the keys) read 123,483 / 126,557 on CI, +324 / +325; both set to the CI figure,
  * approved by the owner at the terminal on 2026-11-21.
+ * #442 (MFA's own round Remove and its confirm) read 123,697 / 126,769 locally after a frozen
+ * install, against main's CI 123,544 / 126,621: +153 / +148. Both raised to the local figure, by
+ * the owner from Discord on 2026-11-26 ("yes", sync-9782 seq 508 to 505).
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 123_583,
-  jsTotalGzipBytes: 126_657,
+  jsGzipBytes: 123_697,
+  jsTotalGzipBytes: 126_769,
 };
 
 const walk = async (directory) => {

@@ -31,6 +31,7 @@ type Status = {
   failLeave?: boolean;
   /** The mock's own: what `discord_approvals` answers (#207). */
   approvals?: string;
+  failApprovalsRemove?: boolean;
   /** The mock's own: the rooms `mail_rooms` lists, in place of ROOMS (#376). */
   rooms?: typeof ROOMS;
   /** The mock's own: a Connect the native side refuses with this (#376). */
@@ -125,6 +126,11 @@ const mock = async (page: Page, status: Status) => {
           return null;
         }
         if (command === "discord_approvals_unlock") { state.approvals = "on"; return null; }
+        if (command === "discord_approvals_remove") {
+          if (state.failApprovalsRemove) throw new Error("Could not remove the multi-factor authentication record from the Keychain");
+          state.approvals = "off";
+          return null;
+        }
         if (command === "discord_connect" && state.connectRefusal) {
           const refusal = state.connectRefusal;
           delete state.connectRefusal;
@@ -237,10 +243,31 @@ test("no forum yet: no select, the invite is still offered", async ({ page }) =>
   await expect(page.getByRole("button", { name: "Invite the bot" })).toBeVisible();
 });
 
+const mfa = (page: Page) => page.locator(".setup-row[data-mfa='row']");
+// What the row says in each state (MfaRow.tsx), so a test can confirm the state it set before it checks anything.
+const MFA_DETAIL: Record<string, string> = {
+  off: "Ask for a code from an authenticator app before anything you approve from outside this Mac goes through",
+  settingUp: "Setup was not finished. Set it up again",
+  on: "On. Anything you approve from outside this Mac waits for a code",
+  locked: "Locked after three wrong codes. Nothing can be approved until you unlock it",
+  unreadable: "The saved secret cannot be read. Set it up again",
+};
+
+// #442 audit: the copy claims nothing about multi-factor authentication's state, which Remove leaves as it is.
+for (const approvals of ["off", "on"]) {
+  test(`Remove's copy claims nothing about multi-factor authentication when it is ${approvals}`, async ({ page }) => {
+    await open(page, paired({ approvals }), "Connection");
+    await expect(mfa(page).locator(".setup-detail").first()).toHaveText(MFA_DETAIL[approvals]);
+    await page.getByRole("tab", { name: "Permission" }).click();
+    await page.getByRole("button", { name: "Remove", exact: true }).click();
+    await expect(row(page, "bot").getByRole("alert")).toHaveText("Remove Discord? The bot stops and its token is deleted. Posts already in Discord stay there. Multi-factor authentication is not changed.");
+  });
+}
+
 test("Remove asks first, says the posts stay, and Cancel removes nothing", async ({ page }) => {
   await open(page, paired());
   await page.getByRole("button", { name: "Remove", exact: true }).click();
-  await expect(row(page, "bot").getByRole("alert")).toHaveText("Remove Discord? The bot stops and its token is deleted. Posts already in Discord stay there.");
+  await expect(row(page, "bot").getByRole("alert")).toHaveText("Remove Discord? The bot stops and its token is deleted. Posts already in Discord stay there. Multi-factor authentication is not changed.");
   expect(await commands(page, "discord_remove")).toEqual([]);
   await page.getByRole("button", { name: "Cancel" }).click();
   await expect(row(page, "bot").getByRole("alert")).toHaveCount(0);
@@ -607,6 +634,7 @@ for (const viewport of [{ width: 444, height: 560 }, { width: 444, height: 280 }
     }
     expect(boxes.overflow).toEqual([]);
   });
+
 });
 
 // #282, #199: what the relay's journal refused, and a loss nothing could record, are shown —
@@ -660,7 +688,6 @@ test("an unrecorded loss is shown even with no token saved, and goes with Remove
 // #207, #376: multi-factor authentication is set up under Connection → Security, once, and is
 // there whatever state the Discord connector is in.
 const SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
-const mfa = (page: Page) => page.locator(".setup-row[data-mfa='row']");
 
 test("multi-factor authentication sits under Connection → Security whether or not Discord is set up or paired", async ({ page }) => {
   for (const status of [blank, withBot({ forums: [FORUM], forumId: FORUM.id, pairingCode: "482913" }), paired()]) {
@@ -745,6 +772,54 @@ test("multi-factor authentication: a setup left unfinished, as after a relaunch,
   await expect(approvals.locator(".setup-qr, .setup-secret")).toHaveCount(0);
 });
 
+// #442: Remove Discord leaves multi-factor authentication alone; it has its own Remove, offered only when On.
+test("Remove Discord leaves multi-factor authentication on", async ({ page }) => {
+  await open(page, paired({ approvals: "on" }), "Connection");
+  await page.getByRole("tab", { name: "Permission" }).click();
+  await page.getByRole("button", { name: "Remove", exact: true }).click();
+  await page.getByRole("button", { name: "Remove Discord" }).click();
+  await expect(page.getByLabel("Discord bot token")).toBeVisible();
+  await page.getByRole("tab", { name: "Connection" }).click();
+  await expect(mfa(page).locator(".setup-detail").first()).toHaveText("On. Anything you approve from outside this Mac waits for a code");
+  expect(await commands(page, "discord_approvals_remove")).toEqual([]);
+});
+
+for (const approvals of ["off", "settingUp", "locked", "unreadable", "on"]) {
+  test(`multi-factor authentication: Remove is ${approvals === "on" ? "" : "not "}offered when it is ${approvals}`, async ({ page }) => {
+    await open(page, paired({ approvals }), "Connection");
+    await expect(mfa(page).locator(".setup-detail").first()).toHaveText(MFA_DETAIL[approvals]);
+    await expect(mfa(page).getByRole("button", { name: "Remove multi-factor authentication" })).toHaveCount(approvals === "on" ? 1 : 0);
+    if (approvals === "on") await expect(mfa(page).getByRole("button")).toHaveText(["Reset", ""]);
+  });
+}
+
+test("multi-factor authentication: Remove asks first, Cancel removes nothing, Remove turns it off", async ({ page }) => {
+  await open(page, paired({ approvals: "on" }), "Connection");
+  const approvals = mfa(page);
+  await approvals.getByRole("button", { name: "Remove multi-factor authentication" }).click();
+  await expect(approvals.getByRole("alert")).toHaveText("Remove multi-factor authentication? The codes in your authenticator app stop working, and approvals sent from outside this Mac are refused until you set it up again.");
+  await expect(approvals.getByRole("button")).toHaveText(["Cancel", "Remove"]);
+  await approvals.getByRole("button", { name: "Cancel" }).click();
+  await expect(approvals.getByRole("alert")).toHaveCount(0);
+  await expect(approvals.getByRole("button")).toHaveText(["Reset", ""]);
+  expect(await commands(page, "discord_approvals_remove")).toEqual([]);
+
+  await approvals.getByRole("button", { name: "Remove multi-factor authentication" }).click();
+  await approvals.getByRole("button", { name: "Remove", exact: true }).click();
+  await expect(approvals.locator(".setup-detail").first()).toHaveText("Ask for a code from an authenticator app before anything you approve from outside this Mac goes through");
+  await expect(approvals.getByRole("button")).toHaveText(["Set up"]);
+  expect(await commands(page, "discord_approvals_remove")).toHaveLength(1);
+});
+
+test("multi-factor authentication: a Remove that fails says so and leaves it on", async ({ page }) => {
+  await open(page, paired({ approvals: "on", failApprovalsRemove: true }), "Connection");
+  const approvals = mfa(page);
+  await approvals.getByRole("button", { name: "Remove multi-factor authentication" }).click();
+  await approvals.getByRole("button", { name: "Remove", exact: true }).click();
+  await expect(approvals.locator("[data-mfa='failure']")).toContainText("Could not remove the multi-factor authentication record from the Keychain");
+  await expect(approvals.locator(".setup-detail").first()).toHaveText("On. Anything you approve from outside this Mac waits for a code");
+});
+
 test.describe("multi-factor authentication at 444 × 560", () => {
   test.use({ viewport: { width: 444, height: 560 } });
 
@@ -775,6 +850,45 @@ test.describe("multi-factor authentication at 444 × 560", () => {
       expect(part.y + part.height, part.name).toBeLessThanOrEqual(boxes.row.y + boxes.row.height + 0.5);
     }
     expect(boxes.overflow).toEqual([]);
+  });
+
+  test("when on, the round Remove sits beside Reset on one line, and its confirm stays inside the row", async ({ page }) => {
+    await open(page, paired({ approvals: "on" }), "Connection");
+    const approvals = mfa(page);
+    await approvals.scrollIntoViewIfNeeded();
+    const measure = () => approvals.evaluate((element) => {
+      const rect = (node: Element | null) => {
+        if (!node) throw new Error("not laid out");
+        const { x, y, width, height } = node.getBoundingClientRect();
+        return { x, y, width, height };
+      };
+      const title = element.querySelector(".setup-title")!;
+      return {
+        row: rect(element),
+        titleLines: Math.round(title.getBoundingClientRect().height / parseFloat(getComputedStyle(title).lineHeight)),
+        buttons: [...element.querySelectorAll(".pill-btn")].map((node) => rect(node)),
+        overflow: [element, ...element.querySelectorAll<HTMLElement>("*")].filter((node) => !(node instanceof SVGElement) && node.scrollWidth > node.clientWidth).map((node) => node.className),
+      };
+    });
+    const on = await measure();
+    expect(on.titleLines).toBe(1);
+    const [reset, remove] = on.buttons;
+    expect(remove.width).toBeCloseTo(remove.height, 0);
+    expect(remove.height).toBeCloseTo(reset.height, 0);
+    expect(remove.y).toBeCloseTo(reset.y, 0);
+    expect(remove.x).toBeGreaterThan(reset.x + reset.width - 0.5);
+    expect(remove.x + remove.width).toBeLessThanOrEqual(on.row.x + on.row.width + 0.5);
+    expect(on.overflow).toEqual([]);
+
+    await approvals.getByRole("button", { name: "Remove multi-factor authentication" }).click();
+    const confirm = await measure();
+    expect(confirm.titleLines).toBe(1);
+    for (const button of confirm.buttons) {
+      expect(button.x).toBeGreaterThanOrEqual(confirm.row.x);
+      expect(button.x + button.width).toBeLessThanOrEqual(confirm.row.x + confirm.row.width + 0.5);
+      expect(button.y + button.height).toBeLessThanOrEqual(confirm.row.y + confirm.row.height + 0.5);
+    }
+    expect(confirm.overflow).toEqual([]);
   });
 });
 

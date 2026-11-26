@@ -7731,12 +7731,14 @@ const { randomUUID } = require("node:crypto");
 const args = process.argv.slice(2);
 const thread = args[args.indexOf("--thread") + 1];
 const message = args[args.indexOf("--message") + 1];
-// #380 audit: every attempt is logged; codex-slow makes a run take 800 ms; codex-refuses makes it
+// #380 audit: every attempt is logged; codex-slow makes a run take 800 ms — every run if empty, runs
+// whose message holds its text otherwise (#399); codex-refuses makes it
 // exit 1 the way a daemon mid-update does — every run if empty, runs whose message holds its text,
 // or the next N runs if it holds a number.
 const fs = require("node:fs");
 fs.appendFileSync(join(process.env.HOME, "codex-attempts.log"), JSON.stringify(message) + "\\n");
-if (fs.existsSync(join(process.env.HOME, "codex-slow"))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 800);
+const slow = join(process.env.HOME, "codex-slow");
+if (fs.existsSync(slow) && (!fs.readFileSync(slow, "utf8").trim() || message.includes(fs.readFileSync(slow, "utf8").trim()))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 800);
 // #380 audit r6: every start is logged with the messages of the runs still alive beside it, and
 // codex-hangs makes runs whose message holds its text (every run if empty) never return by
 // themselves: asked to stop they exit 1 after 700 ms, or never if codex-ignores-term exists.
@@ -7798,7 +7800,7 @@ const promptsIn = async (rollout) => (await readFile(rollout, "utf8")).split("\n
   .filter((entry) => entry.payload?.type === "item_completed" && entry.payload.item?.type === "UserMessage")
   .map((entry) => ({ turnId: entry.payload.turn_id, text: entry.payload.item.content.map((part) => part.text).join("") }));
 
-const codexInARoom = async ({ replyTimeoutMs = null, env: extraEnv = {} } = {}) => {
+const codexInARoom = async ({ replyTimeoutMs = null, env: extraEnv = {}, beforeJoin = null } = {}) => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-bound-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const fakeBin = join(home, ".bun", "bin");
@@ -7849,6 +7851,7 @@ const codexInARoom = async ({ replyTimeoutMs = null, env: extraEnv = {} } = {}) 
   }
   const created = await call("POST", "/sync/rooms", { conversationId: founder });
   const code = created.body.room;
+  await beforeJoin?.(home);
   assert.equal((await joinConfirmed(call, code, founder, thread)).status, 200);
   const saidInRoom = async () => {
     // Read as the founder, with its own key beside the password (#274); fetched each time,
@@ -8338,7 +8341,7 @@ test("an answer whose prompt line cannot be read goes nowhere, not to the room",
 });
 
 /** A Codex session the bridge knows about that is in no room at all. */
-const codexInNoRoom = async ({ replyTimeoutMs = 1_000, env = {}, records = true } = {}) => {
+const codexInNoRoom = async ({ replyTimeoutMs = 1_000, env = {}, records = true, prepare = null } = {}) => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-roomless-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
   const fakeBin = join(home, ".bun", "bin");
@@ -8354,6 +8357,7 @@ const codexInNoRoom = async ({ replyTimeoutMs = 1_000, env = {}, records = true 
   await writeFile(rollout, "");
   const port = await freePort();
   await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  await prepare?.(home);
   const stderrRef = { value: "" };
   const bridge = spawn(
     process.execPath,
@@ -8405,7 +8409,7 @@ const codexInNoRoom = async ({ replyTimeoutMs = 1_000, env = {}, records = true 
     if (bridge.exitCode === null) bridge.kill();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
-  return { call, sender, thread, rollout, rolloutDir, readers, saidInMailbox, endTurn, until, close, stderr: () => stderrRef.value };
+  return { call, sender, thread, rollout, rolloutDir, readers, saidInMailbox, endTurn, until, close, home, stderr: () => stderrRef.value };
 };
 
 test("an answer written just after its turn's stop still reaches the asker, with no push to fetch it (#181)", async () => {
@@ -14067,8 +14071,10 @@ const codexHeavyFixture = async (tag, { gated = false } = {}) => {
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   };
   // Each push is a `codex queue` child of the bridge; with none left, every push it has
-  // started is on record, whatever order the processes finished in (#329 audit).
-  const settled = () => until(async () => spawnSync("pgrep", ["-P", String(bridge.pid)]).status === 1, "no codex queue still running");
+  // started is on record, whatever order the processes finished in (#329 audit). A push waiting
+  // its turn behind another of its thread is no child yet, so the bridge's own count is asked too (#399).
+  const settled = () => until(async () => spawnSync("pgrep", ["-P", String(bridge.pid)]).status === 1 &&
+    (await (await fetch(`http://127.0.0.1:${port}/health`)).json()).codexHarvest.queueing === 0, "no codex queue still running or waiting");
   const release = (name) => writeFile(join(home, `release-${name}`), "");
   return { home, call, pushes, messagesTo, ingestCodex, settled, release, close };
 };
@@ -16239,3 +16245,230 @@ test("#380: mail posted into a Codex thread's mailbox is not counted as read whe
     await room.close();
   }
 });
+
+test("#399: a Codex session takes its placement notice before its confirmation, even when the notice's `codex queue` is slow", async () => {
+  // The notice goes into the session's mailbox and the confirmation into the room: two outbox
+  // boxes, which nothing but the per-thread line in `runCodexQueue` orders against each other.
+  const room = await codexInARoom({ beforeJoin: (home) => writeFile(join(home, "codex-slow"), "you are now in sync room") });
+  try {
+    // The notice is sent when the member is put in, the confirmation only once it is confirmed after.
+    assert.ok(
+      await room.until(async () => {
+        const texts = (await promptsIn(room.rollout)).map((prompt) => prompt.text);
+        return texts.some((text) => /you are now in sync room/.test(text)) && texts.some((text) => /you are confirmed in room/.test(text));
+      }),
+      `the premise: both were taken / ${room.stderrRef.value}`,
+    );
+    const taken = (await promptsIn(room.rollout)).map((prompt) => prompt.text);
+    const placed = taken.findIndex((text) => /you are now in sync room/.test(text));
+    const confirmed = taken.findIndex((text) => /you are confirmed in room/.test(text));
+    assert.ok(placed >= 0 && placed < confirmed, `the notice was taken before the confirmation: ${JSON.stringify(taken.map((text) => text.slice(0, 60)))}`);
+  } finally {
+    await room.close();
+  }
+});
+
+test("#399: one Codex thread never has two `codex queue` runs at once, across a room and its mailbox, while another thread's runs go beside it", async () => {
+  const room = await codexOutboxRoom({ env: { GYREDECK_CODEX_QUEUE_DEADLINE_MS: "1500" } });
+  const other = randomUUID();
+  try {
+    await writeFile(join(room.rolloutDir, `rollout-2026-10-09T12-00-01-${other}.jsonl`), "");
+    await room.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: other, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" },
+      data: { inputCount: 1 },
+    });
+    await writeFile(join(room.home, "codex-hangs"), "HUNG-IN-ROOM");
+    await room.tell("HUNG-IN-ROOM");
+    assert.ok(await room.until(async () => (await room.attempts("HUNG-IN-ROOM")) === 1), "premise: the room push started");
+    const { pid } = (await startsOf(room)).find((start) => start.message.includes("HUNG-IN-ROOM"));
+
+    const mailed = await room.call("POST", `/mail/${room.thread}`, { from: room.founder, kind: "tell", text: "MAILBOX-BEHIND" });
+    assert.equal(mailed.body.delivery, "queued", "the premise: the mailbox push was queued");
+    const otherMailed = await room.call("POST", `/mail/${other}`, { from: room.founder, kind: "tell", text: "OTHER-THREAD" });
+    assert.equal(otherMailed.body.delivery, "queued", "the premise: the other thread's push was queued");
+    assert.ok(await room.until(async () => (await room.attempts("OTHER-THREAD")) === 1, 3_000), "another thread's push is not held behind this thread's hung run");
+    assert.ok(alive(pid), "the premise: the room push still hangs");
+    assert.equal(await room.attempts("MAILBOX-BEHIND"), 0, "the same thread's mailbox push waits behind its hung room push");
+    const otherStart = (await startsOf(room)).find((start) => start.message.includes("OTHER-THREAD"));
+    assert.ok(otherStart.alongside.some((message) => message.includes("HUNG-IN-ROOM")), "the other thread's run started beside the hung one: the line is per thread, not global");
+
+    assert.ok(await room.until(async () => (await room.takenIndex("MAILBOX-BEHIND")) >= 0, 8_000), `the mailbox push went once the hung run ended: ${room.stderrRef.value}`);
+    assert.ok(!alive(pid), "the hung run has ended");
+    const behind = (await startsOf(room)).find((start) => start.message.includes("MAILBOX-BEHIND"));
+    assert.ok(!behind.alongside.some((message) => message.includes("HUNG-IN-ROOM")), "and it did not start while the hung run was alive");
+  } finally {
+    await killHung(room);
+    await room.close();
+  }
+});
+
+test("#399: a push `codex queue` refused does not hold up the next one for its thread", async () => {
+  const room = await codexOutboxRoom();
+  try {
+    await writeFile(join(room.home, "codex-refuses"), "REFUSED-FIRST");
+    await writeFile(join(room.home, "codex-slow"), "REFUSED-FIRST");
+    await room.tell("REFUSED-FIRST");
+    assert.ok(await room.until(async () => (await room.attempts("REFUSED-FIRST")) === 1), "premise: the refused push started");
+    const mailed = await room.call("POST", `/mail/${room.thread}`, { from: room.founder, kind: "tell", text: "AFTER-REFUSED" });
+    assert.equal(mailed.body.delivery, "queued", "the premise: the next push was queued");
+    assert.ok(await room.until(async () => (await room.takenIndex("AFTER-REFUSED")) >= 0, 5_000), `the next push went once the refused run ended: ${room.stderrRef.value}`);
+    assert.equal(await room.takenIndex("REFUSED-FIRST"), -1, "the premise: the fake refused the first");
+    const sent = (await readFile(join(room.home, "codex-attempts.log"), "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.ok(
+      sent.findIndex((message) => message.includes("REFUSED-FIRST")) < sent.findIndex((message) => message.includes("AFTER-REFUSED")),
+      "the premise: the next push was sent after the refused one",
+    );
+  } finally {
+    await room.close();
+  }
+});
+
+test("#399: a `codex queue` that cannot even be spawned ends as a refusal, and the thread's next push still goes", async () => {
+  const room = await codexOutboxRoom();
+  try {
+    // A NUL byte in an argument makes `spawn` throw synchronously (ERR_INVALID_ARG_VALUE).
+    const mailed = await room.call("POST", `/mail/${room.thread}`, { from: room.founder, kind: "tell", text: "NUL\u0000HERE" });
+    assert.equal(mailed.body.delivery, "queued", `the premise: the post was queued: ${JSON.stringify(mailed.body)}`);
+    assert.ok(await room.until(async () => /codex queue could not be started/.test(room.stderrRef.value), 3_000), `the premise: the spawn threw: ${room.stderrRef.value}`);
+    await room.tell("AFTER-THROW");
+    assert.ok(await room.until(async () => (await room.takenIndex("AFTER-THROW")) >= 0, 5_000), `the thread's next push went: ${room.stderrRef.value}`);
+  } finally {
+    await room.close();
+  }
+});
+
+const attemptOrder = async (room) => (await readFile(join(room.home, "codex-attempts.log"), "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+
+test("#399 audit: a thread's pushes start in the order they were sent across its rooms, even when a room's second waits behind its own first", async () => {
+  const room = await codexOutboxRoom();
+  try {
+    await writeFile(join(room.home, "codex-slow"), "ORDER-A1");
+    await room.tell("ORDER-A1");
+    assert.ok(await room.until(async () => (await room.attempts("ORDER-A1")) === 1), "premise: A1 is running");
+    await room.tell("ORDER-A2");
+    const mailed = await room.call("POST", `/mail/${room.thread}`, { from: room.founder, kind: "tell", text: "ORDER-B1" });
+    assert.equal(mailed.body.delivery, "queued", "the premise: B1 was queued");
+    assert.ok(await room.until(async () => (await room.takenIndex("ORDER-B1")) >= 0 && (await room.takenIndex("ORDER-A2")) >= 0, 5_000), `all three went: ${room.stderrRef.value}`);
+    const sent = await attemptOrder(room);
+    const at = (text) => sent.findIndex((message) => message.includes(text));
+    assert.ok(at("ORDER-A1") < at("ORDER-A2") && at("ORDER-A2") < at("ORDER-B1"), `A1, A2, then B1: ${JSON.stringify(sent.map((message) => message.slice(-8)))}`);
+  } finally {
+    await room.close();
+  }
+});
+
+test("#399 audit: a room push waiting behind its thread's other run is not sent once its member has left the room", async () => {
+  const room = await codexOutboxRoom({ env: { GYREDECK_CODEX_QUEUE_DEADLINE_MS: "1500" } });
+  try {
+    await writeFile(join(room.home, "codex-hangs"), "HOLD-MAIL");
+    const mailed = await room.call("POST", `/mail/${room.thread}`, { from: room.founder, kind: "tell", text: "HOLD-MAIL" });
+    assert.equal(mailed.body.delivery, "queued", "the premise: the mailbox push was queued");
+    assert.ok(await room.until(async () => (await room.attempts("HOLD-MAIL")) === 1), "premise: the mailbox push is running");
+    await room.tell("ROOM-WAITING");
+    assert.equal((await room.call("DELETE", `/sync/rooms/${room.code}/members/${room.thread}`)).status, 200, "the premise: the member left");
+    assert.ok(await room.until(async () => (await room.takenIndex("HOLD-MAIL")) === -1 && (await startsOf(room)).every(({ pid }) => !alive(pid)), 6_000), "premise: the held run ended");
+    await room.pause(800);
+    assert.equal(await room.attempts("ROOM-WAITING"), 0, "the room's push was never sent after its member left");
+  } finally {
+    await killHung(room);
+    await room.close();
+  }
+});
+
+test("#399 audit: a push's reply window opens when it really starts, so an answer is read after a wait longer than the window", async () => {
+  const room = await codexOutboxRoom({ replyTimeoutMs: 2_000, env: { GYREDECK_CODEX_QUEUE_DEADLINE_MS: "2000" } });
+  try {
+    await writeFile(join(room.home, "codex-hangs"), "HOLD-ROOM");
+    await room.tell("HOLD-ROOM");
+    assert.ok(await room.until(async () => (await room.attempts("HOLD-ROOM")) === 1), "premise: the room push is running");
+    const mailed = await room.call("POST", `/mail/${room.thread}`, { from: room.founder, kind: "tell", text: "LATE-ASK" });
+    assert.equal(mailed.body.delivery, "queued", "the premise: the mailbox push was queued");
+    assert.ok(await room.until(async () => (await room.takenIndex("LATE-ASK")) >= 0, 8_000), `the mailbox push went once the hung run ended: ${room.stderrRef.value}`);
+    const asked = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("LATE-ASK"));
+    // No hook event follows: only the poll the push itself armed can read this.
+    await appendFile(room.rollout, turnAnswering(asked.turnId, "@everyone tell\nLATE-ANSWER"));
+    assert.ok(await room.until(async () => (await room.saidInMailbox()).includes("LATE-ANSWER"), 3_000), "the answer was read inside the window that opened at the real start");
+  } finally {
+    await killHung(room);
+    await room.close();
+  }
+});
+
+test("#399 audit r2: a push the bridge sends a thread itself waits its turn behind what was sent to it first", async () => {
+  // The heavy-runs notice goes straight to `deliverToCodex`, not through an outbox. Refused at
+  // the start, it is owed again on the session's next event, which is made to come while M1
+  // runs and M2 waits behind it.
+  const session = await codexInNoRoom({
+    env: { GYREDECK_TEST_HEAVY_NO_CODEX_PUSH: "0" },
+    prepare: (home) => writeFile(join(home, "codex-refuses"), "HEAVY RUNS"),
+  });
+  const sent = async () => {
+    try {
+      return (await readFile(join(session.home, "codex-attempts.log"), "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    } catch {
+      return [];
+    }
+  };
+  try {
+    assert.ok(await session.until(async () => (await sent()).some((message) => message.includes("HEAVY RUNS"))), `premise: the notice was tried and refused: ${session.stderr()}`);
+    await rm(join(session.home, "codex-refuses"));
+    await writeFile(join(session.home, "codex-slow"), "ORDER-M1");
+    assert.equal((await session.call("POST", `/mail/${session.thread}`, { from: session.sender, kind: "tell", text: "ORDER-M1" })).status, 202);
+    assert.ok(await session.until(async () => (await sent()).some((message) => message.endsWith("ORDER-M1"))), "premise: M1 is running");
+    assert.equal((await session.call("POST", `/mail/${session.thread}`, { from: session.sender, kind: "tell", text: "ORDER-M2" })).status, 202);
+    await session.call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+      conversationId: session.thread, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "codexCliHook" },
+      data: { inputCount: 1 },
+    });
+    const at = (all, test) => all.findIndex(test);
+    assert.ok(await session.until(async () => {
+      const all = await sent();
+      return at(all, (message) => message.endsWith("ORDER-M2")) >= 0 && all.filter((message) => message.includes("HEAVY RUNS")).length >= 2;
+    }, 6_000), `M2 and the notice both went: ${JSON.stringify((await sent()).map((message) => message.slice(-12)))}`);
+    const all = await sent();
+    const notice = all.findLastIndex((message) => message.includes("HEAVY RUNS"));
+    assert.ok(at(all, (message) => message.endsWith("ORDER-M1")) < at(all, (message) => message.endsWith("ORDER-M2")) && at(all, (message) => message.endsWith("ORDER-M2")) < notice,
+      `M1, M2, then the notice sent after them: ${JSON.stringify(all.map((message) => message.slice(-12)))}`);
+  } finally {
+    await session.close();
+  }
+});
+
+for (const [how, end] of [
+  ["its member is taken out", (session, code) => session.call("DELETE", `/sync/rooms/${code}/members/${session.thread}`)],
+  ["its room is closed", (session, code) => session.call("DELETE", `/sync/rooms/${code}`)],
+]) {
+  test(`#399 audit r2: a room's notice to a member not yet let in is not sent once ${how} while it waited`, async () => {
+    const session = await codexInNoRoom({ env: { GYREDECK_CODEX_QUEUE_DEADLINE_MS: "1500" } });
+    const sent = async () => {
+      try {
+        return (await readFile(join(session.home, "codex-attempts.log"), "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+      } catch {
+        return [];
+      }
+    };
+    try {
+      const code = (await session.call("POST", "/sync/rooms", { conversationId: session.sender })).body.room;
+      assert.equal((await session.call("POST", `/sync/rooms/${code}/members`, { conversationId: session.thread })).status, 200, "premise: put in, not let in");
+      await writeFile(join(session.home, "codex-hangs"), "HOLD-M");
+      assert.equal((await session.call("POST", `/mail/${session.thread}`, { from: session.sender, kind: "tell", text: "HOLD-M" })).status, 202);
+      assert.ok(await session.until(async () => (await sent()).some((message) => message.endsWith("HOLD-M"))), "premise: the mailbox push is running");
+      // Only this run hangs; its retry, sent before the notice, goes through.
+      await rm(join(session.home, "codex-hangs"));
+      const pinged = await session.call("POST", `/mail/${code}`, { from: session.sender, to: session.thread, kind: "tell", text: "PING" });
+      assert.equal(pinged.body.delivery, "queued", "premise: the notice was queued behind the running push");
+      assert.equal((await end(session, code)).status, 200, `premise: ${how}`);
+      // Something after the notice in line, so its turn has come and gone once this is taken.
+      assert.equal((await session.call("POST", `/mail/${session.thread}`, { from: session.sender, kind: "tell", text: "AFTER-NOTICE" })).status, 202);
+      assert.ok(await session.until(async () => (await sent()).some((message) => message.endsWith("AFTER-NOTICE")), 8_000), `premise: the line moved past the notice: ${session.stderr()}`);
+      assert.equal((await sent()).filter((message) => /you have been put in a room here/.test(message)).length, 0, `the notice was never sent: ${session.stderr()}`);
+    } finally {
+      await killHung(session);
+      await session.close();
+    }
+  });
+}

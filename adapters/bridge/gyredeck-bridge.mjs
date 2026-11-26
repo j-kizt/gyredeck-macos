@@ -6639,34 +6639,70 @@ function startBridge(config) {
    * on the session's next event — and only once the process has really exited: the outbox
    * starts nothing more for that thread and room while it still runs, so two runs can never
    * deliver at once. A run that could not start at all ends at its error, since no exit follows.
+   *
+   * One run at a time per thread (#399): a run starts only once the one before it for that thread
+   * has ended, however it ended, and the next is the lowest ticket waiting (`drainCodexThread`), so
+   * the session takes pushes in the order they were sent, across rooms, its mailbox and the bridge's
+   * own notices. A run's deadline starts when it starts, not while it waits in line. `now` is the
+   * outbox starting a head it has just picked.
+   * What waiting may have changed is judged when the run really starts (#399 audit): `stillDue`
+   * false ends it unsent (`skipped`), and `onStart` is when its reply window opens.
    */
-  const runCodexQueue = (binary, threadId, text, onEnd) => {
-    const child = spawn(binary, ["queue", "--thread", threadId, "--message", text], { stdio: ["ignore", "ignore", "ignore"] });
-    // Set before the signal (#380 audit r7): a run stopped at its deadline is a refusal even if it
-    // then exits 0, since nothing says what it had done before it was stopped.
-    let timedOut = false;
-    let timer = setTimeout(() => {
-      timedOut = true;
-      console.error(`⚠ codex queue gave no answer in ${CODEX_QUEUE_DEADLINE_MS} ms for ${threadId}; it is stopped, and the message is tried again on the session's next event`);
-      child.kill("SIGTERM");
-      timer = setTimeout(() => child.kill("SIGKILL"), CODEX_QUEUE_DEADLINE_MS);
+  // Every push to a thread takes a ticket when it is sent, and the thread's next run is the
+  // lowest ticket waiting, whether it came through an outbox or straight here (#399 audit r2).
+  let codexPushTicket = 0;
+  const codexRunning = new Set();
+  const codexWaiting = new Map();
+  const runCodexQueue = (binary, threadId, text, onEnd, { stillDue = null, onStart = null, now = false } = {}) => {
+    const start = () => {
+      codexRunning.add(threadId);
+      const end = (ok, code, skipped = false) => {
+        codexRunning.delete(threadId);
+        onEnd(ok, code, skipped);
+        drainCodexThread(threadId);
+      };
+      if (stillDue && !stillDue()) {
+        end(false, null, true);
+        return;
+      }
+      onStart?.();
+      let child;
+      try {
+        child = spawn(binary, ["queue", "--thread", threadId, "--message", text], { stdio: ["ignore", "ignore", "ignore"] });
+      } catch (error) {
+        console.error(`⚠ codex queue could not be started (${error?.code ?? error}): ${binary}`);
+        end(false, null);
+        return;
+      }
+      // Set before the signal (#380 audit r7): a run stopped at its deadline is a refusal even if it
+      // then exits 0, since nothing says what it had done before it was stopped.
+      let timedOut = false;
+      let timer = setTimeout(() => {
+        timedOut = true;
+        console.error(`⚠ codex queue gave no answer in ${CODEX_QUEUE_DEADLINE_MS} ms for ${threadId}; it is stopped, and the message is tried again on the session's next event`);
+        child.kill("SIGTERM");
+        timer = setTimeout(() => child.kill("SIGKILL"), CODEX_QUEUE_DEADLINE_MS);
+        timer.unref?.();
+      }, CODEX_QUEUE_DEADLINE_MS);
       timer.unref?.();
-    }, CODEX_QUEUE_DEADLINE_MS);
-    timer.unref?.();
-    child.on("error", (error) => {
-      // Emitted too when a kill fails; only a child that never started ends here.
-      if (child.pid !== undefined) return;
-      clearTimeout(timer);
-      console.error(`⚠ codex queue could not be started (${error?.code ?? error}): ${binary}`);
-      onEnd(false, null);
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      onEnd(code === 0 && !timedOut, code);
-    });
+      child.on("error", (error) => {
+        // Emitted too when a kill fails; only a child that never started ends here.
+        if (child.pid !== undefined) return;
+        clearTimeout(timer);
+        console.error(`⚠ codex queue could not be started (${error?.code ?? error}): ${binary}`);
+        end(false, null);
+      });
+      child.on("exit", (code) => {
+        clearTimeout(timer);
+        end(code === 0 && !timedOut, code);
+      });
+    };
+    if (now) return start();
+    codexWaiting.set(threadId, [...(codexWaiting.get(threadId) ?? []), { ticket: ++codexPushTicket, start }]);
+    drainCodexThread(threadId);
   };
 
-  const deliverToCodex = (threadId, room, text, { harvest = true, settled = null } = {}) => {
+  const deliverToCodex = (threadId, room, text, { harvest = true, settled = null, stillDue = null, now = false } = {}) => {
     const binary = findAgentBinary("codex");
     if (!binary) return "unavailable";
     // Answered before the spawn, because afterwards is too late to answer honestly: the
@@ -6683,59 +6719,61 @@ function startBridge(config) {
     // `settled` hears whether `codex queue` took it: exit 0, or not.
     if (!harvest) {
       let done = false;
-      const settle = (ok) => {
+      const settle = (ok, skipped) => {
         if (done) return;
         done = true;
-        settled?.(ok);
+        settled?.(ok, skipped);
       };
-      runCodexQueue(binary, threadId, text, (ok, code) => {
+      runCodexQueue(binary, threadId, text, (ok, code, skipped) => {
         if (!ok && code !== null) console.error(`⚠ codex queue exited ${code} for a notice to ${threadId}; it is tried again on the session's next event`);
-        settle(ok);
-      });
+        settle(ok, skipped);
+      }, { stillDue, now });
       return "queued";
     }
-    const rolloutPath = codexRolloutFor(threadId);
-    const reader = codexReaderFor(threadId);
-    const since = Date.now();
-    // Where the log ends now, if nothing has been read from it yet. The answer to this
-    // message is written after here, so nothing before it can be the answer — and
-    // starting here is what keeps every read to the bytes Codex added, instead of the
-    // whole log. A reader already placed by a confirmation or an earlier push keeps its
-    // place: it is at or before this point, and what it reads on the way is either
-    // claimed already or belongs to the room.
-    //
-    // This used to re-read the entire rollout once a second for up to two minutes, per
-    // message. A long session's log runs past 50 MB, which is ~300 ms of the bridge doing
-    // nothing else; two or three messages in flight kept it busy for most of every
-    // second, the app's health check went unanswered three times running, and the app
-    // killed the bridge — taking every sync room with it. Measured and reproduced
-    // 2026-10-07.
-    if (rolloutPath && reader.cursor === undefined) {
-      try {
-        reader.cursor = statSync(rolloutPath).size;
-        reader.path = rolloutPath;
-      } catch {}
-    }
+    // Everything below runs when the push really starts, not when it joins the line (#399
+    // audit): a reply window opened while it waited would close before Codex had read it.
+    const openReplyWindow = () => {
+      const rolloutPath = codexRolloutFor(threadId);
+      if (!rolloutPath) return;
+      const reader = codexReaderFor(threadId);
+      const since = Date.now();
+      // Where the log ends now, if nothing has been read from it yet. The answer to this
+      // message is written after here, so nothing before it can be the answer — and
+      // starting here is what keeps every read to the bytes Codex added, instead of the
+      // whole log. A reader already placed by a confirmation or an earlier push keeps its
+      // place: it is at or before this point, and what it reads on the way is either
+      // claimed already or belongs to the room.
+      //
+      // This used to re-read the entire rollout once a second for up to two minutes, per
+      // message. A long session's log runs past 50 MB, which is ~300 ms of the bridge doing
+      // nothing else; two or three messages in flight kept it busy for most of every
+      // second, the app's health check went unanswered three times running, and the app
+      // killed the bridge — taking every sync room with it. Measured and reproduced
+      // 2026-10-07.
+      if (reader.cursor === undefined) {
+        try {
+          reader.cursor = statSync(rolloutPath).size;
+          reader.path = rolloutPath;
+        } catch {}
+      }
+      reader.pollUntil = since + CODEX_REPLY_TIMEOUT_MS;
+      reader.wasPushed = true;
+      if (reader.pushedSince === null) reader.pushedSince = since;
+      armCodexPoll(reader);
+    };
+    let pushSettled = false;
+    const settlePush = (ok, skipped) => {
+      if (pushSettled) return;
+      pushSettled = true;
+      settled?.(ok, skipped);
+    };
+    // Without a log to read there is nothing to harvest, but the message is still
+    // delivered — the session will show it even if we cannot see the answer.
     // The caller has already been told "queued"; a push that could not even start is
     // one line on stderr, which is more than the silence it used to be. `settled` hears
     // whether `codex queue` actually took it (#341 audit r2), for what may only be counted
     // as handed over once it was.
-    let pushSettled = false;
-    const settlePush = (ok) => {
-      if (pushSettled) return;
-      pushSettled = true;
-      settled?.(ok);
-    };
-    runCodexQueue(binary, threadId, text, (ok) => settlePush(ok));
-
-    // Without a log to read there is nothing to harvest, but the message was still
-    // delivered — the session will show it even if we cannot see the answer.
-    if (!rolloutPath) return "queued";
-
-    reader.pollUntil = since + CODEX_REPLY_TIMEOUT_MS;
-    reader.wasPushed = true;
-    if (reader.pushedSince === null) reader.pushedSince = since;
-    armCodexPoll(reader);
+    runCodexQueue(binary, threadId, text, (ok, code, skipped) => settlePush(ok, skipped), { stillDue, onStart: openReplyWindow, now });
     return "queued";
   };
 
@@ -6889,55 +6927,77 @@ function startBridge(config) {
     mailRooms.get(push.roomName) !== push.room ||
     push.room.members.get(threadId) !== push.member ||
     (push.roomsOwnVoice && !push.room.messages.some((message) => message.seq === push.seq));
-  const drainCodexOutbox = (key) => {
-    const box = codexOutboxes.get(key);
-    if (!box || box.inFlight) return;
-    while (box.queue.length) {
-      const push = box.queue[0];
-      if (lapsed(box.threadId, push)) {
-        box.queue.shift();
-        continue;
+  // One thread takes one push at a time (`runCodexQueue`), so which box goes next is chosen here,
+  // only once nothing runs for the thread (#399 audit): the head sent first, across the thread's
+  // rooms and the pushes sent to it straight (`codexWaiting`). Chosen at enqueue would let a later room's message pass an earlier room's second one,
+  // still waiting behind its own head. A refused head is `held` until the session's next event or
+  // the next message for its room; a held room does not hold up the thread's other rooms (#380), so
+  // that one room's order is kept, and only it falls behind the rest.
+  const startCodexHead = (key, box) => {
+    const push = box.queue[0];
+    box.inFlight = true;
+    box.wokenInFlight = false;
+    const outcome = deliverToCodex(box.threadId, push.room, push.outgoing, {
+      now: true,
+      // What may have gone while it waited in line is judged at the real start.
+      stillDue: () => !lapsed(box.threadId, push),
+      settled: (ok, skipped) => {
+        box.inFlight = false;
+        const standing = mailRooms.get(push.roomName) === push.room && push.room.members.get(box.threadId) === push.member;
+        if (ok || skipped || !standing) {
+          box.queue.shift();
+          if (ok && standing) {
+            if (Number.isInteger(push.seq)) markRead(push.room, box.threadId, push.seq, new Date().toISOString());
+            push.onTaken?.();
+          }
+        } else if (!box.wokenInFlight) box.held = true;
+        if (!box.queue.length) codexOutboxes.delete(key);
+      },
+    });
+    if (outcome === "queued") return true;
+    box.inFlight = false;
+    box.held = true;
+    return false;
+  };
+  const drainCodexThread = (threadId) => {
+    while (!codexRunning.has(threadId)) {
+      let next = null;
+      const direct = codexWaiting.get(threadId);
+      if (direct) next = { ticket: direct[0].ticket, go: () => {
+        const { start } = direct.shift();
+        if (!direct.length) codexWaiting.delete(threadId);
+        start();
+        return true;
+      } };
+      for (const [key, box] of [...codexOutboxes]) {
+        if (box.threadId !== threadId || box.inFlight || box.held) continue;
+        while (box.queue.length && lapsed(threadId, box.queue[0])) box.queue.shift();
+        if (!box.queue.length) codexOutboxes.delete(key);
+        else if (!next || box.queue[0].ticket < next.ticket) next = { ticket: box.queue[0].ticket, go: () => startCodexHead(key, box) };
       }
-      box.inFlight = true;
-      box.wokenInFlight = false;
-      const outcome = deliverToCodex(box.threadId, push.room, push.outgoing, {
-        settled: (ok) => {
-          box.inFlight = false;
-          const standing = mailRooms.get(push.roomName) === push.room && push.room.members.get(box.threadId) === push.member;
-          if (ok || !standing) {
-            box.queue.shift();
-            if (ok && standing) {
-              if (Number.isInteger(push.seq)) markRead(push.room, box.threadId, push.seq, new Date().toISOString());
-              push.onTaken?.();
-            }
-            drainCodexOutbox(key);
-          } else if (box.wokenInFlight) drainCodexOutbox(key);
-          if (!box.queue.length && !box.inFlight) codexOutboxes.delete(key);
-        },
-      });
-      if (outcome !== "queued") box.inFlight = false;
-      return;
+      if (!next || next.go()) return;
     }
-    codexOutboxes.delete(key);
   };
   const wakeCodexOutboxes = (threadId) => {
-    for (const [key, box] of [...codexOutboxes]) {
+    for (const box of codexOutboxes.values()) {
       if (box.threadId !== threadId) continue;
       if (box.inFlight) box.wokenInFlight = true;
-      else drainCodexOutbox(key);
+      else box.held = false;
     }
+    drainCodexThread(threadId);
   };
   const pushToCodex = (recipient, roomName, room, outgoing, seq, onTaken = null, roomsOwnVoice = false) => {
     if (!findAgentBinary("codex")) return "unavailable";
     const key = `${recipient}\u0000${roomName}`;
-    const box = codexOutboxes.get(key) ?? { threadId: recipient, roomName, queue: [], inFlight: false, wokenInFlight: false };
+    const box = codexOutboxes.get(key) ?? { threadId: recipient, roomName, queue: [], inFlight: false, wokenInFlight: false, held: false };
     codexOutboxes.set(key, box);
     // Every entry behind the head is checked on every push, so what lapsed never accumulates
     // behind a head that keeps failing; the head in flight is settled by its own run.
     box.queue = box.queue.filter((push, index) => (index === 0 && box.inFlight) || !lapsed(recipient, push));
-    box.queue.push({ roomName, room, member: room.members.get(recipient), seq, outgoing, onTaken, roomsOwnVoice });
+    box.queue.push({ roomName, room, member: room.members.get(recipient), seq, outgoing, onTaken, roomsOwnVoice, ticket: ++codexPushTicket });
     if (box.inFlight) box.wokenInFlight = true;
-    else drainCodexOutbox(key);
+    else box.held = false;
+    drainCodexThread(recipient);
     return "queued";
   };
 
@@ -7004,7 +7064,9 @@ function startBridge(config) {
               " refused. Until then, do not retry and do not look for another way in —" +
               " nothing further will reach you.]";
         if (provider === "codexCliHook") {
-          if (deliverToCodex(recipient, room, notice) === "queued") queued = true;
+          // Waiting behind the thread's other runs, it is due only while the room and the member it tells still stand.
+          const stillDue = () => mailRooms.get(roomName) === room && room.members.get(recipient) === member;
+          if (deliverToCodex(recipient, room, notice, { stillDue }) === "queued") queued = true;
           else unavailable = true;
         } else if (provider === "agyHost" || provider === "claudeCodeHook") {
           waiting = true;
@@ -7779,6 +7841,9 @@ function startBridge(config) {
             // Pushes waiting in the Codex outboxes (#380 audit r4). Bounded by what the rooms
             // hold; a number that only grows is a leak.
             outboxed: [...codexOutboxes.values()].reduce((count, box) => count + box.queue.length, 0),
+            // Threads with a `codex queue` running or waiting its turn (#399). Zero once every
+            // push has ended; a number that only grows is a stuck line.
+            queueing: codexRunning.size + [...codexWaiting.values()].reduce((sum, waiting) => sum + waiting.length, 0),
           },
           // Whether the app has handed over the broker's word, how many sessions the
           // broker has bound, and the old-path collects refused on their behalf — the one

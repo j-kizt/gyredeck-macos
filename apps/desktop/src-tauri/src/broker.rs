@@ -198,6 +198,12 @@ pub(crate) type Confirmer = Arc<dyn Fn(&str, &str, &str) -> Result<(u16, Value),
 /// spent by another.
 pub(crate) type ApprovalUser = Arc<dyn Fn(&str, &str, &str) -> Result<(u16, Value), String> + Send + Sync>;
 
+/// The room the bound session is in at this moment, as the bridge answers it (#397):
+/// session -> (HTTP status, the bridge's answer). Asked with the broker's word, so a hook can
+/// learn its own session's room without holding a key, and from the bridge rather than from a
+/// batch held since an earlier turn. It reads; nothing is collected or acknowledged.
+pub(crate) type RoomReader = Arc<dyn Fn(&str) -> Result<(u16, Value), String> + Send + Sync>;
+
 /// Everything a running broker needs that is not the socket.
 #[derive(Clone)]
 pub(crate) struct Policy {
@@ -208,6 +214,7 @@ pub(crate) struct Policy {
     pub report_bound: BoundReporter,
     pub confirm: Confirmer,
     pub use_approval: ApprovalUser,
+    pub room_of: RoomReader,
 }
 
 /// The sessions bound to processes, both ways, and the rules that govern them.
@@ -910,11 +917,17 @@ pub(crate) fn handle_request(
         return for_bound_session(peer, cli, bindings, policy, "use", "used", |session| (policy.use_approval)(session, room, command));
     }
 
-    refused("invalid", "A request is {\"v\":1,\"bind\":{\"conversationId\"}}, {\"v\":1,\"collect\":{\"limit\"}}, {\"v\":1,\"ack\":{\"delivery\"}}, {\"v\":1,\"confirm\":{\"password\"}} or {\"v\":1,\"use\":{\"command\"}}.".to_string())
+    // The bound session's room now (#397): for the session this process is bound to, never
+    // one the request names, read from the bridge and not from any batch held for it.
+    if request.get("room").is_some() {
+        return for_bound_session(peer, cli, bindings, policy, "read its room", "room", |session| (policy.room_of)(session));
+    }
+
+    refused("invalid", "A request is {\"v\":1,\"bind\":{\"conversationId\"}}, {\"v\":1,\"collect\":{\"limit\"}}, {\"v\":1,\"ack\":{\"delivery\"}}, {\"v\":1,\"confirm\":{\"password\"}}, {\"v\":1,\"use\":{\"command\"}} or {\"v\":1,\"room\":{}}.".to_string())
 }
 
 /// A bridge call made for the session this process is bound to and the bridge acknowledged:
-/// a confirm (#294) or a use (#374). The answer is `key` beside `boundTo`. Asked again after
+/// a confirm (#294), a use (#374) or a room read (#397). The answer is `key` beside `boundTo`. Asked again after
 /// the call, as a collect is: a requester whose binding or chain changed meanwhile is not told
 /// the call went through.
 fn for_bound_session(
@@ -1018,7 +1031,7 @@ impl BrokerState {
     }
 
     /// The production policy: the OS answers eligibility and liveness, the bridge collects.
-    pub(crate) fn start_default(&self, collect: Collector, report_bound: BoundReporter, confirm: Confirmer, use_approval: ApprovalUser) -> Result<(), String> {
+    pub(crate) fn start_default(&self, collect: Collector, report_bound: BoundReporter, confirm: Confirmer, use_approval: ApprovalUser, room_of: RoomReader) -> Result<(), String> {
         let path = broker_socket_path().ok_or_else(|| "HOME is not set".to_string())?;
         self.start(
             path,
@@ -1030,6 +1043,7 @@ impl BrokerState {
                 report_bound,
                 confirm,
                 use_approval,
+                room_of,
             },
         )
     }
@@ -1501,6 +1515,7 @@ mod tests {
         Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|p: &Peer| KnownCli::from_executable_name(&p.ancestor_name).ok_or_else(|| Ineligible::UnknownExecutable(p.ancestor_name.clone()))),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1708,6 +1723,32 @@ mod tests {
     }
 
     #[test]
+    fn c397_a_room_read_asks_the_bridge_for_the_bound_session_now_and_takes_nothing() {
+        let bindings = Mutex::new(Bindings::default());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let mut policy = policy_accepting_everything();
+        policy.room_of = Arc::new({
+            let asked = Arc::clone(&asked);
+            move |session: &str| {
+                asked.lock().unwrap().push(session.to_string());
+                Ok((200, json!({ "ok": true, "room": "sync-q397", "you": session, "members": [{ "conversationId": session, "confirmed": true }] })))
+            }
+        });
+        let agy = peer(42, 40, "claude");
+        let read = json!({ "v": 1, "room": { "conversationId": "sess-b" } });
+        assert_eq!(ask(read.clone(), Some(&agy), &bindings, &policy)["error"], "unbound", "nothing is read for a process bound to no session");
+        assert!(asked.lock().unwrap().is_empty());
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "sess-a" } }), Some(&agy), &bindings, &policy)["ok"], true, "premise: bound");
+        let answer = ask(read, Some(&agy), &bindings, &policy);
+        assert_eq!(answer["ok"], true, "{answer}");
+        assert_eq!(answer["boundTo"], "sess-a");
+        assert_eq!(answer["room"]["room"], "sync-q397");
+        assert_eq!(*asked.lock().unwrap(), vec!["sess-a".to_string()], "the bound session, never the one written");
+        assert!(bindings.lock().unwrap().outstanding_for("sess-a").is_none(), "a read holds no batch for the session");
+        assert_eq!(ask(json!({ "v": 1, "room": {} }), Some(&peer(62, 60, "python3")), &bindings, &policy)["error"], "ineligible");
+    }
+
+    #[test]
     fn c294_a_confirm_lets_in_the_session_the_broker_bound_and_no_name_the_caller_wrote() {
         let bindings = Mutex::new(Bindings::default());
         let (policy, asked) = policy_confirming(200);
@@ -1797,6 +1838,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             // The chain broke while it was being looked at — the hook exited, or a shell in
@@ -1819,6 +1861,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1863,6 +1906,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1892,6 +1936,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -1963,6 +2008,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -2012,6 +2058,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new({ let alive = Arc::clone(&alive); move |_| *alive.lock().unwrap() }),
             chain_holds: Arc::new(|_| true),
@@ -2065,6 +2112,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Antigravity)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new({ let chain = Arc::clone(&chain); move |_| *chain.lock().unwrap() }),
@@ -2115,6 +2163,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new({ let chain = Arc::clone(&chain); move |_| *chain.lock().unwrap() }),
@@ -2148,6 +2197,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -2175,6 +2225,7 @@ mod tests {
         let policy = Arc::new(Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -2214,6 +2265,7 @@ mod tests {
         let policy = Arc::new(Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -2256,6 +2308,7 @@ mod tests {
         Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new({ let dead = Arc::clone(dead); move |key: ProcessKey| !dead.lock().unwrap().contains(&key.pid) }),
             chain_holds: Arc::new(|_| true),
@@ -2377,6 +2430,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -2502,6 +2556,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -2525,6 +2580,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -2585,6 +2641,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new({
                 let verdicts = Arc::clone(&verdicts);
                 move |_: &Peer| verdicts.lock().unwrap().remove(0)
@@ -2618,6 +2675,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|key: ProcessKey| platform::process_key(key.pid).is_some_and(|now| now == key)),
             chain_holds: Arc::new(platform::chain_holds),
@@ -2776,6 +2834,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),
@@ -2824,6 +2883,7 @@ mod tests {
         let policy = Policy {
             confirm: Arc::new(|_, _, _| Ok((200, json!({})))),
             use_approval: Arc::new(|_, _, _| Ok((404, json!({ "ok": false, "allowed": false })))),
+            room_of: Arc::new(|_| Ok((200, json!({ "ok": true, "room": null, "members": [], "you": null })))),
             eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
             alive: Arc::new(|_| true),
             chain_holds: Arc::new(|_| true),

@@ -10498,6 +10498,58 @@ test("the Antigravity hook's wait asks the broker, ends on mail, and is refused 
   }
 });
 
+test("an Antigravity member with no wait running is kept going once to start it, and only then (#397)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-397-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port: await freePort() }));
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "ab".repeat(32));
+  const me = `a3970000-0000-4000-8000-${randomBytes(6).toString("hex")}`;
+  // The broker's `room` read: the bridge's answer for the bound session now (#397 audit).
+  const roomNow = (room = {}) => ({ v: 1, ok: true, boundTo: me, room: { ok: true, room: "sync-q397", you: me, members: [{ conversationId: me, confirmed: true }], ...room } });
+  const stop = (fields = {}) => runAdapter("adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "Stop"], home,
+    { conversationId: me, workspacePaths: ["/tmp/p"], terminationReason: "NO_TOOL_CALL", continuationActive: false, executionNum: 0, ...fields });
+  const answerOf = (run) => { assert.equal(run.code, 0, run.stderr); return JSON.parse(run.stdout.trim().split("\n").at(-1)); };
+  let broker = null;
+  let running = null;
+  const withBroker = async (reply) => {
+    await broker?.close();
+    broker = await fakeBroker(home, (request) => (request.bind ? { v: 1, ok: true, bound: { conversationId: me, pid: 1 } } : request.room ? reply : { v: 1, ok: false, error: "invalid" }));
+  };
+  try {
+    await withBroker(roomNow());
+    let answer = answerOf(await stop());
+    assert.equal(answer.decision, "continue", "a member with no wait is kept going");
+    assert.match(answer.reason, new RegExp(`gyredeck-agy-hook\\.mjs wait 300 ${me}; rc=\\$\\?`), "told the exact wait to start");
+    assert.match(answer.reason, /room sync-q397/);
+    assert.deepEqual(broker.requests.map((r) => Object.keys(r).find((k) => k !== "v")), ["bind", "room"],
+      "membership is read through the broker's binding; nothing is collected, so nothing is held or taken at Stop");
+
+    const allowed = async (label, fields, reply = roomNow()) => {
+      await withBroker(reply);
+      const got = answerOf(await stop(fields));
+      assert.equal(got.decision, "allow", label);
+      return broker.requests;
+    };
+    assert.deepEqual(await allowed("already the continuation it asked for", { continuationActive: true }), [], "and the broker is not asked");
+    assert.deepEqual(await allowed("a turn the person cancelled", { terminationReason: "USER_CANCELED" }), []);
+    await allowed("left the room, or it closed", {}, roomNow({ room: null, members: [], you: null }));
+    await allowed("not yet let in", {}, roomNow({ members: [{ conversationId: me, confirmed: false }] }));
+    await allowed("the bridge answered for someone else", {}, roomNow({ you: "someone-else" }));
+    await allowed("an answer for another session", {}, { ...roomNow(), boundTo: "someone-else" });
+    await allowed("the bridge refused the read", {}, { v: 1, ok: false, error: "room", status: 403, boundTo: me, answer: { ok: false } });
+    await allowed("an app whose broker has no room read", {}, { v: 1, ok: false, error: "invalid", message: "A request is ..." });
+
+    // A wait already running for this session — the loop's own command line — is left alone.
+    running = spawn("sh", ["-c", `sleep 60; : gyredeck-agy-hook.mjs wait 300 ${me}`], { stdio: "ignore" });
+    await until(async () => String(spawnSync("ps", ["-axww", "-o", "command="]).stdout).includes(`wait 300 ${me}`), "the stand-in wait in ps");
+    assert.deepEqual(await allowed("a wait is running", {}), [], "and the broker is not asked");
+  } finally {
+    running?.kill();
+    await broker?.close();
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
 // ── Heavy runs (#223) ──
 
 const HEAVY_HELPER_DEADLINE_MS = 15_000;

@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 
 /**
  * Gyredeck AGY (Antigravity) Hook Adapter
@@ -931,6 +932,54 @@ const hearText = (room) =>
   "  · \"wait refused\" on its error output means it could not hear the room; say so to the person rather than starting it again.\n" +
   "  · Run it unmodified, and only one.";
 
+/**
+ * Whether a `wait` for this session is running on this machine, read from the process table:
+ * the loop agy runs it in carries the command line between waits too. `null` when the table
+ * cannot be read (no `ps`, as on Windows): then nobody is told to start one.
+ */
+const waitRunning = (conversationId) => new Promise((resolve) => {
+  execFile("ps", ["-axww", "-o", "command="], { timeout: 2_000, maxBuffer: 8 * 1024 * 1024 }, (error, stdout) => {
+    if (error) return resolve(null);
+    const mine = new RegExp(`gyredeck-agy-hook\\.mjs wait \\d+ ${conversationId}(?![A-Za-z0-9_-])`);
+    resolve(String(stdout).split("\n").some((line) => mine.test(line)));
+  });
+});
+
+/**
+ * At the end of a turn, the one thing agy lets a hook do about the next one (#397): a Stop hook
+ * may answer `continue`, and its reason reaches the model. Antigravity wakes only when one of its
+ * own background tasks exits, and a process a hook starts is not one (the hook's process group is
+ * killed when it ends), so the wait has to be started by the agent. This makes sure it is: a
+ * confirmed member with no wait running is kept going once, to start it. Once only —
+ * `continuationActive` says this turn is already that continuation — and only on a turn that
+ * ended normally, never on one the person cancelled.
+ *
+ * Membership is read through the broker (`room`), which asks the bridge for the bound session
+ * with its own word: it collects nothing, so no mail is moved or held at Stop.
+ */
+const keepHearing = async (conversationId, input) => {
+  if (!conversationId || !WAIT_ID.test(conversationId)) return null;
+  if (input.continuationActive === true || input.terminationReason !== "NO_TOOL_CALL") return null;
+  if ((await waitRunning(conversationId)) !== false) return null;
+  const bound = judgeBrokerAnswer(await askBroker({ bind: { conversationId } }));
+  if (!bound.result) return null;
+  // Asked of the bridge now, through the broker's binding: not from a collect, whose batch may
+  // have been held since an earlier turn and still name a room the session has left, or carry
+  // the key of a membership it has since rejoined under (#397 audit). Nothing is taken.
+  const read = judgeBrokerAnswer(await askBroker({ room: {} }));
+  const now = read.result;
+  if (!now || now.boundTo !== conversationId || now.room?.you !== conversationId) return null;
+  const room = now.room.room;
+  if (typeof room !== "string") return null;
+  const mine = Array.isArray(now.room.members) ? now.room.members.find((member) => member?.conversationId === conversationId) : null;
+  if (mine?.confirmed !== true) return null;
+  return `Before you stop: you are a member of room ${room}, and no wait is running for you, so ` +
+    "nobody in the room can reach you until someone types here. Start it now as a background task, " +
+    "then end your turn:\n" +
+    `while :; do node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 300 ${conversationId}; rc=$?; [ $rc -eq 4 ] || break; done\n` +
+    "If it was refused (\"wait refused\" on its error output), do not start it again: say so to the person instead.";
+};
+
 const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm = null) => {
   if (!token || !MAIL_ROOM_NAME.test(room)) return confirmLead(confirm);
   // Known before anything can fail, so a delivery that throws still says it (#250).
@@ -1206,10 +1255,10 @@ const main = async () => {
         return { injectSteps: [] };
       case "PostInvocation":
         return { injectSteps: [], terminationBehavior: "" };
-      // "allow" permits the turn to end. It must never be "continue": AGY reads that
-      // as "keep going" and answers every finished turn with "Stop hook blocked
-      // termination", looping the agent forever. The bridge POST below is what
-      // reports turn completion — it is independent of this decision.
+      // "allow" permits the turn to end, and is the default. "continue" keeps the agent
+      // going, so an unconditional one loops it forever (#15); it is answered only by
+      // keepHearing, once per turn (#397). The bridge POST below is what reports turn
+      // completion — it is independent of this decision.
       case "Stop":
         return { decision: "allow", reason: "" };
       default:
@@ -1273,6 +1322,8 @@ const main = async () => {
     // round-trip on a path that blocks the agent loop, so it should not be serialized
     // behind the event relay.
     let mailDrain = null;
+    // Stop only: why this turn must not end yet, if it must not (#397).
+    let hearing = null;
 
     if (eventType === "PreToolUse") {
       const toolName = input.toolCall?.name ?? "unknown";
@@ -1339,6 +1390,7 @@ const main = async () => {
       // several invocations, so treating this as turn completion would end the
       // turn early — `Stop` is the real completion signal.
     } else if (eventType === "Stop") {
+      hearing = keepHearing(conversationId, input).catch(() => null);
       posts.push(post(endpoint, token, "/hook/stop", {
         hookId: randomUUID(),
         hookEventName: "Stop",
@@ -1356,6 +1408,8 @@ const main = async () => {
       const [steps] = await Promise.all([mailDrain ?? [], ...posts]);
       if (mailDrain && steps.length > 0) agyResponse.injectSteps = steps;
     }
+    const keepGoing = await hearing;
+    if (keepGoing) Object.assign(agyResponse, { decision: "continue", reason: keepGoing });
 
     respond();
   } catch {

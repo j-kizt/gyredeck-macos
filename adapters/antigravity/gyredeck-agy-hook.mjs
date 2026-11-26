@@ -476,7 +476,7 @@ const OWNER_DISCORD_SENDER = "gyredeck-owner-discord";
  * elapsed deadline for the whole exchange: a request's own timeout is an idle timeout, and
  * a bridge that dribbled a byte at a time could hold the invocation for as long as it liked.
  */
-const getJsonStatus = (endpoint, token, path, deadlineMs = 750) =>
+const getJsonStatus = (endpoint, token, path, deadlineMs = 750, headers = {}) =>
   new Promise((resolve) => {
     let settled = false;
     const done = (value) => {
@@ -492,7 +492,7 @@ const getJsonStatus = (endpoint, token, path, deadlineMs = 750) =>
         port: endpoint.port,
         path,
         method: "GET",
-        headers: { accept: "application/json", "x-gyredeck-token": token },
+        headers: { ...headers, accept: "application/json", "x-gyredeck-token": token },
         timeout: deadlineMs,
       },
       (res) => {
@@ -965,10 +965,20 @@ const keepHearing = async (conversationId, input) => {
   if (!bound.result) return null;
   const collected = judgeBrokerAnswer(await askBroker({ collect: { limit: MAIL_MAX_STEPS, wakingOnly: true } }));
   const result = collected.result;
-  if (!result || result.boundTo !== conversationId || typeof result.room !== "string") return null;
-  const mine = Array.isArray(result.members) ? result.members.find((member) => member?.conversationId === conversationId) : null;
+  if (!result || result.boundTo !== conversationId) return null;
+  // The collect can hand back a batch held since an earlier turn, with the room and members as
+  // they were then: it says nothing about now. Only its key is used, to ask the bridge which
+  // room this session is in at this moment; a member who left, or whose room closed, is refused
+  // there and is not told to start a wait (#397 audit).
+  const key = typeof result.memberKey === "string" && /^[a-f0-9]{64}$/.test(result.memberKey) ? result.memberKey : null;
+  const [endpoint, token] = await Promise.all([readEndpoint(), readIngestToken()]);
+  if (!key || !token) return null;
+  const now = await getJsonStatus(endpoint, token, `/sync/rooms?as=${conversationId}`, 750, { "x-gyredeck-member": key });
+  const room = now.status === 200 && now.body?.ok === true && now.body.you === conversationId ? now.body.room : null;
+  if (typeof room !== "string") return null;
+  const mine = Array.isArray(now.body.members) ? now.body.members.find((member) => member?.conversationId === conversationId) : null;
   if (mine?.confirmed !== true) return null;
-  return `Before you stop: you are a member of room ${result.room}, and no wait is running for you, so ` +
+  return `Before you stop: you are a member of room ${room}, and no wait is running for you, so ` +
     "nobody in the room can reach you until someone types here. Start it now as a background task, " +
     "then end your turn:\n" +
     `while :; do node ~/.config/gyredeck/gyredeck-agy-hook.mjs wait 300 ${conversationId}; rc=$?; [ $rc -eq 4 ] || break; done\n` +

@@ -188,7 +188,7 @@ test("Codex's routing line takes attach= after yn and before name=, quoted or no
 });
 
 test(`rules v${ROOM_RULES_VERSION} have a Files section: outbox only, attach= for Codex, [file: …] lines, deleted on close`, () => {
-  assert.equal(ROOM_RULES_VERSION, 24);
+  assert.ok(ROOM_RULES_VERSION >= 24, "introduced in v24");
   const rules = roomRules("http://127.0.0.1:47621");
   const files = rules.slice(rules.indexOf("## Files"), rules.indexOf("## Narrate"));
   assert.match(files, /from `~\/\.config\/gyredeck\/outbox\/` only/);

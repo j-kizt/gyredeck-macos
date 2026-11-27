@@ -155,12 +155,15 @@ mod platform {
     /// wired up. `userInfo` would be the conventional place, but its dictionary wants
     /// key and value types that do not line up with what the bindings accept here, and
     /// a second field holding the same fact is a second field to keep in step.
-    pub fn deliver(identifier: &str, title: &str, body: &str) -> Result<(), String> {
+    pub fn deliver(identifier: &str, title: &str, subtitle: Option<&str>, body: &str) -> Result<(), String> {
         if !is_bundled() {
             return Err("Notifications require the installed app bundle (unavailable in dev)".to_string());
         }
         let content = UNMutableNotificationContent::new();
         content.setTitle(&NSString::from_str(title));
+        if let Some(subtitle) = subtitle {
+            content.setSubtitle(&NSString::from_str(subtitle));
+        }
         content.setBody(&NSString::from_str(body));
         // No trigger: `None` means deliver immediately.
         let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
@@ -250,7 +253,7 @@ mod platform {
         Err("Native macOS notifications are unavailable on this platform".to_string())
     }
 
-    pub fn deliver(_identifier: &str, _title: &str, _body: &str) -> Result<(), String> {
+    pub fn deliver(_identifier: &str, _title: &str, _subtitle: Option<&str>, _body: &str) -> Result<(), String> {
         Err("Native macOS notifications are unavailable on this platform".to_string())
     }
 
@@ -299,8 +302,9 @@ pub async fn open_notification_settings() -> Result<(), String> {
 pub async fn deliver_notification(
     identifier: String,
     title: String,
+    subtitle: Option<String>,
     body: String,
 ) -> Result<(), String> {
-    run_blocking(move || platform::deliver(&identifier, &title, &body)).await
+    run_blocking(move || platform::deliver(&identifier, &title, subtitle.as_deref(), &body)).await
 }
 

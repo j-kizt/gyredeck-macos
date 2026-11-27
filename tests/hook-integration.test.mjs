@@ -1835,7 +1835,7 @@ test("a room delivery carries only what the session can use, and points at the r
     assert.equal(reactionReceipt.handoff, undefined, "#409: a reaction hands nothing over");
     const reaction = await context();
     assert.doesNotMatch(reaction, /HAND-OFF: /, "#409: nor is the reminder on its delivery");
-    assert.match(reaction, /\[from Codex · reaction\] got it/);
+    assert.match(reaction, /\[from Codex \/ #codex-session-1 · reaction\] got it/, "#383: shown with its id, whole since claude-session-1 holds the last six");
     assert.doesNotMatch(reaction, /REPLY —/);
     // Nothing to answer gets one line instead of the whole brief (#341), and that line still
     // says the one rule that matters here (#157 audit).
@@ -1907,7 +1907,7 @@ test("a room delivery carries only what the session can use, and points at the r
     // and it is pointed at the rules.
     await post(`/mail/${code}`, { from: peer, to: agy, kind: "reaction", text: "noted" });
     const agyReaction = await steps();
-    assert.match(agyReaction, /\[gyredeck mail · from Codex · reaction\] noted/);
+    assert.match(agyReaction, /\[gyredeck mail · from Codex \/ #codex-session-1 · reaction\] noted/);
     assert.match(agyReaction, new RegExp(`Rules v${ROOM_RULES_VERSION}: ~/\\.config/gyredeck/room-rules\\.md`));
     assert.doesNotMatch(agyReaction, /answering is expected/);
     assert.match(agyReaction, /never answer a reaction/);
@@ -2643,6 +2643,43 @@ test("a password accepted in a turn whose mail is withheld still names the room,
   }
 });
 
+test("#383: the Claude hook shows a member as the bridge's `shown`, and as label / name only when an older bridge sends none", async () => {
+  // Reached on a real bridge when a password is accepted and the drain after it is withheld:
+  // the roster then comes from the confirmation's own answer, not from a roster line.
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-383-shown-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port: await freePort() }));
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "ab".repeat(32));
+  const me = "38300000-0000-4000-8000-0000000000c1";
+  const told = async (members) => {
+    const broker = await fakeBroker(home, (request) =>
+      request.bind ? { v: 1, ok: true, bound: { conversationId: me, pid: 1 } }
+        : request.confirm ? { v: 1, ok: true, boundTo: me, confirmed: { ok: true, room: "sync-3a83", members } }
+          : { v: 1, ok: false, error: "conflict", message: "two claims" });
+    try {
+      const result = await runAdapter(
+        "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
+        { hook_event_name: "UserPromptSubmit", session_id: me, cwd: "/tmp/project", prompt: `here it is ${"5e".repeat(16)}` },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+    } finally {
+      await broker.close();
+    }
+  };
+  try {
+    const mine = { conversationId: me, provider: "Claude Code · Worker", name: null, confirmed: true };
+    const audit = { conversationId: "codex-1", provider: "Codex · Auditor", name: "Gyre Audit", confirmed: true };
+    const current = await told([{ ...mine, shown: "Claude Code / #0000c1" }, { ...audit, shown: "Codex / Gyre Audit #a89722" }]);
+    assert.match(current, /the password you were just given was accepted/, "premise: the confirmed, withheld path");
+    assert.match(current, /Also here: Codex \/ Gyre Audit #a89722\./, "the bridge's own form");
+    const older = await told([mine, audit]);
+    assert.match(older, /Also here: Codex · Auditor \/ Gyre Audit\./, "an older bridge: label / name, as before");
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
 test("a password accepted while the bridge refuses the session's TCP read still names the room (#196 audit)", async () => {
   // The third way the drain after a confirmation could come back empty-handed: the broker
   // declines (`ineligible`), the hook falls back to TCP, and the bridge refuses a bound
@@ -3142,7 +3179,7 @@ test("a session declares the name it is called by on its first post; the room an
     const roster = async () => Object.fromEntries((await call("GET", `/sync/rooms?as=${founder}`)).body.members.map((m) => [m.conversationId, m]));
     const founderKey = await memberKeyAt(`http://127.0.0.1:${port}`, founder, token);
     const history = async () => (await call("GET", `/mail/${code}?as=${founder}&since=0`, null, token, { "x-gyredeck-member": founderKey })).body.messages;
-    const calledNotices = async () => (await history()).filter((message) => / is called /.test(message.text));
+    const calledNotices = async () => (await history()).filter((message) => / is now /.test(message.text));
     const post = (from, body) => call("POST", `/mail/${code}`, { from, kind: "tell", ...body });
 
     // Phase 1, nothing declared: the app's name when there is one, the label alone when not.
@@ -3162,7 +3199,7 @@ test("a session declares the name it is called by on its first post; the room an
     const askedContext = JSON.parse(asked.stdout).hookSpecificOutput.additionalContext;
     assert.match(askedContext, /NAME: the app has this session on record as "Altrix Assistant"\. Which name do you want the room to call you by/);
     assert.match(askedContext, /"to":"Antigravity","kind":"reaction","name":"YOUR NAME"/);
-    assert.match(askedContext, /\[from Antigravity · tell\] before anyone named themselves/);
+    assert.match(askedContext, /\[from Antigravity \/ #0000d2 · tell\] before anyone named themselves/);
     await post(founder, { to: "Antigravity", text: "a question for agy", kind: "ask" });
     const agyAsked = await runAdapter(
       "adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], home,
@@ -3191,7 +3228,7 @@ test("a session declares the name it is called by on its first post; the room an
     assert.equal(declared.status, 202, JSON.stringify(declared.body));
     assert.equal(declared.body.name, "Gyre Assistant");
     let notices = await calledNotices();
-    assert.deepEqual(notices.map((message) => message.text.split(" Members now")[0]), ["Claude Code is called Gyre Assistant."]);
+    assert.deepEqual(notices.map((message) => message.text.split(" Members now")[0]), ["Claude Code / #0000d1 is now Claude Code / Gyre Assistant."]);
     assert.equal(notices[0].kind, "notice");
     members = await roster();
     assert.equal(members[founder].name, "Gyre Assistant", "declared beats the app's name");
@@ -3201,7 +3238,7 @@ test("a session declares the name it is called by on its first post; the room an
     // Each message carries its sender as shown when it was posted: the declaring post already
     // under the new name, the ones before it under what stood then.
     const posted = await history();
-    assert.equal(posted.find((message) => message.text === "before anyone named themselves").fromShown, "Antigravity");
+    assert.equal(posted.find((message) => message.text === "before anyone named themselves").fromShown, "Antigravity / #0000d2");
     assert.equal(posted.find((message) => message.text === "a question for agy").fromShown, "Claude Code / Altrix Assistant");
     assert.equal(posted.find((message) => message.seq === declared.body.seq).fromShown, "Claude Code / Gyre Assistant");
     // And the stream a relay reads says the same.
@@ -3260,9 +3297,9 @@ test("a session declares the name it is called by on its first post; the room an
     );
     assert.equal(later.code, 0, later.stderr);
     const laterContext = JSON.parse(later.stdout).hookSpecificOutput.additionalContext;
-    assert.match(laterContext, /\[from Antigravity · tell\] BEFORE-THE-NAME/, "a message posted before a declaration keeps its sender as shown then");
+    assert.match(laterContext, /\[from Antigravity \/ #0000d2 · tell\] BEFORE-THE-NAME/, "a message posted before a declaration keeps its sender as shown then");
     assert.match(laterContext, /\[from Antigravity \/ Gyre Assistant · tell\] after the names/);
-    assert.match(laterContext, /Antigravity is called Gyre Assistant\./);
+    assert.match(laterContext, /Antigravity \/ #0000d2 is now Antigravity \/ Gyre Assistant\./);
     // #341: a name declared is the roster moving with nobody joining or leaving, so it rides
     // whole, with the new names.
     assert.match(laterContext, /Members now \(v\d+\): [^.]*Antigravity \/ Gyre Assistant/, "#341: the roster moved, so it rides again");
@@ -3333,7 +3370,7 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     // The room announcing a join is a fact about who is present: neither a request to
     // act on nor something to be warned about, so it carries neither framing.
     const notice = await context();
-    assert.match(notice, /\[from the room · notice\] Codex joined this room/);
+    assert.match(notice, /\[from the room · notice\] Codex \/ #codex-session-1 joined this room/);
     assert.doesNotMatch(notice, /what you are here for/);
     assert.doesNotMatch(notice, /information only/);
 
@@ -3353,7 +3390,7 @@ test("what an agent may act on depends on who sent it, in three tiers", async ()
     assert.doesNotMatch(fromRoomMate, /Members (now|changed)/);
     assert.match(fromRoomMate, /what you are here for/);
     assert.doesNotMatch(fromRoomMate, /information only/);
-    assert.match(fromRoomMate, /\[from Codex · /, "labelled by provider");
+    assert.match(fromRoomMate, /\[from Codex \/ #codex-session-1 · /, "shown by provider and id (#383)");
     // A reply belongs in the room, so every member sees it and the exchange stays in
     // one place rather than splitting into private mailboxes.
     assert.match(fromRoomMate, new RegExp(`/mail/${code}`));
@@ -4123,7 +4160,7 @@ test("Codex declares its name in its routing line, name=\"<Name>\" after the kin
     };
     const founderHeaders = await memberHeaders(`http://127.0.0.1:${port}`, founder, token);
     const history = async () => (await call("GET", `/mail/${code}?as=${founder}&since=0`, null, founderHeaders)).body.messages;
-    const notices = async () => (await history()).filter((message) => / is called /.test(message.text));
+    const notices = async () => (await history()).filter((message) => / is now /.test(message.text));
     const endTurn = () => call("POST", "/hook/stop", { hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: thread });
     const say = async (text) => {
       await appendFile(rollout, finishedTurn(text));
@@ -4137,7 +4174,7 @@ test("Codex declares its name in its routing line, name=\"<Name>\" after the kin
     const firstPush = roomPushes.map((prompt) => prompt.text).join("\n");
     assert.match(firstPush, /The app has you on record as "Codex Audit"\. Which name do you want the room to call you by/);
     assert.match(firstPush, /@everyone tell name="<Name>"/);
-    assert.match(firstPush, /\[Claude Code · tell\] HELD-BEFORE-THE-NAME/, "held mail keeps the sender as shown when it was said");
+    assert.match(firstPush, /\[Claude Code \/ #ounder · tell\] HELD-BEFORE-THE-NAME/, "held mail keeps the sender as shown when it was said");
     assert.match(firstPush, /\[Claude Code \/ Gyre Assistant · tell\] HELD-WITH-THE-NAME/);
     assert.equal((await notices()).filter((message) => /^Codex /.test(message.text)).length, 0, "premise: Codex has declared nothing yet");
 
@@ -4149,7 +4186,7 @@ test("Codex declares its name in its routing line, name=\"<Name>\" after the kin
     assert.equal(first.kind, "tell");
     assert.equal(first.to, "everyone");
     assert.equal(first.fromShown, "Codex / Gyre Audit");
-    assert.deepEqual((await notices()).map((message) => message.text.split(" Members now")[0]), ["Claude Code is called Gyre Assistant.", "Codex is called Gyre Audit."]);
+    assert.deepEqual((await notices()).map((message) => message.text.split(" Members now")[0]), ["Claude Code / #ounder is now Claude Code / Gyre Assistant.", "Codex / #33f182 is now Codex / Gyre Audit."]);
     const member = (await call("GET", `/sync/rooms?as=${founder}`)).body.members.find((m) => m.conversationId === thread);
     assert.equal(member.name, "Gyre Audit");
     assert.equal(member.recordedName, "Codex Audit");
@@ -7958,7 +7995,7 @@ test("a receipt says what landed: listening by name, one post for a repeated tel
     await post({ from: room.founder, to: room.thread, kind: "tell", text: "thanks" });
     assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("thanks"))));
     const receipt = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("thanks")).text;
-    assert.match(receipt, new RegExp(`Last sent \\(turn ${question.turnId.slice(0, 8)}, tell to Claude Code\\): seq \\d+\\.`));
+    assert.match(receipt, new RegExp(`Last sent \\(turn ${question.turnId.slice(0, 8)}, tell to Claude Code / #ounder\\): seq \\d+\\.`));
     assert.match(receipt, /has not failed: do not send it again/);
 
     // Codex repeating a tell is posted once too.
@@ -7979,7 +8016,7 @@ test("a receipt says what landed: listening by name, one post for a repeated tel
     await post({ from: room.founder, to: room.thread, kind: "tell", text: "last" });
     assert.ok(await room.until(async () => (await promptsIn(room.rollout)).some((prompt) => prompt.text.endsWith("last"))));
     const told = (await promptsIn(room.rollout)).find((prompt) => prompt.text.endsWith("last")).text;
-    assert.match(told, new RegExp(`\\(turn ${later.turnId.slice(0, 8)}, tell to Claude Code\\): repeats seq \\d+, not posted again`));
+    assert.match(told, new RegExp(`\\(turn ${later.turnId.slice(0, 8)}, tell to Claude Code / #ounder\\): repeats seq \\d+, not posted again`));
   } finally {
     await room.close();
   }
@@ -14788,20 +14825,20 @@ test("#339 C1 C3 C5 C6: a join, a confirmation, a name and a reaction wake nobod
     const relayed = relayWatch.frames();
     await relayWatch.stop();
     assert.match(relayed, /joined this room/, "C3: the relay is handed a quiet join");
-    assert.match(relayed, / is called Late Name/, "C3: and a quiet name");
+    assert.match(relayed, / is now Agent \/ Late Name/, "C3: and a quiet name");
     assert.match(relayed, /REACTION-TO-ALL/, "C3: and a reaction");
     await new Promise((resolve) => setTimeout(resolve, 100));
     const frames = founderWatch.frames();
     await founderWatch.stop();
     assert.doesNotMatch(frames, /joined this room/, "C1: a join does not wake");
     assert.doesNotMatch(frames, /was confirmed by the room's owner/, "C1: a confirmation does not wake");
-    assert.doesNotMatch(frames, / is called Late Name/, "C1: a name does not wake");
+    assert.doesNotMatch(frames, / is now Agent \/ Late Name/, "C1: a name does not wake");
     assert.doesNotMatch(frames, /REACTION-TO-FOUNDER/, "C5: a reaction to one member does not wake it");
     assert.doesNotMatch(frames, /REACTION-TO-ALL/, "C5: a reaction to everyone wakes nobody");
     const read = (await f.history(f.founder)).map((message) => message.text).join("\n");
     assert.match(read, /joined this room/, "C3: the join is still there to read");
     assert.match(read, /was confirmed by the room's owner/, "C3: so is the confirmation");
-    assert.match(read, / is called Late Name/, "C3: and the name");
+    assert.match(read, / is now Agent \/ Late Name/, "C3: and the name");
     assert.match(read, /REACTION-TO-FOUNDER/, "C3: and the reaction");
     // A watch reopened later must not replay what the live stream was spared.
     const again = await f.watch(f.founder);
@@ -14809,7 +14846,7 @@ test("#339 C1 C3 C5 C6: a join, a confirmation, a name and a reaction wake nobod
     await again.waitFor(/ASK-SENTINEL/, "C6: an ask still wakes");
     const replay = again.frames();
     await again.stop();
-    assert.doesNotMatch(replay, /joined this room|REACTION-TO|is called/, "C1 C5: nothing quiet comes back on a reopened watch");
+    assert.doesNotMatch(replay, /joined this room|REACTION-TO| is now /, "C1 C5: nothing quiet comes back on a reopened watch");
   } finally {
     await f.close();
   }
@@ -15102,7 +15139,7 @@ test("#339 C2: a Codex member is not pushed a join, a confirmation, a name or a 
     const after = await until(async () => { const m = await f.messagesTo(codex); return m.some((message) => /TELL-TO-CODEX/.test(message)) && m; }, "the tell's push");
     const since = after.slice(before);
     assert.equal(since.length, 1, `C2: one push, the tell: ${JSON.stringify(since)}`);
-    assert.doesNotMatch(since.join("\n"), /joined this room|was confirmed by the room's owner|is called Late Name|REACTION-TO-CODEX/, "C2: nothing quiet is pushed");
+    assert.doesNotMatch(since.join("\n"), /joined this room|was confirmed by the room's owner|is now Agent \/ Late Name|REACTION-TO-CODEX/, "C2: nothing quiet is pushed");
     // What Codex was not woken for still reaches it: the next push names who is in the room now.
     assert.match(since[0], /Late Name/, "C2: the next push carries the roster with the quietly joined member");
   } finally {

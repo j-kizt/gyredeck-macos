@@ -7,6 +7,7 @@ import type { IHeavyStatus } from "../setup/useHeavyRuns";
 import { gitChangesBetween, markOf, type IGitMark } from "./gitChanges";
 import { heavyChangesBetween, heavyMarkOf, type IHeavyMark } from "./heavyChanges";
 import { markOf as quotaMarkOf, quotaAlertsBetween, type QuotaMark } from "./usageAlerts";
+import { senderOf } from "../mail/useRoomInbox";
 import { USAGE_PROVIDERS } from "../usage/providers";
 import type { IAgentUsageState, UsageProviderId } from "../usage/types";
 
@@ -198,7 +199,7 @@ export const useNotifications = ({
 
     const current = settingsRef.current;
     const conversationId = lastLiveEvent.conversationId ?? "";
-    let plan: { identifier: string; title: string; body: string } | null = null;
+    let plan: { identifier: string; title: string; subtitle?: string; body: string } | null = null;
 
     if (lastLiveEvent.type === "attention_requested" && current.attention) {
       const data = lastLiveEvent.data;
@@ -213,7 +214,10 @@ export const useNotifications = ({
       const data = lastLiveEvent.data;
       plan = {
         identifier: `gyredeck.room.${conversationId}`,
-        title: `${data.fromLabel} in ${data.room}`,
+        // The room on its own line (#383): macOS cuts a long title at its end, and the sender
+        // is what must survive.
+        title: senderOf(data).shown,
+        subtitle: data.room,
         body: trim(data.preview) || "Open Gyredeck to read it.",
       };
     }

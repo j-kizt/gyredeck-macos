@@ -4827,8 +4827,11 @@ fn parse_members(value: &serde_json::Value) -> Vec<RoomMember> {
                 .filter_map(|member| {
                     let id = member.get("conversationId")?.as_str()?.to_string();
                     let label = member.get("provider").and_then(serde_json::Value::as_str).unwrap_or("Agent");
-                    let shown = match member.get("name").and_then(serde_json::Value::as_str) {
-                        Some(name) if !name.is_empty() => format!("{label} / {name}"),
+                    // The bridge's own shown form (#383); an older bridge sends none, and then
+                    // the label and name as it showed them.
+                    let shown = match (member.get("shown").and_then(serde_json::Value::as_str), member.get("name").and_then(serde_json::Value::as_str)) {
+                        (Some(shown), _) if !shown.is_empty() => shown.to_string(),
+                        (_, Some(name)) if !name.is_empty() => format!("{label} / {name}"),
                         _ => label.to_string(),
                     };
                     Some(RoomMember { id, shown })

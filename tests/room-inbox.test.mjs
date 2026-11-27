@@ -5,7 +5,7 @@ const module = new URL(
   "../apps/desktop/src/features/mail/useRoomInbox.ts",
   import.meta.url,
 );
-const { recordMessage, recordRoomMessages, retainedRegistry, retainOpenRooms, unreadIn } = await import(module.href);
+const { recordMessage, recordRoomMessages, retainedRegistry, retainOpenRooms, senderOf, unreadIn } = await import(module.href);
 
 /** Any listing taken after the fixtures below, which all sit at 10:00:00Z. */
 const LATER = Date.parse("2026-09-15T11:00:00Z");
@@ -188,4 +188,13 @@ test("c391 a burst of room messages is recorded whole, each once", () => {
   assert.equal(moved.s1.room, "sync-c3d4");
   const again = recordRoomMessages(moved, [...burst, event(1, "sync-c3d4")], recorded);
   assert.equal(again, moved, "what was already recorded is not recorded twice");
+});
+
+test("#383: a sender is shown as the room showed it, a twin's id kept apart, and by its label only when recorded before", () => {
+  assert.deepEqual(senderOf({ fromLabel: "Claude Code · Worker #eb5183", fromShown: "Claude Code / Gyre Assistant" }), { shown: "Claude Code / Gyre Assistant", who: "Claude Code / Gyre Assistant", twin: undefined });
+  assert.deepEqual(senderOf({ fromLabel: "Claude Code · Worker", fromShown: "Claude Code / Audit #4f2c1d" }), { shown: "Claude Code / Audit #4f2c1d", who: "Claude Code / Audit", twin: "#4f2c1d" });
+  assert.deepEqual(senderOf({ fromLabel: "Codex", fromShown: "Codex / #a89722" }), { shown: "Codex / #a89722", who: "Codex / #a89722", twin: undefined }, "an unnamed member's id is its name, not a twin's");
+  assert.deepEqual(senderOf({ fromLabel: "Codex · Auditor #01a211" }), { shown: "Codex · Auditor #01a211", who: "Codex · Auditor #01a211", twin: undefined }, "recorded before #383");
+  const [kept] = Object.values(recordRoomMessages({}, [{ id: "e1", type: "room_message", conversationId: "s1", timestamp: "2026-11-27T07:00:00Z", data: { room: "sync-a1b2", seq: 1, from: "c", fromLabel: "Codex", fromShown: "Codex / #a89722", kind: "ask", preview: "hi" } }], new Set()));
+  assert.equal(kept.messages[0].fromShown, "Codex / #a89722", "the inbox keeps what the bridge sent");
 });

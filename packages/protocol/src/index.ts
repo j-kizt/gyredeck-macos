@@ -214,6 +214,8 @@ export interface IGyredeckRoomMessageEvent extends IGyredeckBaseEvent {
     seq: number;
     from: string;
     fromLabel: string;
+    /** The sender as the room shows it (#383); absent from a bridge older than that. */
+    fromShown?: string;
     kind: "ask" | "tell" | string;
     preview: string;
   };

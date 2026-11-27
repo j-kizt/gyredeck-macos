@@ -235,7 +235,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 26;
+export const ROOM_RULES_VERSION = 27;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -244,7 +244,7 @@ Read this once per conversation, and again after a compaction or a resume. Every
 room names the version it expects; if it names a newer one than you read, read this file again.
 
 ## Who a message is for, and what it is for
-- \`to\` is a member or \`everyone\`. A member is shown as its room label, then \` / \` and its name — \`Codex / Altrix Audit\`. Address it by the label, the whole form as shown, or the name alone when no other member has that name or that label — a label always wins. Answer the member who asked — that wakes one session, not the room.
+- \`to\` is a member or \`everyone\`. A member is shown as its provider, then \` / \` and its name — \`Codex / Altrix Audit\` — or, with no name, \`#\` and the last six characters of its session id — \`Codex / #a1b2c3\`. When two members show the same provider and name, the one that came later also carries its id — \`Codex / Altrix Audit #4f2c1d\`. Address a member by the form as shown, by its name alone when no other member has that name, or by the \`to\` your REPLY command already holds. Answer the member who asked — that wakes one session, not the room.
 - \`kind\` is one of four:
   - **ask** wants an answer. One the owner can answer yes or no, mark yes/no when you send it (below): only then can they answer it with ✅ or ❌ from Discord. A ✅ is "yes" to that question, never an approval of a commit, a release, a credential or a settings change. An unmarked ask needs a typed answer, whatever its wording or language.
   - **tell** does not, but may draw a reaction. Acknowledge a tell with a reaction, never with a tell: a tell wakes whoever it is for, and they have nothing to do with it.
@@ -253,9 +253,9 @@ room names the version it expects; if it names a newer one than you read, read t
 - Leaving the fields out sends a tell to everyone and wakes every session in the room.
 
 ## Your name
-- The room calls you by the name you declare, on your **first post** after you are confirmed — the name your own instructions (CLAUDE.md, AGENTS.md) give you. Until then it uses the name the person gave you in the app, if any; with neither, your label alone.
+- The room calls you by the name you declare, on your **first post** after you are confirmed — the name your own instructions (CLAUDE.md, AGENTS.md) give you. Until then it uses the name the person gave you in the app, if any; with neither, your provider and id — \`Codex / #a1b2c3\`.
 - Claude Code and Antigravity: a \`name\` field beside \`to\` and \`kind\`. Codex: \`name="<Name>"\` after the kind on the first line — \`@everyone tell name="Gyre Audit" — on it\`.
-- The room announces it once and keeps the first name it is given; a later one is ignored. It is only what to call you: routing stays on your label, and the name alone addresses you only when no other member has that name or label. The app's own name for you is not changed.
+- The room announces it once and keeps the first name it is given; a later one is ignored. It is only what to call you: routing stays on your session, and the name alone addresses you only when no other member has that name. The app's own name for you is not changed.
 
 ## Sending
 - Claude Code and Antigravity: the command is in the delivery, under REPLY, whenever there is something to answer, with your own key already in it. Who a message is for and what it is for are fields of what you post, beside the text:
@@ -264,6 +264,7 @@ room names the version it expects; if it names a newer one than you read, read t
 \`\`\`
 - Claude Code and Antigravity mark a yes/no ask with \`"yesNo": true\` beside \`kind\`. It must be \`true\` or \`false\` and \`true\` only on an ask; anything else is refused with \`invalid_yes_no\` and nothing is sent.
 - An ask to \`gyredeck-owner-discord\` whose text reads as yes/no (\`ใช่/ไม่\`, \`yes/no\`, \`y/n\`, \`✅/❌\`) but has no \`"yesNo": true\` is refused with \`missing_yes_no\` and nothing is sent: a ✅/❌ on an unmarked ask never reaches you. Any other unmarked ask to the owner is sent, and its receipt carries a \`hint\`.
+- Asking the owner: send it as an ask to \`gyredeck-owner-discord\` with \`"yesNo": true\` (Codex: \`@gyredeck-owner-discord ask yn\`); the app puts the owner's mention in front of it. End the text with ✅/❌, then a last line saying you are waiting for their answer. Never use this shape on a tell, a reaction, or a reply.
 - While \`Discord\` is a member, never ask with a terminal picker (Claude Code's \`AskUserQuestion\`): the owner cannot see or answer it from the phone, and the Claude Code hook refuses it. Ask in the room, one ask per question to \`gyredeck-owner-discord\`.
 - Claude Code and Antigravity ask the owner for an approval code with \`"approval"\` beside \`kind\`, under Approval from Discord. Anything else there, or on anything but an ask to \`gyredeck-owner-discord\`, is refused with \`invalid_approval\` and nothing is sent.
 - Claude Code and Antigravity never put \`[to: …]\` or \`@…\` in \`text\`: they route only through the \`to\` and \`kind\` fields.
@@ -4031,6 +4032,15 @@ function startBridge(config) {
     const short = `${longest} #${conversationId.slice(0, 6)}`;
     return taken.has(short) ? `${longest} #${conversationId}` : short;
   };
+  /**
+   * The id a member is shown by when it has no name, or when another member already shows
+   * its name (#383), chosen at the door like its label. The last six, not the first: a Codex
+   * thread id is a UUIDv7, whose first six are a timestamp two threads can share.
+   */
+  const allocateTag = (room, conversationId) => {
+    const short = conversationId.slice(-6);
+    return [...room.members.values()].some((member) => member.tag === short) ? conversationId : short;
+  };
 
   /**
    * Take a member out of a room, keeping the name it was known by.
@@ -4043,6 +4053,7 @@ function startBridge(config) {
   const retireLabel = (room, conversationId) => {
     const member = room.members.get(conversationId);
     if (member?.label) room.formerLabels.set(conversationId, member.label);
+    if (member) room.formerShown.set(conversationId, shownIn(room, conversationId));
     room.members.delete(conversationId);
     purgeCodexOutboxes(room.name, conversationId);
     // A member taken out takes its unused code with it (#331 audit): put back, it needs a new one.
@@ -4322,12 +4333,11 @@ function startBridge(config) {
     providerLabelFor(conversationId);
 
   /**
-   * A member as the room shows it (#182): the routing label, then ` / ` and the name the
-   * person gave the session, if any. A slash is the one separator no label can hold — a
-   * label is a provider, a folder's last segment, or an id — so a shown form can never
-   * read as another member's label, which parentheses could (#182 audit). Addressing still matches the label alone — `to` takes the label —
-   * so a name two sessions share stays unambiguous and a name typed later changes nothing
-   * that routes.
+   * The name the person gave the session in the app, if any. A shown form joins provider and
+   * name with ` / `, the one separator no label can hold — a label is a provider, a folder's
+   * last segment, or an id — so a shown form can never read as another member's label, which
+   * parentheses could (#182 audit). The label still routes, so a name typed later changes
+   * nothing that routes.
    */
   const sessionNameOf = (conversationId) => {
     // Stored already cleaned (cleanSessionName), so it is shown as it is: cutting it again
@@ -4374,18 +4384,27 @@ function startBridge(config) {
     return { published, name };
   };
   const announceDeclaredName = (roomName, room, conversationId, name) =>
-    announceMembership(roomName, room, `${labelIn(room, conversationId)} is called ${name}.`);
+    announceMembership(roomName, room, `${shownAs(room, conversationId, null)} is now ${shownIn(room, conversationId)}.`);
   /**
    * The member an address names: its routing label, the whole form the room shows
-   * (`Codex / Altrix Audit`), or the name alone when no other member has it. Accepting
+   * (`Codex / Altrix Audit`), the form older bridges showed (`<label> / <name>`, still in
+   * headers an agent may copy), or the name alone when no other member has it. Accepting
    * every form the room shows means an agent has nothing to cut (#182 audit).
    */
+  const addressedAs = (room, id, wanted) =>
+    labelIn(room, id).toLowerCase() === wanted ||
+    shownIn(room, id).toLowerCase() === wanted ||
+    legacyShownIn(room, id).toLowerCase() === wanted;
   const memberByAddress = (room, target) => {
     const wanted = String(target).trim().toLowerCase();
     const ids = [...room.members.keys()];
-    const exact = ids.find((id) => labelIn(room, id).toLowerCase() === wanted || shownIn(room, id).toLowerCase() === wanted);
-    if (exact) return exact;
-    // A label always wins, so the name alone answers only when no other member's label
+    const byLabel = ids.find((id) => labelIn(room, id).toLowerCase() === wanted);
+    if (byLabel) return byLabel;
+    // A name may hold ` #`, so two members can show the same form (#383 audit): one that fits
+    // more than one member goes to none, never to whichever came first.
+    const byForm = ids.filter((id) => addressedAs(room, id, wanted));
+    if (byForm.length > 0) return byForm.length === 1 ? byForm[0] : null;
+    // A whole form wins, so the name alone answers only when no other member's label
     // or name is the same (#182 audit).
     const byName = ids.filter((id) => nameIn(room, id)?.toLowerCase() === wanted);
     return byName.length === 1 ? byName[0] : null;
@@ -4401,11 +4420,42 @@ function startBridge(config) {
     return [...room.members.keys()].filter((id) =>
       speakableBy(room, id) &&
       (id === String(target).trim() ||
-        labelIn(room, id).toLowerCase() === wanted ||
-        shownIn(room, id).toLowerCase() === wanted ||
+        addressedAs(room, id, wanted) ||
         nameIn(room, id)?.toLowerCase() === wanted));
   };
-  const shownAs = (room, conversationId, name) => (name ? `${labelIn(room, conversationId)} / ${name}` : labelIn(room, conversationId));
+  /**
+   * Whether this member carries its id after its name (#383): one member per room holds a
+   * provider and name plainly, and every other member showing them carries its id, so no two
+   * members show the same form. The first to be shown with them holds them, and keeps them
+   * while it is called that, in the room or out of it; a newcomer never changes how the
+   * holder is shown. A holder that takes another name lets them go to the next one shown.
+   */
+  const laterTwin = (room, conversationId, provider, name) => {
+    const key = `${provider}\n${name.toLowerCase()}`;
+    room.plainNames ??= new Map();
+    const holder = room.plainNames.get(key);
+    if (holder === conversationId) return false;
+    if (holder !== undefined && (!room.members.has(holder) || (providerLabelFor(holder) === provider && nameIn(room, holder)?.toLowerCase() === name.toLowerCase()))) return true;
+    room.plainNames.set(key, conversationId);
+    return false;
+  };
+  /**
+   * A member as the room shows it (#383): `<provider> / <name>`, or `<provider> / #<id>`
+   * with no name. Display only — the label still routes. The relay keeps its label, which
+   * is what the rules and the hooks know it by.
+   */
+  const shownAs = (room, conversationId, name) => {
+    const member = room.members.get(conversationId);
+    if (!member) return room.formerShown?.get(conversationId) ?? labelIn(room, conversationId);
+    if (member.relay) return member.label;
+    const provider = providerLabelFor(conversationId);
+    if (!name) return `${provider} / #${member.tag}`;
+    return laterTwin(room, conversationId, provider, name) ? `${provider} / ${name} #${member.tag}` : `${provider} / ${name}`;
+  };
+  const legacyShownIn = (room, conversationId) => {
+    const name = nameIn(room, conversationId);
+    return name ? `${labelIn(room, conversationId)} / ${name}` : labelIn(room, conversationId);
+  };
   const shownIn = (room, conversationId) => shownAs(room, conversationId, nameIn(room, conversationId));
   /** A message as the room showed its sender when it spoke, never as a later name would. */
   const senderShown = (room, message) => message.fromShown ?? shownIn(room, message.from);
@@ -4912,6 +4962,9 @@ function startBridge(config) {
       // A session is resumable and keeps its id, so one that leaves and is put back
       // is the same session — and a stable name that changes on return is not stable.
       formerLabels: new Map(),
+      // How each member that left was last shown (#383), so a line written about it later
+      // names it the way the room saw it.
+      formerShown: new Map(),
       // The name each session declared for itself here (#182), kept past its membership
       // as its label is, so the notice of its leaving still says it.
       declaredNames: new Map(),
@@ -5370,6 +5423,7 @@ function startBridge(config) {
         conversationId,
         provider: labelIn(room, conversationId),
         name: nameIn(room, conversationId),
+        shown: shownIn(room, conversationId),
         recordedName: sessionNameOf(conversationId),
         declared: room.declaredNames?.has(conversationId) === true,
         confirmed: member.confirmed === true,
@@ -5789,6 +5843,7 @@ function startBridge(config) {
               conversationId,
               provider: labelIn(sync.room, conversationId),
               name: nameIn(sync.room, conversationId),
+              shown: shownIn(sync.room, conversationId),
               recordedName: sessionNameOf(conversationId),
               declared: sync.room.declaredNames?.has(conversationId) === true,
               confirmed: member.confirmed === true,
@@ -6619,6 +6674,7 @@ function startBridge(config) {
             seq: message.seq,
             from: message.from,
             fromLabel: labelIn(room, message.from),
+            fromShown: senderShown(room, message),
             kind: message.kind,
             preview: String(message.text).replace(/\s+/g, " ").slice(0, 160),
           },
@@ -6876,8 +6932,8 @@ function startBridge(config) {
       // ten seconds, because "is there anything else?" is not an acknowledgement in
       // its own reading. A label it writes is something it can get right.
       " Open your message with one line saying who it is for and what it is:" +
-      " @everyone ask, @Antigravity tell, @everyone reaction, or any member as the room shows it" +
-      " in place of everyone. The line is removed before the room sees it. ask wants" +
+      " @everyone ask, @Codex / #a1b2c3 tell, @everyone reaction — any member as the room shows it," +
+      " or its name alone when no other member has it, in place of everyone. The line is removed before the room sees it. ask wants" +
       " an answer; tell does not but may draw a reaction; a reaction is a short line" +
       " saying it landed and where that leaves you — send one for a tell if it helps," +
       " acknowledge with a reaction and never with a tell, and never answer one, which" +
@@ -8351,11 +8407,7 @@ function startBridge(config) {
         }
         const members = [...room.members]
           .filter(([, member]) => member.relay !== true)
-          .map(([id]) => {
-            const label = labelIn(room, id);
-            const name = nameIn(room, id);
-            return { id, provider: usageProviderFor(id), shown: name && name !== label ? `${label} / ${name}` : label };
-          });
+          .map(([id]) => ({ id, provider: usageProviderFor(id), shown: shownIn(room, id) }));
         const usage = {};
         for (const { provider } of members) {
           if (!provider || provider in usage) continue;
@@ -8424,6 +8476,7 @@ function startBridge(config) {
         room.createdBy = conversationId;
         const founder = {
           label: allocateLabel(room, conversationId),
+          tag: allocateTag(room, conversationId),
           joinedAt: new Date().toISOString(),
           // Joining mid-conversation should not replay what was said before: a member
           // starts from where the room is now.
@@ -8665,6 +8718,7 @@ function startBridge(config) {
           if (relay) observeSession(conversationId, { provider: "discord" });
           room.members.set(conversationId, {
             label: allocateLabel(room, conversationId),
+            tag: allocateTag(room, conversationId),
             // The person pressing Connect is the consent a password exists to capture, as
             // pressing Create is for a founder; the relay reads by the app's word and is
             // refused every post (`refuseToPublish`).

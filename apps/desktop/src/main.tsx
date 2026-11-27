@@ -5,7 +5,7 @@ import { createRoot } from "react-dom/client";
 import type { GyredeckPresenceStatus } from "@gyredeck/protocol";
 import { SessionSyncPanel } from "./features/mail/SessionSyncPanel";
 import { useSyncRoom } from "./features/mail/useSyncRoom";
-import { unreadIn, useRoomInbox } from "./features/mail/useRoomInbox";
+import { senderOf, unreadIn, useRoomInbox } from "./features/mail/useRoomInbox";
 import { useMailRooms } from "./features/mail/useMailRooms";
 import { useNotifications } from "./features/notifications/useNotifications";
 import type { IGithubRepoStatus } from "./features/github/types";
@@ -1323,15 +1323,21 @@ const App = () => {
                       <div className="empty-text small">Nothing has been said to this session in a sync room</div>
                     ) : (
                       <ul className="session-sync-log">
-                        {[...sessionMessages].reverse().map((message) => (
+                        {[...sessionMessages].reverse().map((message) => {
+                          const sender = senderOf(message);
+                          return (
                           <li className="session-sync-message" key={`${message.room}:${message.seq}`}>
                             <span className="session-sync-message-head">
-                              <span className="session-sync-message-from">{message.fromLabel}</span>
+                              <span className="session-sync-message-from">
+                                <Tooltip label={sender.shown}><span className="session-sync-message-who">{sender.who}</span></Tooltip>
+                                {sender.twin ? <span className="session-sync-message-twin">&nbsp;{sender.twin}</span> : null}
+                              </span>
                               <span className="session-sync-message-meta">{message.kind} · {message.room} · {formatTime(message.at)}</span>
                             </span>
                             <span className="session-sync-message-text">{message.preview}</span>
                           </li>
-                        ))}
+                          );
+                        })}
                       </ul>
                     )
                   ) : (

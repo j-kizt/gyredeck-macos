@@ -476,7 +476,8 @@ test("the owner's Discord voice is the app's: named You (via Discord), told who 
     const unknown = await owner({ to: "Bob", kind: "ask", text: "hi Bob" });
     assert.equal(unknown.status, 400, JSON.stringify(unknown.body));
     assert.equal(unknown.body.error, "unknown_recipient");
-    assert.deepEqual(unknown.body.names, ["Agent", "Agent #peer-a"], "the agents, never the relay");
+    // #383: shown as provider and the last six of the id, never the routing label.
+    assert.deepEqual(unknown.body.names, ["Agent / #nder-1", "Agent / #peer-a"], "the agents, never the relay");
     const toRelay = await owner({ to: "Discord", kind: "ask", text: "hello relay" });
     assert.equal(toRelay.status, 400, "the relay is no one to write to");
     const reply = await owner({ to: "peer-a", kind: "ask", text: "yes, go ahead", inReplyTo: asked.body.seq });
@@ -1008,6 +1009,125 @@ test("#456 the whole roster of 8 sessions with the longest names, plus Discord, 
     assert.ok(bytes * 2 < CODEX_PUSH_ENVELOPE_RESERVE, `roster ${bytes} B against a ${CODEX_PUSH_ENVELOPE_RESERVE} B reserve`);
     console.log(`#456 roster of 8 sessions + Discord at the longest names: ${bytes} B (reserve ${CODEX_PUSH_ENVELOPE_RESERVE} B)`);
   } finally {
+    await h.stop();
+  }
+});
+
+test("#383: a member is shown as <provider> / <name> or <provider> / #<last 6>, decided at the door; only the later twin carries its id; the label still routes", async () => {
+  const h = await startBridge();
+  const id = (tail) => `38300000-0000-4000-8000-${tail}`;
+  const founder = id("0000000000f1");
+  const auditor = id("00000000a001");
+  const twin = id("00000000a002");
+  const scout = id("1000000ab12c");
+  const clash = id("2000000ab12c");
+  const late = id("00000000a003");
+  const appEvents = [];
+  const reader = new AbortController();
+  try {
+    const seen = async (conversationId, sourceKind, cwd, name) => {
+      await h.call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd, runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind }, data: { inputCount: 1 },
+      });
+      if (name) assert.equal((await h.call("PUT", `/sessions/names/${conversationId}`, { name })).status, 200);
+    };
+    await seen(founder, "claudeCodeHook", "/tmp/Worker", "Gyre Assistant");
+    await seen(auditor, "claudeCodeHook", "/tmp/Auditor", "Audit");
+    await seen(twin, "claudeCodeHook", "/tmp/Worker", "Audit");
+    await seen(scout, "agyHost", "/tmp/Worker", null);
+    await seen(clash, "agyHost", "/tmp/Auditor", null);
+    await seen(late, "claudeCodeHook", "/tmp/Late", "Audit");
+    const code = (await h.call("POST", "/sync/rooms", { conversationId: founder })).body.room;
+    for (const member of [auditor, twin, scout, clash]) {
+      await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: member });
+      await h.joinRoom(code, member);
+    }
+    const members = async () => (await h.call("GET", `/sync/rooms?as=${founder}`)).body.members;
+    const shownOf = async () => Object.fromEntries((await members()).map((m) => [m.conversationId, m.shown]));
+    const before = await members();
+    assert.deepEqual(before.map((m) => [m.provider, m.shown]), [
+      ["Claude Code", "Claude Code / Gyre Assistant"],
+      ["Claude Code · Auditor", "Claude Code / Audit"],
+      ["Claude Code · Worker", "Claude Code / Audit #00a002"],
+      ["Antigravity", "Antigravity / #0ab12c"],
+      ["Antigravity · Auditor", `Antigravity / #${clash}`],
+    ], "provider stays the routing label; the later twin alone carries the last six; a last six already taken gives the whole id");
+
+    // A newcomer with the same name never changes how the earlier ones are shown, and the
+    // twin keeps its id when the member it was told apart from leaves.
+    await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: late });
+    const withLate = await shownOf();
+    assert.equal(withLate[late], "Claude Code / Audit #00a003");
+    assert.equal(withLate[auditor], "Claude Code / Audit");
+    assert.equal(withLate[twin], "Claude Code / Audit #00a002");
+    assert.equal((await h.call("DELETE", `/sync/rooms/${code}/members/${auditor}`)).status, 200);
+    assert.equal((await shownOf())[twin], "Claude Code / Audit #00a002", "decided at the door, never recomputed from who is present");
+
+    // Who is addressed: the new shown form, the label, the form older bridges showed, the
+    // name alone when nobody else has it. Display never routes: a shared name is refused.
+    const asFounder = { "content-type": "application/json", ...(await asMember(h, founder, h.token)) };
+    const routedTo = async (to) => {
+      const sent = await h.call("POST", `/mail/${code}`, { from: founder, to, kind: "tell", text: `to ${to}` }, asFounder);
+      return sent.status === 202 ? (await h.call("GET", `/mail/${code}?as=${founder}&since=0`, null, asFounder)).body.messages.find((m) => m.seq === sent.body.seq).to : sent.body.error;
+    };
+    assert.equal(await routedTo("Claude Code / Audit #00a002"), twin, "the twin's whole shown form");
+    assert.equal(await routedTo("claude code / audit #00a003"), late, "in any case");
+    assert.equal(await routedTo("Antigravity / #0ab12c"), scout, "an unnamed member's shown form");
+    assert.equal(await routedTo(`Antigravity / #${clash}`), clash);
+    assert.equal(await routedTo("Antigravity · Auditor"), clash, "the label");
+    assert.equal(await routedTo("Claude Code · Worker / Audit"), twin, "the label / name form older bridges showed");
+    assert.equal(await routedTo("Gyre Assistant"), founder, "a name nobody else has");
+    assert.equal(await routedTo("Audit"), "not_in_room", "a name two members share names nobody");
+
+    // The owner's Discord address takes the shown form too.
+    const owner = await h.call("POST", `/mail/${code}`, { from: OWNER_DISCORD_SENDER, to: "Claude Code / Audit #00a003", kind: "tell", text: "from the owner" });
+    assert.equal(owner.status, 202, JSON.stringify(owner.body));
+
+    // A name declared on the first post is announced in display forms only.
+    const asScout = { "content-type": "application/json", ...(await asMember(h, scout, h.token)) };
+    const declared = await h.call("POST", `/mail/${code}`, { from: scout, to: "Gyre Assistant", kind: "ask", text: "who reviews?", name: "Scout" }, asScout);
+    assert.equal(declared.status, 202, JSON.stringify(declared.body));
+    const said = (await h.call("GET", `/mail/${code}?as=${founder}&since=0`, null, asFounder)).body.messages;
+    assert.ok(said.some((m) => m.text === "Antigravity / #0ab12c is now Antigravity / Scout."), JSON.stringify(said.map((m) => m.text)));
+    assert.equal(said.find((m) => m.seq === declared.body.seq).fromShown, "Antigravity / Scout");
+
+    // The app is told the sender as shown, beside the label it had before.
+    const stream = await fetch(`${h.base}/events/app?since=deadbeef:0`, { headers: { "x-gyredeck-token": h.token, "x-gyredeck-broker": APP_WORD }, signal: reader.signal });
+    const text = await (async () => {
+      let got = "";
+      const decoder = new TextDecoder();
+      const timer = setTimeout(() => reader.abort(), 400);
+      try {
+        for await (const chunk of stream.body) got += decoder.decode(chunk, { stream: true });
+      } catch {}
+      clearTimeout(timer);
+      return got;
+    })();
+    for (const line of text.split("\n")) if (line.startsWith("data: ")) appEvents.push(JSON.parse(line.slice(6)));
+    const ask = appEvents.find((event) => event.type === "room_message" && event.data.seq === declared.body.seq);
+    assert.ok(ask, "premise: the ask reached the app");
+    assert.equal(ask.data.fromShown, "Antigravity / Scout");
+    assert.equal(ask.data.fromLabel, "Antigravity");
+    const toLate = appEvents.find((event) => event.type === "room_message" && event.data.seq === owner.body.seq);
+    assert.equal(toLate?.conversationId, late, "the owner's shown-form address reached that member");
+    assert.equal(toLate.data.fromShown, "You (via Discord)", "the owner is shown as before");
+
+    // Two members given the same name in the app while both are in the room: the one shown
+    // with it first keeps it plain, and only the other carries its id.
+    for (const member of [late, founder]) assert.equal((await h.call("PUT", `/sessions/names/${member}`, { name: "Pair" })).status, 200);
+    const paired = await shownOf();
+    assert.deepEqual([paired[founder], paired[late]], ["Claude Code / Pair", "Claude Code / Pair #00a003"], "never both");
+
+    // A name the app accepts can read as a twin's whole form (#383 audit): the form then fits
+    // two members, and a message to it goes to neither, never to whichever came first.
+    assert.equal((await h.call("PUT", `/sessions/names/${founder}`, { name: "Audit #00a002" })).status, 200);
+    const lookalike = await shownOf();
+    assert.equal(lookalike[founder], lookalike[twin], "premise: two members show the same form");
+    assert.equal(await routedTo("Claude Code / Audit #00a002"), "not_in_room");
+    assert.equal(await routedTo("Claude Code · Worker"), twin, "the label still reaches the twin");
+  } finally {
+    reader.abort();
     await h.stop();
   }
 });

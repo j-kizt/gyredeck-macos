@@ -1259,9 +1259,9 @@ export const CODEX_PUSH_MAX_BYTES = 98_304;
  *
  * The confirmation carries the room's brief, and the brief names everyone present — so a
  * payload measured when a message was accepted grows when somebody else joins. A room is
- * capped at `MAIL_MAX_MEMBERS` members with short provider labels, so the whole of that
- * growth is a few hundred bytes; this reserve is an order of magnitude more, kept as
- * headroom rather than as a calculation that has to be right.
+ * capped at `MAIL_MAX_MEMBERS` sessions plus one Discord relay; that whole roster at the
+ * longest names a session can declare measured 1,136 bytes (#456), and this reserve is kept
+ * well above it as headroom rather than as a calculation that has to be right.
  */
 export const CODEX_PUSH_ENVELOPE_RESERVE = 4_096;
 
@@ -4850,6 +4850,7 @@ function startBridge(config) {
   // nothing else sets it.
   const MAIL_ROOM_IDLE_MS = Number(process.env.GYREDECK_MAIL_ROOM_IDLE_MS) || 3_600_000;
   const MAIL_MAX_MEMBERS = 8;
+  const sessionCount = (room) => [...room.members.values()].filter((member) => member.relay !== true).length;
   // A stream is closed after this long whether anything happened or not. A watcher
   // that is never hung up on outlives the reason it was armed: the room ends, the
   // session moves on, and the connection sits there proving nothing. Ending it on a
@@ -8655,7 +8656,9 @@ function startBridge(config) {
           return;
         }
         if (joining) {
-          if (room.members.size >= MAIL_MAX_MEMBERS) {
+          // The cap is for sessions (#456): the relay reads the room for the owner and takes
+          // no session's place, and a room has at most one of it.
+          if (relay ? sessionCount(room) < room.members.size : sessionCount(room) >= MAIL_MAX_MEMBERS) {
             sendJson(429, { ok: false, error: "room_full" });
             return;
           }
@@ -8877,8 +8880,9 @@ function startBridge(config) {
       })(),
       // Named so a listing can tell which rooms the person may close from here.
       founder: room.createdBy ?? null,
-              // The cap itself, so Settings can say a room is full without keeping a copy of it (#376).
+              // The session cap, and the sessions held against it: the relay is in `members` and in neither (#456).
               capacity: MAIL_MAX_MEMBERS,
+              sessions: sessionCount(room),
               lastMessageAt: room.messages.at(-1)?.ts ?? null,
               lastReadAt: reader.lastReadAt ?? null,
             };

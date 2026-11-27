@@ -8,8 +8,8 @@ export interface IMailRoom {
   members: string[];
   /** The session that created the room, and the only one that may close it. */
   founder: string | null;
-  /** The most members the bridge lets in; absent from a bridge that does not say. */
-  capacity?: number | null;
+  /** The sessions in it, the Discord relay left out (#456); absent from a bridge that does not say. */
+  sessions?: number | null;
   pending: number;
   subscribers: number;
   lastMessageAt: string | null;

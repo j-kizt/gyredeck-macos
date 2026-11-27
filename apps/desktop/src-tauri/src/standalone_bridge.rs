@@ -979,8 +979,9 @@ pub(crate) struct MailRoom {
     pub members: Vec<String>,
     /// The session that created the room, and the only one that may close it.
     pub founder: Option<String>,
-    /// The most members the bridge lets into this room; none from a bridge that does not say.
-    pub capacity: Option<u32>,
+    /// The sessions held against the room's cap, the Discord relay left out (#456); none from a
+    /// bridge that does not say.
+    pub sessions: Option<u32>,
     pub pending: u32,
     pub subscribers: u32,
     #[serde(rename = "lastMessageAt")]
@@ -1502,8 +1503,8 @@ fn mail_rooms_from(rooms: &[serde_json::Value]) -> Vec<MailRoom> {
                             .collect()
                     })
                     .unwrap_or_default(),
-                capacity: room
-                    .get("capacity")
+                sessions: room
+                    .get("sessions")
                     .and_then(serde_json::Value::as_u64)
                     .map(|value| value as u32),
                 room: name,
@@ -1583,22 +1584,29 @@ pub(crate) fn find_node_binary() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    /// Settings matches this line to give a full room its advice (`ROOM_FULL` in SetupPanel.tsx).
+    /// Held by every test that reads or writes the process-wide founded rooms: `spawn_bridge`
+    /// clears them, and run beside a test that founds a room it made that test fail.
+    static FOUNDED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn hold_founded() -> std::sync::MutexGuard<'static, ()> {
+        FOUNDED_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Settings shows this line after "Couldn't connect to Discord:", e.g. for a second relay (#456).
     #[test]
-    fn a_full_room_is_refused_with_the_line_settings_matches() {
+    fn a_full_room_is_refused_with_a_plain_line() {
         let refusal = serde_json::json!({ "ok": false, "error": "room_full" });
         assert_eq!(super::sync_error(429, &refusal), "That room is full");
     }
 
     #[test]
-    fn a_rooms_member_cap_reaches_settings_and_an_older_bridge_names_none() {
+    fn a_rooms_session_count_reaches_settings_and_an_older_bridge_names_none() {
         let rooms = super::mail_rooms_from(&[
-            serde_json::json!({ "room": "sync-full", "members": ["a", "b"], "capacity": 8 }),
+            serde_json::json!({ "room": "sync-full", "members": ["a", "b", "Discord"], "sessions": 2 }),
             serde_json::json!({ "room": "sync-older", "members": ["a"] }),
         ]);
-        assert_eq!((rooms[0].capacity, rooms[1].capacity), (Some(8), None));
+        assert_eq!((rooms[0].sessions, rooms[1].sessions), (Some(2), None));
         let shown = serde_json::to_value(&rooms[0]).unwrap();
-        assert_eq!(shown["capacity"].as_u64(), Some(8));
+        assert_eq!(shown["sessions"].as_u64(), Some(2));
     }
 
     #[test]
@@ -1619,6 +1627,7 @@ mod tests {
 
     #[test]
     fn a_room_that_ended_is_no_longer_founded() {
+        let _founded = hold_founded();
         let mut founded = super::FoundedRooms::default();
         founded.insert("sync-live");
         founded.insert("sync-gone");
@@ -1689,6 +1698,7 @@ mod tests {
 
     #[test]
     fn a_code_founded_again_while_its_old_room_is_closing_stays_founded() {
+        let _founded = hold_founded();
         for (code, leave) in [("sync-332-close", false), ("sync-332-leave", true)] {
             founded_rooms().insert(code);
             end_held(code, leave, true);
@@ -1972,6 +1982,7 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
 
     #[test]
     fn a_bridge_that_never_reads_its_handshake_is_stopped_inside_the_bound() {
+        let _founded = hold_founded();
         // 65 536 ids are megabytes, far past the pipe's capacity; a child that never reads
         // would hold a blocking write for good. spawn_bridge must come back inside its
         // deadline with the child gone, so the supervisor's loop keeps running.
@@ -2008,6 +2019,7 @@ process.stdin.on('end', () => server.close(() => process.exit(0)))
 
     #[test]
     fn a_ledger_that_cannot_be_read_spawns_no_bridge() {
+        let _founded = hold_founded();
         let Some(node) = find_node_binary() else { return };
         let handshake = BrokerHandshake {
             secret: "ab".repeat(32),

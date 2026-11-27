@@ -32,7 +32,8 @@ const NAMES = Object.keys(APP_FILES) as AppFileName[];
 
 const place = new Map<AppFileName, Place>();
 const held = new Map<AppFileName, string | null>();
-const saved = new Map<AppFileName, string | null>();
+/** The last value sent to the file, or read from it: what the file holds once saves settle. */
+const sent = new Map<AppFileName, string | null>();
 const timers = new Map<AppFileName, ReturnType<typeof setTimeout>>();
 const saving = new Map<AppFileName, Promise<unknown>>();
 
@@ -55,16 +56,17 @@ const legacyDrop = (name: AppFileName) => {
 const sendSave = (name: AppFileName) => {
   timers.delete(name);
   const text = held.get(name) ?? null;
-  if (place.get(name) !== "file" || text === null || text === saved.get(name)) return;
+  // Compared with what was last sent, not last confirmed: a change back to the file's value
+  // while another save is in flight must still be sent after it (#300 audit).
+  if (place.get(name) !== "file" || text === null || text === sent.get(name)) return;
+  sent.set(name, text);
   // One name's saves go one after another, so the last made is the last kept.
   const done = (saving.get(name) ?? Promise.resolve())
     .then(() => invoke("app_file_save", { name, text }))
-    .then(() => {
-      saved.set(name, text);
-      legacyDrop(name);
-    })
+    .then(() => legacyDrop(name))
     .catch(() => {
-      // Still owed: the next write, or the next spacing, tries again.
+      // Still owed: what the file holds is unknown now, so the next try sends whatever is held.
+      sent.delete(name);
       if (!timers.has(name)) timers.set(name, setTimeout(() => sendSave(name), SAVE_SPACING_MS));
     });
   saving.set(name, done);
@@ -97,15 +99,16 @@ const loadOne = async (name: AppFileName): Promise<void> => {
     return;
   }
   place.set(name, "file");
-  if (loaded.state === "ok") {
-    held.set(name, loaded.text);
-    saved.set(name, loaded.text);
-    legacyDrop(name);
-    return;
-  }
-  saved.set(name, null);
-  held.set(name, legacyRead(name));
-  sendSave(name);
+  const fileText = loaded.state === "ok" ? loaded.text : null;
+  sent.set(name, fileText);
+  // A localStorage copy beside a file is never older than it: a file run removes the copy
+  // once a save lands, so one still there was written after (a run that could not reach the
+  // file, or an older version of the app). It goes into the file, and is removed only after
+  // the file holds it (#300 audit).
+  const legacy = legacyRead(name);
+  held.set(name, legacy ?? fileText);
+  if (legacy !== null && legacy === fileText) legacyDrop(name);
+  else sendSave(name);
 };
 
 let loading: Promise<void> | null = null;

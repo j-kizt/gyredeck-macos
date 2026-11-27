@@ -10,7 +10,7 @@ import { expect, test, type Page } from "@playwright/test";
 const KEY = "gyredeck.room-inbox";
 /** A registry the inbox can render, tagged so each copy can be told apart. */
 const inbox = (tag: string) => JSON.stringify({ [tag]: { room: "sync-a1b2", messages: [], readAt: null } });
-type Load = "absent" | "ok" | "unreadable" | "throws" | "hangs" | "odd";
+type Load = "absent" | "ok" | "unreadable" | "throws" | "hangs" | "odd" | "throwsThenOk";
 type Mode = { load: Load; failSaves?: number; saveDelayMs?: number };
 type Entry = { at: number; what: string; name?: string; text?: string };
 
@@ -41,6 +41,12 @@ const open = async (page: Page, mode: Mode, legacy: string | null) => {
             if (args?.name !== "room-inbox") return { state: "absent" };
             log.push({ at: performance.now(), what: "load" });
             if (mode.load === "throws") throw new Error("no app data folder");
+            if (mode.load === "throwsThenOk") {
+              const run = Number(sessionStorage.getItem("run") ?? "0") + 1;
+              sessionStorage.setItem("run", String(run));
+              if (run === 1) throw new Error("app data folder busy");
+              return { state: "ok", text: fileText };
+            }
             if (mode.load === "hangs") return new Promise(() => undefined);
             if (mode.load === "odd") return { state: "ok", text: 5 };
             if (mode.load === "unreadable") return { state: "unreadable", reason: "permission denied" };
@@ -110,12 +116,41 @@ test("a failed save keeps the old copy and is tried again until one lands", asyn
   expect(removed!.at).toBeGreaterThanOrEqual(entries.find((entry) => entry.what === "save done")!.at);
 });
 
-test("a file already holding the cache wins, and a leftover localStorage copy is removed", async ({ page }) => {
-  await open(page, { load: "ok" }, inbox("legacy"));
+test("a file with no localStorage copy beside it is read and not saved again", async ({ page }) => {
+  await open(page, { load: "ok" }, null);
   expect(await read(page)).toBe(inbox("file"));
+  await page.waitForTimeout(2_500);
+  expect((await log(page)).filter((entry) => entry.what === "save")).toEqual([]);
+});
+
+test("a localStorage copy beside the file is the newer one: it is saved to the file, then removed", async ({ page }) => {
+  await open(page, { load: "ok", saveDelayMs: 300 }, inbox("legacy"));
+  expect(await read(page)).toBe(inbox("legacy"));
+  await expect.poll(async () => (await log(page)).map((entry) => entry.what)).toContain("localStorage.removeItem");
   const entries = await log(page);
-  expect(entries.map((entry) => entry.what)).toContain("localStorage.removeItem");
-  expect(entries.filter((entry) => entry.what === "save")).toEqual([]);
+  const done = entries.find((entry) => entry.what === "save done");
+  expect(done?.text).toBe(inbox("legacy"));
+  expect(entries.find((entry) => entry.what === "localStorage.removeItem")!.at).toBeGreaterThanOrEqual(done!.at);
+});
+
+test("what a run wrote to localStorage when it could not reach the file is kept by the next run", async ({ page }) => {
+  await open(page, { load: "throwsThenOk" }, null);
+  await write(page, inbox("written-while-unreachable"));
+  await page.reload();
+  await expect(page.locator("#root > *").first()).toBeAttached({ timeout: 10_000 });
+  expect(await read(page)).toBe(inbox("written-while-unreachable"));
+  await expect.poll(async () => (await log(page)).filter((entry) => entry.what === "save done").map((entry) => entry.text)).toEqual([inbox("written-while-unreachable")]);
+});
+
+test("a change back to the file's value while another save is in flight is still saved after it", async ({ page }) => {
+  await open(page, { load: "ok", saveDelayMs: 500 }, null);
+  const flush = () => page.evaluate(async () => (await import("/src/features/storage/appFiles.ts")).flushAppFiles());
+  await write(page, inbox("b"));
+  await flush();
+  await expect.poll(async () => (await log(page)).filter((entry) => entry.what === "save").length).toBe(1);
+  await write(page, inbox("file"));
+  await flush();
+  await expect.poll(async () => (await log(page)).filter((entry) => entry.what === "save done").map((entry) => entry.text)).toEqual([inbox("b"), inbox("file")]);
 });
 
 test("a file that cannot be read is never saved over, and nothing goes to localStorage", async ({ page }) => {

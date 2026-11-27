@@ -133,12 +133,15 @@ const assetRoot = join(distRoot, "assets");
  * #383 (members shown as provider / name or / #id, twin span, tooltip, notification subtitle)
  * read 124,232 / 127,305 after trimming, 13 B under with main itself at 0 B. Both raised 64 B,
  * by the owner from Discord on 2026-11-27 ("yes", sync-7am7 seq 136 to 129).
+ * #459 (Reconnect on the Discord row: the press, its spin, and the line saying when it was tried
+ * again) read 124,332 locally, 87 B over after cutting the first draft by 86 B. Both raised by
+ * 160 B, by the owner from Discord on 2026-11-27 ("yes", sync-7am7 seq 97 to 91).
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 124_309,
-  jsTotalGzipBytes: 127_381,
+  jsGzipBytes: 124_405,
+  jsTotalGzipBytes: 127_477,
 };
 
 const walk = async (directory) => {

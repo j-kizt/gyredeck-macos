@@ -801,6 +801,54 @@ process.stdout.write(JSON.stringify({ t: 'error', code: 'bad_token', message: 'D
     wait_until("a restart on a new token", || read(&spawns).lines().count() == 2);
 }
 
+/// Reconnect (#459): a connector stopped on an error is replaced at once, with no backoff, the
+/// room still followed and what Discord had not taken handed to the new child.
+#[test]
+fn reconnect_starts_a_fresh_child_at_once_and_keeps_the_rooms() {
+    let f = fixture_with("reconnect", Some(TOKEN), &[(CONFIG_FORUM, "223456789012345678")]);
+    let script = f.dir.join("connector.mjs");
+    fs::write(
+        &script,
+        r#"import { appendFileSync, readFileSync } from 'node:fs'
+const out = process.argv[1]
+appendFileSync(out + '.spawns', 'spawn\n')
+const n = readFileSync(out + '.spawns', 'utf8').trim().split('\n').length
+let buffer = ''
+process.stdin.setEncoding('utf8')
+process.stdin.on('data', (chunk) => {
+  buffer += chunk
+  let at
+  while ((at = buffer.indexOf('\n')) >= 0) { appendFileSync(out + '.lines' + n, buffer.slice(0, at + 1)); buffer = buffer.slice(at + 1) }
+})
+process.stdin.on('end', () => process.exit(0))
+process.stdout.write(JSON.stringify({ t: 'ready', v: 1, bot: { id: '42', username: 'Gyre Bot' }, applicationId: '123456789012345678', forums: [{ id: '223456789012345678', name: 'rooms', guildId: '1', guildName: 'Mine' }] }) + '\n')
+"#,
+    )
+    .unwrap();
+    let lines = |n: u32| read(&PathBuf::from(format!("{}.lines{n}", script.display())));
+    let started = || read(&f.dir.join("supervisor.log")).matches("discord_started").count();
+    f.state.start(node(), script.clone()).unwrap();
+    wait_until("the first child ready", || f.state.status().ready);
+    log_of(&f, ROOM, 1..=2);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("both lines handed to the first child", || lines(1).matches(r#""t":"message""#).count() == 2);
+    on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Error { code: "internal".into(), message: "Opening handshake has timed out".into(), room: None, held: false, forum_id: None });
+    assert_eq!(f.state.status().error.map(|error| error.code).as_deref(), Some("internal"), "premise: stopped on an error");
+    assert_eq!(started(), 1, "premise: one child so far");
+
+    let pressed = Instant::now();
+    let status = f.state.reconnect().unwrap();
+    assert!(status.error.is_none(), "the last child's error goes with it");
+    wait_until("a second child", || started() == 2);
+    // A child that died after a short run waits two seconds before the next one.
+    assert!(pressed.elapsed() < Duration::from_millis(1500), "started at once, not after the backoff: {:?}", pressed.elapsed());
+    wait_until("the second child ready", || f.state.status().ready);
+    assert_eq!(f.state.status().connected_rooms, vec![ROOM.to_string()], "the room is still followed");
+    wait_until("what Discord had not taken, handed again", || lines(2).matches(r#""t":"message""#).count() == 2);
+    assert!(lines(2).contains(r#""t":"connect""#));
+    f.state.shutdown();
+}
+
 #[test]
 fn remove_deletes_the_keychain_item_stops_the_child_and_clears_the_settings() {
     let f = fixture_owned(

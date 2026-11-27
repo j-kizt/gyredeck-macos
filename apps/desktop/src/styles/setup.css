@@ -328,6 +328,10 @@
   padding: 0;
 }
 
+.setup-row-main > .pill-btn.icon-only + .pill-btn {
+  margin-left: -3px;
+}
+
 .setup-row-stack .setup-row-actions {
   justify-content: flex-end;
 }

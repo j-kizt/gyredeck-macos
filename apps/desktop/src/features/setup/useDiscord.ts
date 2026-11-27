@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { disconnectAll, type IDisconnectAllResult } from "./disconnectAll";
 
 /** `discord_status()`, as the native side answers it (#199). */
@@ -55,12 +55,15 @@ export const useDiscord = (canUseNativeControls: boolean): IUseDiscord => {
   const [busy, setBusy] = useState(false);
   const [stillConnected, setStillConnected] = useState<IDisconnectAllResult["failed"]>([]);
 
+  // A read answered after a later one is dropped: what it saw is older than what is shown (#459).
+  const asked = useRef(0);
+  const shown = useRef(0);
   const read = useCallback(async () => {
-    try {
-      setStatus(await invoke<IDiscordStatus>("discord_status"));
-    } catch {
-      setStatus(null);
-    }
+    const ticket = ++asked.current;
+    const next = await invoke<IDiscordStatus>("discord_status").catch(() => null);
+    if (ticket < shown.current) return;
+    shown.current = ticket;
+    setStatus(next);
   }, []);
 
   useEffect(() => {

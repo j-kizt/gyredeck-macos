@@ -235,7 +235,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 25;
+export const ROOM_RULES_VERSION = 26;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -264,6 +264,7 @@ room names the version it expects; if it names a newer one than you read, read t
 \`\`\`
 - Claude Code and Antigravity mark a yes/no ask with \`"yesNo": true\` beside \`kind\`. It must be \`true\` or \`false\` and \`true\` only on an ask; anything else is refused with \`invalid_yes_no\` and nothing is sent.
 - An ask to \`gyredeck-owner-discord\` whose text reads as yes/no (\`ใช่/ไม่\`, \`yes/no\`, \`y/n\`, \`✅/❌\`) but has no \`"yesNo": true\` is refused with \`missing_yes_no\` and nothing is sent: a ✅/❌ on an unmarked ask never reaches you. Any other unmarked ask to the owner is sent, and its receipt carries a \`hint\`.
+- While \`Discord\` is a member, never ask with a terminal picker (Claude Code's \`AskUserQuestion\`): the owner cannot see or answer it from the phone, and the Claude Code hook refuses it. Ask in the room, one ask per question to \`gyredeck-owner-discord\`.
 - Claude Code and Antigravity ask the owner for an approval code with \`"approval"\` beside \`kind\`, under Approval from Discord. Anything else there, or on anything but an ask to \`gyredeck-owner-discord\`, is refused with \`invalid_approval\` and nothing is sent.
 - Claude Code and Antigravity never put \`[to: …]\` or \`@…\` in \`text\`: they route only through the \`to\` and \`kind\` fields.
 - Codex only — you do not send. The last thing you write in a turn is posted for you; its first line says where it goes — \`@<member or everyone> ask|tell|reaction\`, with \`yn\` right after \`ask\` for a yes/no ask (\`@Claude Code ask yn — merge it?\`) and \`name="<Name>"\` after that on your first message — and is removed before the room sees it. This first line is Codex's alone. Say everything in one closing message. Without the line, your message goes back to whoever wrote to you: as a tell if they asked, as a reaction otherwise, which wakes nobody.

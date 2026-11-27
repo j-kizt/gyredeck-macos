@@ -10550,6 +10550,64 @@ test("an Antigravity member with no wait running is kept going once to start it,
   }
 });
 
+test("a Claude Code session in a room with the owner's Discord is refused a terminal picker, and only then (#381)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-381-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port: await freePort() }));
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "ab".repeat(32));
+  const me = `a3810000-0000-4000-8000-${randomBytes(6).toString("hex")}`;
+  const discord = { conversationId: "discord-sync-q381", provider: "Discord", confirmed: true };
+  const roomNow = (room = {}) => ({ v: 1, ok: true, boundTo: me, room: { ok: true, room: "sync-q381", you: me, members: [{ conversationId: me, provider: "Claude Code", confirmed: true }, discord], ...room } });
+  const ask = (tool = "AskUserQuestion") => runAdapter("adapters/claude/gyredeck-claude-hook.mjs", ["--event", "PreToolUse"], home,
+    { hook_event_name: "PreToolUse", session_id: me, cwd: "/tmp/p", tool_name: tool, tool_input: tool === "Bash" ? { command: "ls" } : { questions: [] } });
+  let broker = null;
+  const withBroker = async (reply) => {
+    await broker?.close();
+    broker = await fakeBroker(home, (request) => (request.bind ? { v: 1, ok: true, bound: { conversationId: me, pid: 1 } } : request.room ? reply : { v: 1, ok: false, error: "invalid" }));
+  };
+  try {
+    await withBroker(roomNow());
+    const refused = await ask();
+    assert.equal(refused.code, 0, refused.stderr);
+    const out = JSON.parse(refused.stdout.trim().split("\n").at(-1)).hookSpecificOutput;
+    assert.equal(out.hookEventName, "PreToolUse");
+    assert.equal(out.permissionDecision, "deny", "the picker is refused while the owner's Discord is in the room");
+    assert.match(out.permissionDecisionReason, /gyredeck-owner-discord/, "and told where to ask instead");
+    assert.match(out.permissionDecisionReason, /"yesNo": true/);
+    assert.deepEqual(broker.requests.map((r) => Object.keys(r).find((k) => k !== "v")), ["bind", "room"],
+      "membership is read through the broker's binding; nothing is collected, so no mail is taken");
+
+    const allowed = async (label, reply, tool = "AskUserQuestion") => {
+      await withBroker(reply);
+      const run = await ask(tool);
+      assert.equal(run.code, 0, run.stderr);
+      assert.equal(run.stdout.trim(), "", label);
+    };
+    await allowed("another tool is never refused", roomNow(), "Bash");
+    await allowed("no Discord in the room", roomNow({ members: [{ conversationId: me, provider: "Claude Code", confirmed: true }] }));
+    await allowed("a Discord member not yet confirmed", roomNow({ members: [{ conversationId: me, provider: "Claude Code", confirmed: true }, { ...discord, confirmed: false }] }));
+    await allowed("this session not let in, so it cannot ask in the room either", roomNow({ members: [{ conversationId: me, confirmed: false }, discord] }));
+    await allowed("in no room", roomNow({ room: null, members: [], you: null }));
+    await allowed("the bridge answered for someone else", roomNow({ you: "someone-else" }));
+    await allowed("an answer for another session", { ...roomNow(), boundTo: "someone-else" });
+    await allowed("the bridge refused the read", { v: 1, ok: false, error: "room", status: 403, boundTo: me, answer: { ok: false } });
+    await broker.close();
+    broker = null;
+    const noBroker = await ask();
+    assert.equal(noBroker.code, 0, noBroker.stderr);
+    assert.equal(noBroker.stdout.trim(), "", "no broker: the picker opens as before");
+  } finally {
+    await broker?.close();
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test("rules v26 say a terminal picker is never used while Discord is a member (#381)", async () => {
+  const { roomRules } = await import("../adapters/bridge/gyredeck-bridge.mjs");
+  assert.ok(ROOM_RULES_VERSION >= 26, "introduced in v26");
+  assert.match(roomRules("http://127.0.0.1:47621"), /never ask with a terminal picker \(Claude Code's `AskUserQuestion`\)/);
+});
+
 // ── Heavy runs (#223) ──
 
 const HEAVY_HELPER_DEADLINE_MS = 15_000;

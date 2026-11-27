@@ -20,7 +20,8 @@ import { randomUUID } from "node:crypto";
  * The adapter never blocks Claude Code: it exits 0 with no stdout, so a
  * PreToolUse hook is treated as "allow" and other hooks proceed normally. The one
  * PreToolUse answer it prints is an explicit allow for a Bash command the owner approved
- * from Discord with their code, exactly as approved and once (#374).
+ * from Discord with their code, exactly as approved and once (#374). The other is a deny
+ * for `AskUserQuestion` while the session's room has the owner's Discord in it (#381).
  */
 
 const DEFAULT_ENDPOINT = { hostname: "127.0.0.1", port: 47_621 };
@@ -581,6 +582,27 @@ const approvedCommand = async (endpoint, token, conversationId, input) => {
   return said?.ok === true && said.allowed === true && said.command === command && Number.isInteger(said.seq) ? said.seq : null;
 };
 
+const OWNER_ON_DISCORD_REASON =
+  "The owner follows this room from Discord, where a question picker in the terminal can be neither seen nor answered (#381). " +
+  "Ask in the room instead: one ask per question to gyredeck-owner-discord, with \"yesNo\": true for a yes/no question.";
+
+/**
+ * Whether this session is a confirmed member of a room the owner's Discord is in (#381), so a
+ * terminal picker would sit on a question nobody can reach. Read through the broker's binding,
+ * which collects nothing. Anything short of a well-formed answer for this session is a no: the
+ * picker opens as before, since a refusal with no room to ask in would leave no way to ask.
+ */
+const ownerOnDiscord = async (conversationId, input) => {
+  if (input.tool_name !== "AskUserQuestion" || !conversationId) return false;
+  const bound = judgeBrokerAnswer(await askBroker({ bind: { conversationId } }));
+  if (!bound.result) return false;
+  const now = judgeBrokerAnswer(await askBroker({ room: {} })).result;
+  if (!now || now.boundTo !== conversationId || now.room?.you !== conversationId || typeof now.room.room !== "string") return false;
+  const members = Array.isArray(now.room.members) ? now.room.members : [];
+  const mine = members.find((member) => member?.conversationId === conversationId);
+  return mine?.confirmed === true && members.some((member) => member?.provider === "Discord" && member.confirmed === true);
+};
+
 /**
  * What a session is told when its password was just accepted, on the normal path and the
  * fallback alike: one line, so the two cannot drift apart again (#255). Live, an agent
@@ -1070,8 +1092,13 @@ const main = async () => {
   // The seq of the owner's approval for this exact command (#374). The input goes through
   // unchanged: no `updatedInput`, so what runs is what was approved.
   let approvedSeq = null;
+  let pickerRefused = false;
   const respond = () => {
-    if (approvedSeq !== null) {
+    if (pickerRefused) {
+      process.stdout.write(`${JSON.stringify({
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: OWNER_ON_DISCORD_REASON },
+      })}\n`);
+    } else if (approvedSeq !== null) {
       process.stdout.write(`${JSON.stringify({
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
@@ -1133,6 +1160,7 @@ const main = async () => {
     const posts = [];
     let mailDrain = null;
     let approval = null;
+    let picker = null;
 
     switch (eventType) {
       case "SessionStart":
@@ -1176,6 +1204,7 @@ const main = async () => {
             : [],
         })));
         approval = approvedCommand(endpoint, token, conversationId, input).catch(() => null);
+        picker = ownerOnDiscord(conversationId, input).catch(() => false);
         break;
       case "PostToolUse": {
         const response = input.tool_response;
@@ -1231,9 +1260,10 @@ const main = async () => {
     }
 
     if (posts.length > 0 || mailDrain) {
-      const [mail, seq] = await Promise.all([mailDrain ?? null, approval, ...posts]);
+      const [mail, seq, refused] = await Promise.all([mailDrain ?? null, approval, picker, ...posts]);
       additionalContext = mail;
       approvedSeq = Number.isInteger(seq) ? seq : null;
+      pickerRefused = refused === true;
     }
     respond();
   } catch {

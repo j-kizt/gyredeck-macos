@@ -1,6 +1,6 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
-## The app's caches stop growing its storage while it runs — (v1.39.10)
+## The room inbox and two caches move out of localStorage — (v1.39.10)
 
 ### Fixes
 
@@ -8,12 +8,13 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   a restart.** They were kept in the window's localStorage and rewritten often, and WebKit did not
   fold its log back while the app ran, so every rewrite added to it. Now each is kept in its own
   file in the app's data folder, written whole to a new file and swapped in, as session history
-  already is.
+  already is, so rewriting them no longer adds to that log. How much smaller the app's storage
+  stays has not been measured on an installed app yet.
   - The first run of this version moves what you had into the file, and removes the old copy only
     once the file holds it.
-  - Changes are saved at most once every 2 seconds, and only when something changed. A save still
-    waiting is sent when the window's page is unloaded; a change made in the last 2 seconds before
-    the app quits can still be lost.
+  - Changes are saved only when something changed, and normally gathered into one save every 2
+    seconds. When the window's page is unloaded, a waiting save is sent at once instead. A change
+    made in the last 2 seconds before the app quits can still be lost.
   - If the app cannot read one of these files when it starts, or gets no answer within 3
     seconds, it works from memory for that run and saves nothing, so the file is
     never replaced by something made without it. What changes in that run, such as messages marked

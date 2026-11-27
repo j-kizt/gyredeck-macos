@@ -881,31 +881,6 @@ test.describe("a room Discord refuses", () => {
   const refused = (code: string, message: string, count = 19) =>
     paired({ connectedRooms: ["sync-abcd"], behind: { "sync-abcd": count }, roomErrors: { "sync-abcd": { code, message } } });
 
-  // #456: a refused Connect (a second relay) is said as the bridge said it, inside its row, with no full-room advice.
-  test("a Connect refused as a full room is said as it was, with no count or advice, inside its row", async ({ page }) => {
-    await open(page, paired({ rooms: fullRooms(), connectRefusal: "That room is full" }), "Sync");
-    const founder = page.locator(".setup-account-row", { hasText: "sync-abcd" });
-    await founder.getByRole("button", { name: "Actions for sync-abcd" }).click();
-    await founder.getByRole("menuitem", { name: "Connect to Discord" }).click();
-    const failed = founder.locator("[data-discord='room-failed']");
-    await expect(failed).toHaveText("Couldn't connect to Discord: That room is full");
-    const boxes = await founder.evaluate((element) => {
-      const rect = (node: Element) => { const { x, y, width, height } = node.getBoundingClientRect(); return { x, y, width, height }; };
-      const note = element.querySelector("[data-discord='room-failed']")!;
-      return {
-        row: rect(element),
-        name: rect(element.querySelector(".setup-account-main")!),
-        note: rect(note),
-        overflow: [element, ...element.querySelectorAll<HTMLElement>("*")].filter((node) => !(node instanceof SVGElement) && node.scrollWidth > node.clientWidth).map((node) => node.className),
-      };
-    });
-    expect(boxes.note.y).toBeGreaterThanOrEqual(boxes.name.y + boxes.name.height);
-    expect(boxes.note.x).toBeGreaterThanOrEqual(boxes.row.x);
-    expect(boxes.note.x + boxes.note.width).toBeLessThanOrEqual(boxes.row.x + boxes.row.width + 0.5);
-    expect(boxes.note.y + boxes.note.height).toBeLessThanOrEqual(boxes.row.y + boxes.row.height + 0.5);
-    expect(boxes.overflow).toEqual([]);
-  });
-
   test("a lost permission names the forum and where to fix it, and goes once the room moves", async ({ page }) => {
     await open(page, refused("missing_permission", "The bot lacks a permission it needs on the forum."), "Sync");
     await expect(held(page)).toHaveText("Can't post to Discord — give the bot access to forum rooms: Edit Channel → Permissions. 19 messages go out once it can.");

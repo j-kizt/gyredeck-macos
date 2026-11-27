@@ -8657,8 +8657,8 @@ function startBridge(config) {
         }
         if (joining) {
           // The cap is for sessions (#456): the relay reads the room for the owner and takes
-          // no session's place, and a room has at most one of it.
-          if (relay ? sessionCount(room) < room.members.size : sessionCount(room) >= MAIL_MAX_MEMBERS) {
+          // no session's place.
+          if (!relay && sessionCount(room) >= MAIL_MAX_MEMBERS) {
             sendJson(429, { ok: false, error: "room_full" });
             return;
           }

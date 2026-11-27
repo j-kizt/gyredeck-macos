@@ -960,34 +960,17 @@ test("#456 8 sessions join a room Discord already follows; a 9th is refused, as 
   }
 });
 
-test("#456 a room holds one relay: a second is refused, until the first leaves", async () => {
-  const h = await startBridge();
-  try {
-    const { room: code } = (await h.call("POST", "/sync/rooms", { conversationId: "f456-d" })).body;
-    assert.equal((await joinRelay(h, code, "discord-one")).status, 200);
-    const second = await joinRelay(h, code, "discord-two");
-    assert.deepEqual([second.status, second.body.error], [429, "room_full"]);
-    assert.equal((await joinRelay(h, code, "discord-one")).status, 200, "the same relay pressing Connect again is no second relay");
-    assert.equal((await h.call("DELETE", `/sync/rooms/${code}/members/discord-one`)).status, 200);
-    assert.equal((await joinRelay(h, code, "discord-two")).status, 200, "a place for one relay, not for one id");
-    const room = await listedRoom(h, code);
-    assert.deepEqual([room.sessions, room.members.length], [1, 2]);
-  } finally {
-    await h.stop();
-  }
-});
-
-test("#456 joins at once still stop at the caps: one of three sessions for the 8th place, one of two relays", async () => {
+test("#456 joins at once still stop at the cap: one of three sessions for the 8th place, and the relay is let in", async () => {
   const h = await startBridge();
   try {
     const { room: code } = (await h.call("POST", "/sync/rooms", { conversationId: "f456-e" })).body;
     await fillSessions(h, code, "s456-e", 7);
     const joins = await Promise.all([
       joinSession(h, code, "s456-e-x"), joinSession(h, code, "s456-e-y"), joinSession(h, code, "s456-e-z"),
-      joinRelay(h, code, "discord-x"), joinRelay(h, code, "discord-y"),
+      joinRelay(h, code, "discord-x"),
     ]);
     assert.deepEqual(joins.slice(0, 3).map((joined) => joined.status).sort(), [200, 429, 429], "one session took the 8th place");
-    assert.deepEqual(joins.slice(3).map((joined) => joined.status).sort(), [200, 429], "one relay");
+    assert.deepEqual(joins.slice(3).map((joined) => joined.status), [200], "the relay");
     const room = await listedRoom(h, code);
     assert.deepEqual([room.sessions, room.members.length], [8, 9]);
   } finally {

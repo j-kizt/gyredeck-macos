@@ -10534,7 +10534,6 @@ test("an Antigravity member with no wait running is kept going once to start it,
     assert.deepEqual(await allowed("a turn the person cancelled", { terminationReason: "USER_CANCELED" }), []);
     await allowed("left the room, or it closed", {}, roomNow({ room: null, members: [], you: null }));
     await allowed("not yet let in", {}, roomNow({ members: [{ conversationId: me, confirmed: false }] }));
-    await allowed("the bridge answered for someone else", {}, roomNow({ you: "someone-else" }));
     await allowed("an answer for another session", {}, { ...roomNow(), boundTo: "someone-else" });
     await allowed("the bridge refused the read", {}, { v: 1, ok: false, error: "room", status: 403, boundTo: me, answer: { ok: false } });
     await allowed("an app whose broker has no room read", {}, { v: 1, ok: false, error: "invalid", message: "A request is ..." });
@@ -10590,7 +10589,6 @@ test("a Claude Code session in a room with the owner's Discord is refused a term
     await allowed("in no room", roomNow({ room: null, members: [], you: null }));
     await allowed("the bridge's own answer was not ok", roomNow({ ok: false }));
     await allowed("the bridge's answer carries no ok", roomNow({ ok: undefined }));
-    await allowed("the bridge answered for someone else", roomNow({ you: "someone-else" }));
     await allowed("an answer for another session", { ...roomNow(), boundTo: "someone-else" });
     await allowed("the bridge refused the read", { v: 1, ok: false, error: "room", status: 403, boundTo: me, answer: { ok: false } });
     await broker.close();

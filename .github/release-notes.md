@@ -1,30 +1,23 @@
 Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent sessions, provider usage, listening ports, and GitHub/GitLab repo/CI/PR monitoring, in a window from the menu bar.
 
-## A question for you on Discord is one you can answer — (v1.39.9)
+## The room inbox and two caches move out of localStorage — (v1.39.10)
 
 ### Fixes
 
-- **A yes/no question sent to your Discord without its ✅/❌ marker could not be answered with a
-  tap.** You can answer ✅ or ❌ from Discord only when the agent marks its ask as a yes/no
-  question. When it forgot, you saw the question, tapped an answer, and were told it needed a
-  typed reply, while the agent heard nothing. Now the bridge refuses such an ask when its wording
-  reads as yes/no (`ใช่/ไม่`, `yes/no`, `y/n`, `✅/❌`, `❌/✅`) and sends nothing. The agent is told to
-  send it again with the marker, or to reword it as a question that needs a typed reply.
-  - Any other unmarked ask to you is still sent, and the agent's receipt reminds it that you can
-    answer only by typing.
-  - The check reads the wording only. A yes/no question worded some other way gets through
-    unmarked, and still needs a typed answer.
-  - Codex's own short routing line is not checked: refusing a reply Codex has already ended its
-    turn on would lose it.
-  - An ask for your 6-digit approval code, and the app's own messages, are neither checked nor
-    given the reminder.
-- **A Claude Code session could stop on a question in the terminal while you were following from
-  your phone.** A question picker in the terminal cannot be seen or answered from Discord, so the
-  session waited on a question nobody could reach. Now, while its room has your Discord in it, a
-  Claude Code session that has been let into that room and tries to open the picker is refused and told to ask you in the room
-  instead.
-  - It is refused even when you are at the Mac: the app cannot tell whether you are there.
-  - It applies only once the session's Claude Code hook is updated. If Settings shows the Claude
-    Code hook needs an update, reinstall it from Plugins.
-  - Your Discord counts once it has joined the room. Until then, or if the app cannot say who is
-    in the room at that moment, the picker opens as before.
+- **The room inbox, the GitHub status cache and the usage readings grew the app's storage until
+  a restart.** They were kept in the window's localStorage and rewritten often, and WebKit did not
+  fold its log back while the app ran, so every rewrite added to it. Now each is kept in its own
+  file in the app's data folder, written whole to a new file and swapped in, as session history
+  already is, so rewriting them no longer adds to that log. How much smaller the app's storage
+  stays has not been measured on an installed app yet.
+  - The first run of this version moves what you had into the file, and removes the old copy only
+    once the file holds it.
+  - Changes are saved only when something changed, and normally gathered into one save every 2
+    seconds. When the window's page is unloaded, a waiting save is sent at once instead. A change
+    made in the last 2 seconds before the app quits can still be lost.
+  - If the app cannot read one of these files when it starts, or gets no answer within 3
+    seconds, it works from memory for that run and saves nothing, so the file is
+    never replaced by something made without it. What changes in that run, such as messages marked
+    read in the room inbox, is lost when the app quits.
+  - Running an older version after this one and then coming back: what the older version saved is
+    discarded, and the file is used.

@@ -4391,10 +4391,14 @@ function startBridge(config) {
    * headers an agent may copy), or the name alone when no other member has it. Accepting
    * every form the room shows means an agent has nothing to cut (#182 audit).
    */
-  const addressedAs = (room, id, wanted) =>
+  // The form older bridges showed (`<label> / <name>`) can equal another member's shown form
+  // (#383 release audit): a member showing it now is meant, and the older form only answers
+  // when nobody does.
+  const shownByAnyone = (room, wanted) => [...room.members.keys()].some((id) => shownIn(room, id).toLowerCase() === wanted);
+  const addressedAs = (room, id, wanted, shownTaken) =>
     labelIn(room, id).toLowerCase() === wanted ||
     shownIn(room, id).toLowerCase() === wanted ||
-    legacyShownIn(room, id).toLowerCase() === wanted;
+    (!shownTaken && legacyShownIn(room, id).toLowerCase() === wanted);
   const memberByAddress = (room, target) => {
     const wanted = String(target).trim().toLowerCase();
     const ids = [...room.members.keys()];
@@ -4402,7 +4406,8 @@ function startBridge(config) {
     if (byLabel) return byLabel;
     // A name may hold ` #`, so two members can show the same form (#383 audit): one that fits
     // more than one member goes to none, never to whichever came first.
-    const byForm = ids.filter((id) => addressedAs(room, id, wanted));
+    const shownTaken = shownByAnyone(room, wanted);
+    const byForm = ids.filter((id) => addressedAs(room, id, wanted, shownTaken));
     if (byForm.length > 0) return byForm.length === 1 ? byForm[0] : null;
     // A whole form wins, so the name alone answers only when no other member's label
     // or name is the same (#182 audit).
@@ -4417,10 +4422,11 @@ function startBridge(config) {
    */
   const ownerAddressees = (room, target) => {
     const wanted = String(target).trim().toLowerCase();
+    const shownTaken = shownByAnyone(room, wanted);
     return [...room.members.keys()].filter((id) =>
       speakableBy(room, id) &&
       (id === String(target).trim() ||
-        addressedAs(room, id, wanted) ||
+        addressedAs(room, id, wanted, shownTaken) ||
         nameIn(room, id)?.toLowerCase() === wanted));
   };
   /**

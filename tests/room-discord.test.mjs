@@ -1126,6 +1126,20 @@ test("#383: a member is shown as <provider> / <name> or <provider> / #<last 6>, 
     assert.equal(lookalike[founder], lookalike[twin], "premise: two members show the same form");
     assert.equal(await routedTo("Claude Code / Audit #00a002"), "not_in_room");
     assert.equal(await routedTo("Claude Code · Worker"), twin, "the label still reaches the twin");
+
+    // The founder's older form (`Claude Code / Gamma`) reads as the twin's shown form once both
+    // are called Gamma (#383 release audit): the member showing it is meant, for the owner too.
+    assert.equal((await h.call("PUT", `/sessions/names/${twin}`, { name: "Gamma" })).status, 200);
+    await shownOf();
+    assert.equal((await h.call("PUT", `/sessions/names/${founder}`, { name: "Gamma" })).status, 200);
+    const gamma = await shownOf();
+    assert.deepEqual([gamma[twin], gamma[founder]], ["Claude Code / Gamma", "Claude Code / Gamma #0000f1"], "premise");
+    assert.equal(await routedTo("Claude Code / Gamma"), twin, "the member API");
+    const toGamma = await h.call("POST", `/mail/${code}`, { from: OWNER_DISCORD_SENDER, to: "Claude Code / Gamma", kind: "tell", text: "owner to Gamma" });
+    assert.equal(toGamma.status, 202, JSON.stringify(toGamma.body));
+    const asTwin = { "content-type": "application/json", ...(await asMember(h, twin, h.token)) };
+    const got = (await h.call("GET", `/mail/${code}?as=${twin}&since=0`, null, asTwin)).body.messages.find((m) => m.seq === toGamma.body.seq);
+    assert.equal(got?.to, twin, "the owner's post reaches the member showing that form");
   } finally {
     reader.abort();
     await h.stop();

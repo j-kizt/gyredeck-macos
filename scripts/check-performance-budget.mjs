@@ -135,13 +135,15 @@ const assetRoot = join(distRoot, "assets");
  * by the owner from Discord on 2026-11-27 ("yes", sync-7am7 seq 136 to 129).
  * #459 (Reconnect on the Discord row: the press, its spin, and the line saying when it was tried
  * again) read 124,332 locally, 87 B over after cutting the first draft by 86 B. Both raised by
- * 160 B, by the owner from Discord on 2026-11-27 ("yes", sync-7am7 seq 97 to 91).
+ * 160 B, by the owner from Discord on 2026-11-27 ("yes", sync-7am7 seq 97 to 91). The audit's
+ * fixes (a press that starts no connector, status answers out of order) read 124,371 / 127,445;
+ * both raised 64 B more for headroom, by the owner from Discord ("yes", sync-7am7 seq 135 to 110).
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 124_405,
-  jsTotalGzipBytes: 127_477,
+  jsGzipBytes: 124_469,
+  jsTotalGzipBytes: 127_541,
 };
 
 const walk = async (directory) => {

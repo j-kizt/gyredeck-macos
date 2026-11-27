@@ -3,6 +3,7 @@ import {
   getUsageMetricGroupModels,
 } from "./providers";
 import { meterStatus } from "./meterStatus";
+import { readAppFile, writeAppFile } from "../storage/appFiles";
 import { formatResetLabel } from "./settings";
 import type {
   IAgentUsageSnapshot,
@@ -14,7 +15,6 @@ import type {
   UsageProviderId,
 } from "./types";
 
-const SNAPSHOT_CACHE_KEY = "gyredeck.usage-snapshots.v1";
 
 export {
   formatAbsoluteTime,
@@ -233,7 +233,7 @@ export const readCachedUsageSnapshots = (): Partial<
 > => {
   try {
     const parsed = JSON.parse(
-      window.localStorage.getItem(SNAPSHOT_CACHE_KEY) ?? "null",
+      readAppFile("usage-snapshots") ?? "null",
     ) as Partial<Record<UsageProviderId, IAgentUsageSnapshot>> | null;
 
     if (!parsed || typeof parsed !== "object") {
@@ -259,15 +259,10 @@ export const writeCachedUsageSnapshot = (
   providerId: UsageProviderId,
   snapshot: IAgentUsageSnapshot,
 ): void => {
-  try {
-    const current = readCachedUsageSnapshots();
-    window.localStorage.setItem(
-      SNAPSHOT_CACHE_KEY,
-      JSON.stringify({ ...current, [providerId]: snapshot }),
-    );
-  } catch {
-    // Current usage remains usable when local storage is unavailable.
-  }
+  writeAppFile(
+    "usage-snapshots",
+    JSON.stringify({ ...readCachedUsageSnapshots(), [providerId]: snapshot }),
+  );
 };
 
 export const retainLastGoodUsage = (

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { readAppFile, writeAppFile } from "../storage/appFiles";
 import type {
   GitProvider,
   IDeviceCodeStart,
@@ -8,7 +9,6 @@ import type {
 } from "./types";
 
 const TRACKED_REPOS_KEY = "gyredeck.github.tracked-repos";
-const STATUS_CACHE_KEY = "gyredeck.github.status-cache";
 
 // owner/name (GitHub) or namespace/.../project (GitLab nested groups).
 const REPO_PATTERN = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+$/;
@@ -120,8 +120,14 @@ export const takeLegacyTrackedRepos = (accountKey: string | null): string[] | nu
   return legacy;
 };
 
-export const readStatusCache = (): Record<string, IGithubRepoStatus> =>
-  readJson<Record<string, IGithubRepoStatus>>(STATUS_CACHE_KEY, {});
+export const readStatusCache = (): Record<string, IGithubRepoStatus> => {
+  try {
+    const raw = readAppFile("github-status-cache");
+    return raw ? (JSON.parse(raw) as Record<string, IGithubRepoStatus>) : {};
+  } catch {
+    return {};
+  }
+};
 
 export const writeStatusCache = (cache: Record<string, IGithubRepoStatus>): void =>
-  writeJson(STATUS_CACHE_KEY, cache);
+  writeAppFile("github-status-cache", JSON.stringify(cache));

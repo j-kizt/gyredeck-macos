@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { GyredeckEvent } from "@gyredeck/protocol";
+import { readAppFile, writeAppFile } from "../storage/appFiles.ts";
 
 /** One thing somebody said in a room, as this session received it. */
 export interface IRoomMessage {
@@ -22,13 +23,12 @@ export interface IRoomInbox {
 
 export type RoomInboxRegistry = Record<string, IRoomInbox>;
 
-const STORAGE_KEY = "gyredeck.room-inbox";
 /** Per session. Enough to catch up on after being away, not a transcript. */
 const MAX_MESSAGES = 20;
 
 const read = (): RoomInboxRegistry => {
   try {
-    const stored = window.localStorage.getItem(STORAGE_KEY);
+    const stored = readAppFile("room-inbox");
     if (!stored) return {};
     const parsed = JSON.parse(stored) as RoomInboxRegistry;
     return parsed && typeof parsed === "object" ? parsed : {};
@@ -38,11 +38,7 @@ const read = (): RoomInboxRegistry => {
 };
 
 const write = (registry: RoomInboxRegistry) => {
-  try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(registry));
-  } catch {
-    // The running app still holds the state; losing the history is not worth an error.
-  }
+  writeAppFile("room-inbox", JSON.stringify(registry));
 };
 
 export const unreadIn = (inbox: IRoomInbox | undefined): number => {

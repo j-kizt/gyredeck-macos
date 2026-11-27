@@ -25,6 +25,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 mod agy_statusline;
+mod app_files;
 mod app_stream;
 mod broker;
 mod discord;
@@ -1466,6 +1467,26 @@ fn session_registry_save(
     registry: Value,
 ) -> Result<u64, String> {
     session_store::save(&session_store_dir(&app)?, &state, &registry)
+}
+
+/// The app's rewritten caches live in files too, not localStorage (#300).
+#[tauri::command]
+fn app_file_load(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, app_files::AppFilesState>,
+    name: String,
+) -> Result<app_files::Loaded, String> {
+    app_files::load(&app_files::dir_in(&session_store_dir(&app)?), &state, &name)
+}
+
+#[tauri::command]
+fn app_file_save(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, app_files::AppFilesState>,
+    name: String,
+    text: String,
+) -> Result<(), String> {
+    app_files::save(&app_files::dir_in(&session_store_dir(&app)?), &state, &name, &text)
 }
 
 /// Hands each usage reading to the bridge, so agents in a room can be told when their own
@@ -6272,6 +6293,8 @@ pub fn run() {
             agy_usage,
             session_registry_load,
             session_registry_save,
+            app_file_load,
+            app_file_save,
             bridge_health,
             get_bridge_port,
             mail_rooms,
@@ -6358,6 +6381,7 @@ pub fn run() {
         ))
         .manage(KeepAwakeState::default())
         .manage(session_store::SessionStoreState::default())
+        .manage(app_files::AppFilesState::default())
         .manage(TrayAttentionState::default())
         .manage(DisplayPreferenceState::default())
         .manage(LocalServicesControlState::default())

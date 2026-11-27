@@ -121,7 +121,9 @@ jobs:
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_PROVISIONING_PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE }}
-        run: echo "config=$(node scripts/ci-signing-config.mjs)" >> "$GITHUB_OUTPUT"
+        run: |
+          config=$(node scripts/ci-signing-config.mjs)
+          echo "config=$config" >> "$GITHUB_OUTPUT"
 
       - name: Build and release
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0

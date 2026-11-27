@@ -1828,7 +1828,7 @@ fn a_real_bridge_room_reaches_the_child_in_order_named_and_closes() {
     state.connect(&room, APP_WORD).expect("connect through the real join");
     wait_until("the connect line", || !of_kind(&buffer.lines(), "connect").is_empty());
     let connect = of_kind(&buffer.lines(), "connect")[0].clone();
-    assert_eq!(connect["members"], serde_json::json!(["Agent", "Agent #peer-a", "Agent #peer-b", "Discord"]));
+    assert_eq!(connect["members"], serde_json::json!(["Agent / #nder-1", "Agent / #peer-a", "Agent / #peer-b", "Discord"]));
     assert!(connect["createdAt"].as_u64().is_some());
 
     let speaker = app.clone();
@@ -1853,9 +1853,9 @@ fn a_real_bridge_room_reaches_the_child_in_order_named_and_closes() {
     assert_eq!(
         said,
         vec![
-            ("Agent #peer-a".into(), "Agent #peer-b".into(), "ask".into(), "first, between two others".into()),
-            ("Agent #peer-b".into(), "Agent #peer-a".into(), "reaction".into(), "second".into()),
-            ("Agent".into(), "everyone".into(), "tell".into(), "third, to everyone\nwith a second line".into()),
+            ("Agent / #peer-a".into(), "Agent / #peer-b".into(), "ask".into(), "first, between two others".into()),
+            ("Agent / #peer-b".into(), "Agent / #peer-a".into(), "reaction".into(), "second".into()),
+            ("Agent / #nder-1".into(), "everyone".into(), "tell".into(), "third, to everyone\nwith a second line".into()),
         ]
     );
     let seqs: Vec<u64> = of_kind(&lines, "message").iter().map(|m| m["seq"].as_u64().unwrap()).collect();
@@ -5362,7 +5362,7 @@ fn a_real_bridge_takes_the_owners_say_as_you_via_discord_and_no_one_else_can_spe
     let refused = answer_n(&msg_id(2), 0);
     assert_eq!(refused["ok"], false, "{refused}");
     let names: Vec<&str> = refused["names"].as_array().unwrap().iter().map(|name| name.as_str().unwrap()).collect();
-    assert!(names.contains(&"Agent #peer-a") && !names.contains(&"Discord"), "{names:?}");
+    assert!(names.contains(&"Agent / #peer-a") && !names.contains(&"Discord"), "{names:?}");
 
     // What the room holds, read on the app's word (#274: a member's read takes its own key).
     let read = || call(&app, "GET", &format!("/mail/{room}?as={}&since=0", relay_member(&room)), None, Some(APP_WORD)).1;
@@ -6563,4 +6563,24 @@ fn a_request_heard_again_keeps_its_use() {
     wait_until("seq 3", || lock(&f.state.hub).rooms[ROOM].approvals.contains_key(&3));
     let again = answer(&f, &buffer, approve_with(&sent_id(1_000, 2), 1, &code_now(1), merge(370, SHA_A)));
     assert!(again["error"].as_str().unwrap().contains("already answered"), "{again}");
+}
+
+#[test]
+fn a_member_is_shown_as_the_bridge_shows_it_and_as_before_only_for_an_older_bridge() {
+    // #383: the bridge's `shown` is the one source; `provider` stays the routing label.
+    let shown = |value: serde_json::Value| parse_members(&value).into_iter().map(|member| member.shown).collect::<Vec<_>>();
+    assert_eq!(
+        shown(serde_json::json!({"members": [
+            {"conversationId": "a", "provider": "Claude Code · Worker #eb5183", "name": "Gyre Assistant", "shown": "Claude Code / Gyre Assistant"},
+            {"conversationId": "b", "provider": "Codex", "name": null, "shown": "Codex / #a89722"},
+        ]})),
+        ["Claude Code / Gyre Assistant", "Codex / #a89722"],
+    );
+    assert_eq!(
+        shown(serde_json::json!({"members": [
+            {"conversationId": "a", "provider": "Claude Code · Worker", "name": "Audit"},
+            {"conversationId": "b", "provider": "Codex", "name": null},
+        ]})),
+        ["Claude Code · Worker / Audit", "Codex"],
+    );
 }

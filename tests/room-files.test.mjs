@@ -1117,3 +1117,65 @@ test("#409: the rules have a Hand-offs section: ETA as the ack, the sender's wak
   assert.match(handoffs, /give it and keep working in that turn\. Codex, woken, works in that turn first, then ends it on the result or on a checkpoint; the next wake resumes it\./);
   assert.match(handoffs, /Two wakes with no checkpoint, or two `queued` deliveries with no answer: tell the owner/);
 });
+
+test("#383: after ordinary renames a Codex line to a shown form reaches the one member showing it", async () => {
+  const home = await tempHome();
+  const thread = randomUUID();
+  const rollout = join(home, ".codex", "sessions", "2026", "11", "16", `rollout-2026-11-16T10-00-00-${thread}.jsonl`);
+  const fakeBin = join(home, ".bun", "bin");
+  const h = await startBridge({
+    home,
+    env: { GYREDECK_NO_AGENT_SPAWN: "0", PATH: `${fakeBin}:/bin` },
+    before: async () => {
+      await mkdir(join(home, ".codex", "sessions", "2026", "11", "16"), { recursive: true });
+      await writeFile(rollout, "");
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(join(fakeBin, "codex"), recordingCodexBinary);
+      await chmod(join(fakeBin, "codex"), 0o755);
+    },
+  });
+  try {
+    const a = "38300000-0000-4000-8000-00000000aaa1";
+    const b = "38300000-0000-4000-8000-00000000bbb2";
+    for (const [conversationId, sourceKind, cwd] of [["founder-1", "claudeCodeHook", "/tmp/project"], [a, "claudeCodeHook", "/tmp/a"], [b, "claudeCodeHook", "/tmp/b"], [thread, "codexCliHook", "/tmp/project"]]) {
+      await h.call("POST", "/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId, cwd,
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind }, data: { inputCount: 1 },
+      });
+    }
+    const { room: code } = (await h.call("POST", "/sync/rooms", { conversationId: "founder-1" })).body;
+    for (const member of [a, b, thread]) {
+      await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: member });
+      const minted = await h.call("POST", `/sync/rooms/${code}/members/${member}/join-code`, {});
+      if (member === thread) await h.call("POST", "/hook/sync/confirm", { conversationId: member, turnId: randomUUID(), password: minted.body.code });
+      else assert.equal((await h.call("POST", `/sync/rooms/${code}/confirm`, { conversationId: member, password: minted.body.code }, { "content-type": "application/json", "x-gyredeck-broker": APP_WORD })).status, 200);
+    }
+    const shown = async () => Object.fromEntries((await h.call("GET", `/sync/rooms?as=founder-1`)).body.members.map((m) => [m.conversationId, m.shown]));
+    for (const [member, name] of [[a, "Alpha"], [b, "Beta"], [a, "Beta"], [b, "Alpha"], [a, "Alpha"]]) {
+      assert.equal((await h.call("PUT", `/sessions/names/${member}`, { name })).status, 200);
+      await shown();
+    }
+    const now = await shown();
+    const provider = now[b].split(" / ")[0];
+    assert.deepEqual([now[b], now[a]], [`${provider} / Alpha`, `${provider} / Alpha #${a.slice(-6)}`], "one member holds the plain form");
+    const founder = await asMember(h, "founder-1");
+    const sentTo = async (to) => {
+      const sent = await h.call("POST", `/mail/${code}`, { from: "founder-1", to, kind: "tell", text: `to ${to}` }, founder);
+      return (await h.call("GET", `/mail/${code}?as=founder-1&since=0`, null, founder)).body.messages.find((m) => m.seq === sent.body.seq)?.to;
+    };
+    assert.equal(await sentTo(`${provider} / Alpha`), b, "the member API reaches the plain holder");
+    assert.equal(await sentTo(`${provider} / Alpha #${a.slice(-6)}`), a, "and the twin by its whole form");
+    await appendFile(rollout, finishedTurn(`@${provider} / Alpha tell — TO-ALPHA`));
+    await h.call("POST", "/hook/stop", { hookId: randomUUID(), hookEventName: "Stop", source: "hook", workingDirectory: "/tmp/project", conversationId: thread });
+    const asB = await asMember(h, b);
+    let posted = null;
+    for (let attempt = 0; attempt < 80 && !posted; attempt += 1) {
+      posted = (await h.call("GET", `/mail/${code}?as=${b}&since=0`, null, asB)).body.messages.find((m) => m.from === thread && m.text === "TO-ALPHA");
+      if (!posted) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.ok(posted, `the Codex line reached the member showing that form — ${h.stderr().slice(-400)}`);
+    assert.equal(posted.to, b, "the Codex line reaches the member showing that form, never everyone");
+  } finally {
+    await h.stop();
+  }
+});

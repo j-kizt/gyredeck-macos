@@ -779,9 +779,13 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
     if (member) return member.provider;
     return String(message.from ?? "unknown").replace(/\s+/g, " ").slice(0, 64);
   };
-  // What a reader is shown: the routing label, and the name the person gave that session
-  // (#182). `label` stays the routing label alone, since that is what `to` takes.
-  const named = (member) => (typeof member?.name === "string" && member.name ? `${member.provider} / ${member.name}` : member.provider);
+  // What a reader is shown: the bridge's own form (#383); an older bridge sends none, and then
+  // the routing label and the name, as #182 showed it. `label` stays the routing label alone,
+  // since that is what `to` takes.
+  const named = (member) =>
+    typeof member?.shown === "string" && member.shown
+      ? member.shown
+      : typeof member?.name === "string" && member.name ? `${member.provider} / ${member.name}` : member.provider;
   // A message keeps the name its sender had when it spoke (fromShown); the roster is for an
   // older bridge that does not record it.
   const shown = (message) =>

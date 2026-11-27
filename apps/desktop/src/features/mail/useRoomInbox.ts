@@ -8,10 +8,22 @@ export interface IRoomMessage {
   room: string;
   from: string;
   fromLabel: string;
+  /** Absent from a message recorded before #383, which then shows its label. */
+  fromShown?: string;
   kind: string;
   preview: string;
   at: string;
 }
+
+/**
+ * Who sent a message, as the room showed them (#383), split so a twin's trailing ` #id` can
+ * be kept whole while the rest is cut. A message recorded before #383 shows its label.
+ */
+export const senderOf = ({ fromLabel, fromShown }: Pick<IRoomMessage, "fromLabel" | "fromShown">) => {
+  const shown = fromShown || fromLabel;
+  const twin = fromShown?.match(/^(.*[^/\s]) (#[^\s#/]{6,})$/);
+  return { shown, who: twin ? twin[1] : shown, twin: twin?.[2] };
+};
 
 export interface IRoomInbox {
   /** The room these messages belong to. Leaving it ends them. */
@@ -168,6 +180,7 @@ export const recordRoomMessages = (
       room: data.room,
       from: data.from,
       fromLabel: data.fromLabel,
+      fromShown: data.fromShown,
       kind: data.kind,
       preview: data.preview,
       at: event.timestamp,

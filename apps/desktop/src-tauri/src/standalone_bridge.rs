@@ -1591,7 +1591,7 @@ mod tests {
         FOUNDED_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Settings shows this line after "Couldn't connect to Discord:", e.g. for a second relay (#456).
+    /// Settings shows this line after "Couldn't connect to Discord:".
     #[test]
     fn a_full_room_is_refused_with_a_plain_line() {
         let refusal = serde_json::json!({ "ok": false, "error": "room_full" });

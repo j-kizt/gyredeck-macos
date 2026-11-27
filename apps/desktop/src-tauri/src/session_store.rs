@@ -13,14 +13,12 @@
 //! - A file that cannot be read is moved aside, never overwritten in place, and reported as
 //!   corrupt rather than as an empty registry.
 
+use crate::app_files::{read_capped, stamp, write_durable};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const FILE_NAME: &str = "session-events.json";
 /// 200 conversations of 32 events stay well under this; past it a file is not ours to trust.
@@ -66,10 +64,6 @@ fn file_in(dir: &Path) -> PathBuf {
     dir.join(FILE_NAME)
 }
 
-fn stamp() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
-}
-
 /// Read the registry, and remember its revision. Only a file that is not there is absent;
 /// one that is there and cannot be read blocks every save for the rest of the run.
 pub fn load(dir: &Path, state: &SessionStoreState) -> Loaded {
@@ -81,25 +75,14 @@ pub fn load(dir: &Path, state: &SessionStoreState) -> Loaded {
         inner.blocked = Some(reason.clone());
         Loaded::Unreadable { reason }
     };
-    match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let text = match read_capped(&path, MAX_BYTES) {
+        Ok(Some(text)) => text,
+        Ok(None) => {
             inner.blocked = None;
             return Loaded::Absent;
         }
-        Err(error) => return unreadable(&mut inner, format!("cannot look at {}: {error}", path.display())),
-        Ok(meta) if !meta.file_type().is_file() => return unreadable(&mut inner, format!("{} is not a plain file", path.display())),
-        Ok(meta) if meta.len() > MAX_BYTES => return unreadable(&mut inner, format!("{} is larger than {MAX_BYTES} bytes", path.display())),
-        Ok(_) => {}
-    }
-    let mut text = String::new();
-    let read = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-        .and_then(|file| file.take(MAX_BYTES + 1).read_to_string(&mut text));
-    if let Err(error) = read {
-        return unreadable(&mut inner, format!("cannot read {}: {error}", path.display()));
-    }
+        Err(reason) => return unreadable(&mut inner, reason),
+    };
     let parsed = serde_json::from_str::<Value>(&text).ok().and_then(|value| {
         let revision = value.get("revision")?.as_u64()?;
         let registry = value.get("registry")?.clone();
@@ -140,29 +123,7 @@ pub fn save(dir: &Path, state: &SessionStoreState, registry: &Value) -> Result<u
     if body.len() as u64 > MAX_BYTES {
         return Err(format!("the registry is larger than {MAX_BYTES} bytes"));
     }
-    fs::create_dir_all(dir).map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
-    let path = file_in(dir);
-    if fs::symlink_metadata(&path).is_ok_and(|meta| !meta.file_type().is_file()) {
-        return Err(format!("{} is not a plain file", path.display()));
-    }
-    // A fresh name each time, created only if nothing is there, never through a link.
-    let temp = dir.join(format!(".{FILE_NAME}.{}.{}.tmp", std::process::id(), stamp()));
-    let written = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .mode(0o600)
-            .open(&temp)?;
-        file.write_all(&body)?;
-        file.sync_all()?;
-        fs::rename(&temp, &path)?;
-        fs::File::open(dir)?.sync_all()
-    })();
-    if let Err(error) = written {
-        let _ = fs::remove_file(&temp);
-        return Err(format!("cannot save the session registry: {error}"));
-    }
+    write_durable(dir, FILE_NAME, &body)?;
     inner.revision = revision;
     Ok(revision)
 }

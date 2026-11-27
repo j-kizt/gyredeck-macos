@@ -71,8 +71,8 @@ test("a slow room reading does not delete the messages it has not read yet", asy
   await seedAndOpen(page);
 
   const held = async () =>
-    await page.evaluate(() => {
-      const raw = window.localStorage.getItem("gyredeck.room-inbox");
+    await page.evaluate(async () => {
+      const raw = (await import("/src/features/storage/appFiles.ts")).readAppFile("room-inbox");
       const parsed = raw ? JSON.parse(raw) : {};
       return Object.values(parsed).flatMap((inbox: { messages?: unknown[] }) => inbox.messages ?? []).length;
     });
@@ -102,8 +102,8 @@ test("a session in no room loses the messages of the room it left", async ({ pag
 
   await expect
     .poll(async () =>
-      await page.evaluate(() => {
-        const raw = window.localStorage.getItem("gyredeck.room-inbox");
+      await page.evaluate(async () => {
+        const raw = (await import("/src/features/storage/appFiles.ts")).readAppFile("room-inbox");
         return Object.keys(raw ? JSON.parse(raw) : {}).length;
       }),
     )

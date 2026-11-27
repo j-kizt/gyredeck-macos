@@ -49,6 +49,7 @@ import { useAgentUsageList } from "./features/usage/useAgentUsageList";
 import { useRuntimeMonitor } from "./features/runtime/useRuntimeMonitor";
 import { GithubPanel } from "./features/github/components";
 import { useGithubMonitor } from "./features/github/useGithubMonitor";
+import { loadAppFiles } from "./features/storage/appFiles";
 import { Tooltip } from "./Tooltip";
 import "./styles.css";
 
@@ -1560,8 +1561,10 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, { error: Error
   }
 }
 
-createRoot(document.getElementById("root")!).render(
-  <AppErrorBoundary>
-    <App />
-  </AppErrorBoundary>,
+void loadAppFiles().then(() =>
+  createRoot(document.getElementById("root")!).render(
+    <AppErrorBoundary>
+      <App />
+    </AppErrorBoundary>,
+  ),
 );

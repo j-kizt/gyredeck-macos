@@ -20,7 +20,7 @@ mkdirSync(dir, { recursive: true });
 const profilePath = join(dir, "embedded.provisionprofile");
 const decodedPath = join(dir, "profile.plist");
 writeFileSync(profilePath, Buffer.from(encoded, "base64"));
-if (spawnSync("sh", ["-c", 'security cms -D -i "$1" > "$2"', "sh", profilePath, decodedPath]).status !== 0) {
+if (spawnSync("security", ["cms", "-D", "-i", profilePath, "-o", decodedPath]).status !== 0) {
   console.error("The provisioning profile could not be decoded.");
   process.exit(1);
 }

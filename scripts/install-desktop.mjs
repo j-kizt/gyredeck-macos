@@ -95,7 +95,7 @@ if (picked.identity) {
   const signingDir = join(root, "apps/desktop/src-tauri/target/signing");
   mkdirSync(signingDir, { recursive: true });
   const decodedPath = join(signingDir, "profile.plist");
-  if (spawnSync("sh", ["-c", 'security cms -D -i "$1" > "$2"', "sh", profilePath, decodedPath]).status !== 0) {
+  if (spawnSync("security", ["cms", "-D", "-i", profilePath, "-o", decodedPath]).status !== 0) {
     console.error(`Could not read the provisioning profile at ${profilePath}.`);
     process.exit(1);
   }

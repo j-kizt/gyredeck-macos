@@ -129,13 +129,13 @@ const assetRoot = join(distRoot, "assets");
  * #300 (room inbox, GitHub status cache and usage snapshots kept in app files: load before the
  * first render, migration, ordered and retried saves, nothing saved by a run that could not read
  * the file) read 124,245 / 127,317 locally after a frozen install, +548 / +548 on the ceilings.
- * Both raised to CI's figure, by the owner from Discord on 2026-11-27 ("yes", sync-9782 seq 744 to 743).
+ * CI read the same. Both raised to that figure, by the owner from Discord on 2026-11-27 ("yes", sync-9782 seq 744 to 743).
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 124_305,
-  jsTotalGzipBytes: 127_377,
+  jsGzipBytes: 124_245,
+  jsTotalGzipBytes: 127_317,
 };
 
 const walk = async (directory) => {

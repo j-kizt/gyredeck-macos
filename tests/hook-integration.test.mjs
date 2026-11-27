@@ -10588,6 +10588,8 @@ test("a Claude Code session in a room with the owner's Discord is refused a term
     await allowed("a Discord member not yet confirmed", roomNow({ members: [{ conversationId: me, provider: "Claude Code", confirmed: true }, { ...discord, confirmed: false }] }));
     await allowed("this session not let in, so it cannot ask in the room either", roomNow({ members: [{ conversationId: me, confirmed: false }, discord] }));
     await allowed("in no room", roomNow({ room: null, members: [], you: null }));
+    await allowed("the bridge's own answer was not ok", roomNow({ ok: false }));
+    await allowed("the bridge's answer carries no ok", roomNow({ ok: undefined }));
     await allowed("the bridge answered for someone else", roomNow({ you: "someone-else" }));
     await allowed("an answer for another session", { ...roomNow(), boundTo: "someone-else" });
     await allowed("the bridge refused the read", { v: 1, ok: false, error: "room", status: 403, boundTo: me, answer: { ok: false } });

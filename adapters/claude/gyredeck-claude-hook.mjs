@@ -597,7 +597,7 @@ const ownerOnDiscord = async (conversationId, input) => {
   const bound = judgeBrokerAnswer(await askBroker({ bind: { conversationId } }));
   if (!bound.result) return false;
   const now = judgeBrokerAnswer(await askBroker({ room: {} })).result;
-  if (!now || now.boundTo !== conversationId || now.room?.you !== conversationId || typeof now.room.room !== "string") return false;
+  if (!now || now.boundTo !== conversationId || now.room?.ok !== true || now.room.you !== conversationId || typeof now.room.room !== "string") return false;
   const members = Array.isArray(now.room.members) ? now.room.members : [];
   const mine = members.find((member) => member?.conversationId === conversationId);
   return mine?.confirmed === true && members.some((member) => member?.provider === "Discord" && member.confirmed === true);

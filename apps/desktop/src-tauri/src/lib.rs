@@ -1268,6 +1268,14 @@ fn discord_start_pairing(discord: tauri::State<'_, discord::DiscordState>) -> Re
     discord.start_pairing()
 }
 
+/// Restart the connector now, rooms left open (#459).
+#[tauri::command]
+async fn discord_reconnect(app: tauri::AppHandle) -> Result<discord::DiscordStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<discord::DiscordState>().reconnect())
+        .await
+        .map_err(|error| format!("Reconnecting Discord did not finish: {error}"))?
+}
+
 /// Stop the connector and forget its token, forum and owner. Posts already made stay.
 #[tauri::command]
 async fn discord_remove(app: tauri::AppHandle) -> Result<discord::DiscordStatus, String> {
@@ -6312,6 +6320,7 @@ pub fn run() {
             discord_set_forum,
             discord_start_pairing,
             discord_remove,
+            discord_reconnect,
             discord_connect,
             discord_disconnect,
             discord_retry_leave,

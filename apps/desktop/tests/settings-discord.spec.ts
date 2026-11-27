@@ -29,6 +29,10 @@ type Status = {
   roomErrors?: Record<string, { code: string; message: string }>;
   /** The mock's own switch: a leave the bridge refuses. */
   failLeave?: boolean;
+  failReconnect?: string;
+  holdReconnect?: boolean;
+  refuseToken?: boolean;
+  holdStatus?: boolean;
   /** The mock's own: what `discord_approvals` answers (#207). */
   approvals?: string;
   failApprovalsRemove?: boolean;
@@ -91,7 +95,12 @@ const mock = async (page: Page, status: Status) => {
         if (command === "mail_rooms") return structuredClone(roomList);
         if (command.endsWith("_hook_status")) return ["/Users/demo/.config/gyredeck/hook.mjs", true];
         if (command === "sync_replies_allowed") return false;
-        if (command === "discord_status") return structuredClone(state);
+        if (command === "discord_status") {
+          // Held: what it saw is taken now and answered only when __releaseStatus is called.
+          const seen = structuredClone(state);
+          if (state.holdStatus) await new Promise((release) => Object.assign(window, { __releaseStatus: release }));
+          return seen;
+        }
         if (command.startsWith("discord_") || command === "open_external_url") calls.push(args && Object.keys(args).length > 0 ? { command, args } : { command });
         if (command === "open_external_url") return null;
         // Every command but pairing answers with the status it leaves behind, as the native side does.
@@ -109,6 +118,17 @@ const mock = async (page: Page, status: Status) => {
           if (state.failLeave) state.leaving = Object.fromEntries(state.connectedRooms.map((code) => [code, "Gyredeck could not vouch for itself to its own bridge. Quit and reopen Gyredeck"]));
           // Remove starts the hub over, its journal errors with it (as discord.rs remove() does).
           Object.assign(state, { configured: false, running: false, ready: false, bot: null, forums: [], forumId: null, owner: null, inviteUrl: null, connectedRooms: [], pairingCode: null, error: null, journalErrors: {} });
+          return after();
+        }
+        // A fresh connector, its error gone with the last one, not yet ready (discord.rs reconnect()).
+        if (command === "discord_reconnect") {
+          // Held: the press is still on its way while status reads go on; released by __releaseReconnect.
+          if (state.holdReconnect) await new Promise((release) => Object.assign(window, { __releaseReconnect: release }));
+          // A start that fails (no connector script, no thread) returns its error and sets none (discord.rs reconnect()).
+          if (state.failReconnect) { Object.assign(state, { error: null, ready: false, running: false }); throw new Error(state.failReconnect); }
+          // macOS would not hand the token over: Ok, but no connector started (discord.rs start_supervisor()).
+          if (state.refuseToken) { Object.assign(state, { configured: false, running: false, ready: false, error: null }); return after(); }
+          Object.assign(state, { error: null, ready: false });
           return after();
         }
         if (command === "discord_retry_leave") {
@@ -283,6 +303,142 @@ for (const [code, copy] of Object.entries(ERROR_COPY)) {
     await expect(page.getByLabel("Discord bot token")).toHaveCount(code === "bad_token" ? 1 : 0);
   });
 }
+
+// #459: a connector stopped on an error can be started again from its row, rooms left open.
+test.describe("Reconnect", () => {
+  test.use({ viewport: { width: 444, height: 560 } });
+  const HANDSHAKE = { code: "internal", message: "Opening handshake has timed out" };
+  const stuck = { ...blank, configured: true, running: true, error: HANDSHAKE };
+  const reconnect = (page: Page) => row(page, "bot").getByRole("button", { name: "Reconnect Discord" });
+  const remove = (page: Page) => row(page, "bot").getByRole("button", { name: "Remove", exact: true });
+  const set = (page: Page, next: Partial<Status>) => page.evaluate((next) => Object.assign((window as typeof window & { __discord: Status }).__discord, next), next);
+
+  for (const code of Object.keys(ERROR_COPY)) {
+    const fatal = code === "bad_token" || code === "missing_intent";
+    test(`${code}: Reconnect is ${fatal ? "not " : ""}offered`, async ({ page }) => {
+      await open(page, { ...stuck, error: { code, message: "boom" } });
+      await expect(row(page, "bot").locator(`[data-discord-error='${code}']`)).toBeVisible();
+      await expect(reconnect(page)).toHaveCount(fatal ? 0 : 1);
+    });
+  }
+
+  test("no error, no Reconnect", async ({ page }) => {
+    await open(page, paired());
+    await expect(remove(page)).toBeVisible();
+    await expect(reconnect(page)).toHaveCount(0);
+  });
+
+  test("a round icon as tall as Remove, about 6 px left of it, on its line", async ({ page }) => {
+    await open(page, stuck);
+    const [icon, pill] = await Promise.all([reconnect(page).boundingBox(), remove(page).boundingBox()]);
+    expect(await reconnect(page).textContent()).toBe("");
+    expect(icon!.width).toBeCloseTo(icon!.height, 0);
+    expect(icon!.height).toBeCloseTo(pill!.height, 0);
+    expect(icon!.y + icon!.height / 2).toBeCloseTo(pill!.y + pill!.height / 2, 0);
+    expect(pill!.x - (icon!.x + icon!.width)).toBeGreaterThanOrEqual(5);
+    expect(pill!.x - (icon!.x + icon!.width)).toBeLessThanOrEqual(7);
+  });
+
+  test("pressed: the icon spins, both buttons wait, the row says Reconnecting…; connected again, the button goes", async ({ page }) => {
+    await page.clock.install();
+    await open(page, stuck);
+    await reconnect(page).click();
+    await expect.poll(() => commands(page, "discord_reconnect")).toEqual([{ command: "discord_reconnect" }]);
+    await expect(reconnect(page).locator(".setup-spin")).toHaveCount(1);
+    await expect(reconnect(page)).toBeDisabled();
+    await expect(remove(page)).toBeDisabled();
+    await expect(row(page, "bot").locator(".setup-detail").first()).toHaveText("Reconnecting…");
+    await expect(row(page, "bot").locator("[data-discord-error]")).toHaveCount(0);
+
+    await set(page, { ready: true, bot: BOT, inviteUrl: INVITE });
+    await page.clock.runFor(5_100);
+    await expect(reconnect(page)).toHaveCount(0);
+    await expect(row(page, "bot").locator(".setup-detail").first()).toHaveText("Bot · Gyre Bot");
+    await expect(remove(page)).toBeEnabled();
+  });
+
+  test("still failing: the error stays with when it was tried again, and Reconnect is offered again", async ({ page }) => {
+    await page.clock.install({ time: new Date(2026, 10, 27, 14, 2, 30) });
+    await open(page, stuck);
+    await reconnect(page).click();
+    await expect(reconnect(page).locator(".setup-spin")).toHaveCount(1);
+    await set(page, { error: HANDSHAKE });
+    await page.clock.runFor(5_100);
+    await expect(row(page, "bot").locator("[data-discord-error]")).toHaveText(`Discord connector error: ${HANDSHAKE.message}`);
+    await expect(row(page, "bot").locator("[data-discord-retry]")).toHaveText("Tried again at 14:02 — still can't reach Discord. Check this Mac's internet, then try again.");
+    await expect(row(page, "bot").locator(".setup-detail").first()).toHaveText("Not connected");
+    await expect(reconnect(page)).toBeEnabled();
+    await expect(reconnect(page).locator(".setup-spin")).toHaveCount(0);
+    await expect(remove(page)).toBeEnabled();
+    // Per lessons.md (#243): the longest copy the row shows stays inside it, with nothing overflowing.
+    const { box, copy, overflow } = await row(page, "bot").evaluate((element) => ({
+      box: element.getBoundingClientRect().toJSON(),
+      copy: element.querySelector(".setup-copy")!.getBoundingClientRect().toJSON(),
+      overflow: [element, ...element.querySelectorAll<HTMLElement>("*")].filter((node) => !(node instanceof SVGElement) && node.scrollWidth > node.clientWidth).map((node) => node.className),
+    }));
+    expect(copy.x + copy.width).toBeLessThanOrEqual(box.x + box.width + 0.5);
+    expect(copy.y + copy.height).toBeLessThanOrEqual(box.y + box.height + 0.5);
+    expect(overflow).toEqual([]);
+
+    // A second press starts over: no old time while it spins.
+    await reconnect(page).click();
+    await expect(row(page, "bot").locator("[data-discord-retry]")).toHaveCount(0);
+    await expect(row(page, "bot").locator(".setup-detail").first()).toHaveText("Reconnecting…");
+  });
+
+  test("a press that fails says why and leaves both buttons usable, not spinning", async ({ page }) => {
+    await page.clock.install();
+    await open(page, { ...stuck, failReconnect: "The Discord connector is missing from this install" });
+    await reconnect(page).click();
+    await expect(row(page, "bot").getByText("The Discord connector is missing from this install")).toBeVisible();
+    await page.clock.runFor(5_100);
+    await expect(row(page, "bot").locator(".setup-spin")).toHaveCount(0);
+    await expect(row(page, "bot").locator(".setup-detail").first()).not.toHaveText("Reconnecting…");
+    await expect(remove(page)).toBeEnabled();
+  });
+
+  test("a status read that lands while the press is on its way does not count as the new connector failing", async ({ page }) => {
+    await page.clock.install();
+    await open(page, { ...stuck, holdReconnect: true });
+    await reconnect(page).click();
+    await page.clock.runFor(5_100);
+    await expect.poll(() => commands(page, "discord_reconnect")).toHaveLength(1);
+    await expect(reconnect(page).locator(".setup-spin")).toHaveCount(1);
+    await expect(row(page, "bot").locator("[data-discord-retry]")).toHaveCount(0);
+    await page.evaluate(() => (window as typeof window & { __releaseReconnect: () => void }).__releaseReconnect());
+    await page.clock.runFor(5_100);
+    await expect(reconnect(page).locator(".setup-spin")).toHaveCount(1);
+    await expect(row(page, "bot").locator("[data-discord-retry]")).toHaveCount(0);
+    await expect(row(page, "bot").locator(".setup-detail").first()).toHaveText("Reconnecting…");
+  });
+
+  test("a press that starts no connector stops spinning", async ({ page }) => {
+    await page.clock.install();
+    await open(page, { ...stuck, refuseToken: true });
+    await reconnect(page).click();
+    await expect.poll(() => commands(page, "discord_reconnect")).toHaveLength(1);
+    await page.clock.runFor(5_100);
+    await expect(row(page, "bot").locator(".setup-spin")).toHaveCount(0);
+    await expect(row(page, "bot").locator(".setup-detail").first()).not.toHaveText("Reconnecting…");
+  });
+
+  test("a status read asked before the press but answered after it is dropped", async ({ page }) => {
+    await page.clock.install();
+    await open(page, stuck);
+    await set(page, { holdStatus: true });
+    await page.clock.runFor(5_100);
+    await expect.poll(() => page.evaluate(() => typeof (window as typeof window & { __releaseStatus?: unknown }).__releaseStatus)).toBe("function");
+    await set(page, { holdStatus: false });
+    await reconnect(page).click();
+    await expect.poll(() => commands(page, "discord_reconnect")).toHaveLength(1);
+    await expect(row(page, "bot").locator(".setup-detail").first()).toHaveText("Reconnecting…");
+    await page.evaluate(() => (window as typeof window & { __releaseStatus: () => void }).__releaseStatus());
+    await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+    await expect(reconnect(page).locator(".setup-spin")).toHaveCount(1);
+    await expect(row(page, "bot").locator("[data-discord-retry]")).toHaveCount(0);
+    await expect(row(page, "bot").locator(".setup-detail").first()).toHaveText("Reconnecting…");
+  });
+});
 
 test.describe("the room menu", () => {
   const founderRow = (page: Page) => page.locator(".setup-account-row", { hasText: "sync-abcd" });

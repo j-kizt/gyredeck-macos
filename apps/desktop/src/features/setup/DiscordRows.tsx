@@ -22,6 +22,9 @@ const ERROR_COPY: Record<string, string> = {
   commands_unregistered: "Retrying /disconnect setup.",
 };
 
+/** What a restart cannot clear: the connector idles on these until a new token (discord.rs `FATAL_ERRORS`). */
+const FATAL_ERRORS = ["bad_token", "missing_intent"];
+
 const errorCopy = (error: { code: string; message: string }) =>
   ERROR_COPY[error.code] ?? `Discord connector error: ${error.message}`;
 
@@ -54,6 +57,10 @@ export const DiscordRows = ({ discord, canUseNativeControls, syncRooms }: { disc
   const { status, failure, busy, run } = discord;
   const [token, setToken] = useState("");
   const [confirming, setConfirming] = useState(false);
+  // Reconnect (#459): pressed at `at`, it spins until the new connector is ready or says an error.
+  const [retry, setRetry] = useState<{ at: string; failed?: boolean } | null>(null);
+  const reconnecting = !!retry && !retry.failed;
+  const recoverable = !!status?.error && !FATAL_ERRORS.includes(status.error.code);
   const autoPicked = useRef<string | null>(null);
   const bot = status?.bot ?? null;
   const forums = status?.forums ?? [];
@@ -66,6 +73,14 @@ export const DiscordRows = ({ discord, canUseNativeControls, syncRooms }: { disc
     void run("discord_set_forum", { forumId: onlyForum });
   }, [onlyForum, run]);
 
+  // Judged only once the press has returned: Rust clears the last error after the old connector
+  // stops, and run reads status again before busy drops, so an error seen here is the new one's.
+  useEffect(() => {
+    if (!retry || busy) return;
+    if (status?.error) setRetry({ ...retry, failed: true });
+    else if (status?.ready || retry.failed) setRetry(null);
+  }, [status, busy]);
+
   const save = () => {
     const value = token.trim();
     // Cleared before the call returns: the token is never left in the page, whatever happens.
@@ -77,6 +92,7 @@ export const DiscordRows = ({ discord, canUseNativeControls, syncRooms }: { disc
   const detail = !canUseNativeControls ? "Desktop runtime required"
     : !status ? "Checking…"
     : !status.configured ? "Follow your sync rooms from Discord. Make an app at discord.com/developers, open Bot, copy its token and paste it here."
+    : reconnecting ? "Reconnecting…"
     : bot ? `Bot · ${bot.username}`
     : status.error ? "Not connected"
     : "Connecting…";
@@ -90,13 +106,17 @@ export const DiscordRows = ({ discord, canUseNativeControls, syncRooms }: { disc
           <span className="setup-copy">
             <span className="setup-title">Discord</span>
             <span className="setup-detail">{detail}</span>
-            {status?.error ? <span className="setup-detail" role="status" data-discord-error={status.error.code}>{errorCopy(status.error)}</span> : null}
+            {status?.error && !reconnecting ? <span className="setup-detail" role="status" data-discord-error={status.error.code}>{errorCopy(status.error)}</span> : null}
+            {retry?.failed && recoverable ? <span className="setup-detail" role="status" data-discord-retry>{`Tried again at ${retry.at} — still can't reach Discord. Check this Mac's internet, then try again.`}</span> : null}
             {failure ? <span className="setup-detail" role="status">{failure}</span> : null}
             {confirming ? <span className="setup-detail" role="alert">Remove Discord? The bot stops and its token is deleted. Posts already in Discord stay there. Multi-factor authentication is not changed.</span> : null}
           </span>
+          {(reconnecting || recoverable) && !confirming ? (
+            <button className="pill-btn icon-only" type="button" disabled={busy || reconnecting} onClick={() => { setRetry({ at: new Date().toTimeString().slice(0, 5) }); void run("discord_reconnect").then((after) => (after as IDiscordStatus | undefined)?.configured || setRetry(null)); }} aria-label="Reconnect Discord" title="Reconnect" data-tauri-drag-region="false"><RefreshCw className={reconnecting ? "setup-spin" : undefined} size={12} strokeWidth={2.3} /></button>
+          ) : null}
           {/* Also with no token left: a kept warning says Remove clears it, so Remove is there (#282). */}
           {(status?.configured || Object.keys(status?.journalErrors ?? {}).length > 0) && !confirming ? (
-            <button className="pill-btn danger" type="button" disabled={busy} onClick={() => setConfirming(true)} data-tauri-drag-region="false"><Trash2 size={12} strokeWidth={2.3} />Remove</button>
+            <button className="pill-btn danger" type="button" disabled={busy || reconnecting} onClick={() => setConfirming(true)} data-tauri-drag-region="false"><Trash2 size={12} strokeWidth={2.3} />Remove</button>
           ) : null}
         </div>
         {confirming ? (

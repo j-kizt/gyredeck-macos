@@ -2647,6 +2647,20 @@ impl DiscordState {
         Ok(self.status())
     }
 
+    /// Reconnect (#459): a fresh child at once, with no backoff. Rooms stay followed and the new
+    /// child is handed what they hold, as after any restart. The last child's error is cleared
+    /// once it is stopped, so nothing it says can land after the clear (the UI relies on this).
+    pub(crate) fn reconnect(&self) -> Result<DiscordStatus, String> {
+        self.stop_supervisor();
+        {
+            let mut hub = lock(&self.hub);
+            hub.error = None;
+            hub.commands_error = None;
+        }
+        self.start_supervisor()?;
+        Ok(self.status())
+    }
+
     pub(crate) fn set_forum(&self, forum_id: &str) -> Result<DiscordStatus, String> {
         if !valid_snowflake(forum_id) {
             return Err("That is not a Discord channel id".to_string());

@@ -126,12 +126,16 @@ const assetRoot = join(distRoot, "assets");
  * #442 (MFA's own round Remove and its confirm) read 123,697 / 126,769 locally after a frozen
  * install, against main's CI 123,544 / 126,621: +153 / +148. Both raised to the local figure, by
  * the owner from Discord on 2026-11-26 ("yes", sync-9782 seq 508 to 505).
+ * #300 (room inbox, GitHub status cache and usage snapshots kept in app files: load before the
+ * first render, migration, ordered and retried saves, nothing saved by a run that could not read
+ * the file) read 124,245 / 127,317 locally after a frozen install, +548 / +548 on the ceilings.
+ * Both raised to CI's figure, by the owner from Discord on 2026-11-27 ("yes", sync-9782 seq 744 to 743).
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 123_697,
-  jsTotalGzipBytes: 126_769,
+  jsGzipBytes: 124_305,
+  jsTotalGzipBytes: 127_377,
 };
 
 const walk = async (directory) => {

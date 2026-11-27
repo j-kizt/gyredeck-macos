@@ -36,8 +36,6 @@ type Status = {
   rooms?: typeof ROOMS;
   /** The mock's own: a Connect the native side refuses with this (#376). */
   connectRefusal?: string;
-  /** The mock's own: sessions fill the room while that Connect is on its way (#376). */
-  fillOnRefusal?: boolean;
 };
 type Call = { command: string; args?: Record<string, unknown> };
 
@@ -74,12 +72,12 @@ const withBot = (extra: Partial<Status> = {}): Status => ({ ...blank, configured
 const paired = (extra: Partial<Status> = {}): Status => withBot({ forums: [FORUM], forumId: FORUM.id, owner: OWNER, ...extra });
 
 // One founder room, one joined room, so the button can be seen to pick the founder's.
-const ROOMS: Array<{ room: string; seq: number; members: string[]; founder: string | null; capacity?: number; pending: number; subscribers: number; lastMessageAt: null; lastReadAt: null }> = [
-  { room: "sync-abcd", seq: 3, members: ["claude", "codex"], founder: "claude", capacity: 8, pending: 999, subscribers: 2, lastMessageAt: null, lastReadAt: null },
-  { room: "sync-wxyz", seq: 1, members: ["claude"], founder: null, capacity: 8, pending: 0, subscribers: 1, lastMessageAt: null, lastReadAt: null },
+const ROOMS: Array<{ room: string; seq: number; members: string[]; founder: string | null; sessions?: number | null; pending: number; subscribers: number; lastMessageAt: null; lastReadAt: null }> = [
+  { room: "sync-abcd", seq: 3, members: ["claude", "codex"], founder: "claude", sessions: 2, pending: 999, subscribers: 2, lastMessageAt: null, lastReadAt: null },
+  { room: "sync-wxyz", seq: 1, members: ["claude"], founder: null, sessions: 1, pending: 0, subscribers: 1, lastMessageAt: null, lastReadAt: null },
 ];
-// The founder's room with every place taken.
-const fullRooms = (count = 8) => [{ ...ROOMS[0]!, members: Array.from({ length: count }, (_, index) => `agent-${index}`) }, ROOMS[1]!];
+// The founder's room with every session place taken, and the relay beside them when Discord follows it (#456).
+const fullRooms = (count = 8, discord = false) => [{ ...ROOMS[0]!, members: [...Array.from({ length: count }, (_, index) => `agent-${index}`), ...(discord ? ["Discord"] : [])], sessions: count }, ROOMS[1]!];
 
 const mock = async (page: Page, status: Status) => {
   await page.addInitScript(([initial, rooms]) => {
@@ -134,8 +132,6 @@ const mock = async (page: Page, status: Status) => {
         if (command === "discord_connect" && state.connectRefusal) {
           const refusal = state.connectRefusal;
           delete state.connectRefusal;
-          const room = roomList.find((entry) => entry.room === args?.code);
-          if (state.fillOnRefusal && room?.capacity) while (room.members.length < room.capacity) room.members.push(`late-${room.members.length}`);
           throw new Error(refusal);
         }
         if (command === "discord_connect") { state.connectedRooms.push(String(args?.code)); return after(); }
@@ -336,43 +332,28 @@ test.describe("the room menu", () => {
     await expect(joinedRow(page).getByRole("button", { name: "Actions for sync-wxyz" })).not.toHaveAttribute("aria-busy", "true");
   });
 
-  // #376 reopened: Discord joins a room as a member, so a room with every place taken cannot take it.
-  test("a full room offers Connect disabled and says why; a full room already followed still offers Disconnect", async ({ page }) => {
+  // #456: Discord takes no session's place, so a room of 8 sessions still offers Connect, and its count leaves Discord out.
+  test("a room of 8 sessions offers Connect, with no reason to refuse it; Discord following it is not counted as a session", async ({ page }) => {
     await open(page, paired({ rooms: fullRooms() }), "Sync");
-    let menu = await menuOf(founderRow(page), "sync-abcd");
-    const connect = menu.getByRole("menuitem", { name: "Connect to Discord" });
-    await expect(connect).toBeDisabled();
-    await expect(connect.locator(".setup-menu-item-why")).toHaveText("Room full");
-    await expect(connect).toHaveAttribute("title", "This room is full (8 of 8)");
-    await expect(menu.getByRole("menuitem", { name: "Close room" })).toBeEnabled();
-    await connect.click({ force: true });
-    expect(await commands(page, "discord_connect")).toEqual([]);
-    await open(page, paired({ rooms: fullRooms(), connectedRooms: ["sync-abcd"] }), "Sync");
-    menu = await menuOf(founderRow(page), "sync-abcd");
-    await expect(menu.getByRole("menuitem", { name: "Disconnect from Discord" })).toBeEnabled();
-    await expect(menu.locator(".setup-menu-item-why")).toHaveCount(0);
-    // One place left is not full.
-    await open(page, paired({ rooms: fullRooms(7) }), "Sync");
-    menu = await menuOf(founderRow(page), "sync-abcd");
-    await expect(menu.getByRole("menuitem", { name: "Connect to Discord" })).toBeEnabled();
-    await expect(menu.locator(".setup-menu-item-why")).toHaveCount(0);
+    await expect(founderRow(page).locator(".setup-account-tags")).toHaveText("8 sessions");
+    const menu = await menuOf(founderRow(page), "sync-abcd");
+    const connect = menu.getByRole("menuitem", { name: "Connect to Discord", exact: true });
+    await expect(connect).toBeEnabled();
+    await expect(connect).not.toHaveAttribute("aria-disabled", "true");
+    await expect(connect).not.toHaveAttribute("title");
+    await expect(connect).toHaveText("Connect");
+    await connect.click();
+    expect(await commands(page, "discord_connect")).toEqual([{ command: "discord_connect", args: { code: "sync-abcd" } }]);
+    await open(page, paired({ rooms: fullRooms(8, true), connectedRooms: ["sync-abcd"] }), "Sync");
+    await expect(founderRow(page).locator(".setup-account-tags")).toHaveText("8 sessions");
+    await expect(founderRow(page).getByRole("img", { name: "Connected to Discord" })).toBeVisible();
+    await expect((await menuOf(founderRow(page), "sync-abcd")).getByRole("menuitem", { name: "Disconnect from Discord" })).toBeEnabled();
   });
 
-  test("a full room's Connect is reached by the keyboard and named with its reason, and Enter on it does nothing", async ({ page }) => {
-    await open(page, paired({ rooms: fullRooms() }), "Sync");
-    const button = founderRow(page).getByRole("button", { name: "Actions for sync-abcd" });
-    await button.focus();
-    await page.keyboard.press("Enter");
-    const connect = founderRow(page).getByRole("menuitem", { name: "Connect to Discord: the room is full (8 of 8)", exact: true });
-    await expect(connect).toBeFocused();
-    await expect(connect).toHaveAttribute("aria-disabled", "true");
-    await page.keyboard.press("Enter");
-    expect(await commands(page, "discord_connect")).toEqual([]);
-    await expect(connect).toBeFocused();
-    await page.keyboard.press("ArrowDown");
-    await expect(founderRow(page).getByRole("menuitem", { name: "Close room" })).toBeFocused();
-    await page.keyboard.press("ArrowUp");
-    await expect(connect).toBeFocused();
+  test("a room's count falls back to its members from a bridge that does not say how many are sessions, and says 0 when it says 0", async ({ page }) => {
+    await open(page, paired({ rooms: [{ ...ROOMS[0]!, members: ["claude", "codex", "gemini"], sessions: undefined }, { ...ROOMS[1]!, sessions: 0 }] }), "Sync");
+    await expect(founderRow(page).locator(".setup-account-tags")).toHaveText("3 sessions");
+    await expect(joinedRow(page).locator(".setup-account-tags")).toHaveText("0 sessions");
   });
 
   test("a refused Connect is said under that room's own row on the Sync page, and the next try that works clears it", async ({ page }) => {
@@ -900,14 +881,14 @@ test.describe("a room Discord refuses", () => {
   const refused = (code: string, message: string, count = 19) =>
     paired({ connectedRooms: ["sync-abcd"], behind: { "sync-abcd": count }, roomErrors: { "sync-abcd": { code, message } } });
 
-  // #376 reopened: the room filled while Connect was on its way, the longest line a refused Connect shows.
-  test("a Connect refused because the room filled names the count and what to do, inside its row", async ({ page }) => {
-    await open(page, paired({ rooms: fullRooms(7), connectRefusal: "That room is full", fillOnRefusal: true }), "Sync");
+  // #456: a refused Connect (a second relay) is said as the bridge said it, inside its row, with no full-room advice.
+  test("a Connect refused as a full room is said as it was, with no count or advice, inside its row", async ({ page }) => {
+    await open(page, paired({ rooms: fullRooms(), connectRefusal: "That room is full" }), "Sync");
     const founder = page.locator(".setup-account-row", { hasText: "sync-abcd" });
     await founder.getByRole("button", { name: "Actions for sync-abcd" }).click();
     await founder.getByRole("menuitem", { name: "Connect to Discord" }).click();
     const failed = founder.locator("[data-discord='room-failed']");
-    await expect(failed).toHaveText("Couldn't connect to Discord: the room is full (8 of 8). Discord needs a place of its own — have a session leave, then Connect again.", { timeout: 12_000 });
+    await expect(failed).toHaveText("Couldn't connect to Discord: That room is full");
     const boxes = await founder.evaluate((element) => {
       const rect = (node: Element) => { const { x, y, width, height } = node.getBoundingClientRect(); return { x, y, width, height }; };
       const note = element.querySelector("[data-discord='room-failed']")!;
@@ -923,26 +904,6 @@ test.describe("a room Discord refuses", () => {
     expect(boxes.note.x + boxes.note.width).toBeLessThanOrEqual(boxes.row.x + boxes.row.width + 0.5);
     expect(boxes.note.y + boxes.note.height).toBeLessThanOrEqual(boxes.row.y + boxes.row.height + 0.5);
     expect(boxes.overflow).toEqual([]);
-  });
-
-  test("a room_full refusal still gets its advice while the roster has not caught up, with no count it cannot show", async ({ page }) => {
-    await open(page, paired({ rooms: fullRooms(7), connectRefusal: "That room is full" }), "Sync");
-    const founder = page.locator(".setup-account-row", { hasText: "sync-abcd" });
-    await founder.getByRole("button", { name: "Actions for sync-abcd" }).click();
-    await founder.getByRole("menuitem", { name: "Connect to Discord" }).click();
-    await expect(founder.locator("[data-discord='room-failed']")).toHaveText("Couldn't connect to Discord: the room is full. Discord needs a place of its own — have a session leave, then Connect again.");
-  });
-
-  test("another refusal while the room fills is said as it was, never as a full room", async ({ page }) => {
-    await open(page, paired({ rooms: fullRooms(7), connectRefusal: "Discord is not reachable", fillOnRefusal: true }), "Sync");
-    const founder = page.locator(".setup-account-row", { hasText: "sync-abcd" });
-    await founder.getByRole("button", { name: "Actions for sync-abcd" }).click();
-    await founder.getByRole("menuitem", { name: "Connect to Discord" }).click();
-    // Premise: the roster has caught up and now shows the room full.
-    await founder.getByRole("button", { name: "Actions for sync-abcd" }).click();
-    await expect(founder.locator(".setup-menu-item-why")).toHaveText("Room full", { timeout: 12_000 });
-    await page.keyboard.press("Escape");
-    await expect(founder.locator("[data-discord='room-failed']")).toHaveText("Couldn't connect to Discord: Discord is not reachable");
   });
 
   test("a lost permission names the forum and where to fix it, and goes once the room moves", async ({ page }) => {

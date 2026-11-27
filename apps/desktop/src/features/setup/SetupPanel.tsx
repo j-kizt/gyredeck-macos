@@ -102,7 +102,7 @@ export interface ISetupPanelProps {
   keepAwakeError: string | null;
   hookStatus: IHookStatus;
   /** Rooms the bridge currently holds, keyed by code. Only ones with members are shown. */
-  mailRooms: Record<string, { room: string; members: string[]; pending: number; founder: string | null; capacity?: number | null }>;
+  mailRooms: Record<string, { room: string; members: string[]; pending: number; founder: string | null; sessions?: number | null }>;
   notifications: INotificationsState;
   onCloseRoom: (room: string, founder: string) => Promise<void>;
   /** Per agent; null or absent while unknown, so a switch does not claim "off" before it has looked; a string is why it could not look. */
@@ -263,9 +263,6 @@ const GitAccountList = ({ accounts, canUseNativeControls, onSetActive, onRemove 
 
 type MailRoom = ISetupPanelProps["mailRooms"][string];
 
-/** What the native side says when the bridge refuses a join with `room_full` (`sync_error` in standalone_bridge.rs). */
-const ROOM_FULL = "That room is full";
-
 /**
  * One sync room, laid out like a Git account, with its actions in the same ⋮ menu (#376).
  *
@@ -289,15 +286,11 @@ const SyncRoomRow = ({ entry, discord, discordReady, onCloseRoom }: {
   const followed = discord.status?.connectedRooms.includes(entry.room) === true;
   const held = heldLine(discord.status, entry.room);
   const founder = entry.founder;
-  // Discord joins as a member, so a room with no place left cannot take it (#376).
-  const full = entry.capacity != null && entry.members.length >= entry.capacity;
-  // aria-disabled, not disabled: the item stays in the arrow keys' reach, so its reason can be heard.
-  const connectBlocked = !followed && full;
+  // Discord takes no session's place (#456), so the count and Connect leave it out.
+  const sessions = entry.sessions ?? entry.members.length;
   const failed = discord.failedOn?.room === entry.room ? discord.failure : null;
-  // The advice follows the refusal itself, never the roster, which can lag it by a poll either way.
   const failedLine = !failed ? null
     : discord.failedOn?.command !== "discord_connect" ? `Couldn't disconnect from Discord: ${failed}`
-    : failed === ROOM_FULL ? `Couldn't connect to Discord: the room is full${full ? ` (${entry.members.length} of ${entry.capacity})` : ""}. Discord needs a place of its own — have a session leave, then Connect again.`
     : `Couldn't connect to Discord: ${failed}`;
   return (
     <div className="setup-account-row" data-closing={closing} data-held={held || failedLine ? "true" : undefined}>
@@ -312,7 +305,7 @@ const SyncRoomRow = ({ entry, discord, discordReady, onCloseRoom }: {
               their own detail panels, and naming them here made every row as tall
               as the number of members. */}
           <span className="setup-detail">
-            {entry.members.length === 1 ? "1 session" : `${entry.members.length} sessions`}
+            {sessions === 1 ? "1 session" : `${sessions} sessions`}
           </span>
         </span>
       </span>
@@ -330,9 +323,8 @@ const SyncRoomRow = ({ entry, discord, discordReady, onCloseRoom }: {
             {/* Offered only once a post has somewhere to go and someone to answer to, and only for a
                 room this Mac founded, as before #376. */}
             {founder && discordReady ? (
-              <button className="setup-menu-item" type="button" role="menuitem" disabled={discord.busy} aria-disabled={connectBlocked || undefined} title={connectBlocked ? `This room is full (${entry.members.length} of ${entry.capacity})` : undefined} aria-label={followed ? "Disconnect from Discord" : connectBlocked ? `Connect to Discord: the room is full (${entry.members.length} of ${entry.capacity})` : "Connect to Discord"} onClick={() => { if (connectBlocked) return; close(); void discord.run(followed ? "discord_disconnect" : "discord_connect", { code: entry.room }); }}>
+              <button className="setup-menu-item" type="button" role="menuitem" disabled={discord.busy} aria-label={followed ? "Disconnect from Discord" : "Connect to Discord"} onClick={() => { close(); void discord.run(followed ? "discord_disconnect" : "discord_connect", { code: entry.room }); }}>
                 <DiscordLogo size={12} /> {followed ? "Disconnect" : "Connect"}
-                {connectBlocked ? <span className="setup-menu-item-why" aria-hidden="true">Room full</span> : null}
               </button>
             ) : null}
             {/* The founder is the input sync_close needs; a bridge that names none gets no close to send. */}

@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { OWNER_DISCORD_SENDER, RESERVED_SENDERS, ROOM_RULES_VERSION, isReservedId, roomRules } from "../adapters/bridge/gyredeck-bridge.mjs";
+import { CODEX_PUSH_ENVELOPE_RESERVE, OWNER_DISCORD_SENDER, RESERVED_SENDERS, ROOM_RULES_VERSION, isReservedId, roomRules } from "../adapters/bridge/gyredeck-bridge.mjs";
 import { fileURLToPath } from "node:url";
 
 /**
@@ -909,4 +909,122 @@ test("#207: rules v19 say a merge or a release from Discord needs the owner's co
   assert.match(rules, /GET \/mail\/<room>\/approval\?as=<your id>&seq=<your ask's seq>/);
   assert.match(rules, /gh pr merge --match-head-commit <sha>/);
   assert.match(rules, /Codex cannot attach `approval`, so a Codex agent asks at the terminal as before/);
+});
+
+// #456: the Discord relay takes no session's place. The cap is 8 sessions; a room holds at most
+// one relay on top of them.
+const joinSession = (h, code, id) => h.call("POST", `/sync/rooms/${code}/members`, { conversationId: id });
+const joinRelay = (h, code, id) => h.call("POST", `/sync/rooms/${code}/members`, { conversationId: id, relay: "discord" });
+const listedRoom = async (h, code) => (await h.call("GET", "/mail")).body.rooms.find((room) => room.room === code);
+const fillSessions = async (h, code, prefix, upTo) => {
+  for (let index = 1; index < upTo; index += 1) {
+    const joined = await joinSession(h, code, `${prefix}-${index}`);
+    assert.equal(joined.status, 200, `session ${index + 1} of ${upTo}: ${JSON.stringify(joined.body)}`);
+  }
+};
+
+test("#456 Discord joins a room already holding 8 sessions, and a 9th session is still refused", async () => {
+  const h = await startBridge();
+  try {
+    const { room: code } = (await h.call("POST", "/sync/rooms", { conversationId: "f456-a" })).body;
+    await fillSessions(h, code, "s456-a", 8);
+    const relay = await joinRelay(h, code, `discord-${code}`);
+    assert.equal(relay.status, 200, JSON.stringify(relay.body));
+    const ninth = await joinSession(h, code, "s456-a-9");
+    assert.deepEqual([ninth.status, ninth.body.error], [429, "room_full"], "the 9th session is refused with Discord present");
+    const room = await listedRoom(h, code);
+    assert.deepEqual([room.sessions, room.members.length, room.capacity], [8, 9, 8], "sessions leave the relay out; members name it");
+    assert.ok(room.members.includes("Discord"), "the relay is still named among the members");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("#456 8 sessions join a room Discord already follows; a 9th is refused, as it is without Discord", async () => {
+  const h = await startBridge();
+  try {
+    const { room: code } = (await h.call("POST", "/sync/rooms", { conversationId: "f456-b" })).body;
+    assert.equal((await joinRelay(h, code, `discord-${code}`)).status, 200);
+    await fillSessions(h, code, "s456-b", 8);
+    const ninth = await joinSession(h, code, "s456-b-9");
+    assert.deepEqual([ninth.status, ninth.body.error], [429, "room_full"]);
+    assert.equal((await listedRoom(h, code)).sessions, 8);
+
+    const { room: plain } = (await h.call("POST", "/sync/rooms", { conversationId: "f456-c" })).body;
+    await fillSessions(h, plain, "s456-c", 8);
+    const plainNinth = await joinSession(h, plain, "s456-c-9");
+    assert.deepEqual([plainNinth.status, plainNinth.body.error], [429, "room_full"], "the 9th session is refused without Discord");
+    assert.deepEqual([(await listedRoom(h, plain)).sessions, (await listedRoom(h, plain)).members.length], [8, 8]);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("#456 a room holds one relay: a second is refused, until the first leaves", async () => {
+  const h = await startBridge();
+  try {
+    const { room: code } = (await h.call("POST", "/sync/rooms", { conversationId: "f456-d" })).body;
+    assert.equal((await joinRelay(h, code, "discord-one")).status, 200);
+    const second = await joinRelay(h, code, "discord-two");
+    assert.deepEqual([second.status, second.body.error], [429, "room_full"]);
+    assert.equal((await joinRelay(h, code, "discord-one")).status, 200, "the same relay pressing Connect again is no second relay");
+    assert.equal((await h.call("DELETE", `/sync/rooms/${code}/members/discord-one`)).status, 200);
+    assert.equal((await joinRelay(h, code, "discord-two")).status, 200, "a place for one relay, not for one id");
+    const room = await listedRoom(h, code);
+    assert.deepEqual([room.sessions, room.members.length], [1, 2]);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("#456 joins at once still stop at the caps: one of three sessions for the 8th place, one of two relays", async () => {
+  const h = await startBridge();
+  try {
+    const { room: code } = (await h.call("POST", "/sync/rooms", { conversationId: "f456-e" })).body;
+    await fillSessions(h, code, "s456-e", 7);
+    const joins = await Promise.all([
+      joinSession(h, code, "s456-e-x"), joinSession(h, code, "s456-e-y"), joinSession(h, code, "s456-e-z"),
+      joinRelay(h, code, "discord-x"), joinRelay(h, code, "discord-y"),
+    ]);
+    assert.deepEqual(joins.slice(0, 3).map((joined) => joined.status).sort(), [200, 429, 429], "one session took the 8th place");
+    assert.deepEqual(joins.slice(3).map((joined) => joined.status).sort(), [200, 429], "one relay");
+    const room = await listedRoom(h, code);
+    assert.deepEqual([room.sessions, room.members.length], [8, 9]);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("#456 the whole roster of 8 sessions with the longest names, plus Discord, fits the push envelope reserve", async () => {
+  const h = await startBridge();
+  try {
+    const founder = "f456-f";
+    const { room: code } = (await h.call("POST", "/sync/rooms", { conversationId: founder })).body;
+    const ids = [founder, ...Array.from({ length: 7 }, (_, index) => `s456-f-${index + 1}`)];
+    for (const id of ids.slice(1)) {
+      assert.equal((await joinSession(h, code, id)).status, 200);
+      assert.equal((await h.joinRoom(code, id)).status, 200);
+    }
+    assert.equal((await joinRelay(h, code, `discord-${code}`)).status, 200);
+    // The longest name a session can declare, in a 3-byte script so it is the most bytes too.
+    for (const [index, id] of ids.entries()) {
+      const name = `${"ก".repeat(39)}${"กขคฆงจฉช"[index]}`;
+      const posted = await fetch(`${h.base}/mail/${code}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(await asMember(h, id, h.token)) },
+        body: JSON.stringify({ from: id, to: "everyone", kind: "tell", text: "named", name }),
+      });
+      assert.equal(posted.status, 202, await posted.text());
+    }
+    const room = await listedRoom(h, code);
+    assert.equal(room.members.length, 9);
+    assert.ok(room.members.filter((shown) => shown.includes("ก".repeat(39))).length === 8, "every session carries its long name");
+    const roster = `Members now (v999): ${room.members.join(", ")}.`;
+    const bytes = Buffer.byteLength(roster, "utf8");
+    // Measured 2026-11-27: the roster is the only part of the confirmation that grows as members join.
+    assert.ok(bytes * 2 < CODEX_PUSH_ENVELOPE_RESERVE, `roster ${bytes} B against a ${CODEX_PUSH_ENVELOPE_RESERVE} B reserve`);
+    console.log(`#456 roster of 8 sessions + Discord at the longest names: ${bytes} B (reserve ${CODEX_PUSH_ENVELOPE_RESERVE} B)`);
+  } finally {
+    await h.stop();
+  }
 });

@@ -64,8 +64,11 @@ test("fresh activity brings a cleared session back", async ({ page }) => {
   await expect(page.getByText("gyredeck").first()).toBeVisible({ timeout: 10_000 });
 });
 
+// Asked of a static scenario for the reason the clear test is (#415): on `?demo=1` the first row
+// is whichever conversation the stream touched last, so a click on `.first()` could remove
+// another conversation while the poll waited on demo-1.
 test("delete removes a stuck session registry locally", async ({ page }) => {
-  await page.goto("/?demo=1");
+  await page.goto("/?demo=1&demoScenario=done");
   await page.evaluate(
     ([dismissedKey, deletedKey, sessionKey]) => {
       window.localStorage.removeItem(dismissedKey);
@@ -77,7 +80,7 @@ test("delete removes a stuck session registry locally", async ({ page }) => {
   await page.reload();
 
   await page.getByRole("button", { name: /Clear completed .* session/ }).waitFor({ state: "visible", timeout: 10_000 });
-  await page.locator(".session-row-main").first().click();
+  await page.locator('.session-row-main[data-session-id="local-conv-demo-done"]').click();
   await page.getByRole("button", { name: "Remove history" }).click();
   await page.getByRole("button", { name: "Confirm remove" }).click();
 
@@ -87,8 +90,8 @@ test("delete removes a stuck session registry locally", async ({ page }) => {
         const deleted = JSON.parse(window.localStorage.getItem(deletedKey) ?? "{}");
         const sessions = JSON.parse(window.localStorage.getItem(sessionKey) ?? "{}");
         return {
-          deleted: typeof deleted["local-conv-demo-1"] === "number",
-          hasSessionEvents: Object.hasOwn(sessions, "local-conv-demo-1"),
+          deleted: typeof deleted["local-conv-demo-done"] === "number",
+          hasSessionEvents: Object.hasOwn(sessions, "local-conv-demo-done"),
         };
       },
       [deletedStorageKey, sessionEventsStorageKey],

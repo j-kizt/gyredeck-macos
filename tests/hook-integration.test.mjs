@@ -5936,6 +5936,10 @@ test("a Codex repeat is settled before the room is full, so it is never held and
   await writeFile(join(fakeBin, "codex"), "#!/bin/sh\nexit 0\n");
   await chmod(join(fakeBin, "codex"), 0o755);
   const rollout = join(rolloutDir, `rollout-2026-10-20T09-00-00-${thread}.jsonl`);
+  // Codex writes its log when the session starts, so it is there before the session joins.
+  // Created later, the bridge places its cursor at whatever end it sees when a push starts,
+  // and on a loaded runner that end was already past the first answer (#483).
+  await writeFile(rollout, "");
   const port = await freePort();
   await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
   const stderrRef = { value: "" };
@@ -5978,7 +5982,7 @@ test("a Codex repeat is settled before the room is full, so it is never held and
     // Codex says it once, and it lands.
     await appendFile(rollout, finishedTurn(`@everyone tell\n${words}`));
     await endTurn();
-    for (let i = 0; i < 40 && !(await said()).includes(words); i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+    await until(async () => (await said()).includes(words), "Codex's first post");
     assert.equal((await said()).filter((text) => text === words).length, 1);
 
     // The room fills with mail the sink never collects, then Codex says the same again.
@@ -6000,8 +6004,7 @@ test("a Codex repeat is settled before the room is full, so it is never held and
     // Something new from Codex is what reads the log again from where it was held.
     await appendFile(rollout, finishedTurn("@everyone tell\nAFTER-THE-DRAIN"));
     await endTurn();
-    for (let i = 0; i < 40 && !(await said()).includes("AFTER-THE-DRAIN"); i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.ok((await said()).includes("AFTER-THE-DRAIN"), "the log was read again past the full room");
+    await until(async () => (await said()).includes("AFTER-THE-DRAIN"), "the log read again past the full room");
     assert.equal((await said()).filter((text) => text === words).length, 1, "the repeat was settled when it was read, not posted later");
   } finally {
     bridge.stdin.end();

@@ -9,12 +9,14 @@ import { invoke } from "@tauri-apps/api/core";
  * Saves are spaced (one per name every two seconds at most), skipped when nothing changed,
  * and sent at once when the page is left. A browser build keeps using localStorage.
  *
- * Per name, where it lives this run:
- * - `file`: read from the file; the old localStorage copy is moved in and removed only after
- *   the file holds it.
- * - `local`: the app could not be asked (no answer, an error): localStorage, as before.
- * - `memory`: the file is there but could not be read: never saved over, and nothing goes to
- *   localStorage either, where a later run would lose it to the file.
+ * One rule decides every path: the file is replaced only by a value made from what it holds
+ * (#300 audit, two rounds). So, per name, this run:
+ * - `file`: the file was read. If there was none, the old localStorage copy is moved in and
+ *   removed only after the file holds it. If there was one, it wins, and a localStorage copy
+ *   beside it (a crash between save and removal, or an older version of the app) is removed.
+ * - `memory`: the file could not be read or the app did not answer. Nothing is saved anywhere
+ *   this run: a value built without the file's content must never replace it, in the file or
+ *   in a localStorage copy a later run would take in. This run's changes end with it.
  */
 export const APP_FILES = {
   "room-inbox": "gyredeck.room-inbox",
@@ -23,7 +25,7 @@ export const APP_FILES = {
 } as const;
 
 export type AppFileName = keyof typeof APP_FILES;
-type Place = "file" | "local" | "memory";
+type Place = "file" | "memory";
 type Loaded = { state: "absent" } | { state: "ok"; text: string } | { state: "unreadable"; reason: string };
 
 const SAVE_SPACING_MS = 2_000;
@@ -36,6 +38,9 @@ const held = new Map<AppFileName, string | null>();
 const sent = new Map<AppFileName, string | null>();
 const timers = new Map<AppFileName, ReturnType<typeof setTimeout>>();
 const saving = new Map<AppFileName, Promise<unknown>>();
+
+/** A browser build, which has no app to ask, keeps localStorage. */
+const inBrowser = () => typeof window.__TAURI_INTERNALS__ === "undefined";
 
 const legacyRead = (name: AppFileName) => {
   try {
@@ -88,35 +93,29 @@ const loadOne = async (name: AppFileName): Promise<void> => {
   } catch {
     loaded = null;
   }
-  // No answer, or one this side cannot read: localStorage, as before this change.
-  if (!isLoaded(loaded)) {
-    place.set(name, "local");
-    return;
-  }
-  if (loaded.state === "unreadable") {
+  if (!isLoaded(loaded) || loaded.state === "unreadable") {
     place.set(name, "memory");
     held.set(name, legacyRead(name));
     return;
   }
   place.set(name, "file");
-  const fileText = loaded.state === "ok" ? loaded.text : null;
-  sent.set(name, fileText);
-  // A localStorage copy beside a file is never older than it: a file run removes the copy
-  // once a save lands, so one still there was written after (a run that could not reach the
-  // file, or an older version of the app). It goes into the file, and is removed only after
-  // the file holds it (#300 audit).
-  const legacy = legacyRead(name);
-  held.set(name, legacy ?? fileText);
-  if (legacy !== null && legacy === fileText) legacyDrop(name);
-  else sendSave(name);
+  if (loaded.state === "ok") {
+    sent.set(name, loaded.text);
+    held.set(name, loaded.text);
+    legacyDrop(name);
+    return;
+  }
+  sent.set(name, null);
+  held.set(name, legacyRead(name));
+  sendSave(name);
 };
 
 let loading: Promise<void> | null = null;
 
 /** Read every file once; the app renders after this settles. Never rejects. */
 export const loadAppFiles = (): Promise<void> => {
-  if (typeof window.__TAURI_INTERNALS__ === "undefined") return Promise.resolve();
-  loading ??= Promise.all(NAMES.map((name) => loadOne(name).catch(() => void place.set(name, "local")))).then(() => {
+  if (inBrowser()) return Promise.resolve();
+  loading ??= Promise.all(NAMES.map((name) => loadOne(name).catch(() => void place.set(name, "memory")))).then(() => {
     window.addEventListener("pagehide", flushAppFiles);
   });
   return loading;
@@ -130,14 +129,11 @@ export const flushAppFiles = () => {
   }
 };
 
-export const readAppFile = (name: AppFileName): string | null => {
-  const where = place.get(name) ?? "local";
-  return where === "local" ? legacyRead(name) : held.get(name) ?? null;
-};
+export const readAppFile = (name: AppFileName): string | null =>
+  inBrowser() ? legacyRead(name) : held.get(name) ?? null;
 
 export const writeAppFile = (name: AppFileName, text: string): void => {
-  const where = place.get(name) ?? "local";
-  if (where === "local") {
+  if (inBrowser()) {
     try {
       window.localStorage.setItem(APP_FILES[name], text);
     } catch {
@@ -146,5 +142,5 @@ export const writeAppFile = (name: AppFileName, text: string): void => {
     return;
   }
   held.set(name, text);
-  if (where === "file" && !timers.has(name)) timers.set(name, setTimeout(() => sendSave(name), SAVE_SPACING_MS));
+  if (place.get(name) === "file" && !timers.has(name)) timers.set(name, setTimeout(() => sendSave(name), SAVE_SPACING_MS));
 };

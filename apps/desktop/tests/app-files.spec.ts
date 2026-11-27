@@ -3,8 +3,8 @@ import { expect, test, type Page } from "@playwright/test";
 /**
  * In the desktop app the caches it rewrites often live in files, not localStorage (#300):
  * the old copy is moved in and removed only once the file holds it, saves are spaced and
- * skipped when nothing changed, a file that cannot be read is never saved over, and an app
- * that cannot be asked keeps localStorage as before.
+ * skipped when nothing changed, and a run that could not read the file saves nothing anywhere,
+ * so the file is only ever replaced by a value made from what it holds.
  */
 
 const KEY = "gyredeck.room-inbox";
@@ -123,23 +123,28 @@ test("a file with no localStorage copy beside it is read and not saved again", a
   expect((await log(page)).filter((entry) => entry.what === "save")).toEqual([]);
 });
 
-test("a localStorage copy beside the file is the newer one: it is saved to the file, then removed", async ({ page }) => {
-  await open(page, { load: "ok", saveDelayMs: 300 }, inbox("legacy"));
-  expect(await read(page)).toBe(inbox("legacy"));
-  await expect.poll(async () => (await log(page)).map((entry) => entry.what)).toContain("localStorage.removeItem");
+test("a file already holding the cache wins, and a leftover localStorage copy is removed unsaved", async ({ page }) => {
+  await open(page, { load: "ok" }, inbox("legacy"));
+  expect(await read(page)).toBe(inbox("file"));
+  await page.waitForTimeout(2_500);
   const entries = await log(page);
-  const done = entries.find((entry) => entry.what === "save done");
-  expect(done?.text).toBe(inbox("legacy"));
-  expect(entries.find((entry) => entry.what === "localStorage.removeItem")!.at).toBeGreaterThanOrEqual(done!.at);
+  expect(entries.map((entry) => entry.what)).toContain("localStorage.removeItem");
+  expect(entries.filter((entry) => entry.what === "save")).toEqual([]);
 });
 
-test("what a run wrote to localStorage when it could not reach the file is kept by the next run", async ({ page }) => {
+test("a run that could not read the file changes nothing: the next run still has the file's content", async ({ page }) => {
   await open(page, { load: "throwsThenOk" }, null);
-  await write(page, inbox("written-while-unreachable"));
+  expect(await read(page)).toBeNull();
+  await write(page, inbox("built-without-the-file"));
+  await page.waitForTimeout(2_500);
+  let entries = await log(page);
+  expect(entries.filter((entry) => entry.what === "save" || entry.what === "localStorage.setItem")).toEqual([]);
   await page.reload();
   await expect(page.locator("#root > *").first()).toBeAttached({ timeout: 10_000 });
-  expect(await read(page)).toBe(inbox("written-while-unreachable"));
-  await expect.poll(async () => (await log(page)).filter((entry) => entry.what === "save done").map((entry) => entry.text)).toEqual([inbox("written-while-unreachable")]);
+  expect(await read(page)).toBe(inbox("file"));
+  await page.waitForTimeout(2_500);
+  entries = await log(page);
+  expect(entries.filter((entry) => entry.what === "save")).toEqual([]);
 });
 
 test("a change back to the file's value while another save is in flight is still saved after it", async ({ page }) => {
@@ -165,13 +170,14 @@ test("a file that cannot be read is never saved over, and nothing goes to localS
 });
 
 for (const load of ["throws", "odd", "hangs"] as const) {
-  test(`an app that ${load === "hangs" ? "does not answer" : load === "odd" ? "answers in a shape this side cannot read" : "fails to answer"} keeps localStorage as before, and the panel still opens`, async ({ page }) => {
+  test(`an app that ${load === "hangs" ? "does not answer" : load === "odd" ? "answers in a shape this side cannot read" : "fails to answer"} saves nothing anywhere, and the panel still opens`, async ({ page }) => {
     await open(page, { load }, inbox("legacy"));
     expect(await read(page)).toBe(inbox("legacy"));
     await write(page, inbox("n1"));
+    expect(await read(page)).toBe(inbox("n1"));
+    await page.waitForTimeout(2_500);
     const entries = await log(page);
-    expect(entries.filter((entry) => entry.what === "localStorage.setItem").map((entry) => entry.text)).toEqual([inbox("n1")]);
-    expect(entries.filter((entry) => entry.what === "save")).toEqual([]);
+    expect(entries.filter((entry) => entry.what === "save" || entry.what.startsWith("localStorage."))).toEqual([]);
   });
 }
 

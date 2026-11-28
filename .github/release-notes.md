@@ -15,7 +15,7 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
 - **A room member whose reads lose the broker is told why the room has gone quiet.** If a session
   that has read with its key starts reading without it, the Claude Code and Antigravity hooks say on every turn that room mail
   takes its key, even with nothing to deliver. This lasts until the broker is back or the bridge
-  restarts. Both hooks also say it once on the turn a room password is accepted. Otherwise a
-  session that has never read with its key is not told.
+  restarts. Both hooks also say it on the turn a room password is accepted, if that turn's
+  read is keyless. Otherwise a session that has never read with its key is not told.
 - **An Antigravity session whose pasted room password is refused is still told it is blocked**,
   also on a turn that delivers private mail at the same time.

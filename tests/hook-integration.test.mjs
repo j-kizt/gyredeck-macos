@@ -13032,9 +13032,9 @@ for (const path of rereadPaths) {
         assert.equal(own.filter((text) => text.includes("there is no key to read them again")).length, 1, "the line that says it cannot be read again, once");
         assert.equal(notes.length, 0, "not the outside-a-room note");
         // #294: a post in its name takes its key, so no REPLY command is printed without one.
-        const reply = result.steps.filter((text) => text.startsWith("The mail above is addressed to you"));
+        const reply = result.steps.filter((text) => text.startsWith("The mail above can be read but not answered"));
         assert.equal(reply.length, 1, "premise: mail addressed to it was delivered");
-        assert.match(reply[0], /no reply command can be given in this delivery/);
+        assert.match(reply[0], /carries none\. Either it did not come through the Gyredeck broker, or it was held over from an earlier process/);
         assert.ok(!reply[0].includes("curl"), "and no REPLY it could not run");
       } else {
         assert.equal(own.length + notes.length, 0, "I3: neither line when nothing was delivered");

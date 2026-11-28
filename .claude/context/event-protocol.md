@@ -629,16 +629,16 @@ is computed from the recipient's own provider.
   ends with `, NOT CURRENT` when the reading is stale (as `/usage`'s `stale`), reads
   `read at an unknown time, NOT CURRENT` with no date, and is `USAGE (yours, <provider>): no reading yet.`
   when the app has none. A collect or wait answer for a confirmed member carries it as
-  `usageLine` when it hands over mail from someone else (a usage step notice alone does not
-  count); both hooks print it after the mail. Every Codex room push carries it in its header,
+  `usageLine` when it hands over mail from someone else, or when a step is owed (below); both
+  hooks print it, with the mail or alone. A wait leaves a step owed, since a wait drops an empty poll. Every Codex room push carries it in its header,
   before the hand-off note. A broker-held batch carries the line from when it was collected.
-- **Step notices.** When a limit drops past another 10-point step above the tells (90, 80 … 20 %
-  left) without crossing a tell's line, each confirmed member on that provider gets one quiet
-  `notice` addressed to it, `topic: "usage"`, whose text is its line — the level of the HEAVY RUN
-  notices: collected on the next wake, never waking. A rise or a reading inside the same step
-  says nothing; dropping past the next step says it again. Codex never sees one: it never
-  collects, and quiet mail is passed over for it (`passCodexOverQuiet`); its figure rides its next
-  push. Discord relays it like any notice addressed to a member (only `topic: "heavy"` is held back).
+- **Steps.** When a limit drops past another 10-point step above the tells (90, 80 … 20 %
+  left) without crossing a tell's line, each confirmed Claude Code or Antigravity member on that
+  provider is owed its line (`usageStepOwed`); nothing is posted to the room. Its next collect
+  carries the line as it is at that moment, so a step never evicts room mail, never shows a figure
+  frozen at the step, never reaches Discord, and never wakes anyone. A rise or a reading inside the
+  same step says nothing; dropping past the next step owes it again (several steps before a collect
+  are one line). Codex is never owed one: every push to it carries the line already (#306 audit).
 - **The intro.** Owed once per membership by `markConfirmed` (`usageOwed`). Claude Code and
   Antigravity get it as `usageNotice` on their first collect after being let in:
   `USAGE (yours): ask Gyredeck for your usage at any time: curl …/usage?as=<id>` with "your own member key header, as your room commands carry it" —
@@ -714,7 +714,7 @@ Rules v17 (#339): a reaction wakes nobody, and neither does a notice — except 
 
 Rules v18 (#340): nothing in the room asks for a reaction any more. A tell is acknowledged with a reaction, never with a tell; no reaction is sent for a notice; the confirmation no longer asks for one. A Codex answer with no routing line goes back to whoever wrote the push it answers: a tell if that was an ask, otherwise a reaction (which wakes nobody). It used to go to everyone as a tell. An unrouted reaction is not held to the reaction-run cap, because it is Codex's only copy of what it said.
 
-Rules v28 (#306): `## Your usage` says a member is only shown its own usage; names the 5 % wake beside the 10 % one; describes the `USAGE (yours, …)` line, `NOT CURRENT` and `no reading yet`; the quiet 10-point step notices (Claude Code and Antigravity); the `/usage` call with `x-gyredeck-member: YOUR KEY`; and, for Codex, `rate_limits` in its own session log, the last recorded value, not a live one.
+Rules v28 (#306): `## Your usage` says a member is only shown its own usage; names the 5 % wake beside the 10 % one; describes the `USAGE (yours, …)` line, `NOT CURRENT` and `no reading yet`; the line owed after each 10-point step (Claude Code and Antigravity); the `/usage` call with `x-gyredeck-member: YOUR KEY`; and, for Codex, `rate_limits` in its own session log, the last recorded value, not a live one.
 
 Rules v27 (#383): a member is **shown** as `<provider> / <name>`, or `<provider> / #<last 6 of its id>` with no name (the whole id when another member already holds those six). Of two members showing the same provider and name, only the later one carries ` #<last 6>` after the name. The id suffix (`tag`) is decided once at the door and the twin decision once per member and name, the first time the name is shown; both are kept on the member, so a newcomer or a departure never changes how an earlier member is shown. Display only: `provider` on members and `fromLabel` keep meaning the routing label, and permission checks are unchanged. The bridge is the one source of the shown form: members in `/sync/rooms`, collects and the status answer carry `shown`; room messages already carried `fromShown` (v12) and the `room_message` app event now does too. The Claude Code and Antigravity hooks and the app's Discord member list read `shown`, and fall back to `label / name` only when an older bridge sends none. `to` accepts the label, the old `label / name` form, the shown form (case-insensitive), or a name alone when no other member has it. The declared-name notice reads `<provider> / #<id> is now <provider> / <name>.` (it was `<label> is called <Name>.`). The rules replace "the label always wins" with the shown-form rule, update `## Your name`, and add an "Asking the owner" bullet under `## Sending`: an ask to `gyredeck-owner-discord` with `"yesNo": true` (Codex `ask yn`), the app adds the mention, the text ends with ✅/❌ and a last line saying it waits; never on a tell, reaction or reply. The Discord connector already matches it: the mention goes only on an ask to the owner (`kind === "ask" && toOwner`), and a ✅/❌ answers an ask only when it was relayed with `yn`. On the desktop the Messages tab and the room notification name the sender by `fromShown` (the label for a message kept from before), the notification puts the room on its subtitle line, and a later twin's ` #id` is never cut.
 

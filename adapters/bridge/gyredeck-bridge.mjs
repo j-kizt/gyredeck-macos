@@ -334,7 +334,7 @@ carries the command for as long as the room sees none of yours.
 - Each delivery carries one \`USAGE (yours, …)\` line: each limit, how much is left, when it resets, and
   when it was read. \`NOT CURRENT\` means the reading is older than two of the app's refresh intervals
   or has no time; \`no reading yet\` means Gyredeck has none. Neither is a current figure.
-- Claude Code and Antigravity also get a quiet room notice with that line each time a limit drops past
+- Claude Code and Antigravity also get that line on their next delivery each time a limit drops past
   another 10% step (90, 80 … 20), so the latest figure is back in your context after a compaction. Look any time:
   \`curl -s "${origin}/usage?as=<your id>" -H "x-gyredeck-member: YOUR KEY"\`
   — YOUR KEY is the \`x-gyredeck-member\` value in the watch command your deliveries hand you.
@@ -5198,7 +5198,7 @@ function startBridge(config) {
     return "USAGE (yours): ask Gyredeck for your usage at any time: " +
       `curl -s "http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}/usage?as=${conversationId}" ` +
       "with your own member key header, as your room commands carry it (never another member's). " +
-      "Each delivery carries a USAGE line, a quiet notice comes at each 10% step down, and " + wakes;
+      "Each delivery carries a USAGE line, as does the next one after each 10% step down, and " + wakes;
   };
   /** Confirmed members on one provider, across the sync rooms. */
   const membersOnProvider = function* (provider) {
@@ -5265,10 +5265,13 @@ function startBridge(config) {
         if (told) deliverMail(conversationId, mailbox, outside, ROOM_SENDER, told);
       }
     }
-    // Quiet, as the HEAVY RUN notices are: it puts the figure back in context, it never wakes.
-    if (!stepped) return;
+    // Quiet: a step is owed to the member, not posted to the room. Its next collect carries the
+    // line as it is then, so steps never crowd out the room's mail, never show a figure frozen
+    // at the step, and never reach Discord or Codex, whose every push carries the line anyway
+    // (#306 audit M1, M2, S3, S4).
+    if (!stepped || reading.provider === "codex") return;
     for (const [, room, conversationId] of membersOnProvider(reading.provider)) {
-      publishMail(room, ROOM_SENDER, usageLineFor(conversationId), null, false, { [VOUCHED]: true, to: conversationId, kind: "notice", quiet: true, topic: "usage" });
+      room.members.get(conversationId).usageStepOwed = true;
     }
   };
 
@@ -5358,9 +5361,18 @@ function startBridge(config) {
     member.usageOwed = false;
     return usageIntroFor(conversationId, provider);
   };
-  /** The member's own usage line, on a collect that delivers someone else's mail (#306). */
-  const usageLineOnDelivery = (as, keyless, collected) =>
-    !keyless && inConfirmedRoom(as) && collected.some((message) => message.from !== as && message.topic !== "usage") ? usageLineFor(as) : null;
+  /**
+   * The member's own usage line, on a collect that delivers someone else's mail, or on the
+   * first collect after its limit stepped down 10 points (#306). A wait's poll leaves the step
+   * owed: a wait drops an empty poll whole, so the line would be lost (#259).
+   */
+  const usageLineOnDelivery = (as, keyless, collected, takesStep) => {
+    if (keyless || !inConfirmedRoom(as)) return null;
+    const member = syncRoomFor(as)?.room.members.get(as);
+    const stepOwed = takesStep && member?.usageStepOwed === true;
+    if (stepOwed) member.usageStepOwed = false;
+    return stepOwed || collected.some((message) => message.from !== as) ? usageLineFor(as) : null;
+  };
 
   /**
    * The heavy-run queue, told once to each session outside a room (#223). The queue is
@@ -9377,7 +9389,7 @@ function startBridge(config) {
            */
           const answer = (collected, sync, timedOut, missed = []) => {
             if (collect && sync) noteUsageCollected(sync.name, collected.filter((message) => message.room === sync.name && message.from === ROOM_SENDER), as);
-            const usageLine = collect ? usageLineOnDelivery(as, keyless, collected) : null;
+            const usageLine = collect ? usageLineOnDelivery(as, keyless, collected, false) : null;
             sendJson(200, {
               ok: true,
               ...(usageLine ? { usageLine } : {}),
@@ -9457,7 +9469,7 @@ function startBridge(config) {
             // own drain, which prints them on every path, is what takes them.
             const usageNotice = collect && !wakingOnly ? usageNoticeFor(as, keyless) ?? roomUsageIntroFor(as, keyless) : null;
             const heavyNotice = collect && !wakingOnly ? heavyNoticeFor(as, keyless) : null;
-            const usageLine = collect ? usageLineOnDelivery(as, keyless, collected) : null;
+            const usageLine = collect ? usageLineOnDelivery(as, keyless, collected, !wakingOnly) : null;
             return { ...(usageNotice ? { usageNotice } : {}), ...(heavyNotice ? { heavyNotice } : {}), ...(usageLine ? { usageLine } : {}) };
           })(),
           ...(keyless ? { hint: KEYLESS_HINT, ...(keyLost ? { keyLost: true } : {}) } : {}),

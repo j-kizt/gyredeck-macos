@@ -2373,36 +2373,31 @@ test("each member is told where its own usage lives, and the room pushes only it
     await post("/usage", reading("codex", 75));
     const pushedBefore = (await pushes()).length;
 
-    // I2 + I6: a step down is one quiet notice, for that provider's member only.
+    // I2 + I6: a step down is owed to that provider's member, never posted to the room; its
+    // next collect, even one with nothing else in it, carries the line as it is then
+    // (#306 audit M1, M2).
+    const roomBefore = (await look(me)).length;
     await post("/usage", reading("claude", 65));
-    let mine = await notices(me);
-    assert.equal(mine.length, 1, "I2: one notice for the step");
-    assert.equal(mine[0].to, me);
-    assert.equal(mine[0].kind, "notice");
-    assert.equal(mine[0].quiet, true, "I6: quiet");
-    assert.match(mine[0].text, /^USAGE \(yours, Claude Code\): Session 65% left, resets 2026-10-16T05:00:00Z — as of /);
-    assert.deepEqual(usageNames(mine[0].text), ["Claude Code"], "I1: its own provider only");
-    assert.equal((await notices(agy)).length, 0, "I1: no other member is shown it");
-    // I6: it wakes nobody — a wait for this member times out on it.
-    const waited = await fetch(`${base}/mail/wait?as=${me}&timeout=1`, { headers: await memberHeaders(base, me, token) }).then((r) => r.json());
-    assert.equal(waited.timedOut, true, "I6: a quiet notice never ends a wait");
-    // I2: the same step again, a rise, and a reading inside the step say nothing more.
+    assert.equal((await look(me)).length, roomBefore, "M1: a step puts nothing in the room");
+    // I6: it wakes nobody, and a wait's poll leaves it owed — a wait drops an empty poll whole.
+    const waited = await fetch(`${base}/mail/wait?as=${me}&timeout=1&collect=1`, { headers: await memberHeaders(base, me, token) }).then((r) => r.json());
+    assert.equal(waited.timedOut, true, "I6: a step never ends a wait");
     await post("/usage", reading("claude", 62));
+    const stepped = await claudeContext();
+    assert.match(stepped, /^USAGE \(yours, Claude Code\): Session 62% left, resets 2026-10-16T05:00:00Z — as of [^ ,]+\.$/m, "M2: the reading at collect, not the one at the step");
+    assert.deepEqual(usageNames(stepped), ["Claude Code"], "I1: its own provider only");
+    assert.doesNotMatch(await claudeContext(), /USAGE/, "I2: once per step");
     await post("/usage", reading("claude", 68));
     await post("/usage", reading("claude", 61));
-    assert.equal((await notices(me)).length, 1, "I2: not on every read");
+    assert.doesNotMatch(await claudeContext(), /USAGE/, "I2: a rise and a reading inside the step say nothing");
     await post("/usage", reading("claude", 55));
-    mine = await notices(me);
-    assert.equal(mine.length, 2, "I2: again once another step is crossed");
-    assert.match(mine[1].text, /Session 55% left/);
+    assert.match(await claudeContext(), /USAGE \(yours, Claude Code\): Session 55% left/, "I2: again once another step is crossed");
+    assert.doesNotMatch(await agySteps(), /USAGE/, "I1: no other provider's member is told");
 
-    // I6 for Codex: its step notice is published, out of the others' sight, and pushes nothing.
-    // Codex holds no read key, so the notice is counted by the seq it took.
+    // S4: a Codex step is neither posted nor pushed; every push to Codex carries the line.
     const seqBefore = Math.max(...(await look(me)).map((message) => message.seq));
     await post("/usage", reading("codex", 65));
-    assert.equal((await pushes()).length, pushedBefore, "I6: a quiet notice never wakes Codex");
-    assert.equal((await notices(me)).length, 2, "I1: the Codex notice is not shown to Claude Code");
-    assert.equal((await notices(agy)).length, 0, "I1: nor to Antigravity");
+    assert.equal((await pushes()).length, pushedBefore, "I6: a step never wakes Codex");
 
     // I1: each delivery carries the recipient's own line, for Claude Code and for Codex.
     await sendAs(agy, me, "second");
@@ -2411,7 +2406,7 @@ test("each member is told where its own usage lives, and the room pushes only it
     assert.deepEqual([...new Set(usageNames(delivered))], ["Claude Code"], "I1: only its own, on the line and the notices collected with it");
     await sendAs(me, codex, "to codex");
     const mineAfter = await look(me);
-    assert.equal(Math.max(...mineAfter.map((message) => message.seq)), seqBefore + 3, "premise: one Codex notice was published, beside the two tells sent since");
+    assert.equal(Math.max(...mineAfter.map((message) => message.seq)), seqBefore + 2, "S4: no Codex notice was published, only the two tells sent since");
     const codexPush = await pushedWith("to codex");
     assert.ok(codexPush, "premise: the tell was pushed to Codex");
     assert.match(codexPush, /USAGE \(yours, Codex\): Session 65% left/);
@@ -2442,7 +2437,7 @@ test("each member is told where its own usage lives, and the room pushes only it
     told = (await tells(me)).slice(toldBefore);
     assert.equal(told.length, 4, "I3: a direct jump past both lines is one tell");
     assert.match(told[3].text, /limit has 4% left/);
-    assert.equal((await notices(me)).length, 2, "a reading that wakes adds no quiet notice");
+    assert.equal((await notices(me)).length, 0, "M1: no usage notice is ever posted to the room");
     assert.equal((await tells(agy)).length, 0, "I1: no tell to another provider's member");
 
     // I4: a reading past two intervals, or with no time, is labelled as not current.

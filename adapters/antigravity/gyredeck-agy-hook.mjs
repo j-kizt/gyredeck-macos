@@ -1059,7 +1059,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
   // with nothing waiting, which is when the old early answer said nothing at all.
   if (delivered.length === 0 && !confirm?.accepted) {
     await ackDelivery(result);
-    return [...confirmLead(confirm), usageStep, heavyStep, hintStep, (blocked ?? refusedBlocked) ? { ephemeralMessage: blocked ?? refusedBlocked } : null].filter(Boolean);
+    return [...confirmLead(confirm), ...(typeof result?.usageLine === "string" ? [{ ephemeralMessage: result.usageLine.slice(0, MAIL_MAX_TEXT) }] : []), usageStep, heavyStep, hintStep, (blocked ?? refusedBlocked) ? { ephemeralMessage: blocked ?? refusedBlocked } : null].filter(Boolean);
   }
 
 

@@ -752,7 +752,8 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   const hint = (justConfirmed || result?.keyLost === true) && typeof result?.hint === "string" ? result.hint.slice(0, MAIL_MAX_TEXT) : null;
   if (delivered.length === 0 && !justConfirmed) {
     await ackDelivery(result);
-    return [usageNotice, heavyNotice, hint].filter(Boolean).join("\n\n") || null;
+    const usageLine = typeof result?.usageLine === "string" ? result.usageLine.slice(0, MAIL_MAX_TEXT) : null;
+    return [usageLine, usageNotice, heavyNotice, hint].filter(Boolean).join("\n\n") || null;
   }
 
 

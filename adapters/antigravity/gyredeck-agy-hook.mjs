@@ -393,6 +393,14 @@ const wellFormedCollect = (body) =>
  * answers in its own terminal, and once guessed a command that does not exist. The same
  * REPLY a prompt-time delivery carries, addressed to the last message that wants an answer.
  */
+// One reason for every delivery with no key, room or mailbox: the hook cannot tell which (#403 audit M1).
+const NO_KEY_STEP =
+  "The mail above can be read but not answered in this delivery: a post in your name takes your own key," +
+  " and this delivery carries none. Either it did not come through the Gyredeck broker, or it was held over" +
+  " from an earlier process of this session. A later delivery through the broker carries the key in its reply" +
+  " command; answer this mail then. If none comes, tell the person at this terminal; nothing you send by hand" +
+  " without the key would be accepted.";
+
 const replyForWait = async (result) => {
   const room = typeof result?.room === "string" ? result.room : null;
   const members = new Map((Array.isArray(result?.members) ? result.members : []).map((m) => [m?.conversationId, m]));
@@ -609,15 +617,8 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
     const kind = answering?.kind === "tell" ? "reaction" : "tell";
     const body = JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''");
     // A post in this session's name takes its own key (#294): with none in this delivery, a
-    // command without it would only be refused, so none is printed, and why is said.
-    if (!(typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey))) {
-      return {
-        ephemeralMessage:
-          "The mail above is addressed to you, but no reply command can be given in this delivery:" +
-          " a post in your name takes your own key, and the Gyredeck broker could not vouch for this" +
-          " session to hand it over. Tell the person at this terminal; nothing you send by hand would be accepted.",
-      };
-    }
+    // command without it would only be refused, so none is printed, and why is said (#403 audit R2-M2).
+    if (!(typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey))) return { ephemeralMessage: NO_KEY_STEP };
     return {
       ephemeralMessage:
         "The mail above is addressed to you, and answering is expected — a reply on a" +
@@ -635,14 +636,7 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
   if (!(typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey))) {
     // No key: either not through the broker, or held over from an earlier process of this
     // session; the hook cannot tell which (#403 audit M1).
-    return {
-      ephemeralMessage:
-        "The mail above can be read but not answered in this delivery: a post in your name takes your own key," +
-        " and this delivery carries none. Either it did not come through the Gyredeck broker, or it was held over" +
-        " from an earlier process of this session. A later delivery through the broker carries the key in its reply" +
-        " command; answer this mail then. If none comes, tell the person at this terminal; nothing you send by hand" +
-        " without the key would be accepted.",
-    };
+    return { ephemeralMessage: NO_KEY_STEP };
   }
   const command =
     "TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); " +

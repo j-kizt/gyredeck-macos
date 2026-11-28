@@ -10578,7 +10578,7 @@ test("the Antigravity hook's wait asks the broker, ends on mail, and is refused 
     const key = "c3".repeat(32);
     broker = await fakeBroker(home, () => ({
       v: 1, ok: true, boundTo: me, room: "sync-wq7k", memberKey: key,
-      members: [{ conversationId: me, you: true }, { conversationId: "codex-1", provider: "Codex", name: "New Name", you: false }],
+      members: [{ conversationId: me, you: true, confirmed: true }, { conversationId: "codex-1", provider: "Codex", name: "New Name", you: false }],
       // Shown under the name it was sent with; the member has been renamed since.
       messages: [{ seq: 5, from: "codex-1", fromShown: "Codex / Old Name", text: "your view?", kind: "ask" }],
     }));
@@ -10589,6 +10589,17 @@ test("the Antigravity hook's wait asks the broker, ends on mail, and is refused 
     assert.match(reply, new RegExp(`x-gyredeck-member: ${key}`), "#358: in this session's own name");
     assert.match(reply, /"to":"Codex","kind":"tell"/, "#358: addressed to who asked, by the label the roster gives now");
     assert.doesNotMatch(reply, /Old Name/, "#358 audit: never by the name the message was sent under");
+    await broker.close();
+
+    // #403 audit S3: an unconfirmed member's wait is handed no command; its post would be refused.
+    broker = await fakeBroker(home, () => ({
+      v: 1, ok: true, boundTo: me, room: "sync-wq7k", memberKey: key,
+      members: [{ conversationId: me, you: true, confirmed: false }, { conversationId: "codex-1", provider: "Codex", you: false }],
+      messages: [{ seq: 5, from: "codex-1", text: "your view?", kind: "ask" }],
+    }));
+    waited = await waitBy(["30", me]);
+    assert.equal(waited.code, 0, waited.stderr);
+    assert.equal(JSON.parse(waited.stdout).reply, undefined, "#403 audit S3: no command for an unconfirmed member's wait");
     await broker.close();
 
     // #358: mail that asks nothing carries no command to answer it.
@@ -16819,6 +16830,8 @@ test("#403 F2 invariant 4: the Claude and Antigravity hooks hand a session in no
       assert.ok(text.includes(`question for ${who}`), `premise: ${who} was handed its mail: ${text}`);
       const { command, out } = f.runPrinted(text, `F2-${who.toUpperCase()}-REPLY`);
       assert.match(command, /-H "x-gyredeck-member: [0-9a-f]{64}"/, `${who}: the command carries a key`);
+      assert.match(command, new RegExp(`"replyTo":"${as}"`), `${who}: it answers back to its own mailbox`);
+      assert.doesNotMatch(command, new RegExp(f.token), `${who}: the machine token is read at send time, never pasted`);
       assert.match(out, /"ok":true/, `${who}: the printed command posted: ${out}`);
       assert.match(out, /"seq":\d+/, `${who}: with a seq`);
       // The same command without its key is refused: the key is what posts.
@@ -16827,6 +16840,47 @@ test("#403 F2 invariant 4: the Claude and Antigravity hooks hand a session in no
     }
     const replies = (await f.said()).filter((line) => /:F2-/.test(line));
     assert.deepEqual(replies, [`${f.claude}:F2-CLAUDE-REPLY`, `${f.agy}:F2-AGY-REPLY`], "each reply landed in the asker's mailbox, in its own name");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#403 audit R2: an unconfirmed Claude member is handed no command, and a room batch held over with no key says why", async () => {
+  const f = await f2Fixture("r2", { withBroker: false });
+  try {
+    const code = (await f.call("POST", "/sync/rooms", { conversationId: f.peer })).body.room;
+    // Claude, pending, mail through the broker: told it is blocked, no command (S3).
+    const broker1 = await forwardingBroker(f.home, `http://127.0.0.1:${JSON.parse(await readFile(join(f.home, ...CONFIG_DIR, "gyredeck.config.json"), "utf8")).port}`);
+    assert.equal((await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: f.claude })).status, 200);
+    await f.ask(f.claude, "pending question");
+    const pending = await f.claudeContext();
+    assert.match(pending, /BLOCKED/, pending);
+    assert.doesNotMatch(pending, /curl -s -X POST/, "no command for an unconfirmed member");
+    broker1.close();
+
+    // agy, confirmed room member, a batch held over from an earlier process: the broker strips its key.
+    await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: f.agy });
+    const minted = await f.call("POST", `/sync/rooms/${code}/members/${f.agy}/join-code`, {});
+    const port = JSON.parse(await readFile(join(f.home, ...CONFIG_DIR, "gyredeck.config.json"), "utf8")).port;
+    const confirmed = await fetch(`http://127.0.0.1:${port}/sync/rooms/${code}/confirm`, {
+      method: "POST", headers: { "content-type": "application/json", "x-gyredeck-broker": TEST_APP_WORD },
+      body: JSON.stringify({ conversationId: f.agy, password: minted.body.code }),
+    });
+    assert.equal(confirmed.status, 200, "premise: agy confirmed");
+    await f.call("GET", `/mail/inbox?as=${f.agy}&collect=1&limit=10`);
+    await f.ask(f.agy, "held question");
+    const taken = (await f.call("GET", `/mail/inbox?as=${f.agy}&collect=1&limit=10`)).body;
+    assert.equal(typeof taken.memberKey, "string", "premise: the bridge handed a key");
+    const batch = { ...taken, v: 1, boundTo: f.agy };
+    delete batch.memberKey; delete batch.delivery; delete batch.redelivered;
+    const broker2 = await fakeBroker(f.home, (request) => request.bind
+      ? { v: 1, ok: true, bound: { conversationId: f.agy, pid: 1 } }
+      : request.collect ? { ...batch, delivery: 7, redelivered: true } : { v: 1, ok: true, acked: 7 });
+    const held = await f.agySteps();
+    await broker2.close();
+    assert.ok(held.includes("held question"), `premise: the held mail is shown: ${held}`);
+    assert.match(held, /carries none\. Either it did not come through the Gyredeck broker, or it was held over from an earlier process/, "R2-M2: the true reason");
+    assert.doesNotMatch(held, /could not vouch|curl -s -X POST/);
   } finally {
     await f.close();
   }

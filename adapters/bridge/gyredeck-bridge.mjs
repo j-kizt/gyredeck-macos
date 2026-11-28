@@ -9610,7 +9610,7 @@ function startBridge(config) {
         }
         // A post never lets a member in (#294, the owner's decision): a pending member is
         // confirmed only by the one-time password it is handed through its hook's /confirm, and a
-        // post in a member's name takes that member's own key, which a pending one has not.
+        // post in a member's name takes that member's own key, and a pending one is refused as not confirmed.
         // The app's own call: the machine token and the app's word together, the pair the
         // app-only routes take. Only it may speak as the room or the person (#205).
         const vouched = holdsMachineToken(headerToken) && holdsBrokerSecret(req.headers["x-gyredeck-broker"]);

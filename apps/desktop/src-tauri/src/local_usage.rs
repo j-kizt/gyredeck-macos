@@ -104,37 +104,39 @@ pub(crate) struct LocalReading {
 // Choosing
 // ---------------------------------------------------------------------------------------
 
-/// The local reading for the same account if it is fresh enough, otherwise one call.
-/// `base` is the last API answer for this account; without one there is no plan or credits
-/// to show beside the local lines, so the API is asked first (#398 Q3).
+/// The API is asked every interval (owner, sync-dhhq seq 306/308); the answer is the newer of
+/// its reading and the local one. A local reading is offered the snapshot it would replace, so
+/// it can refuse one from another account. Without an API snapshot there is no plan or credits
+/// to show beside the local lines, so the fetch answers alone (#398 Q3).
 pub(crate) fn choose(
-    local: Option<LocalReading>,
+    local: impl FnOnce(&CodexUsageSnapshot) -> Option<LocalReading>,
     base: Option<CodexUsageSnapshot>,
     account: Option<String>,
     refresh: Duration,
     now: i64,
     fetch: impl FnOnce() -> Result<UsageReading, String>,
 ) -> Result<UsageReading, String> {
-    let local = local.zip(base);
-    if let Some((reading, base)) = &local {
-        if now.saturating_sub(reading.fetched_at) <= refresh.as_secs() as i64 {
-            return Ok(UsageReading { snapshot: merge(base, reading), fresh: true, account });
-        }
-    }
     let fetched = fetch();
-    if matches!(&fetched, Ok(reading) if reading.fresh) {
-        return fetched;
-    }
-    let Some((reading, base)) = local else {
+    let reference = match &fetched {
+        Ok(reading) => Some(reading.snapshot.clone()),
+        Err(_) => base,
+    };
+    let Some(reference) = reference else {
         return fetched;
     };
-    if reading.fetched_at <= iso_seconds(&base.fetched_at).unwrap_or(i64::MAX) {
+    let Some(reading) = local(&reference) else {
         return fetched;
+    };
+    if reading.fetched_at <= iso_seconds(&reference.fetched_at).unwrap_or(i64::MAX) {
+        return fetched;
+    }
+    if now.saturating_sub(reading.fetched_at) <= refresh.as_secs() as i64 {
+        return Ok(UsageReading { snapshot: merge(&reference, &reading), fresh: true, account });
     }
     let snapshot = match fetched {
         Ok(kept) => merge_keeping_status(&kept.snapshot, &reading),
         Err(_) => {
-            let mut snapshot = merge(&base, &reading);
+            let mut snapshot = merge(&reference, &reading);
             snapshot.lines.push(CodexMetricLine::Text {
                 label: "Status".to_string(),
                 value: FETCH_FAILED.to_string(),
@@ -265,10 +267,10 @@ pub(crate) fn parse_claude_statusline(bytes: &[u8], mtime: i64, now: i64) -> Opt
     })
 }
 
-fn weekly_resets_at(snapshot: &CodexUsageSnapshot) -> Option<i64> {
-    snapshot.lines.iter().find_map(|line| match line {
-        CodexMetricLine::Progress { label, resets_at: Some(at), .. } if label == WEEKLY_LABEL => {
-            iso_seconds(at)
+fn weekly(lines: &[CodexMetricLine]) -> Option<(i64, f64)> {
+    lines.iter().find_map(|line| match line {
+        CodexMetricLine::Progress { label, used, resets_at: Some(at), .. } if label == WEEKLY_LABEL => {
+            Some((iso_seconds(at)?, *used))
         }
         _ => None,
     })
@@ -279,7 +281,7 @@ fn same_dir(left: &str, right: &Path) -> bool {
     left.trim_end_matches('/') == right.trim_end_matches('/')
 }
 
-/// The status-line reading, when it was written for this config dir and this account.
+/// The status-line reading, when it was written for this config dir and plausibly this account.
 pub(crate) fn claude_local(
     path: &Path,
     config_dir: &Path,
@@ -293,9 +295,13 @@ pub(crate) fn claude_local(
     let mut bytes = Vec::new();
     file.take(STATUS_LINE_MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
     let status = parse_claude_statusline(&bytes, mtime, now)?;
-    let api_weekly = weekly_resets_at(base?)?;
+    let (api_reset, api_used) = weekly(&base?.lines)?;
+    let (_, local_used) = weekly(&status.reading.lines)?;
+    // Resets are rounded to the hour, so two accounts can share one; within a window the used
+    // share only grows, so a lower one is another account's (sync-dhhq seq 307/308).
     (same_dir(&status.config_dir, config_dir)
-        && (status.weekly_resets_at - api_weekly).abs() <= RESET_MATCH_SECONDS)
+        && (status.weekly_resets_at - api_reset).abs() <= RESET_MATCH_SECONDS
+        && local_used >= api_used)
         .then_some(status.reading)
 }
 
@@ -536,7 +542,7 @@ mod tests {
             "at": at, "configDir": config_dir,
             "payload": { "model": { "display_name": "Opus" }, "rate_limits": {
                 "five_hour": { "used_percentage": 12, "resets_at": NOW + 3_600 },
-                "seven_day": { "used_percentage": 34.5, "resets_at": weekly_reset }
+                "seven_day": { "used_percentage": 54.5, "resets_at": weekly_reset }
             } }
         });
         fs::write(&path, body.to_string()).unwrap();
@@ -552,8 +558,8 @@ mod tests {
         rollout(&home, "a", OTHER, &[token_count(NOW - 30, 10.0, 20.0)], NOW - 20);
         let calls = Cell::new(0);
         let local = codex_local(&home, Some(ACCOUNT), NOW);
-        let reading = choose(local, Some(api_snapshot("codex", NOW - 900)), None, REFRESH, NOW, api_fetch(&calls, "codex")).unwrap();
-        assert_eq!(calls.get(), 1, "another account's log does not spare the call");
+        let reading = choose(|_| local, Some(api_snapshot("codex", NOW - 900)), None, REFRESH, NOW, api_fetch(&calls, "codex")).unwrap();
+        assert_eq!(calls.get(), 1, "another account's log is not shown");
         assert_eq!(reading.snapshot.source, UsageSource::Api);
 
         // Premise: the same file under the right account is used.
@@ -581,7 +587,7 @@ mod tests {
 
         let calls = Cell::new(0);
         let local = claude_local(&other_account, config, Some(&base), NOW);
-        let reading = choose(local, Some(base.clone()), None, REFRESH, NOW, api_fetch(&calls, "claude")).unwrap();
+        let reading = choose(|_| local, Some(base.clone()), None, REFRESH, NOW, api_fetch(&calls, "claude")).unwrap();
         assert_eq!((calls.get(), reading.snapshot.source), (1, UsageSource::Api));
 
         // No API answer yet: there is nothing to match the reset against (#398 Q3).
@@ -592,46 +598,90 @@ mod tests {
 
     // 398-3, 398-4 -----------------------------------------------------------------------
 
+    /// The API is asked every interval, and its fresh answer is newer than any local one.
+    /// When it cannot answer fresh, a local reading within the interval is the answer.
     #[test]
-    fn a_fresh_local_reading_makes_no_call_and_an_old_one_exactly_one() {
-        let home = scratch("codex-cheapest");
-        let dir = scratch("claude-cheapest");
+    fn every_interval_asks_once_and_the_newer_reading_answers() {
+        let home = scratch("codex-newest");
+        let dir = scratch("claude-newest");
         let config = Path::new("/Users/someone/.claude");
         let refresh_s = REFRESH.as_secs() as i64;
 
-        type Local = Box<dyn Fn(i64) -> Option<LocalReading>>;
+        type Local = Box<dyn Fn(i64, &CodexUsageSnapshot) -> Option<LocalReading>>;
         let codex_home = home.clone();
         let claude_dir = dir.clone();
         let providers: [(&'static str, Local); 2] = [
-            ("codex", Box::new(move |age| {
-                rollout(&codex_home, "c", ACCOUNT, &[token_count(NOW - age, 10.0, 20.0)], NOW - age);
+            ("codex", Box::new(move |age, _| {
+                rollout(&codex_home, "c", ACCOUNT, &[token_count(NOW - age, 60.0, 70.0)], NOW - age);
                 codex_local(&codex_home, Some(ACCOUNT), NOW)
             })),
-            ("claude", Box::new(move |age| {
+            ("claude", Box::new(move |age, reference| {
                 let path = claude_file(&claude_dir, NOW - age, "/Users/someone/.claude", WEEKLY_RESET, NOW - age);
-                claude_local(&path, config, Some(&api_snapshot("claude", NOW - 900)), NOW)
+                claude_local(&path, config, Some(reference), NOW)
             })),
         ];
+        let limited = |provider: &'static str, calls: &Cell<u32>| {
+            calls.set(calls.get() + 1);
+            let mut kept = api_snapshot(provider, NOW - 900);
+            kept.lines.push(CodexMetricLine::Text { label: "Status".into(), value: "Rate limited".into() });
+            Ok(UsageReading { snapshot: kept, fresh: false, account: None })
+        };
         for (provider, local_at) in providers {
             let base = || Some(api_snapshot(provider, NOW - 900));
 
             let calls = Cell::new(0);
-            let reading = choose(local_at(refresh_s), base(), Some("tag".into()), REFRESH, NOW, api_fetch(&calls, provider)).unwrap();
-            assert_eq!(calls.get(), 0, "{provider}: a reading at the interval asks nothing");
+            let reading = choose(|r| local_at(1, r), base(), None, REFRESH, NOW, api_fetch(&calls, provider)).unwrap();
+            assert_eq!(calls.get(), 1, "{provider}: a local reading a second old still asks");
+            assert_eq!(reading.snapshot.source, UsageSource::Api, "{provider}: the fresh answer is newer");
             assert!(reading.fresh);
-            assert_ne!(reading.snapshot.source, UsageSource::Api, "{provider}");
+
+            let calls = Cell::new(0);
+            let reading = choose(|r| local_at(refresh_s, r), base(), Some("tag".into()), REFRESH, NOW, || limited(provider, &calls)).unwrap();
+            assert_eq!(calls.get(), 1, "{provider}");
+            assert_ne!(reading.snapshot.source, UsageSource::Api, "{provider}: newer than the kept answer");
+            assert!(reading.fresh, "{provider}: within the interval it is news");
+            assert!(!reading.snapshot.lines.iter().any(is_status), "{provider}: nothing was kept");
             assert_eq!(reading.account.as_deref(), Some("tag"));
 
             let calls = Cell::new(0);
-            let reading = choose(local_at(refresh_s + 1), base(), None, REFRESH, NOW, api_fetch(&calls, provider)).unwrap();
-            assert_eq!(calls.get(), 1, "{provider}: one second past the interval asks once");
-            assert_eq!(reading.snapshot.source, UsageSource::Api, "{provider}");
+            let reading = choose(|r| local_at(refresh_s + 1, r), base(), None, REFRESH, NOW, || limited(provider, &calls)).unwrap();
+            assert!(!reading.fresh, "{provider}: one second past the interval it is kept");
+            assert!(reading.snapshot.lines.iter().any(is_status), "{provider}");
 
             let calls = Cell::new(0);
-            let reading = choose(None, base(), None, REFRESH, NOW, api_fetch(&calls, provider)).unwrap();
+            let reading = choose(|_| None, base(), None, REFRESH, NOW, api_fetch(&calls, provider)).unwrap();
             assert_eq!((calls.get(), reading.snapshot.source), (1, UsageSource::Api), "{provider}: none");
         }
         let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Resets are rounded to the hour, so another account in the same config dir can carry
+    /// the same Weekly reset. A lower used share than the API's then marks it as another's.
+    /// Accepted (seq 308): another account that has used more in the same hour still passes.
+    #[test]
+    fn a_statusline_below_the_api_share_is_another_account() {
+        let dir = scratch("claude-same-reset");
+        let config = Path::new("/c");
+        let api = api_snapshot("claude", NOW - 900);
+        let file = |weekly: f64| {
+            let path = dir.join("claude-statusline.json");
+            let body = serde_json::json!({ "at": NOW - 30, "configDir": "/c", "payload": { "rate_limits": {
+                "five_hour": { "used_percentage": 1, "resets_at": NOW + 3_600 },
+                "seven_day": { "used_percentage": weekly, "resets_at": WEEKLY_RESET } } } });
+            fs::write(&path, body.to_string()).unwrap();
+            set_mtime(&path, NOW - 20);
+            path
+        };
+        assert_eq!(used_of(&api, WEEKLY_LABEL), 50.0, "premise");
+        assert!(claude_local(&file(50.0), config, Some(&api), NOW).is_some(), "the same share is this account");
+        assert!(claude_local(&file(49.0), config, Some(&api), NOW).is_none(), "a lower share is not");
+
+        let reading = choose(
+            |reference| claude_local(&file(10.0), config, Some(reference), NOW),
+            Some(api.clone()), None, REFRESH, NOW, || Err("network down".to_string()),
+        );
+        assert!(reading.is_err(), "nothing of this account's to show");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -676,7 +726,7 @@ mod tests {
             source: UsageSource::Log,
         };
         let calls = Cell::new(0);
-        let reading = choose(Some(local.clone()), Some(base.clone()), Some("tag".into()), REFRESH, NOW, || {
+        let reading = choose(|_| Some(local.clone()), Some(base.clone()), Some("tag".into()), REFRESH, NOW, || {
             calls.set(calls.get() + 1);
             Err("network down".to_string())
         })
@@ -694,7 +744,7 @@ mod tests {
         // An expired login answers with its own kept reading: that one keeps its Status line.
         let mut kept = base.clone();
         kept.lines.push(CodexMetricLine::Text { label: "Status".into(), value: "Login expired".into() });
-        let reading = choose(Some(local), Some(base), None, REFRESH, NOW, || {
+        let reading = choose(|_| Some(local), Some(base), None, REFRESH, NOW, || {
             Ok(UsageReading { snapshot: kept, fresh: false, account: None })
         })
         .unwrap();
@@ -711,8 +761,8 @@ mod tests {
         let home = scratch("codex-merge");
         rollout(&home, "m", ACCOUNT, &[token_count(NOW - 30, 61.0, 72.0)], NOW - 20);
         let local = codex_local(&home, Some(ACCOUNT), NOW).unwrap();
-        let reading = choose(Some(local), Some(api_snapshot("codex", NOW - 900)), None, REFRESH, NOW, || {
-            panic!("no call")
+        let reading = choose(|_| Some(local), Some(api_snapshot("codex", NOW - 900)), None, REFRESH, NOW, || {
+            Err("network down".to_string())
         })
         .unwrap();
         let snapshot = reading.snapshot;

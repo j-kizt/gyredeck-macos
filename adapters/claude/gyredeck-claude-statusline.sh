@@ -9,22 +9,29 @@ umask 077
 dir="$HOME/.config/gyredeck"
 chain="$dir/claude-statusline.chain"
 cfg=$(printf '%s' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" | sed 's/\\/\\\\/g; s/"/\\"/g')
-rec="$dir/claude-statusline.d"
 # mktemp creates each file itself, exclusively, so nothing planted at a guessable name is
-# followed. Each payload is kept as its own record, named by the second it arrived and this
-# process, and no record is ever replaced: the app reads the latest. Two sessions updating at
-# once, or a slow command of theirs, then cannot put an older payload over a newer one
-# (#398 audit). The record is written before their command runs; records that arrived before
-# this one are removed after, which never removes the latest.
+# followed. Each payload is kept as its own record beside it, never replaced, named by when it
+# arrived (nanoseconds where `date` gives them) and this process: the app reads the latest
+# arrival, whatever order the writers finish in (#398 audit). The record is written before
+# their command runs. After, only this script's own records that arrived earlier are removed,
+# by name, in this folder: never the latest, never anything through a link. The record is
+# placed with a hard link, which never replaces and never follows what is at its name.
 if tmp=$(mktemp "$dir/.claude-statusline-in.XXXXXX" 2>/dev/null) && cat > "$tmp"; then
-  at=$(date +%s)
-  if mkdir -p "$rec" 2>/dev/null && out=$(mktemp "$rec/.w.XXXXXX" 2>/dev/null); then
+  ns=$(date +%s%N 2>/dev/null)
+  case $ns in ''|*[!0-9]*) ns="$(date +%s)000000000" ;; esac
+  at=${ns%?????????}
+  name="$dir/claude-statusline.$ns.$$.json"
+  if out=$(mktemp "$dir/.claude-statusline.XXXXXX" 2>/dev/null); then
     if { printf '{"at":%s,"configDir":"%s","payload":' "$at" "$cfg"; cat "$tmp"; printf '}\n'; } > "$out" \
-      && mv -f "$out" "$rec/$at.$$.json" 2>/dev/null; then
-      for old in "$rec"/*.json; do
-        name=${old##*/}
-        case ${name%%.*} in ''|*[!0-9]*) continue ;; esac
-        [ "${name%%.*}" -lt "$at" ] && rm -f "$old"
+      && ln -n "$out" "$name" 2>/dev/null; then
+      rm -f "$out"
+      for old in "$dir"/claude-statusline.*.*.json; do
+        stamp=${old#"$dir"/claude-statusline.}
+        stamp=${stamp%%.*}
+        case $stamp in ''|*[!0-9]*) continue ;; esac
+        pid=${old#"$dir"/claude-statusline.$stamp.}
+        case ${pid%.json} in ''|*[!0-9]*) continue ;; esac
+        [ "$stamp" -lt "$ns" ] 2>/dev/null && rm -f "$old"
       done
     else
       rm -f "$out"

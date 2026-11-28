@@ -76,8 +76,9 @@ pub(crate) const AGY: StatusLineSpec = StatusLineSpec {
 
 pub(crate) const CLAUDE: StatusLineSpec = StatusLineSpec {
     script_name: "gyredeck-claude-statusline.sh",
-    // A folder of records, one per payload, never replaced (#398 audit).
-    payload_file: "claude-statusline.d",
+    // Unused for reading: each payload is its own record beside it, never replaced, read by
+    // `local_usage::newest_claude_record` (#398 audit). Uninstall removes both.
+    payload_file: "claude-statusline.json",
     chain_file: "claude-statusline.chain",
     previous_file: "claude-statusline.previous.json",
     owned_keys: &["type", "command", "padding"],
@@ -684,8 +685,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn remove_if_present(path: &Path) -> Result<(), String> {
-    let is_dir = fs::symlink_metadata(path).map(|meta| meta.is_dir()).unwrap_or(false);
-    match if is_dir { fs::remove_dir_all(path) } else { fs::remove_file(path) } {
+    match fs::remove_file(path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
             Err(format!("Failed to remove {}: {error}", path.display()))
         }
@@ -816,6 +816,15 @@ pub(crate) fn uninstall(paths: &StatusLinePaths) -> Result<(), String> {
     })?;
     for path in [paths.chain(), paths.previous(), paths.payload(), paths.script()] {
         remove_if_present(&path)?;
+    }
+    if !spec.has_enabled {
+        // Claude's records, by name only: a link named like one goes, never what it points at.
+        let records = fs::read_dir(&paths.dir).into_iter().flatten().filter_map(Result::ok).filter(|entry| {
+            entry.file_name().to_str().and_then(crate::local_usage::claude_record_order).is_some()
+        });
+        for entry in records {
+            remove_if_present(&entry.path())?;
+        }
     }
     Ok(())
 }
@@ -1104,7 +1113,7 @@ mod tests {
         if paths.spec.has_enabled {
             paths.payload()
         } else {
-            crate::local_usage::newest_claude_record(&paths.payload()).expect("a Claude record")
+            crate::local_usage::newest_claude_record(&paths.dir).expect("a Claude record")
         }
     }
 
@@ -1182,6 +1191,7 @@ mod tests {
             for gone in [paths.payload(), paths.chain(), paths.previous(), paths.script()] {
                 assert!(!gone.exists(), "{} removed", gone.display());
             }
+            assert_eq!(crate::local_usage::newest_claude_record(&paths.dir), None, "{name}: no record is left");
             let _ = fs::remove_dir_all(&root);
         }
     }
@@ -1199,8 +1209,7 @@ mod tests {
 
             let (code, out) = run_script(&paths, &home, &input);
             assert_eq!((code, out.as_str()), (0, "drawn"), "{name}: their failing line still draws, ours exits 0");
-            let records = (!spec.has_enabled).then(|| fs::read_dir(paths.payload()).unwrap()).into_iter().flatten();
-            let mut left: Vec<String> = fs::read_dir(&paths.dir).unwrap().chain(records)
+            let mut left: Vec<String> = fs::read_dir(&paths.dir).unwrap()
                 .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
                 .filter(|file| file.starts_with('.'))
                 .collect();
@@ -1208,12 +1217,13 @@ mod tests {
             assert_eq!(left, Vec::<String>::new(), "{name}: no temp file is left behind");
 
             // With the folder unwritable mktemp fails: their line still draws, from stdin.
-            remove_if_present(&paths.payload()).unwrap();
+            remove_if_present(&record(&paths)).unwrap();
             fs::set_permissions(&paths.dir, fs::Permissions::from_mode(0o500)).unwrap();
             let (code, out) = run_script(&paths, &home, &input);
             fs::set_permissions(&paths.dir, fs::Permissions::from_mode(0o700)).unwrap();
             assert_eq!((code, out.as_str()), (0, "drawn"), "{name}: a failed capture still exits 0 and draws");
             assert!(!paths.payload().exists(), "{name}: premise: nothing was captured");
+            assert_eq!(crate::local_usage::newest_claude_record(&paths.dir), None, "{name}: no record either");
             let _ = fs::remove_dir_all(&root);
         }
     }
@@ -1232,7 +1242,15 @@ mod tests {
         install(&paths, &script_source_for(&CLAUDE)).unwrap();
         let recorded = || -> Value { serde_json::from_slice(&fs::read(record(&paths)).unwrap()).unwrap() };
 
+        // Released on drop too, so a failing assertion never leaves the held writer running.
+        struct Release(PathBuf);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
         fs::write(&hold, "").unwrap();
+        let release = Release(hold.clone());
         let mut older = Command::new("sh")
             .arg(paths.script())
             .env("HOME", &home)
@@ -1243,30 +1261,64 @@ mod tests {
             .unwrap();
         older.stdin.take().unwrap().write_all(&bytes(&payload(T0))).unwrap();
         let waited = std::time::Instant::now();
-        while crate::local_usage::newest_claude_record(&paths.payload()).is_none() && waited.elapsed() < Duration::from_secs(3) {
+        while crate::local_usage::newest_claude_record(&paths.dir).is_none() && waited.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(20));
         }
         std::thread::sleep(Duration::from_millis(1_100));
         let (code, _) = run_script(&paths, &home, &bytes(&payload(T0 + 60)));
         assert_eq!(code, 0);
         assert_eq!(recorded()["payload"], payload(T0 + 60), "premise: the newer payload is recorded");
-        fs::remove_file(&hold).unwrap();
+        drop(release);
         assert_eq!(older.wait().unwrap().code(), Some(0));
         assert_eq!(recorded()["payload"], payload(T0 + 60), "the held older payload did not come back over it");
 
         // A writer that finishes after a later arrival — the pause Codex forced between check
         // and replace — leaves that later record, and the later one is what is read.
-        let newer_at = recorded()["at"].as_i64().unwrap();
-        let later = unix_now() + 1_000;
+        let arrival = |path: PathBuf| crate::local_usage::claude_record_order(path.file_name().unwrap().to_str().unwrap()).unwrap().0;
+        let newer = arrival(record(&paths));
+        let later = (unix_now() as u128 + 1_000) * 1_000_000_000;
         let mut kept = recorded();
-        kept["at"] = later.into();
-        fs::write(paths.payload().join(format!("{later}.1.json")), serde_json::to_vec(&kept).unwrap()).unwrap();
+        kept["at"] = 1.into();
+        fs::write(paths.dir.join(format!("claude-statusline.{later}.1.json")), serde_json::to_vec(&kept).unwrap()).unwrap();
         run_script(&paths, &home, &bytes(&payload(T0)));
-        assert_eq!(recorded()["at"], later, "an earlier arrival leaves the later record");
-        let names: Vec<String> = fs::read_dir(paths.payload()).unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string()).collect();
-        let arrived = |name: &String| name.split('.').next().unwrap().parse::<i64>().unwrap();
-        assert!(names.iter().all(|name| arrived(name) >= newer_at), "records that arrived earlier are cleared: {names:?}");
+        assert_eq!(recorded()["at"], 1, "an earlier arrival leaves the later record");
+        let arrivals: Vec<u128> = fs::read_dir(&paths.dir).unwrap()
+            .filter_map(|entry| crate::local_usage::claude_record_order(entry.unwrap().file_name().to_str()?).map(|order| order.0))
+            .collect();
+        assert!(arrivals.iter().all(|at| *at >= newer), "records that arrived earlier are cleared: {arrivals:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Nothing named like a record is followed: the prune and uninstall remove a link itself,
+    /// never what it points at, and a record is never written through one (#398 audit r4).
+    #[test]
+    fn c6_a_link_named_like_a_claude_record_is_never_followed() {
+        let root = scratch("claude-links");
+        let home = root.join("home");
+        let paths = paths_for(&root, &CLAUDE);
+        write_settings(&paths, &serde_json::json!({}));
+        install(&paths, &script_source_for(&CLAUDE)).unwrap();
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let theirs = outside.join("theirs.json");
+        fs::write(&theirs, "keep").unwrap();
+        let file_link = paths.dir.join("claude-statusline.1.1.json");
+        let dir_link = paths.dir.join("claude-statusline.2.2.json");
+        std::os::unix::fs::symlink(&theirs, &file_link).unwrap();
+        std::os::unix::fs::symlink(&outside, &dir_link).unwrap();
+
+        let (code, _) = run_script(&paths, &home, &bytes(&payload(T0)));
+        assert_eq!(code, 0);
+        assert!(record(&paths).starts_with(&paths.dir), "premise: a record was written");
+        assert_eq!(fs::read_to_string(&theirs).unwrap(), "keep", "the file a link pointed at is untouched");
+        let inside: Vec<_> = fs::read_dir(&outside).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(inside, vec![std::ffi::OsString::from("theirs.json")], "nothing was written into a linked folder");
+        assert!(fs::symlink_metadata(&file_link).is_err() && fs::symlink_metadata(&dir_link).is_err(), "the links themselves were pruned");
+
+        std::os::unix::fs::symlink(&theirs, paths.dir.join("claude-statusline.9999999999999999999.3.json")).unwrap();
+        uninstall(&paths).unwrap();
+        assert_eq!(fs::read_to_string(&theirs).unwrap(), "keep", "uninstall removes the link, not its target");
+        assert!(!fs::read_dir(&paths.dir).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with("claude-statusline.")));
         let _ = fs::remove_dir_all(&root);
     }
 

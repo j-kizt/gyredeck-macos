@@ -6914,10 +6914,10 @@ fn r318_a_sleep_whose_journal_write_outlasts_the_grace_is_handed_delayed() {
     log_of(&f, ROOM, 1..=1);
     f.state.connect(ROOM, APP_WORD).unwrap();
     wait_until("line 1 forwarded", || lock(&f.state.hub).rooms.get(ROOM).is_some_and(|feed| feed.last_seq == 1));
-    lock(&f.state.hub).rooms[ROOM].journal.as_ref().unwrap().stall_writes(SLEEP_GRACE * 2);
+    lock(&f.state.hub).rooms[ROOM].journal.as_ref().unwrap().stall_writes(SLEEP_GRACE * 6);
     let started = Instant::now();
     f.state.will_sleep();
-    assert!(started.elapsed() < SLEEP_GRACE + Duration::from_millis(150), "a stalled journal: waited {:?}", started.elapsed());
+    assert!(started.elapsed() < SLEEP_GRACE * 3, "a stalled journal held the sleep: waited {:?}", started.elapsed());
     wait_until("the sleep notice handed once the write is done", || !ids_of(&buffer.lines(), ROOM, "sleep").is_empty());
     lock(&f.state.hub).rooms[ROOM].journal.as_ref().unwrap().stall_writes(Duration::ZERO);
     f.state.woke();

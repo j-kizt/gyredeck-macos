@@ -1052,11 +1052,13 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
   const members = Array.isArray(result?.members) ? result.members : [];
   const mine = members.find((member) => member?.conversationId === room) ?? null;
   const blocked = syncRoom && mine && mine.confirmed !== true ? blockedStepFor(endpoint, syncRoom, room) : null;
+  // A refused paste says BLOCKED whatever the read returned: a keyless view names no room (#403).
+  const refusedBlocked = !blocked && confirm?.refused?.room && !confirm.refused.stillIn ? blockedStepFor(endpoint, confirm.refused.room, room) : null;
   // Just accepted: told so with the room in full — where, the rules, how to hear it — even
   // with nothing waiting, which is when the old early answer said nothing at all.
   if (delivered.length === 0 && !confirm?.accepted) {
     await ackDelivery(result);
-    return [...confirmLead(confirm), usageStep, heavyStep, hintStep, blocked ? { ephemeralMessage: blocked } : null].filter(Boolean);
+    return [...confirmLead(confirm), usageStep, heavyStep, hintStep, (blocked ?? refusedBlocked) ? { ephemeralMessage: blocked ?? refusedBlocked } : null].filter(Boolean);
   }
 
 

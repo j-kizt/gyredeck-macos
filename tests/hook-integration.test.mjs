@@ -2179,8 +2179,9 @@ test("a room member hears when its own provider's limit runs low, and can ask fo
     assert.deepEqual(await post("/usage", reading("claude", 50)), { ok: true });
 
     // A member asks with the machine token and its own key (#274), and gets its own
-    // provider's figure; the token alone is nobody in particular, so it opens nobody's.
-    assert.equal((await usage(me, token, false)).status, 403, "the token alone is not this member");
+    // provider's figure. The token alone gets 200 too (#403): the figure is the provider
+    // account's, not member data, and a different status would say who is in a room.
+    assert.equal((await usage(me, token, false)).status, 200, "the token alone is answered as any session is");
     const asked = await usage(me, token);
     assert.equal(asked.status, 200);
     assert.equal(asked.body.provider, "claude");
@@ -14737,9 +14738,12 @@ const pileRows = [
 ];
 let pileTag = 0;
 // Over TCP a hook's wait reads in the member's name with only the machine token, which since
-// #274 is refused for a room member: the TCP rows say that refusal takes nothing and moves
-// no cursor, whatever is piled up. The broker rows carry what the pile proves.
-const TCP_REFUSED = /the bridge refused the read \(not_your_key\)/;
+// #403 gets the keyless view: private mail only, so a pile of room mail neither wakes it nor
+// is taken, and no cursor moves. The broker rows carry what the pile proves.
+const KEYLESS_QUIET = (hook, waiting, code) => {
+  assert.equal(code, hook.timedOutCode, `a keyless wait is not woken by room mail: ${waiting.stderr}`);
+  assert.ok(!waiting.stdout.includes("WAKE-BEHIND-QUIET") && !waiting.stdout.includes("HEAVY RUN"), "nothing of the room was handed over");
+};
 for (const hook of QUIET_HOOKS) {
   for (const { row, quiet, tell, want } of pileRows) {
     test(`quiet r3 [${hook.name} · broker]: ${row}`, async () => {
@@ -14764,17 +14768,14 @@ for (const hook of QUIET_HOOKS) {
         await f.cleanup();
       }
     });
-    test(`quiet r3 [${hook.name} · tcp]: ${row.split(":")[0]} — a room member's wait without its key is refused (#274): nothing taken, no cursor moved`, async () => {
+    test(`quiet r3 [${hook.name} · tcp]: ${row.split(":")[0]} — a room member's wait without its key sees no room mail (#274, #403): nothing taken, no cursor moved`, async () => {
       pileTag += 1;
       const f = await quietPile(`${pileTag}`, { quiet, tell, broker: false });
       try {
         const before = shape(await f.pending());
         assert.equal(before, want ?? Array(QUIET_PILE).fill("Q").join(","), "premise: the pile is waiting");
         const waiting = f.wait(hook, 2);
-        const code = await waiting.exited;
-        assert.equal(code, 2, `refused, not a timeout: ${waiting.stderr}`);
-        assert.match(waiting.stderr, TCP_REFUSED);
-        assert.equal(waiting.stdout, "", "nothing was handed over");
+        KEYLESS_QUIET(hook, waiting, await waiting.exited);
         assert.equal(shape(await f.pending()), before, "nothing taken, no cursor moved");
       } finally {
         await f.cleanup();
@@ -14797,15 +14798,12 @@ for (const hook of QUIET_HOOKS) {
       await f.cleanup();
     }
   });
-  test(`quiet r3 [${hook.name} · tcp]: a wait over 12 quiet is refused without its key, and a tell after it is not lost (#274)`, async () => {
+  test(`quiet r3 [${hook.name} · tcp]: a wait over 12 quiet without its key sees no room mail, and a tell after it is not lost (#274, #403)`, async () => {
     pileTag += 1;
     const f = await quietPile(`${pileTag}`, { tell: false, broker: false });
     try {
-      const waiting = f.wait(hook, 10);
-      const code = await waiting.exited;
-      assert.equal(code, 2, `refused at once, not held: ${waiting.stderr}`);
-      assert.match(waiting.stderr, TCP_REFUSED);
-      assert.equal(waiting.stdout, "");
+      const waiting = f.wait(hook, 2);
+      KEYLESS_QUIET(hook, waiting, await waiting.exited);
       await f.q.say("WAKE-BEHIND-QUIET");
       assert.equal(shape(await f.pending()), PILED, "all twelve and the tell are still there");
     } finally {

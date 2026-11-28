@@ -9567,10 +9567,10 @@ function startBridge(config) {
         // the room already remembers as confirmed could be spoken for by anything that
         // sent the header non-empty — the one thing mail must not allow.
         //
-        // Either credential: a confirmed member's own key, or the machine token. The machine
-        // token is read by every agent on this machine, so it does not isolate one local
-        // agent from another; which member may post is checked once the body names the
-        // sender (#294).
+        // Either credential opens this door: a confirmed member's own key, or the machine token.
+        // The machine token is read by every agent on this machine, so it does not isolate one
+        // local agent from another: a post in a session's name also takes that session's own
+        // key, checked once the body names the sender (#294, #403 F2).
         const standing = SYNC_CODE.test(name) ? mailRooms.get(name) ?? null : null;
         if (standing && standing.members.size > 0) {
           // Or a confirmed member's own key (#331): which member it must be is checked once the

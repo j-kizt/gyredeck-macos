@@ -16854,6 +16854,7 @@ test("#403 audit R2: an unconfirmed Claude member is handed no command, and a ro
     assert.equal((await f.call("POST", `/sync/rooms/${code}/members`, { conversationId: f.claude })).status, 200);
     await f.ask(f.claude, "pending question");
     const pending = await f.claudeContext();
+    assert.ok(pending.includes("pending question"), `premise: the mail was shown: ${pending}`);
     assert.match(pending, /BLOCKED/, pending);
     assert.doesNotMatch(pending, /curl -s -X POST/, "no command for an unconfirmed member");
     broker1.close();

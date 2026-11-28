@@ -376,3 +376,31 @@ test("a provider whose reading went stale sinks behind the online ones in the Us
   await expect(page.locator("#usage-tab-agy .usage-side-dot")).toHaveCount(0);
   await expect(tabs).toHaveText([/Claude Code/, /Codex/, /Antigravity/]);
 });
+
+test("a session-log reading kept after a failed request is labelled outdated, not as from the log (#398)", async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as typeof window & { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (command: string) => {
+        if (command === "set_keep_awake") return false;
+        if (command === "codex_usage") {
+          return {
+            providerId: "codex",
+            displayName: "Codex",
+            plan: "Pro",
+            fetchedAt: "2026-11-28T01:00:00Z",
+            source: "log",
+            lines: [
+              { type: "progress", label: "Session", used: 30, limit: 100 },
+              { type: "text", label: "Status", value: "Login valid, fetch failed, last reading kept." },
+            ],
+          };
+        }
+        throw new Error(`${command} unavailable`);
+      },
+    };
+  });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Usage" }).click();
+  await expect(page.locator(".usage-freshness[data-stale='true']")).toHaveText(/^Outdated/);
+  await expect(page.getByText("Login valid, fetch failed, last reading kept.")).toBeVisible();
+});

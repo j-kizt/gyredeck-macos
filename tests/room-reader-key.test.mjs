@@ -511,14 +511,16 @@ const JOINER = "a4030000-0000-4000-8000-000000000002";
 const FOUNDER = "a4030000-0000-4000-8000-000000000003";
 const keylessOnly = (h) => ({ "x-gyredeck-token": h.token });
 const plant = (h, to, text) => h.call("POST", `/mail/${to}`, { from: "gyredeck-app", kind: "tell", text });
-const unnamed = (text, as) => text.replaceAll(as, "<as>").replace(/"(ts|id)":"[^"]*"/g, '"$1":"<$1>"');
+// A usage answer's age is read at the moment of each request (#398), so a second can pass between the two.
+const unnamed = (text, as) => text.replaceAll(as, "<as>").replace(/"(ts|id)":"[^"]*"/g, '"$1":"<$1>"').replace(/"ageSeconds":\d+/g, '"ageSeconds":<n>');
 /** The same read for the session in no room and the member: identical status, body and size. */
 const twin = async (h, path, why, headers = keylessOnly(h)) => {
   const loner = await h.raw(path(LONER), headers);
   const joiner = await h.raw(path(JOINER), headers);
   assert.equal(joiner.status, loner.status, `${why}: ${path(JOINER)}`);
   assert.equal(unnamed(joiner.text, JOINER), unnamed(loner.text, LONER), `${why}: ${path(JOINER)}`);
-  assert.equal(joiner.text.length, loner.text.length, `${why}: size of ${path(JOINER)}`);
+  const aged = (text) => text.replace(/"ageSeconds":\d+/g, '"ageSeconds":0');
+  assert.equal(aged(joiner.text).length, aged(loner.text).length, `${why}: size of ${path(JOINER)}`);
   return { loner, joiner };
 };
 const texts = (answer) => JSON.parse(answer.text).messages.map((m) => m.text);

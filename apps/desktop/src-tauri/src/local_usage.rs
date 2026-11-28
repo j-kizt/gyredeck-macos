@@ -384,7 +384,11 @@ pub(crate) fn choose_claude_record(dir: &Path, config_dir: &Path, now: i64) -> O
     }
     let best = mine
         .iter()
-        .max_by(|left, right| content_order(&left.0, &right.0).then(left.1.cmp(&right.1)))
+        .max_by(|left, right| {
+            content_order(&left.0, &right.0)
+                .then(left.3.reading.fetched_at.cmp(&right.3.reading.fetched_at))
+                .then(left.1.cmp(&right.1))
+        })
         .map(|(_, order, _, _)| *order)?;
     let mut chosen = None;
     for (_, order, path, status) in mine {
@@ -1049,6 +1053,23 @@ mod tests {
         }
         assert_eq!(choose_claude_record(&dir, Path::new("/c"), NOW).unwrap().0, paused, "order never decides");
         assert!(other_dir.exists() && writing.exists(), "another config dir's and a record being written are kept");
+
+        // The same figures: the later arrival wins, whatever number it reserved.
+        let timed = scratch("claude-choose-timed");
+        let at = |order: u64, at: i64| {
+            let path = timed.join(format!("claude-statusline.{order}.json"));
+            let body = serde_json::json!({ "at": at, "configDir": "/c", "payload": { "rate_limits": {
+                "five_hour": { "used_percentage": 5.0, "resets_at": NOW + 3_600 },
+                "seven_day": { "used_percentage": 5.0, "resets_at": week } } } });
+            fs::write(&path, body.to_string()).unwrap();
+            set_mtime(&path, NOW - 10);
+            path
+        };
+        let later = at(4, NOW - 20);
+        let earlier_higher_number = at(5, NOW - 900);
+        assert_eq!(choose_claude_record(&timed, Path::new("/c"), NOW).unwrap().0, later, "time, then number");
+        assert!(!earlier_higher_number.exists());
+        let _ = fs::remove_dir_all(&timed);
         assert!(choose_claude_record(&dir.join("missing"), Path::new("/c"), NOW).is_none());
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(outside.parent().unwrap());

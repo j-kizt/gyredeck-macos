@@ -313,7 +313,6 @@ pub(crate) fn claude_record_order(name: &str) -> Option<u64> {
 
 pub(crate) const CLAUDE_RECORD_PREFIX: &str = "claude-statusline.";
 /// How many of the highest-numbered records are read; those below are older still.
-const CLAUDE_RECORDS_READ: usize = 64;
 /// A record that does not parse is left this long, in case it is still being written.
 const CLAUDE_UNREADABLE_GRACE: i64 = 600;
 
@@ -368,11 +367,8 @@ pub(crate) fn claude_local_latest(
 
 /// The record `claude_local_latest` reads, before the account guard, with its path.
 pub(crate) fn choose_claude_record(dir: &Path, config_dir: &Path, now: i64) -> Option<(PathBuf, ClaudeStatusLine)> {
-    let mut records = claude_records(dir);
-    records.sort_unstable_by(|left, right| right.0.cmp(&left.0));
-    let below = records.split_off(records.len().min(CLAUDE_RECORDS_READ));
     let mut mine = Vec::new();
-    for (order, path) in records {
+    for (order, path) in claude_records(dir) {
         match read_claude_record(&path, now) {
             (Some(status), _) if same_dir(&status.config_dir, config_dir) => {
                 if let Some(content) = claude_content(&status) {
@@ -385,9 +381,6 @@ pub(crate) fn choose_claude_record(dir: &Path, config_dir: &Path, now: i64) -> O
             }
             (None, _) => {}
         }
-    }
-    for (_, path) in below {
-        let _ = fs::remove_file(&path);
     }
     let best = mine
         .iter()
@@ -1044,15 +1037,18 @@ mod tests {
         assert!(!abandoned.exists(), "one that has not parsed for the grace is removed");
         assert!(fs::symlink_metadata(&link).is_ok() && fs::read_to_string(&outside).unwrap() == "keep", "a link is never a record");
 
-        // A later week outranks a higher share; only the highest-numbered are read, the rest go.
+        // A later week outranks a higher share, and however many higher numbers follow, a lower
+        // number that says more is still read and kept.
         let next_week = write(12, "/c", 1.0, 1.0, week + 7 * 86_400);
         assert_eq!(choose_claude_record(&dir, Path::new("/c"), NOW).unwrap().0, next_week);
         assert!(!newest.exists());
-        for order in 100..(100 + CLAUDE_RECORDS_READ as u64) {
+        let paused = write(13, "/c", 2.0, 1.0, week + 7 * 86_400);
+        for order in 100..200 {
             write(order, "/c", 1.0, 1.0, week + 7 * 86_400);
+            fs::write(dir.join(format!("claude-statusline.{}.json", order + 1000)), "").unwrap();
         }
-        assert!(choose_claude_record(&dir, Path::new("/c"), NOW).is_some());
-        assert!(!next_week.exists() && !other_dir.exists(), "records numbered below those read are removed");
+        assert_eq!(choose_claude_record(&dir, Path::new("/c"), NOW).unwrap().0, paused, "order never decides");
+        assert!(other_dir.exists() && writing.exists(), "another config dir's and a record being written are kept");
         assert!(choose_claude_record(&dir.join("missing"), Path::new("/c"), NOW).is_none());
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(outside.parent().unwrap());

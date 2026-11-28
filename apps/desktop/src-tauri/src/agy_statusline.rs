@@ -10,7 +10,9 @@
 //!
 //! Invariants, each pinned by a test that was made to fail:
 //! - C1  An unknown shape gives no value: no `quota`, a wrongly typed or out-of-range known
-//!       bucket, or no known bucket at all. The format is undocumented and still changing.
+//!       bucket, a reset at or before 1970, or no known bucket in use. The format is
+//!       undocumented and still changing. A bucket agy is not using (full, reset exactly at
+//!       1970, 0 s to go; agy 1.5.18) is skipped: no line, no say in the time (#496).
 //! - C2  `fetched_at` is the payload's time (`reset_time − reset_in_seconds`, never later
 //!       than the file's mtime), not the time it was read.
 //! - C3  Every fresh reading is relayed, a repeat included — the bridge's edge logic is what
@@ -197,6 +199,15 @@ pub(crate) fn parse_payload(bytes: &[u8], mtime: i64) -> Option<AgyStatusLine> {
         .unix_timestamp();
         let reset_in = bucket.get("reset_in_seconds")?.as_i64()?;
         if reset_in < 0 {
+            return None;
+        }
+        // agy 1.5.18 writes a bucket it is not using as exactly this: full, reset at 1970, 0 s
+        // to go (#496). It is skipped: its time would make every reading look decades old. Any
+        // other reset at or before 1970 is an unknown shape and gives nothing (C1).
+        if reset_unix == 0 && reset_in == 0 && remaining == 1.0 {
+            continue;
+        }
+        if reset_unix <= 0 {
             return None;
         }
         fetched_at = fetched_at.min(reset_unix.checked_sub(reset_in)?);
@@ -966,6 +977,40 @@ mod tests {
         }
         assert!(parse_payload(b"not json", T0).is_none());
         assert!(parse_payload(b"[]", T0).is_none());
+    }
+
+    /// #496: agy 1.5.18 writes unused buckets with a 1970 reset. They are skipped, and the
+    /// reading takes its time from the buckets in use, so it is fresh and relayed. Only that
+    /// exact shape is skipped; any other reset at or before 1970 gives nothing.
+    #[test]
+    fn c1_an_unused_bucket_dated_1970_is_skipped_and_does_not_age_the_reading() {
+        let fetched = T0 - 600;
+        let mut value = payload(fetched);
+        let unused = serde_json::json!({ "remaining_fraction": 1, "reset_time": "1970-01-01T00:00:00Z", "reset_in_seconds": 0 });
+        value["quota"]["3p-5h"] = unused.clone();
+        value["quota"]["3p-weekly"] = unused;
+        let status = parse_payload(&bytes(&value), T0 - 60).expect("a payload with unused buckets still reads");
+        assert_eq!(status.lines.iter().map(|line| line.label).collect::<Vec<_>>(), ["Gemini Weekly"]);
+        assert_eq!(status.fetched_at, fetched, "the time comes from the bucket in use");
+        let mut relayed = 0;
+        relay_if_fresh(&reading_from(status, T0, STALE_AFTER), |_| relayed += 1);
+        assert_eq!(relayed, 1, "fresh, so relayed");
+
+        type Mutation = fn(&mut Value);
+        let not_unused: [(&str, Mutation); 4] = [
+            ("1970 but part used", |p| p["quota"]["3p-5h"]["remaining_fraction"] = serde_json::json!(0.3)),
+            ("1970 but exhausted", |p| p["quota"]["3p-5h"]["remaining_fraction"] = serde_json::json!(0)),
+            ("1970 but time to go", |p| p["quota"]["3p-5h"]["reset_in_seconds"] = serde_json::json!(500)),
+            ("before 1970", |p| p["quota"]["3p-5h"]["reset_time"] = serde_json::json!("1969-12-31T23:59:59Z")),
+        ];
+        for (name, mutate) in not_unused {
+            let mut shape = value.clone();
+            mutate(&mut shape);
+            assert!(parse_payload(&bytes(&shape), T0 - 60).is_none(), "{name} is an unknown shape and gives nothing");
+        }
+
+        value["quota"]["gemini-weekly"] = value["quota"]["3p-5h"].clone();
+        assert!(parse_payload(&bytes(&value), T0 - 60).is_none(), "only unused buckets is no reading");
     }
 
     #[test]

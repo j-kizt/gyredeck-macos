@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
     sync::{mpsc, Mutex, OnceLock},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use base64::{
@@ -1554,7 +1554,85 @@ fn usage_settings_set(refresh_ms: Value, usage_mode: Value) {
 
 #[tauri::command]
 async fn codex_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    tauri::async_runtime::spawn_blocking(|| codex_refresh().map(|(snapshot, _)| snapshot))
+        .await
+        .map_err(|error| format!("Codex usage task failed: {error}"))?
+}
+
+/// The last reading each provider's refresh answered, for `/usage` to show — marked as not
+/// current — when a later refresh fails (#396).
+static LAST_USAGE: OnceLock<Mutex<HashMap<&'static str, CodexUsageSnapshot>>> = OnceLock::new();
+
+/// Claude's usage endpoint answers 429 when asked faster than about every 3 minutes
+/// (features/usage/settings.ts), and a 429 holds back the next refresh too. `/usage` asks
+/// off the panel's schedule, so an account answered less than this long ago, by the wall
+/// clock (it runs on through sleep), is answered from that reading instead of being asked
+/// again, whichever path asks (#396 audit M2, round 2 M1 and S1).
+const CLAUDE_MIN_ASK_GAP: Duration = Duration::from_secs(180);
+static CLAUDE_ANSWERED_AT: OnceLock<Mutex<HashMap<String, SystemTime>>> = OnceLock::new();
+
+fn claude_answered_within(fingerprint: &str, gap: Duration, now: SystemTime) -> bool {
+    CLAUDE_ANSWERED_AT
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(fingerprint).copied())
+        .and_then(|at| now.duration_since(at).ok())
+        .is_some_and(|since| since < gap)
+}
+
+fn note_claude_answered(fingerprint: String, now: SystemTime) {
+    if let Ok(mut guard) = CLAUDE_ANSWERED_AT.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        guard.insert(fingerprint, now);
+    }
+}
+
+/// Whether a snapshot carries any numbers, rather than a status line alone.
+pub(crate) fn has_usage_numbers(snapshot: &CodexUsageSnapshot) -> bool {
+    snapshot.lines.iter().any(|line| matches!(line, CodexMetricLine::Progress { .. }))
+}
+
+fn last_usage(provider: &str) -> Option<CodexUsageSnapshot> {
+    LAST_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock().ok().and_then(|guard| guard.get(provider).cloned())
+}
+
+/// One provider's refresh as the panel and `/usage` both take it (#396): the snapshot and
+/// whether it was read just now, remembered as that provider's last reading.
+fn remember_usage(provider: &'static str, refreshed: Result<(CodexUsageSnapshot, bool), String>) -> Result<(CodexUsageSnapshot, bool), String> {
+    if let Ok((snapshot, _)) = &refreshed {
+        // A placeholder with no numbers is never kept as a last reading (#396 audit S6).
+        if has_usage_numbers(snapshot) {
+            if let Ok(mut guard) = LAST_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+                guard.insert(provider, snapshot.clone());
+            }
+        }
+    }
+    refreshed
+}
+
+/// Every provider refreshed now, in parallel, each with its last reading when the refresh
+/// failed (#396). The same refreshes the panel runs, relayed the same way.
+fn refresh_all_usage() -> Vec<discord::UsageRefresh> {
+    refresh_usage_from(&[("claude", "Claude Code", claude_refresh_on_demand), ("codex", "Codex", codex_refresh), ("agy", "Antigravity", agy_refresh)])
+}
+
+type UsageRun = (&'static str, &'static str, fn() -> Result<(CodexUsageSnapshot, bool), String>);
+
+fn refresh_usage_from(runs: &[UsageRun]) -> Vec<discord::UsageRefresh> {
+    let handles: Vec<_> = runs.iter().map(|&(id, display, run)| (id, display, std::thread::spawn(run))).collect();
+    handles
+        .into_iter()
+        .map(|(id, display, handle)| {
+            let refreshed = handle.join().unwrap_or_else(|_| Err(format!("{display} usage task failed")));
+            let answered_now = matches!(&refreshed, Ok((snapshot, fresh)) if *fresh || has_usage_numbers(snapshot));
+            let last = if answered_now { None } else { last_usage(id) };
+            discord::UsageRefresh { display: display.to_string(), refreshed, last }
+        })
+        .collect()
+}
+
+fn codex_refresh() -> Result<(CodexUsageSnapshot, bool), String> {
+    remember_usage("codex", {
         let auth_candidates = load_codex_auth_candidates()?;
         let account_id = auth_candidates.first().and_then(|auth_state| {
             auth_state.auth.tokens.as_ref().and_then(|tokens| tokens.account_id.clone())
@@ -1575,8 +1653,6 @@ async fn codex_usage() -> Result<CodexUsageSnapshot, String> {
         )
         .map(|reading| relay_if_fresh(reading, relay_usage))
     })
-    .await
-    .map_err(|error| format!("Codex usage task failed: {error}"))?
 }
 
 /// Gyredeck only reads the CLI's login and never renews it: a refresh token is single-use,
@@ -1690,7 +1766,13 @@ fn format_codex_usage_error(error: CodexUsageFetchError) -> String {
 
 #[tauri::command]
 async fn agy_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    tauri::async_runtime::spawn_blocking(|| agy_refresh().map(|(snapshot, _)| snapshot))
+        .await
+        .map_err(|error| format!("Antigravity usage task failed: {error}"))?
+}
+
+fn agy_refresh() -> Result<(CodexUsageSnapshot, bool), String> {
+    remember_usage("agy", (|| {
         let stale_after = local_usage::settings().refresh;
         let status = agy_statusline::AgyStatusLinePaths::agy_from_home().ok().and_then(|paths| {
             agy_statusline::read_reading(&paths.payload(), agy_statusline::unix_now(), stale_after)
@@ -1699,16 +1781,14 @@ async fn agy_usage() -> Result<CodexUsageSnapshot, String> {
         match agy_statusline::choose_usage(status, agy_usage_fallback)? {
             agy_statusline::AgyUsage::StatusLine(reading) => {
                 agy_statusline::relay_if_fresh(&reading, |snapshot| relay_usage(snapshot, None));
-                Ok(reading.snapshot)
+                Ok((reading.snapshot, !reading.stale))
             }
             agy_statusline::AgyUsage::Fallback(snapshot) => {
                 relay_usage(&snapshot, None);
-                Ok(snapshot)
+                Ok((snapshot, true))
             }
         }
-    })
-    .await
-    .map_err(|error| format!("Antigravity usage task failed: {error}"))?
+    })())
 }
 
 /// The language server and the cloud path, both of which need agy's credentials. Reached
@@ -1748,7 +1828,23 @@ fn agy_usage_fallback() -> Result<CodexUsageSnapshot, String> {
 
 #[tauri::command]
 async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    tauri::async_runtime::spawn_blocking(|| claude_refresh().map(|(snapshot, _)| snapshot))
+        .await
+        .map_err(|error| format!("Claude usage task failed: {error}"))?
+}
+
+fn claude_refresh() -> Result<(CodexUsageSnapshot, bool), String> {
+    claude_refresh_with(true)
+}
+
+/// Claude for `/usage`: the history it would wait on is never shown, so it is not read
+/// (#396 audit S3).
+fn claude_refresh_on_demand() -> Result<(CodexUsageSnapshot, bool), String> {
+    claude_refresh_with(false)
+}
+
+fn claude_refresh_with(history: bool) -> Result<(CodexUsageSnapshot, bool), String> {
+    remember_usage("claude", {
         let candidates = load_claude_auth_candidates();
         let first = candidates.iter().find(|auth| claude_can_fetch_live_usage(auth));
         let base = first.and_then(read_claude_last_good);
@@ -1766,12 +1862,12 @@ async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
             || claude_usage_blocking(candidates),
         )
         .map(|mut reading| {
-            append_claude_local_usage(&mut reading.snapshot);
+            if history {
+                append_claude_local_usage(&mut reading.snapshot);
+            }
             relay_if_fresh(reading, relay_usage)
         })
     })
-    .await
-    .map_err(|error| format!("Claude usage task failed: {error}"))?
 }
 
 /// A usage answer, and whether it was read just now or kept: from before a 429, or from
@@ -1789,11 +1885,11 @@ struct UsageReading {
 fn relay_if_fresh(
     reading: UsageReading,
     relay: impl FnOnce(&CodexUsageSnapshot, Option<&str>),
-) -> CodexUsageSnapshot {
+) -> (CodexUsageSnapshot, bool) {
     if reading.fresh {
         relay(&reading.snapshot, reading.account.as_deref());
     }
-    reading.snapshot
+    (reading.snapshot, reading.fresh)
 }
 
 /// Seconds left before this account may be asked again, if it was told to wait.
@@ -1861,6 +1957,9 @@ fn claude_usage_blocking(candidates: Vec<ClaudeAuthState>) -> Result<UsageReadin
             }
             ClaudeGate::Ask => {}
         }
+        if let Some(reading) = claude_recent_answer(&auth, SystemTime::now()) {
+            return Ok(reading);
+        }
 
         match fetch_claude_usage(&client, &auth) {
             Ok(usage) => return Ok(fresh_claude_reading(&auth, usage)),
@@ -1919,7 +2018,15 @@ fn claude_gate(auth: &ClaudeAuthState, now: Instant) -> ClaudeGate {
     }
 }
 
+fn claude_recent_answer(auth: &ClaudeAuthState, now: SystemTime) -> Option<UsageReading> {
+    if !claude_answered_within(&claude_auth_fingerprint(auth), CLAUDE_MIN_ASK_GAP, now) {
+        return None;
+    }
+    read_claude_last_good(auth).map(|snapshot| UsageReading { snapshot, fresh: true, account: claude_reading_tag(auth) })
+}
+
 fn fresh_claude_reading(auth: &ClaudeAuthState, usage: Value) -> UsageReading {
+    note_claude_answered(claude_auth_fingerprint(auth), SystemTime::now());
     UsageReading {
         snapshot: store_claude_last_good(auth, build_claude_usage_snapshot(usage, auth)),
         fresh: true,
@@ -7057,6 +7164,95 @@ mod display_selection_tests {
         assert_eq!(relayed, 1, "the premise: a fresh reading is relayed");
         relay_if_fresh(UsageReading { snapshot: snapshot(), fresh: false, account: None }, |_, _| relayed += 1);
         assert_eq!(relayed, 1, "a kept reading is not");
+    }
+
+    /// #396: a provider whose refresh fails is answered with the last reading its refresh
+    /// took, and one never read with none.
+    #[test]
+    fn usage_refresh_falls_back_to_the_last_reading_only_when_the_refresh_fails() {
+        fn reading(used: f64) -> CodexUsageSnapshot {
+            CodexUsageSnapshot {
+                provider_id: "codex".to_string(),
+                display_name: "Codex".to_string(),
+                plan: None,
+                lines: vec![progress_metric("Weekly", used, None, None)],
+                fetched_at: "2026-11-28T04:58:00Z".to_string(),
+                source: UsageSource::Api,
+            }
+        }
+        fn ok() -> Result<(CodexUsageSnapshot, bool), String> {
+            remember_usage("test-396", Ok((reading(55.0), true)))
+        }
+        fn failed() -> Result<(CodexUsageSnapshot, bool), String> {
+            remember_usage("test-396", Err("rate limited".to_string()))
+        }
+        fn never() -> Result<(CodexUsageSnapshot, bool), String> {
+            remember_usage("test-396-never", Err("no login".to_string()))
+        }
+        let first = refresh_usage_from(&[("test-396", "Codex", ok)]);
+        assert!(first[0].refreshed.is_ok() && first[0].last.is_none(), "premise: a refresh that worked needs no last reading");
+        let answer = refresh_usage_from(&[("test-396", "Codex", failed), ("test-396-never", "Never", never)]);
+        assert!(answer[0].refreshed.is_err());
+        let last = answer[0].last.as_ref().expect("the last reading is kept for a failed refresh");
+        assert_eq!(last.fetched_at, "2026-11-28T04:58:00Z");
+        assert!(answer[1].last.is_none(), "nothing made up for a provider never read");
+    }
+
+    /// #396 audit M2/S6: `/usage` reuses a fresh reading taken inside the gap instead of asking
+    /// Claude again; a kept or expired one is asked for; a placeholder with no numbers is never
+    /// remembered, so it neither stands in later nor hides the last real reading.
+    #[test]
+    fn claude_is_asked_at_most_every_three_minutes_by_the_wall_clock_and_a_placeholder_is_never_kept() {
+        fn reading(lines: Vec<CodexMetricLine>) -> CodexUsageSnapshot {
+            CodexUsageSnapshot {
+                provider_id: "claude".to_string(),
+                display_name: "Claude Code".to_string(),
+                plan: None,
+                lines,
+                fetched_at: "2026-11-28T05:00:00Z".to_string(),
+                source: UsageSource::Api,
+            }
+        }
+        let real = || reading(vec![progress_metric("Session", 15.0, None, None)]);
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(!claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0), "never answered: asked");
+        note_claude_answered("test-396-m2".to_string(), t0);
+        assert!(claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0 + Duration::from_secs(179)), "inside the gap the last answer stands");
+        assert!(!claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0 + Duration::from_secs(180)), "past the gap it is asked again");
+        assert!(!claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0 + Duration::from_secs(8 * 3600)), "a night's sleep counts: the wall clock, not uptime");
+        assert!(!claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0 - Duration::from_secs(60)), "a clock set back asks rather than trusting the reading");
+        assert!(!claude_answered_within("test-396-m2-other", CLAUDE_MIN_ASK_GAP, t0), "per account");
+
+        let auth = claude_auth("test-396-m2-access", "test-396-m2-refresh");
+        assert!(claude_recent_answer(&auth, SystemTime::now()).is_none(), "never answered: the endpoint is asked");
+        let answered = fresh_claude_reading(&auth, serde_json::json!({"five_hour": {"utilization": 15.0}}));
+        let reused = claude_recent_answer(&auth, SystemTime::now()).expect("the answer just taken stands for the next ask");
+        assert!(reused.fresh);
+        assert_eq!(reused.snapshot.lines.len(), answered.snapshot.lines.len());
+        assert!(claude_recent_answer(&auth, SystemTime::now() + Duration::from_secs(181)).is_none(), "past the gap it is asked again");
+
+        let _ = remember_usage("test-396-s6", Ok((real(), true)));
+        let _ = remember_usage("test-396-s6", Ok((reading(vec![]), false)));
+        let kept = last_usage("test-396-s6").expect("the real reading is still the last one");
+        assert!(has_usage_numbers(&kept), "a placeholder did not replace it");
+        let _ = remember_usage("test-396-s6-only", Ok((reading(vec![]), false)));
+        assert!(last_usage("test-396-s6-only").is_none(), "a placeholder alone is never remembered");
+
+        fn placeholder() -> Result<(CodexUsageSnapshot, bool), String> {
+            remember_usage("test-396-s6", Ok((
+                CodexUsageSnapshot {
+                    provider_id: "claude".to_string(),
+                    display_name: "Claude Code".to_string(),
+                    plan: None,
+                    lines: vec![],
+                    fetched_at: String::new(),
+                    source: UsageSource::Api,
+                },
+                false,
+            )))
+        }
+        let answer = refresh_usage_from(&[("test-396-s6", "Claude Code", placeholder)]);
+        assert!(answer[0].last.as_ref().is_some_and(has_usage_numbers), "a placeholder answer is backed by the last real reading");
     }
 
     #[test]

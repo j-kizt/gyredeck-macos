@@ -401,7 +401,10 @@ const NO_KEY_STEP =
   " command; answer this mail then. If none comes, tell the person at this terminal; nothing you send by hand" +
   " without the key would be accepted.";
 
-const replyForWait = async (result) => {
+// `self` is the id the wait was started with, checked against the broker's `boundTo`: a post is in
+// this session's name, never the room's (#358 reopened). A TCP read carries no room and no key, so
+// that path prints no command.
+const replyForWait = async (result, self) => {
   const room = typeof result?.room === "string" ? result.room : null;
   const members = new Map((Array.isArray(result?.members) ? result.members : []).map((m) => [m?.conversationId, m]));
   const answering = (Array.isArray(result?.messages) ? result.messages : [])
@@ -411,7 +414,7 @@ const replyForWait = async (result) => {
   const me = [...members.values()].find((m) => m?.you === true);
   if (!room || !answering || (me && me.confirmed !== true)) return {};
   const reply = replyInstruction(
-    await readEndpoint(), room, [room], answering,
+    await readEndpoint(), self, [room], answering,
     // The member's label from the roster as it is now, as the prompt-time delivery does: a
     // message's `fromShown` is the name it was sent under, and may have changed since (#358 audit).
     (m) => members.get(m.from)?.provider ?? m.from,
@@ -448,7 +451,7 @@ const waitForMail = async (secondsArg, expected) => {
       const reply = await getJsonStatus(endpoint, token, `/mail/wait?as=${expected}&timeout=${remainingSeconds}&collect=1`, remainingMs() + 2_000);
       if (reply.status === 200 && wellFormedCollect(reply.body)) {
         if (reply.body.messages.length === 0 && (reply.body.missed ?? []).length === 0) return 4;
-        process.stdout.write(`${JSON.stringify({ ...reply.body, ...(await replyForWait(reply.body)) })}\n`);
+        process.stdout.write(`${JSON.stringify({ ...reply.body, ...(await replyForWait(reply.body, expected)) })}\n`);
         return 0;
       }
       if (reply.status === 403) return refused(`the bridge refused the read (${reply.body?.error ?? 403}): ${reply.body?.message ?? ""}`);
@@ -464,7 +467,7 @@ const waitForMail = async (secondsArg, expected) => {
     if (messages.length > 0 || missed.length > 0) {
       // Printed before it is acknowledged: a wait cut short here hands the batch over
       // again next time — a duplicate, never a loss.
-      process.stdout.write(`${JSON.stringify({ ok: true, timedOut: false, ...result, ...(await replyForWait(result)) })}\n`);
+      process.stdout.write(`${JSON.stringify({ ok: true, timedOut: false, ...result, ...(await replyForWait(result, expected)) })}\n`);
       await ackDelivery(result, remainingMs() + BROKER_DEADLINE_MS);
       return 0;
     }
@@ -600,7 +603,7 @@ const nameAsk = (mine) => {
     ' Send it once, as a "name" field beside to and kind on your first post; the room keeps the first name it is given.';
 };
 
-const replyInstruction = (endpoint, room, replyRooms, answering = null, label = null, isMember = null, askName = false, memberKey = null) => {
+const replyInstruction = (endpoint, self, replyRooms, answering = null, label = null, isMember = null, askName = false, memberKey = null) => {
   if (replyRooms.length === 0) return null;
   const target = replyRooms[0];
   // A room is posted to with the member's own key (#331); a plain mailbox, the only other
@@ -615,7 +618,7 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
       ? OWNER_DISCORD_SENDER
       : answering && label && isMember?.(answering.from) ? label(answering) : "everyone";
     const kind = answering?.kind === "tell" ? "reaction" : "tell";
-    const body = JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''");
+    const body = JSON.stringify({ from: self, text: "YOUR REPLY HERE", replyTo: self, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''");
     // A post in this session's name takes its own key (#294): with none in this delivery, a
     // command without it would only be refused, so none is printed, and why is said (#403 audit R2-M2).
     if (!(typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey))) return { ephemeralMessage: NO_KEY_STEP };
@@ -644,7 +647,7 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
     "-H 'content-type: application/json' " +
     '-H "x-gyredeck-token: $TOKEN" ' +
     `-H "x-gyredeck-member: ${memberKey}" ` +
-    `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}","to":"everyone","kind":"tell"}'`;
+    `-d '{"from":"${self}","text":"YOUR REPLY HERE","replyTo":"${self}","to":"everyone","kind":"tell"}'`;
   return {
     ephemeralMessage:
       "The mail above asked you something, and answering is expected — this is a " +

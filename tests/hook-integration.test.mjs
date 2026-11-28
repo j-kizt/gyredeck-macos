@@ -10850,6 +10850,7 @@ test("the Antigravity hook's wait asks the broker, ends on mail, and is refused 
     assert.match(reply, new RegExp(`x-gyredeck-member: ${key}`), "#358: in this session's own name");
     assert.match(reply, /"to":"Codex","kind":"tell"/, "#358: addressed to who asked, by the label the roster gives now");
     assert.doesNotMatch(reply, /Old Name/, "#358 audit: never by the name the message was sent under");
+    assert.ok(reply.includes(`"from":"${me}"`) && reply.includes(`"replyTo":"${me}"`), "#358 reopened: in the waiting session's own id, never the room's");
     await broker.close();
 
     // #403 audit S3: an unconfirmed member's wait is handed no command; its post would be refused.
@@ -12809,6 +12810,45 @@ const agyPasteFixture = async (tag, { breakInbox = false, inboxBody = null, boun
   const agyKey = () => memberKeyAt(`http://127.0.0.1:${bridgePort}`, agy, token);
   return { home, agy, founder, code, password, mint, confirms, invoke, confirmed, close, call, confirm, say, bridgePort, proxyPort: proxy.address().port, broker, token, agyKey };
 };
+
+test("#358 reopened: the command a wait prints is run as printed, and the room takes it", async () => {
+  const f = await agyPasteFixture("waitrun");
+  let broker;
+  try {
+    await f.confirm();
+    const seq = await f.say("your view?");
+    const memberKey = await f.agyKey();
+    const roster = (await f.call("GET", `/sync/rooms?as=${f.agy}`)).body.members;
+    assert.ok(roster.some((m) => m.conversationId === f.founder), "premise: the founder is on the roster");
+    broker = await fakeBroker(f.home, () => ({
+      v: 1, ok: true, boundTo: f.agy, room: f.code, memberKey,
+      members: roster.map((m) => ({ ...m, you: m.conversationId === f.agy })),
+      messages: [{ seq, room: f.code, from: f.founder, text: "your view?", kind: "ask" }],
+    }));
+    const waited = await runAdapter("adapters/antigravity/gyredeck-agy-hook.mjs", ["wait", "30", f.agy], f.home, {});
+    assert.equal(waited.code, 0, waited.stderr);
+    const reply = JSON.parse(waited.stdout).reply ?? "";
+    const command = /^\s*(curl -s -X POST .+)$/m.exec(reply)?.[1];
+    assert.ok(command, `premise: a command was printed: ${reply}`);
+    // Async: the printed endpoint may be this process's own proxy, which a sync spawn would starve.
+    const ran = await new Promise((resolve) => {
+      const child = spawn("sh", ["-c", command.replace("YOUR REPLY HERE", "seen it")], { env: { ...process.env, HOME: f.home, http_proxy: "", HTTP_PROXY: "", ALL_PROXY: "", all_proxy: "" }, stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      const limit = setTimeout(() => child.kill(), 15_000);
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.on("error", (error) => { stderr += String(error); });
+      child.on("close", (code) => { clearTimeout(limit); resolve({ stdout, stderr, code }); });
+    });
+    const posted = JSON.parse(ran.stdout || "{}");
+    assert.equal(posted.ok, true, `the room took the post: ${ran.stdout} ${ran.stderr} (exit ${ran.code})`);
+    assert.equal(typeof posted.seq, "number", "and gave it a seq");
+  } finally {
+    await broker?.close();
+    await f.close();
+  }
+});
 
 test("#250 C1 C3 C4: a pasted password confirms the member once, and the same invocation says so", async () => {
   const f = await agyPasteFixture("accept");

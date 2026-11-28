@@ -21,17 +21,23 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   marked `NOT CURRENT` when it was older than two refresh intervals when collected or has no time,
   or saying `no reading yet`. Claude Code and Antigravity are also shown that line on their next
   delivery after each 10% step down, without being woken. The waking tell now comes at 5% left as
-  well as 10%; a drop past both at once is one tell.
-- **The Usage card says when a reading is from the status line or the session log.**
+  well as 10%; a drop past both at once is one tell, and a limit hovering around 5% can tell more
+  than once.
+- **For Claude Code and Codex, the Usage card says when a reading is from the status line or the
+  session log.** Antigravity's card still says Updated.
 
 ### Fixes
 
 - **Usage could show an older reading over a newer one.** Gyredeck now also reads Claude Code's
   status line and Codex's session log, and shows whichever reading of the same account is newest by
-  the time it records, not by when the file was written. Claude Code's and Codex's servers are still
+  the time it records, not by when the file was written. Such a reading is shown only once the
+  server has answered since Gyredeck started; that answer is what ties it to the account. Claude Code's and Codex's servers are still
   asked on each refresh when they can be (a Claude Code login that answered in the last 3 minutes is
   not asked again). For Claude Code this needs the hook reinstalled: the install sets Claude Code's
-  `statusLine` to Gyredeck's script, which runs your own status line after it. Auto refresh is now
+  `statusLine` to Gyredeck's script, which runs your own status line after it. There is no button to
+  undo it yet; your previous `statusLine` is kept in
+  `~/.config/gyredeck/claude-statusline.previous.json`. Antigravity's status-line reading now counts
+  as outdated after one refresh interval (was 15 minutes). Auto refresh is now
   5 / 15 / 30 / 60 minutes (default 5); a saved 3 or 10 becomes 5. (#398)
 - **Antigravity usage read as decades old, and Refresh could not update it.** agy 1.5.18 writes a
   placeholder for unused quota dated 1970; that date aged the whole reading, so the status line was
@@ -51,7 +57,7 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
 
 ### Reinstall the hooks
 
-Hooks installed before this version print no usage line, and their reply command for mail outside
-a room lacks the key and is now refused. Settings shows them as Out of date: press Reinstall for
+Hooks installed before this version print no usage line, their reply command for mail outside a
+room lacks the key and is now refused, and Antigravity's reply after a wait is still refused. Settings shows them as Out of date: press Reinstall for
 Claude Code and Antigravity. Reinstall for Claude Code is refused while `~/.claude/settings.json` is
 a symlink (dotfiles): make it a plain file first.

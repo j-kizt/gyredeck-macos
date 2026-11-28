@@ -1228,71 +1228,80 @@ mod tests {
         }
     }
 
-    /// Records are never replaced and the latest is read, so no order the writers finish in
-    /// puts an older payload over a newer one (#398 audit, seq 320/322: a slow command of
-    /// theirs, and a pause between a check and a replace, each lost the newer payload).
+    /// A Claude payload as Claude Code hands it over: only `rate_limits` matters here.
+    fn claude_payload(weekly_used: f64, session_used: f64) -> Value {
+        let now = unix_now();
+        serde_json::json!({ "session_id": "s-1", "rate_limits": {
+            "five_hour": { "used_percentage": session_used, "resets_at": now + 3_600 },
+            "seven_day": { "used_percentage": weekly_used, "resets_at": now + 86_400 } } })
+    }
+
+    /// Which record the app reads: chosen by what the payloads say, never by the order the
+    /// writers ran or finished in (#398 audit, seq 320/322/347: a slow command of theirs, a
+    /// pause between a check and a replace, and a writer paused before it took its number,
+    /// each put an older payload first or removed the newer).
     #[test]
     fn c6_an_older_claude_payload_never_replaces_a_newer_record() {
         let root = scratch("claude-order");
         let home = root.join("home");
+        let config = home.join(".claude");
         let paths = paths_for(&root, &CLAUDE);
         write_settings(&paths, &serde_json::json!({ "statusLine": running(&CLAUDE, "head -c 3") }));
         install(&paths, &script_source_for(&CLAUDE)).unwrap();
-        let recorded = || -> Value { serde_json::from_slice(&fs::read(record(&paths)).unwrap()).unwrap() };
+        let chosen = || -> Value {
+            let (path, _) = crate::local_usage::choose_claude_record(&paths.dir, &config, unix_now()).expect("a reading");
+            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap()["payload"].clone()
+        };
+        let count = || fs::read_dir(&paths.dir).unwrap()
+            .filter(|entry| crate::local_usage::claude_record_order(entry.as_ref().unwrap().file_name().to_str().unwrap()).is_some())
+            .count();
+        let (older, newer) = (claude_payload(40.0, 10.0), claude_payload(41.0, 12.0));
 
-        // The older payload's number is reserved when it arrives, before its input is read;
-        // the newer one arrives, is written and pruned while the older is still reading.
-        let mut older = Command::new("sh")
-            .arg(paths.script())
-            .env("HOME", &home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut older_in = older.stdin.take().unwrap();
+        // Paused before it took its number: the older payload's writer runs after the newer one.
+        assert_eq!(run_script(&paths, &home, &bytes(&newer)).0, 0);
+        assert_eq!(run_script(&paths, &home, &bytes(&older)).0, 0);
+        assert_eq!(count(), 2, "the script removes neither");
+        assert_eq!(chosen(), newer, "the newer payload is read though the older holds the higher number");
+        assert_eq!(count(), 1, "the record it outranks is removed by the app");
+
+        // Paused after its number, before its input: the older one finishes last.
+        let mut slow = Command::new("sh").arg(paths.script()).env("HOME", &home)
+            .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let mut slow_in = slow.stdin.take().unwrap();
         let waited = std::time::Instant::now();
-        while crate::local_usage::newest_claude_record(&paths.dir).is_none() && waited.elapsed() < Duration::from_secs(3) {
+        while count() < 2 && waited.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(20));
         }
-        let (code, _) = run_script(&paths, &home, &bytes(&payload(T0 + 60)));
-        assert_eq!(code, 0);
-        assert_eq!(recorded()["payload"], payload(T0 + 60), "premise: the newer payload is recorded");
-        older_in.write_all(&bytes(&payload(T0))).unwrap();
-        drop(older_in);
-        assert_eq!(older.wait().unwrap().code(), Some(0));
-        assert_eq!(recorded()["payload"], payload(T0 + 60), "the older payload, finishing last, neither leads nor removes the newer");
+        let newest = claude_payload(42.0, 15.0);
+        assert_eq!(run_script(&paths, &home, &bytes(&newest)).0, 0);
+        slow_in.write_all(&bytes(&older)).unwrap();
+        drop(slow_in);
+        assert_eq!(slow.wait().unwrap().code(), Some(0));
+        assert_eq!(chosen(), newest, "the older payload, finishing last, neither leads nor removes the newer");
 
-        let arrival = |path: PathBuf| crate::local_usage::claude_record_order(path.file_name().unwrap().to_str().unwrap()).unwrap();
-        let newer = arrival(record(&paths));
-        let later = newer + 1_000;
-        let mut kept = recorded();
-        kept["at"] = 1.into();
-        fs::write(paths.dir.join(format!("claude-statusline.{later}.json")), serde_json::to_vec(&kept).unwrap()).unwrap();
-        run_script(&paths, &home, &bytes(&payload(T0)));
-        assert_eq!(recorded()["payload"], payload(T0), "the next arrival takes the next number, past every record there");
-        assert_eq!(arrival(record(&paths)), later + 1);
-        let arrivals: Vec<u64> = fs::read_dir(&paths.dir).unwrap()
-            .filter_map(|entry| crate::local_usage::claude_record_order(entry.unwrap().file_name().to_str()?))
-            .collect();
-        assert_eq!(arrivals, vec![later + 1], "records that arrived earlier are cleared");
+        // A new week resets the share: a later reset outranks a higher share.
+        let next_week = {
+            let mut next = claude_payload(1.0, 1.0);
+            next["rate_limits"]["seven_day"]["resets_at"] = (unix_now() + 86_400 * 8).into();
+            next
+        };
+        assert_eq!(run_script(&paths, &home, &bytes(&next_week)).0, 0);
+        assert_eq!(chosen(), next_week);
 
-        // The clock and the process id play no part: with a `date` that has no %N and stands
-        // still, and a record already numbered far past any pid, the next payload still leads.
+        // The clock and the process id play no part in the number: with a `date` that has no
+        // %N and stands still, and a record numbered far past any pid, the next number follows it.
         let stub = root.join("bin");
         fs::create_dir_all(&stub).unwrap();
         fs::write(stub.join("date"), "#!/bin/sh\necho 1000\n").unwrap();
         fs::set_permissions(stub.join("date"), fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!("{}:{}", stub.display(), std::env::var("PATH").unwrap_or_default());
         let high = 4_294_967_296_u64;
-        fs::write(paths.dir.join(format!("claude-statusline.{high}.json")), serde_json::to_vec(&kept).unwrap()).unwrap();
-        for at in [T0 + 120, T0 + 180] {
-            let mut child = Command::new("sh").arg(paths.script()).env("HOME", &home).env("PATH", &path)
-                .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
-            child.stdin.take().unwrap().write_all(&bytes(&payload(at))).unwrap();
-            assert_eq!(child.wait().unwrap().code(), Some(0));
-        }
-        assert_eq!(recorded()["payload"], payload(T0 + 180), "the later of two payloads in one frozen second leads");
-        assert_eq!(recorded()["at"], 1000);
+        fs::write(paths.dir.join(format!("claude-statusline.{high}.json")), "{}").unwrap();
+        let mut child = Command::new("sh").arg(paths.script()).env("HOME", &home).env("PATH", &path)
+            .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(&bytes(&payload(T0))).unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(0));
+        assert_eq!(record(&paths), paths.dir.join(format!("claude-statusline.{}.json", high + 1)));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1330,7 +1339,7 @@ mod tests {
             drop(input);
             assert_eq!(child.wait_with_output().unwrap().status.code(), Some(0));
         }
-        assert_eq!(numbers(), vec![7], "the last number is what is left");
+        assert_eq!(numbers(), (0..8).collect::<Vec<u64>>(), "every record is kept for the app to choose from");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1384,6 +1393,12 @@ mod tests {
         let dir_link = paths.dir.join("claude-statusline.2.json");
         std::os::unix::fs::symlink(&theirs, &file_link).unwrap();
         std::os::unix::fs::symlink(&outside, &dir_link).unwrap();
+        // A day old, all three: the script's clean-up takes regular files only.
+        let stale = paths.dir.join("claude-statusline.3.json");
+        fs::write(&stale, "{}").unwrap();
+        for old in [&stale, &file_link, &dir_link] {
+            assert!(Command::new("touch").args(["-h", "-t", "202001010000"]).arg(old).status().unwrap().success());
+        }
 
         let (code, _) = run_script(&paths, &home, &bytes(&payload(T0)));
         assert_eq!(code, 0);
@@ -1391,7 +1406,8 @@ mod tests {
         assert_eq!(fs::read_to_string(&theirs).unwrap(), "keep", "the file a link pointed at is untouched");
         let inside: Vec<_> = fs::read_dir(&outside).unwrap().map(|entry| entry.unwrap().file_name()).collect();
         assert_eq!(inside, vec![std::ffi::OsString::from("theirs.json")], "nothing was written into a linked folder");
-        assert!(fs::symlink_metadata(&file_link).is_err() && fs::symlink_metadata(&dir_link).is_err(), "the links themselves were pruned");
+        assert!(!stale.exists(), "a day-old record is removed");
+        assert!(fs::symlink_metadata(&file_link).is_ok() && fs::symlink_metadata(&dir_link).is_ok(), "a link, however old, is not a record the script removes");
 
         std::os::unix::fs::symlink(&theirs, paths.dir.join("claude-statusline.9999999999.json")).unwrap();
         uninstall(&paths).unwrap();

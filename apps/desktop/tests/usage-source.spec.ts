@@ -50,7 +50,7 @@ test("the reworded Auto refresh row fits the window at 440 px (#398)", async ({ 
   await page.getByRole("button", { name: "Usage settings" }).click();
   const row = page.locator(".usage-setting-group").filter({ hasText: "Auto refresh" });
   await expect(row.locator(".usage-setting-desc")).toHaveText(
-    "How often usage is refreshed. A newer reading from an agent’s own log is used instead of asking the provider.",
+    "How often usage is refreshed. Each refresh asks the provider, and a newer reading from an agent’s own status line or log is shown in its place.",
   );
   const fit = await row.evaluate((el) => {
     const panel = el.closest(".usage-settings-panel")!.getBoundingClientRect();

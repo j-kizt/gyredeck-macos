@@ -1,10 +1,10 @@
 //! Usage from the agent's own files before the provider's API (#398).
 //!
 //! Claude Code hands its status line `rate_limits` on every update, and Codex writes
-//! `rate_limits` into each session log. A reading from either, for the same account and no
-//! older than the refresh interval, is shown instead of asking the provider. Its Session and
-//! Weekly lines replace those of the last API answer for that account, so Plan, resets and
-//! credits still come from the provider.
+//! `rate_limits` into each session log. The provider is still asked every refresh; a reading
+//! from either, for the same account and newer than the provider's answer, is shown in its
+//! place. Its Session and Weekly lines replace those of the last API answer for that
+//! account, so Plan, resets and credits still come from the provider.
 //!
 //! Invariants, each pinned by a test that was made to fail:
 //! - L1  Whose: a Codex log counts only when its `creator_account_id` is the login's
@@ -285,20 +285,21 @@ fn same_dir(left: &str, right: &Path) -> bool {
     left.trim_end_matches('/') == right.trim_end_matches('/')
 }
 
-/// The status-line record that arrived last: `claude-statusline.<n>.json` in the app's folder,
-/// regular files only, the highest `n` compared as a number. The script reserves `n` when a
-/// payload arrives, so the highest is the newest whatever order the writers finish in and
-/// whatever the clock says (#398 audit). One still being written does not parse, and gives no
-/// reading rather than an older one.
+/// The record with the highest number: the last one whose number was reserved. Tests use it
+/// to find what a run of the script wrote; the app chooses by content (`claude_local_latest`).
+#[cfg(test)]
 pub(crate) fn newest_claude_record(dir: &Path) -> Option<PathBuf> {
-    fs::read_dir(dir)
-        .ok()?
+    claude_records(dir).into_iter().max_by_key(|(order, _)| *order).map(|(_, path)| path)
+}
+
+/// `claude-statusline.<n>.json` in the app's folder, regular files only.
+fn claude_records(dir: &Path) -> Vec<(u64, PathBuf)> {
+    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    entries
         .filter_map(Result::ok)
-        .take(4_096)
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .filter_map(|entry| Some((claude_record_order(entry.file_name().to_str()?)?, entry.path())))
-        .max_by_key(|(order, _)| *order)
-        .map(|(_, path)| path)
+        .collect()
 }
 
 /// The arrival number of a record's name, or nothing when the name is not one.
@@ -311,21 +312,110 @@ pub(crate) fn claude_record_order(name: &str) -> Option<u64> {
 }
 
 pub(crate) const CLAUDE_RECORD_PREFIX: &str = "claude-statusline.";
+/// How many of the highest-numbered records are read; those below are older still.
+const CLAUDE_RECORDS_READ: usize = 64;
+/// A record that does not parse is left this long, in case it is still being written.
+const CLAUDE_UNREADABLE_GRACE: i64 = 600;
+
+/// A record as the script wrote it, and the file's mtime when it could be opened.
+fn read_claude_record(path: &Path, now: i64) -> (Option<ClaudeStatusLine>, Option<i64>) {
+    let Some((file, length, mtime)) = open_regular(path) else { return (None, None) };
+    if length > STATUS_LINE_MAX_BYTES {
+        return (None, Some(mtime));
+    }
+    let mut bytes = Vec::new();
+    if file.take(STATUS_LINE_MAX_BYTES + 1).read_to_end(&mut bytes).is_err() {
+        return (None, Some(mtime));
+    }
+    (parse_claude_statusline(&bytes, mtime, now), Some(mtime))
+}
+
+/// Which of two payloads is newer, by what they say: within a window the used share only
+/// grows, and a later reset is a later window. The order processes ran in plays no part, so a
+/// writer paused at any point cannot put its older payload first (#398 audit r7).
+fn claude_content(status: &ClaudeStatusLine) -> Option<[(i64, f64); 2]> {
+    let window = |wanted: &str| {
+        status.reading.lines.iter().find_map(|line| match line {
+            CodexMetricLine::Progress { label, used, resets_at: Some(at), .. } if label == wanted => {
+                Some((iso_seconds(at)?, *used))
+            }
+            _ => None,
+        })
+    };
+    Some([window(WEEKLY_LABEL)?, window(SESSION_LABEL)?])
+}
+
+fn content_order(left: &[(i64, f64); 2], right: &[(i64, f64); 2]) -> std::cmp::Ordering {
+    left.iter()
+        .zip(right)
+        .map(|((left_at, left_used), (right_at, right_used))| left_at.cmp(right_at).then(left_used.total_cmp(right_used)))
+        .find(|order| order.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// The newest status-line reading for this config dir, chosen by content, when it is plausibly
+/// this account's. Records it outranks are removed, by name, without following a link: those of
+/// this config dir saying no more than it, those numbered below the ones read, and those that
+/// have not parsed for `CLAUDE_UNREADABLE_GRACE`.
+pub(crate) fn claude_local_latest(
+    dir: &Path,
+    config_dir: &Path,
+    base: Option<&CodexUsageSnapshot>,
+    now: i64,
+) -> Option<LocalReading> {
+    guard_claude(choose_claude_record(dir, config_dir, now)?.1, config_dir, base)
+}
+
+/// The record `claude_local_latest` reads, before the account guard, with its path.
+pub(crate) fn choose_claude_record(dir: &Path, config_dir: &Path, now: i64) -> Option<(PathBuf, ClaudeStatusLine)> {
+    let mut records = claude_records(dir);
+    records.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+    let below = records.split_off(records.len().min(CLAUDE_RECORDS_READ));
+    let mut mine = Vec::new();
+    for (order, path) in records {
+        match read_claude_record(&path, now) {
+            (Some(status), _) if same_dir(&status.config_dir, config_dir) => {
+                if let Some(content) = claude_content(&status) {
+                    mine.push((content, order, path, status));
+                }
+            }
+            (Some(_), _) => {}
+            (None, Some(mtime)) if now.saturating_sub(mtime) > CLAUDE_UNREADABLE_GRACE => {
+                let _ = fs::remove_file(&path);
+            }
+            (None, _) => {}
+        }
+    }
+    for (_, path) in below {
+        let _ = fs::remove_file(&path);
+    }
+    let best = mine
+        .iter()
+        .max_by(|left, right| content_order(&left.0, &right.0).then(left.1.cmp(&right.1)))
+        .map(|(_, order, _, _)| *order)?;
+    let mut chosen = None;
+    for (_, order, path, status) in mine {
+        if order == best {
+            chosen = Some((path, status));
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    chosen
+}
 
 /// The status-line reading, when it was written for this config dir and plausibly this account.
+#[cfg(test)]
 pub(crate) fn claude_local(
     path: &Path,
     config_dir: &Path,
     base: Option<&CodexUsageSnapshot>,
     now: i64,
 ) -> Option<LocalReading> {
-    let (file, length, mtime) = open_regular(path)?;
-    if length > STATUS_LINE_MAX_BYTES {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(STATUS_LINE_MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
-    let status = parse_claude_statusline(&bytes, mtime, now)?;
+    guard_claude(read_claude_record(path, now).0?, config_dir, base)
+}
+
+fn guard_claude(status: ClaudeStatusLine, config_dir: &Path, base: Option<&CodexUsageSnapshot>) -> Option<LocalReading> {
     let (api_reset, api_used) = weekly(&base?.lines)?;
     let (_, local_used) = weekly(&status.reading.lines)?;
     // Resets are rounded to the hour, so two accounts can share one; within a window the used
@@ -909,12 +999,63 @@ mod tests {
         fs::write(&elsewhere, "{}").unwrap();
         std::os::unix::fs::symlink(&elsewhere, dir.join("claude-statusline.30.json")).unwrap();
         assert_eq!(newest_claude_record(&dir), Some(dir.join("claude-statusline.10.json")), "a link is never a record");
-        fs::write(dir.join("claude-statusline.11.json"), "").unwrap();
-        assert_eq!(newest_claude_record(&dir), Some(dir.join("claude-statusline.11.json")), "one still being written is the newest, never skipped for an older");
-        assert!(claude_local(&dir.join("claude-statusline.11.json"), &dir, None, 0).is_none(), "and gives no reading");
         assert_eq!(newest_claude_record(&dir.join("missing")), None);
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(elsewhere.parent().unwrap());
+    }
+
+    /// The app reads the record whose payload says the most, whatever its number, and removes
+    /// only what it outranks: never another config dir's, never one still being written, never
+    /// through a link (#398 audit r7).
+    #[test]
+    fn the_claude_record_read_is_chosen_by_what_it_says_and_only_what_it_outranks_goes() {
+        let dir = scratch("claude-choose");
+        let write = |order: u64, config: &str, weekly: f64, session: f64, weekly_reset: i64| {
+            let path = dir.join(format!("claude-statusline.{order}.json"));
+            let body = serde_json::json!({ "at": NOW - 10, "configDir": config, "payload": { "rate_limits": {
+                "five_hour": { "used_percentage": session, "resets_at": NOW + 3_600 },
+                "seven_day": { "used_percentage": weekly, "resets_at": weekly_reset } } } });
+            fs::write(&path, body.to_string()).unwrap();
+            set_mtime(&path, NOW - 10);
+            path
+        };
+        let week = NOW + 86_400;
+        let newest = write(3, "/c", 41.0, 12.0, week);
+        let older_later_number = write(9, "/c", 40.0, 30.0, week);
+        let same_weekly_less_session = write(2, "/c", 41.0, 11.0, week);
+        let other_dir = write(10, "/other", 90.0, 90.0, week);
+        let writing = dir.join("claude-statusline.11.json");
+        fs::write(&writing, "").unwrap();
+        set_mtime(&writing, NOW - CLAUDE_UNREADABLE_GRACE + 1);
+        let abandoned = dir.join("claude-statusline.1.json");
+        fs::write(&abandoned, "{").unwrap();
+        set_mtime(&abandoned, NOW - CLAUDE_UNREADABLE_GRACE - 1);
+        let outside = scratch("claude-choose-outside").join("theirs.json");
+        fs::write(&outside, "keep").unwrap();
+        let link = dir.join("claude-statusline.0.json");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let (path, status) = choose_claude_record(&dir, Path::new("/c"), NOW).expect("a reading");
+        assert_eq!(path, newest, "the most the payloads say, not the highest number");
+        assert_eq!(weekly(&status.reading.lines).unwrap().1, 41.0);
+        assert!(!older_later_number.exists() && !same_weekly_less_session.exists(), "what it outranks is removed");
+        assert!(other_dir.exists(), "another config dir's record is not compared, so not removed");
+        assert!(writing.exists(), "one still being written is left");
+        assert!(!abandoned.exists(), "one that has not parsed for the grace is removed");
+        assert!(fs::symlink_metadata(&link).is_ok() && fs::read_to_string(&outside).unwrap() == "keep", "a link is never a record");
+
+        // A later week outranks a higher share; only the highest-numbered are read, the rest go.
+        let next_week = write(12, "/c", 1.0, 1.0, week + 7 * 86_400);
+        assert_eq!(choose_claude_record(&dir, Path::new("/c"), NOW).unwrap().0, next_week);
+        assert!(!newest.exists());
+        for order in 100..(100 + CLAUDE_RECORDS_READ as u64) {
+            write(order, "/c", 1.0, 1.0, week + 7 * 86_400);
+        }
+        assert!(choose_claude_record(&dir, Path::new("/c"), NOW).is_some());
+        assert!(!next_week.exists() && !other_dir.exists(), "records numbered below those read are removed");
+        assert!(choose_claude_record(&dir.join("missing"), Path::new("/c"), NOW).is_none());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(outside.parent().unwrap());
     }
 
     #[test]

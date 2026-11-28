@@ -10,16 +10,14 @@ dir="$HOME/.config/gyredeck"
 chain="$dir/claude-statusline.chain"
 cfg=$(printf '%s' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" | sed 's/\\/\\\\/g; s/"/\\"/g')
 # mktemp creates each file itself, exclusively, so nothing planted at a guessable name is
-# followed. Each payload is kept as its own record beside it, never replaced, numbered in the
-# order the payloads arrived: the number is reserved the moment one arrives, one past the
-# highest already there, by a hard link to an empty file of ours (`ln -n` neither replaces
-# nor follows what is at a name, so a taken number moves on to the next). The clock plays no
-# part in the order, so no clock resolution or process id can put an older payload first
-# (#398 audit). Its time is taken then too, so input that is slow to come never makes an
-# old payload look new. The record is filled in place before their command runs; the app reads the
-# highest number and treats one not yet complete as no reading. After, only this script's
-# own records numbered below it are removed, by name, with `rm -f`: a link goes, never what
-# it points at.
+# followed. Each payload is kept as its own record beside it, never replaced: a number is
+# reserved, with the time, the moment one arrives, one past the highest already there, by a
+# hard link to an empty file of ours (`ln -n` neither replaces nor follows what is at a name,
+# so a taken number moves on to the next). The record is filled in place before their command
+# runs. Which record is newest is decided by the app from what the payloads say, never from
+# the order processes ran in, and the app removes the ones it outranks (#398 audit). Here only
+# regular files of this name left a day old are removed, so the folder stays bounded while the
+# app is not running.
 if tmp=$(mktemp "$dir/.claude-statusline-in.XXXXXX" 2>/dev/null) && out=$(mktemp "$dir/.claude-statusline.XXXXXX" 2>/dev/null); then
   at=$(date +%s)
   seq=0
@@ -38,12 +36,13 @@ if tmp=$(mktemp "$dir/.claude-statusline-in.XXXXXX" 2>/dev/null) && out=$(mktemp
   if cat > "$tmp"; then
     if [ -n "$seq" ] \
       && { printf '{"at":%s,"configDir":"%s","payload":' "$at" "$cfg"; cat "$tmp"; printf '}\n'; } > "$out"; then
-      for old in "$dir"/claude-statusline.*.json; do
-        n=${old#"$dir"/claude-statusline.}
-        n=${n%.json}
-        case $n in ''|*[!0-9]*) continue ;; esac
-        [ "$n" -lt "$seq" ] 2>/dev/null && rm -f "$old"
-      done
+      find "$dir" -maxdepth 1 -type f -name 'claude-statusline.[0-9]*.json' -mmin +1440 2>/dev/null |
+        while IFS= read -r old; do
+          n=${old#"$dir"/claude-statusline.}
+          n=${n%.json}
+          case $n in ''|*[!0-9]*) continue ;; esac
+          rm -f "$old"
+        done
     elif [ -n "$seq" ]; then
       rm -f "$dir/claude-statusline.$seq.json"
     fi

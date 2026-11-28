@@ -2249,6 +2249,220 @@ test("a room member hears when its own provider's limit runs low, and can ask fo
   }
 });
 
+test("each member is told where its own usage lives, and the room pushes only its own reading (#306)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-usage-own-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const fakeBin = join(home, ".bun", "bin");
+  await mkdir(fakeBin, { recursive: true });
+  const queued = join(home, "queued.log");
+  await writeFile(
+    join(fakeBin, "codex"),
+    `#!${process.execPath}\n` +
+      "require('node:fs').appendFileSync(" +
+      `${JSON.stringify(queued)}, process.argv.slice(2).join(" ").replace(/\\s+/g, " ") + "\\n");\n`,
+  );
+  await chmod(join(fakeBin, "codex"), 0o755);
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home, GYREDECK_NO_AGENT_SPAWN: "0", PATH: fakeBin }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const base = `http://127.0.0.1:${port}`;
+  const me = "a3060000-0000-4000-8000-000000000001";
+  const agy = "a3060000-0000-4000-8000-000000000002";
+  const codex = "a3060000-0000-4000-8000-000000000003";
+  let broker = null;
+  try {
+    await waitForHealth(port, stderrRef);
+    broker = await forwardingBroker(home, base);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const headers = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
+    const post = (path, body) =>
+      fetch(base + path, { method: "POST", headers, body: JSON.stringify(body) }).then((r) => r.json());
+    for (const [conversationId, sourceKind] of [[me, "claudeCodeHook"], [agy, "agyHost"], [codex, "codexCliHook"]]) {
+      await post("/ingest", {
+        version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(),
+        conversationId, cwd: "/tmp/project",
+        runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind },
+        data: { inputCount: 1 },
+      });
+    }
+    const code = (await post("/sync/rooms", { conversationId: me })).room;
+    for (const joiner of [agy, codex]) {
+      await post(`/sync/rooms/${code}/members`, { conversationId: joiner });
+      await post(`/sync/rooms/${code}/confirm`, { conversationId: joiner, password: (await post(`/sync/rooms/${code}/members/${joiner}/join-code`, {})).code });
+    }
+    const pushes = async (settleMs = 300) => {
+      await new Promise((resolve) => { setTimeout(resolve, settleMs); });
+      return existsSync(queued) ? (await readFile(queued, "utf8")).split("\n").filter(Boolean) : [];
+    };
+    const pushedWith = async (needle) => {
+      for (let tries = 0; tries < 80; tries += 1) {
+        const found = (await pushes(50)).find((line) => line.includes(needle));
+        if (found) return found;
+      }
+      return undefined;
+    };
+    const claudeContext = async () => {
+      const result = await runAdapter(
+        "adapters/claude/gyredeck-claude-hook.mjs",
+        ["--event", "UserPromptSubmit"],
+        home,
+        { hook_event_name: "UserPromptSubmit", session_id: me, cwd: "/tmp/project", prompt: "hi" },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
+    };
+    const agySteps = async () => {
+      const result = await runAdapter(
+        "adapters/antigravity/gyredeck-agy-hook.mjs",
+        ["--event", "PreInvocation"],
+        home,
+        { hookEventName: "PreInvocation", conversationId: agy, workspacePaths: ["/tmp/project"] },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return (JSON.parse(result.stdout).injectSteps ?? []).map((step) => step.ephemeralMessage ?? "").join("\n");
+    };
+    const usageNames = (text) => [...text.matchAll(/USAGE \(yours(?:, ([^)]+))?\)/g)].map((match) => match[1] ?? "");
+    const sendAs = async (from, to, text) => {
+      const answer = await fetch(`${base}/mail/${code}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(await memberHeaders(base, from, token)) },
+        body: JSON.stringify({ from, to, kind: "tell", text }),
+      }).then((r) => r.json());
+      assert.equal(answer.ok, true, JSON.stringify(answer));
+    };
+    const look = async (as) =>
+      (await fetch(`${base}/mail/${code}?as=${as}`, { headers: await memberHeaders(base, as, token) }).then((r) => r.json())).messages;
+    const notices = async (as) => (await look(as)).filter((message) => message.topic === "usage");
+    const tells = async (as) => (await look(as)).filter((message) => message.from === "gyredeck-room" && /limit (has|is back)/.test(message.text));
+    const reading = (provider, leftPct, extra = {}) => ({
+      providerId: provider,
+      displayName: { claude: "Claude Code", agy: "Antigravity", codex: "Codex" }[provider],
+      lines: [{ type: "progress", label: "Session", used: 100 - leftPct, limit: 100, resetsAt: "2026-10-16T05:00:00Z" }],
+      fetchedAt: new Date().toISOString(),
+      ...extra,
+    });
+
+    // I5: the intro names each provider's own place, once; Codex's is its session log.
+    const intro = await claudeContext();
+    assert.match(intro, new RegExp(`USAGE \\(yours\\): ask Gyredeck .*curl -s "http://127\\.0\\.0\\.1:${port}/usage\\?as=${me}" with your own member key header`));
+    assert.doesNotMatch(intro.split("\n\n").find((part) => part.startsWith("USAGE (yours):")), /[0-9a-f]{64}/, "the intro carries no key");
+    assert.doesNotMatch(intro, /usage\?as=a3060000-0000-4000-8000-00000000000[23]/, "I1: never another member's");
+    assert.doesNotMatch(await claudeContext(), /USAGE/, "I5: told once");
+    const agyIntro = await agySteps();
+    assert.match(agyIntro, new RegExp(`USAGE \\(yours\\): ask Gyredeck .*/usage\\?as=${agy}"`));
+    assert.doesNotMatch(agyIntro, /rate_limits/);
+    const confirmedPush = await pushedWith("you are confirmed");
+    assert.ok(confirmedPush, "premise: Codex was pushed its confirmation");
+    assert.match(confirmedPush, /USAGE \(yours\): your Codex figures are in your session log: rate_limits .* ~\/\.codex\/sessions\/ .*not a live one/);
+    assert.doesNotMatch(confirmedPush, /\/usage\?as=/, "I5: Codex is not handed a call it cannot make");
+
+    // I4: before any reading, the delivery line says there is none — never a figure.
+    await sendAs(agy, me, "first");
+    const none = await claudeContext();
+    assert.match(none, /USAGE \(yours, Claude Code\): no reading yet\./);
+    assert.doesNotMatch(none, /% left/);
+
+    await post("/usage", reading("claude", 75));
+    await post("/usage", reading("codex", 75));
+    const pushedBefore = (await pushes()).length;
+
+    // I2 + I6: a step down is one quiet notice, for that provider's member only.
+    await post("/usage", reading("claude", 65));
+    let mine = await notices(me);
+    assert.equal(mine.length, 1, "I2: one notice for the step");
+    assert.equal(mine[0].to, me);
+    assert.equal(mine[0].kind, "notice");
+    assert.equal(mine[0].quiet, true, "I6: quiet");
+    assert.match(mine[0].text, /^USAGE \(yours, Claude Code\): Session 65% left, resets 2026-10-16T05:00:00Z — as of /);
+    assert.deepEqual(usageNames(mine[0].text), ["Claude Code"], "I1: its own provider only");
+    assert.equal((await notices(agy)).length, 0, "I1: no other member is shown it");
+    // I6: it wakes nobody — a wait for this member times out on it.
+    const waited = await fetch(`${base}/mail/wait?as=${me}&timeout=1`, { headers: await memberHeaders(base, me, token) }).then((r) => r.json());
+    assert.equal(waited.timedOut, true, "I6: a quiet notice never ends a wait");
+    // I2: the same step again, a rise, and a reading inside the step say nothing more.
+    await post("/usage", reading("claude", 62));
+    await post("/usage", reading("claude", 68));
+    await post("/usage", reading("claude", 61));
+    assert.equal((await notices(me)).length, 1, "I2: not on every read");
+    await post("/usage", reading("claude", 55));
+    mine = await notices(me);
+    assert.equal(mine.length, 2, "I2: again once another step is crossed");
+    assert.match(mine[1].text, /Session 55% left/);
+
+    // I6 for Codex: its step notice is published, out of the others' sight, and pushes nothing.
+    // Codex holds no read key, so the notice is counted by the seq it took.
+    const seqBefore = Math.max(...(await look(me)).map((message) => message.seq));
+    await post("/usage", reading("codex", 65));
+    assert.equal((await pushes()).length, pushedBefore, "I6: a quiet notice never wakes Codex");
+    assert.equal((await notices(me)).length, 2, "I1: the Codex notice is not shown to Claude Code");
+    assert.equal((await notices(agy)).length, 0, "I1: nor to Antigravity");
+
+    // I1: each delivery carries the recipient's own line, for Claude Code and for Codex.
+    await sendAs(agy, me, "second");
+    const delivered = await claudeContext();
+    assert.match(delivered, /USAGE \(yours, Claude Code\): Session 55% left, resets 2026-10-16T05:00:00Z — as of [^,.]+\./);
+    assert.deepEqual([...new Set(usageNames(delivered))], ["Claude Code"], "I1: only its own, on the line and the notices collected with it");
+    await sendAs(me, codex, "to codex");
+    const mineAfter = await look(me);
+    assert.equal(Math.max(...mineAfter.map((message) => message.seq)), seqBefore + 3, "premise: one Codex notice was published, beside the two tells sent since");
+    const codexPush = await pushedWith("to codex");
+    assert.ok(codexPush, "premise: the tell was pushed to Codex");
+    assert.match(codexPush, /USAGE \(yours, Codex\): Session 65% left/);
+    assert.deepEqual([...new Set(usageNames(codexPush))], ["Codex"], "I1: Codex is shown only its own");
+    const agyDelivered = await agySteps();
+    assert.doesNotMatch(agyDelivered, /USAGE/, "premise: nothing delivered to Antigravity, no line");
+    await sendAs(me, agy, "to agy");
+    assert.match(await agySteps(), /USAGE \(yours, Antigravity\): no reading yet\./, "I1 + I4: its own provider, which has none");
+
+    // I3: 10 % wakes once, 5 % once more; a direct jump past both is one tell, for 5 %.
+    const toldBefore = (await tells(me)).length;
+    await post("/usage", reading("claude", 9));
+    await post("/usage", reading("claude", 8));
+    let told = (await tells(me)).slice(toldBefore);
+    assert.equal(told.length, 1, "I3: once at 10 %");
+    assert.match(told[0].text, /limit has 9% left/);
+    assert.notEqual(told[0].quiet, true, "the tell wakes");
+    await post("/usage", reading("claude", 5));
+    await post("/usage", reading("claude", 3));
+    told = (await tells(me)).slice(toldBefore);
+    assert.equal(told.length, 2, "I3: once more at 5 %, separately");
+    assert.match(told[1].text, /limit has 5% left/);
+    await post("/usage", reading("claude", 60));
+    told = (await tells(me)).slice(toldBefore);
+    assert.equal(told.length, 3);
+    assert.match(told[2].text, /back to 60% left/);
+    await post("/usage", reading("claude", 4));
+    told = (await tells(me)).slice(toldBefore);
+    assert.equal(told.length, 4, "I3: a direct jump past both lines is one tell");
+    assert.match(told[3].text, /limit has 4% left/);
+    assert.equal((await notices(me)).length, 2, "a reading that wakes adds no quiet notice");
+    assert.equal((await tells(agy)).length, 0, "I1: no tell to another provider's member");
+
+    // I4: a reading past two intervals, or with no time, is labelled as not current.
+    await post("/usage", reading("claude", 40, { fetchedAt: new Date(Date.now() - 20 * 60_000).toISOString(), refreshMs: 5 * 60_000 }));
+    await sendAs(agy, me, "third");
+    assert.match(await claudeContext(), /USAGE \(yours, Claude Code\): Session 40% left, resets 2026-10-16T05:00:00Z — as of [^ ]+, NOT CURRENT\./);
+    await post("/usage", reading("claude", 40, { fetchedAt: "not a date" }));
+    await sendAs(agy, me, "fourth");
+    assert.match(await claudeContext(), /USAGE \(yours, Claude Code\): Session 40% left, resets 2026-10-16T05:00:00Z — read at an unknown time, NOT CURRENT\./);
+    await post("/usage", reading("claude", 40));
+    await sendAs(agy, me, "fifth");
+    assert.doesNotMatch(await claudeContext(), /NOT CURRENT/, "premise: a fresh reading is not labelled");
+  } finally {
+    await broker?.close();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
 test("an agent outside a room learns it can ask for its usage, and hears when it runs low (#169)", async () => {
   const home = await mkdtemp(join(tmpdir(), "gyredeck-usage-out-"));
   await mkdir(join(home, ...CONFIG_DIR), { recursive: true });

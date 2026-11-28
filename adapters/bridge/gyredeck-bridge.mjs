@@ -235,7 +235,7 @@ export const writePrivateJson = (path, value) => {
  * text changes: a delivery names the version it expects, and a session that read an
  * older one is told to read it again.
  */
-export const ROOM_RULES_VERSION = 27;
+export const ROOM_RULES_VERSION = 28;
 export const ROOM_RULES_DISPLAY_PATH = "~/.config/gyredeck/room-rules.md";
 /** The rules, for the bridge serving at `origin`: the one command in them names it. */
 export const roomRules = (origin) => `# Gyredeck room rules — v${ROOM_RULES_VERSION}
@@ -328,12 +328,20 @@ carries the command for as long as the room sees none of yours.
 - Claude Code: after a restart or a new session it may list expired watches as background tasks that "didn't finish". They are harmless — each re-armed watch leaves one behind. Check that exactly one watch for the current room is running, and never re-run the old ones.
 
 ## Your usage
-- When your provider's limit drops to 10% left or less, the room tells you, once; and again when it is
-  back above. Finish at a safe point, then tell the room when you expect to be back.
-- Claude Code and Antigravity can look any time:
+- You are only ever shown your own provider's usage, never another member's.
+- When your provider's limit drops to 10% left or less, the room tells you, once; again at 5% or less;
+  and once more when it is back above 10%. Finish at a safe point, then tell the room when you expect to be back.
+- Each delivery carries one \`USAGE (yours, …)\` line: each limit, how much is left, when it resets, and
+  when it was read. \`NOT CURRENT\` means the reading is older than two of the app's refresh intervals
+  or has no time; \`no reading yet\` means Gyredeck has none. Neither is a current figure.
+- Claude Code and Antigravity also get a quiet room notice with that line each time a limit drops past
+  another 10% step (90, 80 … 20), so the latest figure is back in your context after a compaction. Look any time:
   \`curl -s "${origin}/usage?as=<your id>" -H "x-gyredeck-member: YOUR KEY"\`
   — YOUR KEY is the \`x-gyredeck-member\` value in the watch command your deliveries hand you.
-  — each limit's label, how much is left, and when it resets. Codex cannot call it; the room tells it.
+- Codex cannot call it. Your own figures are in your session log: \`rate_limits\` on the last
+  \`token_count\` event of your rollout under \`~/.codex/sessions/\` (\`used_percent\` for each
+  \`window_minutes\`). That is the last value Codex recorded, not a live one. Every push from the room
+  carries Gyredeck's line too.
 
 ## Wait (Claude Code, Antigravity)
 Only while an answer you need before you can carry on is outstanding:
@@ -4178,7 +4186,7 @@ function startBridge(config) {
             .map((message) => `[${senderShown(room, message)} · ${message.kind}] ${message.text}${fileLines(message.files)}`)
             .join("\n\n"),
       { full: true },
-    ) + `\n\n${heavyHint(conversationId)}`;
+    ) + `\n\n${heavyHint(conversationId)}\n\n${usageIntroFor(conversationId, "codex")}`;
   };
 
   /**
@@ -4257,6 +4265,7 @@ function startBridge(config) {
     member.confirmed = true;
     member.confirmedAt = new Date().toISOString();
     member.heavyOwed = true;
+    member.usageOwed = true;
   };
 
   /**
@@ -5087,6 +5096,13 @@ function startBridge(config) {
 
   /** Below this much left, a member is told, once per crossing — and again when it is back above. */
   const USAGE_LOW_PCT = 10;
+  // The room's waking tells (#306): at 10 % left or less, and again at 5 % or less. A reading
+  // that passes both at once is one tell, for the lower level (lessons.md: one alert for the
+  // worst crossing), and both count as told.
+  const USAGE_WAKE_PCTS = [USAGE_LOW_PCT, 5];
+  // The quiet steps above them (#306): a notice each time a limit drops past another 10 points.
+  const USAGE_STEP_PCTS = [90, 80, 70, 60, 50, 40, 30, 20];
+  const usageLevel = (leftPct, levels) => levels.filter((pct) => leftPct <= pct).length;
   const USAGE_SOURCES = ["api", "statusline", "log"];
   // The refresh choices the app offers, the first its default (#398).
   const USAGE_REFRESH_MS = [5, 15, 30, 60].map((minutes) => minutes * 60_000);
@@ -5154,10 +5170,51 @@ function startBridge(config) {
     };
   };
 
+  const USAGE_PROVIDER_NAME = { claude: "Claude Code", codex: "Codex", agy: "Antigravity" };
+  /** A member's own provider's reading, as one line (#306); never another provider's. */
+  const usageLineFor = (conversationId, now = Date.now()) => {
+    const provider = usageProviderFor(conversationId);
+    if (!provider) return null;
+    const reading = usageByProvider.get(provider);
+    if (!reading) return `USAGE (yours, ${USAGE_PROVIDER_NAME[provider]}): no reading yet.`;
+    const shown = describeUsage(reading, now);
+    const limits = shown.lines
+      .map((line) => `${line.label} ${line.leftPct}% left${line.resetsAt ? `, resets ${line.resetsAt}` : ""}`)
+      .join("; ");
+    const when = shown.fetchedAt === null
+      ? "read at an unknown time, NOT CURRENT"
+      : `as of ${shown.fetchedAt}${shown.stale ? ", NOT CURRENT" : ""}`;
+    return `USAGE (yours, ${shown.displayName}): ${limits || "no limits"} — ${when}.`;
+  };
+  /** Where a member looks up its own usage, told once on being let in (#306). */
+  const usageIntroFor = (conversationId, provider = usageProviderFor(conversationId)) => {
+    const wakes = `the room wakes you at ${USAGE_WAKE_PCTS.join("% and ")}% left or less.`;
+    if (provider === "codex") {
+      return "USAGE (yours): your Codex figures are in your session log: rate_limits on the last token_count " +
+        "event of your rollout under ~/.codex/sessions/ (used_percent per window_minutes). That is the last " +
+        "value Codex recorded, not a live one. Every push from the room carries Gyredeck's USAGE line; " + wakes;
+    }
+    if (provider !== "claude" && provider !== "agy") return null;
+    return "USAGE (yours): ask Gyredeck for your usage at any time: " +
+      `curl -s "http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}/usage?as=${conversationId}" ` +
+      "with your own member key header, as your room commands carry it (never another member's). " +
+      "Each delivery carries a USAGE line, a quiet notice comes at each 10% step down, and " + wakes;
+  };
+  /** Confirmed members on one provider, across the sync rooms. */
+  const membersOnProvider = function* (provider) {
+    for (const [name, room] of mailRooms) {
+      if (!SYNC_CODE.test(name)) continue;
+      for (const [conversationId, member] of room.members) {
+        if (member.confirmed === true && usageProviderFor(conversationId) === provider) yield [name, room, conversationId];
+      }
+    }
+  };
+
   /**
    * Keep the reading, and tell the room's members on that provider when a limit crosses
-   * the line — edge-triggered, as every alert here is: the first reading is never news, a
-   * limit that stays low says nothing more, and one that comes back up says so once.
+   * a line — edge-triggered, as every alert here is: the first reading is never news, a
+   * limit that stays low says nothing more, and one that comes back up says so once. The
+   * lines are 10 % and 5 % (#306), and a quiet notice marks each 10-point step above them.
    */
   const noteUsage = (reading) => {
     const before = usageByProvider.get(reading.provider);
@@ -5165,11 +5222,15 @@ function startBridge(config) {
     // Another account's numbers are not a change in this one's (as D66 for a new reading).
     if (!before || before.account !== reading.account) return;
     const was = new Map(before.lines.map((line) => [line.label, line.leftPct]));
+    let stepped = false;
     for (const line of reading.lines) {
       const prior = was.get(line.label);
       if (prior === undefined) continue;
-      const low = prior > USAGE_LOW_PCT && line.leftPct <= USAGE_LOW_PCT;
-      const back = prior <= USAGE_LOW_PCT && line.leftPct > USAGE_LOW_PCT;
+      const wakeBefore = usageLevel(prior, USAGE_WAKE_PCTS);
+      const wakeNow = usageLevel(line.leftPct, USAGE_WAKE_PCTS);
+      const low = wakeNow > wakeBefore;
+      const back = wakeBefore > 0 && wakeNow === 0;
+      if (!low && usageLevel(line.leftPct, USAGE_STEP_PCTS) > usageLevel(prior, USAGE_STEP_PCTS)) stepped = true;
       if (!low && !back) continue;
       const when = line.resetsAt ? ` It resets at ${line.resetsAt}.` : "";
       const text = low
@@ -5177,18 +5238,14 @@ function startBridge(config) {
           " Finish what you are doing at a safe point, then tell the room when you expect to be back," +
           " before the limit stops you mid-reply.]"
         : `[Gyredeck: your ${reading.displayName} ${line.label} limit is back to ${line.leftPct}% left.]`;
-      for (const [name, room] of mailRooms) {
-        if (!SYNC_CODE.test(name)) continue;
-        for (const [conversationId, member] of room.members) {
-          if (member.confirmed !== true || usageProviderFor(conversationId) !== reading.provider) continue;
-          const told = publishMail(room, ROOM_SENDER, text, null, false, { [VOUCHED]: true, to: conversationId, kind: "tell" });
-          if (told) {
-            deliverMail(name, room, text, ROOM_SENDER, told);
-            // Counted as told only once the member collects it, so leaving the room before
-            // reading it does not lose the warning, and reading it first does not repeat it
-            // outside (#169 audit).
-            if (reading.provider !== "codex") usageRoomTells.set(`${name}:${told.seq}`, { conversationId, label: line.label, low });
-          }
+      for (const [name, room, conversationId] of membersOnProvider(reading.provider)) {
+        const told = publishMail(room, ROOM_SENDER, text, null, false, { [VOUCHED]: true, to: conversationId, kind: "tell" });
+        if (told) {
+          deliverMail(name, room, text, ROOM_SENDER, told);
+          // Counted as told only once the member collects it, so leaving the room before
+          // reading it does not lose the warning, and reading it first does not repeat it
+          // outside (#169 audit).
+          if (reading.provider !== "codex") usageRoomTells.set(`${name}:${told.seq}`, { conversationId, label: line.label, low });
         }
       }
       // Codex outside a room has no hook that reads and no call it can make from its
@@ -5207,6 +5264,11 @@ function startBridge(config) {
         const told = publishMail(mailbox, ROOM_SENDER, outside, null, false, { [VOUCHED]: true, to: conversationId, kind: "tell" });
         if (told) deliverMail(conversationId, mailbox, outside, ROOM_SENDER, told);
       }
+    }
+    // Quiet, as the HEAVY RUN notices are: it puts the figure back in context, it never wakes.
+    if (!stepped) return;
+    for (const [, room, conversationId] of membersOnProvider(reading.provider)) {
+      publishMail(room, ROOM_SENDER, usageLineFor(conversationId), null, false, { [VOUCHED]: true, to: conversationId, kind: "notice", quiet: true, topic: "usage" });
     }
   };
 
@@ -5282,6 +5344,23 @@ function startBridge(config) {
     }
     return changed.length > 0 ? `USAGE: your ${reading.displayName} limits — ${changed.join("; ")}.` : null;
   };
+
+  /**
+   * A Claude Code or Antigravity member's usage intro, on its first collect after being let in
+   * (#306); Codex has it in the push that lets it in. Kept owed until the provider is known.
+   */
+  const roomUsageIntroFor = (conversationId, keyless) => {
+    if (keyless) return null;
+    const member = syncRoomFor(conversationId)?.room.members.get(conversationId);
+    if (member?.confirmed !== true || member.usageOwed !== true) return null;
+    const provider = usageProviderFor(conversationId);
+    if (provider !== "claude" && provider !== "agy") return null;
+    member.usageOwed = false;
+    return usageIntroFor(conversationId, provider);
+  };
+  /** The member's own usage line, on a collect that delivers someone else's mail (#306). */
+  const usageLineOnDelivery = (as, keyless, collected) =>
+    !keyless && inConfirmedRoom(as) && collected.some((message) => message.from !== as && message.topic !== "usage") ? usageLineFor(as) : null;
 
   /**
    * The heavy-run queue, told once to each session outside a room (#223). The queue is
@@ -5677,7 +5756,7 @@ function startBridge(config) {
     // rides this one (#259); everyone else is handed it on a collect.
     const member = room.members.get(conversationId);
     const withHeavy = confirmed && member?.heavyOwed === true && providerByConversation.get(conversationId) === "codexCliHook"
-      ? `${text}\n\n${heavyHint(conversationId)}`
+      ? `${text}\n\n${heavyHint(conversationId)}\n\n${usageIntroFor(conversationId, "codex")}`
       : text;
     const told = publishMail(mailbox, ROOM_SENDER, withHeavy, null, false, { [VOUCHED]: true, to: conversationId, kind: "tell" });
     if (deliverMail(conversationId, mailbox, withHeavy, ROOM_SENDER, told) === "queued" && withHeavy !== text) member.heavyOwed = false;
@@ -7029,6 +7108,8 @@ function startBridge(config) {
     const handoff = answering && (answering.kind === "ask" || answering.kind === "tell") && isAgentMember(room, answering.id)
       ? ` ${CODEX_HANDOFF_NOTE}`
       : "";
+    const usage = usageLineFor(recipient);
+    const usageShown = usage ? ` ${usage}` : "";
     // Every other push carries the short form (#157): the rules that broke live when told
     // once — the routing line, never answering a reaction, where the seq comes from — plus
     // the roster and seq, which are state and change. The rest is in the rules file, and
@@ -7043,6 +7124,7 @@ function startBridge(config) {
         (told.changed ? ` ${rosterLine(told)}` : "") +
         seqLine +
         " No seq on your next message = it did not arrive." +
+        usageShown +
         handoff +
         "]\n\n" +
         text
@@ -7086,6 +7168,7 @@ function startBridge(config) {
       " You will not see a response to what you write — the bridge posts for you and" +
       " tells you the seq here, on the next message you get. If a seq never follows," +
       " what you wrote did not arrive." +
+      usageShown +
       handoff +
       "]\n\n" +
       text
@@ -9294,8 +9377,10 @@ function startBridge(config) {
            */
           const answer = (collected, sync, timedOut, missed = []) => {
             if (collect && sync) noteUsageCollected(sync.name, collected.filter((message) => message.room === sync.name && message.from === ROOM_SENDER), as);
+            const usageLine = collect ? usageLineOnDelivery(as, keyless, collected) : null;
             sendJson(200, {
               ok: true,
+              ...(usageLine ? { usageLine } : {}),
               timedOut,
               ...(timedOut ? { yourLastMessage: diagnoseSilence(sync) } : {}),
               ...describeInbox(collected, sync, as, missed, vouched),
@@ -9370,9 +9455,10 @@ function startBridge(config) {
             // Neither notice on a wait's poll (#259): a wait prints only what wakes it and
             // drops an empty poll whole, so a line handed to one would be gone. The hook's
             // own drain, which prints them on every path, is what takes them.
-            const usageNotice = collect && !wakingOnly ? usageNoticeFor(as, keyless) : null;
+            const usageNotice = collect && !wakingOnly ? usageNoticeFor(as, keyless) ?? roomUsageIntroFor(as, keyless) : null;
             const heavyNotice = collect && !wakingOnly ? heavyNoticeFor(as, keyless) : null;
-            return { ...(usageNotice ? { usageNotice } : {}), ...(heavyNotice ? { heavyNotice } : {}) };
+            const usageLine = collect ? usageLineOnDelivery(as, keyless, collected) : null;
+            return { ...(usageNotice ? { usageNotice } : {}), ...(heavyNotice ? { heavyNotice } : {}), ...(usageLine ? { usageLine } : {}) };
           })(),
           ...(keyless ? { hint: KEYLESS_HINT, ...(keyLost ? { keyLost: true } : {}) } : {}),
         });

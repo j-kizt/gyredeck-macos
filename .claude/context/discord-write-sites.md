@@ -34,6 +34,9 @@ Every Hub record therefore goes through `append_once`, reached from `write_now` 
 | 7 | `install` merged loss → `pending.push_back` `rs:1319` | `loss` from the fallback | `flush_pending` `rs:1079` | Loss line handed and fallback unlinked after append + sync | Same entry (as row 3) | `merge_loss` decides between already present (drop the fallback), conflicting (refuse) and new |
 | 8 | `install` ended close → `record(Close Ended)` `rs:1327` | `close{id,ended,at}` for an open tail | `sync_all` | `Disconnect` on `CloseLanded`, behind a merged loss | The id is minted once and kept in `Pending` | A journalled close keeps its id |
 
+| 9 | `will_sleep` / `has_powered_on` → `say_power` → `record(Power)` (#318) | `power{id,kind,at,after,asleep?}`; it carries no room seq, so it moves no `written`/`covered`/`last` | `sync_all` / next sync. It is not fsynced before the sleep is allowed, the same as a line. | The notice is handed (`Then::PowerLanded`), placed after lines ≤ `after` | The id is minted once and stays in `Pending` | Replayed from `Batch.powers`; a 💤 is replayed marked delayed |
+| 10 | `powered` → `record(Powered)` (#318) | `powered{id}` | `settle` | None outside the process; the note is let go | Only an id still owed is recorded | Parse drops the power it names. An orphan or duplicate is corrupt. |
+
 ## Effects that are not record writes
 
 | Effect | Site | Gated by |

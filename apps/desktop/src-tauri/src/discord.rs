@@ -152,6 +152,9 @@ const UNREAD_AT_QUIT_UNKNOWN: &str = "unread when Gyredeck quit, unknown";
 /// is not reading. A fresh Node child reads nothing for its first half second or so.
 const CHILD_STUCK: Duration = Duration::from_secs(20);
 const CHILD_LINE_MAX_BYTES: usize = 64 * 1024;
+/// How long a sleep waits for its notices to reach Discord (#318): a probe's round trip took
+/// 27–75 ms, and the Mac sleeps whatever is still owed.
+const SLEEP_GRACE: Duration = Duration::from_millis(400);
 const SUPERVISOR_INTERVAL: Duration = Duration::from_millis(500);
 const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// A child that ran this long before dying starts the backoff again from one second.
@@ -323,6 +326,18 @@ pub(crate) enum ToChild {
     /// A room said quiet shows work again: the child disarms its prompt.
     #[serde(rename = "quiet_over")]
     QuietOver { room: String },
+    /// The Mac is going to sleep, or is back (#318): the child words it, and says `powered`
+    /// once Discord has it. `delayed`: a sleep notice not said before the sleep.
+    #[serde(rename_all = "camelCase")]
+    Power {
+        room: String,
+        id: String,
+        kind: journal::PowerKind,
+        at: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        asleep: Option<u64>,
+        delayed: bool,
+    },
 }
 
 /// The child's stdin. One thread owns the pipe and pulls each line from the [`Hub`] only when
@@ -443,6 +458,9 @@ enum FromChild {
     /// The close `id` of that room instance is said, archived and `closedAt` saved (#199 I12).
     #[serde(rename_all = "camelCase")]
     Closed { room: String, #[serde(default)] created_at: Option<u64>, #[serde(default)] id: Option<String> },
+    /// Discord took the sleep or wake notice `id` of that room instance (#318).
+    #[serde(rename_all = "camelCase")]
+    Powered { room: String, #[serde(default)] created_at: Option<u64>, id: String },
     /// The post the child opened for a room instance: the only post a `say` is taken from.
     #[serde(rename_all = "camelCase")]
     Connected {
@@ -739,6 +757,28 @@ struct RoomFeed {
     /// The approval requests relayed from this instance, by seq (#207): a code is checked only
     /// against one of these, so a closed or reconnected room takes none.
     approvals: HashMap<u64, Requested>,
+    /// Sleep and wake notices Discord has not taken (#318), outside the seqs and the budget.
+    power: Vec<PowerNote>,
+}
+
+#[derive(Clone, Debug)]
+struct PowerNote {
+    power: journal::Power,
+    delayed: bool,
+    /// The sleep call this 💤 answers, counted from 1; 0 for a wake or a replayed notice.
+    cycle: u64,
+    /// Handed to the current child; every attach starts it again.
+    handed: bool,
+}
+
+/// A 💤 handed once the sleep was let go can only land after it: it goes marked delayed, and
+/// stays so, whatever kept it from going sooner (#318 audit r3).
+fn power_line(room: &str, note: &mut PowerNote, let_go: u64) -> ToChild {
+    if note.cycle != 0 && note.cycle <= let_go && note.power.kind == journal::PowerKind::Sleep {
+        note.delayed = true;
+    }
+    let power = &note.power;
+    ToChild::Power { room: room.to_string(), id: power.id.clone(), kind: power.kind, at: power.at, asleep: power.asleep, delayed: note.delayed }
 }
 
 /// What the bridge's event stream last said of a session (#205).
@@ -794,11 +834,12 @@ impl RoomFeed {
             connected_at: Instant::now(),
             quiet_said: false,
             approvals: HashMap::new(),
+            power: Vec::new(),
         }
     }
 
     fn done(&self) -> bool {
-        self.unacked.is_empty() && !self.close_pending
+        self.unacked.is_empty() && self.power.is_empty() && !self.close_pending
     }
 
     /// What it still owes Discord: its lines, and its closing line.
@@ -1015,6 +1056,11 @@ struct Hub {
     compact_over: u64,
     /// What the bridge's event stream last said of each session, for the quiet prompt (#205).
     presence: HashMap<String, Seen>,
+    /// Since when the Mac sleeps, and the room instances told so: one wake notice each (#318).
+    asleep: Option<(u64, Vec<(String, Option<u64>)>)>,
+    /// The latest sleep call already let go, by its cycle: raised by the IOKit side the moment
+    /// it allows the sleep, without waiting for this hub, and never lowered (#318 audit r4).
+    let_go: Arc<AtomicU64>,
 }
 
 impl Hub {
@@ -1049,14 +1095,24 @@ impl Hub {
             let message = match self.outbox.pop_front()? {
                 Out::Control(message) => message,
                 Out::Feed { room, feed } => {
+                    let let_go = self.let_go.load(Ordering::SeqCst);
                     let Some(entry) = self.feed_mut(&room, feed) else {
                         continue;
                     };
                     let handed = entry.handed;
-                    let Some(line) = entry.unacked.iter().find(|line| line_seq(line) > handed).cloned() else {
-                        continue;
+                    let next = entry.unacked.iter().find(|line| line_seq(line) > handed).cloned();
+                    // A sleep or wake notice goes after the lines taken before it, ahead of the rest.
+                    let before = next.as_ref().map_or(u64::MAX, line_seq);
+                    let line = if let Some(note) = entry.power.iter_mut().find(|note| !note.handed && note.power.after < before) {
+                        note.handed = true;
+                        power_line(&room, note, let_go)
+                    } else {
+                        let Some(line) = next else {
+                            continue;
+                        };
+                        entry.handed = line_seq(&line);
+                        line
                     };
-                    entry.handed = line_seq(&line);
                     self.outbox.push_front(Out::Feed { room, feed });
                     line
                 }
@@ -1115,6 +1171,9 @@ impl Hub {
         let feeds = self.rooms.values_mut().chain(self.draining.values_mut().flat_map(|batches| batches.iter_mut().map(|(feed, _)| feed)));
         for feed in feeds {
             feed.handed = 0;
+            for note in &mut feed.power {
+                note.handed = false;
+            }
         }
         let (Some(out), Some(hub)) = (channel.out.take(), self.me.upgrade()) else {
             channel.shared.broken.store(true, Ordering::SeqCst);
@@ -1530,7 +1589,7 @@ impl Hub {
         // stands in for this connection's own, so it is told only when nothing of the file
         // still waits for the journal — a quit's loss for this connection above all; otherwise
         // the connection is kept and closed behind what waits, as any other (#199 r6b).
-        if feed.unacked.is_empty() && !self.waiting(feed.journal.as_ref()) {
+        if feed.unacked.is_empty() && feed.power.is_empty() && !self.waiting(feed.journal.as_ref()) {
             let owed = self.draining.get(room).and_then(|batches| batches.last()).filter(|(last, last_reason)| {
                 last.close_pending && last.close_durable && last.created_at == feed.created_at && *last_reason == reason
             });
@@ -1733,6 +1792,96 @@ impl Hub {
         }
     }
 
+    /// The Mac is going to sleep (#318): each followed room is told once. A second notice before
+    /// the wake adds nothing. Whether a 💤 is late is decided when it is handed (`let_go`).
+    fn will_sleep(&mut self, now: u64, cycle: u64) {
+        if self.asleep.is_some() {
+            return;
+        }
+        let told: Vec<(String, Option<u64>)> = self.rooms.iter().map(|(room, feed)| (room.clone(), feed.created_at)).collect();
+        self.asleep = Some((now, told.clone()));
+        for (room, _) in told {
+            self.say_power(&room, journal::PowerKind::Sleep, now, None, cycle);
+        }
+    }
+
+    /// The Mac is back: a sleep notice Discord has not taken goes again marked delayed, and each
+    /// room instance told of the sleep and still followed is told how long it slept. A wake with
+    /// no sleep before it says nothing.
+    fn has_powered_on(&mut self, now: u64) {
+        let Some((since, told)) = self.asleep.take() else {
+            return;
+        };
+        let mut late = Vec::new();
+        let draining = self.draining.iter_mut().flat_map(|(room, batches)| batches.iter_mut().map(move |(feed, _)| (room, feed)));
+        for (room, feed) in self.rooms.iter_mut().chain(draining) {
+            for note in feed.power.iter_mut().filter(|note| note.power.kind == journal::PowerKind::Sleep && !note.delayed) {
+                note.delayed = true;
+                note.handed = false;
+                late.push((room.clone(), feed.id));
+            }
+        }
+        for (room, feed) in late {
+            self.queue_feed(&room, feed);
+        }
+        let asleep = now.saturating_sub(since);
+        for (room, created_at) in told {
+            if self.rooms.get(&room).is_some_and(|feed| feed.created_at == created_at) {
+                self.say_power(&room, journal::PowerKind::Wake, now, Some(asleep), 0);
+            }
+        }
+    }
+
+    /// A notice is handed at once and journalled behind whatever the file still has pending: a
+    /// journal that refuses it (shown as `journal_blocked`) does not keep it from Discord, and a
+    /// `powered` for it is written only after it, so the file never names a notice it lacks. A
+    /// quit before the journal or Discord has taken it loses it.
+    fn say_power(&mut self, room: &str, kind: journal::PowerKind, at: u64, asleep: Option<u64>, cycle: u64) {
+        let Some(feed) = self.rooms.get_mut(room) else {
+            return;
+        };
+        let power = journal::Power { id: close_id(), kind, at, after: feed.last_seq, asleep };
+        let (journal, id) = (feed.journal.clone(), feed.id);
+        let record = power.record();
+        feed.power.push(PowerNote { power, delayed: false, cycle, handed: false });
+        self.queue_feed(room, id);
+        self.record(room, journal, record, Then::Nothing);
+    }
+
+    /// Discord took this notice of this room instance: journalled, then let go. Any other id,
+    /// or one already taken, changes nothing.
+    fn powered(&mut self, room: &str, created_at: Option<u64>, id: &str) {
+        let Some(at) = created_at else {
+            return;
+        };
+        let mut journal = None;
+        let mut found = false;
+        for feed in self.instance_feeds(room, at) {
+            let before = feed.power.len();
+            feed.power.retain(|note| note.power.id != id);
+            if feed.power.len() < before {
+                found = true;
+                journal = journal.or_else(|| feed.journal.clone());
+            }
+        }
+        if !found {
+            return;
+        }
+        self.record(room, journal.clone(), journal::Record::Powered { id: id.to_string() }, Then::Nothing);
+        self.settle(room, at, journal);
+    }
+
+    /// Whether a sleep is still worth waiting for: Discord is up and has not taken every 💤.
+    fn sleep_owed(&self) -> bool {
+        self.ready && self.sleep_unsaid()
+    }
+
+    /// A followed room's sleep notice Discord has not taken.
+    fn sleep_unsaid(&self) -> bool {
+        let is_sleep = |power: &journal::Power| power.kind == journal::PowerKind::Sleep;
+        self.rooms.values().any(|feed| feed.power.iter().any(|note| is_sleep(&note.power)))
+    }
+
     /// After an ACK or a close: let go of what is done; a room instance with nothing left
     /// followed or draining has its journal synced and deleted, which may make room for a
     /// parked one; one that grew past its size is compacted.
@@ -1879,6 +2028,8 @@ impl Hub {
             let last = batch.items.iter().map(journal::Item::seq).max().unwrap_or(0).max(batch.close.as_ref().map_or(0, |close| close.at));
             let mut feed = RoomFeed::new(self.next_feed, parsed.members.clone(), Some(parsed.created_at), last, Some(Arc::clone(&file)));
             feed.acked = parsed.acked;
+            // A sleep notice still owed after a relaunch was not said before its sleep.
+            feed.power = batch.powers.into_iter().map(|power| PowerNote { delayed: power.kind == journal::PowerKind::Sleep, cycle: 0, power, handed: false }).collect();
             for item in batch.items {
                 let line = item_line(&room, item);
                 feed.bytes += line_bytes(&line);
@@ -1954,7 +2105,7 @@ impl Hub {
         }
         // After the last close (acknowledged or not) it starts a tail of its own.
         if parsed.batches.last().is_none_or(|batch| batch.close.is_some()) {
-            parsed.batches.push(journal::Batch { items: Vec::new(), close: None });
+            parsed.batches.push(journal::Batch { items: Vec::new(), powers: Vec::new(), close: None });
         }
         Ok(Some((record, item_line(&code, loss))))
     }
@@ -2372,6 +2523,17 @@ pub(crate) struct DiscordState {
     /// Whether a token is kept, as last read or written — so a status poll never asks the
     /// Keychain.
     configured: AtomicBool,
+    /// The sleep and wake worker (#318), started on the first notice.
+    power: Mutex<Option<mpsc::Sender<PowerJob>>>,
+    /// The hub's `let_go`, raised here without its lock.
+    let_go: Arc<AtomicU64>,
+    /// Sleep calls so far: each one's cycle.
+    sleeps: AtomicU64,
+}
+
+enum PowerJob {
+    Sleep { at: u64, cycle: u64, deadline: Instant, done: mpsc::Sender<()> },
+    Wake { at: u64 },
 }
 
 impl Default for DiscordState {
@@ -2471,6 +2633,7 @@ impl DiscordState {
             #[cfg(test)]
             connect_gap: Mutex::new(None),
         });
+        let let_go = Arc::clone(&lock(&hub).let_go);
         Self {
             hub,
             core,
@@ -2478,6 +2641,9 @@ impl DiscordState {
             supervisor: Mutex::new(None),
             launch: Mutex::new(None),
             configured: AtomicBool::new(false),
+            power: Mutex::new(None),
+            let_go,
+            sleeps: AtomicU64::new(0),
         }
     }
 
@@ -2909,6 +3075,59 @@ impl DiscordState {
         }
         self.core.disconnect(room, app_word)?;
         Ok(self.status())
+    }
+
+    /// The Mac is going to sleep (#318). Returns within [`SLEEP_GRACE`] of being called, however
+    /// long the hub's lock or the journal takes: that work runs on the power worker, and this
+    /// waits for it only until the deadline, so the sleep is never held for long.
+    pub(crate) fn will_sleep(&self) {
+        self.will_sleep_within(SLEEP_GRACE);
+    }
+
+    fn will_sleep_within(&self, grace: Duration) {
+        let deadline = Instant::now() + grace;
+        let cycle = self.sleeps.fetch_add(1, Ordering::SeqCst) + 1;
+        let (done, finished) = mpsc::channel();
+        if self.power_job(PowerJob::Sleep { at: unix_ms(), cycle, deadline, done }) {
+            let _ = finished.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+        self.let_go.fetch_max(cycle, Ordering::SeqCst);
+    }
+
+    pub(crate) fn woke(&self) {
+        self.power_job(PowerJob::Wake { at: unix_ms() });
+    }
+
+    /// One worker takes sleep and wake in the order they came, so a wake never overtakes the
+    /// sleep it ends, even while a sleep is still stuck on the hub.
+    fn power_job(&self, job: PowerJob) -> bool {
+        let mut worker = lock(&self.power);
+        if worker.is_none() {
+            let (jobs, queue) = mpsc::channel::<PowerJob>();
+            let hub = Arc::clone(&self.hub);
+            let started = thread::Builder::new().name("gyredeck-discord-power".to_string()).spawn(move || {
+                for job in queue {
+                    match job {
+                        PowerJob::Sleep { at, cycle, deadline, done } => {
+                            lock(&hub).will_sleep(at, cycle);
+                            while Instant::now() < deadline {
+                                if !lock(&hub).sleep_owed() {
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(20));
+                            }
+                            let _ = done.send(());
+                        }
+                        PowerJob::Wake { at } => lock(&hub).has_powered_on(at),
+                    }
+                }
+            });
+            if started.is_err() {
+                return false;
+            }
+            *worker = Some(jobs);
+        }
+        worker.as_ref().is_some_and(|jobs| jobs.send(job).is_ok())
     }
 }
 
@@ -3695,6 +3914,9 @@ fn on_child_event_from(hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64, ev
         }
         FromChild::Closed { room, created_at, id } => {
             hub.closed(&room, created_at, id);
+        }
+        FromChild::Powered { room, created_at, id } => {
+            hub.powered(&room, created_at, &id);
         }
         // The post of the room instance followed now; one of an earlier instance, replayed
         // while it drains, is not where the owner speaks to this one.

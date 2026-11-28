@@ -871,3 +871,29 @@ fn standin_r9_a_failed_dir_sync_after_compaction_is_not_taken_as_synced() {
     assert!(file.sync().is_err(), "sync() answered Ok without syncing: line 51 is only in a rename no sync made durable");
     let _ = fs::remove_dir_all(base);
 }
+
+// ── #318: sleep and wake notices ──
+
+fn power(id: &str, kind: PowerKind, after: u64) -> Power {
+    Power { id: id.into(), kind, at: CREATED + after, after, asleep: (kind == PowerKind::Wake).then_some(60_000) }
+}
+
+#[test]
+fn r318_power_notices_are_kept_until_taken_and_survive_a_compaction() {
+    let sleep = power("00000000000000a1", PowerKind::Sleep, 1);
+    let wake = power("00000000000000a2", PowerKind::Wake, 2);
+    let bytes = bytes_of(&[open_record(), line(1), sleep.record(), line(2), wake.record(), Record::Powered { id: sleep.id.clone() }]);
+    let parsed = parse(&name(), &bytes).unwrap();
+    assert_eq!(parsed.batches.len(), 1);
+    assert_eq!(parsed.batches[0].powers, vec![wake.clone()], "the taken sleep notice is let go, the wake is still owed");
+    assert_eq!((parsed.last_seq, parsed.covered), (2, 2), "a notice moves no seq");
+    assert_eq!(parse(&name(), &render(&parsed)).unwrap().batches, parsed.batches, "a compacted file reads back the same");
+
+    let all_taken = bytes_of(&[open_record(), line(1), sleep.record(), Record::Powered { id: sleep.id.clone() }]);
+    assert!(parse(&name(), &all_taken).unwrap().batches.iter().all(|batch| batch.powers.is_empty()));
+
+    let twice = bytes_of(&[open_record(), sleep.record(), sleep.record()]);
+    assert!(parse(&name(), &twice).is_err(), "one notice twice is corrupt");
+    let orphan = bytes_of(&[open_record(), Record::Powered { id: sleep.id.clone() }]);
+    assert!(parse(&name(), &orphan).is_err(), "taken before it was written is corrupt");
+}

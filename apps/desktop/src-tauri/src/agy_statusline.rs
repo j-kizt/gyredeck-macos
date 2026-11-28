@@ -10,7 +10,9 @@
 //!
 //! Invariants, each pinned by a test that was made to fail:
 //! - C1  An unknown shape gives no value: no `quota`, a wrongly typed or out-of-range known
-//!       bucket, or no known bucket at all. The format is undocumented and still changing.
+//!       bucket, a reset at or before 1970, or no known bucket in use. The format is
+//!       undocumented and still changing. A bucket agy is not using (full, reset exactly at
+//!       1970, 0 s to go; agy 1.5.18) is skipped: no line, no say in the time (#496).
 //! - C2  `fetched_at` is the payload's time (`reset_time − reset_in_seconds`, never later
 //!       than the file's mtime), not the time it was read.
 //! - C3  Every fresh reading is relayed, a repeat included — the bridge's edge logic is what
@@ -40,53 +42,100 @@ use std::{
 use serde_json::{Map, Value};
 
 use super::{
-    unix_seconds_to_iso, CodexMetricLine, CodexProgressFormat, CodexUsageSnapshot,
+    unix_seconds_to_iso, CodexMetricLine, CodexProgressFormat, CodexUsageSnapshot, UsageSource,
     AGY_QUOTA_BUCKETS,
 };
 
 pub(crate) const SCRIPT_NAME: &str = "gyredeck-agy-statusline.sh";
-const PAYLOAD_FILE: &str = "agy-statusline.json";
-const CHAIN_FILE: &str = "agy-statusline.chain";
-const PREVIOUS_FILE: &str = "agy-statusline.previous.json";
 const STATUS_LINE_KEY: &str = "statusLine";
-/// The keys of `statusLine` the install sets, and so the ones uninstall puts back.
-const OWNED_KEYS: [&str; 4] = ["type", "command", "enabled", "stack_with_default"];
 const MAX_PAYLOAD_BYTES: u64 = 64 * 1024;
 const MERGE_ATTEMPTS: usize = 3;
-/// agy writes only while its TUI updates, never while it sits idle.
-pub(crate) const STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 
-/// Where everything this feature touches lives. Passed in rather than read from `HOME`, so
-/// tests can run side by side.
-pub(crate) struct AgyStatusLinePaths {
-    pub(crate) settings: PathBuf,
-    pub(crate) dir: PathBuf,
+/// One agent's status line, as the shared installer sees it (#398 S5): the install, the
+/// chain, the record and the rollback are one code path, and only these differ.
+pub(crate) struct StatusLineSpec {
+    pub(crate) script_name: &'static str,
+    payload_file: &'static str,
+    chain_file: &'static str,
+    previous_file: &'static str,
+    /// The keys of `statusLine` the install sets, and so the ones uninstall puts back.
+    owned_keys: &'static [&'static str],
+    /// agy runs a status line only while `enabled` is true; Claude Code has no such key.
+    has_enabled: bool,
+    /// With nothing of the person's to chain, agy's default line is kept under ours.
+    stack_default_when_alone: bool,
 }
 
-impl AgyStatusLinePaths {
-    pub(crate) fn from_home() -> Result<Self, String> {
-        let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
-        let home = PathBuf::from(home);
+pub(crate) const AGY: StatusLineSpec = StatusLineSpec {
+    script_name: SCRIPT_NAME,
+    payload_file: "agy-statusline.json",
+    chain_file: "agy-statusline.chain",
+    previous_file: "agy-statusline.previous.json",
+    owned_keys: &["type", "command", "enabled", "stack_with_default"],
+    has_enabled: true,
+    stack_default_when_alone: true,
+};
+
+pub(crate) const CLAUDE: StatusLineSpec = StatusLineSpec {
+    script_name: "gyredeck-claude-statusline.sh",
+    // Unused for reading: each payload is its own record beside it, never replaced, read by
+    // `local_usage::newest_claude_record` (#398 audit). Uninstall removes both.
+    payload_file: "claude-statusline.json",
+    chain_file: "claude-statusline.chain",
+    previous_file: "claude-statusline.previous.json",
+    owned_keys: &["type", "command", "padding"],
+    has_enabled: false,
+    stack_default_when_alone: false,
+};
+
+/// Where everything one status line touches lives. Passed in rather than read from `HOME`,
+/// so tests can run side by side.
+pub(crate) struct StatusLinePaths {
+    pub(crate) settings: PathBuf,
+    pub(crate) dir: PathBuf,
+    pub(crate) spec: &'static StatusLineSpec,
+}
+
+pub(crate) type AgyStatusLinePaths = StatusLinePaths;
+
+fn home() -> Result<PathBuf, String> {
+    std::env::var("HOME").map(PathBuf::from).map_err(|_| "HOME is not set".to_string())
+}
+
+impl StatusLinePaths {
+    pub(crate) fn agy_from_home() -> Result<Self, String> {
+        let home = home()?;
         Ok(Self {
             settings: home.join(".gemini").join("antigravity-cli").join("settings.json"),
             dir: home.join(".config").join("gyredeck"),
+            spec: &AGY,
+        })
+    }
+
+    /// Claude Code's user settings under `~/.claude`, where `install_claude_hook` writes too.
+    pub(crate) fn claude_from_home() -> Result<Self, String> {
+        let home = home()?;
+        Ok(Self {
+            settings: home.join(".claude").join("settings.json"),
+            dir: home.join(".config").join("gyredeck"),
+            spec: &CLAUDE,
         })
     }
 
     pub(crate) fn script(&self) -> PathBuf {
-        self.dir.join(SCRIPT_NAME)
+        self.dir.join(self.spec.script_name)
     }
 
     pub(crate) fn payload(&self) -> PathBuf {
-        self.dir.join(PAYLOAD_FILE)
+        self.dir.join(self.spec.payload_file)
     }
 
     pub(crate) fn chain(&self) -> PathBuf {
-        self.dir.join(CHAIN_FILE)
+        self.dir.join(self.spec.chain_file)
     }
 
     pub(crate) fn previous(&self) -> PathBuf {
-        self.dir.join(PREVIOUS_FILE)
+        self.dir.join(self.spec.previous_file)
     }
 }
 
@@ -152,6 +201,15 @@ pub(crate) fn parse_payload(bytes: &[u8], mtime: i64) -> Option<AgyStatusLine> {
         if reset_in < 0 {
             return None;
         }
+        // agy 1.5.18 writes a bucket it is not using as exactly this: full, reset at 1970, 0 s
+        // to go (#496). It is skipped: its time would make every reading look decades old. Any
+        // other reset at or before 1970 is an unknown shape and gives nothing (C1).
+        if reset_unix == 0 && reset_in == 0 && remaining == 1.0 {
+            continue;
+        }
+        if reset_unix <= 0 {
+            return None;
+        }
         fetched_at = fetched_at.min(reset_unix.checked_sub(reset_in)?);
         resolved.insert(
             id,
@@ -213,9 +271,11 @@ pub(crate) struct AgyStatusLineReading {
     pub(crate) stale: bool,
 }
 
-pub(crate) fn reading_from(status: AgyStatusLine, now: i64) -> AgyStatusLineReading {
+/// agy writes only while its TUI updates, so a reading older than the usage refresh interval
+/// (`stale_after`, the person's setting, #398 Q5) is outdated.
+pub(crate) fn reading_from(status: AgyStatusLine, now: i64, stale_after: Duration) -> AgyStatusLineReading {
     let age = now.saturating_sub(status.fetched_at);
-    let stale = age > STALE_AFTER.as_secs() as i64;
+    let stale = age > stale_after.as_secs() as i64;
     let mut lines: Vec<CodexMetricLine> = status
         .lines
         .iter()
@@ -246,14 +306,15 @@ pub(crate) fn reading_from(status: AgyStatusLine, now: i64) -> AgyStatusLineRead
             lines,
             fetched_at: unix_seconds_to_iso(status.fetched_at)
                 .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
+            source: UsageSource::StatusLine,
         },
         stale,
     }
 }
 
-pub(crate) fn read_reading(path: &Path, now: i64) -> Option<AgyStatusLineReading> {
+pub(crate) fn read_reading(path: &Path, now: i64, stale_after: Duration) -> Option<AgyStatusLineReading> {
     let (bytes, mtime) = read_payload_file(path)?;
-    parse_payload(&bytes, mtime).map(|status| reading_from(status, now))
+    parse_payload(&bytes, mtime).map(|status| reading_from(status, now, stale_after))
 }
 
 pub(crate) fn unix_now() -> i64 {
@@ -595,7 +656,7 @@ pub(crate) fn with_rollback<T>(
     })
 }
 
-/// The command agy is given: `sh` and the script, quoted for the shell.
+/// The command the agent is given: `sh` and the script, quoted for the shell.
 pub(crate) fn our_command(script: &Path) -> String {
     let path = script.to_string_lossy().replace('\'', "'\\''");
     format!("sh '{path}'")
@@ -603,25 +664,31 @@ pub(crate) fn our_command(script: &Path) -> String {
 
 /// Ours is any command naming the script, wherever it was installed from. Chaining one of
 /// those would run the script inside itself on every frame.
-fn is_ours_command(command: &str) -> bool {
-    command.contains(SCRIPT_NAME)
+fn is_ours_command(spec: &StatusLineSpec, command: &str) -> bool {
+    command.contains(spec.script_name)
 }
 
-fn is_ours(status_line: &Value) -> bool {
+fn is_ours(spec: &StatusLineSpec, status_line: &Value) -> bool {
     status_line
         .get("command")
         .and_then(Value::as_str)
-        .is_some_and(is_ours_command)
+        .is_some_and(|command| is_ours_command(spec, command))
 }
 
-/// The command of a status line that was actually running, and is not ours.
-fn running_command(status_line: Option<&Value>) -> Option<String> {
+/// The command of a status line that was actually running, and is not ours: agy's switched
+/// on, Claude Code's of type `command`.
+fn running_command(spec: &StatusLineSpec, status_line: Option<&Value>) -> Option<String> {
     let line = status_line?.as_object()?;
-    if line.get("enabled").and_then(Value::as_bool) != Some(true) {
+    let runs = if spec.has_enabled {
+        line.get("enabled").and_then(Value::as_bool) == Some(true)
+    } else {
+        line.get("type").and_then(Value::as_str) == Some("command")
+    };
+    if !runs {
         return None;
     }
     let command = line.get("command")?.as_str()?.trim();
-    (!command.is_empty() && !is_ours_command(command)).then(|| command.to_string())
+    (!command.is_empty() && !is_ours_command(spec, command)).then(|| command.to_string())
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -637,9 +704,9 @@ fn remove_if_present(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Everything the install could refuse over, checked before anything is changed: agy's
+/// Everything the install could refuse over, checked before anything is changed: the agent's
 /// settings must parse, and `statusLine` must be an object or absent.
-pub(crate) fn preflight(paths: &AgyStatusLinePaths) -> Result<(), String> {
+pub(crate) fn preflight(paths: &StatusLinePaths) -> Result<(), String> {
     match read_json_object(&paths.settings)?.get(STATUS_LINE_KEY) {
         None | Some(Value::Object(_)) => Ok(()),
         Some(_) => Err(format!(
@@ -651,10 +718,11 @@ pub(crate) fn preflight(paths: &AgyStatusLinePaths) -> Result<(), String> {
 
 /// Install the script as agy's status line, keeping whatever the person had so it still
 /// draws and can be put back.
-pub(crate) fn install(paths: &AgyStatusLinePaths, bundled_script: &Path) -> Result<(), String> {
+pub(crate) fn install(paths: &StatusLinePaths, bundled_script: &Path) -> Result<(), String> {
+    let spec = paths.spec;
     preflight(paths)?;
     let source = fs::read(bundled_script)
-        .map_err(|error| format!("Failed to read the bundled {SCRIPT_NAME}: {error}"))?;
+        .map_err(|error| format!("Failed to read the bundled {}: {error}", spec.script_name))?;
     write_atomically(&paths.script(), &source, 0o644)?;
     let command = our_command(&paths.script());
 
@@ -667,9 +735,11 @@ pub(crate) fn install(paths: &AgyStatusLinePaths, bundled_script: &Path) -> Resu
         let enable = |object: &mut Map<String, Value>| {
             object.insert("type".to_string(), Value::String("command".to_string()));
             object.insert("command".to_string(), Value::String(command.clone()));
-            object.insert("enabled".to_string(), Value::Bool(true));
+            if spec.has_enabled {
+                object.insert("enabled".to_string(), Value::Bool(true));
+            }
         };
-        if line.is_some_and(is_ours) {
+        if line.is_some_and(|line| is_ours(spec, line)) {
             // Reinstalling repairs ours, a status line switched off included; the record of
             // what was there before stays as it is.
             enable(&mut object);
@@ -678,13 +748,13 @@ pub(crate) fn install(paths: &AgyStatusLinePaths, bundled_script: &Path) -> Resu
         // Recorded before agy is pointed at the script, so a failure here changes nothing.
         let record = serde_json::json!({ "present": line.is_some(), "previous": line.cloned() });
         write_private(&paths.previous(), format!("{record}\n").as_bytes())?;
-        let theirs = running_command(line);
+        let theirs = running_command(spec, line);
         match &theirs {
             Some(theirs) => write_private(&paths.chain(), theirs.as_bytes())?,
             None => remove_if_present(&paths.chain())?,
         }
         enable(&mut object);
-        if theirs.is_none() {
+        if theirs.is_none() && spec.stack_default_when_alone {
             // The script draws nothing of its own, so without this agy's default line goes.
             object.insert("stack_with_default".to_string(), Value::Bool(true));
         }
@@ -696,20 +766,21 @@ pub(crate) fn install(paths: &AgyStatusLinePaths, bundled_script: &Path) -> Resu
 /// Whether agy will run this installation's script: a regular file, and a status line of
 /// type `command`, switched on, naming it. An app updated past an install from before #230
 /// has the hook but not this, and the panel names it out of date so the person installs again.
-pub(crate) fn wired(paths: &AgyStatusLinePaths) -> bool {
+pub(crate) fn wired(paths: &StatusLinePaths) -> bool {
     let command = our_command(&paths.script());
     matches!(read_regular_nofollow(&paths.script()), Ok(ReadNoFollow::Regular(_)))
         && read_json_object(&paths.settings).is_ok_and(|root| {
             root.get(STATUS_LINE_KEY).is_some_and(|line| {
                 line.get("type").and_then(Value::as_str) == Some("command")
-                    && line.get("enabled").and_then(Value::as_bool) == Some(true)
+                    && (!paths.spec.has_enabled
+                        || line.get("enabled").and_then(Value::as_bool) == Some(true))
                     && line.get("command").and_then(Value::as_str) == Some(command.as_str())
             })
         })
 }
 
 /// What the install recorded: whether `statusLine` was there, and what it held.
-fn read_record(paths: &AgyStatusLinePaths) -> Option<(bool, Option<Map<String, Value>>)> {
+fn read_record(paths: &StatusLinePaths) -> Option<(bool, Option<Map<String, Value>>)> {
     let record: Value = serde_json::from_slice(&read_plain(&paths.previous()).ok()??.bytes).ok()?;
     let present = record.get("present")?.as_bool()?;
     Some((present, record.get("previous").and_then(Value::as_object).cloned()))
@@ -718,16 +789,17 @@ fn read_record(paths: &AgyStatusLinePaths) -> Option<(bool, Option<Map<String, V
 /// Put back the status line the person had before the install. A status line they set
 /// since is theirs and is left alone. Either way the files this feature keeps go, the
 /// payload included, since it carries the account email.
-pub(crate) fn uninstall(paths: &AgyStatusLinePaths) -> Result<(), String> {
+pub(crate) fn uninstall(paths: &StatusLinePaths) -> Result<(), String> {
+    let spec = paths.spec;
     let record = read_record(paths);
     merge_json_key(&paths.settings, STATUS_LINE_KEY, |line| {
-        let Some(line) = line.filter(|value| is_ours(value)) else {
+        let Some(line) = line.filter(|value| is_ours(spec, value)) else {
             return Ok(line.cloned());
         };
         let mut object = line.as_object().cloned().unwrap_or_default();
         match &record {
             Some((true, Some(before))) => {
-                for key in OWNED_KEYS {
+                for &key in spec.owned_keys {
                     match before.get(key) {
                         Some(value) => object.insert(key.to_string(), value.clone()),
                         None => object.remove(key),
@@ -735,13 +807,15 @@ pub(crate) fn uninstall(paths: &AgyStatusLinePaths) -> Result<(), String> {
                 }
             }
             Some((false, _)) => {
-                for key in OWNED_KEYS {
+                for &key in spec.owned_keys {
                     object.remove(key);
                 }
                 if object.is_empty() {
                     return Ok(None);
                 }
             }
+            // No record to go by, and no status line is Claude Code's default.
+            _ if !spec.has_enabled => return Ok(None),
             // No record to go by: agy's own empty default, which turns ours off.
             _ => {
                 object.insert("type".to_string(), Value::String(String::new()));
@@ -753,6 +827,15 @@ pub(crate) fn uninstall(paths: &AgyStatusLinePaths) -> Result<(), String> {
     })?;
     for path in [paths.chain(), paths.previous(), paths.payload(), paths.script()] {
         remove_if_present(&path)?;
+    }
+    if !spec.has_enabled {
+        // Claude's records, by name only: a link named like one goes, never what it points at.
+        let records = fs::read_dir(&paths.dir).into_iter().flatten().filter_map(Result::ok).filter(|entry| {
+            entry.file_name().to_str().and_then(crate::local_usage::claude_record_order).is_some()
+        });
+        for entry in records {
+            remove_if_present(&entry.path())?;
+        }
     }
     Ok(())
 }
@@ -767,8 +850,16 @@ mod tests {
     /// 2026-10-26T05:00:00Z
     const T0: i64 = 1_792_990_800;
 
+    /// The interval the C3/C4 tests run at; agy follows the panel's refresh since #398.
+    const STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+
     fn script_source() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../adapters/antigravity").join(SCRIPT_NAME)
+        script_source_for(&AGY)
+    }
+
+    fn script_source_for(spec: &StatusLineSpec) -> PathBuf {
+        let adapter = if spec.has_enabled { "antigravity" } else { "claude" };
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../adapters").join(adapter).join(spec.script_name)
     }
 
     fn iso(seconds: i64) -> String {
@@ -813,9 +904,20 @@ mod tests {
     }
 
     fn paths(root: &Path) -> AgyStatusLinePaths {
-        AgyStatusLinePaths {
-            settings: root.join("home/.gemini/antigravity-cli/settings.json"),
-            dir: root.join("home/.config/gyredeck"),
+        paths_for(root, &AGY)
+    }
+
+    fn paths_for(root: &Path, spec: &'static StatusLineSpec) -> StatusLinePaths {
+        let settings = if spec.has_enabled { "home/.gemini/antigravity-cli/settings.json" } else { "home/.claude/settings.json" };
+        StatusLinePaths { settings: root.join(settings), dir: root.join("home/.config/gyredeck"), spec }
+    }
+
+    /// A status line of the person's own that the agent is running.
+    fn running(spec: &StatusLineSpec, command: &str) -> Value {
+        if spec.has_enabled {
+            serde_json::json!({ "type": "command", "command": command, "enabled": true, "padding": 1 })
+        } else {
+            serde_json::json!({ "type": "command", "command": command, "padding": 1 })
         }
     }
 
@@ -877,6 +979,40 @@ mod tests {
         assert!(parse_payload(b"[]", T0).is_none());
     }
 
+    /// #496: agy 1.5.18 writes unused buckets with a 1970 reset. They are skipped, and the
+    /// reading takes its time from the buckets in use, so it is fresh and relayed. Only that
+    /// exact shape is skipped; any other reset at or before 1970 gives nothing.
+    #[test]
+    fn c1_an_unused_bucket_dated_1970_is_skipped_and_does_not_age_the_reading() {
+        let fetched = T0 - 600;
+        let mut value = payload(fetched);
+        let unused = serde_json::json!({ "remaining_fraction": 1, "reset_time": "1970-01-01T00:00:00Z", "reset_in_seconds": 0 });
+        value["quota"]["3p-5h"] = unused.clone();
+        value["quota"]["3p-weekly"] = unused;
+        let status = parse_payload(&bytes(&value), T0 - 60).expect("a payload with unused buckets still reads");
+        assert_eq!(status.lines.iter().map(|line| line.label).collect::<Vec<_>>(), ["Gemini Weekly"]);
+        assert_eq!(status.fetched_at, fetched, "the time comes from the bucket in use");
+        let mut relayed = 0;
+        relay_if_fresh(&reading_from(status, T0, STALE_AFTER), |_| relayed += 1);
+        assert_eq!(relayed, 1, "fresh, so relayed");
+
+        type Mutation = fn(&mut Value);
+        let not_unused: [(&str, Mutation); 4] = [
+            ("1970 but part used", |p| p["quota"]["3p-5h"]["remaining_fraction"] = serde_json::json!(0.3)),
+            ("1970 but exhausted", |p| p["quota"]["3p-5h"]["remaining_fraction"] = serde_json::json!(0)),
+            ("1970 but time to go", |p| p["quota"]["3p-5h"]["reset_in_seconds"] = serde_json::json!(500)),
+            ("before 1970", |p| p["quota"]["3p-5h"]["reset_time"] = serde_json::json!("1969-12-31T23:59:59Z")),
+        ];
+        for (name, mutate) in not_unused {
+            let mut shape = value.clone();
+            mutate(&mut shape);
+            assert!(parse_payload(&bytes(&shape), T0 - 60).is_none(), "{name} is an unknown shape and gives nothing");
+        }
+
+        value["quota"]["gemini-weekly"] = value["quota"]["3p-5h"].clone();
+        assert!(parse_payload(&bytes(&value), T0 - 60).is_none(), "only unused buckets is no reading");
+    }
+
     #[test]
     fn c1_the_file_must_be_a_small_regular_file() {
         let dir = scratch("file");
@@ -906,7 +1042,7 @@ mod tests {
         let now = T0;
         let status = parse_payload(&bytes(&payload(fetched)), mtime).unwrap();
         assert_eq!(status.fetched_at, fetched);
-        let reading = reading_from(status, now);
+        let reading = reading_from(status, now, STALE_AFTER);
         assert_eq!(reading.snapshot.fetched_at, iso(fetched));
         assert_ne!(reading.snapshot.fetched_at, iso(now));
         assert!(!reading.stale, "premise: ten minutes old is fresh");
@@ -920,10 +1056,10 @@ mod tests {
 
     #[test]
     fn c3_every_fresh_reading_is_relayed_and_a_stale_one_never() {
-        let first = reading_from(parse_payload(&bytes(&payload(T0)), T0).unwrap(), T0 + 60);
+        let first = reading_from(parse_payload(&bytes(&payload(T0)), T0).unwrap(), T0 + 60, STALE_AFTER);
         let mut crossing = payload(T0);
         crossing["quota"]["gemini-weekly"]["remaining_fraction"] = serde_json::json!(0.05);
-        let second = reading_from(parse_payload(&bytes(&crossing), T0).unwrap(), T0 + 60);
+        let second = reading_from(parse_payload(&bytes(&crossing), T0).unwrap(), T0 + 60, STALE_AFTER);
         // Premise: the same second, the same account, different numbers.
         assert_eq!(first.snapshot.fetched_at, second.snapshot.fetched_at);
         assert_eq!((used_of(&first.snapshot, "Gemini Weekly"), used_of(&second.snapshot, "Gemini Weekly")), (80.0, 95.0));
@@ -941,8 +1077,14 @@ mod tests {
         let stale = reading_from(
             parse_payload(&bytes(&payload(T0)), T0).unwrap(),
             T0 + STALE_AFTER.as_secs() as i64 + 1,
+            STALE_AFTER,
         );
         assert!(stale.stale);
+        // The bound is the interval given, not a fixed one (#398 Q5).
+        let at_five = |age: i64| {
+            reading_from(parse_payload(&bytes(&payload(T0)), T0).unwrap(), T0 + age, Duration::from_secs(300)).stale
+        };
+        assert_eq!((at_five(300), at_five(301)), (false, true), "five minutes is the edge at a five-minute refresh");
         let mut stale_relays = 0;
         relay_if_fresh(&stale, |_| stale_relays += 1);
         assert_eq!(stale_relays, 0, "a stale reading is not relayed");
@@ -966,8 +1108,9 @@ mod tests {
             plan: None,
             lines: Vec::new(),
             fetched_at: iso(T0),
+            source: UsageSource::Api,
         };
-        let reading = |now| reading_from(parse_payload(&bytes(&payload(T0)), T0).unwrap(), now);
+        let reading = |now| reading_from(parse_payload(&bytes(&payload(T0)), T0).unwrap(), now, STALE_AFTER);
         let stale_now = T0 + STALE_AFTER.as_secs() as i64 + 1;
 
         // (status line, fallback answers, calls expected, answer from the status line)
@@ -999,7 +1142,7 @@ mod tests {
         let status = parse_payload(&fixture, T0).unwrap();
         assert!(!format!("{status:?}").contains(EMAIL), "nothing kept holds the email");
 
-        let reading = reading_from(status, T0 + 1);
+        let reading = reading_from(status, T0 + 1, STALE_AFTER);
         let mut body = String::new();
         relay_if_fresh(&reading, |snapshot| body = serde_json::to_string(snapshot).unwrap());
         assert!(!body.is_empty(), "premise: the reading was relayed");
@@ -1009,6 +1152,15 @@ mod tests {
     }
 
     // C6 -------------------------------------------------------------------------------
+
+    /// Where the last payload was recorded: agy's one file, or Claude's latest record.
+    fn record(paths: &StatusLinePaths) -> PathBuf {
+        if paths.spec.has_enabled {
+            paths.payload()
+        } else {
+            crate::local_usage::newest_claude_record(&paths.dir).expect("a Claude record")
+        }
+    }
 
     fn run_script(paths: &AgyStatusLinePaths, home: &Path, input: &[u8]) -> (i32, String) {
         let mut child = Command::new("sh")
@@ -1026,57 +1178,332 @@ mod tests {
 
     #[test]
     fn c6_installing_over_a_status_line_keeps_its_output_and_uninstall_restores_it() {
-        let root = scratch("chain");
-        let home = root.join("home");
-        let paths = paths(&root);
-        let theirs = serde_json::json!({
-            "type": "command", "command": "printf 'mine:'; head -c 9", "enabled": true, "padding": 1
-        });
-        let original = serde_json::json!({ "theme": "dark", "statusLine": theirs, "trustedWorkspaces": ["/a"] });
-        write_settings(&paths, &original);
+        for spec in [&AGY, &CLAUDE] {
+            let name = spec.script_name;
+            let root = scratch(&format!("chain-{}", spec.payload_file));
+            let home = root.join("home");
+            let paths = paths_for(&root, spec);
+            let theirs = running(spec, "printf 'mine:'; head -c 9");
+            let original = serde_json::json!({ "theme": "dark", "statusLine": theirs, "trustedWorkspaces": ["/a"] });
+            write_settings(&paths, &original);
 
-        let input = bytes(&payload(T0));
-        let drawn = format!("mine:{}", String::from_utf8_lossy(&input[..9]));
-        // Premise: their command alone draws this from the payload.
-        let mut alone = Command::new("sh")
-            .args(["-c", "printf 'mine:'; head -c 9"])
+            let input = bytes(&payload(T0));
+            let drawn = format!("mine:{}", String::from_utf8_lossy(&input[..9]));
+            // Premise: their command alone draws this from the payload.
+            let mut alone = Command::new("sh")
+                .args(["-c", "printf 'mine:'; head -c 9"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            alone.stdin.take().unwrap().write_all(&input).unwrap();
+            assert_eq!(String::from_utf8_lossy(&alone.wait_with_output().unwrap().stdout), drawn);
+
+            assert!(!wired(&paths), "{name}: premise: not wired before the install");
+            install(&paths, &script_source_for(spec)).unwrap();
+            assert!(wired(&paths), "{name}: wired after the install");
+            let installed = settings(&paths);
+            assert!(is_ours(spec, &installed["statusLine"]), "{name}: the agent now runs the script");
+            assert_eq!(installed["statusLine"]["type"], "command");
+            assert_eq!(installed["statusLine"].get("enabled").cloned(), spec.has_enabled.then_some(Value::Bool(true)), "{name}");
+            assert!(installed["statusLine"].get("stack_with_default").is_none(), "{name}: theirs draws, so no default line is stacked");
+            assert_eq!(installed["statusLine"]["padding"], 1);
+            assert_eq!(installed["theme"], "dark");
+            assert_eq!(installed["trustedWorkspaces"], serde_json::json!(["/a"]));
+
+            let (code, out) = run_script(&paths, &home, &input);
+            assert_eq!(code, 0);
+            assert_eq!(out, drawn, "{name}: their output is what the agent draws");
+            let kept = fs::read(record(&paths)).unwrap();
+            if spec.has_enabled {
+                assert_eq!(kept, input, "the payload is kept whole");
+            } else {
+                let wrapper: Value = serde_json::from_slice(&kept).unwrap();
+                assert_eq!(wrapper["payload"], payload(T0), "the payload is kept whole inside the record");
+                assert_eq!(wrapper["configDir"], home.join(".claude").to_string_lossy().as_ref(), "with the config dir it ran under");
+                assert!(wrapper["at"].as_i64().unwrap() >= unix_now() - 60, "and when it was written");
+            }
+            assert_eq!(fs::metadata(record(&paths)).unwrap().permissions().mode() & 0o777, 0o600, "{name}");
+
+            // A second install must not record our own command as theirs.
+            install(&paths, &script_source_for(spec)).unwrap();
+            let (_, again) = run_script(&paths, &home, &input);
+            assert_eq!(again, drawn, "{name}: reinstall keeps their command chained");
+
+            uninstall(&paths).unwrap();
+            assert!(!wired(&paths), "{name}: not wired after the uninstall");
+            assert_eq!(settings(&paths), original, "{name}: uninstall puts their status line back");
+            for gone in [paths.payload(), paths.chain(), paths.previous(), paths.script()] {
+                assert!(!gone.exists(), "{} removed", gone.display());
+            }
+            assert_eq!(crate::local_usage::newest_claude_record(&paths.dir), None, "{name}: no record is left");
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn c6_the_script_always_exits_0_leaves_no_temp_file_and_still_draws_their_line() {
+        for spec in [&AGY, &CLAUDE] {
+            let name = spec.script_name;
+            let root = scratch(&format!("exit0-{}", spec.payload_file));
+            let home = root.join("home");
+            let paths = paths_for(&root, spec);
+            write_settings(&paths, &serde_json::json!({ "statusLine": running(spec, "printf drawn; exit 3") }));
+            install(&paths, &script_source_for(spec)).unwrap();
+            let input = bytes(&payload(T0));
+
+            let (code, out) = run_script(&paths, &home, &input);
+            assert_eq!((code, out.as_str()), (0, "drawn"), "{name}: their failing line still draws, ours exits 0");
+            let mut left: Vec<String> = fs::read_dir(&paths.dir).unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .filter(|file| file.starts_with('.'))
+                .collect();
+            left.sort();
+            assert_eq!(left, Vec::<String>::new(), "{name}: no temp file is left behind");
+
+            // With the folder unwritable mktemp fails: their line still draws, from stdin.
+            remove_if_present(&record(&paths)).unwrap();
+            fs::set_permissions(&paths.dir, fs::Permissions::from_mode(0o500)).unwrap();
+            let (code, out) = run_script(&paths, &home, &input);
+            fs::set_permissions(&paths.dir, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!((code, out.as_str()), (0, "drawn"), "{name}: a failed capture still exits 0 and draws");
+            assert!(!paths.payload().exists(), "{name}: premise: nothing was captured");
+            assert_eq!(crate::local_usage::newest_claude_record(&paths.dir), None, "{name}: no record either");
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A Claude payload as Claude Code hands it over: only `rate_limits` matters here.
+    fn claude_payload(weekly_used: f64, session_used: f64) -> Value {
+        let now = unix_now();
+        serde_json::json!({ "session_id": "s-1", "rate_limits": {
+            "five_hour": { "used_percentage": session_used, "resets_at": now + 3_600 },
+            "seven_day": { "used_percentage": weekly_used, "resets_at": now + 86_400 } } })
+    }
+
+    /// Which record the app reads: chosen by what the payloads say, never by the order the
+    /// writers ran or finished in (#398 audit, seq 320/322/347: a slow command of theirs, a
+    /// pause between a check and a replace, and a writer paused before it took its number,
+    /// each put an older payload first or removed the newer).
+    #[test]
+    fn c6_an_older_claude_payload_never_replaces_a_newer_record() {
+        let root = scratch("claude-order");
+        let home = root.join("home");
+        let config = home.join(".claude");
+        let paths = paths_for(&root, &CLAUDE);
+        write_settings(&paths, &serde_json::json!({ "statusLine": running(&CLAUDE, "head -c 3") }));
+        install(&paths, &script_source_for(&CLAUDE)).unwrap();
+        let chosen = || -> Value {
+            let (path, _) = crate::local_usage::choose_claude_record(&paths.dir, &config, unix_now(), &|_| true).expect("a reading");
+            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap()["payload"].clone()
+        };
+        let count = || fs::read_dir(&paths.dir).unwrap()
+            .filter(|entry| crate::local_usage::claude_record_order(entry.as_ref().unwrap().file_name().to_str().unwrap()).is_some())
+            .count();
+        let (older, newer) = (claude_payload(40.0, 10.0), claude_payload(41.0, 12.0));
+
+        // Paused before it took its number: the older payload's writer runs after the newer one.
+        assert_eq!(run_script(&paths, &home, &bytes(&newer)).0, 0);
+        assert_eq!(run_script(&paths, &home, &bytes(&older)).0, 0);
+        assert_eq!(count(), 2, "the script removes neither");
+        assert_eq!(chosen(), newer, "the newer payload is read though the older holds the higher number");
+        assert_eq!(count(), 1, "the record it outranks is removed by the app");
+
+        // Paused after its number, before its input: the older one finishes last.
+        let mut slow = Command::new("sh").arg(paths.script()).env("HOME", &home)
+            .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let mut slow_in = slow.stdin.take().unwrap();
+        let waited = std::time::Instant::now();
+        while count() < 2 && waited.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let newest = claude_payload(42.0, 15.0);
+        assert_eq!(run_script(&paths, &home, &bytes(&newest)).0, 0);
+        slow_in.write_all(&bytes(&older)).unwrap();
+        drop(slow_in);
+        assert_eq!(slow.wait().unwrap().code(), Some(0));
+        assert_eq!(chosen(), newest, "the older payload, finishing last, neither leads nor removes the newer");
+
+        // A new week resets the share: a later reset outranks a higher share.
+        let next_week = {
+            let mut next = claude_payload(1.0, 1.0);
+            next["rate_limits"]["seven_day"]["resets_at"] = (unix_now() + 86_400 * 8).into();
+            next
+        };
+        assert_eq!(run_script(&paths, &home, &bytes(&next_week)).0, 0);
+        assert_eq!(chosen(), next_week);
+
+        // The clock and the process id play no part in the number: with a `date` that has no
+        // %N and stands still, and a record numbered far past any pid, the next number follows it.
+        let stub = root.join("bin");
+        fs::create_dir_all(&stub).unwrap();
+        fs::write(stub.join("date"), "#!/bin/sh\necho 1000\n").unwrap();
+        fs::set_permissions(stub.join("date"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", stub.display(), std::env::var("PATH").unwrap_or_default());
+        let high = 4_294_967_296_u64;
+        fs::write(paths.dir.join(format!("claude-statusline.{high}.json")), "{}").unwrap();
+        let mut child = Command::new("sh").arg(paths.script()).env("HOME", &home).env("PATH", &path)
+            .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(&bytes(&payload(T0))).unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(0));
+        assert_eq!(record(&paths), paths.dir.join(format!("claude-statusline.{}.json", high + 1)));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Payloads that arrive together each reserve a number of their own: a number already taken
+    /// moves the next writer on, so none is lost and none shares one (#398 audit r5).
+    #[test]
+    fn c6_claude_payloads_arriving_together_each_get_their_own_number() {
+        let root = scratch("claude-together");
+        let home = root.join("home");
+        let paths = paths_for(&root, &CLAUDE);
+        write_settings(&paths, &serde_json::json!({}));
+        install(&paths, &script_source_for(&CLAUDE)).unwrap();
+        let numbers = || -> Vec<u64> {
+            let mut found: Vec<u64> = fs::read_dir(&paths.dir).unwrap()
+                .filter_map(|entry| crate::local_usage::claude_record_order(entry.unwrap().file_name().to_str()?))
+                .collect();
+            found.sort_unstable();
+            found
+        };
+        let mut writers: Vec<_> = (0..8)
+            .map(|_| {
+                let mut child = Command::new("sh").arg(paths.script()).env("HOME", &home)
+                    .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+                let input = child.stdin.take().unwrap();
+                (child, input)
+            })
+            .collect();
+        let waited = std::time::Instant::now();
+        while numbers().len() < 8 && waited.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(numbers(), (0..8).collect::<Vec<u64>>(), "eight writers hold eight numbers");
+        for (child, mut input) in writers.drain(..) {
+            input.write_all(&bytes(&payload(T0))).unwrap();
+            drop(input);
+            assert_eq!(child.wait_with_output().unwrap().status.code(), Some(0));
+        }
+        assert_eq!(numbers(), (0..8).collect::<Vec<u64>>(), "every record is kept for the app to choose from");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A record's time is when its payload arrived, not when its input finished coming: one
+    /// held across a tick of the clock keeps the earlier time (#398 audit r6).
+    #[test]
+    fn c6_a_claude_record_is_timed_when_its_payload_arrives() {
+        let root = scratch("claude-arrival-time");
+        let home = root.join("home");
+        let paths = paths_for(&root, &CLAUDE);
+        write_settings(&paths, &serde_json::json!({}));
+        install(&paths, &script_source_for(&CLAUDE)).unwrap();
+        let stub = root.join("bin");
+        let clock = root.join("clock");
+        fs::create_dir_all(&stub).unwrap();
+        fs::write(&clock, "1000\n").unwrap();
+        fs::write(stub.join("date"), format!("#!/bin/sh\ncat '{}'\n", clock.display())).unwrap();
+        fs::set_permissions(stub.join("date"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", stub.display(), std::env::var("PATH").unwrap_or_default());
+        let mut child = Command::new("sh").arg(paths.script()).env("HOME", &home).env("PATH", &path)
+            .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let waited = std::time::Instant::now();
+        while crate::local_usage::newest_claude_record(&paths.dir).is_none() && waited.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(crate::local_usage::newest_claude_record(&paths.dir).is_some(), "premise: the number is reserved before the input is read");
+        fs::write(&clock, "2000\n").unwrap();
+        input.write_all(&bytes(&payload(T0))).unwrap();
+        drop(input);
+        assert_eq!(child.wait().unwrap().code(), Some(0));
+        let kept: Value = serde_json::from_slice(&fs::read(record(&paths)).unwrap()).unwrap();
+        assert_eq!(kept["at"], 1000, "the time the payload arrived, not when its input finished");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Nothing named like a record is followed: the prune and uninstall remove a link itself,
+    /// never what it points at, and a record is never written through one (#398 audit r4).
+    #[test]
+    fn c6_a_link_named_like_a_claude_record_is_never_followed() {
+        let root = scratch("claude-links");
+        let home = root.join("home");
+        let paths = paths_for(&root, &CLAUDE);
+        write_settings(&paths, &serde_json::json!({}));
+        install(&paths, &script_source_for(&CLAUDE)).unwrap();
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let theirs = outside.join("theirs.json");
+        fs::write(&theirs, "keep").unwrap();
+        let file_link = paths.dir.join("claude-statusline.1.json");
+        let dir_link = paths.dir.join("claude-statusline.2.json");
+        std::os::unix::fs::symlink(&theirs, &file_link).unwrap();
+        std::os::unix::fs::symlink(&outside, &dir_link).unwrap();
+        // A day old, all three: the script's clean-up takes regular files only.
+        let stale = paths.dir.join("claude-statusline.3.json");
+        fs::write(&stale, "{}").unwrap();
+        for old in [&stale, &file_link, &dir_link] {
+            assert!(Command::new("touch").args(["-h", "-t", "202001010000"]).arg(old).status().unwrap().success());
+        }
+
+        let (code, _) = run_script(&paths, &home, &bytes(&payload(T0)));
+        assert_eq!(code, 0);
+        assert!(record(&paths).starts_with(&paths.dir), "premise: a record was written");
+        assert_eq!(fs::read_to_string(&theirs).unwrap(), "keep", "the file a link pointed at is untouched");
+        let inside: Vec<_> = fs::read_dir(&outside).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(inside, vec![std::ffi::OsString::from("theirs.json")], "nothing was written into a linked folder");
+        assert!(!stale.exists(), "a day-old record is removed");
+        assert!(fs::symlink_metadata(&file_link).is_ok() && fs::symlink_metadata(&dir_link).is_ok(), "a link, however old, is not a record the script removes");
+
+        std::os::unix::fs::symlink(&theirs, paths.dir.join("claude-statusline.9999999999.json")).unwrap();
+        uninstall(&paths).unwrap();
+        assert_eq!(fs::read_to_string(&theirs).unwrap(), "keep", "uninstall removes the link, not its target");
+        assert!(!fs::read_dir(&paths.dir).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with("claude-statusline.")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn c6_a_config_dir_with_quotes_is_kept_as_valid_json() {
+        let root = scratch("cfg-quote");
+        let home = root.join("home");
+        let paths = paths_for(&root, &CLAUDE);
+        write_settings(&paths, &serde_json::json!({}));
+        install(&paths, &script_source_for(&CLAUDE)).unwrap();
+        let odd = r#"/tmp/a "b" \c"#;
+        let mut child = Command::new("sh")
+            .arg(paths.script())
+            .env("HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", odd)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .spawn()
             .unwrap();
-        alone.stdin.take().unwrap().write_all(&input).unwrap();
-        assert_eq!(String::from_utf8_lossy(&alone.wait_with_output().unwrap().stdout), drawn);
-
-        assert!(!wired(&paths), "premise: not wired before the install");
-        install(&paths, &script_source()).unwrap();
-        assert!(wired(&paths), "wired after the install");
-        let installed = settings(&paths);
-        assert!(is_ours(&installed["statusLine"]), "agy now runs the script");
-        assert_eq!(installed["statusLine"]["type"], "command");
-        assert_eq!(installed["statusLine"]["enabled"], true);
-        assert!(installed["statusLine"].get("stack_with_default").is_none(), "theirs draws, so no default line is stacked");
-        assert_eq!(installed["statusLine"]["padding"], 1);
-        assert_eq!(installed["theme"], "dark");
-        assert_eq!(installed["trustedWorkspaces"], serde_json::json!(["/a"]));
-
-        let (code, out) = run_script(&paths, &home, &input);
-        assert_eq!(code, 0);
-        assert_eq!(out, drawn, "their output is what agy draws");
-        assert_eq!(fs::read(paths.payload()).unwrap(), input, "the payload is kept whole");
-        assert_eq!(fs::metadata(paths.payload()).unwrap().permissions().mode() & 0o777, 0o600);
-
-        // A second install must not record our own command as theirs.
-        install(&paths, &script_source()).unwrap();
-        let (_, again) = run_script(&paths, &home, &input);
-        assert_eq!(again, drawn, "reinstall keeps their command chained");
-
-        uninstall(&paths).unwrap();
-        assert!(!wired(&paths), "not wired after the uninstall");
-        assert_eq!(settings(&paths), original, "uninstall puts their status line back");
-        for gone in [paths.payload(), paths.chain(), paths.previous(), paths.script()] {
-            assert!(!gone.exists(), "{} removed", gone.display());
-        }
+        child.stdin.take().unwrap().write_all(&bytes(&payload(T0))).unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(0));
+        let wrapper: Value = serde_json::from_slice(&fs::read(record(&paths)).unwrap()).unwrap();
+        assert_eq!(wrapper["configDir"], odd);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn c6_claude_without_a_status_line_of_its_own_gets_ours_alone_and_uninstall_removes_the_key() {
+        for original in [
+            serde_json::json!({ "theme": "dark" }),
+            serde_json::json!({ "statusLine": { "type": "static", "command": "echo not run" } }),
+        ] {
+            let root = scratch("claude-plain");
+            let home = root.join("home");
+            let paths = paths_for(&root, &CLAUDE);
+            write_settings(&paths, &original);
+            install(&paths, &script_source_for(&CLAUDE)).unwrap();
+            assert!(!paths.chain().exists(), "{original}: nothing to chain");
+            assert!(settings(&paths)["statusLine"].get("stack_with_default").is_none(), "agy's key never reaches Claude Code");
+            assert!(settings(&paths)["statusLine"].get("enabled").is_none());
+            let (code, out) = run_script(&paths, &home, b"{}");
+            assert_eq!((code, out.as_str()), (0, ""), "{original}");
+            uninstall(&paths).unwrap();
+            assert_eq!(settings(&paths), original, "uninstall restores exactly, an absent key included");
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
@@ -1108,50 +1535,72 @@ mod tests {
 
     #[test]
     fn c6_our_own_command_is_never_chained() {
-        let root = scratch("self");
-        let paths = paths(&root);
-        write_settings(&paths, &serde_json::json!({ "statusLine": { "type": "command", "enabled": true,
-            "command": "sh '/elsewhere/gyredeck-agy-statusline.sh'" } }));
-        install(&paths, &script_source()).unwrap();
-        assert!(!paths.chain().exists(), "our own command is never chained");
-        let ours_running = serde_json::json!({ "enabled": true, "command": "sh '/x/gyredeck-agy-statusline.sh'" });
-        assert_eq!(running_command(Some(&serde_json::json!({ "enabled": true, "command": "echo hi" }))).as_deref(), Some("echo hi"), "premise");
-        assert_eq!(running_command(Some(&ours_running)), None, "ours is never a command to chain");
-        let _ = fs::remove_dir_all(&root);
+        for spec in [&AGY, &CLAUDE] {
+            let root = scratch(&format!("self-{}", spec.payload_file));
+            let paths = paths_for(&root, spec);
+            let elsewhere = format!("sh '/elsewhere/{}'", spec.script_name);
+            write_settings(&paths, &serde_json::json!({ "statusLine": running(spec, &elsewhere) }));
+            install(&paths, &script_source_for(spec)).unwrap();
+            assert!(!paths.chain().exists(), "{}: our own command is never chained", spec.script_name);
+            let ours_running = running(spec, &format!("sh '/x/{}'", spec.script_name));
+            assert_eq!(running_command(spec, Some(&running(spec, "echo hi"))).as_deref(), Some("echo hi"), "premise");
+            assert_eq!(running_command(spec, Some(&ours_running)), None, "ours is never a command to chain");
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
     fn c6_a_status_line_set_after_install_is_left_alone_by_uninstall() {
-        let root = scratch("theirs-later");
-        let paths = paths(&root);
-        install(&paths, &script_source()).unwrap();
-        let mut current = settings(&paths);
-        current["statusLine"]["command"] = Value::String("echo new".into());
-        fs::write(&paths.settings, current.to_string()).unwrap();
-        assert!(paths.script().is_file(), "premise: the script is still in place");
-        assert!(!wired(&paths), "a status line of theirs is not ours wired");
-        uninstall(&paths).unwrap();
-        assert_eq!(settings(&paths), current);
-        let _ = fs::remove_dir_all(&root);
+        for spec in [&AGY, &CLAUDE] {
+            let root = scratch(&format!("theirs-later-{}", spec.payload_file));
+            let paths = paths_for(&root, spec);
+            install(&paths, &script_source_for(spec)).unwrap();
+            let mut current = settings(&paths);
+            current["statusLine"]["command"] = Value::String("echo new".into());
+            fs::write(&paths.settings, current.to_string()).unwrap();
+            assert!(paths.script().is_file(), "premise: the script is still in place");
+            assert!(!wired(&paths), "a status line of theirs is not ours wired");
+            uninstall(&paths).unwrap();
+            assert_eq!(settings(&paths), current, "{}", spec.script_name);
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 
     // C8 -------------------------------------------------------------------------------
 
     #[test]
     fn c8_installing_over_a_symlinked_script_leaves_its_target_alone() {
-        let root = scratch("script-link");
-        let paths = paths(&root);
-        fs::create_dir_all(&paths.dir).unwrap();
-        let victim = root.join("victim.txt");
-        fs::write(&victim, b"keep me").unwrap();
-        std::os::unix::fs::symlink(&victim, paths.script()).unwrap();
-        assert!(fs::symlink_metadata(paths.script()).unwrap().file_type().is_symlink(), "premise: a link");
+        for spec in [&AGY, &CLAUDE] {
+            let root = scratch(&format!("script-link-{}", spec.payload_file));
+            let paths = paths_for(&root, spec);
+            fs::create_dir_all(&paths.dir).unwrap();
+            let victim = root.join("victim.txt");
+            fs::write(&victim, b"keep me").unwrap();
+            std::os::unix::fs::symlink(&victim, paths.script()).unwrap();
+            assert!(fs::symlink_metadata(paths.script()).unwrap().file_type().is_symlink(), "premise: a link");
 
-        install(&paths, &script_source()).unwrap();
-        assert_eq!(fs::read(&victim).unwrap(), b"keep me", "the link's target is byte-identical");
-        assert!(fs::symlink_metadata(paths.script()).unwrap().file_type().is_file(), "the link was replaced");
-        assert_eq!(fs::read(paths.script()).unwrap(), fs::read(script_source()).unwrap());
-        let _ = fs::remove_dir_all(&root);
+            install(&paths, &script_source_for(spec)).unwrap();
+            assert_eq!(fs::read(&victim).unwrap(), b"keep me", "the link's target is byte-identical");
+            assert!(fs::symlink_metadata(paths.script()).unwrap().file_type().is_file(), "the link was replaced");
+            assert_eq!(fs::read(paths.script()).unwrap(), fs::read(script_source_for(spec)).unwrap());
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn c8_a_linked_settings_file_is_refused_for_both_agents() {
+        for spec in [&AGY, &CLAUDE] {
+            let root = scratch(&format!("settings-link-{}", spec.payload_file));
+            let paths = paths_for(&root, spec);
+            let target = root.join("target.json");
+            fs::write(&target, b"{\"theirs\":1}").unwrap();
+            fs::create_dir_all(paths.settings.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&target, &paths.settings).unwrap();
+            assert!(install(&paths, &script_source_for(spec)).is_err(), "{}: refused", spec.script_name);
+            assert_eq!(fs::read(&target).unwrap(), b"{\"theirs\":1}", "the target is untouched");
+            assert!(!paths.script().exists(), "nothing written");
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
@@ -1202,25 +1651,29 @@ mod tests {
     #[test]
     fn c9_a_switched_off_or_unsupported_status_line_is_not_wired_and_install_repairs_it() {
         type Mutation = fn(&mut Value);
-        let cases: [(&str, Mutation); 3] = [
-            ("switched off", |s| s["statusLine"]["enabled"] = Value::Bool(false)),
-            ("type not command", |s| s["statusLine"]["type"] = Value::String(String::new())),
-            ("enabled missing", |s| { s["statusLine"].as_object_mut().unwrap().remove("enabled"); }),
+        let cases: [(&StatusLineSpec, &str, Mutation); 4] = [
+            (&AGY, "switched off", |s| s["statusLine"]["enabled"] = Value::Bool(false)),
+            (&AGY, "type not command", |s| s["statusLine"]["type"] = Value::String(String::new())),
+            (&AGY, "enabled missing", |s| { s["statusLine"].as_object_mut().unwrap().remove("enabled"); }),
+            (&CLAUDE, "claude: type not command", |s| s["statusLine"]["type"] = Value::String("static".into())),
         ];
-        for (name, mutate) in cases {
+        for (spec, name, mutate) in cases {
+            let spec: &'static StatusLineSpec = if spec.has_enabled { &AGY } else { &CLAUDE };
             let root = scratch("wired");
-            let paths = paths(&root);
-            install(&paths, &script_source()).unwrap();
+            let paths = paths_for(&root, spec);
+            install(&paths, &script_source_for(spec)).unwrap();
             assert!(wired(&paths), "{name}: premise, wired after install");
             let mut current = settings(&paths);
             mutate(&mut current);
             fs::write(&paths.settings, current.to_string()).unwrap();
             assert!(!wired(&paths), "{name}: not wired");
 
-            install(&paths, &script_source()).unwrap();
+            install(&paths, &script_source_for(spec)).unwrap();
             let repaired = settings(&paths);
             assert_eq!(repaired["statusLine"]["type"], "command", "{name}");
-            assert_eq!(repaired["statusLine"]["enabled"], true, "{name}");
+            if spec.has_enabled {
+                assert_eq!(repaired["statusLine"]["enabled"], true, "{name}");
+            }
             assert!(wired(&paths), "{name}: install repairs it");
             let _ = fs::remove_dir_all(&root);
         }
@@ -1322,16 +1775,18 @@ mod tests {
             ("statusLine a boolean", b"{ \"statusLine\": true }"),
             ("statusLine a string", b"{ \"statusLine\": \"sh x\" }"),
         ];
-        for (name, content) in cases {
-            let root = scratch("refuse-install");
-            let paths = paths(&root);
-            fs::create_dir_all(paths.settings.parent().unwrap()).unwrap();
-            fs::write(&paths.settings, content).unwrap();
-            assert!(preflight(&paths).is_err(), "{name}: the preflight refuses");
-            assert!(install(&paths, &script_source()).is_err(), "{name}: install refuses");
-            assert!(!paths.script().exists(), "{name}: a refusal leaves nothing behind");
-            assert_eq!(fs::read(&paths.settings).unwrap(), content, "{name}");
-            let _ = fs::remove_dir_all(&root);
+        for spec in [&AGY, &CLAUDE] {
+            for (name, content) in cases {
+                let root = scratch("refuse-install");
+                let paths = paths_for(&root, spec);
+                fs::create_dir_all(paths.settings.parent().unwrap()).unwrap();
+                fs::write(&paths.settings, content).unwrap();
+                assert!(preflight(&paths).is_err(), "{name}: the preflight refuses");
+                assert!(install(&paths, &script_source_for(spec)).is_err(), "{name}: install refuses");
+                assert!(!paths.script().exists(), "{name}: a refusal leaves nothing behind");
+                assert_eq!(fs::read(&paths.settings).unwrap(), content, "{name}");
+                let _ = fs::remove_dir_all(&root);
+            }
         }
     }
 

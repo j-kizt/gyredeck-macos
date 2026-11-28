@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
     sync::{mpsc, Mutex, OnceLock},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use base64::{
@@ -33,6 +33,7 @@ mod github;
 mod heavy_watch;
 mod keep_awake;
 mod local_services;
+mod local_usage;
 mod notification;
 mod session_store;
 mod sleep_wake;
@@ -196,7 +197,27 @@ struct CodexUsageSnapshot {
     plan: Option<String>,
     lines: Vec<CodexMetricLine>,
     fetched_at: String,
+    source: UsageSource,
 }
+
+/// Where a reading came from (#398): the provider's API, the agent's status line, or the
+/// agent's own session log. `fetched_at` is always when that source recorded it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum UsageSource {
+    Api,
+    #[serde(rename = "statusline")]
+    StatusLine,
+    Log,
+}
+
+/// The labels and periods of the two windows every source reports. The bridge compares a
+/// reading with the last one by label (D66), so the local readers use these too (#398).
+const SESSION_LABEL: &str = "Session";
+const WEEKLY_LABEL: &str = "Weekly";
+const SESSION_PERIOD_MS: u64 = 5 * 60 * 60 * 1000;
+const WEEKLY_PERIOD_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+const CODEX_LIMIT_LABELS: (&str, &str) = (SESSION_LABEL, WEEKLY_LABEL);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -672,7 +693,7 @@ fn apply_agy_sync_reply_rules(
 }
 
 fn agy_settings_path() -> Result<PathBuf, String> {
-    Ok(agy_statusline::AgyStatusLinePaths::from_home()?.settings)
+    Ok(agy_statusline::AgyStatusLinePaths::agy_from_home()?.settings)
 }
 
 fn write_agy_sync_reply_rules_at(path: &Path, enabled: bool, port: u16) -> Result<(), String> {
@@ -1501,26 +1522,143 @@ fn app_file_save(
 /// Hands each usage reading to the bridge, so agents in a room can be told when their own
 /// limit runs low and can ask for it (#158). Best effort: a bridge that is down misses one
 /// reading, and the next refresh carries it.
-fn relay_usage(snapshot: &CodexUsageSnapshot) {
-    if let Ok(body) = serde_json::to_string(snapshot) {
+fn relay_usage(snapshot: &CodexUsageSnapshot, account: Option<&str>) {
+    if let Ok(body) = serde_json::to_string(&relay_body(
+        snapshot,
+        account,
+        local_usage::settings().refresh,
+    )) {
         let _ = standalone_bridge::bridge_request("POST", "/usage", Some(body));
     }
 }
 
+/// The snapshot, plus what only the bridge needs: whose reading it is (a short tag, never
+/// the id) and the interval it was taken at, which bounds when the bridge calls it stale.
+fn relay_body(snapshot: &CodexUsageSnapshot, account: Option<&str>, refresh: Duration) -> Value {
+    let mut body = serde_json::to_value(snapshot).unwrap_or(Value::Null);
+    if let Some(object) = body.as_object_mut() {
+        if let Some(account) = account {
+            object.insert("account".to_string(), Value::String(account.to_string()));
+        }
+        object.insert("refreshMs".to_string(), Value::from(refresh.as_millis() as u64));
+    }
+    body
+}
+
+/// The interval and display mode the panel uses; the chooser and the bridge read them
+/// from here (#398).
+#[tauri::command]
+fn usage_settings_set(refresh_ms: Value, usage_mode: Value) {
+    local_usage::set_settings(local_usage::settings_from(&refresh_ms, &usage_mode));
+}
+
 #[tauri::command]
 async fn codex_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        codex_usage_blocking().map(|reading| relay_if_fresh(reading, relay_usage))
+    tauri::async_runtime::spawn_blocking(|| codex_refresh().map(|(snapshot, _)| snapshot))
+        .await
+        .map_err(|error| format!("Codex usage task failed: {error}"))?
+}
+
+/// The last reading each provider's refresh answered, for `/usage` to show — marked as not
+/// current — when a later refresh fails (#396).
+static LAST_USAGE: OnceLock<Mutex<HashMap<&'static str, CodexUsageSnapshot>>> = OnceLock::new();
+
+/// Claude's usage endpoint answers 429 when asked faster than about every 3 minutes
+/// (features/usage/settings.ts), and a 429 holds back the next refresh too. `/usage` asks
+/// off the panel's schedule, so an account answered less than this long ago, by the wall
+/// clock (it runs on through sleep), is answered from that reading instead of being asked
+/// again, whichever path asks (#396 audit M2, round 2 M1 and S1).
+const CLAUDE_MIN_ASK_GAP: Duration = Duration::from_secs(180);
+static CLAUDE_ANSWERED_AT: OnceLock<Mutex<HashMap<String, SystemTime>>> = OnceLock::new();
+
+fn claude_answered_within(fingerprint: &str, gap: Duration, now: SystemTime) -> bool {
+    CLAUDE_ANSWERED_AT
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(fingerprint).copied())
+        .and_then(|at| now.duration_since(at).ok())
+        .is_some_and(|since| since < gap)
+}
+
+fn note_claude_answered(fingerprint: String, now: SystemTime) {
+    if let Ok(mut guard) = CLAUDE_ANSWERED_AT.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        guard.insert(fingerprint, now);
+    }
+}
+
+/// Whether a snapshot carries any numbers, rather than a status line alone.
+pub(crate) fn has_usage_numbers(snapshot: &CodexUsageSnapshot) -> bool {
+    snapshot.lines.iter().any(|line| matches!(line, CodexMetricLine::Progress { .. }))
+}
+
+fn last_usage(provider: &str) -> Option<CodexUsageSnapshot> {
+    LAST_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock().ok().and_then(|guard| guard.get(provider).cloned())
+}
+
+/// One provider's refresh as the panel and `/usage` both take it (#396): the snapshot and
+/// whether it was read just now, remembered as that provider's last reading.
+fn remember_usage(provider: &'static str, refreshed: Result<(CodexUsageSnapshot, bool), String>) -> Result<(CodexUsageSnapshot, bool), String> {
+    if let Ok((snapshot, _)) = &refreshed {
+        // A placeholder with no numbers is never kept as a last reading (#396 audit S6).
+        if has_usage_numbers(snapshot) {
+            if let Ok(mut guard) = LAST_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+                guard.insert(provider, snapshot.clone());
+            }
+        }
+    }
+    refreshed
+}
+
+/// Every provider refreshed now, in parallel, each with its last reading when the refresh
+/// failed (#396). The same refreshes the panel runs, relayed the same way.
+fn refresh_all_usage() -> Vec<discord::UsageRefresh> {
+    refresh_usage_from(&[("claude", "Claude Code", claude_refresh_on_demand), ("codex", "Codex", codex_refresh), ("agy", "Antigravity", agy_refresh)])
+}
+
+type UsageRun = (&'static str, &'static str, fn() -> Result<(CodexUsageSnapshot, bool), String>);
+
+fn refresh_usage_from(runs: &[UsageRun]) -> Vec<discord::UsageRefresh> {
+    let handles: Vec<_> = runs.iter().map(|&(id, display, run)| (id, display, std::thread::spawn(run))).collect();
+    handles
+        .into_iter()
+        .map(|(id, display, handle)| {
+            let refreshed = handle.join().unwrap_or_else(|_| Err(format!("{display} usage task failed")));
+            let answered_now = matches!(&refreshed, Ok((snapshot, fresh)) if *fresh || has_usage_numbers(snapshot));
+            let last = if answered_now { None } else { last_usage(id) };
+            discord::UsageRefresh { display: display.to_string(), refreshed, last }
+        })
+        .collect()
+}
+
+fn codex_refresh() -> Result<(CodexUsageSnapshot, bool), String> {
+    remember_usage("codex", {
+        let auth_candidates = load_codex_auth_candidates()?;
+        let account_id = auth_candidates.first().and_then(|auth_state| {
+            auth_state.auth.tokens.as_ref().and_then(|tokens| tokens.account_id.clone())
+        });
+        let base = auth_candidates.first().and_then(read_codex_last_good);
+        let account = account_id.clone();
+        let local = move |_: &CodexUsageSnapshot, now| {
+            let home = codex_home().ok()?;
+            local_usage::codex_local(&home, account.as_deref(), now)
+        };
+        local_usage::choose(
+            local,
+            base,
+            auth_candidates.first().and_then(codex_reading_tag),
+            local_usage::settings().refresh,
+            agy_statusline::unix_now,
+            || codex_usage_blocking(auth_candidates),
+        )
+        .map(|reading| relay_if_fresh(reading, relay_usage))
     })
-    .await
-    .map_err(|error| format!("Codex usage task failed: {error}"))?
 }
 
 /// Gyredeck only reads the CLI's login and never renews it: a refresh token is single-use,
 /// so one spent here logs out the `codex` that still holds it (#361). An expired login answers
 /// with the last good reading, marked, until the CLI writes a new one.
-fn codex_usage_blocking() -> Result<UsageReading, String> {
-    let auth_candidates = load_codex_auth_candidates()?;
+fn codex_usage_blocking(auth_candidates: Vec<CodexAuthState>) -> Result<UsageReading, String> {
     let client = usage_client("Codex")?;
 
     let mut expired = None;
@@ -1550,7 +1688,7 @@ fn codex_usage_blocking() -> Result<UsageReading, String> {
     }
 
     match expired {
-        Some(auth_state) => expired_login_reading(read_codex_last_good(&auth_state), "Codex", "codex"),
+        Some(auth_state) => expired_login_reading(read_codex_last_good(&auth_state), codex_reading_tag(&auth_state), "Codex", "codex"),
         None => Err("Codex session expired. Run `codex` to log in again.".to_string()),
     }
 }
@@ -1559,7 +1697,23 @@ fn fresh_codex_reading(auth_state: &CodexAuthState, snapshot: CodexUsageSnapshot
     if let Ok(mut guard) = CODEX_LAST_GOOD_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
         guard.insert(codex_auth_fingerprint(auth_state), snapshot.clone());
     }
-    UsageReading { snapshot, fresh: true }
+    UsageReading { snapshot, fresh: true, account: codex_reading_tag(auth_state) }
+}
+
+/// Whose a reading is (#398). Every reading carries the tag of the login that answered,
+/// kept ones too: with several logins, the answer can come from a later one than the
+/// login the local reading was matched to.
+fn codex_reading_tag(auth_state: &CodexAuthState) -> Option<String> {
+    auth_state
+        .auth
+        .tokens
+        .as_ref()
+        .and_then(|tokens| tokens.account_id.as_deref())
+        .map(local_usage::account_tag)
+}
+
+fn claude_reading_tag(auth: &ClaudeAuthState) -> Option<String> {
+    Some(local_usage::account_tag(&claude_auth_fingerprint(auth)))
 }
 
 fn read_codex_last_good(auth_state: &CodexAuthState) -> Option<CodexUsageSnapshot> {
@@ -1573,6 +1727,7 @@ fn read_codex_last_good(auth_state: &CodexAuthState) -> Option<CodexUsageSnapsho
 /// The last good reading, marked as kept and never relayed, or an error when there is none.
 fn expired_login_reading(
     kept: Option<CodexUsageSnapshot>,
+    account: Option<String>,
     name: &str,
     cli: &str,
 ) -> Result<UsageReading, String> {
@@ -1583,7 +1738,7 @@ fn expired_login_reading(
         label: "Status".to_string(),
         value: format!("Login expired; showing last good values. Run `{cli}` to renew it."),
     });
-    Ok(UsageReading { snapshot, fresh: false })
+    Ok(UsageReading { snapshot, fresh: false, account })
 }
 
 fn fetch_codex_usage_snapshot(
@@ -1611,24 +1766,29 @@ fn format_codex_usage_error(error: CodexUsageFetchError) -> String {
 
 #[tauri::command]
 async fn agy_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let status = agy_statusline::AgyStatusLinePaths::from_home()
-            .ok()
-            .and_then(|paths| agy_statusline::read_reading(&paths.payload(), agy_statusline::unix_now()));
+    tauri::async_runtime::spawn_blocking(|| agy_refresh().map(|(snapshot, _)| snapshot))
+        .await
+        .map_err(|error| format!("Antigravity usage task failed: {error}"))?
+}
+
+fn agy_refresh() -> Result<(CodexUsageSnapshot, bool), String> {
+    remember_usage("agy", (|| {
+        let stale_after = local_usage::settings().refresh;
+        let status = agy_statusline::AgyStatusLinePaths::agy_from_home().ok().and_then(|paths| {
+            agy_statusline::read_reading(&paths.payload(), agy_statusline::unix_now(), stale_after)
+        });
         // The status line comes first: the fallback reads agy's token from the Keychain (#230).
         match agy_statusline::choose_usage(status, agy_usage_fallback)? {
             agy_statusline::AgyUsage::StatusLine(reading) => {
-                agy_statusline::relay_if_fresh(&reading, relay_usage);
-                Ok(reading.snapshot)
+                agy_statusline::relay_if_fresh(&reading, |snapshot| relay_usage(snapshot, None));
+                Ok((reading.snapshot, !reading.stale))
             }
             agy_statusline::AgyUsage::Fallback(snapshot) => {
-                relay_usage(&snapshot);
-                Ok(snapshot)
+                relay_usage(&snapshot, None);
+                Ok((snapshot, true))
             }
         }
-    })
-    .await
-    .map_err(|error| format!("Antigravity usage task failed: {error}"))?
+    })())
 }
 
 /// The language server and the cloud path, both of which need agy's credentials. Reached
@@ -1668,14 +1828,46 @@ fn agy_usage_fallback() -> Result<CodexUsageSnapshot, String> {
 
 #[tauri::command]
 async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        claude_usage_blocking().map(|mut reading| {
-            append_claude_local_usage(&mut reading.snapshot);
+    tauri::async_runtime::spawn_blocking(|| claude_refresh().map(|(snapshot, _)| snapshot))
+        .await
+        .map_err(|error| format!("Claude usage task failed: {error}"))?
+}
+
+fn claude_refresh() -> Result<(CodexUsageSnapshot, bool), String> {
+    claude_refresh_with(true)
+}
+
+/// Claude for `/usage`: the history it would wait on is never shown, so it is not read
+/// (#396 audit S3).
+fn claude_refresh_on_demand() -> Result<(CodexUsageSnapshot, bool), String> {
+    claude_refresh_with(false)
+}
+
+fn claude_refresh_with(history: bool) -> Result<(CodexUsageSnapshot, bool), String> {
+    remember_usage("claude", {
+        let candidates = load_claude_auth_candidates();
+        let first = candidates.iter().find(|auth| claude_can_fetch_live_usage(auth));
+        let base = first.and_then(read_claude_last_good);
+        let account = first.and_then(claude_reading_tag);
+        let local = |reference: &CodexUsageSnapshot, now| {
+            let paths = agy_statusline::StatusLinePaths::claude_from_home().ok()?;
+            local_usage::claude_local_latest(&paths.dir, &claude_config_dir()?, Some(reference), now)
+        };
+        local_usage::choose(
+            local,
+            base,
+            account,
+            local_usage::settings().refresh,
+            agy_statusline::unix_now,
+            || claude_usage_blocking(candidates),
+        )
+        .map(|mut reading| {
+            if history {
+                append_claude_local_usage(&mut reading.snapshot);
+            }
             relay_if_fresh(reading, relay_usage)
         })
     })
-    .await
-    .map_err(|error| format!("Claude usage task failed: {error}"))?
 }
 
 /// A usage answer, and whether it was read just now or kept: from before a 429, or from
@@ -1683,6 +1875,8 @@ async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
 struct UsageReading {
     snapshot: CodexUsageSnapshot,
     fresh: bool,
+    /// Whose reading it is, as a short tag the bridge keys its comparison on (#398).
+    account: Option<String>,
 }
 
 /// A reading kept from before a 429 is not news. Relayed, it reached the bridge as a fresh
@@ -1690,12 +1884,12 @@ struct UsageReading {
 /// never announced (#192).
 fn relay_if_fresh(
     reading: UsageReading,
-    relay: impl FnOnce(&CodexUsageSnapshot),
-) -> CodexUsageSnapshot {
+    relay: impl FnOnce(&CodexUsageSnapshot, Option<&str>),
+) -> (CodexUsageSnapshot, bool) {
     if reading.fresh {
-        relay(&reading.snapshot);
+        relay(&reading.snapshot, reading.account.as_deref());
     }
-    reading.snapshot
+    (reading.snapshot, reading.fresh)
 }
 
 /// Seconds left before this account may be asked again, if it was told to wait.
@@ -1730,11 +1924,11 @@ fn claude_rate_limited_reading(
     UsageReading {
         snapshot: claude_rate_limited_snapshot(auth, Some(wait)),
         fresh: false,
+        account: claude_reading_tag(auth),
     }
 }
 
-fn claude_usage_blocking() -> Result<UsageReading, String> {
-    let candidates = load_claude_auth_candidates();
+fn claude_usage_blocking(candidates: Vec<ClaudeAuthState>) -> Result<UsageReading, String> {
     if candidates.is_empty() {
         return Err("Claude Code auth not found. Run `claude` to log in.".to_string());
     }
@@ -1758,9 +1952,13 @@ fn claude_usage_blocking() -> Result<UsageReading, String> {
                 return Ok(UsageReading {
                     snapshot: claude_rate_limited_snapshot(&auth, Some(wait)),
                     fresh: false,
+                    account: claude_reading_tag(&auth),
                 });
             }
             ClaudeGate::Ask => {}
+        }
+        if let Some(reading) = claude_recent_answer(&auth, SystemTime::now()) {
+            return Ok(reading);
         }
 
         match fetch_claude_usage(&client, &auth) {
@@ -1792,7 +1990,7 @@ fn claude_usage_blocking() -> Result<UsageReading, String> {
     }
 
     if let Some(auth) = expired {
-        return expired_login_reading(read_claude_last_good(&auth), "Claude Code", "claude");
+        return expired_login_reading(read_claude_last_good(&auth), claude_reading_tag(&auth), "Claude Code", "claude");
     }
     Err(last_error.unwrap_or_else(|| {
         "Claude Code usage unavailable. Run `claude` to log in again.".to_string()
@@ -1820,10 +2018,19 @@ fn claude_gate(auth: &ClaudeAuthState, now: Instant) -> ClaudeGate {
     }
 }
 
+fn claude_recent_answer(auth: &ClaudeAuthState, now: SystemTime) -> Option<UsageReading> {
+    if !claude_answered_within(&claude_auth_fingerprint(auth), CLAUDE_MIN_ASK_GAP, now) {
+        return None;
+    }
+    read_claude_last_good(auth).map(|snapshot| UsageReading { snapshot, fresh: true, account: claude_reading_tag(auth) })
+}
+
 fn fresh_claude_reading(auth: &ClaudeAuthState, usage: Value) -> UsageReading {
+    note_claude_answered(claude_auth_fingerprint(auth), SystemTime::now());
     UsageReading {
         snapshot: store_claude_last_good(auth, build_claude_usage_snapshot(usage, auth)),
         fresh: true,
+        account: claude_reading_tag(auth),
     }
 }
 
@@ -2175,7 +2382,7 @@ fn build_codex_usage_snapshot(
             read_percent_header(headers, "x-codex-primary-used-percent"),
             read_percent_header(headers, "x-codex-secondary-used-percent"),
         ),
-        ("Session", "Weekly"),
+        CODEX_LIMIT_LABELS,
     ));
     if let Some(additional_limits) = usage.additional_rate_limits.as_ref() {
         if let Some(entry) = additional_limits
@@ -2217,6 +2424,7 @@ fn build_codex_usage_snapshot(
                 plan: usage.plan_type.and_then(format_codex_plan),
                 lines,
                 fetched_at: now_iso(),
+                source: UsageSource::Api,
             };
         };
         let credits = balance.max(0.0).floor() as i64;
@@ -2236,6 +2444,7 @@ fn build_codex_usage_snapshot(
         plan: usage.plan_type.and_then(format_codex_plan),
         lines,
         fetched_at: now_iso(),
+        source: UsageSource::Api,
     }
 }
 
@@ -3133,8 +3342,8 @@ fn codex_classified_window_lines(
     }
 
     [
-        (CodexWindowKind::Session, labels.0, 5 * 60 * 60 * 1000),
-        (CodexWindowKind::Weekly, labels.1, 7 * 24 * 60 * 60 * 1000),
+        (CodexWindowKind::Session, labels.0, SESSION_PERIOD_MS),
+        (CodexWindowKind::Weekly, labels.1, WEEKLY_PERIOD_MS),
     ]
     .into_iter()
     .filter_map(|(kind, label, fallback_duration_ms)| {
@@ -3567,6 +3776,13 @@ fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     bytes.as_ref().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// The config dir whose login the app reads, as Claude Code names it.
+fn claude_config_dir() -> Option<PathBuf> {
+    env_text("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(CLAUDE_DEFAULT_HOME)))
+}
+
 fn claude_credentials_path() -> Option<PathBuf> {
     if let Some(config_dir) = env_text("CLAUDE_CONFIG_DIR") {
         return Some(PathBuf::from(config_dir).join(CLAUDE_CREDENTIALS_FILE));
@@ -3789,8 +4005,8 @@ fn claude_auth_fingerprint(auth: &ClaudeAuthState) -> String {
 fn build_claude_usage_snapshot(usage: Value, auth: &ClaudeAuthState) -> CodexUsageSnapshot {
     let mut lines = Vec::new();
     for (key, label, period) in [
-        ("five_hour", "Session", Some(5 * 60 * 60 * 1000)),
-        ("seven_day", "Weekly", Some(7 * 24 * 60 * 60 * 1000)),
+        ("five_hour", SESSION_LABEL, Some(SESSION_PERIOD_MS)),
+        ("seven_day", WEEKLY_LABEL, Some(WEEKLY_PERIOD_MS)),
         (
             "seven_day_opus",
             "Opus weekly",
@@ -3840,6 +4056,7 @@ fn build_claude_usage_snapshot(usage: Value, auth: &ClaudeAuthState) -> CodexUsa
         plan: claude_plan_label(auth),
         lines,
         fetched_at: now_iso(),
+        source: UsageSource::Api,
     }
 }
 
@@ -3908,6 +4125,7 @@ fn build_claude_status_snapshot(auth: &ClaudeAuthState, message: String) -> Code
             value: message,
         }],
         fetched_at: now_iso(),
+        source: UsageSource::Api,
     }
 }
 
@@ -4102,6 +4320,7 @@ fn fetch_antigravity_cloud_snapshot(
         plan,
         lines,
         fetched_at: now_iso(),
+        source: UsageSource::Api,
     }))
 }
 
@@ -4400,6 +4619,7 @@ fn fetch_antigravity_ls_snapshot(
         plan,
         lines,
         fetched_at: now_iso(),
+        source: UsageSource::Api,
     })
 }
 
@@ -4421,6 +4641,7 @@ fn fetch_antigravity_quota_summary_snapshot(
         plan,
         lines,
         fetched_at: now_iso(),
+        source: UsageSource::Api,
     })
 }
 
@@ -4664,13 +4885,40 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
             tauri::path::BaseDirectory::Resource,
         )
         .map_err(|e| format!("Failed to resolve resource: {e}"))?;
+    let statusline_resource = app
+        .path()
+        .resolve(agy_statusline::CLAUDE.script_name, tauri::path::BaseDirectory::Resource)
+        .map_err(|e| format!("Failed to resolve resource: {e}"))?;
+    let statusline_paths = agy_statusline::StatusLinePaths::claude_from_home()?;
+    // Usage is read from Claude Code's status line before its API (#398), through the same
+    // installer as agy's, so a refusal there leaves nothing half-written here either.
+    agy_statusline::preflight(&statusline_paths)?;
+    let touched = [
+        install_path.clone(),
+        settings_path.clone(),
+        statusline_paths.script(),
+        statusline_paths.chain(),
+        statusline_paths.previous(),
+    ];
+    agy_statusline::with_rollback(&touched, || {
+        let installed_path =
+            install_claude_hook_files(&resource_path, &install_path, &settings_path)?;
+        agy_statusline::install(&statusline_paths, &statusline_resource)?;
+        Ok(installed_path)
+    })
+}
 
+fn install_claude_hook_files(
+    resource_path: &Path,
+    install_path: &Path,
+    settings_path: &Path,
+) -> Result<String, String> {
     let Some(parent) = install_path.parent() else {
         return Err("Failed to resolve config directory".to_string());
     };
     fs::create_dir_all(parent)
         .map_err(|error| format!("Failed to create config directory: {error}"))?;
-    agy_statusline::copy_atomically(&resource_path, &install_path, 0o644)
+    agy_statusline::copy_atomically(resource_path, install_path, 0o644)
         .map_err(|error| format!("Failed to copy hook script: {error}"))?;
 
     let installed_path = install_path.to_string_lossy().to_string();
@@ -4758,7 +5006,7 @@ fn install_claude_hook(app: tauri::AppHandle) -> Result<String, String> {
 
     let json_string = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("Failed to stringify settings.json: {e}"))?;
-    fs::write(&settings_path, format!("{json_string}\n"))
+    fs::write(settings_path, format!("{json_string}\n"))
         .map_err(|error| format!("Failed to write settings.json: {error}"))?;
 
     Ok(installed_path)
@@ -4824,12 +5072,31 @@ fn claude_hook_status(app: tauri::AppHandle) -> Result<(String, bool, Option<boo
     let (installed_path, installed) = claude_hook_state()?;
     // Stale only matters once it is installed: an absent adapter is already reported as
     // missing, and calling it out of date as well says the same thing twice.
+    // The status line is part of the install since #398, the way agy's is since #230.
     let stale = if installed {
-        hook_is_stale(&app, "gyredeck-claude-hook.mjs", Path::new(&installed_path))
+        let statusline = agy_statusline::StatusLinePaths::claude_from_home()?;
+        combine_stale([
+            hook_is_stale(&app, "gyredeck-claude-hook.mjs", Path::new(&installed_path)),
+            if agy_statusline::wired(&statusline) {
+                hook_is_stale(&app, agy_statusline::CLAUDE.script_name, &statusline.script())
+            } else {
+                Some(true)
+            },
+        ])
     } else {
         Some(false)
     };
     Ok((installed_path, installed, stale))
+}
+
+fn combine_stale(parts: [Option<bool>; 2]) -> Option<bool> {
+    if parts.contains(&Some(true)) {
+        Some(true)
+    } else if parts.contains(&None) {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 
@@ -4849,7 +5116,7 @@ fn install_agy_hook(app: tauri::AppHandle) -> Result<String, String> {
         .path()
         .resolve(agy_statusline::SCRIPT_NAME, tauri::path::BaseDirectory::Resource)
         .map_err(|e| format!("Failed to resolve resource: {e}"))?;
-    let statusline_paths = agy_statusline::AgyStatusLinePaths::from_home()?;
+    let statusline_paths = agy_statusline::AgyStatusLinePaths::agy_from_home()?;
     install_agy_hook_at(
         &resource_path,
         &statusline_resource,
@@ -4933,7 +5200,7 @@ fn install_agy_hook_at(
 /// the script (#230). Nothing in the panel calls it yet.
 #[tauri::command]
 fn uninstall_agy_statusline() -> Result<(), String> {
-    agy_statusline::uninstall(&agy_statusline::AgyStatusLinePaths::from_home()?)
+    agy_statusline::uninstall(&agy_statusline::AgyStatusLinePaths::agy_from_home()?)
 }
 
 fn codex_notify_install_path() -> Result<PathBuf, String> {
@@ -5268,22 +5535,15 @@ fn agy_hook_status(app: tauri::AppHandle) -> Result<(String, bool, Option<bool>)
     // The status line is part of the install since #230: an install without it is out of
     // date, and so is a script that differs from the one this build ships.
     let stale = if installed {
-        let statusline = agy_statusline::AgyStatusLinePaths::from_home()?;
-        let parts = [
+        let statusline = agy_statusline::AgyStatusLinePaths::agy_from_home()?;
+        combine_stale([
             hook_is_stale(&app, "gyredeck-agy-hook.mjs", &install_path),
             if agy_statusline::wired(&statusline) {
                 hook_is_stale(&app, agy_statusline::SCRIPT_NAME, &statusline.script())
             } else {
                 Some(true)
             },
-        ];
-        if parts.contains(&Some(true)) {
-            Some(true)
-        } else if parts.contains(&None) {
-            None
-        } else {
-            Some(false)
-        }
+        ])
     } else {
         Some(false)
     };
@@ -6300,6 +6560,7 @@ pub fn run() {
         Box::new(tauri::generate_handler![
             app_stream::app_events,
             agy_usage,
+            usage_settings_set,
             session_registry_load,
             session_registry_save,
             app_file_load,
@@ -6782,6 +7043,7 @@ mod display_selection_tests {
             plan: Some("Max".to_string()),
             lines: vec![],
             fetched_at: now_iso(),
+            source: UsageSource::Api,
         };
 
         store_claude_last_good(&first, snapshot);
@@ -6803,6 +7065,7 @@ mod display_selection_tests {
             plan: Some("Max".to_string()),
             lines: vec![],
             fetched_at: "2026-07-25T12:00:00Z".to_string(),
+            source: UsageSource::Api,
         };
 
         store_claude_last_good(&auth, snapshot);
@@ -6894,12 +7157,130 @@ mod display_selection_tests {
             plan: None,
             lines: vec![],
             fetched_at: "2026-10-24T01:00:00Z".to_string(),
+            source: UsageSource::Api,
         };
         let mut relayed = 0;
-        relay_if_fresh(UsageReading { snapshot: snapshot(), fresh: true }, |_| relayed += 1);
+        relay_if_fresh(UsageReading { snapshot: snapshot(), fresh: true, account: None }, |_, _| relayed += 1);
         assert_eq!(relayed, 1, "the premise: a fresh reading is relayed");
-        relay_if_fresh(UsageReading { snapshot: snapshot(), fresh: false }, |_| relayed += 1);
+        relay_if_fresh(UsageReading { snapshot: snapshot(), fresh: false, account: None }, |_, _| relayed += 1);
         assert_eq!(relayed, 1, "a kept reading is not");
+    }
+
+    /// #396: a provider whose refresh fails is answered with the last reading its refresh
+    /// took, and one never read with none.
+    #[test]
+    fn usage_refresh_falls_back_to_the_last_reading_only_when_the_refresh_fails() {
+        fn reading(used: f64) -> CodexUsageSnapshot {
+            CodexUsageSnapshot {
+                provider_id: "codex".to_string(),
+                display_name: "Codex".to_string(),
+                plan: None,
+                lines: vec![progress_metric("Weekly", used, None, None)],
+                fetched_at: "2026-11-28T04:58:00Z".to_string(),
+                source: UsageSource::Api,
+            }
+        }
+        fn ok() -> Result<(CodexUsageSnapshot, bool), String> {
+            remember_usage("test-396", Ok((reading(55.0), true)))
+        }
+        fn failed() -> Result<(CodexUsageSnapshot, bool), String> {
+            remember_usage("test-396", Err("rate limited".to_string()))
+        }
+        fn never() -> Result<(CodexUsageSnapshot, bool), String> {
+            remember_usage("test-396-never", Err("no login".to_string()))
+        }
+        let first = refresh_usage_from(&[("test-396", "Codex", ok)]);
+        assert!(first[0].refreshed.is_ok() && first[0].last.is_none(), "premise: a refresh that worked needs no last reading");
+        let answer = refresh_usage_from(&[("test-396", "Codex", failed), ("test-396-never", "Never", never)]);
+        assert!(answer[0].refreshed.is_err());
+        let last = answer[0].last.as_ref().expect("the last reading is kept for a failed refresh");
+        assert_eq!(last.fetched_at, "2026-11-28T04:58:00Z");
+        assert!(answer[1].last.is_none(), "nothing made up for a provider never read");
+    }
+
+    /// #396 audit M2/S6: `/usage` reuses a fresh reading taken inside the gap instead of asking
+    /// Claude again; a kept or expired one is asked for; a placeholder with no numbers is never
+    /// remembered, so it neither stands in later nor hides the last real reading.
+    #[test]
+    fn claude_is_asked_at_most_every_three_minutes_by_the_wall_clock_and_a_placeholder_is_never_kept() {
+        fn reading(lines: Vec<CodexMetricLine>) -> CodexUsageSnapshot {
+            CodexUsageSnapshot {
+                provider_id: "claude".to_string(),
+                display_name: "Claude Code".to_string(),
+                plan: None,
+                lines,
+                fetched_at: "2026-11-28T05:00:00Z".to_string(),
+                source: UsageSource::Api,
+            }
+        }
+        let real = || reading(vec![progress_metric("Session", 15.0, None, None)]);
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(!claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0), "never answered: asked");
+        note_claude_answered("test-396-m2".to_string(), t0);
+        assert!(claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0 + Duration::from_secs(179)), "inside the gap the last answer stands");
+        assert!(!claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0 + Duration::from_secs(180)), "past the gap it is asked again");
+        assert!(!claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0 + Duration::from_secs(8 * 3600)), "a night's sleep counts: the wall clock, not uptime");
+        assert!(!claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0 - Duration::from_secs(60)), "a clock set back asks rather than trusting the reading");
+        assert!(!claude_answered_within("test-396-m2-other", CLAUDE_MIN_ASK_GAP, t0), "per account");
+
+        let auth = claude_auth("test-396-m2-access", "test-396-m2-refresh");
+        assert!(claude_recent_answer(&auth, SystemTime::now()).is_none(), "never answered: the endpoint is asked");
+        let answered = fresh_claude_reading(&auth, serde_json::json!({"five_hour": {"utilization": 15.0}}));
+        let reused = claude_recent_answer(&auth, SystemTime::now()).expect("the answer just taken stands for the next ask");
+        assert!(reused.fresh);
+        assert_eq!(reused.snapshot.lines.len(), answered.snapshot.lines.len());
+        assert!(claude_recent_answer(&auth, SystemTime::now() + Duration::from_secs(181)).is_none(), "past the gap it is asked again");
+
+        let _ = remember_usage("test-396-s6", Ok((real(), true)));
+        let _ = remember_usage("test-396-s6", Ok((reading(vec![]), false)));
+        let kept = last_usage("test-396-s6").expect("the real reading is still the last one");
+        assert!(has_usage_numbers(&kept), "a placeholder did not replace it");
+        let _ = remember_usage("test-396-s6-only", Ok((reading(vec![]), false)));
+        assert!(last_usage("test-396-s6-only").is_none(), "a placeholder alone is never remembered");
+
+        fn placeholder() -> Result<(CodexUsageSnapshot, bool), String> {
+            remember_usage("test-396-s6", Ok((
+                CodexUsageSnapshot {
+                    provider_id: "claude".to_string(),
+                    display_name: "Claude Code".to_string(),
+                    plan: None,
+                    lines: vec![],
+                    fetched_at: String::new(),
+                    source: UsageSource::Api,
+                },
+                false,
+            )))
+        }
+        let answer = refresh_usage_from(&[("test-396-s6", "Claude Code", placeholder)]);
+        assert!(answer[0].last.as_ref().is_some_and(has_usage_numbers), "a placeholder answer is backed by the last real reading");
+    }
+
+    #[test]
+    fn the_relay_body_carries_the_source_the_account_and_the_interval() {
+        let snapshot = |source| CodexUsageSnapshot {
+            provider_id: "codex".to_string(),
+            display_name: "Codex".to_string(),
+            plan: None,
+            lines: vec![],
+            fetched_at: "2026-10-24T01:00:00Z".to_string(),
+            source,
+        };
+        let mut sent = Vec::new();
+        relay_if_fresh(
+            UsageReading { snapshot: snapshot(UsageSource::Log), fresh: true, account: Some("0123456789abcdef".into()) },
+            |snapshot, account| sent.push(relay_body(snapshot, account, Duration::from_secs(15 * 60))),
+        );
+        let body = &sent[0];
+        assert_eq!(body["source"], "log");
+        assert_eq!(body["account"], "0123456789abcdef");
+        assert_eq!(body["refreshMs"], 15 * 60_000);
+        assert_eq!(body["fetchedAt"], "2026-10-24T01:00:00Z");
+
+        // What the webview sets is what the body carries.
+        let set = local_usage::settings_from(&Value::from(30 * 60_000), &Value::Null);
+        let body = relay_body(&snapshot(UsageSource::StatusLine), None, set.refresh);
+        assert_eq!((body["refreshMs"].as_u64(), body["source"].as_str()), (Some(30 * 60_000), Some("statusline")));
+        assert!(body.get("account").is_none());
     }
 
     fn codex_auth(access_token: &str) -> CodexAuthState {
@@ -6948,6 +7329,36 @@ mod display_selection_tests {
         assert_eq!(claude_gate(&auth, now), ClaudeGate::Expired, "an expired one says so, wait or not");
     }
 
+    /// With several logins the answer can come from a later one; it says so, so `choose`
+    /// never merges it with the local reading matched to the first (#398 r2).
+    #[test]
+    fn a_kept_reading_carries_the_login_that_answered() {
+        let mut first = claude_auth("r398-first-access", "r398-first-refresh");
+        first.inference_only = true;
+        let second = claude_auth("r398-second-access", "r398-second-refresh");
+        assert!(!claude_can_fetch_live_usage(&first), "premise: the first login is passed over");
+        assert_ne!(claude_reading_tag(&first), claude_reading_tag(&second), "premise");
+
+        let limited = claude_rate_limited_reading(&second, Some(600), Instant::now());
+        assert_eq!(limited.account, claude_reading_tag(&second));
+        let waited = claude_usage_blocking(vec![first, second.clone()]).unwrap();
+        assert!(!waited.fresh);
+        assert_eq!(waited.account, claude_reading_tag(&second), "the waiting answer is the second login's");
+
+        let mut codex = codex_auth("r398-codex");
+        codex.auth.tokens.as_mut().unwrap().account_id = Some("acct-398".to_string());
+        let kept = expired_login_reading(Some(CodexUsageSnapshot {
+            provider_id: "codex".to_string(),
+            display_name: "Codex".to_string(),
+            plan: None,
+            lines: vec![],
+            fetched_at: "2026-11-28T00:00:00Z".to_string(),
+            source: UsageSource::Api,
+        }), codex_reading_tag(&codex), "Codex", "codex").unwrap();
+        assert_eq!(kept.account, codex_reading_tag(&codex));
+        assert!(codex_reading_tag(&codex).is_some(), "premise: the fixture has an account id");
+    }
+
     #[test]
     fn an_expired_login_shows_the_last_good_reading_as_kept_and_never_as_news() {
         let reading = |fetched_at: &str| CodexUsageSnapshot {
@@ -6956,12 +7367,13 @@ mod display_selection_tests {
             plan: None,
             lines: vec![],
             fetched_at: fetched_at.to_string(),
+            source: UsageSource::Api,
         };
         let mine = codex_auth("codex-361-mine");
         let other = codex_auth("codex-361-other");
         assert!(fresh_codex_reading(&mine, reading("2026-11-08T01:00:00Z")).fresh);
 
-        let kept = expired_login_reading(read_codex_last_good(&mine), "Codex", "codex").unwrap();
+        let kept = expired_login_reading(read_codex_last_good(&mine), None, "Codex", "codex").unwrap();
         assert!(!kept.fresh, "a kept reading is not relayed as a fresh one");
         assert_eq!(kept.snapshot.fetched_at, "2026-11-08T01:00:00Z", "and keeps its own time");
         assert!(
@@ -6971,7 +7383,7 @@ mod display_selection_tests {
 
         assert!(read_codex_last_good(&other).is_none(), "another login inherits no numbers");
         assert_eq!(
-            expired_login_reading(None, "Codex", "codex").err().as_deref(),
+            expired_login_reading(None, None, "Codex", "codex").err().as_deref(),
             Some("Codex login expired. Run `codex` to renew it.")
         );
     }
@@ -7857,6 +8269,7 @@ mod agy_install_links {
             paths: agy_statusline::AgyStatusLinePaths {
                 settings: home.join(".gemini/antigravity-cli/settings.json"),
                 dir: home.join(".config/gyredeck"),
+                spec: &agy_statusline::AGY,
             },
             root,
         }
@@ -8513,6 +8926,7 @@ mod claude_usage_history_tests {
             plan: None,
             lines: Vec::new(),
             fetched_at: String::new(),
+            source: UsageSource::Api,
         }
     }
 

@@ -4356,3 +4356,108 @@ test("#318 a sleep notice still queued at the wake goes marked (delayed), then t
   assert.deepEqual(of("powered").map((m) => [m.id, m.createdAt]), [["00000000000000a1", 1], ["00000000000000a2", 1], ["00000000000000a1", 1], ["00000000000000a2", 1]]);
   await c.close();
 });
+
+// ---- #396 /usage: the app refreshes, only the paired owner sees the answer ----
+
+const askUsage = async (fake, channelId, userId = OWNER) => {
+  fake.command({ name: "usage", userId, channelId });
+  await flush();
+  return fake.interactions.at(-1);
+};
+const hhmm = (ms) => `${String(new Date(ms).getHours()).padStart(2, "0")}:${String(new Date(ms).getMinutes()).padStart(2, "0")}`;
+
+test("#396 /usage from anyone but the paired owner gets a one-line refusal only they see, and the app is asked nothing", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  const answer = await askUsage(fake, threadId, "U-STRANGER");
+  assert.deepEqual(fake.replies.map((r) => [r.ephemeral, r.content]), [[true, "Only the person paired with this Gyredeck can ask for usage."]]);
+  assert.equal(answer.deferred, null, "never deferred, so no answer can follow");
+  assert.deepEqual(of("usage_request"), [], "no refresh, no numbers");
+  await c.close();
+});
+
+test("#396 /usage is ephemeral and asks the app before answering; nothing reaches the room, its post or anyone else", async () => {
+  const { c, fake, of, threadId } = await ownerRoom();
+  const sentBefore = fake.sent.length;
+  const answer = await askUsage(fake, threadId);
+  assert.deepEqual(answer.deferred, { ephemeral: true }, "only you can see this");
+  const [req] = of("usage_request");
+  assert.deepEqual({ ...req, requestId: typeof req.requestId }, { t: "usage_request", requestId: "string", ownerId: OWNER });
+  assert.deepEqual(answer.edits, [], "nothing shown before the app has refreshed");
+  c.handle({ t: "usage", requestId: req.requestId, mode: "left", providers: [{ display: "Codex", plan: "Plus", source: "api", fetchedAt: new Date(Date.UTC(2026, 9, 27, 9, 0, 0)).toISOString(), current: true, lines: [{ label: "Weekly", pct: 45, resetsAt: null }] }] });
+  await flush();
+  assert.equal(answer.edits.length, 1);
+  assert.deepEqual(answer.edits[0].allowedMentions, { parse: [] });
+  assert.match(answer.edits[0].content, /Weekly 45% left/);
+  assert.equal(fake.sent.length, sentBefore, "no post into the room's thread");
+  assert.deepEqual(fake.replies, [], "no public reply");
+  assert.deepEqual([of("say"), of("status_request")], [[], []], "nothing said to the room");
+  await c.close();
+});
+
+test("#396 a provider that could not refresh shows its last reading with its time and age, never as current; the source is named", async () => {
+  const { c, fake, of, clock } = await ownerRoom();
+  const now = clock.now();
+  const answer = await askUsage(fake, "C-GENERAL");
+  const [req] = of("usage_request");
+  const at = (minutesAgo) => new Date(now - minutesAgo * 60_000).toISOString();
+  c.handle({ t: "usage", requestId: req.requestId, mode: "left", providers: [
+    { display: "Claude Code", plan: "Team 5x", source: "statusline", fetchedAt: at(2), current: true, lines: [{ label: "Session", pct: 90, resetsAt: new Date(now + 125 * 60_000).toISOString() }] },
+    { display: "Codex", plan: "Plus", source: "api", fetchedAt: at(43), current: false, lines: [{ label: "Weekly", pct: 45, resetsAt: null }] },
+    { display: "Antigravity", plan: null, source: "api", fetchedAt: at(0), current: true, lines: [] },
+    { display: "Old log", source: "log", fetchedAt: at(130), current: false, lines: [] },
+    { display: "Fresh log", source: "log", fetchedAt: at(1), current: true, lines: [] },
+    { display: "Never read", current: false, lines: [] },
+  ] });
+  await flush();
+  const lines = answer.edits[0].content.split("\n");
+  const of_ = (name) => lines.find((l) => l.startsWith(`**${name}**`));
+  assert.equal(of_("Claude Code"), `**Claude Code** · Team 5x · from status line ${hhmm(now - 2 * 60_000)}`);
+  assert.ok(lines.includes("  Session 90% left · resets in 2h 5m"));
+  assert.equal(of_("Codex"), `**Codex** · Plus · couldn't refresh — last reading ${hhmm(now - 43 * 60_000)} (43 min ago)`);
+  assert.ok(lines.includes("  Weekly 45% left · running low"));
+  assert.equal(of_("Antigravity"), `**Antigravity** · updated ${hhmm(now)}`);
+  assert.equal(of_("Old log"), `**Old log** · couldn't refresh — last reading from session log ${hhmm(now - 130 * 60_000)} (2 h ago)`);
+  assert.equal(of_("Fresh log"), `**Fresh log** · from session log ${hhmm(now - 60_000)}`);
+  assert.equal(of_("Never read"), "**Never read** · couldn't refresh — no reading yet");
+  assert.doesNotMatch(of_("Codex"), /updated/, "a failed refresh is never worded as current");
+  await c.close();
+});
+
+test("#396 audit S2: /usage cut off by a re-pair or a close says so in usage words, never /status ones", async () => {
+  const { c, fake, of } = await ownerRoom();
+  const repaired = await askUsage(fake, "C-GENERAL");
+  c.handle({ t: "owner", ownerId: "U-NEW-OWNER" });
+  await flush();
+  assert.deepEqual(repaired.edits.map((e) => e.content), ["No usage was shown: the paired owner changed while it was asked."]);
+  c.handle({ t: "owner", ownerId: OWNER });
+  await flush();
+  const closed = await askUsage(fake, "C-GENERAL");
+  assert.equal(of("usage_request").length, 2);
+  await c.close();
+  assert.deepEqual(closed.edits.map((e) => e.content), ["Usage is not available right now."]);
+});
+
+test("#396 /usage shows percent used when the app's Usage mode says Used", async () => {
+  const { c, fake, of, clock } = await ownerRoom();
+  const answer = await askUsage(fake, "C-GENERAL");
+  const [req] = of("usage_request");
+  c.handle({ t: "usage", requestId: req.requestId, mode: "used", providers: [{ display: "Codex", source: "api", fetchedAt: new Date(clock.now()).toISOString(), current: true, lines: [{ label: "Weekly", pct: 80, resetsAt: null }] }] });
+  await flush();
+  assert.match(answer.edits[0].content, /\n {2}Weekly 80% used · nearly exhausted$/, "80% used is 20% left");
+  assert.doesNotMatch(answer.edits[0].content, /left/);
+  await c.close();
+});
+
+test("#396 /usage is registered for the server and a DM; an app that never answers is said so; an error is shown as sent", async () => {
+  const { c, fake, of, clock } = await ownerRoom();
+  assert.equal(fake.commands.find((d) => d.name === "usage")?.dm, true);
+  const late = await askUsage(fake, "C-GENERAL");
+  await clock.advance(61_000);
+  assert.deepEqual(late.edits.map((e) => e.content), ["Usage is not available right now."]);
+  const refused = await askUsage(fake, "C-GENERAL");
+  const [, req] = of("usage_request");
+  c.handle({ t: "usage", requestId: req.requestId, error: "No Discord account is paired with Gyredeck, so no usage was shown" });
+  await flush();
+  assert.deepEqual(refused.edits.map((e) => e.content), ["No Discord account is paired with Gyredeck, so no usage was shown"]);
+  await c.close();
+});

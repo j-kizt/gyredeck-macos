@@ -132,11 +132,33 @@ export const useAgentUsageList = (
     });
   };
 
+  // The app reads the interval too (#398): a local reading counts as fresh within it, and
+  // the bridge calls a reading stale past two of it. Sent before the first refresh; an app
+  // without the command keeps its default.
+  const pushSettings = () =>
+    invoke("usage_settings_set", {
+      refreshMs: settingsRef.current.refreshMs,
+      usageMode: settingsRef.current.usageMode,
+    }).catch(() => {});
+
   useEffect(() => {
-    refresh();
-    const timer = window.setInterval(refresh, settings.refreshMs);
-    return () => window.clearInterval(timer);
+    let timer: number | undefined;
+    let stopped = false;
+    pushSettings().then(() => {
+      if (!stopped) {
+        refresh();
+        timer = window.setInterval(refresh, settings.refreshMs);
+      }
+    });
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
   }, [settings.refreshMs]);
+
+  useEffect(() => {
+    pushSettings();
+  }, [settings.usageMode]);
 
   useEffect(() => {
     if (settings.resetMode !== "relative") {

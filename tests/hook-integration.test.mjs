@@ -11,6 +11,9 @@ import test, { after } from "node:test";
 import { MAIL_MAX_NOTICES, ROOM_RULES_VERSION } from "../adapters/bridge/gyredeck-bridge.mjs";
 import { fileURLToPath } from "node:url";
 
+// A path inside an `sh -c` string, quoted so a TMPDIR with a space still names one file.
+const shq = (path) => `'${path.replaceAll("'", `'\\''`)}'`;
+
 const repoRoot = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 const CONFIG_DIR = [".config", "gyredeck"];
 
@@ -2203,6 +2206,38 @@ test("a room member hears when its own provider's limit runs low, and can ask fo
     await post("/usage", reading("agy", 99));
     const agyAfter = await fetch(`${base}/mail/inbox?as=${other}`, { headers: otherHeaders }).then((r) => r.json());
     assert.ok(agyAfter.messages.every((message) => !message.text.includes("limit has")));
+
+    // #398: another account's reading is a first look, not a crossing; the same account's is.
+    await post("/usage", { ...reading("claude", 50), account: "aaaa" });
+    assert.equal(await context(), "");
+    await post("/usage", { ...reading("claude", 95), account: "bbbb" });
+    assert.equal(await context(), "", "a switch of account is not a crossing");
+    await post("/usage", { ...reading("claude", 50), account: "bbbb" });
+    assert.match(await context(), /your Claude Code Session limit is back to 50% left/, "premise: the same account still compares");
+
+    // #398: the answer says where a reading came from and how old it is, and calls it stale
+    // past two of the app's intervals; an interval the app does not offer counts as 5 min.
+    const dated = (minutesAgo, extra) => ({
+      ...reading("claude", 30),
+      fetchedAt: new Date(Date.now() - minutesAgo * 60_000).toISOString(),
+      ...extra,
+    });
+    const described = async (body) => {
+      await post("/usage", body);
+      return (await usage(me, token)).body.usage;
+    };
+    const atFive = await described(dated(11, { refreshMs: 5 * 60_000, source: "log", account: "bbbb" }));
+    assert.equal(atFive.source, "log");
+    assert.ok(atFive.ageSeconds >= 659 && atFive.ageSeconds <= 670, `ageSeconds ${atFive.ageSeconds}`);
+    assert.equal(atFive.stale, true, "11 min is past 2 × 5 min");
+    assert.deepEqual(Object.keys(atFive).sort(), ["ageSeconds", "displayName", "fetchedAt", "lines", "source", "stale"]);
+    const atFifteen = await described(dated(11, { refreshMs: 15 * 60_000, account: "bbbb" }));
+    assert.equal(atFifteen.stale, false, "11 min is inside 2 × 15 min");
+    assert.equal(atFifteen.source, "api", "no source is the API");
+    assert.equal((await described(dated(11, { refreshMs: 3 * 60_000, account: "bbbb" }))).stale, true, "3 min is not offered");
+    assert.equal((await described(dated(11, { refreshMs: 15 * 60_000, source: "disk", account: "bbbb" }))).source, "api");
+    const undated = await described({ ...reading("claude", 30), fetchedAt: "not a date", account: "bbbb" });
+    assert.deepEqual([undated.ageSeconds, undated.stale], [null, true], "an unknown time is never fresh");
   } finally {
     await broker?.close();
     bridge.stdin.end();
@@ -10998,7 +11033,7 @@ test("heavy C3: a helper killed with -9 leaves its group holding the slot", asyn
   try {
     await h.start();
     const pidFile = join(h.home, "pid");
-    const run = h.helper(["--as", "run-a", "--what", "sleeps", "--", "sh", "-c", `echo $$ > ${pidFile}; exec sleep 300`]);
+    const run = h.helper(["--as", "run-a", "--what", "sleeps", "--", "sh", "-c", `echo $$ > ${shq(pidFile)}; exec sleep 300`]);
     const pgid = await until(async () => existsSync(pidFile) && Number((await readFile(pidFile, "utf8")).trim()), "the command started");
     h.groups.add(pgid);
     await until(async () => (await h.state()).holder?.state === "active", "active");
@@ -11136,7 +11171,7 @@ test("heavy r4: a reservation refused at activate kills the gated child and asks
   });
   try {
     const marker = join(h.home, "marker");
-    const run = h.helper(["--as", "run-a", "--what", "appends", "--", "sh", "-c", `echo once >> ${marker}`], {}, fake.helperPath);
+    const run = h.helper(["--as", "run-a", "--what", "appends", "--", "sh", "-c", `echo once >> ${shq(marker)}`], {}, fake.helperPath);
     assert.equal((await run.exited).code, 0, run.stderr);
     assert.equal(pgids.length, 2, "asked twice");
     assert.notEqual(pgids[0], pgids[1]);
@@ -11170,7 +11205,7 @@ test("heavy r2: SIGTERM is forwarded and the slot is held until the group has ex
     const started = join(h.home, "started");
     const termed = join(h.home, "termed");
     const finish = join(h.home, "finish");
-    const script = `trap 'touch ${termed}; while [ ! -e ${finish} ]; do sleep 0.05; done; exit 5' TERM; echo $$ > ${started}; while :; do sleep 0.05; done`;
+    const script = `trap 'touch "${termed}"; while [ ! -e "${finish}" ]; do sleep 0.05; done; exit 5' TERM; echo $$ > ${shq(started)}; while :; do sleep 0.05; done`;
     const run = h.helper(["--as", "run-a", "--what", "traps", "--", "sh", "-c", script]);
     h.groups.add(await until(async () => existsSync(started) && Number((await readFile(started, "utf8")).trim()), "the command started"));
     run.child.kill("SIGTERM");
@@ -11470,7 +11505,7 @@ test("heavy C9: a restart keeps a running holder, grants no second slot, and the
     const started = join(h.home, "started");
     const finish = join(h.home, "finish");
     const run = h.helper(
-      ["--as", "run-a", "--what", "waits", "--", "sh", "-c", `echo $$ > ${started}; while [ ! -e ${finish} ]; do sleep 0.05; done`],
+      ["--as", "run-a", "--what", "waits", "--", "sh", "-c", `echo $$ > ${shq(started)}; while [ ! -e ${shq(finish)} ]; do sleep 0.05; done`],
       { GYREDECK_TEST_HEAVY_HEARTBEAT_MS: "100" },
     );
     h.groups.add(await until(async () => existsSync(started) && Number((await readFile(started, "utf8")).trim()), "the command started"));
@@ -11646,7 +11681,7 @@ test("heavy r3: a bridge killed after recording activation lets the helper retry
   try {
     const bridge = await h.start({ GYREDECK_TEST_HEAVY_FAULT: "activate" });
     const marker = join(h.home, "marker");
-    const run = h.helper(["--as", "run-a", "--what", "appends", "--", "sh", "-c", `echo once >> ${marker}`]);
+    const run = h.helper(["--as", "run-a", "--what", "appends", "--", "sh", "-c", `echo once >> ${shq(marker)}`]);
     assert.equal(await bridge.exited, 86, "premise: the bridge died at activate");
     h.start();
     assert.equal((await run.exited).code, 0, run.stderr);
@@ -12248,7 +12283,7 @@ test("heavy r2: a command that ignores SIGTERM is killed when the escalation run
     await h.start({ GYREDECK_TEST_HEAVY_TICK_MS: "600000" });
     const started = join(h.home, "started");
     const run = h.helper(
-      ["--as", "run-a", "--what", "ignores", "--", "sh", "-c", `trap '' TERM; echo $$ > ${started}; while :; do sleep 0.05; done`],
+      ["--as", "run-a", "--what", "ignores", "--", "sh", "-c", `trap '' TERM; echo $$ > ${shq(started)}; while :; do sleep 0.05; done`],
       { GYREDECK_TEST_HEAVY_KILL_AFTER_MS: "500" },
     );
     const pgid = await until(async () => existsSync(started) && Number((await readFile(started, "utf8")).trim()), "the command started");

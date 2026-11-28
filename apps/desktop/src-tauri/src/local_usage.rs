@@ -285,33 +285,29 @@ fn same_dir(left: &str, right: &Path) -> bool {
     left.trim_end_matches('/') == right.trim_end_matches('/')
 }
 
-/// The status-line record that arrived last: `claude-statusline.<arrival ns>.<pid>.json` in
-/// the app's folder, regular files only, ordered by number. Records are never replaced, so
-/// the latest arrival is the newest payload whatever order the writers finished in (#398
-/// audit).
+/// The status-line record that arrived last: `claude-statusline.<n>.json` in the app's folder,
+/// regular files only, the highest `n` compared as a number. The script reserves `n` when a
+/// payload arrives, so the highest is the newest whatever order the writers finish in and
+/// whatever the clock says (#398 audit). One still being written does not parse, and gives no
+/// reading rather than an older one.
 pub(crate) fn newest_claude_record(dir: &Path) -> Option<PathBuf> {
     fs::read_dir(dir)
         .ok()?
         .filter_map(Result::ok)
         .take(4_096)
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            let (arrived, pid) = claude_record_order(&name)?;
-            Some((arrived, pid, entry.path()))
-        })
-        .max_by_key(|(arrived, pid, _)| (*arrived, *pid))
-        .map(|(_, _, path)| path)
+        .filter_map(|entry| Some((claude_record_order(entry.file_name().to_str()?)?, entry.path())))
+        .max_by_key(|(order, _)| *order)
+        .map(|(_, path)| path)
 }
 
-/// `(arrival, pid)` of a record's name, or nothing when the name is not one.
-pub(crate) fn claude_record_order(name: &str) -> Option<(u128, u64)> {
-    let (arrived, pid) = name.strip_prefix(CLAUDE_RECORD_PREFIX)?.strip_suffix(".json")?.split_once('.')?;
-    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
-    if !(digits(arrived) && digits(pid)) {
+/// The arrival number of a record's name, or nothing when the name is not one.
+pub(crate) fn claude_record_order(name: &str) -> Option<u64> {
+    let number = name.strip_prefix(CLAUDE_RECORD_PREFIX)?.strip_suffix(".json")?;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some((arrived.parse().ok()?, pid.parse().ok()?))
+    number.parse().ok()
 }
 
 pub(crate) const CLAUDE_RECORD_PREFIX: &str = "claude-statusline.";
@@ -897,25 +893,25 @@ mod tests {
     fn the_latest_claude_record_is_read_whatever_order_it_was_written_in() {
         let dir = scratch("claude-records");
         for name in [
-            "claude-statusline.1000000000000000009.9.json",
-            "claude-statusline.1000000000000000010.3.json",
-            "claude-statusline.999999999999999999.5.json",
+            "claude-statusline.9.json",
+            "claude-statusline.10.json",
+            "claude-statusline.07.json",
             ".claude-statusline.abc",
-            "claude-statusline.2000000000000000000.x.json",
+            "claude-statusline.20.1.json",
+            "claude-statusline.x.json",
             "claude-statusline.previous.json",
             "claude-statusline.json",
         ] {
             fs::write(dir.join(name), "{}").unwrap();
         }
-        assert_eq!(
-            newest_claude_record(&dir),
-            Some(dir.join("claude-statusline.1000000000000000010.3.json")),
-            "by number, not by name: ...10 arrived after ...9"
-        );
+        assert_eq!(newest_claude_record(&dir), Some(dir.join("claude-statusline.10.json")), "by number, not by name: 10 arrived after 9");
         let elsewhere = scratch("claude-records-elsewhere").join("x.json");
         fs::write(&elsewhere, "{}").unwrap();
-        std::os::unix::fs::symlink(&elsewhere, dir.join("claude-statusline.3000000000000000000.1.json")).unwrap();
-        assert_eq!(newest_claude_record(&dir), Some(dir.join("claude-statusline.1000000000000000010.3.json")), "a link is never a record");
+        std::os::unix::fs::symlink(&elsewhere, dir.join("claude-statusline.30.json")).unwrap();
+        assert_eq!(newest_claude_record(&dir), Some(dir.join("claude-statusline.10.json")), "a link is never a record");
+        fs::write(dir.join("claude-statusline.11.json"), "").unwrap();
+        assert_eq!(newest_claude_record(&dir), Some(dir.join("claude-statusline.11.json")), "one still being written is the newest, never skipped for an older");
+        assert!(claude_local(&dir.join("claude-statusline.11.json"), &dir, None, 0).is_none(), "and gives no reading");
         assert_eq!(newest_claude_record(&dir.join("missing")), None);
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(elsewhere.parent().unwrap());

@@ -1236,56 +1236,101 @@ mod tests {
         let root = scratch("claude-order");
         let home = root.join("home");
         let paths = paths_for(&root, &CLAUDE);
-        let hold = root.join("hold");
-        write_settings(&paths, &serde_json::json!({ "statusLine": running(&CLAUDE,
-            "while [ -n \"$HOLD\" ] && [ -f \"$HOLD\" ]; do sleep 0.05; done; head -c 3") }));
+        write_settings(&paths, &serde_json::json!({ "statusLine": running(&CLAUDE, "head -c 3") }));
         install(&paths, &script_source_for(&CLAUDE)).unwrap();
         let recorded = || -> Value { serde_json::from_slice(&fs::read(record(&paths)).unwrap()).unwrap() };
 
-        // Released on drop too, so a failing assertion never leaves the held writer running.
-        struct Release(PathBuf);
-        impl Drop for Release {
-            fn drop(&mut self) {
-                let _ = fs::remove_file(&self.0);
-            }
-        }
-        fs::write(&hold, "").unwrap();
-        let release = Release(hold.clone());
+        // The older payload's number is reserved when it arrives, before its input is read;
+        // the newer one arrives, is written and pruned while the older is still reading.
         let mut older = Command::new("sh")
             .arg(paths.script())
             .env("HOME", &home)
-            .env("HOLD", &hold)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
-        older.stdin.take().unwrap().write_all(&bytes(&payload(T0))).unwrap();
+        let mut older_in = older.stdin.take().unwrap();
         let waited = std::time::Instant::now();
         while crate::local_usage::newest_claude_record(&paths.dir).is_none() && waited.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(20));
         }
-        std::thread::sleep(Duration::from_millis(1_100));
         let (code, _) = run_script(&paths, &home, &bytes(&payload(T0 + 60)));
         assert_eq!(code, 0);
         assert_eq!(recorded()["payload"], payload(T0 + 60), "premise: the newer payload is recorded");
-        drop(release);
+        older_in.write_all(&bytes(&payload(T0))).unwrap();
+        drop(older_in);
         assert_eq!(older.wait().unwrap().code(), Some(0));
-        assert_eq!(recorded()["payload"], payload(T0 + 60), "the held older payload did not come back over it");
+        assert_eq!(recorded()["payload"], payload(T0 + 60), "the older payload, finishing last, neither leads nor removes the newer");
 
-        // A writer that finishes after a later arrival — the pause Codex forced between check
-        // and replace — leaves that later record, and the later one is what is read.
-        let arrival = |path: PathBuf| crate::local_usage::claude_record_order(path.file_name().unwrap().to_str().unwrap()).unwrap().0;
+        let arrival = |path: PathBuf| crate::local_usage::claude_record_order(path.file_name().unwrap().to_str().unwrap()).unwrap();
         let newer = arrival(record(&paths));
-        let later = (unix_now() as u128 + 1_000) * 1_000_000_000;
+        let later = newer + 1_000;
         let mut kept = recorded();
         kept["at"] = 1.into();
-        fs::write(paths.dir.join(format!("claude-statusline.{later}.1.json")), serde_json::to_vec(&kept).unwrap()).unwrap();
+        fs::write(paths.dir.join(format!("claude-statusline.{later}.json")), serde_json::to_vec(&kept).unwrap()).unwrap();
         run_script(&paths, &home, &bytes(&payload(T0)));
-        assert_eq!(recorded()["at"], 1, "an earlier arrival leaves the later record");
-        let arrivals: Vec<u128> = fs::read_dir(&paths.dir).unwrap()
-            .filter_map(|entry| crate::local_usage::claude_record_order(entry.unwrap().file_name().to_str()?).map(|order| order.0))
+        assert_eq!(recorded()["payload"], payload(T0), "the next arrival takes the next number, past every record there");
+        assert_eq!(arrival(record(&paths)), later + 1);
+        let arrivals: Vec<u64> = fs::read_dir(&paths.dir).unwrap()
+            .filter_map(|entry| crate::local_usage::claude_record_order(entry.unwrap().file_name().to_str()?))
             .collect();
-        assert!(arrivals.iter().all(|at| *at >= newer), "records that arrived earlier are cleared: {arrivals:?}");
+        assert_eq!(arrivals, vec![later + 1], "records that arrived earlier are cleared");
+
+        // The clock and the process id play no part: with a `date` that has no %N and stands
+        // still, and a record already numbered far past any pid, the next payload still leads.
+        let stub = root.join("bin");
+        fs::create_dir_all(&stub).unwrap();
+        fs::write(stub.join("date"), "#!/bin/sh\necho 1000\n").unwrap();
+        fs::set_permissions(stub.join("date"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", stub.display(), std::env::var("PATH").unwrap_or_default());
+        let high = 4_294_967_296_u64;
+        fs::write(paths.dir.join(format!("claude-statusline.{high}.json")), serde_json::to_vec(&kept).unwrap()).unwrap();
+        for at in [T0 + 120, T0 + 180] {
+            let mut child = Command::new("sh").arg(paths.script()).env("HOME", &home).env("PATH", &path)
+                .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(&bytes(&payload(at))).unwrap();
+            assert_eq!(child.wait().unwrap().code(), Some(0));
+        }
+        assert_eq!(recorded()["payload"], payload(T0 + 180), "the later of two payloads in one frozen second leads");
+        assert_eq!(recorded()["at"], 1000);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Payloads that arrive together each reserve a number of their own: a number already taken
+    /// moves the next writer on, so none is lost and none shares one (#398 audit r5).
+    #[test]
+    fn c6_claude_payloads_arriving_together_each_get_their_own_number() {
+        let root = scratch("claude-together");
+        let home = root.join("home");
+        let paths = paths_for(&root, &CLAUDE);
+        write_settings(&paths, &serde_json::json!({}));
+        install(&paths, &script_source_for(&CLAUDE)).unwrap();
+        let numbers = || -> Vec<u64> {
+            let mut found: Vec<u64> = fs::read_dir(&paths.dir).unwrap()
+                .filter_map(|entry| crate::local_usage::claude_record_order(entry.unwrap().file_name().to_str()?))
+                .collect();
+            found.sort_unstable();
+            found
+        };
+        let mut writers: Vec<_> = (0..8)
+            .map(|_| {
+                let mut child = Command::new("sh").arg(paths.script()).env("HOME", &home)
+                    .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+                let input = child.stdin.take().unwrap();
+                (child, input)
+            })
+            .collect();
+        let waited = std::time::Instant::now();
+        while numbers().len() < 8 && waited.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(numbers(), (0..8).collect::<Vec<u64>>(), "eight writers hold eight numbers");
+        for (child, mut input) in writers.drain(..) {
+            input.write_all(&bytes(&payload(T0))).unwrap();
+            drop(input);
+            assert_eq!(child.wait_with_output().unwrap().status.code(), Some(0));
+        }
+        assert_eq!(numbers(), vec![7], "the last number is what is left");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1302,8 +1347,8 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         let theirs = outside.join("theirs.json");
         fs::write(&theirs, "keep").unwrap();
-        let file_link = paths.dir.join("claude-statusline.1.1.json");
-        let dir_link = paths.dir.join("claude-statusline.2.2.json");
+        let file_link = paths.dir.join("claude-statusline.1.json");
+        let dir_link = paths.dir.join("claude-statusline.2.json");
         std::os::unix::fs::symlink(&theirs, &file_link).unwrap();
         std::os::unix::fs::symlink(&outside, &dir_link).unwrap();
 
@@ -1315,7 +1360,7 @@ mod tests {
         assert_eq!(inside, vec![std::ffi::OsString::from("theirs.json")], "nothing was written into a linked folder");
         assert!(fs::symlink_metadata(&file_link).is_err() && fs::symlink_metadata(&dir_link).is_err(), "the links themselves were pruned");
 
-        std::os::unix::fs::symlink(&theirs, paths.dir.join("claude-statusline.9999999999999999999.3.json")).unwrap();
+        std::os::unix::fs::symlink(&theirs, paths.dir.join("claude-statusline.9999999999.json")).unwrap();
         uninstall(&paths).unwrap();
         assert_eq!(fs::read_to_string(&theirs).unwrap(), "keep", "uninstall removes the link, not its target");
         assert!(!fs::read_dir(&paths.dir).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with("claude-statusline.")));

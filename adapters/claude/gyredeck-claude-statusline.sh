@@ -10,37 +10,53 @@ dir="$HOME/.config/gyredeck"
 chain="$dir/claude-statusline.chain"
 cfg=$(printf '%s' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" | sed 's/\\/\\\\/g; s/"/\\"/g')
 # mktemp creates each file itself, exclusively, so nothing planted at a guessable name is
-# followed. Each payload is kept as its own record beside it, never replaced, named by when it
-# arrived (nanoseconds where `date` gives them) and this process: the app reads the latest
-# arrival, whatever order the writers finish in (#398 audit). The record is written before
-# their command runs. After, only this script's own records that arrived earlier are removed,
-# by name, in this folder: never the latest, never anything through a link. The record is
-# placed with a hard link, which never replaces and never follows what is at its name.
-if tmp=$(mktemp "$dir/.claude-statusline-in.XXXXXX" 2>/dev/null) && cat > "$tmp"; then
-  ns=$(date +%s%N 2>/dev/null)
-  case $ns in ''|*[!0-9]*) ns="$(date +%s)000000000" ;; esac
-  at=${ns%?????????}
-  name="$dir/claude-statusline.$ns.$$.json"
-  if out=$(mktemp "$dir/.claude-statusline.XXXXXX" 2>/dev/null); then
-    if { printf '{"at":%s,"configDir":"%s","payload":' "$at" "$cfg"; cat "$tmp"; printf '}\n'; } > "$out" \
-      && ln -n "$out" "$name" 2>/dev/null; then
-      rm -f "$out"
-      for old in "$dir"/claude-statusline.*.*.json; do
-        stamp=${old#"$dir"/claude-statusline.}
-        stamp=${stamp%%.*}
-        case $stamp in ''|*[!0-9]*) continue ;; esac
-        pid=${old#"$dir"/claude-statusline.$stamp.}
-        case ${pid%.json} in ''|*[!0-9]*) continue ;; esac
-        [ "$stamp" -lt "$ns" ] 2>/dev/null && rm -f "$old"
+# followed. Each payload is kept as its own record beside it, never replaced, numbered in the
+# order the payloads arrived: the number is reserved the moment one arrives, one past the
+# highest already there, by a hard link to an empty file of ours (`ln -n` neither replaces
+# nor follows what is at a name, so a taken number moves on to the next). The clock plays no
+# part in the order, so no clock resolution or process id can put an older payload first
+# (#398 audit). The record is filled in place before their command runs; the app reads the
+# highest number and treats one not yet complete as no reading. After, only this script's
+# own records numbered below it are removed, by name, with `rm -f`: a link goes, never what
+# it points at.
+if tmp=$(mktemp "$dir/.claude-statusline-in.XXXXXX" 2>/dev/null) && out=$(mktemp "$dir/.claude-statusline.XXXXXX" 2>/dev/null); then
+  seq=0
+  for old in "$dir"/claude-statusline.*.json; do
+    n=${old#"$dir"/claude-statusline.}
+    n=${n%.json}
+    case $n in ''|*[!0-9]*) continue ;; esac
+    [ "$n" -ge "$seq" ] 2>/dev/null && seq=$((n + 1))
+  done
+  tries=0
+  until ln -n "$out" "$dir/claude-statusline.$seq.json" 2>/dev/null; do
+    seq=$((seq + 1))
+    tries=$((tries + 1))
+    [ "$tries" -ge 64 ] && { seq=; break; }
+  done
+  if cat > "$tmp"; then
+    if [ -n "$seq" ] \
+      && { printf '{"at":%s,"configDir":"%s","payload":' "$(date +%s)" "$cfg"; cat "$tmp"; printf '}\n'; } > "$out"; then
+      for old in "$dir"/claude-statusline.*.json; do
+        n=${old#"$dir"/claude-statusline.}
+        n=${n%.json}
+        case $n in ''|*[!0-9]*) continue ;; esac
+        [ "$n" -lt "$seq" ] 2>/dev/null && rm -f "$old"
       done
-    else
-      rm -f "$out"
+    elif [ -n "$seq" ]; then
+      rm -f "$dir/claude-statusline.$seq.json"
+    fi
+    rm -f "$out"
+    if [ -s "$chain" ]; then
+      sh -c "$(cat "$chain")" < "$tmp"
+    fi
+    rm -f "$tmp"
+  else
+    [ -n "$seq" ] && rm -f "$dir/claude-statusline.$seq.json"
+    rm -f "$out" "$tmp"
+    if [ -s "$chain" ]; then
+      sh -c "$(cat "$chain")"
     fi
   fi
-  if [ -s "$chain" ]; then
-    sh -c "$(cat "$chain")" < "$tmp"
-  fi
-  rm -f "$tmp"
 else
   [ -n "$tmp" ] && rm -f "$tmp"
   if [ -s "$chain" ]; then

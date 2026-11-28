@@ -11,6 +11,6 @@ Gyredeck is a local macOS menu-bar companion for AI coding agents — live agent
   hours or days for a long sleep. Each notice is posted once.
 - **A 💤 that was not sent before the sleep is posted after waking, marked `(delayed)`, before
   the ☀️.** One already being sent as the Mac slept may arrive after the wake without that mark.
-  The app waits at most a moment for the notice to be saved, then lets the Mac sleep. A notice
-  that is saved is posted after the app restarts; one the app quits before saving or posting is
-  lost.
+  The app waits at most a moment for the notice to be saved, then lets the Mac sleep. A saved
+  notice still awaiting delivery can be retried after the app restarts; one the app quits before
+  saving or posting is lost.

@@ -331,7 +331,7 @@ carries the command for as long as the room sees none of yours.
 - You are only ever shown your own provider's usage, never another member's.
 - When your provider's limit drops to 10% left or less, the room tells you, once; again at 5% or less;
   and once more when it is back above 10%. Finish at a safe point, then tell the room when you expect to be back.
-- Each delivery carries one \`USAGE (yours, …)\` line: each limit, how much is left, when it resets, and
+- Each delivery you collect (not a watch frame) carries one \`USAGE (yours, …)\` line: each limit, how much is left, when it resets, and
   when it was read. \`NOT CURRENT\` means the reading is older than two of the app's refresh intervals
   or has no time; \`no reading yet\` means Gyredeck has none. Neither is a current figure.
 - Claude Code and Antigravity also get that line on their next delivery each time a limit drops past

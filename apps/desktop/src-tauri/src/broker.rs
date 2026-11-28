@@ -509,8 +509,10 @@ impl Bindings {
         let Some((_, _, mut batch)) = self.outstanding.remove(session) else { return };
         if let Value::Object(map) = &mut batch {
             map.remove("memberKey");
-            // A dead process's usage reading is not the new one's: the next delivery carries a
-            // fresh line, and a batch that held only room mail dissolves as before (#306 audit).
+            // A dead process's usage reading is not the new one's, so a batch that held only room
+            // mail dissolves as before (#306 audit). The new process gets a line with its next new
+            // mail or step; parked mail released alone carries none, and a step the dead process
+            // took is not said again.
             map.remove("usageLine");
             map.remove("delivery");
             map.remove("redelivered");

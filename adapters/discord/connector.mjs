@@ -55,6 +55,7 @@ const STATUS_WAIT_MS = 10_000;
 const STATUS_ROOMS_SHOWN = 25;
 const STATUS_MAX_CHARS = 1900;
 const OWNER_CHANGED = "No status was shown: the paired owner changed while it was asked.";
+const USAGE_OWNER_CHANGED = "No usage was shown: the paired owner changed while it was asked.";
 /** How long /usage waits for the app's refresh, which asks every provider (#396). */
 const USAGE_WAIT_MS = 60_000;
 const USAGE_UNAVAILABLE = "Usage is not available right now.";
@@ -842,7 +843,7 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
     await c.defer({ ephemeral: true });
     const requestId = randomBytes(8).toString("hex");
     const timer = clock.setTimeout(() => statusDone(requestId, USAGE_UNAVAILABLE), USAGE_WAIT_MS);
-    statusAsked.set(requestId, { c, scope: {}, timer, askedBy: c.userId, at: clock.now() });
+    statusAsked.set(requestId, { c, scope: {}, timer, askedBy: c.userId, at: clock.now(), usage: true });
     send({ t: "usage_request", requestId, ownerId: c.userId });
   }
   function usageAnswer(msg) {
@@ -1963,7 +1964,7 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
         ownerId = msg.ownerId ?? null;
         cancelOthers();
         // A status asked by the old owner is never shown after a re-pair (#206 audit).
-        for (const [id, asked] of [...statusAsked]) if (asked.askedBy !== ownerId) statusDone(id, OWNER_CHANGED);
+        for (const [id, asked] of [...statusAsked]) if (asked.askedBy !== ownerId) statusDone(id, asked.usage ? USAGE_OWNER_CHANGED : OWNER_CHANGED);
         if (awaitingOwner && msg.round === awaitingOwner.round && msg.ownerId === awaitingOwner.userId) {
           awaitingOwner.reply?.("Paired with Gyredeck.")?.catch?.(() => {});
           awaitingOwner = null;
@@ -2112,7 +2113,7 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
     if (sweepTimer) clock.clearTimeout(sweepTimer);
     if (incomingTimer) clock.clearTimeout(incomingTimer);
     if (settleTimer) clock.clearTimeout(settleTimer);
-    for (const id of [...statusAsked.keys()]) statusDone(id, "Status is not available right now.");
+    for (const [id, asked] of [...statusAsked]) statusDone(id, asked.usage ? USAGE_UNAVAILABLE : "Status is not available right now.");
     settleTimer = null;
     sweepTimer = null;
     releaseReady();

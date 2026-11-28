@@ -2475,9 +2475,7 @@ pub(crate) trait RoomActs: Send + Sync {
     /// Publish as [`OWNER_SENDER`], vouched by the app's word. Answers the seq.
     fn post_owner(&self, room: &str, post: &OwnerPost, app_word: &str) -> Result<u64, Refused>;
     /// Every provider's usage refreshed now, as the Usage panel refreshes it (#396).
-    fn refresh_usage(&self) -> Vec<UsageRefresh> {
-        Vec::new()
-    }
+    fn refresh_usage(&self) -> Vec<UsageRefresh>;
 }
 
 /// One provider's refresh for `/usage` (#396): what it answered — the snapshot and whether it
@@ -2494,9 +2492,11 @@ pub(crate) struct UsageRefresh {
 /// left or used, as the app's Usage mode says; reset times and the reading's time are the
 /// child's to word.
 fn usage_entry(refresh: UsageRefresh, mode: crate::local_usage::UsageMode) -> serde_json::Value {
+    // A kept placeholder with no numbers (a first fetch that met a 429) is no reading: the last
+    // one stands in for it, as for a failure (#396 audit S6).
     let (snapshot, current) = match refresh.refreshed {
-        Ok((snapshot, fresh)) => (Some(snapshot), fresh),
-        Err(_) => (refresh.last, false),
+        Ok((snapshot, fresh)) if fresh || crate::has_usage_numbers(&snapshot) => (Some(snapshot), fresh),
+        _ => (refresh.last, false),
     };
     let Some(snapshot) = snapshot else {
         return serde_json::json!({ "display": refresh.display, "current": false, "lines": [] });

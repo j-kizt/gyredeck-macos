@@ -1561,14 +1561,38 @@ async fn codex_usage() -> Result<CodexUsageSnapshot, String> {
 
 /// The last reading each provider's refresh answered, for `/usage` to show — marked as not
 /// current — when a later refresh fails (#396).
-static LAST_USAGE: OnceLock<Mutex<HashMap<&'static str, CodexUsageSnapshot>>> = OnceLock::new();
+static LAST_USAGE: OnceLock<Mutex<HashMap<&'static str, LastUsage>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct LastUsage {
+    snapshot: CodexUsageSnapshot,
+    fresh: bool,
+    at: Instant,
+}
+
+/// Claude's usage endpoint answers 429 when asked faster than about every 3 minutes
+/// (features/usage/settings.ts), and a 429 holds back the panel's next refresh too. `/usage`
+/// asked sooner after a fresh reading shows that reading instead of asking (#396 audit M2).
+const CLAUDE_ON_DEMAND_MIN_GAP: Duration = Duration::from_secs(180);
+
+/// Whether a snapshot carries any numbers, rather than a status line alone.
+pub(crate) fn has_usage_numbers(snapshot: &CodexUsageSnapshot) -> bool {
+    snapshot.lines.iter().any(|line| matches!(line, CodexMetricLine::Progress { .. }))
+}
+
+fn last_usage(provider: &str) -> Option<LastUsage> {
+    LAST_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock().ok().and_then(|guard| guard.get(provider).cloned())
+}
 
 /// One provider's refresh as the panel and `/usage` both take it (#396): the snapshot and
 /// whether it was read just now, remembered as that provider's last reading.
 fn remember_usage(provider: &'static str, refreshed: Result<(CodexUsageSnapshot, bool), String>) -> Result<(CodexUsageSnapshot, bool), String> {
-    if let Ok((snapshot, _)) = &refreshed {
-        if let Ok(mut guard) = LAST_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
-            guard.insert(provider, snapshot.clone());
+    if let Ok((snapshot, fresh)) = &refreshed {
+        // A placeholder with no numbers is never kept as a last reading (#396 audit S6).
+        if has_usage_numbers(snapshot) {
+            if let Ok(mut guard) = LAST_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+                guard.insert(provider, LastUsage { snapshot: snapshot.clone(), fresh: *fresh, at: Instant::now() });
+            }
         }
     }
     refreshed
@@ -1577,7 +1601,7 @@ fn remember_usage(provider: &'static str, refreshed: Result<(CodexUsageSnapshot,
 /// Every provider refreshed now, in parallel, each with its last reading when the refresh
 /// failed (#396). The same refreshes the panel runs, relayed the same way.
 fn refresh_all_usage() -> Vec<discord::UsageRefresh> {
-    refresh_usage_from(&[("claude", "Claude Code", claude_refresh), ("codex", "Codex", codex_refresh), ("agy", "Antigravity", agy_refresh)])
+    refresh_usage_from(&[("claude", "Claude Code", claude_refresh_on_demand), ("codex", "Codex", codex_refresh), ("agy", "Antigravity", agy_refresh)])
 }
 
 type UsageRun = (&'static str, &'static str, fn() -> Result<(CodexUsageSnapshot, bool), String>);
@@ -1588,9 +1612,8 @@ fn refresh_usage_from(runs: &[UsageRun]) -> Vec<discord::UsageRefresh> {
         .into_iter()
         .map(|(id, display, handle)| {
             let refreshed = handle.join().unwrap_or_else(|_| Err(format!("{display} usage task failed")));
-            let last = refreshed.is_err().then(|| {
-                LAST_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock().ok().and_then(|guard| guard.get(id).cloned())
-            }).flatten();
+            let answered_now = matches!(&refreshed, Ok((snapshot, fresh)) if *fresh || has_usage_numbers(snapshot));
+            let last = if answered_now { None } else { last_usage(id).map(|last| last.snapshot) };
             discord::UsageRefresh { display: display.to_string(), refreshed, last }
         })
         .collect()
@@ -1799,6 +1822,24 @@ async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
 }
 
 fn claude_refresh() -> Result<(CodexUsageSnapshot, bool), String> {
+    claude_refresh_with(true)
+}
+
+/// Claude for `/usage`: a fresh reading under three minutes old is shown as it is, and the
+/// endpoint is not asked again; the history it would wait on is never shown, so it is not read
+/// (#396 audit M2, S3).
+fn claude_refresh_on_demand() -> Result<(CodexUsageSnapshot, bool), String> {
+    if let Some(snapshot) = recent_fresh_usage("claude", CLAUDE_ON_DEMAND_MIN_GAP) {
+        return Ok((snapshot, true));
+    }
+    claude_refresh_with(false)
+}
+
+fn recent_fresh_usage(provider: &str, gap: Duration) -> Option<CodexUsageSnapshot> {
+    last_usage(provider).filter(|last| last.fresh && last.at.elapsed() < gap).map(|last| last.snapshot)
+}
+
+fn claude_refresh_with(history: bool) -> Result<(CodexUsageSnapshot, bool), String> {
     remember_usage("claude", {
         let candidates = load_claude_auth_candidates();
         let first = candidates.iter().find(|auth| claude_can_fetch_live_usage(auth));
@@ -1817,7 +1858,9 @@ fn claude_refresh() -> Result<(CodexUsageSnapshot, bool), String> {
             || claude_usage_blocking(candidates),
         )
         .map(|mut reading| {
-            append_claude_local_usage(&mut reading.snapshot);
+            if history {
+                append_claude_local_usage(&mut reading.snapshot);
+            }
             relay_if_fresh(reading, relay_usage)
         })
     })
@@ -7138,6 +7181,52 @@ mod display_selection_tests {
         let last = answer[0].last.as_ref().expect("the last reading is kept for a failed refresh");
         assert_eq!(last.fetched_at, "2026-11-28T04:58:00Z");
         assert!(answer[1].last.is_none(), "nothing made up for a provider never read");
+    }
+
+    /// #396 audit M2/S6: `/usage` reuses a fresh reading taken inside the gap instead of asking
+    /// Claude again; a kept or expired one is asked for; a placeholder with no numbers is never
+    /// remembered, so it neither stands in later nor hides the last real reading.
+    #[test]
+    fn on_demand_usage_reuses_only_a_recent_fresh_reading_and_never_keeps_a_placeholder() {
+        fn reading(lines: Vec<CodexMetricLine>) -> CodexUsageSnapshot {
+            CodexUsageSnapshot {
+                provider_id: "claude".to_string(),
+                display_name: "Claude Code".to_string(),
+                plan: None,
+                lines,
+                fetched_at: "2026-11-28T05:00:00Z".to_string(),
+                source: UsageSource::Api,
+            }
+        }
+        let real = || reading(vec![progress_metric("Session", 15.0, None, None)]);
+        let _ = remember_usage("test-396-m2", Ok((real(), true)));
+        assert!(recent_fresh_usage("test-396-m2", Duration::from_secs(180)).is_some(), "a fresh reading inside the gap is reused");
+        assert!(recent_fresh_usage("test-396-m2", Duration::ZERO).is_none(), "past the gap it is asked for again");
+        let _ = remember_usage("test-396-m2-kept", Ok((real(), false)));
+        assert!(recent_fresh_usage("test-396-m2-kept", Duration::from_secs(180)).is_none(), "a kept reading is never reused as current");
+
+        let _ = remember_usage("test-396-s6", Ok((real(), true)));
+        let _ = remember_usage("test-396-s6", Ok((reading(vec![]), false)));
+        let kept = last_usage("test-396-s6").expect("the real reading is still the last one");
+        assert!(has_usage_numbers(&kept.snapshot), "a placeholder did not replace it");
+        let _ = remember_usage("test-396-s6-only", Ok((reading(vec![]), false)));
+        assert!(last_usage("test-396-s6-only").is_none(), "a placeholder alone is never remembered");
+
+        fn placeholder() -> Result<(CodexUsageSnapshot, bool), String> {
+            remember_usage("test-396-s6", Ok((
+                CodexUsageSnapshot {
+                    provider_id: "claude".to_string(),
+                    display_name: "Claude Code".to_string(),
+                    plan: None,
+                    lines: vec![],
+                    fetched_at: String::new(),
+                    source: UsageSource::Api,
+                },
+                false,
+            )))
+        }
+        let answer = refresh_usage_from(&[("test-396-s6", "Claude Code", placeholder)]);
+        assert!(answer[0].last.as_ref().is_some_and(has_usage_numbers), "a placeholder answer is backed by the last real reading");
     }
 
     #[test]

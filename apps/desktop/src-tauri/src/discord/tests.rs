@@ -1760,6 +1760,9 @@ impl RoomActs for LiveActs {
     fn post_owner(&self, room: &str, post: &OwnerPost, app_word: &str) -> Result<u64, Refused> {
         post_owner_to(&self.target, room, post, app_word)
     }
+    fn refresh_usage(&self) -> Vec<UsageRefresh> {
+        Vec::new()
+    }
 }
 
 struct LiveBridge {
@@ -7031,12 +7034,24 @@ fn usage_refreshes_before_answering_and_nothing_reaches_a_room() {
     f.state.connect(ROOM, APP_WORD).unwrap();
     connected(&f, ROOM, THREAD);
     *f.acts.usage.lock().unwrap() = vec![usage_refresh(Ok((usage_snapshot(crate::UsageSource::Api, 30.0, "2026-11-28T05:41:00Z"), true)), None)];
+    // The writer thread drains hello and connect on its own time: count only once both are out.
+    wait_until("hello and connect written", || {
+        let lines = buffer.lines();
+        !of_kind(&lines, "hello").is_empty() && !of_kind(&lines, "connect").is_empty()
+    });
     let lines_before = buffer.lines().len();
     let answer = usage_ask(&f, &buffer, OWNER_ID);
     assert_eq!(f.acts.usage_refreshes.load(Ordering::SeqCst), 1, "the app refreshed before it answered");
     assert!(answer.get("error").is_none(), "{answer}");
     assert_eq!(answer["providers"][0]["display"], "Codex");
     assert_eq!(answer["providers"][0]["current"], true);
+    // The keys the connector reads (#396 audit S1): a renamed one would leave the answer blank.
+    for key in ["display", "plan", "source", "fetchedAt", "current", "lines"] {
+        assert!(answer["providers"][0].get(key).is_some(), "provider key {key}: {answer}");
+    }
+    for key in ["label", "pct", "resetsAt"] {
+        assert!(answer["providers"][0]["lines"][0].get(key).is_some(), "line key {key}: {answer}");
+    }
     assert!(f.acts.posts.lock().unwrap().is_empty(), "nothing published to the room, so no agent reads it");
     let after: Vec<String> = buffer.lines().into_iter().skip(lines_before).filter_map(|m| m["t"].as_str().map(str::to_string)).collect();
     assert_eq!(after, ["usage"], "the only line to the child is the answer itself");

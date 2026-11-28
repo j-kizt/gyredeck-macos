@@ -4423,6 +4423,20 @@ test("#396 a provider that could not refresh shows its last reading with its tim
   await c.close();
 });
 
+test("#396 audit S2: /usage cut off by a re-pair or a close says so in usage words, never /status ones", async () => {
+  const { c, fake, of } = await ownerRoom();
+  const repaired = await askUsage(fake, "C-GENERAL");
+  c.handle({ t: "owner", ownerId: "U-NEW-OWNER" });
+  await flush();
+  assert.deepEqual(repaired.edits.map((e) => e.content), ["No usage was shown: the paired owner changed while it was asked."]);
+  c.handle({ t: "owner", ownerId: OWNER });
+  await flush();
+  const closed = await askUsage(fake, "C-GENERAL");
+  assert.equal(of("usage_request").length, 2);
+  await c.close();
+  assert.deepEqual(closed.edits.map((e) => e.content), ["Usage is not available right now."]);
+});
+
 test("#396 /usage shows percent used when the app's Usage mode says Used", async () => {
   const { c, fake, of, clock } = await ownerRoom();
   const answer = await askUsage(fake, "C-GENERAL");

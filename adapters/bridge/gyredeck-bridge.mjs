@@ -1270,7 +1270,9 @@ export const CODEX_PUSH_MAX_BYTES = 98_304;
  * payload measured when a message was accepted grows when somebody else joins. A room is
  * capped at `MAIL_MAX_MEMBERS` sessions plus one Discord relay; that whole roster at the
  * longest names a session can declare measured 1,136 bytes (#456), and this reserve is kept
- * well above it as headroom rather than as a calculation that has to be right.
+ * well above it as headroom rather than as a calculation that has to be right. The push also
+ * carries the recipient's usage line (#306): about 1.7 KB at sixteen limits with long labels,
+ * which still fits beside the full roster.
  */
 export const CODEX_PUSH_ENVELOPE_RESERVE = 4_096;
 

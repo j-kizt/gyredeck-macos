@@ -10,17 +10,26 @@ dir="$HOME/.config/gyredeck"
 chain="$dir/claude-statusline.chain"
 cfg=$(printf '%s' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" | sed 's/\\/\\\\/g; s/"/\\"/g')
 # mktemp creates each file itself, exclusively, so nothing planted at a guessable name is
-# followed.
+# followed. The record is written before their command runs and is timed when the payload
+# arrived, and a record never replaces one received later: a slow command of theirs, or a
+# second session updating at the same moment, cannot put an older payload over a newer one
+# under a newer time (#398 audit).
 if tmp=$(mktemp "$dir/.claude-statusline-in.XXXXXX" 2>/dev/null) && cat > "$tmp"; then
-  if [ -s "$chain" ]; then
-    sh -c "$(cat "$chain")" < "$tmp"
-  fi
+  at=$(date +%s)
   if out=$(mktemp "$dir/.claude-statusline.XXXXXX" 2>/dev/null); then
-    if { printf '{"at":%s,"configDir":"%s","payload":' "$(date +%s)" "$cfg"; cat "$tmp"; printf '}\n'; } > "$out"; then
-      mv -f "$out" "$dir/claude-statusline.json" 2>/dev/null || rm -f "$out"
+    if { printf '{"at":%s,"configDir":"%s","payload":' "$at" "$cfg"; cat "$tmp"; printf '}\n'; } > "$out"; then
+      prev=$(sed -n '1s/^{"at":\([0-9][0-9]*\),.*/\1/p' "$dir/claude-statusline.json" 2>/dev/null)
+      if [ -z "$prev" ] || [ "$prev" -le "$at" ]; then
+        mv -f "$out" "$dir/claude-statusline.json" 2>/dev/null || rm -f "$out"
+      else
+        rm -f "$out"
+      fi
     else
       rm -f "$out"
     fi
+  fi
+  if [ -s "$chain" ]; then
+    sh -c "$(cat "$chain")" < "$tmp"
   fi
   rm -f "$tmp"
 else

@@ -1206,6 +1206,51 @@ mod tests {
         }
     }
 
+    /// A slow status line of theirs held an older payload's record until after a newer one
+    /// was written, then put it over the newer one under a later time (#398 audit, seq 320).
+    #[test]
+    fn c6_an_older_claude_payload_never_replaces_a_newer_record() {
+        let root = scratch("claude-order");
+        let home = root.join("home");
+        let paths = paths_for(&root, &CLAUDE);
+        let hold = root.join("hold");
+        write_settings(&paths, &serde_json::json!({ "statusLine": running(&CLAUDE,
+            "while [ -n \"$HOLD\" ] && [ -f \"$HOLD\" ]; do sleep 0.05; done; head -c 3") }));
+        install(&paths, &script_source_for(&CLAUDE)).unwrap();
+        let recorded = || -> Value { serde_json::from_slice(&fs::read(paths.payload()).unwrap()).unwrap() };
+
+        fs::write(&hold, "").unwrap();
+        let mut older = Command::new("sh")
+            .arg(paths.script())
+            .env("HOME", &home)
+            .env("HOLD", &hold)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        older.stdin.take().unwrap().write_all(&bytes(&payload(T0))).unwrap();
+        let waited = std::time::Instant::now();
+        while !paths.payload().exists() && waited.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(1_100));
+        let (code, _) = run_script(&paths, &home, &bytes(&payload(T0 + 60)));
+        assert_eq!(code, 0);
+        assert_eq!(recorded()["payload"], payload(T0 + 60), "premise: the newer payload is recorded");
+        fs::remove_file(&hold).unwrap();
+        assert_eq!(older.wait().unwrap().code(), Some(0));
+        assert_eq!(recorded()["payload"], payload(T0 + 60), "the held older payload did not come back over it");
+
+        // A record received later is never replaced, whoever writes last.
+        let later = unix_now() + 1_000;
+        let mut kept = recorded();
+        kept["at"] = later.into();
+        fs::write(paths.payload(), serde_json::to_vec(&kept).unwrap()).unwrap();
+        run_script(&paths, &home, &bytes(&payload(T0)));
+        assert_eq!(recorded()["at"], later, "an earlier arrival leaves the later record");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn c6_a_config_dir_with_quotes_is_kept_as_valid_json() {
         let root = scratch("cfg-quote");

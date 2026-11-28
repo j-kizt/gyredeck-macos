@@ -509,6 +509,11 @@ impl Bindings {
         let Some((_, _, mut batch)) = self.outstanding.remove(session) else { return };
         if let Value::Object(map) = &mut batch {
             map.remove("memberKey");
+            // A dead process's usage reading is not the new one's, so a batch that held only room
+            // mail dissolves as before (#306 audit). The new process gets a line with its next new
+            // mail or step; parked mail released alone carries none, and a step the dead process
+            // took is not said again.
+            map.remove("usageLine");
             map.remove("delivery");
             map.remove("redelivered");
             let from_mailbox = |entry: &Value| entry.get("room").and_then(Value::as_str) == Some(session);
@@ -641,8 +646,9 @@ fn refused(error: &str, message: String) -> Value {
 /// The bridge's own rule for a mailbox name (`MAIL_ROOM_NAME`): a bind the bridge would
 /// not serve must not succeed here either.
 /// The notices a collect answer may carry beside its mail: said once by the bridge, and
-/// gone from it once said (#259).
-const NOTICES: [&str; 2] = ["heavyNotice", "usageNotice"];
+/// gone from it once said (#259). `usageLine` alone is a 10-point step the bridge has marked
+/// said (#306 audit M1).
+const NOTICES: [&str; 3] = ["heavyNotice", "usageNotice", "usageLine"];
 
 fn listed(answer: &Value, key: &str) -> bool {
     answer.get(key).and_then(Value::as_array).is_some_and(|list| !list.is_empty())
@@ -2095,6 +2101,7 @@ mod tests {
     fn a_notice_is_carried_like_mail() {
         assert!(carries(&json!({ "messages": [], "heavyNotice": "HEAVY RUNS: x" })), "the heavy line alone");
         assert!(carries(&json!({ "messages": [], "usageNotice": "USAGE: x" })), "the usage line alone");
+        assert!(carries(&json!({ "messages": [], "usageLine": "USAGE (yours, Claude Code): x" })), "a step's own line alone (#306)");
         assert!(carries(&json!({ "messages": [{ "seq": 1 }] })));
         assert!(carries(&json!({ "messages": [], "missed": [{ "count": 1 }] })));
         assert!(!carries(&json!({ "messages": [] })), "an empty answer moved nothing");
@@ -2379,6 +2386,101 @@ mod tests {
         open_gate(&gates, 2);
         assert_eq!(resumed_bind.join().unwrap()["ok"], true);
         assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&resumed), &bindings, &policy)["messages"][0]["text"], "OWN");
+    }
+
+    #[test]
+    fn a_step_line_alone_survives_a_refusal_and_a_fresher_one_wins_on_a_wait() {
+        let bindings = Mutex::new(Bindings::default());
+        let chain = Arc::new(Mutex::new(true));
+        let round = Arc::new(Mutex::new(0u32));
+        let policy = Policy {
+            chain_holds: Arc::new({ let chain = Arc::clone(&chain); move |_| *chain.lock().unwrap() }),
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            collect: Arc::new({
+                let chain = Arc::clone(&chain);
+                let round = Arc::clone(&round);
+                move |_: &str, _, _| {
+                    let mut round = round.lock().unwrap();
+                    *round += 1;
+                    Ok(match *round {
+                        1 => { *chain.lock().unwrap() = false; json!({ "ok": true, "messages": [], "usageLine": "USAGE (yours, Claude Code): STEP" }) }
+                        3 => json!({ "ok": true, "messages": [{ "seq": 7, "text": "wakes it" }], "usageLine": "USAGE (yours, Claude Code): FRESH" }),
+                        _ => json!({ "ok": true, "messages": [] }),
+                    })
+                }
+            }),
+            ..policy_accepting_everything()
+        };
+        let claude = peer(42, 40, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&claude), &bindings, &policy)["ok"], true);
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy)["error"], "unattested");
+        *chain.lock().unwrap() = true;
+        let waited = ask(json!({ "v": 1, "collect": { "wakingOnly": true } }), Some(&claude), &bindings, &policy);
+        assert!(waited.get("usageLine").is_none(), "#306 a wait is not handed the step line alone: {waited}");
+        let woke = ask(json!({ "v": 1, "collect": { "wakingOnly": true } }), Some(&claude), &bindings, &policy);
+        assert_eq!(woke["usageLine"], "USAGE (yours, Claude Code): FRESH", "#306 the fresher line wins over the held one: {woke}");
+        assert_eq!(ask(json!({ "v": 1, "ack": { "delivery": woke["delivery"] } }), Some(&claude), &bindings, &policy)["ok"], true);
+        assert!(bindings.lock().unwrap().outstanding_for("s1").is_none());
+    }
+
+    #[test]
+    fn a_step_line_alone_refused_after_the_collect_is_redelivered_to_a_plain_collect() {
+        let bindings = Mutex::new(Bindings::default());
+        let chain = Arc::new(Mutex::new(true));
+        let round = Arc::new(Mutex::new(0u32));
+        let policy = Policy {
+            chain_holds: Arc::new({ let chain = Arc::clone(&chain); move |_| *chain.lock().unwrap() }),
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            collect: Arc::new({
+                let chain = Arc::clone(&chain);
+                let round = Arc::clone(&round);
+                move |_: &str, _, _| {
+                    let mut round = round.lock().unwrap();
+                    *round += 1;
+                    Ok(match *round {
+                        1 => { *chain.lock().unwrap() = false; json!({ "ok": true, "messages": [], "usageLine": "USAGE (yours, Claude Code): STEP" }) }
+                        _ => json!({ "ok": true, "messages": [] }),
+                    })
+                }
+            }),
+            ..policy_accepting_everything()
+        };
+        let claude = peer(42, 40, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&claude), &bindings, &policy)["ok"], true);
+        assert_eq!(ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy)["error"], "unattested");
+        *chain.lock().unwrap() = true;
+        let again = ask(json!({ "v": 1, "collect": {} }), Some(&claude), &bindings, &policy);
+        assert_eq!(again["usageLine"], "USAGE (yours, Claude Code): STEP", "#306: the step line comes back: {again}");
+        assert_eq!(again["redelivered"], true);
+        assert_eq!(*round.lock().unwrap(), 1, "the bridge was not asked again");
+    }
+
+    #[test]
+    fn an_earlier_process_usage_line_is_dropped_so_the_new_process_gets_its_mail_first() {
+        let bindings = Mutex::new(Bindings::default());
+        let dead = Arc::new(Mutex::new(vec![]));
+        let asked = Arc::new(Mutex::new(0u32));
+        let answers = Arc::new(Mutex::new(vec![
+            json!({ "ok": true, "messages": [{ "room": "room-x", "seq": 8, "text": "NEW-MAIL" }], "usageLine": "USAGE FRESH", "room": "room-x", "roomInstance": "i-1", "members": [{ "you": true, "confirmed": true }] }),
+            json!({ "ok": true, "messages": [{ "room": "room-x", "seq": 7, "text": "ROOM-MAIL" }], "usageLine": "USAGE OLD", "room": "room-x", "roomInstance": "i-1", "members": [{ "you": true, "confirmed": true }] }),
+        ]));
+        let policy = Policy {
+            collect: Arc::new({ let answers = Arc::clone(&answers); let asked = Arc::clone(&asked); move |_: &str, _, _| { *asked.lock().unwrap() += 1; Ok(answers.lock().unwrap().pop().unwrap()) } }),
+            alive: Arc::new({ let dead = Arc::clone(&dead); move |key: ProcessKey| !dead.lock().unwrap().contains(&key.pid) }),
+            eligible: Arc::new(|_: &Peer| Ok(KnownCli::Claude)),
+            ..policy_accepting_everything()
+        };
+        let first = peer(42, 40, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&first), &bindings, &policy)["ok"], true);
+        let taken = ask(json!({ "v": 1, "collect": {} }), Some(&first), &bindings, &policy);
+        assert_eq!(taken["messages"][0]["text"], "ROOM-MAIL");
+        dead.lock().unwrap().push(40);
+        let resumed = peer(62, 60, "claude");
+        assert_eq!(ask(json!({ "v": 1, "bind": { "conversationId": "s1" } }), Some(&resumed), &bindings, &policy)["ok"], true);
+        let handed = ask(json!({ "v": 1, "collect": {} }), Some(&resumed), &bindings, &policy);
+        assert_eq!(*asked.lock().unwrap(), 2, "#306 audit r3: the resumed process's first collect reaches the bridge");
+        assert_eq!(handed["messages"][0]["text"], "ROOM-MAIL", "#306 audit r3: and is handed its mail");
+        assert_eq!(handed["usageLine"], "USAGE FRESH", "#306 audit r3: with the fresh line, never the dead process's: {handed}");
     }
 
     #[test]

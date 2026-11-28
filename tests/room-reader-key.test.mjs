@@ -727,7 +727,8 @@ test("#403 claim 4: keyless notices are a session in no room's, and spend none o
     assert.match(loner.heavyNotice ?? "", /^HEAVY RUNS/, "and the heavy runs");
     const joiner = await own(JOINER);
     assert.match(joiner.heavyNotice ?? "", /^HEAVY RUNS/, "the member's own read still carries the line its confirmation owes");
-    assert.equal(joiner.usageNotice, undefined, "a member's usage is the room's to tell, as before");
+    assert.match(joiner.usageNotice ?? "", /^USAGE \(yours\): ask Gyredeck/, "the member's own read carries the usage intro its confirmation owes (#306)");
+    assert.doesNotMatch(joiner.usageNotice, /ingest-token/, "the room's intro, not the one for a session in no room");
   } finally {
     await h.stop();
   }

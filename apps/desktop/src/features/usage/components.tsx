@@ -477,7 +477,7 @@ const SettingsPanel = ({ settings, onChange }: ISettingsPanelProps) => {
       </div>
       {group(
         "Auto refresh",
-        "How often usage is refreshed. Each refresh asks the provider, and a newer reading from an agent’s own status line or log is shown in its place.",
+        "How often usage is refreshed. Each refresh asks the provider when it can, and a newer reading from an agent’s own status line or log is shown in its place.",
         <Segment
           value={`${settings.refreshMs}`}
           onChange={(value) => set({ refreshMs: Number(value) })}

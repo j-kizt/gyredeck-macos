@@ -401,7 +401,9 @@ const NO_KEY_STEP =
   " command; answer this mail then. If none comes, tell the person at this terminal; nothing you send by hand" +
   " without the key would be accepted.";
 
-const replyForWait = async (result) => {
+// `self` is the id the wait was started with, already checked against the broker's `boundTo` or
+// sent as the bridge's `as=`: a post is in this session's name, never the room's (#358 reopened).
+const replyForWait = async (result, self) => {
   const room = typeof result?.room === "string" ? result.room : null;
   const members = new Map((Array.isArray(result?.members) ? result.members : []).map((m) => [m?.conversationId, m]));
   const answering = (Array.isArray(result?.messages) ? result.messages : [])
@@ -411,7 +413,7 @@ const replyForWait = async (result) => {
   const me = [...members.values()].find((m) => m?.you === true);
   if (!room || !answering || (me && me.confirmed !== true)) return {};
   const reply = replyInstruction(
-    await readEndpoint(), room, [room], answering,
+    await readEndpoint(), self, [room], answering,
     // The member's label from the roster as it is now, as the prompt-time delivery does: a
     // message's `fromShown` is the name it was sent under, and may have changed since (#358 audit).
     (m) => members.get(m.from)?.provider ?? m.from,
@@ -448,7 +450,7 @@ const waitForMail = async (secondsArg, expected) => {
       const reply = await getJsonStatus(endpoint, token, `/mail/wait?as=${expected}&timeout=${remainingSeconds}&collect=1`, remainingMs() + 2_000);
       if (reply.status === 200 && wellFormedCollect(reply.body)) {
         if (reply.body.messages.length === 0 && (reply.body.missed ?? []).length === 0) return 4;
-        process.stdout.write(`${JSON.stringify({ ...reply.body, ...(await replyForWait(reply.body)) })}\n`);
+        process.stdout.write(`${JSON.stringify({ ...reply.body, ...(await replyForWait(reply.body, expected)) })}\n`);
         return 0;
       }
       if (reply.status === 403) return refused(`the bridge refused the read (${reply.body?.error ?? 403}): ${reply.body?.message ?? ""}`);
@@ -464,7 +466,7 @@ const waitForMail = async (secondsArg, expected) => {
     if (messages.length > 0 || missed.length > 0) {
       // Printed before it is acknowledged: a wait cut short here hands the batch over
       // again next time — a duplicate, never a loss.
-      process.stdout.write(`${JSON.stringify({ ok: true, timedOut: false, ...result, ...(await replyForWait(result)) })}\n`);
+      process.stdout.write(`${JSON.stringify({ ok: true, timedOut: false, ...result, ...(await replyForWait(result, expected)) })}\n`);
       await ackDelivery(result, remainingMs() + BROKER_DEADLINE_MS);
       return 0;
     }

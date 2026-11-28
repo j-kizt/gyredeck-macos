@@ -650,6 +650,9 @@ const plainDelivery = async (taken) => {
   if (typeof taken.result.missedNote === "string") lines.push(taken.result.missedNote.slice(0, MAIL_MAX_TEXT));
   if (typeof taken.result.usageNotice === "string") lines.push(taken.result.usageNotice.slice(0, MAIL_MAX_TEXT));
   if (typeof taken.result.heavyNotice === "string") lines.push(taken.result.heavyNotice.slice(0, MAIL_MAX_TEXT));
+  // The keyless hint is said on the turn that names the room just joined, or any keyless read
+  // of a session that had a key; for a session that never had one it would be noise on every turn.
+  if ((accepted || taken.result.keyLost === true) && typeof taken.result.hint === "string") lines.push(taken.result.hint.slice(0, MAIL_MAX_TEXT));
   return lines.length > 0 ? lines.join("\n\n") : null;
 };
 
@@ -743,9 +746,12 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   const usageNotice = typeof result?.usageNotice === "string" ? result.usageNotice.slice(0, MAIL_MAX_TEXT) : null;
   // And about the machine's heavy-run queue, once (#223).
   const heavyNotice = typeof result?.heavyNotice === "string" ? result.heavyNotice.slice(0, MAIL_MAX_TEXT) : null;
+  // Why only private mail came back (#403): on the turn that names the room just joined, or
+  // every keyless read of a session that had a key (the broker went away), even with nothing to deliver.
+  const hint = (justConfirmed || result?.keyLost === true) && typeof result?.hint === "string" ? result.hint.slice(0, MAIL_MAX_TEXT) : null;
   if (delivered.length === 0 && !justConfirmed) {
     await ackDelivery(result);
-    return [usageNotice, heavyNotice].filter(Boolean).join("\n\n") || null;
+    return [usageNotice, heavyNotice, hint].filter(Boolean).join("\n\n") || null;
   }
 
 
@@ -1077,6 +1083,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
 
   if (usageNotice) lines.push(usageNotice);
   if (heavyNotice) lines.push(heavyNotice);
+  if (hint) lines.push(hint);
   const text = lines.join("\n\n");
   await ackDelivery(result);
   return text;

@@ -1904,6 +1904,29 @@ const USED = Symbol("used");
 const isRoomsOwnVoice = (message) => message.from === ROOM_SENDER || message.kind === "notice";
 
 /**
+ * Private mail is a private mailbox's mail that is not the room's voice (#403): what a read
+ * without the member's key or the broker's word is shown. Such a read keeps no cursor of its
+ * own and moves none; it marks what it hands with HANDED instead. Behind a mailbox's one
+ * cursor, or marked, is handed — and every read, keyed or keyless, skips what was handed, so
+ * mail is handed once whichever read takes it first. PRIVATE_SEQ numbers private mail alone,
+ * so a keyless view shows no gap where the room's notices were left out.
+ */
+export const HANDED = Symbol("handed");
+export const PRIVATE_SEQ = Symbol("privateSeq");
+export const isPrivateMail = (message) => !isRoomsOwnVoice(message);
+export const handedIn = (room, message) => message.seq <= room.readSeq || message[HANDED] === true;
+/** Whether a message may go to make space: every reader has passed it, or, in a private mailbox, it was handed. */
+const spentIn = (room, safeUpTo, message) => message.seq <= safeUpTo || (room.members.size === 0 && message[HANDED] === true);
+/**
+ * Where the next message that may go sits, or -1. A shared room spends only from the front, behind
+ * every reader. A private mailbox spends handed mail wherever it sits (#403 audit r1): a room
+ * notice the keyless view never takes stays for the keyed read, and must not pin the mail behind it.
+ */
+const nextSpent = (room, safeUpTo) => room.members.size === 0
+  ? room.messages.findIndex((message) => spentIn(room, safeUpTo, message))
+  : room.messages.length > 0 && spentIn(room, safeUpTo, room.messages[0]) ? 0 : -1;
+
+/**
  * Past this many, a room's notices are dropped even while its Discord relay has not read
  * them: the bound the allowance exists for still holds, four times wider.
  */
@@ -1957,14 +1980,13 @@ export const trimRoomMessages = (room) => {
   const safeUpTo = slowestReaderSeq(room);
   let bytes = roomBytes(room);
   let dropped = 0;
-  while (
-    room.messages.length > 0 &&
-    room.messages[0].seq <= safeUpTo &&
-    (room.messages.length > MAIL_MAX_MESSAGES || bytes > MAIL_MAX_ROOM_BYTES)
-  ) {
-    const [gone] = room.messages.splice(0, 1);
+  while (room.messages.length > MAIL_MAX_MESSAGES || bytes > MAIL_MAX_ROOM_BYTES) {
+    const index = nextSpent(room, safeUpTo);
+    if (index < 0) break;
+    const [gone] = room.messages.splice(index, 1);
     bytes -= messageBytes(gone);
-    room.droppedThroughSeq = Math.max(room.droppedThroughSeq ?? 0, gone.seq);
+    // Handed past the cursor, it was not lost: no reader is to be told it missed it.
+    if (gone.seq <= safeUpTo) room.droppedThroughSeq = Math.max(room.droppedThroughSeq ?? 0, gone.seq);
     dropped += 1;
   }
   return dropped;
@@ -1991,8 +2013,12 @@ export const roomIsFull = (room, incomingBytes = 0) => {
   let bytes = roomBytes(room);
   for (const message of room.messages) {
     if (messages + 1 <= MAIL_MAX_MESSAGES && bytes + incomingBytes <= MAIL_MAX_ROOM_BYTES) break;
-    // Past here is owed to somebody, and no amount of need makes it spendable.
-    if (message.seq > safeUpTo) break;
+    // Past here is owed to somebody, and no amount of need makes it spendable — in a shared
+    // room. A private mailbox skips what is owed and spends handed mail behind it (nextSpent).
+    if (!spentIn(room, safeUpTo, message)) {
+      if (room.members.size === 0) continue;
+      break;
+    }
     messages -= 1;
     bytes -= messageBytes(message);
   }
@@ -5185,24 +5211,28 @@ function startBridge(config) {
       usageStateFor(as).low.set(tell.label, tell.low);
     }
   };
-  const usageStateFor = (conversationId) => {
-    let state = usageToldBySession.get(conversationId);
+  // What keyless reads were told (#403), apart from what the session's own reads were told: a
+  // keyless view is "no room" for everyone, and must not spend a member's real notices.
+  const usageToldKeyless = new Map();
+  const usageStateFor = (conversationId, keyless = false) => {
+    const told = keyless ? usageToldKeyless : usageToldBySession;
+    let state = told.get(conversationId);
     if (!state) {
       state = { introduced: false, low: new Map() };
-      usageToldBySession.set(conversationId, state);
+      told.set(conversationId, state);
     }
     return state;
   };
-  const usageNoticeFor = (conversationId) => {
+  const usageNoticeFor = (conversationId, keyless = false) => {
     const provider = usageProviderFor(conversationId);
-    if ((provider !== "claude" && provider !== "agy") || inConfirmedRoom(conversationId)) return null;
+    if ((provider !== "claude" && provider !== "agy") || (!keyless && inConfirmedRoom(conversationId))) return null;
     // Nothing to point at until the app has read this provider: the call would answer
     // null, and the intro is better kept for when it says something.
     const reading = usageByProvider.get(provider) ?? null;
     if (!reading) return null;
     const lowNow = (line) => line.leftPct <= USAGE_LOW_PCT;
     const describe = (line) => `${line.label} ${line.leftPct}% left${line.resetsAt ? `, resets ${line.resetsAt}` : ""}`;
-    const state = usageStateFor(conversationId);
+    const state = usageStateFor(conversationId, keyless);
     const told = state.low;
     if (!state.introduced) {
       state.introduced = true;
@@ -5212,7 +5242,7 @@ function startBridge(config) {
         `curl -s "http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}/usage?as=${conversationId}" ` +
         '-H "x-gyredeck-token: $(cat ~/.config/gyredeck/gyredeck.ingest-token)"' +
         // Handed only on a read that already passed the member's door, so the key is its own.
-        (typeof syncRoomFor(conversationId)?.room.members.get(conversationId)?.readKey === "string"
+        (!keyless && typeof syncRoomFor(conversationId)?.room.members.get(conversationId)?.readKey === "string"
           ? ` -H "x-gyredeck-member: ${syncRoomFor(conversationId).room.members.get(conversationId).readKey}"`
           : "") +
         (low.length > 0 ? ` — low now: ${low.map(describe).join("; ")}. Finish at a safe point.` : "");
@@ -5242,15 +5272,17 @@ function startBridge(config) {
    */
   const heavyTold = new Map();
   const HEAVY_TOLD_MAX = Number(process.env.GYREDECK_TEST_HEAVY_TOLD_MAX) || 10_000;
-  const heavyWasTold = (conversationId) => {
-    if (!heavyTold.has(conversationId)) return false;
-    heavyTold.delete(conversationId);
-    heavyTold.set(conversationId, true);
+  // Who keyless reads told (#403), kept apart so a keyless view never spends a member's own.
+  const heavyToldKeyless = new Map();
+  const heavyWasTold = (conversationId, told = heavyTold) => {
+    if (!told.has(conversationId)) return false;
+    told.delete(conversationId);
+    told.set(conversationId, true);
     return true;
   };
-  const markHeavyTold = (conversationId) => {
-    heavyTold.set(conversationId, true);
-    while (heavyTold.size > HEAVY_TOLD_MAX) heavyTold.delete(heavyTold.keys().next().value);
+  const markHeavyTold = (conversationId, told = heavyTold) => {
+    told.set(conversationId, true);
+    while (told.size > HEAVY_TOLD_MAX) told.delete(told.keys().next().value);
   };
   const heavyHint = (conversationId) =>
     `HEAVY RUNS: one at a time on this machine. Run ${HEAVY_COMMANDS.join(", ")} through ` +
@@ -5279,9 +5311,18 @@ function startBridge(config) {
     }
     return true;
   };
-  const heavyNoticeFor = (conversationId) => {
+  const heavyNoticeFor = (conversationId, keyless = false) => {
     const provider = usageProviderFor(conversationId);
     if (provider !== "claude" && provider !== "agy") return null;
+    // A keyless view is "no room" (#403): told once from its own record, never the confirmation's
+    // owed line, and the nudge read without being taken from the session's own reads.
+    if (keyless) {
+      const nudge = peekHeavyNudge(conversationId, provider);
+      if (heavyWasTold(conversationId, heavyToldKeyless)) return nudge;
+      markHeavyTold(conversationId, heavyToldKeyless);
+      const told = provider === "agy" ? heavyHintForAgy(conversationId) : heavyHint(conversationId);
+      return nudge ? `${told}\n\n${nudge}` : told;
+    }
     const nudge = takeHeavyNudge(conversationId, provider);
     // Owed by a confirmation (#259) comes before the told set: a session told outside a
     // room an hour ago, in a context since compacted, is told again on being let in.
@@ -5324,6 +5365,13 @@ function startBridge(config) {
     if (pattern === undefined) return null;
     heavyNudgePending.delete(conversationId);
     remember(heavyNudged, conversationId, true);
+    return heavyNudgeText(conversationId, pattern, provider);
+  };
+  const heavyNudgedKeyless = new Map();
+  const peekHeavyNudge = (conversationId, provider) => {
+    const pattern = heavyNudgePending.get(conversationId);
+    if (pattern === undefined || heavyNudgedKeyless.get(conversationId) === pattern) return null;
+    remember(heavyNudgedKeyless, conversationId, pattern);
     return heavyNudgeText(conversationId, pattern, provider);
   };
   const nudgeHeavySession = (conversationId, pattern) => {
@@ -6143,17 +6191,49 @@ function startBridge(config) {
     typeof member?.readKey === "string" && matchesIngestToken(member.readKey, req?.headers?.[MEMBER_KEY_HEADER]);
 
   /**
-   * The one door for a read made in the name of a session that is in a room (#274 audit):
-   * its inbox and wait, its private mailbox and that mailbox's stream. A member's mail is
-   * taken only by the broker's collect, which knows the process asking, or with the
-   * member's own key; the machine token is every agent's. Asked before anything is read or any position moves. A session in no
-   * room, and the relay (the app's own door), are not this door's to judge.
+   * The door for a post into a private mailbox in a room member's name (#274, #294): the
+   * broker's word or the member's own key. Reads no longer use it (#403): a refusal that only
+   * a member could get said which sessions are in a room — see `readsWithKey`.
    */
   const refuseMemberRead = (as, req) => {
     const member = syncRoomFor(as)?.room.members.get(as);
     if (!member || member.relay === true) return null;
     if (holdsBrokerSecret(req?.headers?.["x-gyredeck-broker"]) || holdsMemberKey(member, req)) return null;
     return { error: "not_your_key", message: MEMBER_KEY_HINT };
+  };
+
+  /**
+   * Whether a read in a session's name is keyed: the broker's word, the member's own key, or
+   * the relay, whose own door judged it (#403). Anything else — the machine token, which every
+   * agent holds — gets the keyless view, the same for a session in a room and one in none:
+   * its private mail only, numbered by PRIVATE_SEQ, the room never named, and KEYLESS_HINT.
+   */
+  const readsWithKey = (as, req) => {
+    if (holdsBrokerSecret(req?.headers?.["x-gyredeck-broker"])) return true;
+    const member = syncRoomFor(as)?.room.members.get(as);
+    return member?.relay === true || holdsMemberKey(member, req);
+  };
+  // Sessions that have collected with a key or the broker's word. A keyless read of one says
+  // `keyLost` on every read, never spent, so a lost answer or a second collector cannot use it
+  // up (#403 audit r3, r4). The rule is the same for a member and a session in no room, so it
+  // says nothing about membership; a session that never had a key stays silent.
+  const readKeyed = new Set();
+  const KEYLESS_HINT =
+    "This read had neither the session's own member key (x-gyredeck-member) nor the Gyredeck broker's word, so it" +
+    " shows the session's private mail only. Room mail and the room's notices are read with the member key, which" +
+    " arrives with the session's own deliveries.";
+  const keylessMessage = (message) => {
+    const { seq: _seq, ord: _ord, ...rest } = message;
+    return { seq: message[PRIVATE_SEQ], ...rest };
+  };
+  const keylessFrame = (message) =>
+    `id: ${message[PRIVATE_SEQ]}\nevent: mail\ndata: ${JSON.stringify(keylessMessage(message))}\n\n`;
+  const keylessMail = (mailbox) => (mailbox ? mailbox.messages.filter((message) => isPrivateMail(message) && !handedIn(mailbox, message)) : []);
+  const handKeyless = (mailbox, messages) => {
+    if (!mailbox || messages.length === 0) return;
+    for (const message of messages) message[HANDED] = true;
+    mailbox.touchedAt = Date.now();
+    wakeCodexReadersAfterCollection(mailbox.name);
   };
 
   /**
@@ -6579,6 +6659,10 @@ function startBridge(config) {
       // The room's own copies (#375), admitted by the caller; never the sender's path.
       ...(Array.isArray(routing?.files) && routing.files.length > 0 ? { files: routing.files } : {}),
     };
+    if (!SYNC_CODE.test(room.name) && isPrivateMail(message)) {
+      room.privateSeq = (room.privateSeq ?? 0) + 1;
+      message[PRIVATE_SEQ] = room.privateSeq;
+    }
     room.messages.push(message);
     // Notices first, against their own allowance, so the room's own voice can never cost
     // a message addressed to somebody. Then what every reader has already been handed. A
@@ -6590,6 +6674,7 @@ function startBridge(config) {
 
     const frame = mailFrame(message);
     let pushed = false;
+    let handedKeyless = false;
     for (const res of room.clients) {
       try {
         // A stream exists to interrupt, so only what should interrupt goes down it.
@@ -6599,8 +6684,22 @@ function startBridge(config) {
         // A reaction or a quiet room notice is still published and still readable; it
         // simply does not cost anyone a turn (#339).
         if (res.gyredeckWatcher && !streamsTo(room, message, res.gyredeckWatcher)) continue;
+        // A keyless watch (#403) is written private mail alone, in its own numbering; what it is
+        // written is handed, and moves no cursor. A wake-only watch (`once=1`) hands nothing:
+        // it only wakes, and the read after it takes the mail (#403 audit r2).
+        if (res.gyredeckKeyless) {
+          if (!isPrivateMail(message)) continue;
+          res.write(keylessFrame(message));
+          if (!res.gyredeckOnce) handedKeyless = true;
+          if (res.gyredeckOnce) {
+            res.end();
+            room.clients.delete(res);
+          }
+          continue;
+        }
         res.write(frame);
-        pushed = true;
+        // A wake-only watch is no delivery: the read after it takes the mail (#159, #403 audit r2).
+        if (!res.gyredeckOnce) pushed = true;
         // A wake-only watch ends with the first frame it is sent (#159): ending is what
         // wakes Antigravity, which hears only a background task that exits.
         if (res.gyredeckOnce) {
@@ -6615,6 +6714,7 @@ function startBridge(config) {
         room.clients.delete(res);
       }
     }
+    if (handedKeyless) message[HANDED] = true;
     // A push is a delivery. Without this a room whose only reader holds a stream
     // would report every message as still waiting to be picked up forever, because
     // nothing ever calls the read endpoint on it.
@@ -8823,7 +8923,7 @@ function startBridge(config) {
     // ── Usage (#158) ──
     // POST /usage — the app hands over each provider's usage as it reads it (machine token).
     // GET /usage?as=<id> — that session's own provider's usage (machine token, or a room
-    // member's own key, the same door as its inbox).
+    // member's own key).
     if (req.url === "/usage" || req.url.startsWith("/usage?")) {
       const sendJson = (status, body) => {
         res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...corsHeaders });
@@ -8859,12 +8959,8 @@ function startBridge(config) {
           sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
           return;
         }
-        // A room member's usage is read in its name, so by its door (#274 audit).
-        const notTheMember = refuseMemberRead(as, req);
-        if (notTheMember) {
-          sendJson(403, { ok: false, ...notTheMember });
-          return;
-        }
+        // Usage is the provider's, not the session's (#403): the same answer in a room or out
+        // of one, or it says which sessions are in a room.
         const provider = usageProviderFor(as);
         const usage = provider ? usageByProvider.get(provider) ?? null : null;
         sendJson(200, { ok: true, provider, usage });
@@ -8930,7 +9026,10 @@ function startBridge(config) {
               room: name,
               seq: room.seq,
               readSeq: reader.readSeq,
-              pending: Math.max(0, room.seq - reader.readSeq),
+              // A mailbox's mail a keyless read handed is not waiting (#403); it moved no cursor.
+              pending: room.members.size === 0
+                ? room.messages.filter((message) => !handedIn(room, message)).length
+                : Math.max(0, room.seq - reader.readSeq),
               buffered: room.messages.length,
               subscribers: room.clients.size,
               // Named, not raw ids: this list is read by a person in Settings, and a
@@ -8985,14 +9084,18 @@ function startBridge(config) {
           sendJson(403, { ok: false, ...relayRefusal });
           return;
         }
-        // A room member's mailbox carries its room, and the key that reads it: the broker's
-        // word, or the member's own key — never the shared password alone (#274).
-        const vouched = holdsBrokerSecret(brokerHeader);
-        const notTheMember = refuseMemberRead(as, req);
-        if (notTheMember) {
-          sendJson(403, { ok: false, ...notTheMember });
+        // The mailbox's own refusals first, for a session in a room and one in none alike
+        // (#403): asked after the member's door, they said which sessions were members.
+        const closed = refuseMailboxRead(as, brokerHeader);
+        if (closed) {
+          sendJson(403, { ok: false, ...closed });
           return;
         }
+        // A room member's mailbox carries its room, and the key that reads it: the broker's
+        // word, or the member's own key (#274). Without either, the keyless view (#403).
+        const vouched = holdsBrokerSecret(brokerHeader);
+        const keyless = !readsWithKey(as, req);
+        const keyLost = keyless && readKeyed.has(as);
         const diagnoseSilence = (sync) => {
           if (!sync) return null;
           const mine = [...sync.room.messages].reverse().find((message) => message.from === as);
@@ -9022,11 +9125,6 @@ function startBridge(config) {
         // until something in it would wake this session — so quiet mail stays here, where a
         // foreground collect still finds it, rather than in a waiting process's memory.
         const wakingOnly = url.searchParams.get("waking") === "1";
-        const closed = refuseMailboxRead(as, brokerHeader);
-        if (closed) {
-          sendJson(403, { ok: false, ...closed });
-          return;
-        }
         // The cap has to be applied by whoever advances the position. A caller that
         // trimmed the list itself would leave the rest marked as read and never
         // delivered — the position must only ever move as far as what was handed over.
@@ -9037,7 +9135,23 @@ function startBridge(config) {
 
         // `wakingOnly`: a held wait takes nothing until something in it would wake this
         // session — then the batch carries what came quietly before it too.
+        // The keyless view (#403): private mail only, nothing handed before, nothing moved but
+        // the mark on what it hands. A held wait wakes for what is not quiet, as the own mailbox does.
+        const collectKeyless = ({ wakingOnly = false } = {}) => {
+          const mailbox = mailRoomFor(as, false);
+          const fresh = keylessMail(mailbox);
+          let collected = fresh.slice(0, limit);
+          if (wakingOnly) {
+            const woken = fresh.filter((message) => message.quiet !== true);
+            if (woken.length === 0) return { collected: [], sync: null, missed: [] };
+            collected = fresh.slice(0, fresh.indexOf(woken[Math.min(limit, woken.length) - 1]) + 1);
+          }
+          if (collect) handKeyless(mailbox, collected);
+          else if (mailbox) mailbox.touchedAt = Date.now();
+          return { collected: collected.map((message) => ({ room: as, ...keylessMessage(message) })), sync: null, missed: [] };
+        };
         const collectInbox = ({ wakingOnly = false } = {}) => {
+          if (keyless) return collectKeyless({ wakingOnly });
           const at = new Date().toISOString();
           const sync = syncRoomFor(as);
           // A session's own mailbox is always its own to read. Its room is not: reading
@@ -9075,6 +9189,8 @@ function startBridge(config) {
             for (const message of room.messages) {
               if (message.seq <= reader.readSeq) continue;
               examined.set(roomName, Math.max(examined.get(roomName) ?? 0, message.seq));
+              // Handed already by a keyless read (#403): handed once, whichever read was first.
+              if (!shared && message[HANDED] === true) continue;
               // Everything addressed here, whatever its kind. A collection costs no
               // turn, and both of the quiet kinds have something to give a reader: a
               // notice says who arrived or left, and a reaction says how somebody took
@@ -9157,6 +9273,7 @@ function startBridge(config) {
               timedOut,
               ...(timedOut ? { yourLastMessage: diagnoseSilence(sync) } : {}),
               ...describeInbox(collected, sync, as, missed, vouched),
+              ...(keyless ? { hint: KEYLESS_HINT, ...(keyLost ? { keyLost: true } : {}) } : {}),
             });
           };
 
@@ -9191,7 +9308,7 @@ function startBridge(config) {
             clearTimeout(timer);
             answer(collected, sync, timedOut, missed);
           };
-          const timer = setTimeout(() => finish([], syncRoomFor(as), true), waitMs);
+          const timer = setTimeout(() => finish([], keyless ? null : syncRoomFor(as), true), waitMs);
           timer.unref?.();
           waiter.check = () => {
             // A request already gone must not have its position advanced: collect=1
@@ -9213,6 +9330,7 @@ function startBridge(config) {
         }
 
         const { collected, sync, missed } = collectInbox({ wakingOnly });
+        if (collect && !keyless) readKeyed.add(as);
         sendJson(200, {
           ok: true,
           // A collect that found nothing says why the last thing this session said drew
@@ -9226,10 +9344,11 @@ function startBridge(config) {
             // Neither notice on a wait's poll (#259): a wait prints only what wakes it and
             // drops an empty poll whole, so a line handed to one would be gone. The hook's
             // own drain, which prints them on every path, is what takes them.
-            const usageNotice = collect && !wakingOnly ? usageNoticeFor(as) : null;
-            const heavyNotice = collect && !wakingOnly ? heavyNoticeFor(as) : null;
+            const usageNotice = collect && !wakingOnly ? usageNoticeFor(as, keyless) : null;
+            const heavyNotice = collect && !wakingOnly ? heavyNoticeFor(as, keyless) : null;
             return { ...(usageNotice ? { usageNotice } : {}), ...(heavyNotice ? { heavyNotice } : {}) };
           })(),
+          ...(keyless ? { hint: KEYLESS_HINT, ...(keyLost ? { keyLost: true } : {}) } : {}),
         });
         return;
       }
@@ -9783,15 +9902,11 @@ function startBridge(config) {
             sendJson(403, { ok: false, ...refusal });
             return;
           }
-          if (room.members.size === 0 && !holdsMailboxCredential(name, headerToken)) {
-            sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
-            return;
-          }
         }
-        // A member's private mailbox is its own, by the same door as its inbox (#274 audit).
-        const notTheMember = SYNC_CODE.test(name) ? null : refuseMemberRead(name, req);
-        if (notTheMember) {
-          sendJson(403, { ok: false, ...notTheMember });
+        // Asked whether or not the mailbox exists yet (#403): a member's always does, so a door
+        // that stood only before existing ones answered a non-member's differently.
+        if ((room ? room.members.size === 0 : !SYNC_CODE.test(name)) && !holdsMailboxCredential(name, headerToken)) {
+          sendJson(401, { ok: false, error: "unauthorized", message: TOKEN_HINT });
           return;
         }
         // A private mailbox is read by its one reader or by nobody; a sync room is read in a
@@ -9808,6 +9923,33 @@ function startBridge(config) {
         }
         const parsed = Number.parseInt(url.searchParams.get("since") ?? "", 10);
         const since = Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+        // A private mailbox read without its key (#403): the keyless view, the same in a room or
+        // out of one. `since` and `until` count private mail; a take marks what it hands.
+        if (!SYNC_CODE.test(name) && !readsWithKey(name, req)) {
+          const untilParam = url.searchParams.get("until");
+          let messages;
+          let truncated = false;
+          if (untilParam !== null) {
+            const until = /^\d{1,15}$/.test(untilParam) ? Number(untilParam) : null;
+            const as = url.searchParams.get("as") ?? "";
+            if (until === null || url.searchParams.get("collect") === "1" || !MAIL_ROOM_NAME.test(as)) {
+              sendJson(400, { ok: false, error: "invalid_look", message: "until=<seq> takes a whole number, the reader's own as=<id>, and no collect: it is a look back, and it moves nothing." });
+              return;
+            }
+            // A look back at what was handed, so it does not skip the handed.
+            const reached = room
+              ? room.messages.filter((message) => isPrivateMail(message) && message[PRIVATE_SEQ] > since && message[PRIVATE_SEQ] <= until && reachesMember(message, as))
+              : [];
+            truncated = reached.length > MAIL_LOOK_MAX;
+            messages = reached.slice(0, MAIL_LOOK_MAX);
+          } else {
+            messages = keylessMail(room).filter((message) => message[PRIVATE_SEQ] > since);
+            if (url.searchParams.get("collect") === "1") handKeyless(room, messages);
+            else if (room) room.touchedAt = Date.now();
+          }
+          sendJson(200, { ok: true, room: name, seq: room?.privateSeq ?? 0, messages: messages.map(keylessMessage), ...(truncated ? { truncated: true } : {}), hint: KEYLESS_HINT });
+          return;
+        }
         // `until=<seq>` (#251 audit): a look back at what was delivered, not everything said
         // since. Bounded above, only what reaches this member — by the collect's own rule,
         // so a re-read and the delivery it repeats cannot disagree — and capped. Without it
@@ -9834,7 +9976,10 @@ function startBridge(config) {
           // into is read as before.
           const reader = url.searchParams.get("as") ?? "";
           const whole = !room || room.members.size === 0 || room.members.get(reader)?.relay === true;
-          messages = room ? room.messages.filter((message) => message.seq > since && (whole || message.from === reader || reachesMember(message, reader))) : [];
+          // A mailbox's mail a keyless read already handed is not handed again (#403).
+          messages = room
+            ? room.messages.filter((message) => message.seq > since && (room.members.size > 0 || message[HANDED] !== true) && (whole || message.from === reader || reachesMember(message, reader)))
+            : [];
           examined = Math.min(room?.seq ?? since, Math.max(since, room?.messages.at(-1)?.seq ?? since));
         }
         if (room) {
@@ -9876,12 +10021,15 @@ function startBridge(config) {
         // The stream of a private mailbox is a read of it, and the same door applies.
         // A sync room's stream is the room's: the watcher's own key (#274), since the watch
         // moves the named member's resume cursor.
+        // Without the member's key or the broker's word it is the keyless view (#403).
+        let keyless = false;
         if (!SYNC_CODE.test(name)) {
-          const closed = refuseMailboxRead(name, brokerHeader) ?? refuseMemberRead(name, req);
+          const closed = refuseMailboxRead(name, brokerHeader);
           if (closed) {
             refuseStream(403, closed.error, closed.message);
             return;
           }
+          keyless = !readsWithKey(name, req);
         }
         const room = SYNC_CODE.test(name) ? mailRooms.get(name) : mailRoomFor(name, true);
         if (!room) {
@@ -9913,6 +10061,7 @@ function startBridge(config) {
           `: gyredeck mail room ${name} connected ${new Date().toISOString()}` +
             ` expires in ${MAIL_STREAM_MAX_MS / 1000}s\n\n`,
         );
+        if (keyless) res.write(`: ${KEYLESS_HINT}\n\n`);
         // Said in the stream as well as enforced, so a watcher can tell a deliberate
         // expiry from a connection that dropped.
         const expiry = setTimeout(() => {
@@ -9973,9 +10122,17 @@ function startBridge(config) {
         // A member's own cursor is a starting point even at 0 — a room's first message
         // arrives at seq 1, while its founder's watch may be between two connections.
         const fromCursor = (asked === "resume" && typeof streamed === "number") || asRelay;
-        if (Number.isInteger(resumeFrom) && (resumeFrom > 0 || fromCursor)) {
+        // A keyless watch resumes in private-mail numbering, and is replayed only what was never handed.
+        if (keyless && Number.isInteger(resumeFrom) && resumeFrom > 0) {
+          const due = keylessMail(room).filter((message) => message[PRIVATE_SEQ] > resumeFrom && (!watcher || streamsTo(room, message, watcher)));
+          // Not marked, as a keyed replay moves no mailbox cursor: only a live push is a delivery.
+          for (const message of due) res.write(keylessFrame(message));
+          replayed = due.length > 0;
+        } else if (Number.isInteger(resumeFrom) && (resumeFrom > 0 || fromCursor)) {
           for (const message of room.messages) {
             if (message.seq <= resumeFrom) continue;
+            // A mailbox's mail a keyless read already handed is not handed again (#403).
+            if (room.members.size === 0 && message[HANDED] === true) continue;
             // The same rule as a live push, applied by the same function rather than
             // restated — the two paths were written apart and drifted apart, so a watch
             // that reconnected was handed the acknowledgements and room notices it had
@@ -10005,6 +10162,7 @@ function startBridge(config) {
         }
         res.gyredeckWatcher = watcher;
         res.gyredeckOnce = once;
+        res.gyredeckKeyless = keyless;
         room.clients.add(res);
         room.touchedAt = Date.now();
         // A comment line is ignored by every reader (`grep '^data: '`), and writing it is

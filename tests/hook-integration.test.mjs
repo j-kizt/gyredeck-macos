@@ -1233,6 +1233,8 @@ test("claude UserPromptSubmit delivers mail as additional context exactly once",
     // From outside any room this session is in, so the caution applies.
     assert.match(context, /information only/);
     assert.doesNotMatch(context, /what you are here for/);
+    // A session in no room is not told about member keys with its mail (#403).
+    assert.doesNotMatch(context, /neither the session's own member key/);
     assert.match(context, new RegExp("/mail/codex-room"));
     assert.doesNotMatch(context, new RegExp(token), "the token is read at send time, not pasted in");
 
@@ -2458,7 +2460,8 @@ test("mail a hook has collected still reaches the session when building the deli
     } finally {
       delete process.env.GYREDECK_TEST_FAULT;
     }
-    // Delivered once: the plain answer was the delivery.
+    // Delivered once: the plain answer was the delivery. The keyless read's hint rides only
+    // with mail, so the turn after is silent (#403).
     assert.equal(await claudeContext(), "");
     assert.deepEqual(await agySteps(), []);
 
@@ -2487,10 +2490,10 @@ test("mail a hook has collected still reaches the session when building the deli
     try {
       assert.match(await claudeContext(), /^USAGE: ask Gyredeck/m, "a usage-only answer survives");
       // The founder is a room member reading over TCP, through a broker that cannot bind this
-      // CLI's reads: since #274 the bridge refuses a member's mailbox to a read that holds
-      // neither the broker's word nor the member's key. The confirm still goes through the
-      // broker (#294), so the acceptance is still said; the room's mail is not taken, so
-      // nothing collected is lost to the fault.
+      // CLI's reads: a read with neither the broker's word nor the member's key gets the
+      // no-room view (#403), private mail only. The confirm still goes through the broker
+      // (#294), so the acceptance is still said; the room's mail is not taken, so nothing
+      // collected is lost to the fault.
       const confirmer = await fakeBroker(home, () => ({ v: 1, ok: false, error: "ineligible", message: "not a CLI this broker binds" }), { confirmVia: `http://127.0.0.1:${port}` });
       const result = await runAdapter(
         "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
@@ -2498,9 +2501,10 @@ test("mail a hook has collected still reaches the session when building the deli
       );
       await confirmer.close();
       assert.equal(result.code, 0, result.stderr);
-      assert.match(result.stderr, /mail withheld this turn — the broker said ineligible, the bridge said not_your_key/);
+      assert.doesNotMatch(result.stderr, /mail withheld this turn/);
       const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
       assert.match(context, /the password you were just given was accepted/);
+      assert.match(context, /neither the session's own member key/, "the hint says why the room's mail is not here");
       assert.doesNotMatch(context, /joined this room/, "no room mail was read over TCP");
     } finally {
       delete process.env.GYREDECK_TEST_FAULT;
@@ -2545,6 +2549,93 @@ test("mail a hook has collected still reaches the session when building the deli
       await broker.close();
       broker = null;
     }
+  } finally {
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test("#403 audit r3/r4: a room member whose reads lose the broker is told on every turn that room mail takes its key, by the same rule as a session in no room, and nothing spends it", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gyredeck-403r3-"));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  const base = `http://127.0.0.1:${port}`;
+  const claude = "a4030000-0000-4000-8000-0000000003c1";
+  const agy = "a4030000-0000-4000-8000-0000000003a1";
+  const other = "a4030000-0000-4000-8000-0000000003b1";
+  const stranger = "a4030000-0000-4000-8000-0000000003c2";
+  const neverKeyed = "a4030000-0000-4000-8000-0000000003c3";
+  const HINT = /neither the session's own member key/;
+  try {
+    await waitForHealth(port, stderrRef);
+    const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+    const call = (method, path, body) => fetch(`${base}${path}`, {
+      method,
+      headers: { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD },
+      body: body ? JSON.stringify(body) : undefined,
+    }).then((r) => r.json());
+    const claudeContext = async (session) => {
+      const result = await runAdapter(
+        "adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home,
+        { hook_event_name: "UserPromptSubmit", session_id: session, cwd: "/tmp/project", prompt: "hi" },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : "";
+    };
+    const agySteps = async () => {
+      const result = await runAdapter(
+        "adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], home,
+        { hookEventName: "PreInvocation", conversationId: agy, workspacePaths: ["/tmp/project"] },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return (JSON.parse(result.stdout).injectSteps ?? []).map((step) => step.ephemeralMessage);
+    };
+    const rooms = [];
+    for (const id of [claude, agy]) rooms.push((await call("POST", "/sync/rooms", { conversationId: id })).room);
+    // Their reads so far went through the broker: a collect with the broker's word stands in for them.
+    for (const id of [claude, agy, stranger]) {
+      const vouched = await call("GET", `/mail/inbox?as=${id}&collect=1`);
+      assert.equal(vouched.ok, true, JSON.stringify(vouched));
+      assert.equal(vouched.hintIsNew, undefined, "a vouched read carries no hint");
+    }
+    // Room mail now waits for both: a member joins each room.
+    for (const room of rooms) await call("POST", `/sync/rooms/${room}/members`, { conversationId: other });
+
+    // An answer that never reached the session, or a second keyless collector, spends nothing.
+    const keylessCollect = () => fetch(`${base}/mail/inbox?as=${claude}&collect=1`, { headers: { "x-gyredeck-token": token } }).then((r) => r.json());
+    for (let i = 0; i < 2; i += 1) assert.equal((await keylessCollect()).keyLost, true, "every keyless read says it");
+
+    // The broker is gone: the hooks read over TCP with neither word nor key. Each such turn
+    // says why the room has gone quiet, even with nothing to deliver.
+    for (let turn = 0; turn < 2; turn += 1) {
+      const context = await claudeContext(claude);
+      assert.match(context, HINT);
+      assert.doesNotMatch(context, /joined this room/);
+      const steps = await agySteps();
+      assert.ok(steps.some((text) => HINT.test(text)), JSON.stringify(steps));
+      assert.ok(steps.every((text) => !/joined this room/.test(text)), JSON.stringify(steps));
+    }
+
+    // A session in no room with the same history is told the same: the rule never asks
+    // whether the session is a member, so the hint names no membership. One that never had
+    // a key is not told, after its first turn's own notices.
+    assert.match(await claudeContext(stranger), HINT);
+    await claudeContext(neverKeyed);
+    assert.equal(await claudeContext(neverKeyed), "");
+
+    // The room mail was not taken by the keyless turns: a read with the broker's word still has it.
+    const keyed = await call("GET", `/mail/inbox?as=${claude}`);
+    assert.ok(keyed.messages.some((message) => /joined this room/.test(message.text)), JSON.stringify(keyed.messages));
   } finally {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
@@ -2715,15 +2806,14 @@ test("a password accepted while the bridge refuses the session's TCP read still 
       { hook_event_name: "UserPromptSubmit", session_id: founder, cwd: "/tmp/project", prompt: password },
     );
     assert.equal(result.code, 0, result.stderr);
-    // A room member's TCP read without its key is refused before the broker's binding is
-    // weighed (#274), so the bridge names the key.
-    assert.match(result.stderr, /mail withheld this turn — the broker said ineligible, the bridge said not_your_key/, "the premise: the TCP read was refused");
+    // The broker's binding is weighed before membership (#403), so the bridge names the broker.
+    assert.match(result.stderr, /mail withheld this turn — the broker said ineligible, the bridge said broker_required/, "the premise: the TCP read was refused");
     const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
     assert.match(context, new RegExp(`Gyredeck sync room ${code}\\b`), "the room is named");
     assert.match(context, /the password you were just given was accepted/);
     assert.ok(context.includes(NO_KEY_HEAR), "it is told it cannot watch without the broker (#274)");
     assert.ok(!context.includes(`/mail/${code}/events?as=${founder}&since=resume`), "and handed no watch command the room would refuse");
-    assert.match(context, /could not be collected this turn \(the broker said "ineligible" and the bridge said "not_your_key"/, "and the held mail is still said");
+    assert.match(context, /could not be collected this turn \(the broker said "ineligible" and the bridge said "broker_required"/, "and the held mail is still said");
   } finally {
     if (broker) await broker.close();
     bridge.stdin.end();
@@ -5144,16 +5234,18 @@ test("every mutation and every room read needs a credential that verifies", asyn
     assert.equal(await peek(), waiting, "a refused collect left the cursor where it was");
 
     // The peer is a room member, so its mailbox carries the room: the machine token alone
-    // no longer opens it, on either door (#274) — and is refused without moving the cursor.
+    // gets the no-room view on either door (#403) — private mail only, the room never named
+    // — and the member's cursor is not moved.
     for (const route of ["inbox", "wait"]) {
-      const keyless = await drain(token, route);
-      assert.equal(keyless.status, 403, `the machine token alone does not open a member's /mail/${route}`);
-      assert.equal(keyless.body.error, "not_your_key");
-      const otherKey = await drain(token, route, founderKey);
-      assert.equal(otherKey.status, 403, `nor with another member's key on /mail/${route}`);
-      assert.equal(otherKey.body.error, "not_your_key");
+      for (const key of [null, founderKey]) {
+        const keyless = await drain(token, route, key);
+        assert.equal(keyless.status, 200, `/mail/${route} without the member's own key answers the no-room view`);
+        assert.equal(typeof keyless.body.hint, "string", "and says why the room's mail is not in it");
+        assert.ok(!JSON.stringify(keyless.body).includes(code), "the room is never named");
+        assert.ok(!keyless.body.messages.some((message) => /you are now in sync room/.test(message.text)), "nor its notices shown");
+      }
     }
-    assert.equal(await peek(), waiting, "the refused collects left the cursor where it was");
+    assert.equal(await peek(), waiting, "the keyless collects left the member's cursor where it was");
     const collected = await drain(token, "inbox", peerKey);
     assert.equal(collected.status, 200, "the hook's own credential with the member's own key opens it");
     assert.ok(
@@ -9617,15 +9709,19 @@ test("the bridge refuses an old-path collect for a session the broker has bound,
     const waitedByHand = await runAdapter("adapters/claude/gyredeck-claude-hook.mjs", ["wait", "1", remembered], home, {});
     assert.equal(waitedByHand.code, 2, `withheld: ${waitedByHand.stderr}`);
     assert.match(waitedByHand.stderr, /wait withheld — the bridge refused the read \(broker_required\)/);
-    // A protected session in a room is refused the same way, for the key it does not hold (#274).
+    // A protected session in a room is refused the same way: the broker's refusal comes
+    // before membership is weighed, so it does not say whether the session is a member (#403).
     const waitedInRoom = await runAdapter("adapters/claude/gyredeck-claude-hook.mjs", ["wait", "1", bound], home, {});
     assert.equal(waitedInRoom.code, 2, `withheld: ${waitedInRoom.stderr}`);
-    assert.match(waitedInRoom.stderr, /wait withheld — the bridge refused the read \(not_your_key\)/);
-    // So is an unprotected one, now that it founded a room: its mailbox carries the room,
-    // and the machine token is not its key (#274).
+    assert.match(waitedInRoom.stderr, /wait withheld — the bridge refused the read \(broker_required\)/);
+    // An unprotected founder without its key gets the no-room view, as a session in no room
+    // would, with the hint that says why the room is not in it (#403).
     const waitedFounder = await runAdapter("adapters/claude/gyredeck-claude-hook.mjs", ["wait", "1", unbound], home, {});
-    assert.equal(waitedFounder.code, 2, `withheld: ${waitedFounder.stderr}`);
-    assert.match(waitedFounder.stderr, /wait withheld — the bridge refused the read \(not_your_key\)/);
+    assert.equal(waitedFounder.code, 0, waitedFounder.stderr);
+    const founderWaited = JSON.parse(waitedFounder.stdout);
+    assert.equal(founderWaited.ok, true);
+    assert.equal(typeof founderWaited.hint, "string");
+    assert.ok(!waitedFounder.stdout.includes(code), "the room is never named");
     // An unprotected session in no room still waits over TCP as before.
     const loner = "dddd4444-0000-4d8c-9b3a-aa11bb22cc33";
     await call("POST", `/mail/${loner}`, {}, { from: "codex", text: `for ${loner}`, replyTo: "codex-room" });

@@ -896,6 +896,9 @@ const plainSteps = async (taken) => {
   if (typeof taken.result.missedNote === "string") steps.push({ ephemeralMessage: taken.result.missedNote.slice(0, MAIL_MAX_TEXT) });
   if (typeof taken.result.usageNotice === "string") steps.push({ ephemeralMessage: taken.result.usageNotice.slice(0, MAIL_MAX_TEXT) });
   if (typeof taken.result.heavyNotice === "string") steps.push({ ephemeralMessage: taken.result.heavyNotice.slice(0, MAIL_MAX_TEXT) });
+  // The keyless hint is said on the turn that names the room just joined, or any keyless read
+  // of a session that had a key; for a session that never had one it would be noise on every turn.
+  if ((taken.confirm?.accepted || taken.result.keyLost === true) && typeof taken.result.hint === "string") steps.push({ ephemeralMessage: taken.result.hint.slice(0, MAIL_MAX_TEXT) });
   if (taken.endpoint && messages.length > 0) {
     steps.push(...rereadSteps(taken.endpoint, taken.as, typeof taken.result.room === "string" ? taken.result.room : null, messages, taken.result.memberKey));
   }
@@ -1040,6 +1043,9 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
   const heavyStep = typeof result?.heavyNotice === "string"
     ? { ephemeralMessage: result.heavyNotice.slice(0, MAIL_MAX_TEXT) }
     : null;
+  // Why only private mail came back (#403): on the turn that names the room just joined, or
+  // every keyless read of a session that had a key (the broker went away), even with nothing to deliver.
+  const hintStep = (confirm?.accepted || result?.keyLost === true) && typeof result?.hint === "string" ? { ephemeralMessage: result.hint.slice(0, MAIL_MAX_TEXT) } : null;
   // The room the collect already describes: no extra request to know this session is in
   // one it has not confirmed.
   const syncRoom = typeof result?.room === "string" ? result.room : null;
@@ -1050,7 +1056,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
   // with nothing waiting, which is when the old early answer said nothing at all.
   if (delivered.length === 0 && !confirm?.accepted) {
     await ackDelivery(result);
-    return [...confirmLead(confirm), usageStep, heavyStep, blocked ? { ephemeralMessage: blocked } : null].filter(Boolean);
+    return [...confirmLead(confirm), usageStep, heavyStep, hintStep, blocked ? { ephemeralMessage: blocked } : null].filter(Boolean);
   }
 
 
@@ -1231,6 +1237,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
     }),
     ...(usageStep ? [usageStep] : []),
     ...(heavyStep ? [heavyStep] : []),
+    ...(hintStep ? [hintStep] : []),
     ...rereadSteps(endpoint, room, syncRoom, delivered, result?.memberKey),
     // Last, so the command is the freshest thing in context when the model acts.
     ...(reply ? [reply] : []),

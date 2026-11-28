@@ -1568,7 +1568,7 @@ async fn codex_usage() -> Result<CodexUsageSnapshot, String> {
         local_usage::choose(
             local,
             base,
-            account_id.as_deref().map(local_usage::account_tag),
+            auth_candidates.first().and_then(codex_reading_tag),
             local_usage::settings().refresh,
             agy_statusline::unix_now(),
             || codex_usage_blocking(auth_candidates),
@@ -1612,7 +1612,7 @@ fn codex_usage_blocking(auth_candidates: Vec<CodexAuthState>) -> Result<UsageRea
     }
 
     match expired {
-        Some(auth_state) => expired_login_reading(read_codex_last_good(&auth_state), "Codex", "codex"),
+        Some(auth_state) => expired_login_reading(read_codex_last_good(&auth_state), codex_reading_tag(&auth_state), "Codex", "codex"),
         None => Err("Codex session expired. Run `codex` to log in again.".to_string()),
     }
 }
@@ -1621,13 +1621,23 @@ fn fresh_codex_reading(auth_state: &CodexAuthState, snapshot: CodexUsageSnapshot
     if let Ok(mut guard) = CODEX_LAST_GOOD_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
         guard.insert(codex_auth_fingerprint(auth_state), snapshot.clone());
     }
-    let account = auth_state
+    UsageReading { snapshot, fresh: true, account: codex_reading_tag(auth_state) }
+}
+
+/// Whose a reading is (#398). Every reading carries the tag of the login that answered,
+/// kept ones too: with several logins, the answer can come from a later one than the
+/// login the local reading was matched to.
+fn codex_reading_tag(auth_state: &CodexAuthState) -> Option<String> {
+    auth_state
         .auth
         .tokens
         .as_ref()
         .and_then(|tokens| tokens.account_id.as_deref())
-        .map(local_usage::account_tag);
-    UsageReading { snapshot, fresh: true, account }
+        .map(local_usage::account_tag)
+}
+
+fn claude_reading_tag(auth: &ClaudeAuthState) -> Option<String> {
+    Some(local_usage::account_tag(&claude_auth_fingerprint(auth)))
 }
 
 fn read_codex_last_good(auth_state: &CodexAuthState) -> Option<CodexUsageSnapshot> {
@@ -1641,6 +1651,7 @@ fn read_codex_last_good(auth_state: &CodexAuthState) -> Option<CodexUsageSnapsho
 /// The last good reading, marked as kept and never relayed, or an error when there is none.
 fn expired_login_reading(
     kept: Option<CodexUsageSnapshot>,
+    account: Option<String>,
     name: &str,
     cli: &str,
 ) -> Result<UsageReading, String> {
@@ -1651,7 +1662,7 @@ fn expired_login_reading(
         label: "Status".to_string(),
         value: format!("Login expired; showing last good values. Run `{cli}` to renew it."),
     });
-    Ok(UsageReading { snapshot, fresh: false, account: None })
+    Ok(UsageReading { snapshot, fresh: false, account })
 }
 
 fn fetch_codex_usage_snapshot(
@@ -1741,7 +1752,7 @@ async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
         let candidates = load_claude_auth_candidates();
         let first = candidates.iter().find(|auth| claude_can_fetch_live_usage(auth));
         let base = first.and_then(read_claude_last_good);
-        let account = first.map(|auth| local_usage::account_tag(&claude_auth_fingerprint(auth)));
+        let account = first.and_then(claude_reading_tag);
         let now = agy_statusline::unix_now();
         let local = |reference: &CodexUsageSnapshot| {
             let paths = agy_statusline::StatusLinePaths::claude_from_home().ok()?;
@@ -1818,7 +1829,7 @@ fn claude_rate_limited_reading(
     UsageReading {
         snapshot: claude_rate_limited_snapshot(auth, Some(wait)),
         fresh: false,
-        account: None,
+        account: claude_reading_tag(auth),
     }
 }
 
@@ -1846,7 +1857,7 @@ fn claude_usage_blocking(candidates: Vec<ClaudeAuthState>) -> Result<UsageReadin
                 return Ok(UsageReading {
                     snapshot: claude_rate_limited_snapshot(&auth, Some(wait)),
                     fresh: false,
-                    account: None,
+                    account: claude_reading_tag(&auth),
                 });
             }
             ClaudeGate::Ask => {}
@@ -1881,7 +1892,7 @@ fn claude_usage_blocking(candidates: Vec<ClaudeAuthState>) -> Result<UsageReadin
     }
 
     if let Some(auth) = expired {
-        return expired_login_reading(read_claude_last_good(&auth), "Claude Code", "claude");
+        return expired_login_reading(read_claude_last_good(&auth), claude_reading_tag(&auth), "Claude Code", "claude");
     }
     Err(last_error.unwrap_or_else(|| {
         "Claude Code usage unavailable. Run `claude` to log in again.".to_string()
@@ -1913,7 +1924,7 @@ fn fresh_claude_reading(auth: &ClaudeAuthState, usage: Value) -> UsageReading {
     UsageReading {
         snapshot: store_claude_last_good(auth, build_claude_usage_snapshot(usage, auth)),
         fresh: true,
-        account: Some(local_usage::account_tag(&claude_auth_fingerprint(auth))),
+        account: claude_reading_tag(auth),
     }
 }
 
@@ -7123,6 +7134,36 @@ mod display_selection_tests {
         assert_eq!(claude_gate(&auth, now), ClaudeGate::Expired, "an expired one says so, wait or not");
     }
 
+    /// With several logins the answer can come from a later one; it says so, so `choose`
+    /// never merges it with the local reading matched to the first (#398 r2).
+    #[test]
+    fn a_kept_reading_carries_the_login_that_answered() {
+        let mut first = claude_auth("r398-first-access", "r398-first-refresh");
+        first.inference_only = true;
+        let second = claude_auth("r398-second-access", "r398-second-refresh");
+        assert!(!claude_can_fetch_live_usage(&first), "premise: the first login is passed over");
+        assert_ne!(claude_reading_tag(&first), claude_reading_tag(&second), "premise");
+
+        let limited = claude_rate_limited_reading(&second, Some(600), Instant::now());
+        assert_eq!(limited.account, claude_reading_tag(&second));
+        let waited = claude_usage_blocking(vec![first, second.clone()]).unwrap();
+        assert!(!waited.fresh);
+        assert_eq!(waited.account, claude_reading_tag(&second), "the waiting answer is the second login's");
+
+        let mut codex = codex_auth("r398-codex");
+        codex.auth.tokens.as_mut().unwrap().account_id = Some("acct-398".to_string());
+        let kept = expired_login_reading(Some(CodexUsageSnapshot {
+            provider_id: "codex".to_string(),
+            display_name: "Codex".to_string(),
+            plan: None,
+            lines: vec![],
+            fetched_at: "2026-11-28T00:00:00Z".to_string(),
+            source: UsageSource::Api,
+        }), codex_reading_tag(&codex), "Codex", "codex").unwrap();
+        assert_eq!(kept.account, codex_reading_tag(&codex));
+        assert!(codex_reading_tag(&codex).is_some(), "premise: the fixture has an account id");
+    }
+
     #[test]
     fn an_expired_login_shows_the_last_good_reading_as_kept_and_never_as_news() {
         let reading = |fetched_at: &str| CodexUsageSnapshot {
@@ -7137,7 +7178,7 @@ mod display_selection_tests {
         let other = codex_auth("codex-361-other");
         assert!(fresh_codex_reading(&mine, reading("2026-11-08T01:00:00Z")).fresh);
 
-        let kept = expired_login_reading(read_codex_last_good(&mine), "Codex", "codex").unwrap();
+        let kept = expired_login_reading(read_codex_last_good(&mine), None, "Codex", "codex").unwrap();
         assert!(!kept.fresh, "a kept reading is not relayed as a fresh one");
         assert_eq!(kept.snapshot.fetched_at, "2026-11-08T01:00:00Z", "and keeps its own time");
         assert!(
@@ -7147,7 +7188,7 @@ mod display_selection_tests {
 
         assert!(read_codex_last_good(&other).is_none(), "another login inherits no numbers");
         assert_eq!(
-            expired_login_reading(None, "Codex", "codex").err().as_deref(),
+            expired_login_reading(None, None, "Codex", "codex").err().as_deref(),
             Some("Codex login expired. Run `codex` to renew it.")
         );
     }

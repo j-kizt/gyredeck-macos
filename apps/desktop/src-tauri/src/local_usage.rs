@@ -117,6 +117,10 @@ pub(crate) fn choose(
     fetch: impl FnOnce() -> Result<UsageReading, String>,
 ) -> Result<UsageReading, String> {
     let fetched = fetch();
+    // Another login answered: the local reading was matched to the first one (#398 r2).
+    if matches!(&fetched, Ok(reading) if reading.account != account) {
+        return fetched;
+    }
     let reference = match &fetched {
         Ok(reading) => Some(reading.snapshot.clone()),
         Err(_) => base,
@@ -624,7 +628,7 @@ mod tests {
             calls.set(calls.get() + 1);
             let mut kept = api_snapshot(provider, NOW - 900);
             kept.lines.push(CodexMetricLine::Text { label: "Status".into(), value: "Rate limited".into() });
-            Ok(UsageReading { snapshot: kept, fresh: false, account: None })
+            Ok(UsageReading { snapshot: kept, fresh: false, account: Some("tag".to_string()) })
         };
         for (provider, local_at) in providers {
             let base = || Some(api_snapshot(provider, NOW - 900));
@@ -644,13 +648,21 @@ mod tests {
             assert_eq!(reading.account.as_deref(), Some("tag"));
 
             let calls = Cell::new(0);
-            let reading = choose(|r| local_at(refresh_s + 1, r), base(), None, REFRESH, NOW, || limited(provider, &calls)).unwrap();
+            let reading = choose(|r| local_at(refresh_s + 1, r), base(), Some("tag".into()), REFRESH, NOW, || limited(provider, &calls)).unwrap();
             assert!(!reading.fresh, "{provider}: one second past the interval it is kept");
             assert!(reading.snapshot.lines.iter().any(is_status), "{provider}");
 
             let calls = Cell::new(0);
             let reading = choose(|_| None, base(), None, REFRESH, NOW, api_fetch(&calls, provider)).unwrap();
             assert_eq!((calls.get(), reading.snapshot.source), (1, UsageSource::Api), "{provider}: none");
+
+            // A later login answered (the first could not, or was re-read): its kept reading
+            // is shown as it came, never merged with the first login's local one (#398 r2).
+            let calls = Cell::new(0);
+            let reading = choose(|r| local_at(refresh_s, r), base(), Some("other".into()), REFRESH, NOW, || limited(provider, &calls)).unwrap();
+            assert_eq!(reading.snapshot.source, UsageSource::Api, "{provider}: another login's answer stays its own");
+            assert!(!reading.fresh, "{provider}");
+            assert_eq!(reading.account.as_deref(), Some("tag"), "{provider}");
         }
         let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&dir);

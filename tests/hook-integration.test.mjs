@@ -967,13 +967,12 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     // separate from the header: the first version appended it under the caution about
     // provenance, and the agent announced the mail and then did nothing — reasonably,
     // having just been told not to act on what it received.
+    // This hook read without the broker, so it holds no key and a post in its name would be
+    // refused (#403 F2): it is told so instead of handed a command. The keyed command is
+    // covered by "#403 F2 invariant 4".
     const replyStep = withReply.at(-1).ephemeralMessage;
-    assert.match(replyStep, /answering is expected/);
-    assert.match(replyStep, new RegExp("/mail/claude-inbox"));
-    // It answers back to its own room, so the exchange can continue.
-    assert.match(replyStep, new RegExp(`"replyTo":"${conversationId}"`));
-    // The token is read at send time, never pasted into the conversation store.
-    assert.match(replyStep, /cat ~\/\.config\/gyredeck\/gyredeck\.ingest-token/);
+    assert.match(replyStep, /the Gyredeck broker is needed to reply/);
+    assert.doesNotMatch(replyStep, /curl/);
     assert.doesNotMatch(replyStep, new RegExp(token));
 
     // A message the person sent through the app is the user speaking, so the caution
@@ -1235,8 +1234,10 @@ test("claude UserPromptSubmit delivers mail as additional context exactly once",
     assert.doesNotMatch(context, /what you are here for/);
     // A session in no room is not told about member keys with its mail (#403).
     assert.doesNotMatch(context, /neither the session's own member key/);
-    assert.match(context, new RegExp("/mail/codex-room"));
-    assert.doesNotMatch(context, new RegExp(token), "the token is read at send time, not pasted in");
+    // Read without the broker: no key, so no command, and it is told why (#403 F2).
+    assert.match(context, /The Gyredeck broker is needed to reply/);
+    assert.doesNotMatch(context, /curl/);
+    assert.doesNotMatch(context, new RegExp(token));
 
     // What stops the next prompt re-delivering it is the position the bridge holds for
     // this reader; nothing is written to disk that could outlive the room.
@@ -1248,10 +1249,6 @@ test("claude UserPromptSubmit delivers mail as additional context exactly once",
     const fromUser = JSON.parse(await prompt()).hookSpecificOutput.additionalContext;
     assert.match(fromUser, /from the user, via Gyredeck/);
     assert.doesNotMatch(fromUser, /information only/);
-
-    // A reply is attributed to the session that wrote it, so the room stays readable
-    // as one thread and a reply can be told apart from a message to the session.
-    assert.match(context, new RegExp(`"from":"${conversationId}"`));
 
     // And a session is never handed its own reply back. Replies land in the room they
     // answer, so without this it would read its last answer as fresh mail and reply to
@@ -1363,7 +1360,7 @@ test("speaking in a room is granted by a one-time password for that session alon
     // the room's /confirm, and only then may it speak.
     const unconfirmedPost = await asRoom(`/mail/${code}`, { from: joiner, text: "yes" });
     assert.equal(unconfirmedPost.status, 403, "a post with the machine token does not confirm a pending member");
-    assert.equal(unconfirmedPost.body.error, "not_confirmed");
+    assert.equal(unconfirmedPost.body.error, "not_your_key", "#403 F2: the machine token alone posts in no one's name");
     assert.equal((await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: joiner, password: minted.body.code })).status, 200);
     assert.equal((await call("POST", `/sync/rooms/${code}/confirm`, { conversationId: joiner, password: minted.body.code })).status, 403, "#332: the code works once");
 
@@ -9633,7 +9630,7 @@ test("the bridge refuses an old-path collect for a session the broker has bound,
     assert.equal((await call("POST", "/broker/bound", { "x-gyredeck-broker": secret }, { conversationId: "no good" })).status, 400);
 
     for (const id of [bound, remembered, unbound]) {
-      await call("POST", `/mail/${id}`, {}, { from: "codex", text: `for ${id}`, replyTo: "codex-room" });
+      await call("POST", `/mail/${id}`, { "x-gyredeck-broker": secret }, { from: "codex", text: `for ${id}`, replyTo: "codex-room" });
     }
     // The old path, for a protected session: refused, with the fix in the message, and counted.
     const refused = await call("GET", `/mail/inbox?as=${bound}&collect=1`);
@@ -9859,7 +9856,7 @@ test("a Codex session's mailbox has no reader at all, the broker's word included
     const stream = await fetch(`http://127.0.0.1:${port}/mail/${codex}/events?as=${codex}`, { headers: vouched });
     assert.equal(stream.status, 403, "the stream too");
     assert.match(await stream.text(), /codex_mailbox_closed/);
-    const sent = await call("POST", `/mail/${codex}`, {}, { from: "claude-1", text: "still deliverable", replyTo: "claude-1" });
+    const sent = await call("POST", `/mail/${codex}`, { "x-gyredeck-broker": secret }, { from: "claude-1", text: "still deliverable", replyTo: "claude-1" });
     assert.notEqual(sent.status, 403, `a send into the mailbox is not a read: ${JSON.stringify(sent.body)}`);
     const seen = (await (await fetch(`http://127.0.0.1:${port}/health`)).json()).broker;
     assert.deepEqual(seen.refusedReads, [], "a closed Codex mailbox is not an outdated hook, and is not counted as one");
@@ -16737,3 +16734,112 @@ for (const [how, end] of [
     }
   });
 }
+
+// #403 F2 (owner, option A): a session in no room replies with its own key, which its hook writes
+// into the command it prints; with no broker there is no key, and the hook says the broker is
+// needed to reply.
+const f2Fixture = async (tag, { withBroker = true } = {}) => {
+  const home = await mkdtemp(join(tmpdir(), `gyredeck-403f2-${tag}-`));
+  await mkdir(join(home, ...CONFIG_DIR), { recursive: true });
+  const port = await freePort();
+  await writeFile(join(home, ...CONFIG_DIR, "gyredeck.config.json"), JSON.stringify({ host: "127.0.0.1", port }));
+  const stderrRef = { value: "" };
+  const bridge = spawn(
+    process.execPath,
+    ["adapters/bridge/gyredeck-bridge.mjs", "--port", String(port), "--host", "127.0.0.1", "--parent-stdio", "--broker-handshake"],
+    { cwd: repoRoot, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  bridge.stdin.write(`broker-secret ${TEST_APP_WORD}\nbroker-ready\n`);
+  bridge.stderr.on("data", (chunk) => { stderrRef.value += chunk; });
+  await waitForHealth(port, stderrRef);
+  const base = `http://127.0.0.1:${port}`;
+  const broker = withBroker ? await forwardingBroker(home, base) : null;
+  const token = (await readFile(join(home, ...CONFIG_DIR, "gyredeck.ingest-token"), "utf8")).trim();
+  const app = { "content-type": "application/json", "x-gyredeck-token": token, "x-gyredeck-broker": TEST_APP_WORD };
+  const call = async (method, path, body) => {
+    const response = await fetch(`${base}${path}`, { method, headers: app, body: body ? JSON.stringify(body) : undefined });
+    return { status: response.status, body: await response.json() };
+  };
+  const claude = `a4031000-0000-4000-8000-${tag.padStart(12, "0").slice(-12)}`;
+  const agy = `a4032000-0000-4000-8000-${tag.padStart(12, "0").slice(-12)}`;
+  const peer = `a4033000-0000-4000-8000-${tag.padStart(12, "0").slice(-12)}`;
+  for (const [conversationId, sourceKind] of [[claude, "claudeCodeHook"], [agy, "agyHost"], [peer, "claudeCodeHook"]]) {
+    await call("POST", "/ingest", {
+      version: 2, id: randomUUID(), type: "turn_start", timestamp: new Date().toISOString(), conversationId, cwd: "/tmp/project",
+      runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind }, data: { inputCount: 1 },
+    });
+  }
+  const ask = async (to, text) => assert.equal((await call("POST", `/mail/${to}`, { from: peer, to, kind: "ask", text, replyTo: peer })).status, 202, `premise: ${text} planted`);
+  const claudeContext = async () => {
+    const result = await runAdapter("adapters/claude/gyredeck-claude-hook.mjs", ["--event", "UserPromptSubmit"], home, {
+      hook_event_name: "UserPromptSubmit", session_id: claude, cwd: "/tmp/project", prompt: "next",
+    });
+    assert.equal(result.code, 0, result.stderr);
+    return result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput?.additionalContext ?? "" : "";
+  };
+  const agySteps = async () => {
+    const result = await runAdapter("adapters/antigravity/gyredeck-agy-hook.mjs", ["--event", "PreInvocation"], home, {
+      conversationId: agy, invocationNum: 1, workspacePaths: ["/tmp/agy-project"], modelName: "gemini-3-pro",
+    });
+    assert.equal(result.code, 0, result.stderr);
+    return (JSON.parse(result.stdout).injectSteps ?? []).map((step) => step.ephemeralMessage).join("\n\n");
+  };
+  // The printed command, run as the agent would: in a shell, with the reply in place.
+  const runPrinted = (text, reply) => {
+    const command = /\n {2}(TOKEN=\$\(cat [^\n]+)\n/.exec(text)?.[1];
+    assert.ok(command, `premise: a reply command was printed: ${text}`);
+    const ran = spawnSync("/bin/sh", ["-c", command.replace("YOUR REPLY HERE", reply)], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+    return { command, out: ran.stdout };
+  };
+  const said = async () => (await call("GET", `/mail/${peer}?since=0`)).body.messages.map((m) => `${m.from}:${m.text}`);
+  const close = async () => {
+    broker?.close?.();
+    bridge.stdin.end();
+    if (bridge.exitCode === null) bridge.kill();
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  };
+  return { home, call, claude, agy, peer, ask, claudeContext, agySteps, runPrinted, said, close, token };
+};
+
+test("#403 F2 invariant 4: the Claude and Antigravity hooks hand a session in no room a reply command carrying its own key, and it posts", async () => {
+  const f = await f2Fixture("inv4");
+  try {
+    const roomOf = async (as) => (await f.call("GET", `/sync/rooms?as=${as}`)).body.room;
+    for (const as of [f.claude, f.agy]) assert.equal(await roomOf(as), null, `premise: ${as} is in no room`);
+    for (const [who, as, read] of [["claude", f.claude, f.claudeContext], ["agy", f.agy, f.agySteps]]) {
+      await f.ask(as, `question for ${who}`);
+      const text = await read();
+      assert.ok(text.includes(`question for ${who}`), `premise: ${who} was handed its mail: ${text}`);
+      const { command, out } = f.runPrinted(text, `F2-${who.toUpperCase()}-REPLY`);
+      assert.match(command, /-H "x-gyredeck-member: [0-9a-f]{64}"/, `${who}: the command carries a key`);
+      assert.match(out, /"ok":true/, `${who}: the printed command posted: ${out}`);
+      assert.match(out, /"seq":\d+/, `${who}: with a seq`);
+      // The same command without its key is refused: the key is what posts.
+      const keyless = spawnSync("/bin/sh", ["-c", command.replace(/ -H "x-gyredeck-member: [0-9a-f]{64}"/, "").replace("YOUR REPLY HERE", "KEYLESS")], { env: { ...process.env, HOME: f.home }, encoding: "utf8" });
+      assert.match(keyless.stdout, /not_your_key/, `${who}: without the key the post is refused: ${keyless.stdout}`);
+    }
+    const replies = (await f.said()).filter((line) => /:F2-/.test(line));
+    assert.deepEqual(replies, [`${f.claude}:F2-CLAUDE-REPLY`, `${f.agy}:F2-AGY-REPLY`], "each reply landed in the asker's mailbox, in its own name");
+  } finally {
+    await f.close();
+  }
+});
+
+test("#403 F2 invariant 5: with no broker a session in no room still reads its mail, is handed no key, and is told the broker is needed to reply", async () => {
+  const f = await f2Fixture("inv5", { withBroker: false });
+  try {
+    await f.ask(f.agy, "agy over TCP");
+    const steps = await f.agySteps();
+    assert.ok(steps.includes("agy over TCP"), `the read keeps working over TCP: ${steps}`);
+    assert.match(steps, /the Gyredeck broker is needed to reply/);
+    assert.doesNotMatch(steps, /x-gyredeck-member/, "no key");
+    assert.doesNotMatch(steps, /curl -s -X POST/, "and no command that would only be refused");
+    await f.ask(f.claude, "claude over TCP");
+    const context = await f.claudeContext();
+    assert.ok(context.includes("claude over TCP"), `the Claude read keeps working over TCP too: ${context}`);
+    assert.match(context, /The Gyredeck broker is needed to reply/);
+    assert.doesNotMatch(context, /x-gyredeck-member|curl -s -X POST/);
+  } finally {
+    await f.close();
+  }
+});

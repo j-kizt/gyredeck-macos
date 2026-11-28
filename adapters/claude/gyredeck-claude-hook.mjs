@@ -429,6 +429,12 @@ const hookCommandPath = () => {
   return here === installed ? "~/.config/gyredeck/gyredeck-claude-hook.mjs" : here;
 };
 const MAIL_MAX_TEXT = 2_000;
+// A post in a session's name takes its own key (#294, #403 F2), handed only through the broker:
+// with none in a delivery, a command would only be refused, so none is printed.
+const NO_KEY_ANSWER =
+  "REPLY — not available in this delivery: a post in your name takes your own key, which only the Gyredeck broker" +
+  " hands over, and this delivery did not come through it. The Gyredeck broker is needed to reply: tell the person" +
+  " at this terminal; nothing you send by hand would be accepted.";
 /** `from` the desktop app uses when the person sends a message themselves. */
 const APP_SENDER = "gyredeck";
 /** `from` the bridge uses when the room reports a change to its own membership. */
@@ -987,12 +993,14 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
         `-H "x-gyredeck-member: ${memberKey}" ` +
         `-d '${JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''")}'\n` +
         "It was sent only if you see ok:true and a seq."
-      : "REPLY — not available in this delivery: a post in your name takes your own key, and the Gyredeck broker could not vouch for this session to hand it over. Tell the person at this terminal; nothing you send by hand would be accepted.",
+      : NO_KEY_ANSWER,
     );
+  } else if (replyTo && !room_ && !memberKey) {
+    lines.push(NO_KEY_ANSWER);
   } else if (replyTo && !room_) {
-    // A plain mailbox takes the machine token, read at send time rather than written in
-    // here so no credential lands in the transcript.
-    const header = "-H \"x-gyredeck-token: $TOKEN\"";
+    // A plain mailbox takes the machine token, read at send time, and a post in this
+    // session's name its own key (#403 F2).
+    const header = `-H "x-gyredeck-token: $TOKEN" -H "x-gyredeck-member: ${memberKey}"`;
     const prelude = "  TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); ";
     lines.push(
       "ANSWER — run this once, with your reply in place of YOUR REPLY HERE:\n" +

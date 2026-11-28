@@ -594,7 +594,7 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
   if (replyRooms.length === 0) return null;
   const target = replyRooms[0];
   // A room is posted to with the member's own key (#331); a plain mailbox, the only other
-  // thing `target` can be, with the machine token.
+  // thing `target` can be, with the machine token beside it.
   const isRoom = /^sync-[a-z2-9]{4}$/.test(target);
   if (isRoom) {
     // The short form (#157): the rest is in the rules file. Addressed and labelled in
@@ -628,11 +628,22 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
         "It was sent only if you see ok:true and a seq.",
     };
   }
+  // A plain mailbox takes the machine token and, for a post in this session's name, its own
+  // key (#403 F2), which only the broker hands over: a TCP read without it gets no command.
+  if (!(typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey))) {
+    return {
+      ephemeralMessage:
+        "The mail above can be read but not answered from here: the Gyredeck broker is needed to reply." +
+        " A post in your name takes your own key, which only the broker hands over, and this delivery did not" +
+        " come through it. Tell the person at this terminal; nothing you send by hand would be accepted.",
+    };
+  }
   const command =
     "TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); " +
     `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${target} ` +
     "-H 'content-type: application/json' " +
     '-H "x-gyredeck-token: $TOKEN" ' +
+    `-H "x-gyredeck-member: ${memberKey}" ` +
     `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}","to":"everyone","kind":"tell"}'`;
   return {
     ephemeralMessage:

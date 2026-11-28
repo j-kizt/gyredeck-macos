@@ -4243,9 +4243,8 @@ function startBridge(config) {
    * ever told outside one still learns of the helper. Kept on the membership, so leaving
    * and coming back is a new confirmation, told again.
    *
-   * It is also when the member's read key is minted (#274): a read in a member's name takes
-   * this key, and the key is handed only to a
-   * read the broker vouches for. Minted first, so a failure leaves the member unconfirmed.
+   * The member's key is the session's own (#403, `sessionKeys`), minted at its first delivery
+   * the broker vouches for and kept across joining and leaving, so nothing is minted here.
    *
    * And when the process it was let in from is recorded (#332): the generation of the
    * session's live broker binding, or none when the broker has not bound it. A later
@@ -4253,7 +4252,6 @@ function startBridge(config) {
    */
   const markConfirmed = (member, conversationId) => {
     member.boundGeneration = brokerGeneration.get(conversationId) ?? null;
-    member.readKey = randomBytes(32).toString("hex");
     member.confirmed = true;
     member.confirmedAt = new Date().toISOString();
     member.heavyOwed = true;
@@ -5241,10 +5239,6 @@ function startBridge(config) {
       return "USAGE: ask Gyredeck how much of your plan is left at any time: " +
         `curl -s "http://${config.host ?? BRIDGE_HOST}:${config.port ?? DEFAULT_PORT}/usage?as=${conversationId}" ` +
         '-H "x-gyredeck-token: $(cat ~/.config/gyredeck/gyredeck.ingest-token)"' +
-        // Handed only on a read that already passed the member's door, so the key is its own.
-        (!keyless && typeof syncRoomFor(conversationId)?.room.members.get(conversationId)?.readKey === "string"
-          ? ` -H "x-gyredeck-member: ${syncRoomFor(conversationId).room.members.get(conversationId).readKey}"`
-          : "") +
         (low.length > 0 ? ` — low now: ${low.map(describe).join("; ")}. Finish at a safe point.` : "");
     }
     const changed = [];
@@ -5850,10 +5844,8 @@ function startBridge(config) {
    */
   const describeInbox = (messages, sync, as, missed = [], vouched = false, markRoster = false) => ({
     messages,
-    // Handed only to the read the broker vouched for, and only once the member is in (#274).
-    ...(vouched && sync?.room.members.get(as)?.confirmed === true && typeof sync.room.members.get(as)?.readKey === "string"
-      ? { memberKey: sync.room.members.get(as).readKey }
-      : {}),
+    // Handed only to the read the broker vouched for, to every session alike (#403 F2).
+    ...(vouched && sessionKeyFor(as) ? { memberKey: sessionKeys.get(as) } : {}),
     // Only when something was actually lost. An empty field on every answer is noise
     // that teaches readers to skip the one time it matters.
     ...(missed.length > 0
@@ -6042,6 +6034,8 @@ function startBridge(config) {
     const seen = brokerGeneration.get(conversationId);
     if (seen !== undefined && generation <= seen) return;
     brokerGeneration.set(conversationId, generation);
+    // A new process of a session this bridge already knew: the key the old one was handed dies.
+    if (seen !== undefined) sessionKeys.delete(conversationId);
     const sync = syncRoomFor(conversationId);
     const member = sync?.room.members.get(conversationId);
     if (!member || member.relay === true || member.boundGeneration === generation) return;
@@ -6052,7 +6046,7 @@ function startBridge(config) {
   const shutOutNewProcess = (name, room, conversationId) => {
     const member = room.members.get(conversationId);
     member.confirmed = false;
-    delete member.readKey;
+    sessionKeys.delete(conversationId);
     member.toldUnconfirmed = false;
     member.heldThroughSeq = null;
     // A watch opened by the old process carries the old key and would go on reading.
@@ -6148,7 +6142,7 @@ function startBridge(config) {
     if (!sync) return false;
     // A confirmed member's own key opens its own mailbox (#331).
     const member = sync.room.members.get(mailboxName);
-    return member?.confirmed === true && holdsMemberKey(member, req);
+    return member?.confirmed === true && holdsMemberKey(mailboxName, req);
   };
 
   /**
@@ -6172,33 +6166,44 @@ function startBridge(config) {
         message: `Name yourself with ?as=<conversationId>; only a confirmed member of this room may ${verb} it. ${ROOM_PASSWORD_HINT}`,
       };
     }
-    if (!holdsMemberKey(member, req)) return { error: "not_your_key", message: MEMBER_KEY_HINT };
+    if (!holdsMemberKey(as, req)) return { error: "not_your_key", message: MEMBER_KEY_HINT };
     return null;
   };
 
   /**
-   * A member's own read key (#274), in `x-gyredeck-member`. It reaches a session only in a
-   * collect the broker made for it, which is the one read that knows which process asks, so
-   * holding it is what tells one member's read from another's. A member with no key —
-   * unconfirmed, or the relay, which reads by the app's word — never matches.
+   * Every session's own key (#274, #403 F2), in `x-gyredeck-member`: one store for a room
+   * member and a session in no room, so a key handed before joining still works after, and
+   * leaving takes nothing away. Minted at the session's first delivery the broker vouches for,
+   * the one read that knows which process asks, and never for the relay, which reads by the
+   * app's word. It dies when a new process takes the session (#332). Capped by refusing to
+   * mint, never by dropping a key a session holds: a session past the cap is handed none.
    */
   const MEMBER_KEY_HEADER = "x-gyredeck-member";
   const MEMBER_KEY_HINT =
-    "A read or a post in a member's name takes that member's own key in x-gyredeck-member." +
-    " The key arrives with this session's own deliveries, written into the commands they hand you; a session" +
-    " the Gyredeck broker cannot vouch for is never given one.";
-  const holdsMemberKey = (member, req) =>
-    typeof member?.readKey === "string" && matchesIngestToken(member.readKey, req?.headers?.[MEMBER_KEY_HEADER]);
+    "A post in a session's name, and a read in a room member's name, takes that session's own key in" +
+    " x-gyredeck-member. The key arrives with this session's own deliveries, written into the commands they" +
+    " hand you; a session the Gyredeck broker cannot vouch for is never given one.";
+  const sessionKeys = new Map();
+  const sessionKeyFor = (as) => {
+    if (!sessionKeys.has(as) && typeof as === "string" && MAIL_ROOM_NAME.test(as) && !isRelayMember(as) && sessionKeys.size < BROKER_BOUND_MAX) {
+      sessionKeys.set(as, randomBytes(32).toString("hex"));
+    }
+    return sessionKeys.get(as) ?? null;
+  };
+  const holdsMemberKey = (as, req) => {
+    const key = typeof as === "string" ? sessionKeys.get(as) : undefined;
+    return typeof key === "string" && matchesIngestToken(key, req?.headers?.[MEMBER_KEY_HEADER]);
+  };
 
   /**
-   * The door for a post into a private mailbox in a room member's name (#274, #294): the
-   * broker's word or the member's own key. Reads no longer use it (#403): a refusal that only
-   * a member could get said which sessions are in a room — see `readsWithKey`.
+   * The door for every post in a session's name (#294, #403 F2): the broker's word or that
+   * session's own key, asked before anything about the room is. A keyless post is answered
+   * `not_your_key` whether or not the name is in a room, so a post says nothing about who is
+   * in one. The voices that are not a session are judged by `refuseToPublish`.
    */
-  const refuseMemberRead = (as, req) => {
-    const member = syncRoomFor(as)?.room.members.get(as);
-    if (!member || member.relay === true) return null;
-    if (holdsBrokerSecret(req?.headers?.["x-gyredeck-broker"]) || holdsMemberKey(member, req)) return null;
+  const refuseNamedPost = (from, req) => {
+    if (isReservedId(from)) return null;
+    if (holdsBrokerSecret(req?.headers?.["x-gyredeck-broker"]) || holdsMemberKey(from, req)) return null;
     return { error: "not_your_key", message: MEMBER_KEY_HINT };
   };
 
@@ -6210,8 +6215,7 @@ function startBridge(config) {
    */
   const readsWithKey = (as, req) => {
     if (holdsBrokerSecret(req?.headers?.["x-gyredeck-broker"])) return true;
-    const member = syncRoomFor(as)?.room.members.get(as);
-    return member?.relay === true || holdsMemberKey(member, req);
+    return syncRoomFor(as)?.room.members.get(as)?.relay === true || holdsMemberKey(as, req);
   };
   // Sessions that have collected with a key or the broker's word. A keyless read of one says
   // `keyLost` on every read, never spent, so a lost answer or a second collector cannot use it
@@ -8541,7 +8545,7 @@ function startBridge(config) {
         }
         const found = syncRoomFor(as);
         const member = found?.room.members.get(as);
-        if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"]) && !(member?.confirmed === true && holdsMemberKey(member, req))) {
+        if (!holdsBrokerSecret(req.headers["x-gyredeck-broker"]) && !(member?.confirmed === true && holdsMemberKey(as, req))) {
           sendJson(403, { ok: false, error: "not_your_key", message: MEMBER_KEY_HINT });
           return;
         }
@@ -9571,7 +9575,7 @@ function startBridge(config) {
         if (standing && standing.members.size > 0) {
           // Or a confirmed member's own key (#331): which member it must be is checked once the
           // body names the sender — a post in a member's name takes that member's key (#294).
-          const anyMemberKey = [...standing.members.values()].some((member) => member.confirmed === true && holdsMemberKey(member, req));
+          const anyMemberKey = [...standing.members].some(([id, member]) => member.confirmed === true && holdsMemberKey(id, req));
           if (!holdsMachineToken(headerToken) && !anyMemberKey) {
             sendJson(403, { ok: false, error: "not_confirmed", message: ROOM_PASSWORD_HINT });
             return;
@@ -9610,9 +9614,9 @@ function startBridge(config) {
         // The app's own call: the machine token and the app's word together, the pair the
         // app-only routes take. Only it may speak as the room or the person (#205).
         const vouched = holdsMachineToken(headerToken) && holdsBrokerSecret(req.headers["x-gyredeck-broker"]);
-        // A post in a member's name takes that member's own key or the broker's word (#294),
-        // the door #274 set for reads: the machine token is every agent's.
-        const notTheirs = refuseToPublish(room, from, vouched) ? null : refuseMemberRead(from, req);
+        // A post in any session's name takes that session's own key or the broker's word (#294,
+        // #403 F2), asked first so the answer is the same whether or not the name is in a room.
+        const notTheirs = refuseNamedPost(from, req);
         if (notTheirs) {
           sendJson(403, { ok: false, ...notTheirs });
           return;

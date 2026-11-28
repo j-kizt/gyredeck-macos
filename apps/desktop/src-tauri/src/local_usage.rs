@@ -352,25 +352,31 @@ fn content_order(left: &[(i64, f64); 2], right: &[(i64, f64); 2]) -> std::cmp::O
         .unwrap_or(std::cmp::Ordering::Equal)
 }
 
-/// The newest status-line reading for this config dir, chosen by content, when it is plausibly
-/// this account's. Records it outranks are removed, by name, without following a link: those of
-/// this config dir saying no more than it, those numbered below the ones read, and those that
-/// have not parsed for `CLAUDE_UNREADABLE_GRACE`.
+/// The newest status-line reading for this config dir that is plausibly this account's, chosen
+/// by content. Records it outranks are removed, by name, without following a link: those of this
+/// config dir and account saying no more than it, and those that have not parsed for
+/// `CLAUDE_UNREADABLE_GRACE`. Another account's, or another config dir's, are left alone.
 pub(crate) fn claude_local_latest(
     dir: &Path,
     config_dir: &Path,
     base: Option<&CodexUsageSnapshot>,
     now: i64,
 ) -> Option<LocalReading> {
-    guard_claude(choose_claude_record(dir, config_dir, now)?.1, config_dir, base)
+    let accept = |status: &ClaudeStatusLine| guard_claude(status.clone(), config_dir, base).is_some();
+    Some(choose_claude_record(dir, config_dir, now, &accept)?.1.reading)
 }
 
-/// The record `claude_local_latest` reads, before the account guard, with its path.
-pub(crate) fn choose_claude_record(dir: &Path, config_dir: &Path, now: i64) -> Option<(PathBuf, ClaudeStatusLine)> {
+/// The record `claude_local_latest` reads, with its path, among those `accept` lets through.
+pub(crate) fn choose_claude_record(
+    dir: &Path,
+    config_dir: &Path,
+    now: i64,
+    accept: &dyn Fn(&ClaudeStatusLine) -> bool,
+) -> Option<(PathBuf, ClaudeStatusLine)> {
     let mut mine = Vec::new();
     for (order, path) in claude_records(dir) {
         match read_claude_record(&path, now) {
-            (Some(status), _) if same_dir(&status.config_dir, config_dir) => {
+            (Some(status), _) if same_dir(&status.config_dir, config_dir) && accept(&status) => {
                 if let Some(content) = claude_content(&status) {
                     mine.push((content, order, path, status));
                 }
@@ -1032,7 +1038,7 @@ mod tests {
         let link = dir.join("claude-statusline.0.json");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
 
-        let (path, status) = choose_claude_record(&dir, Path::new("/c"), NOW).expect("a reading");
+        let (path, status) = choose_claude_record(&dir, Path::new("/c"), NOW, &|_| true).expect("a reading");
         assert_eq!(path, newest, "the most the payloads say, not the highest number");
         assert_eq!(weekly(&status.reading.lines).unwrap().1, 41.0);
         assert!(!older_later_number.exists() && !same_weekly_less_session.exists(), "what it outranks is removed");
@@ -1044,14 +1050,14 @@ mod tests {
         // A later week outranks a higher share, and however many higher numbers follow, a lower
         // number that says more is still read and kept.
         let next_week = write(12, "/c", 1.0, 1.0, week + 7 * 86_400);
-        assert_eq!(choose_claude_record(&dir, Path::new("/c"), NOW).unwrap().0, next_week);
+        assert_eq!(choose_claude_record(&dir, Path::new("/c"), NOW, &|_| true).unwrap().0, next_week);
         assert!(!newest.exists());
         let paused = write(13, "/c", 2.0, 1.0, week + 7 * 86_400);
         for order in 100..200 {
             write(order, "/c", 1.0, 1.0, week + 7 * 86_400);
             fs::write(dir.join(format!("claude-statusline.{}.json", order + 1000)), "").unwrap();
         }
-        assert_eq!(choose_claude_record(&dir, Path::new("/c"), NOW).unwrap().0, paused, "order never decides");
+        assert_eq!(choose_claude_record(&dir, Path::new("/c"), NOW, &|_| true).unwrap().0, paused, "order never decides");
         assert!(other_dir.exists() && writing.exists(), "another config dir's and a record being written are kept");
 
         // The same figures: the later arrival wins, whatever number it reserved.
@@ -1067,10 +1073,30 @@ mod tests {
         };
         let later = at(4, NOW - 20);
         let earlier_higher_number = at(5, NOW - 900);
-        assert_eq!(choose_claude_record(&timed, Path::new("/c"), NOW).unwrap().0, later, "time, then number");
+        assert_eq!(choose_claude_record(&timed, Path::new("/c"), NOW, &|_| true).unwrap().0, later, "time, then number");
         assert!(!earlier_higher_number.exists());
         let _ = fs::remove_dir_all(&timed);
-        assert!(choose_claude_record(&dir.join("missing"), Path::new("/c"), NOW).is_none());
+
+        // Another account in the same config dir, with a later Weekly reset, outranks by content
+        // but is not this account's: it is never chosen, and neither record is removed for it.
+        let two = scratch("claude-choose-two-accounts");
+        let account = |order: u64, weekly_reset: i64| {
+            let path = two.join(format!("claude-statusline.{order}.json"));
+            let body = serde_json::json!({ "at": NOW - 10, "configDir": "/c", "payload": { "rate_limits": {
+                "five_hour": { "used_percentage": 5.0, "resets_at": NOW + 3_600 },
+                "seven_day": { "used_percentage": 60.0, "resets_at": weekly_reset } } } });
+            fs::write(&path, body.to_string()).unwrap();
+            set_mtime(&path, NOW - 10);
+            path
+        };
+        let mine = account(1, WEEKLY_RESET);
+        let theirs = account(2, WEEKLY_RESET + 7 * 86_400);
+        let base = api_snapshot("claude", NOW - 900);
+        let reading = claude_local_latest(&two, Path::new("/c"), Some(&base), NOW).expect("this account's reading");
+        assert_eq!(weekly(&reading.lines).unwrap().0, WEEKLY_RESET);
+        assert!(mine.exists() && theirs.exists(), "another account's record neither wins nor removes this one");
+        let _ = fs::remove_dir_all(&two);
+        assert!(choose_claude_record(&dir.join("missing"), Path::new("/c"), NOW, &|_| true).is_none());
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(outside.parent().unwrap());
     }

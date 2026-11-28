@@ -1249,7 +1249,7 @@ mod tests {
         write_settings(&paths, &serde_json::json!({ "statusLine": running(&CLAUDE, "head -c 3") }));
         install(&paths, &script_source_for(&CLAUDE)).unwrap();
         let chosen = || -> Value {
-            let (path, _) = crate::local_usage::choose_claude_record(&paths.dir, &config, unix_now()).expect("a reading");
+            let (path, _) = crate::local_usage::choose_claude_record(&paths.dir, &config, unix_now(), &|_| true).expect("a reading");
             serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap()["payload"].clone()
         };
         let count = || fs::read_dir(&paths.dir).unwrap()

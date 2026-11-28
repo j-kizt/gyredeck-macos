@@ -3906,14 +3906,25 @@ fn on_core_event_from(core: &Arc<Core>, epoch: u64, event: FromChild) {
             }
             let core = Arc::clone(core);
             thread::spawn(move || {
-                let answer = core.usage_requested(request_id, &owner_id);
-                core.usage_busy.store(false, Ordering::SeqCst);
+                let answer = {
+                    let _busy = ClearOnDrop(&core.usage_busy);
+                    core.usage_requested(request_id, &owner_id)
+                };
                 if lock(&core.hub).epoch == epoch {
                     lock(&core.hub).send(&answer);
                 }
             });
         }
         other => on_child_event_from(&core.hub, core.owners.as_ref(), epoch, other),
+    }
+}
+
+/// Clears the flag however the work ends, a panic included, so `/usage` is never refused for good.
+struct ClearOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 

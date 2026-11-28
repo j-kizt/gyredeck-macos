@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
     sync::{mpsc, Mutex, OnceLock},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use base64::{
@@ -1561,37 +1561,49 @@ async fn codex_usage() -> Result<CodexUsageSnapshot, String> {
 
 /// The last reading each provider's refresh answered, for `/usage` to show — marked as not
 /// current — when a later refresh fails (#396).
-static LAST_USAGE: OnceLock<Mutex<HashMap<&'static str, LastUsage>>> = OnceLock::new();
-
-#[derive(Clone)]
-struct LastUsage {
-    snapshot: CodexUsageSnapshot,
-    fresh: bool,
-    at: Instant,
-}
+static LAST_USAGE: OnceLock<Mutex<HashMap<&'static str, CodexUsageSnapshot>>> = OnceLock::new();
 
 /// Claude's usage endpoint answers 429 when asked faster than about every 3 minutes
-/// (features/usage/settings.ts), and a 429 holds back the panel's next refresh too. `/usage`
-/// asked sooner after a fresh reading shows that reading instead of asking (#396 audit M2).
-const CLAUDE_ON_DEMAND_MIN_GAP: Duration = Duration::from_secs(180);
+/// (features/usage/settings.ts), and a 429 holds back the next refresh too. `/usage` asks
+/// off the panel's schedule, so an account answered less than this long ago, by the wall
+/// clock (it runs on through sleep), is answered from that reading instead of being asked
+/// again, whichever path asks (#396 audit M2, round 2 M1 and S1).
+const CLAUDE_MIN_ASK_GAP: Duration = Duration::from_secs(180);
+static CLAUDE_ANSWERED_AT: OnceLock<Mutex<HashMap<String, SystemTime>>> = OnceLock::new();
+
+fn claude_answered_within(fingerprint: &str, gap: Duration, now: SystemTime) -> bool {
+    CLAUDE_ANSWERED_AT
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(fingerprint).copied())
+        .and_then(|at| now.duration_since(at).ok())
+        .is_some_and(|since| since < gap)
+}
+
+fn note_claude_answered(fingerprint: String, now: SystemTime) {
+    if let Ok(mut guard) = CLAUDE_ANSWERED_AT.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        guard.insert(fingerprint, now);
+    }
+}
 
 /// Whether a snapshot carries any numbers, rather than a status line alone.
 pub(crate) fn has_usage_numbers(snapshot: &CodexUsageSnapshot) -> bool {
     snapshot.lines.iter().any(|line| matches!(line, CodexMetricLine::Progress { .. }))
 }
 
-fn last_usage(provider: &str) -> Option<LastUsage> {
+fn last_usage(provider: &str) -> Option<CodexUsageSnapshot> {
     LAST_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock().ok().and_then(|guard| guard.get(provider).cloned())
 }
 
 /// One provider's refresh as the panel and `/usage` both take it (#396): the snapshot and
 /// whether it was read just now, remembered as that provider's last reading.
 fn remember_usage(provider: &'static str, refreshed: Result<(CodexUsageSnapshot, bool), String>) -> Result<(CodexUsageSnapshot, bool), String> {
-    if let Ok((snapshot, fresh)) = &refreshed {
+    if let Ok((snapshot, _)) = &refreshed {
         // A placeholder with no numbers is never kept as a last reading (#396 audit S6).
         if has_usage_numbers(snapshot) {
             if let Ok(mut guard) = LAST_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
-                guard.insert(provider, LastUsage { snapshot: snapshot.clone(), fresh: *fresh, at: Instant::now() });
+                guard.insert(provider, snapshot.clone());
             }
         }
     }
@@ -1613,7 +1625,7 @@ fn refresh_usage_from(runs: &[UsageRun]) -> Vec<discord::UsageRefresh> {
         .map(|(id, display, handle)| {
             let refreshed = handle.join().unwrap_or_else(|_| Err(format!("{display} usage task failed")));
             let answered_now = matches!(&refreshed, Ok((snapshot, fresh)) if *fresh || has_usage_numbers(snapshot));
-            let last = if answered_now { None } else { last_usage(id).map(|last| last.snapshot) };
+            let last = if answered_now { None } else { last_usage(id) };
             discord::UsageRefresh { display: display.to_string(), refreshed, last }
         })
         .collect()
@@ -1825,18 +1837,10 @@ fn claude_refresh() -> Result<(CodexUsageSnapshot, bool), String> {
     claude_refresh_with(true)
 }
 
-/// Claude for `/usage`: a fresh reading under three minutes old is shown as it is, and the
-/// endpoint is not asked again; the history it would wait on is never shown, so it is not read
-/// (#396 audit M2, S3).
+/// Claude for `/usage`: the history it would wait on is never shown, so it is not read
+/// (#396 audit S3).
 fn claude_refresh_on_demand() -> Result<(CodexUsageSnapshot, bool), String> {
-    if let Some(snapshot) = recent_fresh_usage("claude", CLAUDE_ON_DEMAND_MIN_GAP) {
-        return Ok((snapshot, true));
-    }
     claude_refresh_with(false)
-}
-
-fn recent_fresh_usage(provider: &str, gap: Duration) -> Option<CodexUsageSnapshot> {
-    last_usage(provider).filter(|last| last.fresh && last.at.elapsed() < gap).map(|last| last.snapshot)
 }
 
 fn claude_refresh_with(history: bool) -> Result<(CodexUsageSnapshot, bool), String> {
@@ -1953,6 +1957,9 @@ fn claude_usage_blocking(candidates: Vec<ClaudeAuthState>) -> Result<UsageReadin
             }
             ClaudeGate::Ask => {}
         }
+        if let Some(reading) = claude_recent_answer(&auth, SystemTime::now()) {
+            return Ok(reading);
+        }
 
         match fetch_claude_usage(&client, &auth) {
             Ok(usage) => return Ok(fresh_claude_reading(&auth, usage)),
@@ -2011,7 +2018,15 @@ fn claude_gate(auth: &ClaudeAuthState, now: Instant) -> ClaudeGate {
     }
 }
 
+fn claude_recent_answer(auth: &ClaudeAuthState, now: SystemTime) -> Option<UsageReading> {
+    if !claude_answered_within(&claude_auth_fingerprint(auth), CLAUDE_MIN_ASK_GAP, now) {
+        return None;
+    }
+    read_claude_last_good(auth).map(|snapshot| UsageReading { snapshot, fresh: true, account: claude_reading_tag(auth) })
+}
+
 fn fresh_claude_reading(auth: &ClaudeAuthState, usage: Value) -> UsageReading {
+    note_claude_answered(claude_auth_fingerprint(auth), SystemTime::now());
     UsageReading {
         snapshot: store_claude_last_good(auth, build_claude_usage_snapshot(usage, auth)),
         fresh: true,
@@ -7187,7 +7202,7 @@ mod display_selection_tests {
     /// Claude again; a kept or expired one is asked for; a placeholder with no numbers is never
     /// remembered, so it neither stands in later nor hides the last real reading.
     #[test]
-    fn on_demand_usage_reuses_only_a_recent_fresh_reading_and_never_keeps_a_placeholder() {
+    fn claude_is_asked_at_most_every_three_minutes_by_the_wall_clock_and_a_placeholder_is_never_kept() {
         fn reading(lines: Vec<CodexMetricLine>) -> CodexUsageSnapshot {
             CodexUsageSnapshot {
                 provider_id: "claude".to_string(),
@@ -7199,16 +7214,27 @@ mod display_selection_tests {
             }
         }
         let real = || reading(vec![progress_metric("Session", 15.0, None, None)]);
-        let _ = remember_usage("test-396-m2", Ok((real(), true)));
-        assert!(recent_fresh_usage("test-396-m2", Duration::from_secs(180)).is_some(), "a fresh reading inside the gap is reused");
-        assert!(recent_fresh_usage("test-396-m2", Duration::ZERO).is_none(), "past the gap it is asked for again");
-        let _ = remember_usage("test-396-m2-kept", Ok((real(), false)));
-        assert!(recent_fresh_usage("test-396-m2-kept", Duration::from_secs(180)).is_none(), "a kept reading is never reused as current");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(!claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0), "never answered: asked");
+        note_claude_answered("test-396-m2".to_string(), t0);
+        assert!(claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0 + Duration::from_secs(179)), "inside the gap the last answer stands");
+        assert!(!claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0 + Duration::from_secs(180)), "past the gap it is asked again");
+        assert!(!claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0 + Duration::from_secs(8 * 3600)), "a night's sleep counts: the wall clock, not uptime");
+        assert!(!claude_answered_within("test-396-m2", CLAUDE_MIN_ASK_GAP, t0 - Duration::from_secs(60)), "a clock set back asks rather than trusting the reading");
+        assert!(!claude_answered_within("test-396-m2-other", CLAUDE_MIN_ASK_GAP, t0), "per account");
+
+        let auth = claude_auth("test-396-m2-access", "test-396-m2-refresh");
+        assert!(claude_recent_answer(&auth, SystemTime::now()).is_none(), "never answered: the endpoint is asked");
+        let answered = fresh_claude_reading(&auth, serde_json::json!({"five_hour": {"utilization": 15.0}}));
+        let reused = claude_recent_answer(&auth, SystemTime::now()).expect("the answer just taken stands for the next ask");
+        assert!(reused.fresh);
+        assert_eq!(reused.snapshot.lines.len(), answered.snapshot.lines.len());
+        assert!(claude_recent_answer(&auth, SystemTime::now() + Duration::from_secs(181)).is_none(), "past the gap it is asked again");
 
         let _ = remember_usage("test-396-s6", Ok((real(), true)));
         let _ = remember_usage("test-396-s6", Ok((reading(vec![]), false)));
         let kept = last_usage("test-396-s6").expect("the real reading is still the last one");
-        assert!(has_usage_numbers(&kept.snapshot), "a placeholder did not replace it");
+        assert!(has_usage_numbers(&kept), "a placeholder did not replace it");
         let _ = remember_usage("test-396-s6-only", Ok((reading(vec![]), false)));
         assert!(last_usage("test-396-s6-only").is_none(), "a placeholder alone is never remembered");
 

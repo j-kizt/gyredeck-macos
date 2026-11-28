@@ -657,6 +657,7 @@ const plainDelivery = async (taken) => {
     );
   }
   if (typeof taken.result.missedNote === "string") lines.push(taken.result.missedNote.slice(0, MAIL_MAX_TEXT));
+  if (typeof taken.result.usageLine === "string") lines.push(taken.result.usageLine.slice(0, MAIL_MAX_TEXT));
   if (typeof taken.result.usageNotice === "string") lines.push(taken.result.usageNotice.slice(0, MAIL_MAX_TEXT));
   if (typeof taken.result.heavyNotice === "string") lines.push(taken.result.heavyNotice.slice(0, MAIL_MAX_TEXT));
   // The keyless hint is said on the turn that names the room just joined, or any keyless read
@@ -760,7 +761,8 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
   const hint = (justConfirmed || result?.keyLost === true) && typeof result?.hint === "string" ? result.hint.slice(0, MAIL_MAX_TEXT) : null;
   if (delivered.length === 0 && !justConfirmed) {
     await ackDelivery(result);
-    return [usageNotice, heavyNotice, hint].filter(Boolean).join("\n\n") || null;
+    const usageLine = typeof result?.usageLine === "string" ? result.usageLine.slice(0, MAIL_MAX_TEXT) : null;
+    return [usageLine, usageNotice, heavyNotice, hint].filter(Boolean).join("\n\n") || null;
   }
 
 
@@ -1095,6 +1097,7 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
     );
   }
 
+  if (typeof result?.usageLine === "string") lines.push(result.usageLine.slice(0, MAIL_MAX_TEXT));
   if (usageNotice) lines.push(usageNotice);
   if (heavyNotice) lines.push(heavyNotice);
   if (hint) lines.push(hint);

@@ -905,6 +905,7 @@ const plainSteps = async (taken) => {
     );
   }
   if (typeof taken.result.missedNote === "string") steps.push({ ephemeralMessage: taken.result.missedNote.slice(0, MAIL_MAX_TEXT) });
+  if (typeof taken.result.usageLine === "string") steps.push({ ephemeralMessage: taken.result.usageLine.slice(0, MAIL_MAX_TEXT) });
   if (typeof taken.result.usageNotice === "string") steps.push({ ephemeralMessage: taken.result.usageNotice.slice(0, MAIL_MAX_TEXT) });
   if (typeof taken.result.heavyNotice === "string") steps.push({ ephemeralMessage: taken.result.heavyNotice.slice(0, MAIL_MAX_TEXT) });
   // The keyless hint is said on the turn that names the room just joined, or any keyless read
@@ -1069,7 +1070,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
   // with nothing waiting, which is when the old early answer said nothing at all.
   if (delivered.length === 0 && !confirm?.accepted) {
     await ackDelivery(result);
-    return [...confirmLead(confirm), usageStep, heavyStep, hintStep, (blocked ?? refusedBlocked) ? { ephemeralMessage: blocked ?? refusedBlocked } : null].filter(Boolean);
+    return [...confirmLead(confirm), ...(typeof result?.usageLine === "string" ? [{ ephemeralMessage: result.usageLine.slice(0, MAIL_MAX_TEXT) }] : []), usageStep, heavyStep, hintStep, (blocked ?? refusedBlocked) ? { ephemeralMessage: blocked ?? refusedBlocked } : null].filter(Boolean);
   }
 
 
@@ -1249,6 +1250,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
         ephemeralMessage: `[gyredeck mail · from ${from}${kindOf(message) ? ` · ${kindOf(message)}` : ""}] ${message.text.slice(0, MAIL_MAX_TEXT)}${fileLines(message)}`,
       };
     }),
+    ...(typeof result?.usageLine === "string" ? [{ ephemeralMessage: result.usageLine.slice(0, MAIL_MAX_TEXT) }] : []),
     ...(usageStep ? [usageStep] : []),
     ...(heavyStep ? [heavyStep] : []),
     ...(hintStep ? [hintStep] : []),

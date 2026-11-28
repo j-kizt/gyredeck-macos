@@ -47,12 +47,18 @@ export const COMMANDS = [
   },
   // Usable in a DM to the bot too: the listing of every connected room (#206).
   { name: "status", description: "Who is in this room and how far they have got; outside a post, every room", dm: true },
+  // Only the owner sees the answer, anywhere they ask (#396).
+  { name: "usage", description: "Your providers' usage, refreshed now by Gyredeck (only you see it)", dm: true },
 ];
 /** How long /status waits for the app before it says the answer is not there (#206). */
 const STATUS_WAIT_MS = 10_000;
 const STATUS_ROOMS_SHOWN = 25;
 const STATUS_MAX_CHARS = 1900;
 const OWNER_CHANGED = "No status was shown: the paired owner changed while it was asked.";
+/** How long /usage waits for the app's refresh, which asks every provider (#396). */
+const USAGE_WAIT_MS = 60_000;
+const USAGE_UNAVAILABLE = "Usage is not available right now.";
+const SOURCE_WORDS = { api: "updated", statusline: "from status line", log: "from session log" };
 
 // "@Name: text" or "Name: text" at the very start addresses Name; anything else is for
 // everyone. The colon is what ends the name: without it "@Gyre Assistant please reply" could
@@ -805,6 +811,7 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
   discord.on("command", (c) => {
     if (stopped) return;
     if (c.name === "status") return void statusCommand(c).catch((e) => fail("internal", e?.message));
+    if (c.name === "usage") return void usageCommand(c).catch((e) => fail("internal", e?.message));
     if (c.name !== "disconnect") return;
     command(c).catch((e) => fail("internal", e?.message));
   });
@@ -827,6 +834,63 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
     const timer = clock.setTimeout(() => statusDone(requestId, "Status is not available right now."), STATUS_WAIT_MS);
     statusAsked.set(requestId, { c, scope, timer, askedBy: c.userId });
     send({ t: "status_request", requestId, ownerId: c.userId, channelId: c.channelId, ...scope });
+  }
+  // /usage (#396): the app refreshes every provider and answers with its own numbers. Only the
+  // owner is asked about, the answer only they see; nothing goes into a room, nobody is woken.
+  async function usageCommand(c) {
+    if (!ownerId || c.userId !== ownerId) return c.reply({ content: "Only the person paired with this Gyredeck can ask for usage.", ephemeral: true });
+    await c.defer({ ephemeral: true });
+    const requestId = randomBytes(8).toString("hex");
+    const timer = clock.setTimeout(() => statusDone(requestId, USAGE_UNAVAILABLE), USAGE_WAIT_MS);
+    statusAsked.set(requestId, { c, scope: {}, timer, askedBy: c.userId, at: clock.now() });
+    send({ t: "usage_request", requestId, ownerId: c.userId });
+  }
+  function usageAnswer(msg) {
+    const requestId = String(msg.requestId ?? "");
+    const asked = statusAsked.get(requestId);
+    if (!asked) return;
+    if (typeof msg.error === "string") return statusDone(requestId, msg.error);
+    statusDone(requestId, usageText(Array.isArray(msg.providers) ? msg.providers : [], msg.mode === "used" ? "used" : "left", asked.at));
+  }
+  // As the Usage panel words it: a reading this refresh took is "updated" or "from status line /
+  // session log" at its time; any other is the last one, with its age, never shown as current.
+  function usageText(providers, mode, askedAt) {
+    const now = clock.now();
+    const lines = [`**Usage** · asked ${hhmm(askedAt)}`];
+    if (!providers.length) lines.push("No provider answered.");
+    for (const p of providers) {
+      const at = Date.parse(p.fetchedAt);
+      const source = SOURCE_WORDS[p.source] ?? SOURCE_WORDS.api;
+      const plan = p.plan ? ` · ${plain(p.plan)}` : "";
+      let when;
+      if (!Number.isFinite(at)) when = "couldn't refresh — no reading yet";
+      else if (p.current === true) when = `${source} ${hhmm(at)}`;
+      else when = `couldn't refresh — last reading ${source === "updated" ? "" : `${source} `}${hhmm(at)} (${ago((now - at) / 1000)})`;
+      lines.push(`**${plain(p.display)}**${plan} · ${when}`);
+      if (!Number.isFinite(at)) continue;
+      for (const l of Array.isArray(p.lines) ? p.lines : []) {
+        const pct = Number(l.pct);
+        if (!Number.isFinite(pct)) continue;
+        const left = mode === "used" ? 100 - pct : pct;
+        const low = left > 45 ? "" : left > 20 ? " · running low" : left > 0 ? " · nearly exhausted" : " · exhausted";
+        const resetMs = Date.parse(l.resetsAt) - now;
+        const resets = Number.isFinite(resetMs) && resetMs > 0 ? ` · resets in ${span(resetMs)}` : "";
+        lines.push(`  ${plain(l.label)} ${pct}% ${mode}${low}${resets}`);
+      }
+    }
+    return lines.join("\n");
+  }
+  function hhmm(ms) {
+    const d = new Date(ms);
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  }
+  function span(ms) {
+    const minutes = Math.max(0, Math.round(ms / 60_000));
+    const days = Math.floor(minutes / 1440);
+    const hours = Math.floor((minutes % 1440) / 60);
+    if (days) return `${days}d ${hours}h`;
+    if (hours) return `${hours}h ${minutes % 60}m`;
+    return `${minutes}m`;
   }
   function statusDone(requestId, content) {
     const asked = statusAsked.get(requestId);
@@ -1232,7 +1296,7 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
         if (e?.kind !== "network") {
           return commandsSaid(e?.kind === "permission" ? "missing_permission" : "internal", `Could not register /disconnect: ${e?.message}`);
         }
-        if (!failed) commandsSaid("commands_unregistered", "Could not register /disconnect and /status yet; retrying.");
+        if (!failed) commandsSaid("commands_unregistered", "Could not register /disconnect, /status and /usage yet; retrying.");
         failed = true;
         await wait(backoff);
         backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
@@ -2011,6 +2075,8 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
       }
       case "status":
         return statusAnswer(msg);
+      case "usage":
+        return usageAnswer(msg);
       case "said":
         return said(msg);
       case "quiet": {

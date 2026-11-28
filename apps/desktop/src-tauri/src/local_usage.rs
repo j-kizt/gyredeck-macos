@@ -53,7 +53,7 @@ pub(crate) enum UsageMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UsageSettings {
     pub(crate) refresh: Duration,
-    #[allow(dead_code)] // held for the Discord answer (#396), which reads it
+    /// Left or Used, as the panel shows it; `/usage` on Discord follows it (#396).
     pub(crate) mode: UsageMode,
 }
 

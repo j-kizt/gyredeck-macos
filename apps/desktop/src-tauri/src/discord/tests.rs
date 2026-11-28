@@ -168,6 +168,9 @@ struct FakeActs {
     /// Every owner post the bridge was asked to publish, and what it answers.
     posts: Mutex<Vec<(String, OwnerPost, String)>>,
     answer: Mutex<Option<Result<u64, Refused>>>,
+    /// What each /usage refresh answers (#396), and how many were asked.
+    usage: Mutex<Vec<UsageRefresh>>,
+    usage_refreshes: AtomicU64,
 }
 
 impl Default for FakeActs {
@@ -180,6 +183,8 @@ impl Default for FakeActs {
             leave_words: Mutex::default(),
             posts: Mutex::default(),
             answer: Mutex::default(),
+            usage: Mutex::default(),
+            usage_refreshes: AtomicU64::new(0),
         }
     }
 }
@@ -195,6 +200,10 @@ impl RoomActs for Arc<FakeActs> {
     fn post_owner(&self, room: &str, post: &OwnerPost, app_word: &str) -> Result<u64, Refused> {
         self.posts.lock().unwrap().push((room.to_string(), post.clone(), app_word.to_string()));
         self.answer.lock().unwrap().clone().unwrap_or(Ok(7))
+    }
+    fn refresh_usage(&self) -> Vec<UsageRefresh> {
+        self.usage_refreshes.fetch_add(1, Ordering::SeqCst);
+        self.usage.lock().unwrap().clone()
     }
     fn leave(&self, room: &str, _member: &str, app_word: &str) -> Result<(), String> {
         self.leaves.lock().unwrap().push(room.to_string());
@@ -6972,4 +6981,103 @@ fn r318_a_wake_between_two_sleeps_let_go_does_not_make_the_second_on_time() {
     wait_until("the second wake handed", || ids_of(&buffer.lines(), ROOM, "wake").len() == 2);
     let sleeps: Vec<String> = shape(&buffer.lines(), ROOM).into_iter().filter(|line| line.starts_with("sleep")).collect();
     assert!(sleeps.iter().all(|line| line == "sleep(delayed)"), "{sleeps:?}");
+}
+
+
+// ---- #396 /usage: the app refreshes every provider and answers the paired owner only ----
+
+fn usage_ask(f: &Fixture, buffer: &SharedBuf, owner_id: &str) -> serde_json::Value {
+    let before = of_kind(&buffer.lines(), "usage").len();
+    let json = format!(r#"{{"t":"usage_request","requestId":"u1","ownerId":"{owner_id}"}}"#);
+    on_core_event(&f.state.core, serde_json::from_str::<FromChild>(&json).expect("a usage request parses"));
+    wait_until("the usage answer", || of_kind(&buffer.lines(), "usage").len() > before);
+    of_kind(&buffer.lines(), "usage")[before].clone()
+}
+
+fn usage_snapshot(source: crate::UsageSource, used: f64, fetched_at: &str) -> crate::CodexUsageSnapshot {
+    crate::CodexUsageSnapshot {
+        provider_id: "codex".to_string(),
+        display_name: "Codex".to_string(),
+        plan: Some("Plus".to_string()),
+        lines: vec![
+            crate::progress_metric("Weekly", used, Some("2026-12-01T00:00:00Z".to_string()), None),
+            crate::CodexMetricLine::Text { label: "Status".to_string(), value: "kept".to_string() },
+        ],
+        fetched_at: fetched_at.to_string(),
+        source,
+    }
+}
+
+fn usage_refresh(refreshed: Result<(crate::CodexUsageSnapshot, bool), String>, last: Option<crate::CodexUsageSnapshot>) -> UsageRefresh {
+    UsageRefresh { display: "Codex".to_string(), refreshed, last }
+}
+
+#[test]
+fn usage_is_refused_to_anyone_but_the_keychain_owner_and_nothing_is_refreshed_or_shown() {
+    let f = fixture_owned("usage-refused", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    *f.acts.usage.lock().unwrap() = vec![usage_refresh(Ok((usage_snapshot(crate::UsageSource::Api, 30.0, "2026-11-28T05:41:00Z"), true)), None)];
+    let answer = usage_ask(&f, &buffer, "999999999999999999");
+    assert_eq!(answer["requestId"], "u1");
+    assert!(answer["error"].as_str().is_some_and(|e| e.contains("Only the paired owner")), "{answer}");
+    assert!(answer.get("providers").is_none(), "no numbers for anyone else: {answer}");
+    assert_eq!(f.acts.usage_refreshes.load(Ordering::SeqCst), 0, "nothing refreshed for anyone else");
+}
+
+#[test]
+fn usage_refreshes_before_answering_and_nothing_reaches_a_room() {
+    let f = fixture_owned("usage-owner", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    connected(&f, ROOM, THREAD);
+    *f.acts.usage.lock().unwrap() = vec![usage_refresh(Ok((usage_snapshot(crate::UsageSource::Api, 30.0, "2026-11-28T05:41:00Z"), true)), None)];
+    let lines_before = buffer.lines().len();
+    let answer = usage_ask(&f, &buffer, OWNER_ID);
+    assert_eq!(f.acts.usage_refreshes.load(Ordering::SeqCst), 1, "the app refreshed before it answered");
+    assert!(answer.get("error").is_none(), "{answer}");
+    assert_eq!(answer["providers"][0]["display"], "Codex");
+    assert_eq!(answer["providers"][0]["current"], true);
+    assert!(f.acts.posts.lock().unwrap().is_empty(), "nothing published to the room, so no agent reads it");
+    let after: Vec<String> = buffer.lines().into_iter().skip(lines_before).filter_map(|m| m["t"].as_str().map(str::to_string)).collect();
+    assert_eq!(after, ["usage"], "the only line to the child is the answer itself");
+}
+
+#[test]
+fn usage_a_failed_or_kept_refresh_is_never_current_and_keeps_its_reading_time() {
+    use crate::local_usage::UsageMode::Left;
+    let fresh = usage_entry(usage_refresh(Ok((usage_snapshot(crate::UsageSource::Api, 30.0, "2026-11-28T05:41:00Z"), true)), None), Left);
+    assert_eq!(fresh["current"], true, "premise: a reading taken just now is current");
+    let kept = usage_entry(usage_refresh(Ok((usage_snapshot(crate::UsageSource::Api, 30.0, "2026-11-28T04:58:00Z"), false)), None), Left);
+    assert_eq!((kept["current"].clone(), kept["fetchedAt"].clone()), (serde_json::json!(false), serde_json::json!("2026-11-28T04:58:00Z")), "a kept reading");
+    let failed = usage_entry(usage_refresh(Err("Codex usage is rate limited.".into()), Some(usage_snapshot(crate::UsageSource::Api, 55.0, "2026-11-28T04:58:00Z"))), Left);
+    assert_eq!(failed["current"], false, "a failed refresh shows the last reading, not as current");
+    assert_eq!(failed["fetchedAt"], "2026-11-28T04:58:00Z", "with the time it was read");
+    assert_eq!(failed["lines"][0]["pct"], 45);
+    let never = usage_entry(usage_refresh(Err("no login".into()), None), Left);
+    assert_eq!((never["current"].clone(), never["lines"].clone(), never.get("fetchedAt").is_none()), (serde_json::json!(false), serde_json::json!([]), true), "nothing made up");
+}
+
+#[test]
+fn usage_names_where_each_reading_came_from() {
+    use crate::local_usage::UsageMode::Left;
+    let source = |s| usage_entry(usage_refresh(Ok((usage_snapshot(s, 30.0, "2026-11-28T05:41:00Z"), true)), None), Left)["source"].clone();
+    assert_eq!(
+        [source(crate::UsageSource::Api), source(crate::UsageSource::StatusLine), source(crate::UsageSource::Log)],
+        [serde_json::json!("api"), serde_json::json!("statusline"), serde_json::json!("log")]
+    );
+}
+
+#[test]
+fn usage_percent_follows_the_apps_usage_mode() {
+    let f = fixture_owned("usage-mode", Some(TOKEN), &[], the_owner());
+    let buffer = f.attach_buffer();
+    *f.acts.usage.lock().unwrap() = vec![usage_refresh(Ok((usage_snapshot(crate::UsageSource::Api, 30.0, "2026-11-28T05:41:00Z"), true)), None)];
+    let set = |mode: &str| crate::local_usage::set_settings(crate::local_usage::settings_from(&serde_json::json!(300_000), &serde_json::json!(mode)));
+    set("used");
+    let used = usage_ask(&f, &buffer, OWNER_ID);
+    set("left");
+    let left = usage_ask(&f, &buffer, OWNER_ID);
+    assert_eq!((used["mode"].clone(), used["providers"][0]["lines"][0]["pct"].clone()), (serde_json::json!("used"), serde_json::json!(30)));
+    assert_eq!((left["mode"].clone(), left["providers"][0]["lines"][0]["pct"].clone()), (serde_json::json!("left"), serde_json::json!(70)));
+    assert_eq!(used["providers"][0]["lines"].as_array().map(Vec::len), Some(1), "windows only, never the Status line");
 }

@@ -1554,7 +1554,50 @@ fn usage_settings_set(refresh_ms: Value, usage_mode: Value) {
 
 #[tauri::command]
 async fn codex_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    tauri::async_runtime::spawn_blocking(|| codex_refresh().map(|(snapshot, _)| snapshot))
+        .await
+        .map_err(|error| format!("Codex usage task failed: {error}"))?
+}
+
+/// The last reading each provider's refresh answered, for `/usage` to show — marked as not
+/// current — when a later refresh fails (#396).
+static LAST_USAGE: OnceLock<Mutex<HashMap<&'static str, CodexUsageSnapshot>>> = OnceLock::new();
+
+/// One provider's refresh as the panel and `/usage` both take it (#396): the snapshot and
+/// whether it was read just now, remembered as that provider's last reading.
+fn remember_usage(provider: &'static str, refreshed: Result<(CodexUsageSnapshot, bool), String>) -> Result<(CodexUsageSnapshot, bool), String> {
+    if let Ok((snapshot, _)) = &refreshed {
+        if let Ok(mut guard) = LAST_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+            guard.insert(provider, snapshot.clone());
+        }
+    }
+    refreshed
+}
+
+/// Every provider refreshed now, in parallel, each with its last reading when the refresh
+/// failed (#396). The same refreshes the panel runs, relayed the same way.
+fn refresh_all_usage() -> Vec<discord::UsageRefresh> {
+    refresh_usage_from(&[("claude", "Claude Code", claude_refresh), ("codex", "Codex", codex_refresh), ("agy", "Antigravity", agy_refresh)])
+}
+
+type UsageRun = (&'static str, &'static str, fn() -> Result<(CodexUsageSnapshot, bool), String>);
+
+fn refresh_usage_from(runs: &[UsageRun]) -> Vec<discord::UsageRefresh> {
+    let handles: Vec<_> = runs.iter().map(|&(id, display, run)| (id, display, std::thread::spawn(run))).collect();
+    handles
+        .into_iter()
+        .map(|(id, display, handle)| {
+            let refreshed = handle.join().unwrap_or_else(|_| Err(format!("{display} usage task failed")));
+            let last = refreshed.is_err().then(|| {
+                LAST_USAGE.get_or_init(|| Mutex::new(HashMap::new())).lock().ok().and_then(|guard| guard.get(id).cloned())
+            }).flatten();
+            discord::UsageRefresh { display: display.to_string(), refreshed, last }
+        })
+        .collect()
+}
+
+fn codex_refresh() -> Result<(CodexUsageSnapshot, bool), String> {
+    remember_usage("codex", {
         let auth_candidates = load_codex_auth_candidates()?;
         let account_id = auth_candidates.first().and_then(|auth_state| {
             auth_state.auth.tokens.as_ref().and_then(|tokens| tokens.account_id.clone())
@@ -1575,8 +1618,6 @@ async fn codex_usage() -> Result<CodexUsageSnapshot, String> {
         )
         .map(|reading| relay_if_fresh(reading, relay_usage))
     })
-    .await
-    .map_err(|error| format!("Codex usage task failed: {error}"))?
 }
 
 /// Gyredeck only reads the CLI's login and never renews it: a refresh token is single-use,
@@ -1690,7 +1731,13 @@ fn format_codex_usage_error(error: CodexUsageFetchError) -> String {
 
 #[tauri::command]
 async fn agy_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    tauri::async_runtime::spawn_blocking(|| agy_refresh().map(|(snapshot, _)| snapshot))
+        .await
+        .map_err(|error| format!("Antigravity usage task failed: {error}"))?
+}
+
+fn agy_refresh() -> Result<(CodexUsageSnapshot, bool), String> {
+    remember_usage("agy", (|| {
         let stale_after = local_usage::settings().refresh;
         let status = agy_statusline::AgyStatusLinePaths::agy_from_home().ok().and_then(|paths| {
             agy_statusline::read_reading(&paths.payload(), agy_statusline::unix_now(), stale_after)
@@ -1699,16 +1746,14 @@ async fn agy_usage() -> Result<CodexUsageSnapshot, String> {
         match agy_statusline::choose_usage(status, agy_usage_fallback)? {
             agy_statusline::AgyUsage::StatusLine(reading) => {
                 agy_statusline::relay_if_fresh(&reading, |snapshot| relay_usage(snapshot, None));
-                Ok(reading.snapshot)
+                Ok((reading.snapshot, !reading.stale))
             }
             agy_statusline::AgyUsage::Fallback(snapshot) => {
                 relay_usage(&snapshot, None);
-                Ok(snapshot)
+                Ok((snapshot, true))
             }
         }
-    })
-    .await
-    .map_err(|error| format!("Antigravity usage task failed: {error}"))?
+    })())
 }
 
 /// The language server and the cloud path, both of which need agy's credentials. Reached
@@ -1748,7 +1793,13 @@ fn agy_usage_fallback() -> Result<CodexUsageSnapshot, String> {
 
 #[tauri::command]
 async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    tauri::async_runtime::spawn_blocking(|| claude_refresh().map(|(snapshot, _)| snapshot))
+        .await
+        .map_err(|error| format!("Claude usage task failed: {error}"))?
+}
+
+fn claude_refresh() -> Result<(CodexUsageSnapshot, bool), String> {
+    remember_usage("claude", {
         let candidates = load_claude_auth_candidates();
         let first = candidates.iter().find(|auth| claude_can_fetch_live_usage(auth));
         let base = first.and_then(read_claude_last_good);
@@ -1770,8 +1821,6 @@ async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
             relay_if_fresh(reading, relay_usage)
         })
     })
-    .await
-    .map_err(|error| format!("Claude usage task failed: {error}"))?
 }
 
 /// A usage answer, and whether it was read just now or kept: from before a 429, or from
@@ -1789,11 +1838,11 @@ struct UsageReading {
 fn relay_if_fresh(
     reading: UsageReading,
     relay: impl FnOnce(&CodexUsageSnapshot, Option<&str>),
-) -> CodexUsageSnapshot {
+) -> (CodexUsageSnapshot, bool) {
     if reading.fresh {
         relay(&reading.snapshot, reading.account.as_deref());
     }
-    reading.snapshot
+    (reading.snapshot, reading.fresh)
 }
 
 /// Seconds left before this account may be asked again, if it was told to wait.
@@ -7057,6 +7106,38 @@ mod display_selection_tests {
         assert_eq!(relayed, 1, "the premise: a fresh reading is relayed");
         relay_if_fresh(UsageReading { snapshot: snapshot(), fresh: false, account: None }, |_, _| relayed += 1);
         assert_eq!(relayed, 1, "a kept reading is not");
+    }
+
+    /// #396: a provider whose refresh fails is answered with the last reading its refresh
+    /// took, and one never read with none.
+    #[test]
+    fn usage_refresh_falls_back_to_the_last_reading_only_when_the_refresh_fails() {
+        fn reading(used: f64) -> CodexUsageSnapshot {
+            CodexUsageSnapshot {
+                provider_id: "codex".to_string(),
+                display_name: "Codex".to_string(),
+                plan: None,
+                lines: vec![progress_metric("Weekly", used, None, None)],
+                fetched_at: "2026-11-28T04:58:00Z".to_string(),
+                source: UsageSource::Api,
+            }
+        }
+        fn ok() -> Result<(CodexUsageSnapshot, bool), String> {
+            remember_usage("test-396", Ok((reading(55.0), true)))
+        }
+        fn failed() -> Result<(CodexUsageSnapshot, bool), String> {
+            remember_usage("test-396", Err("rate limited".to_string()))
+        }
+        fn never() -> Result<(CodexUsageSnapshot, bool), String> {
+            remember_usage("test-396-never", Err("no login".to_string()))
+        }
+        let first = refresh_usage_from(&[("test-396", "Codex", ok)]);
+        assert!(first[0].refreshed.is_ok() && first[0].last.is_none(), "premise: a refresh that worked needs no last reading");
+        let answer = refresh_usage_from(&[("test-396", "Codex", failed), ("test-396-never", "Never", never)]);
+        assert!(answer[0].refreshed.is_err());
+        let last = answer[0].last.as_ref().expect("the last reading is kept for a failed refresh");
+        assert_eq!(last.fetched_at, "2026-11-28T04:58:00Z");
+        assert!(answer[1].last.is_none(), "nothing made up for a provider never read");
     }
 
     #[test]

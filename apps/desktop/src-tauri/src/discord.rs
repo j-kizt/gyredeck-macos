@@ -80,6 +80,7 @@ const BUSY_STALE: Duration = Duration::from_secs(30 * 60);
 const STATUS_ROOMS: usize = 25;
 const STATUS_MEMBERS: usize = 20;
 const STATUS_BUSY: &str = "Another /status is still being answered; try again in a moment.";
+const USAGE_BUSY: &str = "Another /usage is still being answered; try again in a moment.";
 
 /// How far ahead of this clock a read time may be and still count as just read.
 const READ_CLOCK_SKEW: i64 = 5 * 60;
@@ -309,6 +310,17 @@ pub(crate) enum ToChild {
         #[serde(skip_serializing_if = "Option::is_none")]
         hidden_rooms: Option<usize>,
     },
+    /// The answer to one `/usage` (#396): an error, or each provider just refreshed.
+    #[serde(rename_all = "camelCase")]
+    Usage {
+        request_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        providers: Option<Vec<serde_json::Value>>,
+    },
     /// What became of one `say` (#205): 📨 only on `ok` with a seq.
     #[serde(rename_all = "camelCase")]
     Said {
@@ -532,6 +544,10 @@ enum FromChild {
         #[serde(default)]
         created_at: Option<u64>,
     },
+    /// `/usage` (#396): answered by the app after it refreshes usage.
+    #[serde(rename = "usage_request")]
+    #[serde(rename_all = "camelCase")]
+    UsageRequest { request_id: String, owner_id: String },
 }
 
 /// One owner message, as the child saw it (#205). The post and the author are both checked
@@ -2458,6 +2474,57 @@ pub(crate) trait RoomActs: Send + Sync {
     fn leave(&self, room: &str, member: &str, app_word: &str) -> Result<(), String>;
     /// Publish as [`OWNER_SENDER`], vouched by the app's word. Answers the seq.
     fn post_owner(&self, room: &str, post: &OwnerPost, app_word: &str) -> Result<u64, Refused>;
+    /// Every provider's usage refreshed now, as the Usage panel refreshes it (#396).
+    fn refresh_usage(&self) -> Vec<UsageRefresh> {
+        Vec::new()
+    }
+}
+
+/// One provider's refresh for `/usage` (#396): what it answered — the snapshot and whether it
+/// was read just now — and, when it failed, the last reading taken before it.
+#[derive(Clone)]
+pub(crate) struct UsageRefresh {
+    pub display: String,
+    pub refreshed: Result<(crate::CodexUsageSnapshot, bool), String>,
+    pub last: Option<crate::CodexUsageSnapshot>,
+}
+
+/// One provider as `/usage` shows it (#396). `current` is true only for a reading this refresh
+/// took just now; a kept, outdated or last reading is never current. Each window's percent is
+/// left or used, as the app's Usage mode says; reset times and the reading's time are the
+/// child's to word.
+fn usage_entry(refresh: UsageRefresh, mode: crate::local_usage::UsageMode) -> serde_json::Value {
+    let (snapshot, current) = match refresh.refreshed {
+        Ok((snapshot, fresh)) => (Some(snapshot), fresh),
+        Err(_) => (refresh.last, false),
+    };
+    let Some(snapshot) = snapshot else {
+        return serde_json::json!({ "display": refresh.display, "current": false, "lines": [] });
+    };
+    let lines: Vec<serde_json::Value> = snapshot
+        .lines
+        .iter()
+        .filter_map(|line| match line {
+            crate::CodexMetricLine::Progress { label, used, limit, resets_at, .. } => {
+                let used = if *limit > 0.0 && *limit != 100.0 { used / limit * 100.0 } else { *used };
+                let used = used.round().clamp(0.0, 100.0);
+                let pct = match mode {
+                    crate::local_usage::UsageMode::Left => 100.0 - used,
+                    crate::local_usage::UsageMode::Used => used,
+                };
+                Some(serde_json::json!({ "label": label, "pct": pct as u64, "resetsAt": resets_at }))
+            }
+            _ => None,
+        })
+        .collect();
+    serde_json::json!({
+        "display": snapshot.display_name,
+        "plan": snapshot.plan,
+        "source": snapshot.source,
+        "fetchedAt": snapshot.fetched_at,
+        "current": current,
+        "lines": lines,
+    })
 }
 
 pub(crate) struct Deps {
@@ -2497,6 +2564,8 @@ pub(crate) struct Core {
     owners: Arc<dyn OwnerStore>,
     /// A /status being answered; the next is refused until it is (#206 audit).
     status_busy: AtomicBool,
+    /// A /usage being answered; the next is refused until it is (#396).
+    usage_busy: AtomicBool,
     approvals: Arc<dyn LossStore>,
     /// Held from reading the approval record to the stamp, so two codes are never checked at
     /// once (#207). Holds the secret being set up, in hex, until a code from it verifies.
@@ -2626,6 +2695,7 @@ impl DiscordState {
             source: Arc::clone(&deps.source),
             owners: Arc::clone(&deps.owners),
             status_busy: AtomicBool::new(false),
+            usage_busy: AtomicBool::new(false),
             approvals: Arc::clone(&deps.approvals),
             approval_gate: Mutex::new(None),
             attachments: attachments_root(&deps.state_path),
@@ -3286,6 +3356,25 @@ impl Core {
         }
     }
 
+    /// `/usage` (#396): the owner in the Keychain, then every provider refreshed, then each
+    /// shown as the Usage panel shows it. Nothing reaches a room.
+    fn usage_requested(&self, request_id: String, owner_id: &str) -> ToChild {
+        if let Err(why) = self.keychain_owner(owner_id) {
+            return ToChild::Usage { request_id, error: Some(why.replace("nothing was sent", "no usage was shown")), mode: None, providers: None };
+        }
+        let refreshed = self.acts.refresh_usage();
+        let mode = crate::local_usage::settings().mode;
+        ToChild::Usage {
+            request_id,
+            error: None,
+            mode: Some(match mode {
+                crate::local_usage::UsageMode::Left => "left",
+                crate::local_usage::UsageMode::Used => "used",
+            }),
+            providers: Some(refreshed.into_iter().map(|refresh| usage_entry(refresh, mode)).collect()),
+        }
+    }
+
     /// The child asked, on the owner's ✅: the same disconnect the button runs, with the word
     /// each room was connected with. Checked again here: the owner in the Keychain confirmed
     /// it, and a single room's request came from that room's own post.
@@ -3806,6 +3895,24 @@ fn on_core_event_from(core: &Arc<Core>, epoch: u64, event: FromChild) {
                 }
             });
         }
+        FromChild::UsageRequest { request_id, owner_id } => {
+            if lock(&core.hub).epoch != epoch {
+                return;
+            }
+            // A refresh asks every provider and can take seconds: off this reader, one at a time.
+            if core.usage_busy.swap(true, Ordering::SeqCst) {
+                lock(&core.hub).send(&ToChild::Usage { request_id, error: Some(USAGE_BUSY.to_string()), mode: None, providers: None });
+                return;
+            }
+            let core = Arc::clone(core);
+            thread::spawn(move || {
+                let answer = core.usage_requested(request_id, &owner_id);
+                core.usage_busy.store(false, Ordering::SeqCst);
+                if lock(&core.hub).epoch == epoch {
+                    lock(&core.hub).send(&answer);
+                }
+            });
+        }
         other => on_child_event_from(&core.hub, core.owners.as_ref(), epoch, other),
     }
 }
@@ -3927,7 +4034,7 @@ fn on_child_event_from(hub: &Mutex<Hub>, owners: &dyn OwnerStore, epoch: u64, ev
                 }
             }
         }
-        FromChild::Connected { .. } | FromChild::Say(_) | FromChild::Approve(_) | FromChild::DisconnectRequest { .. } | FromChild::StatusRequest { .. } => {}
+        FromChild::Connected { .. } | FromChild::Say(_) | FromChild::Approve(_) | FromChild::DisconnectRequest { .. } | FromChild::StatusRequest { .. } | FromChild::UsageRequest { .. } => {}
     }
 }
 
@@ -4877,6 +4984,10 @@ impl RoomActs for BridgeActs {
         let target = standalone_bridge::BridgeTarget::configured()
             .map_err(|error| Refused { message: format!("Gyredeck could not reach its bridge: {error}"), names: None })?;
         post_owner_to(&target, room, post, app_word)
+    }
+
+    fn refresh_usage(&self) -> Vec<UsageRefresh> {
+        crate::refresh_all_usage()
     }
 }
 

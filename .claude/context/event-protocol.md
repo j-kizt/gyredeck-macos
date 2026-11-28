@@ -630,7 +630,7 @@ is computed from the recipient's own provider.
   `read at an unknown time, NOT CURRENT` with no date, and is `USAGE (yours, <provider>): no reading yet.`
   when the app has none. A collect or wait answer for a confirmed member carries it as
   `usageLine` when it hands over mail from someone else, or when a step is owed (below); both
-  hooks print it, with the mail or alone. A wait leaves a step owed, since a wait drops an empty poll. Every Codex room push carries it in its header,
+  hooks print it, with the mail or alone. A wait's empty poll leaves a step owed, since a wait drops an empty poll; a line that rides with mail takes the step. The broker holds an answer carrying `usageLine` until it is acknowledged, as it holds a notice, so a step's line is not lost to a refusal after the collect. Every Codex room push carries it in its header,
   before the hand-off note. A broker-held batch carries the line from when it was collected.
 - **Steps.** When a limit drops past another 10-point step above the tells (90, 80 … 20 %
   left) without crossing a tell's line, each confirmed Claude Code or Antigravity member on that

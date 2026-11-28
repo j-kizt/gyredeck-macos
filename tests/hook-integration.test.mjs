@@ -139,7 +139,7 @@ after(() => { for (const server of openFakeServers) server.close(); });
  * With no `as`, the last bind decides whom a collect is for: these fixtures run one hook at a
  * time, which is the only order a broker without process attestation can tell apart.
  */
-const NOTICE_KEYS = ["heavyNotice", "usageNotice"];
+const NOTICE_KEYS = ["heavyNotice", "usageNotice", "usageLine"];
 const listedIn = (answer, key) => Array.isArray(answer?.[key]) && answer[key].length > 0;
 const carriesBatch = (answer) => listedIn(answer, "messages") || listedIn(answer, "missed")
   || NOTICE_KEYS.some((key) => typeof answer?.[key] === "string" && answer[key] !== "");
@@ -2339,7 +2339,7 @@ test("each member is told where its own usage lives, and the room pushes only it
     };
     const look = async (as) =>
       (await fetch(`${base}/mail/${code}?as=${as}`, { headers: await memberHeaders(base, as, token) }).then((r) => r.json())).messages;
-    const notices = async (as) => (await look(as)).filter((message) => message.topic === "usage");
+    const notices = async (as) => (await look(as)).filter((message) => message.from === "gyredeck-room" && /USAGE \(yours/.test(message.text));
     const tells = async (as) => (await look(as)).filter((message) => message.from === "gyredeck-room" && /limit (has|is back)/.test(message.text));
     const reading = (provider, leftPct, extra = {}) => ({
       providerId: provider,
@@ -2382,6 +2382,9 @@ test("each member is told where its own usage lives, and the room pushes only it
     // I6: it wakes nobody, and a wait's poll leaves it owed — a wait drops an empty poll whole.
     const waited = await fetch(`${base}/mail/wait?as=${me}&timeout=1&collect=1`, { headers: await memberHeaders(base, me, token) }).then((r) => r.json());
     assert.equal(waited.timedOut, true, "I6: a step never ends a wait");
+    // The wait the hooks really run polls the inbox through the broker (#306 audit M2).
+    const polled = await fetch(`${base}/mail/inbox?as=${me}&collect=1&waking=1`, { headers: await memberHeaders(base, me, token) }).then((r) => r.json());
+    assert.equal(polled.usageLine ?? null, null, "I6: a waking poll leaves the step owed");
     await post("/usage", reading("claude", 62));
     const stepped = await claudeContext();
     assert.match(stepped, /^USAGE \(yours, Claude Code\): Session 62% left, resets 2026-10-16T05:00:00Z — as of [^ ,]+\.$/m, "M2: the reading at collect, not the one at the step");
@@ -2450,6 +2453,20 @@ test("each member is told where its own usage lives, and the room pushes only it
     await post("/usage", reading("claude", 40));
     await sendAs(agy, me, "fifth");
     assert.doesNotMatch(await claudeContext(), /NOT CURRENT/, "premise: a fresh reading is not labelled");
+
+    // S2: a line that rode with mail on a wait's poll takes the step, so it is not said twice.
+    await post("/usage", reading("claude", 30));
+    await sendAs(agy, me, "sixth");
+    const woke = await fetch(`${base}/mail/inbox?as=${me}&collect=1&waking=1`, { headers: await memberHeaders(base, me, token) }).then((r) => r.json());
+    assert.match(woke.usageLine ?? "", /USAGE \(yours, Claude Code\): Session 30% left/, "the line rides with the mail the wait wakes on");
+    assert.doesNotMatch(await claudeContext(), /USAGE/, "S2: said once, with the mail");
+
+    // M2: Antigravity is owed its step and shown it on its next invocation, like Claude Code.
+    await post("/usage", reading("agy", 75));
+    await agySteps();
+    await post("/usage", reading("agy", 65));
+    assert.match(await agySteps(), /USAGE \(yours, Antigravity\): Session 65% left/, "M2: an Antigravity step");
+    assert.doesNotMatch(await agySteps(), /USAGE/, "once");
   } finally {
     await broker?.close();
     bridge.stdin.end();

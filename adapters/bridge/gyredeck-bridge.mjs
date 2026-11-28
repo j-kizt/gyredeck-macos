@@ -5100,7 +5100,8 @@ function startBridge(config) {
   // that passes both at once is one tell, for the lower level (lessons.md: one alert for the
   // worst crossing), and both count as told.
   const USAGE_WAKE_PCTS = [USAGE_LOW_PCT, 5];
-  // The quiet steps above them (#306): a notice each time a limit drops past another 10 points.
+  // The quiet steps above them (#306): each time a limit drops past another 10 points, the
+  // member is owed its usage line on its next collect.
   const USAGE_STEP_PCTS = [90, 80, 70, 60, 50, 40, 30, 20];
   const usageLevel = (leftPct, levels) => levels.filter((pct) => leftPct <= pct).length;
   const USAGE_SOURCES = ["api", "statusline", "log"];
@@ -5184,7 +5185,7 @@ function startBridge(config) {
     const when = shown.fetchedAt === null
       ? "read at an unknown time, NOT CURRENT"
       : `as of ${shown.fetchedAt}${shown.stale ? ", NOT CURRENT" : ""}`;
-    return `USAGE (yours, ${shown.displayName}): ${limits || "no limits"} — ${when}.`;
+    return `USAGE (yours, ${shown.displayName}): ${limits || "no figures in this reading"} — ${when}.`;
   };
   /** Where a member looks up its own usage, told once on being let in (#306). */
   const usageIntroFor = (conversationId, provider = usageProviderFor(conversationId)) => {
@@ -5214,7 +5215,8 @@ function startBridge(config) {
    * Keep the reading, and tell the room's members on that provider when a limit crosses
    * a line — edge-triggered, as every alert here is: the first reading is never news, a
    * limit that stays low says nothing more, and one that comes back up says so once. The
-   * lines are 10 % and 5 % (#306), and a quiet notice marks each 10-point step above them.
+   * lines are 10 % and 5 % (#306); each 10-point step above them leaves the member owed its
+   * usage line on its next collect.
    */
   const noteUsage = (reading) => {
     const before = usageByProvider.get(reading.provider);
@@ -5364,14 +5366,17 @@ function startBridge(config) {
   /**
    * The member's own usage line, on a collect that delivers someone else's mail, or on the
    * first collect after its limit stepped down 10 points (#306). A wait's poll leaves the step
-   * owed: a wait drops an empty poll whole, so the line would be lost (#259).
+   * owed: a wait drops an empty poll whole, so the line would be lost (#259). A line that rides
+   * with mail takes the step either way, or the next collect would say it again (#306 audit S2).
+   * Through the broker, an answer carrying the line is held until acknowledged, as a notice is.
    */
   const usageLineOnDelivery = (as, keyless, collected, takesStep) => {
     if (keyless || !inConfirmedRoom(as)) return null;
     const member = syncRoomFor(as)?.room.members.get(as);
-    const stepOwed = takesStep && member?.usageStepOwed === true;
+    const withMail = collected.some((message) => message.from !== as);
+    const stepOwed = member?.usageStepOwed === true && (takesStep || withMail);
     if (stepOwed) member.usageStepOwed = false;
-    return stepOwed || collected.some((message) => message.from !== as) ? usageLineFor(as) : null;
+    return stepOwed || withMail ? usageLineFor(as) : null;
   };
 
   /**

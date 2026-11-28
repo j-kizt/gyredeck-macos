@@ -641,8 +641,9 @@ fn refused(error: &str, message: String) -> Value {
 /// The bridge's own rule for a mailbox name (`MAIL_ROOM_NAME`): a bind the bridge would
 /// not serve must not succeed here either.
 /// The notices a collect answer may carry beside its mail: said once by the bridge, and
-/// gone from it once said (#259).
-const NOTICES: [&str; 2] = ["heavyNotice", "usageNotice"];
+/// gone from it once said (#259). `usageLine` alone is a 10-point step the bridge has marked
+/// said (#306 audit M1).
+const NOTICES: [&str; 3] = ["heavyNotice", "usageNotice", "usageLine"];
 
 fn listed(answer: &Value, key: &str) -> bool {
     answer.get(key).and_then(Value::as_array).is_some_and(|list| !list.is_empty())
@@ -2095,6 +2096,7 @@ mod tests {
     fn a_notice_is_carried_like_mail() {
         assert!(carries(&json!({ "messages": [], "heavyNotice": "HEAVY RUNS: x" })), "the heavy line alone");
         assert!(carries(&json!({ "messages": [], "usageNotice": "USAGE: x" })), "the usage line alone");
+        assert!(carries(&json!({ "messages": [], "usageLine": "USAGE (yours, Claude Code): x" })), "a step's own line alone (#306)");
         assert!(carries(&json!({ "messages": [{ "seq": 1 }] })));
         assert!(carries(&json!({ "messages": [], "missed": [{ "count": 1 }] })));
         assert!(!carries(&json!({ "messages": [] })), "an empty answer moved nothing");

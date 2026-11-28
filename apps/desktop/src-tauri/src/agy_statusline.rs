@@ -1334,6 +1334,39 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A record's time is when its payload arrived, not when its input finished coming: one
+    /// held across a tick of the clock keeps the earlier time (#398 audit r6).
+    #[test]
+    fn c6_a_claude_record_is_timed_when_its_payload_arrives() {
+        let root = scratch("claude-arrival-time");
+        let home = root.join("home");
+        let paths = paths_for(&root, &CLAUDE);
+        write_settings(&paths, &serde_json::json!({}));
+        install(&paths, &script_source_for(&CLAUDE)).unwrap();
+        let stub = root.join("bin");
+        let clock = root.join("clock");
+        fs::create_dir_all(&stub).unwrap();
+        fs::write(&clock, "1000\n").unwrap();
+        fs::write(stub.join("date"), format!("#!/bin/sh\ncat '{}'\n", clock.display())).unwrap();
+        fs::set_permissions(stub.join("date"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", stub.display(), std::env::var("PATH").unwrap_or_default());
+        let mut child = Command::new("sh").arg(paths.script()).env("HOME", &home).env("PATH", &path)
+            .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let waited = std::time::Instant::now();
+        while crate::local_usage::newest_claude_record(&paths.dir).is_none() && waited.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(crate::local_usage::newest_claude_record(&paths.dir).is_some(), "premise: the number is reserved before the input is read");
+        fs::write(&clock, "2000\n").unwrap();
+        input.write_all(&bytes(&payload(T0))).unwrap();
+        drop(input);
+        assert_eq!(child.wait().unwrap().code(), Some(0));
+        let kept: Value = serde_json::from_slice(&fs::read(record(&paths)).unwrap()).unwrap();
+        assert_eq!(kept["at"], 1000, "the time the payload arrived, not when its input finished");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Nothing named like a record is followed: the prune and uninstall remove a link itself,
     /// never what it points at, and a record is never written through one (#398 audit r4).
     #[test]

@@ -15,11 +15,13 @@ cfg=$(printf '%s' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" | sed 's/\\/\\\\/g; s/"/
 # highest already there, by a hard link to an empty file of ours (`ln -n` neither replaces
 # nor follows what is at a name, so a taken number moves on to the next). The clock plays no
 # part in the order, so no clock resolution or process id can put an older payload first
-# (#398 audit). The record is filled in place before their command runs; the app reads the
+# (#398 audit). Its time is taken then too, so input that is slow to come never makes an
+# old payload look new. The record is filled in place before their command runs; the app reads the
 # highest number and treats one not yet complete as no reading. After, only this script's
 # own records numbered below it are removed, by name, with `rm -f`: a link goes, never what
 # it points at.
 if tmp=$(mktemp "$dir/.claude-statusline-in.XXXXXX" 2>/dev/null) && out=$(mktemp "$dir/.claude-statusline.XXXXXX" 2>/dev/null); then
+  at=$(date +%s)
   seq=0
   for old in "$dir"/claude-statusline.*.json; do
     n=${old#"$dir"/claude-statusline.}
@@ -35,7 +37,7 @@ if tmp=$(mktemp "$dir/.claude-statusline-in.XXXXXX" 2>/dev/null) && out=$(mktemp
   done
   if cat > "$tmp"; then
     if [ -n "$seq" ] \
-      && { printf '{"at":%s,"configDir":"%s","payload":' "$(date +%s)" "$cfg"; cat "$tmp"; printf '}\n'; } > "$out"; then
+      && { printf '{"at":%s,"configDir":"%s","payload":' "$at" "$cfg"; cat "$tmp"; printf '}\n'; } > "$out"; then
       for old in "$dir"/claude-statusline.*.json; do
         n=${old#"$dir"/claude-statusline.}
         n=${n%.json}

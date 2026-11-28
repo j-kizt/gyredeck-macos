@@ -199,6 +199,11 @@ pub(crate) fn parse_payload(bytes: &[u8], mtime: i64) -> Option<AgyStatusLine> {
         if reset_in < 0 {
             return None;
         }
+        // agy 1.5.18 writes a bucket it is not using with a 1970 reset (#496). It carries no
+        // reading, and its time would make every reading look decades old.
+        if reset_unix <= 0 {
+            continue;
+        }
         fetched_at = fetched_at.min(reset_unix.checked_sub(reset_in)?);
         resolved.insert(
             id,
@@ -966,6 +971,24 @@ mod tests {
         }
         assert!(parse_payload(b"not json", T0).is_none());
         assert!(parse_payload(b"[]", T0).is_none());
+    }
+
+    /// #496: agy 1.5.18 writes unused buckets with a 1970 reset. They are skipped, and the
+    /// reading takes its time from the buckets in use, so it is fresh and relayed.
+    #[test]
+    fn c1_an_unused_bucket_dated_1970_is_skipped_and_does_not_age_the_reading() {
+        let fetched = T0 - 600;
+        let mut value = payload(fetched);
+        let unused = serde_json::json!({ "remaining_fraction": 1, "reset_time": "1970-01-01T00:00:00Z", "reset_in_seconds": 0 });
+        value["quota"]["3p-5h"] = unused.clone();
+        value["quota"]["3p-weekly"] = unused;
+        let status = parse_payload(&bytes(&value), T0 - 60).expect("a payload with unused buckets still reads");
+        assert_eq!(status.lines.iter().map(|line| line.label).collect::<Vec<_>>(), ["Gemini Weekly"]);
+        assert_eq!(status.fetched_at, fetched, "the time comes from the bucket in use");
+        assert!(!reading_from(status, T0, STALE_AFTER).stale);
+
+        value["quota"]["gemini-weekly"] = value["quota"]["3p-5h"].clone();
+        assert!(parse_payload(&bytes(&value), T0 - 60).is_none(), "only unused buckets is no reading");
     }
 
     #[test]

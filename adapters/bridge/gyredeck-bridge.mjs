@@ -5087,6 +5087,9 @@ function startBridge(config) {
 
   /** Below this much left, a member is told, once per crossing — and again when it is back above. */
   const USAGE_LOW_PCT = 10;
+  const USAGE_SOURCES = ["api", "statusline", "log"];
+  // The refresh choices the app offers, the first its default (#398).
+  const USAGE_REFRESH_MS = [5, 15, 30, 60].map((minutes) => minutes * 60_000);
   const usageByProvider = new Map();
   const USAGE_PROVIDER_OF_KIND = {
     claudeCodeHook: "claude",
@@ -5126,6 +5129,28 @@ function startBridge(config) {
       lines,
       // A time that is not a date is unknown, never "now": an old reading must not pass as fresh (#206).
       fetchedAt: body.fetchedAt === undefined ? new Date().toISOString() : typeof body.fetchedAt === "string" && !Number.isNaN(Date.parse(body.fetchedAt)) ? body.fetchedAt : null,
+      // Where it came from, whose it is (a short tag, never the id) and the interval it was
+      // read at, which bounds when it is called stale (#398).
+      source: USAGE_SOURCES.includes(body.source) ? body.source : "api",
+      account: typeof body.account === "string" && /^[0-9a-f]{1,16}$/.test(body.account) ? body.account : null,
+      refreshMs: USAGE_REFRESH_MS.includes(body.refreshMs) ? body.refreshMs : USAGE_REFRESH_MS[0],
+    };
+  };
+
+  /**
+   * A reading as an agent is given it: how old it is, and whether that is older than two
+   * intervals, which a reading never is while the app is refreshing (#398 Q4).
+   */
+  const describeUsage = (reading, now = Date.now()) => {
+    const at = reading.fetchedAt === null ? NaN : Date.parse(reading.fetchedAt);
+    const ageSeconds = Number.isNaN(at) ? null : Math.max(0, Math.floor((now - at) / 1000));
+    return {
+      displayName: reading.displayName,
+      lines: reading.lines,
+      source: reading.source,
+      fetchedAt: reading.fetchedAt,
+      ageSeconds,
+      stale: ageSeconds === null || ageSeconds * 1000 > 2 * reading.refreshMs,
     };
   };
 
@@ -5137,7 +5162,8 @@ function startBridge(config) {
   const noteUsage = (reading) => {
     const before = usageByProvider.get(reading.provider);
     usageByProvider.set(reading.provider, reading);
-    if (!before) return;
+    // Another account's numbers are not a change in this one's (as D66 for a new reading).
+    if (!before || before.account !== reading.account) return;
     const was = new Map(before.lines.map((line) => [line.label, line.leftPct]));
     for (const line of reading.lines) {
       const prior = was.get(line.label);
@@ -8518,7 +8544,7 @@ function startBridge(config) {
         for (const { provider } of members) {
           if (!provider || provider in usage) continue;
           const reading = usageByProvider.get(provider) ?? null;
-          usage[provider] = reading ? { displayName: reading.displayName, lines: reading.lines, fetchedAt: reading.fetchedAt } : null;
+          usage[provider] = reading ? describeUsage(reading) : null;
         }
         sendJson(200, { ok: true, members, usage });
         return;
@@ -8962,8 +8988,8 @@ function startBridge(config) {
         // Usage is the provider's, not the session's (#403): the same answer in a room or out
         // of one, or it says which sessions are in a room.
         const provider = usageProviderFor(as);
-        const usage = provider ? usageByProvider.get(provider) ?? null : null;
-        sendJson(200, { ok: true, provider, usage });
+        const reading = provider ? usageByProvider.get(provider) ?? null : null;
+        sendJson(200, { ok: true, provider, usage: reading ? describeUsage(reading) : null });
         return;
       }
       sendJson(405, { ok: false, error: "method_not_allowed" });

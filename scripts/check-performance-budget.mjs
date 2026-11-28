@@ -140,12 +140,14 @@ const assetRoot = join(distRoot, "assets");
  * both raised 64 B more for headroom, by the owner from Discord ("yes", sync-7am7 seq 135 to 110).
  * After rebasing onto v1.39.11 (#383 and #459 together) it read 124,514 / 127,590, 45 B over:
  * both raised to that + 64 B, by the owner from Discord on 2026-11-28 ("yes", sync-7am7 seq 179 to 174).
+ * #398 (usage source in the header, the reworded Auto refresh row) read 124,708 / 127,782, 130 B over:
+ * both raised 256 B, by the owner from Discord on 2026-11-28 ("yes", sync-dhhq seq 281 to 280).
  */
 const BUDGETS = {
   coreDistBytes: 575_500,
   cssGzipBytes: 13_650,
-  jsGzipBytes: 124_578,
-  jsTotalGzipBytes: 127_654,
+  jsGzipBytes: 124_834,
+  jsTotalGzipBytes: 127_910,
 };
 
 const walk = async (directory) => {

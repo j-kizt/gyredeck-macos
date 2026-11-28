@@ -752,7 +752,10 @@ test("#206 a room's status is read by the app alone: machine token and broker wo
       runtime: { sourcePid: 1, sourcePpid: null, sourceStartedAtMs: 1, sourceKind: "claudeCodeHook" }, data: { inputCount: 1 },
     })).status, 202);
     assert.equal((await h.call("POST", "/usage", { providerId: "claude", displayName: "Claude Code", lines, fetchedAt: "bad-date" })).status, 200);
-    assert.equal((await h.call("GET", `/sync/rooms/${code}/status`)).body.usage.claude?.fetchedAt, null);
+    const described = (await h.call("GET", `/sync/rooms/${code}/status`)).body.usage.claude;
+    assert.equal(described?.fetchedAt, null);
+    // #398: the status answers as GET /usage does, through one formatter.
+    assert.deepEqual([described?.source, described?.ageSeconds, described?.stale], ["api", null, true], "an unknown time is never fresh");
     assert.equal((await h.call("GET", "/sync/rooms/sync-zz99/status")).status, 404, "a room that is not there");
     assert.equal((await readRoom(h, code)).length, before, "nothing was posted into the room");
   } finally {

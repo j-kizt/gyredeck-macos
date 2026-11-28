@@ -20,6 +20,7 @@ import type {
   UsageProviderId,
   UsageResetMode,
   UsageSidebarSelection,
+  UsageSource,
 } from "./types";
 import { Tooltip } from "../../Tooltip";
 
@@ -272,6 +273,14 @@ interface IProviderDetailProps {
   usage: IAgentUsageState;
 }
 
+/** agy keeps "Updated": the approved frames name no source for it (#398 Q5). */
+const freshnessPrefix = (providerId: string, source: UsageSource): string =>
+  providerId === "agy" || source === "api"
+    ? "Updated"
+    : source === "statusline"
+      ? "From status line ·"
+      : "From session log ·";
+
 const ProviderDetail = ({ provider, settings, usage }: IProviderDetailProps) => {
   const StatusIcon = usage.status === "loading" ? RefreshCw : TriangleAlert;
   const hasMetrics = usage.metrics.length > 0;
@@ -283,7 +292,7 @@ const ProviderDetail = ({ provider, settings, usage }: IProviderDetailProps) => 
       ? `Outdated · ${fetchedAt}`
       : "Outdated"
     : usage.status === "online" && fetchedAt
-      ? `Updated ${fetchedAt}`
+      ? `${freshnessPrefix(provider.id, usage.source)} ${fetchedAt}`
       : null;
   const groups = USAGE_METRIC_GROUPS.map((group) => ({
     ...group,
@@ -468,7 +477,7 @@ const SettingsPanel = ({ settings, onChange }: ISettingsPanelProps) => {
       </div>
       {group(
         "Auto refresh",
-        "How often provider usage is refreshed",
+        "How often usage is refreshed. Each refresh asks the provider when it can, and a newer reading from an agent’s own status line or log is shown in its place.",
         <Segment
           value={`${settings.refreshMs}`}
           onChange={(value) => set({ refreshMs: Number(value) })}

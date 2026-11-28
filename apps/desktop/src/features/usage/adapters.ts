@@ -118,6 +118,7 @@ export const createAgentUsageState = (
   message: null,
   stale: false,
   fetchedAt: null,
+  source: "api",
   plan: null,
   metrics: [],
   sessionPercent: null,
@@ -163,6 +164,10 @@ export const parseAgentUsageSnapshot = (
     message,
     stale: Boolean(message) && metrics.length > 0,
     fetchedAt: snapshot.fetchedAt ?? new Date().toISOString(),
+    source:
+      snapshot.source === "statusline" || snapshot.source === "log"
+        ? snapshot.source
+        : "api",
     plan: snapshot.plan ?? null,
     metrics,
     sessionPercent: getProgressPercent(findMetricLine(lines, "Session")),

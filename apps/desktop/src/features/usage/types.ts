@@ -52,7 +52,11 @@ export interface IAgentUsageSnapshot {
   plan?: string | null;
   lines?: IUsageMetricLine[];
   fetchedAt?: string;
+  source?: UsageSource;
 }
+
+/** Where a reading came from (#398): the provider, the agent's status line, or its session log. */
+export type UsageSource = "api" | "statusline" | "log";
 
 export interface IUsageMetric {
   label: string;
@@ -80,6 +84,7 @@ export interface IAgentUsageState {
   message: string | null;
   stale: boolean;
   fetchedAt: string | null;
+  source: UsageSource;
   plan: string | null;
   metrics: IUsageMetric[];
   sessionPercent: number | null;

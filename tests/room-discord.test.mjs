@@ -253,10 +253,14 @@ test("the app's relay joins as Discord, hears the whole room, moves its read pos
     assert.equal((await post("peer-b", { to: "everyone", kind: "tell", text: "after the clamp" })).status, 202);
     assert.equal(await pendingOf(relayId), 1, "a message after the clamped ACK is still owed to the relay");
 
-    // It never speaks, with a token or without.
+    // It never speaks: with the machine token alone it is refused as any keyless post in a name is
+    // (#403 F2), and even with the app's word it is a relay.
     const spoke = await post(relayId, { to: "everyone", kind: "tell", text: "hello" });
     assert.equal(spoke.status, 403);
-    assert.equal(spoke.body.error, "relay_only");
+    assert.equal(spoke.body.error, "not_your_key");
+    const vouchedSpoke = await h.call("POST", `/mail/${code}`, { from: relayId, to: "everyone", kind: "tell", text: "hello" });
+    assert.equal(vouchedSpoke.status, 403);
+    assert.equal(vouchedSpoke.body.error, "relay_only");
   } finally {
     await h.stop();
   }

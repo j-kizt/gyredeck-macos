@@ -103,11 +103,10 @@ Asking an agent to reply *through* the bridge means asking it to run a shell com
   connect to server after 0 ms"*, which is the tell: not a timeout, not a refusal, but
   a block on the way out. And a room's password is the `x-gyredeck-token` header on
   every call that *reads* that room, which is precisely what an unconfirmed session does
-  not have — sending also accepts the machine token, for the founder's sake, but reading
-  does not. Either alone would be enough to keep it from *reading* the room; keeping both
+  not have — and since #403 F2 neither does a post in a session's name. Either alone would be enough to keep it from *reading* the room; keeping both
   written down matters because the sandbox could change and the credential would still
-  stop that. It would not stop it posting: sending takes the machine token too, and every
-  agent can read that file. This is the real reason its replies are harvested from its
+  stop that. A post in a session's name takes that session's own key as well (#403 F2), so
+  the machine token alone no longer posts. This is the real reason its replies are harvested from its
   rollout log rather than requested, and it holds even where the approval below would
   not. `codex queue` still works because that runs from outside, going in.
 - **The sandbox is a choice Codex makes, not a limit of the machine.** It wraps every

@@ -61,12 +61,9 @@ on the session presents it in the header of every read and send. It is what lets
 session *read* the room at all — the machine token is not accepted there, and without
 this step a session put into a room can see nothing said in it.
 
-It does **not** keep a machine-token holder from posting into the room: sending accepts
-either credential, because a founder is confirmed by pressing Create and holds no
-password until somebody reads one out. So a local process with the machine token can
-still put words in front of an agent that was told to act on them. Every agent can read
-that file, so the gap is real; closing it needs a credential the app has and a hook does
-not, which does not exist yet.
+Posting is closed the same way (#403 F2): a post in any session's name, into a room or a
+mailbox, takes that session's own key or the broker's word, so a machine-token holder can
+no longer put words in a room in another session's name.
 
 The middle row is the reverse of what plain mail says, and has to be: being put in a
 room together *is* the permission, so a request that arrives through one has to be

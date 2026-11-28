@@ -102,7 +102,11 @@ test("#332 a confirmed member that reopens in a new process is shut out: key, wa
     assert.equal(await confirmedIn(h, "member-b"), false, "the new process is not confirmed");
     assert.equal((await readAs(h, code, "member-b", oldKey)).status, 403, "the old process's key reads nothing");
     assert.match(await watchText, /reopened in a new process/, "the old watch is cut");
-    assert.equal(await keyOf(h, "member-b"), undefined, "no key is handed to an unconfirmed member");
+    // The new process's first delivery hands it a key of its own (#403 F2), which reads nothing of
+    // the room until it is let in again.
+    const newKey = await keyOf(h, "member-b");
+    assert.notEqual(newKey, oldKey, "a new process, a new key");
+    assert.equal((await readAs(h, code, "member-b", newKey)).status, 403, "the new key reads nothing of the room while unconfirmed");
     const sent = await h.call("POST", `/mail/${code}`, { from: "member-b", to: "everyone", kind: "tell", text: "still here?" }, { "content-type": "application/json", "x-gyredeck-token": h.token, "x-gyredeck-member": oldKey });
     assert.ok(sent.status >= 400, `the old key posts nothing: ${sent.status}`);
     // Its own inbox, wait and private mailbox stream too: the door those take judges the key alone.

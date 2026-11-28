@@ -58,6 +58,10 @@ const startBridge = async () => {
     const response = await fetch(`${base}${path}`, { headers });
     return { status: response.status, text: await response.text() };
   };
+  const raw2 = async (method, path, body, headers) => {
+    const response = await fetch(`${base}${path}`, { method, headers, body: JSON.stringify(body) });
+    return { status: response.status, text: await response.text() };
+  };
   const stop = async () => {
     bridge.stdin.end();
     if (bridge.exitCode === null) bridge.kill();
@@ -70,7 +74,7 @@ const startBridge = async () => {
     const confirmed = await confirm(code, conversationId, minted.body.code);
     return { ...confirmed, code: minted.body.code };
   };
-  return { base, call, raw, stop, token, app, log, confirm, joinRoom };
+  return { base, call, raw, raw2, stop, token, app, log, confirm, joinRoom, home };
 };
 
 const STALE_PW = "5a".repeat(16);
@@ -344,7 +348,10 @@ test("C1 table: a room member's usage answers as any session's does (#403)", asy
 test("C1 control: a session in no room keeps its mailbox as it was", async () => {
   const h = await startBridge();
   try {
-    await h.call("POST", "/mail/loner-1", { from: "someone", text: "for the loner", replyTo: "someone" }, { "content-type": "application/json", "x-gyredeck-token": h.token });
+    // A post in someone's name takes someone's own key (#403 F2), handed by the broker's read.
+    const someoneKey = (await h.call("GET", "/mail/inbox?as=someone")).body.memberKey;
+    const posted = await h.call("POST", "/mail/loner-1", { from: "someone", text: "for the loner", replyTo: "someone" }, { "content-type": "application/json", "x-gyredeck-token": h.token, "x-gyredeck-member": someoneKey });
+    assert.equal(posted.status, 202, JSON.stringify(posted.body));
     const look = await h.raw("/mail/loner-1?since=0", { "x-gyredeck-token": h.token });
     assert.equal(look.status, 200, look.text);
     assert.match(look.text, /for the loner/);
@@ -417,40 +424,50 @@ test("C2/C4: the key is handed only to a read the broker vouches for, and never 
   }
 });
 
-test("C2: an unconfirmed member is handed no key, even by the broker", async () => {
+test("C2: an unconfirmed member is handed its session's key by the broker, and the key opens nothing of the room (#403 F2)", async () => {
   const h = await startBridge();
   try {
     const { room: code } = (await h.call("POST", "/sync/rooms", { conversationId: "member-a" })).body;
     await h.call("POST", `/sync/rooms/${code}/members`, { conversationId: "member-c" });
     const answer = await h.call("GET", `/mail/inbox?as=member-c`);
     assert.equal(answer.status, 200, JSON.stringify(answer.body));
-    assert.equal(answer.body.memberKey, undefined);
+    const key = answer.body.memberKey;
+    assert.match(String(key), KEY);
+    const withKey = { "x-gyredeck-token": h.token, "x-gyredeck-member": key };
+    const watched = await watch(h, code, "member-c", withKey);
+    assert.equal(watched.status, 403, watched.text);
+    assert.match(watched.text, /not_confirmed/);
+    const looked = await h.raw(`/mail/${code}?as=member-c&since=0`, withKey);
+    assert.equal(looked.status, 403, looked.text);
+    const posted = await h.call("POST", `/mail/${code}`, { from: "member-c", text: "let me in" }, { "content-type": "application/json", ...withKey });
+    assert.equal(posted.status, 403, JSON.stringify(posted.body));
+    assert.equal(posted.body.error, "not_confirmed");
   } finally {
     await h.stop();
   }
 });
 
-test("C5: a key dies with its membership; coming back mints a new one", async () => {
+test("C5 (#403 F2 invariant 3): a session's key outlives leaving and coming back; out of the room it opens nothing of the room", async () => {
   const h = await startBridge();
   try {
     const r = await twoMembers(h);
     const old = await r.keyOf("member-b");
     assert.equal((await h.call("DELETE", `/sync/rooms/${r.code}/members/member-b`)).status, 200, "premise: b is taken out");
+    const out = { ...r.pw, "x-gyredeck-member": old };
+    assert.equal(await r.keyOf("member-b"), old, "leaving takes the key away from nobody");
+    const keyedOut = await h.raw(`/mail/inbox?as=member-b`, out);
+    assert.equal(keyedOut.status, 200, keyedOut.text);
+    assert.notEqual(JSON.parse(keyedOut.text).room, r.code, "out of the room, the key reads no room");
+    assert.equal((await watch(h, r.code, "member-b", out)).status, 403, "nor watches it");
     await h.call("POST", `/sync/rooms/${r.code}/members`, { conversationId: "member-b" });
     const again = await h.joinRoom(r.code, "member-b");
     assert.equal(again.status, 200, "premise: b is back");
-    const fresh = await r.keyOf("member-b");
-    assert.match(fresh, KEY);
-    assert.notEqual(fresh, old, "a new membership, a new key");
-    const withOld = await h.raw(`/mail/inbox?as=member-b`, { ...r.pw, "x-gyredeck-member": old });
-    assert.equal(withOld.status, 200, withOld.text);
-    assert.equal(JSON.parse(withOld.text).room, null, "the old key reads only the keyless view (#403)");
-    assert.equal(typeof JSON.parse(withOld.text).hint, "string");
-    assert.equal((await watch(h, r.code, "member-b", { ...r.pw, "x-gyredeck-member": old })).status, 403, "nor watches");
-    assert.equal((await h.raw(`/mail/inbox?as=member-b`, { ...r.pw, "x-gyredeck-member": fresh })).status, 200, "the new one does");
+    assert.equal(await r.keyOf("member-b"), old, "joining again mints nothing new");
+    assert.equal((await watch(h, r.code, "member-b", out)).status, 200, "the key b held before joining watches after");
+    assert.equal((await r.post("member-b", "member-a", "back, same key")).status, 202, "and posts");
     const spent = await h.confirm(r.code, "member-b", again.code);
     assert.equal(spent.status, 403, "a spent join code confirms nothing");
-    assert.equal(await r.keyOf("member-b"), fresh, "a refused repeat does not re-mint: a running watch keeps working");
+    assert.equal(await r.keyOf("member-b"), old, "a refused repeat does not re-mint: a running watch keeps working");
   } finally {
     await h.stop();
   }
@@ -778,6 +795,152 @@ test("#403 F2 groundwork: every delivery the broker vouches for carries the memb
     }
     assert.ok(keys.every((key) => KEY.test(key ?? "")), `a key on every delivery: ${JSON.stringify(keys)}`);
     assert.equal(new Set(keys).size, 1, "and the same key each time, so a session that lost its context still replies");
+  } finally {
+    await h.stop();
+  }
+});
+
+// #403 F2 (owner, option A): every session has its own key from its first delivery, in a room
+// or not, and a post in any session's name takes that key or the broker's word.
+const keyOfSession = async (h, as) => {
+  const key = (await h.call("GET", `/mail/inbox?as=${as}`)).body.memberKey;
+  assert.match(String(key), KEY, `premise: the broker's read hands ${as} its key`);
+  return key;
+};
+const postAs = (h, to, from, text, headers) =>
+  h.raw2("POST", `/mail/${to}`, { from, to: "everyone", kind: "tell", text }, { "content-type": "application/json", ...headers });
+const landed = async (h, mailbox) => (await h.call("GET", `/mail/${mailbox}?since=0`)).body.messages.map((m) => `${m.from}:${m.text}`);
+
+test("#403 F2 invariant 1: a keyless post in a session's name answers a member as it answers a session in no room — status, error, body and size — across join and leave", async () => {
+  const h = await startBridge();
+  try {
+    const code = await openRoom(h);
+    const founderKey = await keyOfSession(h, FOUNDER);
+    // Both hold a key already, so the only difference left is membership.
+    const keys = { [LONER]: await keyOfSession(h, LONER), [JOINER]: await keyOfSession(h, JOINER) };
+    const keyless = [
+      ["the machine token alone", { "x-gyredeck-token": h.token }],
+      ["the machine token and another session's key", { "x-gyredeck-token": h.token, "x-gyredeck-member": founderKey }],
+      ["the machine token and a key-shaped guess", { "x-gyredeck-token": h.token, "x-gyredeck-member": "0".repeat(64) }],
+      ["the machine token and a stranger's broker word", { "x-gyredeck-token": h.token, "x-gyredeck-broker": "e4".repeat(32) }],
+    ];
+    const compare = async (stage) => {
+      for (const target of [FOUNDER, code]) {
+        for (const [why, headers] of keyless) {
+          const loner = await postAs(h, target, LONER, `as the loner, ${stage}, ${why}`, headers);
+          const joiner = await postAs(h, target, JOINER, `as the joiner, ${stage}, ${why}`, headers);
+          const at = `${stage}, to ${target === code ? "the room" : "a mailbox"}, ${why}`;
+          assert.equal(loner.status, 403, `${at}: ${loner.text}`);
+          assert.equal(JSON.parse(loner.text).error, "not_your_key", at);
+          assert.equal(joiner.status, loner.status, at);
+          assert.equal(unnamed(joiner.text, JOINER), unnamed(loner.text, LONER), at);
+          assert.equal(joiner.text.length, loner.text.length, `${at}: size`);
+          for (const key of [founderKey, ...Object.values(keys)]) assert.ok(!joiner.text.includes(key) && !loner.text.includes(key), `${at}: no key in the answer`);
+        }
+      }
+    };
+    await compare("before join");
+    await letIn(h, code, JOINER);
+    await compare("as a member");
+    await letOut(h, code, JOINER);
+    await compare("after leaving");
+    const published = [...(await landed(h, FOUNDER)), ...(await h.call("GET", `/mail/${code}?as=${FOUNDER}&since=0`, null, { "x-gyredeck-token": h.token, "x-gyredeck-member": founderKey })).body.messages.map((m) => `${m.from}:${m.text}`)];
+    assert.deepEqual(published.filter((line) => line.startsWith(`${LONER}:`) || line.startsWith(`${JOINER}:`)), [], "nothing was published in either name");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("#403 F2 invariant 2: a session's own key, or the broker's word, posts in its name — member or not", async () => {
+  const h = await startBridge();
+  try {
+    const code = await openRoom(h);
+    await letIn(h, code, JOINER);
+    const keys = { [LONER]: await keyOfSession(h, LONER), [JOINER]: await keyOfSession(h, JOINER) };
+    for (const as of [LONER, JOINER]) {
+      const own = await postAs(h, FOUNDER, as, `${as} by its own key`, { "x-gyredeck-token": h.token, "x-gyredeck-member": keys[as] });
+      assert.equal(own.status, 202, own.text);
+      const broker = await postAs(h, FOUNDER, as, `${as} by the broker's word`, { "x-gyredeck-token": h.token, "x-gyredeck-broker": APP_WORD });
+      assert.equal(broker.status, 202, broker.text);
+      const other = as === LONER ? JOINER : LONER;
+      const crossed = await postAs(h, FOUNDER, as, `${as} by ${other}'s key`, { "x-gyredeck-token": h.token, "x-gyredeck-member": keys[other] });
+      assert.equal(crossed.status, 403, `another session's key never posts: ${crossed.text}`);
+    }
+    assert.deepEqual((await landed(h, FOUNDER)).filter((line) => !line.startsWith("gyredeck-room:")), [
+      `${LONER}:${LONER} by its own key`, `${LONER}:${LONER} by the broker's word`,
+      `${JOINER}:${JOINER} by its own key`, `${JOINER}:${JOINER} by the broker's word`,
+    ]);
+    assert.equal((await postAs(h, code, JOINER, "in the room by its own key", { "x-gyredeck-member": keys[JOINER] })).status, 202, "the member's key posts in its room too");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("#403 audit M2: a session in no room loses its key to a new process of itself; a late report from the old one changes nothing", async () => {
+  const h = await startBridge();
+  try {
+    const bound = (generation) => h.call("POST", "/broker/bound", { conversationId: LONER, generation });
+    const mail = (text, key) => postAs(h, FOUNDER, LONER, text, { "x-gyredeck-token": h.token, "x-gyredeck-member": key });
+    assert.equal((await bound(1)).status, 200);
+    const old = await keyOfSession(h, LONER);
+    assert.equal((await mail("first process", old)).status, 202, "premise: the first process's key posts");
+    assert.equal((await bound(2)).status, 200);
+    assert.equal((await mail("old key after a new process", old)).status, 403, "the old process's key dies");
+    const fresh = await keyOfSession(h, LONER);
+    assert.notEqual(fresh, old, "the new process is handed a new key");
+    assert.equal((await mail("new process", fresh)).status, 202);
+    assert.equal((await bound(1)).status, 200);
+    assert.equal((await mail("after a late report from the old process", fresh)).status, 202, "a late, lower generation kills nothing");
+    assert.equal((await mail("old key after the late report", old)).status, 403, "nor brings the old key back");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("#403 F2 invariant 3: a key handed before joining still posts and watches after joining, and posts after leaving", async () => {
+  const h = await startBridge();
+  try {
+    const code = await openRoom(h);
+    const before = await keyOfSession(h, LONER);
+    const withKey = { "x-gyredeck-token": h.token, "x-gyredeck-member": before };
+    assert.equal((await postAs(h, FOUNDER, LONER, "before joining", withKey)).status, 202);
+    await letIn(h, code, LONER);
+    assert.equal(await keyOfSession(h, LONER), before, "joining mints nothing new");
+    assert.equal((await watch(h, code, LONER, withKey)).status, 200, "the key from before joining watches the room");
+    assert.equal((await postAs(h, code, LONER, "in the room", { "x-gyredeck-member": before })).status, 202, "and posts in it");
+    assert.equal((await postAs(h, FOUNDER, LONER, "as a member", withKey)).status, 202, "and still posts to a mailbox");
+    await letOut(h, code, LONER);
+    assert.equal(await keyOfSession(h, LONER), before, "leaving takes nothing away");
+    assert.equal((await postAs(h, FOUNDER, LONER, "after leaving", withKey)).status, 202);
+    assert.deepEqual((await landed(h, FOUNDER)).filter((line) => line.startsWith(`${LONER}:`)), [`${LONER}:before joining`, `${LONER}:as a member`, `${LONER}:after leaving`]);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("#403 F2 invariant 6: nothing a keyless reader can see carries a session's key, member or not", async () => {
+  const h = await startBridge();
+  try {
+    const code = await openRoom(h);
+    await letIn(h, code, JOINER);
+    const keys = [await keyOfSession(h, LONER), await keyOfSession(h, JOINER), await keyOfSession(h, FOUNDER)];
+    for (const as of [LONER, JOINER]) await plant(h, as, "to be read keyless");
+    const surfaces = {};
+    for (const as of [LONER, JOINER]) {
+      for (const path of [`/mail/inbox?as=${as}`, `/mail/inbox?as=${as}&collect=1`, `/mail/wait?as=${as}&timeout=1`, `/mail/${as}?as=${as}&since=0`, `/usage?as=${as}`, `/sync/rooms?as=${as}`]) {
+        surfaces[`${path} keyless`] = (await h.raw(path, keylessOnly(h))).text;
+      }
+      surfaces[`${as}'s keyless stream`] = (await watch(h, as, as, keylessOnly(h), 300)).text;
+      surfaces[`${as}'s refused post`] = (await postAs(h, FOUNDER, as, "keyless", keylessOnly(h))).text;
+    }
+    surfaces["the room's keyless watch"] = (await watch(h, code, JOINER, keylessOnly(h), 300)).text;
+    surfaces["the event log"] = await readFile(join(h.home, ...CONFIG_DIR, "gyredeck.events.ndjson"), "utf8").catch(() => "");
+    surfaces["bridge stderr"] = h.log.stderr;
+    surfaces["bridge stdout"] = h.log.stdout;
+    assert.ok(surfaces[`/mail/inbox?as=${LONER} keyless`].includes("to be read keyless"), "premise: the keyless read was served");
+    for (const [where, text] of Object.entries(surfaces)) {
+      for (const key of keys) assert.ok(!text.includes(key), `a key in ${where}`);
+    }
   } finally {
     await h.stop();
   }

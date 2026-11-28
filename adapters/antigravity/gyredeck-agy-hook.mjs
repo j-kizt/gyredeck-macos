@@ -393,13 +393,23 @@ const wellFormedCollect = (body) =>
  * answers in its own terminal, and once guessed a command that does not exist. The same
  * REPLY a prompt-time delivery carries, addressed to the last message that wants an answer.
  */
+// One reason for every delivery with no key, room or mailbox: the hook cannot tell which (#403 audit M1).
+const NO_KEY_STEP =
+  "The mail above can be read but not answered in this delivery: a post in your name takes your own key," +
+  " and this delivery carries none. Either it did not come through the Gyredeck broker, or it was held over" +
+  " from an earlier process of this session. A later delivery through the broker carries the key in its reply" +
+  " command; answer this mail then. If none comes, tell the person at this terminal; nothing you send by hand" +
+  " without the key would be accepted.";
+
 const replyForWait = async (result) => {
   const room = typeof result?.room === "string" ? result.room : null;
   const members = new Map((Array.isArray(result?.members) ? result.members : []).map((m) => [m?.conversationId, m]));
   const answering = (Array.isArray(result?.messages) ? result.messages : [])
     .filter((m) => (m.kind === "ask" || m.kind === "tell") && m.from !== ROOM_SENDER && members.get(m.from)?.you !== true)
     .at(-1);
-  if (!room || !answering) return {};
+  // An unconfirmed member cannot post yet; a command would only be refused (#403 audit S3).
+  const me = [...members.values()].find((m) => m?.you === true);
+  if (!room || !answering || (me && me.confirmed !== true)) return {};
   const reply = replyInstruction(
     await readEndpoint(), room, [room], answering,
     // The member's label from the roster as it is now, as the prompt-time delivery does: a
@@ -594,7 +604,7 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
   if (replyRooms.length === 0) return null;
   const target = replyRooms[0];
   // A room is posted to with the member's own key (#331); a plain mailbox, the only other
-  // thing `target` can be, with the machine token.
+  // thing `target` can be, with the machine token beside it.
   const isRoom = /^sync-[a-z2-9]{4}$/.test(target);
   if (isRoom) {
     // The short form (#157): the rest is in the rules file. Addressed and labelled in
@@ -607,15 +617,8 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
     const kind = answering?.kind === "tell" ? "reaction" : "tell";
     const body = JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''");
     // A post in this session's name takes its own key (#294): with none in this delivery, a
-    // command without it would only be refused, so none is printed, and why is said.
-    if (!(typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey))) {
-      return {
-        ephemeralMessage:
-          "The mail above is addressed to you, but no reply command can be given in this delivery:" +
-          " a post in your name takes your own key, and the Gyredeck broker could not vouch for this" +
-          " session to hand it over. Tell the person at this terminal; nothing you send by hand would be accepted.",
-      };
-    }
+    // command without it would only be refused, so none is printed, and why is said (#403 audit R2-M2).
+    if (!(typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey))) return { ephemeralMessage: NO_KEY_STEP };
     return {
       ephemeralMessage:
         "The mail above is addressed to you, and answering is expected — a reply on a" +
@@ -628,11 +631,19 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
         "It was sent only if you see ok:true and a seq.",
     };
   }
+  // A plain mailbox takes the machine token and, for a post in this session's name, its own
+  // key (#403 F2), which only the broker hands over: a TCP read without it gets no command.
+  if (!(typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey))) {
+    // No key: either not through the broker, or held over from an earlier process of this
+    // session; the hook cannot tell which (#403 audit M1).
+    return { ephemeralMessage: NO_KEY_STEP };
+  }
   const command =
     "TOKEN=$(cat ~/.config/gyredeck/gyredeck.ingest-token); " +
     `curl -s -X POST http://${endpoint.hostname}:${endpoint.port}/mail/${target} ` +
     "-H 'content-type: application/json' " +
     '-H "x-gyredeck-token: $TOKEN" ' +
+    `-H "x-gyredeck-member: ${memberKey}" ` +
     `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}","to":"everyone","kind":"tell"}'`;
   return {
     ephemeralMessage:
@@ -1222,7 +1233,8 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
     heard = true;
   }
   const header = { ephemeralMessage: parts.join(" "), ...(heard ? { [SAYS_HEAR]: room } : {}) };
-  const reply = replyInstruction(
+  // An unconfirmed member is told it is blocked; a reply command would only be refused (#403 audit S3).
+  const reply = syncRoom && mine && !confirmed ? null : replyInstruction(
     endpoint, room, replyRooms, answerable.at(-1), label,
     (id) => byId.has(id) && id !== room,
     askName !== null,

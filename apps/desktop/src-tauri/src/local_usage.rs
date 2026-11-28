@@ -107,16 +107,18 @@ pub(crate) struct LocalReading {
 /// The API is asked every interval (owner, sync-dhhq seq 306/308); the answer is the newer of
 /// its reading and the local one. A local reading is offered the snapshot it would replace, so
 /// it can refuse one from another account. Without an API snapshot there is no plan or credits
-/// to show beside the local lines, so the fetch answers alone (#398 Q3).
+/// to show beside the local lines, so the fetch answers alone (#398 Q3). The clock is read once
+/// the API has answered, so a local reading that aged out during a slow fetch is not news.
 pub(crate) fn choose(
-    local: impl FnOnce(&CodexUsageSnapshot) -> Option<LocalReading>,
+    local: impl FnOnce(&CodexUsageSnapshot, i64) -> Option<LocalReading>,
     base: Option<CodexUsageSnapshot>,
     account: Option<String>,
     refresh: Duration,
-    now: i64,
+    clock: impl FnOnce() -> i64,
     fetch: impl FnOnce() -> Result<UsageReading, String>,
 ) -> Result<UsageReading, String> {
     let fetched = fetch();
+    let now = clock();
     // Another login answered: the local reading was matched to the first one (#398 r2).
     if matches!(&fetched, Ok(reading) if reading.account != account) {
         return fetched;
@@ -128,7 +130,7 @@ pub(crate) fn choose(
     let Some(reference) = reference else {
         return fetched;
     };
-    let Some(reading) = local(&reference) else {
+    let Some(reading) = local(&reference, now) else {
         return fetched;
     };
     if reading.fetched_at <= iso_seconds(&reference.fetched_at).unwrap_or(i64::MAX) {
@@ -682,7 +684,7 @@ mod tests {
         rollout(&home, "a", OTHER, &[token_count(NOW - 30, 10.0, 20.0)], NOW - 20);
         let calls = Cell::new(0);
         let local = codex_local(&home, Some(ACCOUNT), NOW);
-        let reading = choose(|_| local, Some(api_snapshot("codex", NOW - 900)), None, REFRESH, NOW, api_fetch(&calls, "codex")).unwrap();
+        let reading = choose(|_, _| local, Some(api_snapshot("codex", NOW - 900)), None, REFRESH, || NOW, api_fetch(&calls, "codex")).unwrap();
         assert_eq!(calls.get(), 1, "another account's log is not shown");
         assert_eq!(reading.snapshot.source, UsageSource::Api);
 
@@ -711,7 +713,7 @@ mod tests {
 
         let calls = Cell::new(0);
         let local = claude_local(&other_account, config, Some(&base), NOW);
-        let reading = choose(|_| local, Some(base.clone()), None, REFRESH, NOW, api_fetch(&calls, "claude")).unwrap();
+        let reading = choose(|_, _| local, Some(base.clone()), None, REFRESH, || NOW, api_fetch(&calls, "claude")).unwrap();
         assert_eq!((calls.get(), reading.snapshot.source), (1, UsageSource::Api));
 
         // No API answer yet: there is nothing to match the reset against (#398 Q3).
@@ -754,13 +756,13 @@ mod tests {
             let base = || Some(api_snapshot(provider, NOW - 900));
 
             let calls = Cell::new(0);
-            let reading = choose(|r| local_at(1, r), base(), None, REFRESH, NOW, api_fetch(&calls, provider)).unwrap();
+            let reading = choose(|r, _| local_at(1, r), base(), None, REFRESH, || NOW, api_fetch(&calls, provider)).unwrap();
             assert_eq!(calls.get(), 1, "{provider}: a local reading a second old still asks");
             assert_eq!(reading.snapshot.source, UsageSource::Api, "{provider}: the fresh answer is newer");
             assert!(reading.fresh);
 
             let calls = Cell::new(0);
-            let reading = choose(|r| local_at(refresh_s, r), base(), Some("tag".into()), REFRESH, NOW, || limited(provider, &calls)).unwrap();
+            let reading = choose(|r, _| local_at(refresh_s, r), base(), Some("tag".into()), REFRESH, || NOW, || limited(provider, &calls)).unwrap();
             assert_eq!(calls.get(), 1, "{provider}");
             assert_ne!(reading.snapshot.source, UsageSource::Api, "{provider}: newer than the kept answer");
             assert!(reading.fresh, "{provider}: within the interval it is news");
@@ -768,18 +770,29 @@ mod tests {
             assert_eq!(reading.account.as_deref(), Some("tag"));
 
             let calls = Cell::new(0);
-            let reading = choose(|r| local_at(refresh_s + 1, r), base(), Some("tag".into()), REFRESH, NOW, || limited(provider, &calls)).unwrap();
+            let reading = choose(|r, _| local_at(refresh_s + 1, r), base(), Some("tag".into()), REFRESH, || NOW, || limited(provider, &calls)).unwrap();
             assert!(!reading.fresh, "{provider}: one second past the interval it is kept");
             assert!(reading.snapshot.lines.iter().any(is_status), "{provider}");
 
+            // The interval is measured once the API has answered: a reading inside it when the
+            // fetch began but past it by the time the fetch failed is kept, not news.
             let calls = Cell::new(0);
-            let reading = choose(|_| None, base(), None, REFRESH, NOW, api_fetch(&calls, provider)).unwrap();
+            let clock = Cell::new(NOW);
+            let reading = choose(|r, _| local_at(refresh_s, r), base(), Some("tag".into()), REFRESH, || clock.get(), || {
+                clock.set(NOW + 12);
+                limited(provider, &calls)
+            })
+            .unwrap();
+            assert!(!reading.fresh, "{provider}: it aged out while the API was asked");
+
+            let calls = Cell::new(0);
+            let reading = choose(|_, _| None, base(), None, REFRESH, || NOW, api_fetch(&calls, provider)).unwrap();
             assert_eq!((calls.get(), reading.snapshot.source), (1, UsageSource::Api), "{provider}: none");
 
             // A later login answered (the first could not, or was re-read): its kept reading
             // is shown as it came, never merged with the first login's local one (#398 r2).
             let calls = Cell::new(0);
-            let reading = choose(|r| local_at(refresh_s, r), base(), Some("other".into()), REFRESH, NOW, || limited(provider, &calls)).unwrap();
+            let reading = choose(|r, _| local_at(refresh_s, r), base(), Some("other".into()), REFRESH, || NOW, || limited(provider, &calls)).unwrap();
             assert_eq!(reading.snapshot.source, UsageSource::Api, "{provider}: another login's answer stays its own");
             assert!(!reading.fresh, "{provider}");
             assert_eq!(reading.account.as_deref(), Some("tag"), "{provider}");
@@ -810,8 +823,8 @@ mod tests {
         assert!(claude_local(&file(49.0), config, Some(&api), NOW).is_none(), "a lower share is not");
 
         let reading = choose(
-            |reference| claude_local(&file(10.0), config, Some(reference), NOW),
-            Some(api.clone()), None, REFRESH, NOW, || Err("network down".to_string()),
+            |reference, _| claude_local(&file(10.0), config, Some(reference), NOW),
+            Some(api.clone()), None, REFRESH, || NOW, || Err("network down".to_string()),
         );
         assert!(reading.is_err(), "nothing of this account's to show");
         let _ = fs::remove_dir_all(&dir);
@@ -858,7 +871,7 @@ mod tests {
             source: UsageSource::Log,
         };
         let calls = Cell::new(0);
-        let reading = choose(|_| Some(local.clone()), Some(base.clone()), Some("tag".into()), REFRESH, NOW, || {
+        let reading = choose(|_, _| Some(local.clone()), Some(base.clone()), Some("tag".into()), REFRESH, || NOW, || {
             calls.set(calls.get() + 1);
             Err("network down".to_string())
         })
@@ -876,7 +889,7 @@ mod tests {
         // An expired login answers with its own kept reading: that one keeps its Status line.
         let mut kept = base.clone();
         kept.lines.push(CodexMetricLine::Text { label: "Status".into(), value: "Login expired".into() });
-        let reading = choose(|_| Some(local), Some(base), None, REFRESH, NOW, || {
+        let reading = choose(|_, _| Some(local), Some(base), None, REFRESH, || NOW, || {
             Ok(UsageReading { snapshot: kept, fresh: false, account: None })
         })
         .unwrap();
@@ -893,7 +906,7 @@ mod tests {
         let home = scratch("codex-merge");
         rollout(&home, "m", ACCOUNT, &[token_count(NOW - 30, 61.0, 72.0)], NOW - 20);
         let local = codex_local(&home, Some(ACCOUNT), NOW).unwrap();
-        let reading = choose(|_| Some(local), Some(api_snapshot("codex", NOW - 900)), None, REFRESH, NOW, || {
+        let reading = choose(|_, _| Some(local), Some(api_snapshot("codex", NOW - 900)), None, REFRESH, || NOW, || {
             Err("network down".to_string())
         })
         .unwrap();

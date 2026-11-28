@@ -1561,16 +1561,16 @@ async fn codex_usage() -> Result<CodexUsageSnapshot, String> {
         });
         let base = auth_candidates.first().and_then(read_codex_last_good);
         let account = account_id.clone();
-        let local = move |_: &CodexUsageSnapshot| {
+        let local = move |_: &CodexUsageSnapshot, now| {
             let home = codex_home().ok()?;
-            local_usage::codex_local(&home, account.as_deref(), agy_statusline::unix_now())
+            local_usage::codex_local(&home, account.as_deref(), now)
         };
         local_usage::choose(
             local,
             base,
             auth_candidates.first().and_then(codex_reading_tag),
             local_usage::settings().refresh,
-            agy_statusline::unix_now(),
+            agy_statusline::unix_now,
             || codex_usage_blocking(auth_candidates),
         )
         .map(|reading| relay_if_fresh(reading, relay_usage))
@@ -1753,8 +1753,7 @@ async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
         let first = candidates.iter().find(|auth| claude_can_fetch_live_usage(auth));
         let base = first.and_then(read_claude_last_good);
         let account = first.and_then(claude_reading_tag);
-        let now = agy_statusline::unix_now();
-        let local = |reference: &CodexUsageSnapshot| {
+        let local = |reference: &CodexUsageSnapshot, now| {
             let paths = agy_statusline::StatusLinePaths::claude_from_home().ok()?;
             local_usage::claude_local_latest(&paths.dir, &claude_config_dir()?, Some(reference), now)
         };
@@ -1763,7 +1762,7 @@ async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
             base,
             account,
             local_usage::settings().refresh,
-            now,
+            agy_statusline::unix_now,
             || claude_usage_blocking(candidates),
         )
         .map(|mut reading| {

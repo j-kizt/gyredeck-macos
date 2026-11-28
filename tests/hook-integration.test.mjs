@@ -12832,13 +12832,17 @@ test("#358 reopened: the command a wait prints is run as printed, and the room t
     assert.ok(command, `premise: a command was printed: ${reply}`);
     // Async: the printed endpoint may be this process's own proxy, which a sync spawn would starve.
     const ran = await new Promise((resolve) => {
-      const child = spawn("sh", ["-c", command.replace("YOUR REPLY HERE", "seen it")], { env: { ...process.env, HOME: f.home }, stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn("sh", ["-c", command.replace("YOUR REPLY HERE", "seen it")], { env: { ...process.env, HOME: f.home, http_proxy: "", HTTP_PROXY: "", ALL_PROXY: "", all_proxy: "" }, stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "";
+      let stderr = "";
+      const limit = setTimeout(() => child.kill(), 15_000);
       child.stdout.on("data", (chunk) => { stdout += chunk; });
-      child.on("close", () => resolve({ stdout }));
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.on("error", (error) => { stderr += String(error); });
+      child.on("close", (code) => { clearTimeout(limit); resolve({ stdout, stderr, code }); });
     });
     const posted = JSON.parse(ran.stdout || "{}");
-    assert.equal(posted.ok, true, `the room took the post: ${ran.stdout}`);
+    assert.equal(posted.ok, true, `the room took the post: ${ran.stdout} ${ran.stderr} (exit ${ran.code})`);
     assert.equal(typeof posted.seq, "number", "and gave it a seq");
   } finally {
     await broker?.close();

@@ -401,8 +401,9 @@ const NO_KEY_STEP =
   " command; answer this mail then. If none comes, tell the person at this terminal; nothing you send by hand" +
   " without the key would be accepted.";
 
-// `self` is the id the wait was started with, already checked against the broker's `boundTo` or
-// sent as the bridge's `as=`: a post is in this session's name, never the room's (#358 reopened).
+// `self` is the id the wait was started with, checked against the broker's `boundTo`: a post is in
+// this session's name, never the room's (#358 reopened). A TCP read carries no room and no key, so
+// that path prints no command.
 const replyForWait = async (result, self) => {
   const room = typeof result?.room === "string" ? result.room : null;
   const members = new Map((Array.isArray(result?.members) ? result.members : []).map((m) => [m?.conversationId, m]));
@@ -602,7 +603,7 @@ const nameAsk = (mine) => {
     ' Send it once, as a "name" field beside to and kind on your first post; the room keeps the first name it is given.';
 };
 
-const replyInstruction = (endpoint, room, replyRooms, answering = null, label = null, isMember = null, askName = false, memberKey = null) => {
+const replyInstruction = (endpoint, self, replyRooms, answering = null, label = null, isMember = null, askName = false, memberKey = null) => {
   if (replyRooms.length === 0) return null;
   const target = replyRooms[0];
   // A room is posted to with the member's own key (#331); a plain mailbox, the only other
@@ -617,7 +618,7 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
       ? OWNER_DISCORD_SENDER
       : answering && label && isMember?.(answering.from) ? label(answering) : "everyone";
     const kind = answering?.kind === "tell" ? "reaction" : "tell";
-    const body = JSON.stringify({ from: room, text: "YOUR REPLY HERE", replyTo: room, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''");
+    const body = JSON.stringify({ from: self, text: "YOUR REPLY HERE", replyTo: self, to, kind, ...(askName ? { name: "YOUR NAME" } : {}) }).replace(/'/g, "'\\''");
     // A post in this session's name takes its own key (#294): with none in this delivery, a
     // command without it would only be refused, so none is printed, and why is said (#403 audit R2-M2).
     if (!(typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey))) return { ephemeralMessage: NO_KEY_STEP };
@@ -646,7 +647,7 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
     "-H 'content-type: application/json' " +
     '-H "x-gyredeck-token: $TOKEN" ' +
     `-H "x-gyredeck-member: ${memberKey}" ` +
-    `-d '{"from":"${room}","text":"YOUR REPLY HERE","replyTo":"${room}","to":"everyone","kind":"tell"}'`;
+    `-d '{"from":"${self}","text":"YOUR REPLY HERE","replyTo":"${self}","to":"everyone","kind":"tell"}'`;
   return {
     ephemeralMessage:
       "The mail above asked you something, and answering is expected — this is a " +

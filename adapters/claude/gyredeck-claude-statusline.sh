@@ -9,21 +9,23 @@ umask 077
 dir="$HOME/.config/gyredeck"
 chain="$dir/claude-statusline.chain"
 cfg=$(printf '%s' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+rec="$dir/claude-statusline.d"
 # mktemp creates each file itself, exclusively, so nothing planted at a guessable name is
-# followed. The record is written before their command runs and is timed when the payload
-# arrived, and a record never replaces one received later: a slow command of theirs, or a
-# second session updating at the same moment, cannot put an older payload over a newer one
-# under a newer time (#398 audit).
+# followed. Each payload is kept as its own record, named by the second it arrived and this
+# process, and no record is ever replaced: the app reads the latest. Two sessions updating at
+# once, or a slow command of theirs, then cannot put an older payload over a newer one
+# (#398 audit). The record is written before their command runs; records that arrived before
+# this one are removed after, which never removes the latest.
 if tmp=$(mktemp "$dir/.claude-statusline-in.XXXXXX" 2>/dev/null) && cat > "$tmp"; then
   at=$(date +%s)
-  if out=$(mktemp "$dir/.claude-statusline.XXXXXX" 2>/dev/null); then
-    if { printf '{"at":%s,"configDir":"%s","payload":' "$at" "$cfg"; cat "$tmp"; printf '}\n'; } > "$out"; then
-      prev=$(sed -n '1s/^{"at":\([0-9][0-9]*\),.*/\1/p' "$dir/claude-statusline.json" 2>/dev/null)
-      if [ -z "$prev" ] || [ "$prev" -le "$at" ]; then
-        mv -f "$out" "$dir/claude-statusline.json" 2>/dev/null || rm -f "$out"
-      else
-        rm -f "$out"
-      fi
+  if mkdir -p "$rec" 2>/dev/null && out=$(mktemp "$rec/.w.XXXXXX" 2>/dev/null); then
+    if { printf '{"at":%s,"configDir":"%s","payload":' "$at" "$cfg"; cat "$tmp"; printf '}\n'; } > "$out" \
+      && mv -f "$out" "$rec/$at.$$.json" 2>/dev/null; then
+      for old in "$rec"/*.json; do
+        name=${old##*/}
+        case ${name%%.*} in ''|*[!0-9]*) continue ;; esac
+        [ "${name%%.*}" -lt "$at" ] && rm -f "$old"
+      done
     else
       rm -f "$out"
     fi

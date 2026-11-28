@@ -76,7 +76,8 @@ pub(crate) const AGY: StatusLineSpec = StatusLineSpec {
 
 pub(crate) const CLAUDE: StatusLineSpec = StatusLineSpec {
     script_name: "gyredeck-claude-statusline.sh",
-    payload_file: "claude-statusline.json",
+    // A folder of records, one per payload, never replaced (#398 audit).
+    payload_file: "claude-statusline.d",
     chain_file: "claude-statusline.chain",
     previous_file: "claude-statusline.previous.json",
     owned_keys: &["type", "command", "padding"],
@@ -683,7 +684,8 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn remove_if_present(path: &Path) -> Result<(), String> {
-    match fs::remove_file(path) {
+    let is_dir = fs::symlink_metadata(path).map(|meta| meta.is_dir()).unwrap_or(false);
+    match if is_dir { fs::remove_dir_all(path) } else { fs::remove_file(path) } {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
             Err(format!("Failed to remove {}: {error}", path.display()))
         }
@@ -1097,6 +1099,15 @@ mod tests {
 
     // C6 -------------------------------------------------------------------------------
 
+    /// Where the last payload was recorded: agy's one file, or Claude's latest record.
+    fn record(paths: &StatusLinePaths) -> PathBuf {
+        if paths.spec.has_enabled {
+            paths.payload()
+        } else {
+            crate::local_usage::newest_claude_record(&paths.payload()).expect("a Claude record")
+        }
+    }
+
     fn run_script(paths: &AgyStatusLinePaths, home: &Path, input: &[u8]) -> (i32, String) {
         let mut child = Command::new("sh")
             .arg(paths.script())
@@ -1149,7 +1160,7 @@ mod tests {
             let (code, out) = run_script(&paths, &home, &input);
             assert_eq!(code, 0);
             assert_eq!(out, drawn, "{name}: their output is what the agent draws");
-            let kept = fs::read(paths.payload()).unwrap();
+            let kept = fs::read(record(&paths)).unwrap();
             if spec.has_enabled {
                 assert_eq!(kept, input, "the payload is kept whole");
             } else {
@@ -1158,7 +1169,7 @@ mod tests {
                 assert_eq!(wrapper["configDir"], home.join(".claude").to_string_lossy().as_ref(), "with the config dir it ran under");
                 assert!(wrapper["at"].as_i64().unwrap() >= unix_now() - 60, "and when it was written");
             }
-            assert_eq!(fs::metadata(paths.payload()).unwrap().permissions().mode() & 0o777, 0o600, "{name}");
+            assert_eq!(fs::metadata(record(&paths)).unwrap().permissions().mode() & 0o777, 0o600, "{name}");
 
             // A second install must not record our own command as theirs.
             install(&paths, &script_source_for(spec)).unwrap();
@@ -1188,7 +1199,8 @@ mod tests {
 
             let (code, out) = run_script(&paths, &home, &input);
             assert_eq!((code, out.as_str()), (0, "drawn"), "{name}: their failing line still draws, ours exits 0");
-            let mut left: Vec<String> = fs::read_dir(&paths.dir).unwrap()
+            let records = (!spec.has_enabled).then(|| fs::read_dir(paths.payload()).unwrap()).into_iter().flatten();
+            let mut left: Vec<String> = fs::read_dir(&paths.dir).unwrap().chain(records)
                 .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
                 .filter(|file| file.starts_with('.'))
                 .collect();
@@ -1196,7 +1208,7 @@ mod tests {
             assert_eq!(left, Vec::<String>::new(), "{name}: no temp file is left behind");
 
             // With the folder unwritable mktemp fails: their line still draws, from stdin.
-            fs::remove_file(paths.payload()).unwrap();
+            remove_if_present(&paths.payload()).unwrap();
             fs::set_permissions(&paths.dir, fs::Permissions::from_mode(0o500)).unwrap();
             let (code, out) = run_script(&paths, &home, &input);
             fs::set_permissions(&paths.dir, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1206,8 +1218,9 @@ mod tests {
         }
     }
 
-    /// A slow status line of theirs held an older payload's record until after a newer one
-    /// was written, then put it over the newer one under a later time (#398 audit, seq 320).
+    /// Records are never replaced and the latest is read, so no order the writers finish in
+    /// puts an older payload over a newer one (#398 audit, seq 320/322: a slow command of
+    /// theirs, and a pause between a check and a replace, each lost the newer payload).
     #[test]
     fn c6_an_older_claude_payload_never_replaces_a_newer_record() {
         let root = scratch("claude-order");
@@ -1217,7 +1230,7 @@ mod tests {
         write_settings(&paths, &serde_json::json!({ "statusLine": running(&CLAUDE,
             "while [ -n \"$HOLD\" ] && [ -f \"$HOLD\" ]; do sleep 0.05; done; head -c 3") }));
         install(&paths, &script_source_for(&CLAUDE)).unwrap();
-        let recorded = || -> Value { serde_json::from_slice(&fs::read(paths.payload()).unwrap()).unwrap() };
+        let recorded = || -> Value { serde_json::from_slice(&fs::read(record(&paths)).unwrap()).unwrap() };
 
         fs::write(&hold, "").unwrap();
         let mut older = Command::new("sh")
@@ -1230,7 +1243,7 @@ mod tests {
             .unwrap();
         older.stdin.take().unwrap().write_all(&bytes(&payload(T0))).unwrap();
         let waited = std::time::Instant::now();
-        while !paths.payload().exists() && waited.elapsed() < Duration::from_secs(3) {
+        while crate::local_usage::newest_claude_record(&paths.payload()).is_none() && waited.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(20));
         }
         std::thread::sleep(Duration::from_millis(1_100));
@@ -1241,13 +1254,19 @@ mod tests {
         assert_eq!(older.wait().unwrap().code(), Some(0));
         assert_eq!(recorded()["payload"], payload(T0 + 60), "the held older payload did not come back over it");
 
-        // A record received later is never replaced, whoever writes last.
+        // A writer that finishes after a later arrival — the pause Codex forced between check
+        // and replace — leaves that later record, and the later one is what is read.
+        let newer_at = recorded()["at"].as_i64().unwrap();
         let later = unix_now() + 1_000;
         let mut kept = recorded();
         kept["at"] = later.into();
-        fs::write(paths.payload(), serde_json::to_vec(&kept).unwrap()).unwrap();
+        fs::write(paths.payload().join(format!("{later}.1.json")), serde_json::to_vec(&kept).unwrap()).unwrap();
         run_script(&paths, &home, &bytes(&payload(T0)));
         assert_eq!(recorded()["at"], later, "an earlier arrival leaves the later record");
+        let names: Vec<String> = fs::read_dir(paths.payload()).unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string()).collect();
+        let arrived = |name: &String| name.split('.').next().unwrap().parse::<i64>().unwrap();
+        assert!(names.iter().all(|name| arrived(name) >= newer_at), "records that arrived earlier are cleared: {names:?}");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1269,7 +1288,7 @@ mod tests {
             .unwrap();
         child.stdin.take().unwrap().write_all(&bytes(&payload(T0))).unwrap();
         assert_eq!(child.wait().unwrap().code(), Some(0));
-        let wrapper: Value = serde_json::from_slice(&fs::read(paths.payload()).unwrap()).unwrap();
+        let wrapper: Value = serde_json::from_slice(&fs::read(record(&paths)).unwrap()).unwrap();
         assert_eq!(wrapper["configDir"], odd);
         let _ = fs::remove_dir_all(&root);
     }

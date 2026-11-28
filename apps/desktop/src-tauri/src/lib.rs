@@ -1756,7 +1756,8 @@ async fn claude_usage() -> Result<CodexUsageSnapshot, String> {
         let now = agy_statusline::unix_now();
         let local = |reference: &CodexUsageSnapshot| {
             let paths = agy_statusline::StatusLinePaths::claude_from_home().ok()?;
-            local_usage::claude_local(&paths.payload(), &claude_config_dir()?, Some(reference), now)
+            let record = local_usage::newest_claude_record(&paths.payload())?;
+            local_usage::claude_local(&record, &claude_config_dir()?, Some(reference), now)
         };
         local_usage::choose(
             local,

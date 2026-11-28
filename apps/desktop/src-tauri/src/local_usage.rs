@@ -285,6 +285,31 @@ fn same_dir(left: &str, right: &Path) -> bool {
     left.trim_end_matches('/') == right.trim_end_matches('/')
 }
 
+/// The record that arrived last in the status line's folder: `<second>.<pid>.json`, regular
+/// files only, the folder itself not a link. Records are never replaced, so the latest is the
+/// newest payload whatever order the writers finished in (#398 audit).
+pub(crate) fn newest_claude_record(dir: &Path) -> Option<PathBuf> {
+    if !fs::symlink_metadata(dir).ok()?.is_dir() {
+        return None;
+    }
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .take(4_096)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let (at, pid) = name.strip_suffix(".json")?.split_once('.')?;
+            let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+            if !(digits(at) && digits(pid)) {
+                return None;
+            }
+            Some((at.parse::<i64>().ok()?, name, entry.path()))
+        })
+        .max_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)))
+        .map(|(_, _, path)| path)
+}
+
 /// The status-line reading, when it was written for this config dir and plausibly this account.
 pub(crate) fn claude_local(
     path: &Path,
@@ -860,6 +885,26 @@ mod tests {
             mutate(&mut value);
             assert!(codex_lines(&value, NOW).is_none(), "{name}");
         }
+    }
+
+    #[test]
+    fn the_latest_claude_record_is_read_whatever_order_it_was_written_in() {
+        let root = scratch("claude-records");
+        let dir = root.join("claude-statusline.d");
+        fs::create_dir_all(&dir).unwrap();
+        for name in ["1000.9.json", "1002.3.json", "1001.5.json", ".w.abc", "1003.x.json", "notes.json"] {
+            fs::write(dir.join(name), "{}").unwrap();
+        }
+        std::os::unix::fs::symlink(dir.join("1000.9.json"), dir.join("1009.1.json")).unwrap();
+        assert_eq!(newest_claude_record(&dir), Some(dir.join("1002.3.json")), "the latest by arrival, never a link or a stray");
+        // Premise: the link would win by name; claude_local refuses it regardless.
+        assert!(claude_local(&dir.join("1009.1.json"), Path::new("/c"), Some(&api_snapshot("claude", NOW)), NOW).is_none());
+
+        let linked = root.join("linked.d");
+        std::os::unix::fs::symlink(&dir, &linked).unwrap();
+        assert_eq!(newest_claude_record(&linked), None, "a linked folder is not followed");
+        assert_eq!(newest_claude_record(&root.join("missing")), None);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

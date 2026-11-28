@@ -12606,6 +12606,23 @@ test("#250 C5: a refused password is said with its error code, then BLOCKED, and
   }
 });
 
+test("#403 audit r6: a refused paste on a turn that also delivers private mail still says BLOCKED", async () => {
+  const f = await agyPasteFixture("refmail");
+  try {
+    const sent = await f.call("POST", `/mail/${f.agy}`, { from: f.founder, kind: "tell", text: "PRIVATE-NOTE-403" });
+    assert.equal(sent.body.ok, true, `premise: private mail posted through the bridge: ${JSON.stringify(sent.body)}`);
+    const wrong = f.password.replace(/^./, (c) => (c === "0" ? "1" : "0"));
+    const result = await f.invoke(wrong);
+    assert.match(result.text, /PRIVATE-NOTE-403/, "premise: the private mail was delivered on this turn");
+    assert.match(result.text, /The pasted password was refused \(bad_password\)/);
+    assert.equal(result.steps.filter((text) => text.startsWith("BLOCKED:")).length, 1, "BLOCKED, once");
+    assert.equal(result.text.toLowerCase().indexOf(wrong), -1);
+    assert.equal(await f.confirmed(), false);
+  } finally {
+    await f.close();
+  }
+});
+
 test("#250 r2: an accepted paste keeps its HEAR when the delivery cannot be built, when the inbox answers nothing, and when it answers {}", async () => {
   // Short tags: the broker's socket lives under the temp home, and a long path passes
   // macOS's 104-byte limit for a socket, which the hook reads as a broken broker.

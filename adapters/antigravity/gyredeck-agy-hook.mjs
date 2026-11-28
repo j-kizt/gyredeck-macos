@@ -1240,6 +1240,7 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
     ...(usageStep ? [usageStep] : []),
     ...(heavyStep ? [heavyStep] : []),
     ...(hintStep ? [hintStep] : []),
+    ...(refusedBlocked ? [{ ephemeralMessage: refusedBlocked }] : []),
     ...rereadSteps(endpoint, room, syncRoom, delivered, result?.memberKey),
     // Last, so the command is the freshest thing in context when the model acts.
     ...(reply ? [reply] : []),

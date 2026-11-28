@@ -399,7 +399,9 @@ const replyForWait = async (result) => {
   const answering = (Array.isArray(result?.messages) ? result.messages : [])
     .filter((m) => (m.kind === "ask" || m.kind === "tell") && m.from !== ROOM_SENDER && members.get(m.from)?.you !== true)
     .at(-1);
-  if (!room || !answering) return {};
+  // An unconfirmed member cannot post yet; a command would only be refused (#403 audit S3).
+  const me = [...members.values()].find((m) => m?.you === true);
+  if (!room || !answering || (me && me.confirmed !== true)) return {};
   const reply = replyInstruction(
     await readEndpoint(), room, [room], answering,
     // The member's label from the roster as it is now, as the prompt-time delivery does: a
@@ -631,11 +633,15 @@ const replyInstruction = (endpoint, room, replyRooms, answering = null, label = 
   // A plain mailbox takes the machine token and, for a post in this session's name, its own
   // key (#403 F2), which only the broker hands over: a TCP read without it gets no command.
   if (!(typeof memberKey === "string" && /^[a-f0-9]{64}$/.test(memberKey))) {
+    // No key: either not through the broker, or held over from an earlier process of this
+    // session; the hook cannot tell which (#403 audit M1).
     return {
       ephemeralMessage:
-        "The mail above can be read but not answered from here: the Gyredeck broker is needed to reply." +
-        " A post in your name takes your own key, which only the broker hands over, and this delivery did not" +
-        " come through it. Tell the person at this terminal; nothing you send by hand would be accepted.",
+        "The mail above can be read but not answered in this delivery: a post in your name takes your own key," +
+        " and this delivery carries none. Either it did not come through the Gyredeck broker, or it was held over" +
+        " from an earlier process of this session. A later delivery through the broker carries the key in its reply" +
+        " command; answer this mail then. If none comes, tell the person at this terminal; nothing you send by hand" +
+        " without the key would be accepted.",
     };
   }
   const command =
@@ -1232,7 +1238,8 @@ const drainMailIntoSteps = async (endpoint, token, room, taken = null, confirm =
     heard = true;
   }
   const header = { ephemeralMessage: parts.join(" "), ...(heard ? { [SAYS_HEAR]: room } : {}) };
-  const reply = replyInstruction(
+  // An unconfirmed member is told it is blocked; a reply command would only be refused (#403 audit S3).
+  const reply = syncRoom && mine && !confirmed ? null : replyInstruction(
     endpoint, room, replyRooms, answerable.at(-1), label,
     (id) => byId.has(id) && id !== room,
     askName !== null,

@@ -971,7 +971,7 @@ test("antigravity PreInvocation delivers mail into injectSteps exactly once", as
     // refused (#403 F2): it is told so instead of handed a command. The keyed command is
     // covered by "#403 F2 invariant 4".
     const replyStep = withReply.at(-1).ephemeralMessage;
-    assert.match(replyStep, /the Gyredeck broker is needed to reply/);
+    assert.match(replyStep, /carries none\. Either it did not come through the Gyredeck broker, or it was held over from an earlier process/);
     assert.doesNotMatch(replyStep, /curl/);
     assert.doesNotMatch(replyStep, new RegExp(token));
 
@@ -1235,7 +1235,7 @@ test("claude UserPromptSubmit delivers mail as additional context exactly once",
     // A session in no room is not told about member keys with its mail (#403).
     assert.doesNotMatch(context, /neither the session's own member key/);
     // Read without the broker: no key, so no command, and it is told why (#403 F2).
-    assert.match(context, /The Gyredeck broker is needed to reply/);
+    assert.match(context, /carries none\. Either it did not come through the Gyredeck broker, or it was held over from an earlier process/);
     assert.doesNotMatch(context, /curl/);
     assert.doesNotMatch(context, new RegExp(token));
 
@@ -12309,6 +12309,13 @@ test("an unconfirmed Antigravity member sees how to confirm on every invocation,
     assert.match(second, /pastes it as their next prompt here, and this hook presents it/, "with the way in");
     assert.ok(!second.includes(confirmLine) && !second.includes(ownId), "and no confirm command to send by hand");
 
+    // #403 audit S3: answerable mail to an unconfirmed member hands it no reply command — a post
+    // would only be refused — and BLOCKED still says why.
+    assert.equal((await call("POST", `/mail/${agy}`, { from: founder, text: "please answer", kind: "ask", to: "everyone" })).status, 202);
+    const asked = await agySteps();
+    assert.match(asked, /BLOCKED:/);
+    assert.doesNotMatch(asked, /curl -s -X POST/, "no reply command for a member that cannot post yet");
+
     // A confirm with no id, or no password, says what is missing — not "never invited".
     const noId = await call("POST", `/sync/rooms/${code}/confirm`, { password: "ab".repeat(16) });
     assert.equal(noId.status, 400);
@@ -16825,19 +16832,19 @@ test("#403 F2 invariant 4: the Claude and Antigravity hooks hand a session in no
   }
 });
 
-test("#403 F2 invariant 5: with no broker a session in no room still reads its mail, is handed no key, and is told the broker is needed to reply", async () => {
+test("#403 F2 invariant 5: with no broker a session in no room still reads its mail, is handed no key, and is told why it cannot reply yet", async () => {
   const f = await f2Fixture("inv5", { withBroker: false });
   try {
     await f.ask(f.agy, "agy over TCP");
     const steps = await f.agySteps();
     assert.ok(steps.includes("agy over TCP"), `the read keeps working over TCP: ${steps}`);
-    assert.match(steps, /the Gyredeck broker is needed to reply/);
+    assert.match(steps, /carries none\. Either it did not come through the Gyredeck broker, or it was held over from an earlier process/);
     assert.doesNotMatch(steps, /x-gyredeck-member/, "no key");
     assert.doesNotMatch(steps, /curl -s -X POST/, "and no command that would only be refused");
     await f.ask(f.claude, "claude over TCP");
     const context = await f.claudeContext();
     assert.ok(context.includes("claude over TCP"), `the Claude read keeps working over TCP too: ${context}`);
-    assert.match(context, /The Gyredeck broker is needed to reply/);
+    assert.match(context, /carries none\. Either it did not come through the Gyredeck broker, or it was held over from an earlier process/);
     assert.doesNotMatch(context, /x-gyredeck-member|curl -s -X POST/);
   } finally {
     await f.close();

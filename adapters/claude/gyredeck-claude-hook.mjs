@@ -430,11 +430,14 @@ const hookCommandPath = () => {
 };
 const MAIL_MAX_TEXT = 2_000;
 // A post in a session's name takes its own key (#294, #403 F2), handed only through the broker:
-// with none in a delivery, a command would only be refused, so none is printed.
+// with none in a delivery, a command would only be refused, so none is printed. A delivery can
+// lack it for two reasons the hook cannot tell apart: it did not come through the broker, or the
+// broker held it over from an earlier process of this session (#403 audit M1).
 const NO_KEY_ANSWER =
-  "REPLY — not available in this delivery: a post in your name takes your own key, which only the Gyredeck broker" +
-  " hands over, and this delivery did not come through it. The Gyredeck broker is needed to reply: tell the person" +
-  " at this terminal; nothing you send by hand would be accepted.";
+  "REPLY — not available in this delivery: a post in your name takes your own key, and this delivery carries" +
+  " none. Either it did not come through the Gyredeck broker, or it was held over from an earlier process of" +
+  " this session. A later delivery through the broker carries the key in its reply command; answer this mail" +
+  " then. If none comes, tell the person at this terminal; nothing you send by hand without the key would be accepted.";
 /** `from` the desktop app uses when the person sends a message themselves. */
 const APP_SENDER = "gyredeck";
 /** `from` the bridge uses when the room reports a change to its own membership. */
@@ -972,7 +975,10 @@ const drainMailIntoContext = async (endpoint, token, room, justConfirmed = null,
     room_ ??
     delivered.map((message) => message.replyTo).find((value) => typeof value === "string") ??
     null;
-  if (replyTo && room_ && (answerable.length > 0 || justConfirmed)) {
+  // An unconfirmed member is told above that it cannot post yet; a command would only be refused.
+  if (replyTo && room_ && mine && !confirmed && !justConfirmed) {
+    // Nothing: the BLOCKED line already says what is missing (#403 audit S3).
+  } else if (replyTo && room_ && (answerable.length > 0 || justConfirmed)) {
     // Addressed and labelled in advance from what it answers — the asker, and a tell for
     // an ask or a reaction for a tell — since a reply left to the defaults goes to the
     // whole room and wakes everyone.

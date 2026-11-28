@@ -873,6 +873,27 @@ test("#403 F2 invariant 2: a session's own key, or the broker's word, posts in i
   }
 });
 
+test("#403 audit M2: a session in no room loses its key to a new process of itself; a late report from the old one changes nothing", async () => {
+  const h = await startBridge();
+  try {
+    const bound = (generation) => h.call("POST", "/broker/bound", { conversationId: LONER, generation });
+    const mail = (text, key) => postAs(h, FOUNDER, LONER, text, { "x-gyredeck-token": h.token, "x-gyredeck-member": key });
+    assert.equal((await bound(1)).status, 200);
+    const old = await keyOfSession(h, LONER);
+    assert.equal((await mail("first process", old)).status, 202, "premise: the first process's key posts");
+    assert.equal((await bound(2)).status, 200);
+    assert.equal((await mail("old key after a new process", old)).status, 403, "the old process's key dies");
+    const fresh = await keyOfSession(h, LONER);
+    assert.notEqual(fresh, old, "the new process is handed a new key");
+    assert.equal((await mail("new process", fresh)).status, 202);
+    assert.equal((await bound(1)).status, 200);
+    assert.equal((await mail("after a late report from the old process", fresh)).status, 202, "a late, lower generation kills nothing");
+    assert.equal((await mail("old key after the late report", old)).status, 403, "nor brings the old key back");
+  } finally {
+    await h.stop();
+  }
+});
+
 test("#403 F2 invariant 3: a key handed before joining still posts and watches after joining, and posts after leaving", async () => {
   const h = await startBridge();
   try {

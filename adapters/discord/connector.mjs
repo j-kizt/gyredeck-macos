@@ -27,6 +27,9 @@ const SETTLE_MAX_MS = 60_000;
 export const SAY_MAX_TEXT = 4_096;
 /** Relayed messages remembered per room, so a Reply or a reaction can name what it answers. */
 export const RELAYED_MAX = 500;
+/** Sleep and wake notices remembered as posted, per room, so one handed again is not (#318). */
+export const POWERED_MAX = 64;
+export const SLEEP_TEXT = "💤 Mac is going to sleep";
 const SPOKEN_MAX = 500;
 export const EDIT_NOTE = "Edits are not sent to the room; send a new message.";
 export const OWNER_VOICE = "gyredeck-owner-discord";
@@ -325,6 +328,11 @@ export function awayText(ms) {
   const h = Math.round(ms / 3_600_000);
   if (h < 48) return `${h} h`;
   return `${Math.round(ms / 86_400_000)} d`;
+}
+
+/** The words of a sleep or wake notice (#318); the app sends only how long it slept. */
+export function powerText(kind, asleepMs) {
+  return kind === "sleep" ? SLEEP_TEXT : `☀️ Back (asleep ${awayText(asleepMs)})`;
 }
 
 const ERROR_CODES = new Set([
@@ -1341,7 +1349,7 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
           backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
           continue;
         }
-        if (kind === "missing" && item.op === "send") {
+        if (kind === "missing" && (item.op === "send" || item.op === "power")) {
           item.needsPost = true;
           continue;
         }
@@ -1378,12 +1386,12 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
     // anything else goes to the post where it lives.
     w.target = item.op === "open" || item.needsPost ? forumId : state.rooms[w.code]?.forumId ?? forumId;
     if (item.op === "open") return openPost(w, item);
-    if (item.op === "send") {
+    if (item.op === "send" || item.op === "power") {
       if (item.needsPost) {
         await openPost(w, { members: w.members }, { fresh: true });
         item.needsPost = false;
       }
-      return relay(w, item);
+      return item.op === "power" ? sayPower(w, item) : relay(w, item);
     }
     if (item.op === "close") return closePost(w, item);
     if (item.op === "lost") return sayLost(w, item);
@@ -1747,6 +1755,24 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
     acked(w, seq, item.inst, msgId ?? rs.lastMsgId ?? null);
   }
 
+  // A sleep or wake notice, once: known by its id, never by a seq (#318). Marked delayed when the
+  // app says it was not said before the sleep, or when held as long as a late line.
+  async function sayPower(w, item) {
+    const rs = state.rooms[w.code];
+    if (!rs?.threadId) throw Object.assign(new Error("no post"), { kind: "missing" });
+    const done = () => send({ t: "powered", room: w.code, createdAt: item.inst ?? null, id: item.id });
+    if (rs.powered?.includes(item.id)) return done();
+    const delayed = item.delayed || clock.now() - item.at > DELAYED_MS;
+    const { username, content } = formatMessage({ kind: "notice", text: powerText(item.kind, item.asleep) }, delayed);
+    settle();
+    await postOnce(w, rs, { key: `power:${item.id}`, username, content }, (r) => {
+      (r.powered ??= []).push(item.id);
+      if (r.powered.length > POWERED_MAX) r.powered.splice(0, r.powered.length - POWERED_MAX);
+    });
+    settle();
+    done();
+  }
+
   // The app is ending the relay (Remove) and these lines will not be delivered: the post
   // says which, once, before its close, and they count as taken (#199 I21).
   async function sayLost(w, item) {
@@ -1950,6 +1976,24 @@ export function createConnector({ discord, out, clock = realClock, fetchFile = (
         const said = typeof msg.ts === "string" ? Date.parse(msg.ts) : NaN;
         const at = Number.isFinite(said) ? Math.min(said, clock.now()) : clock.now();
         return enqueue(w, { op: "send", m, at, sent: 0, inst: w.createdAt });
+      }
+      case "power": {
+        if (storageBlocked) return;
+        const w = workers.get(msg.room);
+        if (!w?.accepting) return fail("room_unknown", "That room is not connected.", msg.room);
+        const id = String(msg.id ?? "");
+        const kind = msg.kind;
+        if (!/^[0-9a-f]{16}$/.test(id) || (kind !== "sleep" && kind !== "wake")) return;
+        if (kind === "wake" && !(Number.isFinite(msg.asleep) && msg.asleep >= 0)) return;
+        if (state.rooms[msg.room]?.powered?.includes(id)) return send({ t: "powered", room: msg.room, createdAt: w.createdAt ?? null, id });
+        // Handed again — after a wake, or to say it is now late — it is the one already queued.
+        const queued = w.queue.find((it) => it.op === "power" && it.id === id);
+        if (queued) {
+          if (msg.delayed === true) queued.delayed = true;
+          return;
+        }
+        const at = Number.isFinite(msg.at) ? Math.min(msg.at, clock.now()) : clock.now();
+        return enqueue(w, { op: "power", id, kind, asleep: kind === "wake" ? msg.asleep : null, at, delayed: msg.delayed === true, inst: w.createdAt });
       }
       case "end":
         return endRelay();

@@ -4323,3 +4323,36 @@ test("#454 a /disconnect registration refused for a permission is not retried an
   assert.deepEqual(of("commands").map((m) => m.code ?? null), ["missing_permission"], "said once, and nothing clears it");
   await c.close();
 });
+
+test("#318 a sleep notice still queued at the wake goes marked (delayed), then the wake, and none is posted twice", async () => {
+  const { c, fake, clock, of } = await boot();
+  c.handle({ t: "connect", room: "R", members: [], createdAt: 1 });
+  await flush();
+  const held = [];
+  fake.gate = async (op) => {
+    if (op !== "send") return;
+    const d = deferred();
+    held.push(d);
+    await d.promise;
+  };
+  const at = clock.now();
+  const sleep = { t: "power", room: "R", id: "00000000000000a1", kind: "sleep", at, delayed: false };
+  const wake = { t: "power", room: "R", id: "00000000000000a2", kind: "wake", at, asleep: 300_000, delayed: false };
+  c.handle(message("R", 1));
+  c.handle(sleep);
+  await flush();
+  assert.equal(held.length, 1, "premise: m1 is in flight, the sleep notice queued behind it");
+  c.handle({ ...sleep, delayed: true });
+  c.handle(wake);
+  c.handle(wake);
+  fake.gate = null;
+  held.shift().resolve();
+  await flush();
+  assert.deepEqual(fake.sent.slice(1).map((s) => s.content), ["(delayed)\n💤 Mac is going to sleep", "☀️ Back (asleep 5 min)"]);
+  c.handle({ ...sleep, delayed: true });
+  c.handle(wake);
+  await flush();
+  assert.equal(fake.sent.length, 3, "a notice already posted is not posted again");
+  assert.deepEqual(of("powered").map((m) => [m.id, m.createdAt]), [["00000000000000a1", 1], ["00000000000000a2", 1], ["00000000000000a1", 1], ["00000000000000a2", 1]]);
+  await c.close();
+});

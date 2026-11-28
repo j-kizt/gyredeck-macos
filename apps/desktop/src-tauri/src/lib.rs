@@ -35,6 +35,7 @@ mod keep_awake;
 mod local_services;
 mod notification;
 mod session_store;
+mod sleep_wake;
 mod standalone_bridge;
 
 use github::{
@@ -6404,6 +6405,17 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let awake = app.handle().clone();
             app.state::<discord::DiscordState>().on_rooms(std::sync::Arc::new(move |rooms| awake.state::<KeepAwakeState>().set_discord_rooms(rooms)));
+            let power = app.handle().clone();
+            let listening = sleep_wake::start(std::sync::Arc::new(move |event| {
+                let discord = power.state::<discord::DiscordState>();
+                match event {
+                    sleep_wake::Event::WillSleep => discord.will_sleep(),
+                    sleep_wake::Event::Woke => discord.woke(),
+                }
+            }));
+            if let Err(error) = listening {
+                eprintln!("Gyredeck cannot say sleep and wake on Discord: {error}");
+            }
             notification::initialize();
             let preference = read_display_preference(app.handle());
             app.state::<DisplayPreferenceState>().set(preference);

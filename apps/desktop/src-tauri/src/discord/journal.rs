@@ -76,6 +76,41 @@ pub(crate) enum Record {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         through: Option<u64>,
     },
+    /// A sleep or wake notice (#318). It has no room seq, so it is known by `id` and placed
+    /// after the line it followed (`after`); `asleep` is how long a wake slept, in ms.
+    Power {
+        id: String,
+        kind: PowerKind,
+        at: u64,
+        after: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asleep: Option<u64>,
+    },
+    /// Discord took that notice.
+    Powered { id: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PowerKind {
+    Sleep,
+    Wake,
+}
+
+/// A sleep or wake notice the journal holds until Discord takes it (#318).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Power {
+    pub id: String,
+    pub kind: PowerKind,
+    pub at: u64,
+    pub after: u64,
+    pub asleep: Option<u64>,
+}
+
+impl Power {
+    pub(crate) fn record(&self) -> Record {
+        Record::Power { id: self.id.clone(), kind: self.kind, at: self.at, after: self.after, asleep: self.asleep }
+    }
 }
 
 /// A line or a loss, as the journal holds it until Discord takes it.
@@ -121,6 +156,8 @@ pub(crate) struct Close {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Batch {
     pub items: Vec<Item>,
+    /// Its sleep and wake notices Discord has not taken (#318).
+    pub powers: Vec<Power>,
     pub close: Option<Close>,
 }
 
@@ -208,6 +245,8 @@ pub(crate) fn parse(name: &str, bytes: &[u8]) -> Result<Parsed, Corrupt> {
     let mut closes: HashMap<String, bool> = HashMap::new();
     let mut batches: Vec<Batch> = Vec::new();
     let mut current: Vec<Item> = Vec::new();
+    let mut current_powers: Vec<Power> = Vec::new();
+    let mut power_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let whole: &[u8] = if valid_len == 0 { &[] } else { &bytes[..valid_len - 1] };
     for (index, raw) in whole.split(|b| *b == b'\n').enumerate().filter(|_| valid_len > 0) {
         let line = index + 1;
@@ -269,7 +308,22 @@ pub(crate) fn parse(name: &str, bytes: &[u8]) -> Result<Parsed, Corrupt> {
                 if closes.insert(id.clone(), false).is_some() {
                     return Err(corrupt(line, format!("close {id} twice")));
                 }
-                batches.push(Batch { items: std::mem::take(&mut current), close: Some(Close { id, reason, at, acked: false }) });
+                batches.push(Batch { items: std::mem::take(&mut current), powers: std::mem::take(&mut current_powers), close: Some(Close { id, reason, at, acked: false }) });
+            }
+            Record::Power { id, kind, at, after, asleep } => {
+                if !power_ids.insert(id.clone()) {
+                    return Err(corrupt(line, format!("power {id} twice")));
+                }
+                current_powers.push(Power { id, kind, at, after, asleep });
+            }
+            Record::Powered { id } => {
+                if !power_ids.contains(&id) {
+                    return Err(corrupt(line, format!("powered {id} names no earlier power")));
+                }
+                current_powers.retain(|power| power.id != id);
+                for batch in &mut batches {
+                    batch.powers.retain(|power| power.id != id);
+                }
             }
             Record::Closeack { id } => match closes.get_mut(&id) {
                 Some(done) => *done = true,
@@ -280,8 +334,8 @@ pub(crate) fn parse(name: &str, bytes: &[u8]) -> Result<Parsed, Corrupt> {
     let Some(members) = members else {
         return Err(corrupt(0, "no whole record".to_string()));
     };
-    if !current.is_empty() || closes.is_empty() {
-        batches.push(Batch { items: current, close: None });
+    if !current.is_empty() || !current_powers.is_empty() || closes.is_empty() {
+        batches.push(Batch { items: current, powers: current_powers, close: None });
     }
     for batch in &mut batches {
         batch.items.retain(|item| item.seq() > acked);
@@ -289,7 +343,7 @@ pub(crate) fn parse(name: &str, bytes: &[u8]) -> Result<Parsed, Corrupt> {
             close.acked = closes.get(&close.id) == Some(&true);
         }
     }
-    batches.retain(|batch| !(batch.items.is_empty() && batch.close.as_ref().is_some_and(|close| close.acked)));
+    batches.retain(|batch| !(batch.items.is_empty() && batch.powers.is_empty() && batch.close.as_ref().is_some_and(|close| close.acked)));
     Ok(Parsed { code: code.to_string(), created_at, members, acked, last_msg_id, anchor_seq, batches, last_seq: last_seq.unwrap_or(0), covered, valid_len })
 }
 
@@ -305,6 +359,7 @@ fn render(parsed: &Parsed) -> Vec<u8> {
     }
     for batch in &parsed.batches {
         records.extend(batch.items.iter().map(Item::record));
+        records.extend(batch.powers.iter().map(Power::record));
         if let Some(close) = &batch.close {
             records.push(Record::Close { id: close.id.clone(), reason: close.reason, at: close.at });
             if close.acked {
@@ -696,6 +751,8 @@ struct Inner {
     short: bool,
     #[cfg(test)]
     fail_syncs: u32,
+    #[cfg(test)]
+    stall: std::time::Duration,
 }
 
 impl Inner {
@@ -721,6 +778,8 @@ impl Inner {
             short: false,
             #[cfg(test)]
             fail_syncs: 0,
+            #[cfg(test)]
+            stall: std::time::Duration::ZERO,
         }
     }
 }
@@ -746,6 +805,10 @@ impl File {
         let mut inner = self.lock();
         if inner.broken {
             return Err(refuse("an earlier write could not be undone"));
+        }
+        #[cfg(test)]
+        if !inner.stall.is_zero() {
+            std::thread::sleep(inner.stall);
         }
         #[cfg(test)]
         let passing = tests::fault_free();
@@ -902,6 +965,12 @@ impl File {
     #[cfg(test)]
     pub(crate) fn fail_writes(&self, fail: bool) {
         self.lock().fail = fail;
+    }
+
+    /// Every append waits this long before it writes, the caller still holding what it held.
+    #[cfg(test)]
+    pub(crate) fn stall_writes(&self, stall: std::time::Duration) {
+        self.lock().stall = stall;
     }
 
     #[cfg(test)]

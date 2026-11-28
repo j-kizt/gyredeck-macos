@@ -6632,3 +6632,344 @@ fn a_member_is_shown_as_the_bridge_shows_it_and_as_before_only_for_an_older_brid
         ["Claude Code · Worker / Audit", "Codex"],
     );
 }
+
+// ── #318: sleep and wake notices ──
+
+const THIRD: &str = "sync-ef67";
+
+fn powers_to<'a>(lines: &'a [serde_json::Value], room: &str) -> Vec<&'a serde_json::Value> {
+    lines.iter().filter(|line| line["t"] == "power" && line["room"] == room).collect()
+}
+
+fn power_records(path: &Path, room: &str) -> Vec<serde_json::Value> {
+    let text = fs::read_to_string(path.join(journal::file_name(room, CREATED))).unwrap_or_default();
+    text.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).filter(|record| record["t"] == "power").collect()
+}
+
+/// What one room is handed, its lines and notices in order: `m1`, `sleep`, `sleep(delayed)`, `wake 60000`.
+fn shape(lines: &[serde_json::Value], room: &str) -> Vec<String> {
+    lines.iter().filter(|line| line["room"] == room).filter_map(|line| match line["t"].as_str() {
+        Some("message") => Some(format!("m{}", line["seq"])),
+        Some("power") => Some(format!(
+            "{}{}{}",
+            line["kind"].as_str().unwrap(),
+            if line["delayed"] == true { "(delayed)" } else { "" },
+            line["asleep"].as_u64().map(|ms| format!(" {ms}")).unwrap_or_default()
+        )),
+        _ => None,
+    }).collect()
+}
+
+fn ids_of(lines: &[serde_json::Value], room: &str, kind: &str) -> std::collections::BTreeSet<String> {
+    powers_to(lines, room).into_iter().filter(|line| line["kind"] == kind).map(|line| line["id"].as_str().unwrap().to_string()).collect()
+}
+
+/// I1: one 💤 and one ☀️ per sleep for each room followed when the Mac went to sleep; a wake
+/// with no sleep, a repeated sleep or wake, a room let go during the sleep and one followed only
+/// after it say nothing more.
+#[test]
+fn r318_one_sleep_and_one_wake_notice_per_cycle_for_each_followed_room_and_none_for_another() {
+    const LATE: &str = "sync-gh89";
+    let (hub, path) = journal_hub("r318-once");
+    let mut hub = lock(&hub);
+    quiet_attach(&mut hub);
+    for room in [ROOM, OTHER, THIRD] {
+        hub.connect(room, vec![], Some(CREATED)).unwrap();
+    }
+    hub.has_powered_on(CREATED + 500);
+    hub.will_sleep(CREATED + 1_000, 0);
+    hub.disconnect(THIRD, DisconnectReason::Disconnected);
+    hub.connect(LATE, vec![], Some(CREATED)).unwrap();
+    hub.will_sleep(CREATED + 2_000, 0);
+    hub.has_powered_on(CREATED + 721_000);
+    hub.has_powered_on(CREATED + 800_000);
+    let lines = wire(&mut hub);
+    for room in [ROOM, OTHER] {
+        assert_eq!((ids_of(&lines, room, "sleep").len(), ids_of(&lines, room, "wake").len()), (1, 1), "{room}: {:?}", shape(&lines, room));
+        let wakes: Vec<u64> = powers_to(&lines, room).iter().filter(|line| line["kind"] == "wake").map(|line| line["asleep"].as_u64().unwrap()).collect();
+        assert_eq!(wakes, [720_000], "{room}: how long since the one sleep");
+        assert_eq!(power_records(&path, room).len(), 2, "{room}: each journalled once");
+    }
+    assert_eq!((ids_of(&lines, THIRD, "sleep").len(), ids_of(&lines, THIRD, "wake").len()), (1, 0), "let go while asleep: {:?}", shape(&lines, THIRD));
+    assert!(powers_to(&lines, LATE).is_empty(), "followed only after the sleep: {:?}", shape(&lines, LATE));
+}
+
+/// I2: a 💤 Discord had not taken when the Mac slept goes again after the wake, the same notice
+/// marked delayed, and ahead of the ☀️.
+#[test]
+fn r318_a_sleep_notice_discord_did_not_take_goes_after_the_wake_marked_delayed_before_the_wake() {
+    let (hub, _path) = journal_hub("r318-late");
+    let mut hub = lock(&hub);
+    quiet_attach(&mut hub);
+    hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
+    hub.forward(line_in(ROOM, 1));
+    hub.will_sleep(CREATED + 1_000, 0);
+    let before = wire(&mut hub);
+    assert_eq!(shape(&before, ROOM), ["m1", "sleep"]);
+    hub.has_powered_on(CREATED + 301_000);
+    hub.forward(line_in(ROOM, 2));
+    let after = wire(&mut hub);
+    assert_eq!(shape(&after, ROOM), ["sleep(delayed)", "wake 300000", "m2"]);
+    assert_eq!(powers_to(&before, ROOM)[0]["id"], powers_to(&after, ROOM)[0]["id"], "the same notice, so the child says it once");
+}
+
+/// I3 and I4 across a relaunch: the notices are on disk when the sleep is allowed; a relaunch
+/// hands again only what Discord did not take, a 💤 marked delayed, each line once and in order.
+#[test]
+fn r318_notices_are_journalled_before_the_sleep_is_allowed_and_a_relaunch_repeats_only_what_discord_did_not_take() {
+    let (hub, path) = journal_hub("r318-relaunch");
+    {
+        let mut hub = lock(&hub);
+        quiet_attach(&mut hub);
+        for room in [ROOM, OTHER] {
+            hub.connect(room, vec![], Some(CREATED)).unwrap();
+            hub.forward(line_in(room, 1));
+        }
+        hub.will_sleep(CREATED + 1_000, 0);
+        for room in [ROOM, OTHER] {
+            assert_eq!(power_records(&path, room).len(), 1, "{room}: on disk when the sleep is allowed");
+        }
+        let handed = wire(&mut hub);
+        let id = powers_to(&handed, ROOM)[0]["id"].as_str().unwrap().to_string();
+        let taken: FromChild = serde_json::from_value(serde_json::json!({ "t": "powered", "room": ROOM, "createdAt": CREATED, "id": id })).unwrap();
+        let FromChild::Powered { room, created_at, id } = taken else { panic!("not read as powered") };
+        hub.powered(&room, created_at, &id);
+        hub.has_powered_on(CREATED + 61_000);
+        for room in [ROOM, OTHER] {
+            hub.forward(line_in(room, 2));
+        }
+    }
+    drop(hub);
+
+    let next = recovered_hub(&path, 10);
+    let mut next = lock(&next);
+    quiet_attach(&mut next);
+    let replay = wire(&mut next);
+    assert_eq!(shape(&replay, ROOM), ["m1", "wake 60000", "m2"], "the 💤 Discord took is not said again");
+    assert_eq!(shape(&replay, OTHER), ["m1", "sleep(delayed)", "wake 60000", "m2"]);
+    for room in [ROOM, OTHER] {
+        next.ack(room, 2, Some(CREATED), None);
+        for id in ids_of(&replay, room, "sleep").into_iter().chain(ids_of(&replay, room, "wake")) {
+            next.powered(room, Some(CREATED), &id);
+        }
+    }
+    drop(next);
+
+    let last = recovered_hub(&path, 10);
+    let mut last = lock(&last);
+    quiet_attach(&mut last);
+    let replay = wire(&mut last);
+    for room in [ROOM, OTHER] {
+        assert!(shape(&replay, room).is_empty(), "{room}: all taken, nothing said again: {:?}", shape(&replay, room));
+    }
+}
+
+/// I4: a notice takes no room seq and none of the room's budget: every line arrives once and in
+/// order, with no line said to have gone by unfollowed or been dropped.
+#[test]
+fn r318_notices_move_no_room_seq_and_take_none_of_the_budget() {
+    let (hub, _path) = journal_hub("r318-seqs");
+    let mut hub = lock(&hub);
+    hub.cap = 2;
+    quiet_attach(&mut hub);
+    hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
+    assert_eq!(hub.forward(line_in(ROOM, 1)), Forwarded::Taken);
+    hub.will_sleep(CREATED + 1_000, 0);
+    assert_eq!(hub.forward(line_in(ROOM, 2)), Forwarded::Taken, "a notice takes none of the budget");
+    let mut lines = wire(&mut hub);
+    hub.ack(ROOM, 2, Some(CREATED), None);
+    hub.has_powered_on(CREATED + 61_000);
+    assert_eq!(hub.forward(line_in(ROOM, 3)), Forwarded::Taken);
+    assert_eq!(hub.forward(line_in(ROOM, 3)), Forwarded::Ignored, "once");
+    assert_eq!(hub.forward(line_in(ROOM, 4)), Forwarded::Taken);
+    lines.extend(wire(&mut hub));
+    assert_eq!(shape(&lines, ROOM), ["m1", "sleep", "m2", "sleep(delayed)", "wake 60000", "m3", "m4"]);
+    let notices: Vec<&str> = of_kind(&lines, "message").iter().filter(|line| line["kind"] == "notice").filter_map(|line| line["text"].as_str()).collect();
+    assert!(notices.is_empty(), "no gap or drop is said: {notices:?}");
+}
+
+/// I3 and I5 through the app's own entry points: a sleep waits a bounded moment for Discord and
+/// no longer once Discord has the notice, and nothing is posted into the room.
+#[test]
+fn r318_a_sleep_waits_a_bounded_moment_for_discord_and_nothing_is_posted_into_the_room() {
+    let f = fixture("r318-grace", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    log_of(&f, ROOM, 1..=1);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("line 1 forwarded", || lock(&f.state.hub).rooms.get(ROOM).is_some_and(|feed| feed.last_seq == 1));
+
+    let started = Instant::now();
+    f.state.will_sleep();
+    let waited = started.elapsed();
+    assert!(waited >= SLEEP_GRACE && waited < SLEEP_GRACE + Duration::from_millis(600), "Discord silent: waited {waited:?}");
+    wait_until("the sleep notice handed", || !ids_of(&buffer.lines(), ROOM, "sleep").is_empty());
+    f.state.woke();
+    wait_until("the wake notice handed", || !ids_of(&buffer.lines(), ROOM, "wake").is_empty());
+
+    // Discord takes every notice as soon as it is handed: the next sleep is let go at once.
+    let first = ids_of(&buffer.lines(), ROOM, "sleep");
+    let waited = thread::scope(|scope| {
+        scope.spawn(|| {
+            wait_until("the second sleep notice handed", || ids_of(&buffer.lines(), ROOM, "sleep").len() > first.len());
+            for id in ids_of(&buffer.lines(), ROOM, "sleep") {
+                on_child_event(&f.state.hub, f.owners.as_ref(), FromChild::Powered { room: ROOM.into(), created_at: Some(CREATED), id });
+            }
+        });
+        let started = Instant::now();
+        f.state.will_sleep();
+        started.elapsed()
+    });
+    assert!(waited < SLEEP_GRACE, "Discord took it: waited {waited:?}");
+    f.state.woke();
+    wait_until("the second wake notice handed", || ids_of(&buffer.lines(), ROOM, "wake").len() == 2);
+    assert!(f.acts.posts.lock().unwrap().is_empty(), "nothing is posted into the room: {:?}", f.acts.posts.lock().unwrap());
+}
+
+/// P1 (audit r1): a journal that refuses the 💤 does not keep it from Discord. It is handed, the
+/// room shows the block, the record follows once the journal takes it again, and a relaunch
+/// before Discord took it says it again, delayed.
+#[test]
+fn r318_a_journal_that_refuses_the_sleep_notice_still_hands_it_and_shows_the_block() {
+    let (hub, path) = journal_hub("r318-refused");
+    {
+        let mut hub = lock(&hub);
+        quiet_attach(&mut hub);
+        hub.connect(ROOM, vec![], Some(CREATED)).unwrap();
+        hub.forward(line_in(ROOM, 1));
+        let file = hub.rooms[ROOM].journal.clone().unwrap();
+        file.fail_writes(true);
+        hub.will_sleep(CREATED + 1_000, 0);
+        assert_eq!(shape(&wire(&mut hub), ROOM), ["m1", "sleep"], "handed although the journal refused it");
+        assert!(power_records(&path, ROOM).is_empty(), "the journal refused it");
+        assert_eq!(hub.journal_errors[ROOM].code, JOURNAL_BLOCKED, "the block is shown");
+        file.fail_writes(false);
+        hub.flush_pending();
+        assert_eq!(power_records(&path, ROOM).len(), 1, "written once the journal takes it");
+    }
+    drop(hub);
+    let next = recovered_hub(&path, 10);
+    let mut next = lock(&next);
+    quiet_attach(&mut next);
+    assert_eq!(shape(&wire(&mut next), ROOM), ["m1", "sleep(delayed)"]);
+}
+
+/// P2 (audit r1): the sleep is let go within the grace of the call, even while the hub's lock
+/// (and so the journal behind it) is held; the notice goes once the hub is free.
+#[test]
+fn r318_a_sleep_is_let_go_within_the_grace_even_while_the_hub_is_held() {
+    let f = fixture("r318-held", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    log_of(&f, ROOM, 1..=1);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("line 1 forwarded", || lock(&f.state.hub).rooms.get(ROOM).is_some_and(|feed| feed.last_seq == 1));
+    let (held, holding) = mpsc::channel();
+    let waited = thread::scope(|scope| {
+        scope.spawn(|| {
+            let _hub = lock(&f.state.hub);
+            held.send(()).unwrap();
+            thread::sleep(SLEEP_GRACE * 4);
+        });
+        holding.recv().unwrap();
+        let started = Instant::now();
+        f.state.will_sleep();
+        started.elapsed()
+    });
+    assert!(waited < SLEEP_GRACE + Duration::from_millis(150), "held hub: waited {waited:?}");
+    wait_until("the sleep notice handed once the hub is free", || !ids_of(&buffer.lines(), ROOM, "sleep").is_empty());
+}
+
+/// P2 (audit r2): a sleep the hub takes only after the sleep was let go is handed delayed from the
+/// first time. The order is held: the hub is busy past the grace, the 💤 is handed once it is free,
+/// and only then does the wake come, so no wake can mark it late on the sleep's behalf.
+#[test]
+fn r318_a_sleep_the_hub_takes_after_it_was_let_go_is_delayed_from_the_first_hand() {
+    let f = fixture("r318-late", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    log_of(&f, ROOM, 1..=1);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("line 1 forwarded", || lock(&f.state.hub).rooms.get(ROOM).is_some_and(|feed| feed.last_seq == 1));
+    let (held, holding) = mpsc::channel();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let _hub = lock(&f.state.hub);
+            held.send(()).unwrap();
+            thread::sleep(SLEEP_GRACE * 2);
+        });
+        holding.recv().unwrap();
+        f.state.will_sleep();
+    });
+    wait_until("the sleep notice handed once the hub is free", || !ids_of(&buffer.lines(), ROOM, "sleep").is_empty());
+    f.state.woke();
+    wait_until("the wake notice handed", || !ids_of(&buffer.lines(), ROOM, "wake").is_empty());
+    let sleeps: Vec<String> = shape(&buffer.lines(), ROOM).into_iter().filter(|line| line.starts_with("sleep")).collect();
+    assert_eq!(sleeps, ["sleep(delayed)"]);
+}
+
+/// P2 (audit r3): the hub took the sleep in time, but the journal write under its lock ran past
+/// the grace. The 💤 is handed after the sleep was let go and before the wake: it goes delayed.
+#[test]
+fn r318_a_sleep_whose_journal_write_outlasts_the_grace_is_handed_delayed() {
+    let f = fixture("r318-stall", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    log_of(&f, ROOM, 1..=1);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("line 1 forwarded", || lock(&f.state.hub).rooms.get(ROOM).is_some_and(|feed| feed.last_seq == 1));
+    lock(&f.state.hub).rooms[ROOM].journal.as_ref().unwrap().stall_writes(SLEEP_GRACE * 2);
+    let started = Instant::now();
+    f.state.will_sleep();
+    assert!(started.elapsed() < SLEEP_GRACE + Duration::from_millis(150), "a stalled journal: waited {:?}", started.elapsed());
+    wait_until("the sleep notice handed once the write is done", || !ids_of(&buffer.lines(), ROOM, "sleep").is_empty());
+    lock(&f.state.hub).rooms[ROOM].journal.as_ref().unwrap().stall_writes(Duration::ZERO);
+    f.state.woke();
+    wait_until("the wake notice handed", || !ids_of(&buffer.lines(), ROOM, "wake").is_empty());
+    let sleeps: Vec<String> = shape(&buffer.lines(), ROOM).into_iter().filter(|line| line.starts_with("sleep")).collect();
+    assert_eq!(sleeps, ["sleep(delayed)"]);
+}
+
+/// A sleep let go makes only its own cycle late: the next sleep, handed before it is let go, is not delayed.
+#[test]
+fn r318_the_next_sleep_after_a_wake_is_not_marked_late() {
+    let f = fixture("r318-next", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    log_of(&f, ROOM, 1..=1);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("line 1 forwarded", || lock(&f.state.hub).rooms.get(ROOM).is_some_and(|feed| feed.last_seq == 1));
+    f.state.will_sleep();
+    f.state.woke();
+    wait_until("the first wake handed", || !ids_of(&buffer.lines(), ROOM, "wake").is_empty());
+    lock(&f.state.hub).will_sleep(unix_ms(), 2);
+    wait_until("the second sleep handed", || ids_of(&buffer.lines(), ROOM, "sleep").len() == 2);
+    let sleeps: Vec<String> = shape(&buffer.lines(), ROOM).into_iter().filter(|line| line.starts_with("sleep")).collect();
+    assert_eq!(sleeps.last().map(String::as_str), Some("sleep"), "{sleeps:?}");
+}
+
+/// P2 (audit r4): two sleeps both let go while the hub is held, a wake between them. Once the hub
+/// is free the worker takes sleep 1, wake 1, sleep 2: wake 1 must not make sleep 2 look on time.
+#[test]
+fn r318_a_wake_between_two_sleeps_let_go_does_not_make_the_second_on_time() {
+    let f = fixture("r318-two", Some(TOKEN));
+    let buffer = f.attach_buffer();
+    log_of(&f, ROOM, 1..=1);
+    f.state.connect(ROOM, APP_WORD).unwrap();
+    wait_until("line 1 forwarded", || lock(&f.state.hub).rooms.get(ROOM).is_some_and(|feed| feed.last_seq == 1));
+    let (held, holding) = mpsc::channel();
+    let (go, release) = mpsc::channel::<()>();
+    let hub = &f.state.hub;
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            let _hub = lock(hub);
+            held.send(()).unwrap();
+            let _ = release.recv_timeout(SLEEP_GRACE * 10);
+        });
+        holding.recv().unwrap();
+        f.state.will_sleep();
+        f.state.woke();
+        f.state.will_sleep();
+        go.send(()).unwrap();
+    });
+    wait_until("both sleeps handed", || ids_of(&buffer.lines(), ROOM, "sleep").len() == 2);
+    f.state.woke();
+    wait_until("the second wake handed", || ids_of(&buffer.lines(), ROOM, "wake").len() == 2);
+    let sleeps: Vec<String> = shape(&buffer.lines(), ROOM).into_iter().filter(|line| line.starts_with("sleep")).collect();
+    assert!(sleeps.iter().all(|line| line == "sleep(delayed)"), "{sleeps:?}");
+}
